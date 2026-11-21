@@ -7,15 +7,13 @@ use std::sync::Arc;
 
 use super::{RELAY_HOP_HEADER, healthy_first, relay_middleware};
 use crate::server::state::ServerState;
-use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -35,20 +33,7 @@ struct Fixture {
 }
 
 async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
+    crate::tests::routes::write_fixture(state, key_space, key.into(), value.into()).await;
 }
 
 async fn setup(installed: Vec<String>) -> Fixture {
@@ -67,9 +52,10 @@ async fn setup(installed: Vec<String>) -> Fixture {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,

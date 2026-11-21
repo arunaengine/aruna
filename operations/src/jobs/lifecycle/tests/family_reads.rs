@@ -5,19 +5,17 @@
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::FAMILY_RECORD_KEYSPACE;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     ExecutionReceipt, JobFamilyRecord, JobRecordKey, JobRecordKind, LogicalJobSpec,
 };
 use aruna_core::types::Value;
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::keys::record_key;
-use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, FamilyReadError, RecordOrigin, load_family_complete,
-    load_kind_complete,
-};
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::tests::records::{Family, REALM, context};
+use aruna_core::structs::execution::job::record_keys::record_key;
+use aruna_drivers::driver::{DriverContext, drive};
 
 /// Spec, claim, budget, launch, and the receipt that authorizes one execution.
 async fn seed(ctx: &DriverContext, family: &Family) -> (LogicalJobSpec, ExecutionReceipt) {
@@ -102,12 +100,15 @@ async fn reads_kind_only() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (_spec, receipt) = seed(&ctx, &family).await;
 
-    let all = load_family_complete(&ctx, family.family())
+    let all = drive(LoadFamilyOperation::family(family.family()), &ctx)
         .await
         .expect("family reads completely");
-    let receipts = load_kind_complete(&ctx, family.family(), JobRecordKind::Receipt)
-        .await
-        .expect("receipts read completely");
+    let receipts = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+        &ctx,
+    )
+    .await
+    .expect("receipts read completely");
     assert_eq!(all.len(), 5);
     assert_eq!(receipts.len(), 1);
     assert!(matches!(
@@ -118,9 +119,10 @@ async fn reads_kind_only() {
 
 #[tokio::test]
 async fn resolves_session_alias() {
-    use crate::jobs::JobRouteError;
-    use crate::jobs::lifecycle::routing::session_job;
-    use crate::jobs::service::read_owned_job;
+    use super::session_job;
+    use crate::jobs::job::reads::tests::{read_owned_job, read_report_routed};
+    use crate::jobs::job::reports::{JobReportLookup, ReportQuery};
+    use crate::jobs::route::JobRouteError;
 
     let family = Family::new([7u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
@@ -139,55 +141,42 @@ async fn resolves_session_alias() {
     assert_eq!(record.owner_node_id, family.target.public());
     assert_eq!(physical, Some(receipt.physical_job_id));
     let now = aruna_core::time::unix_timestamp_millis();
-    let mut physical = aruna_core::structs::execution::job::JobRecord::new(
+    let mut physical = aruna_core::structs::execution::job::local::JobRecord::new(
         receipt.physical_job_id,
-        aruna_core::structs::execution::job::JobPayload::Execution(spec.payload.clone()),
+        aruna_core::structs::execution::job::input::JobPayload::Execution(spec.payload.clone()),
         spec.created_by,
         family.target.public(),
         now,
         now,
         None,
     );
-    physical.state = aruna_core::structs::execution::job::JobState::Succeeded;
+    physical.state = aruna_core::structs::execution::job::identity::JobState::Succeeded;
     physical.finished_at_ms = Some(now);
     physical.report_digest = Some([4; 32]);
-    crate::jobs::store::insert_job(&ctx.storage_handle, &physical)
+    aruna_test_support::jobs::insert_job(&ctx, &physical)
         .await
         .unwrap();
-    let auth = |user_id: aruna_core::UserId| aruna_core::structs::identity::auth::AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
+    let auth =
+        |user_id: aruna_core::user::id::UserId| aruna_core::structs::identity::auth::AuthContext {
+            user_id,
+            realm_id: REALM,
+            path_restrictions: None,
+            session: None,
+        };
+    let query = || ReportQuery {
+        expected_digest: None,
+        last_key: None,
+        limit: 1,
     };
-    let report = crate::jobs::service::read_report_routed(
-        &ctx,
-        &auth(spec.created_by),
-        spec.job_id,
-        None,
-        None,
-        1,
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(
-        matches!(report, crate::jobs::service::JobReportLookup::Ready { job, .. }
-        if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32])
-    );
-    let stranger = aruna_core::UserId::new(ulid::Ulid(42), REALM);
+    let report = read_report_routed(&ctx, &auth(spec.created_by), spec.job_id, query())
+        .await
+        .unwrap();
+    assert!(matches!(report, JobReportLookup::Ready { job, .. }
+        if job.job_id == receipt.physical_job_id && job.report_digest == [4; 32]));
+    let stranger = aruna_core::user::id::UserId::new(ulid::Ulid(42), REALM);
     assert!(matches!(
-        crate::jobs::service::read_report_routed(
-            &ctx,
-            &auth(stranger),
-            spec.job_id,
-            None,
-            None,
-            1,
-            None
-        )
-        .await,
-        Ok(crate::jobs::service::JobReportLookup::NotFound)
+        read_report_routed(&ctx, &auth(stranger), spec.job_id, query()).await,
+        Ok(JobReportLookup::NotFound)
     ));
     assert!(matches!(
         session_job(&ctx, stranger, spec.job_id).await,
@@ -208,24 +197,36 @@ async fn undecodable_blocks_chain() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     let (spec, receipt) = seed(&ctx, &family).await;
     assert!(
-        chain_for(&ctx, spec.job_id, receipt.execution_id)
-            .await
-            .is_some()
+        drive(
+            ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id),
+            &ctx
+        )
+        .await
+        .expect("chain read")
+        .is_some()
     );
 
     poison(&ctx, &family).await;
 
     assert!(matches!(
-        load_family_complete(&ctx, family.family()).await,
+        drive(LoadFamilyOperation::family(family.family()), &ctx).await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(matches!(
-        load_kind_complete(&ctx, family.family(), JobRecordKind::Receipt).await,
+        drive(
+            LoadFamilyOperation::kind(family.family(), JobRecordKind::Receipt),
+            &ctx
+        )
+        .await,
         Err(FamilyReadError::Decode(_))
     ));
     assert!(
-        chain_for(&ctx, spec.job_id, receipt.execution_id)
-            .await
-            .is_none()
+        drive(
+            ExecutionChainOperation::of_execution(spec.job_id, receipt.execution_id),
+            &ctx
+        )
+        .await
+        .expect("chain read")
+        .is_none()
     );
 }

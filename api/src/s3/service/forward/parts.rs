@@ -3,13 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::member_read::MemberBody;
 use s3s::dto::{
     CompleteMultipartUploadOutput, CompletedMultipartUpload, CreateMultipartUploadOutput, ETag,
     ListPartsOutput, Part, Timestamp, TimestampFormat, UploadPartOutput,
 };
 use s3s::{S3Response, S3Result, s3_error};
 
-use super::{answer_text, header, xml_field};
+use super::{header, xml_field};
 use crate::s3::service::ArunaS3Service;
 
 /// Escapes text for an XML element body.
@@ -76,11 +77,12 @@ fn e_tag(text: Option<String>) -> Option<ETag> {
 
 impl ArunaS3Service {
     pub(in crate::s3::service) async fn forwarded_create(
-        response: reqwest::Response,
+        &self,
+        response: MemberBody,
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        let body = answer_text(response).await?;
+        let body = self.answer_text(response).await?;
         let upload_id = xml_field(&body, "UploadId")
             .ok_or_else(|| s3_error!(InternalError, "The coordinator named no upload id"))?;
         Ok(S3Response::new(CreateMultipartUploadOutput {
@@ -92,11 +94,12 @@ impl ArunaS3Service {
     }
 
     pub(in crate::s3::service) async fn forwarded_list(
-        response: reqwest::Response,
+        &self,
+        response: MemberBody,
         bucket: String,
         key: String,
     ) -> S3Result<S3Response<ListPartsOutput>> {
-        let body = answer_text(response).await?;
+        let body = self.answer_text(response).await?;
         let number = |tag: &str| xml_field(&body, tag).and_then(|value| value.parse().ok());
         Ok(S3Response::new(ListPartsOutput {
             bucket: Some(bucket),
@@ -112,7 +115,7 @@ impl ArunaS3Service {
     }
 
     pub(in crate::s3::service) fn forwarded_part(
-        response: &reqwest::Response,
+        response: &MemberBody,
     ) -> S3Response<UploadPartOutput> {
         S3Response::new(UploadPartOutput {
             e_tag: e_tag(header(response, "etag")),
@@ -127,10 +130,11 @@ impl ArunaS3Service {
 
     /// A completion can fail after its status line, so an error body still counts as failure.
     pub(in crate::s3::service) async fn forwarded_complete(
-        response: reqwest::Response,
+        &self,
+        response: MemberBody,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let version_id = header(&response, "x-amz-version-id");
-        let body = answer_text(response).await?;
+        let body = self.answer_text(response).await?;
         if body.contains("<Error>") {
             let code = xml_field(&body, "Code").unwrap_or_default();
             let message = xml_field(&body, "Message").unwrap_or_default();

@@ -5,17 +5,16 @@
 
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::password::{Kdf, PasswordHash};
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, SessionKind};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::share::{
     ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget, ShareUses,
 };
-use aruna_operations::auth::request_authorization::AuthorizeError;
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::{drive, drive_retry};
+use aruna_operations::auth::error::AuthorizeError;
 use aruna_operations::shares::lifecycle::{
     CreateShareConfig, CreateShareOperation, RevokeShareOperation, ShareError,
 };
@@ -23,20 +22,22 @@ use aruna_operations::shares::rules::required_permission;
 use aruna_operations::shares::store::{
     GetShareOperation, ListSharesOperation, ReadUsesOperation, ShareEventsOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{map_authorize_error, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::map_authorize_error;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::deletion::bucket_info;
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 
 mod dataset;
 mod relay;
@@ -47,12 +48,8 @@ const MAX_PASSWORD: usize = 1024;
 /// Log entries per page when the caller names no limit.
 const LOG_PAGE: usize = 100;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "shares", description = "Share links for people without an account")))]
-pub struct SharesDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SharesDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_share, list_shares))
         .routes(routes!(get_share, revoke_share))
         .routes(routes!(share_log))
@@ -211,10 +208,6 @@ pub struct ShareLogQuery {
     pub limit: Option<usize>,
 }
 
-pub(crate) fn unix_now() -> u64 {
-    Utc::now().timestamp().max(0) as u64
-}
-
 pub(crate) fn rfc3339(secs: u64) -> String {
     DateTime::<Utc>::from_timestamp(secs as i64, 0)
         .unwrap_or_default()
@@ -256,12 +249,11 @@ async fn link_uses(state: &ServerState, links: &[ShareLink]) -> ServerResult<Vec
 }
 
 fn store_error(error: impl std::fmt::Display) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.to_string().into())
 }
 
 /// Only a full portal or API session may act for its user beyond its own lifetime.
-fn require_creator(state: &ServerState, auth: Option<AuthContext>) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
+fn require_creator(auth: AuthContext) -> ServerResult<AuthContext> {
     let kind = auth.session.as_ref().map(|session| session.kind);
     match kind {
         None | Some(SessionKind::Portal | SessionKind::Api) => Ok(auth),
@@ -340,9 +332,12 @@ async fn share_policies(
     }));
     let permission = required_permission(request.mode.into());
     let policy = policy_request_with(path, &permission, Some(auth), extras);
-    enforce_policies(&state.get_ctx(), state.get_realm_id(), &policy)
-        .await
-        .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
+    drive(
+        EnforcePolicyOperation::new(state.get_realm_id(), policy.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
 }
 
 fn share_error(error: ShareError) -> ServerError {
@@ -350,7 +345,7 @@ fn share_error(error: ShareError) -> ServerError {
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
         ShareError::Denied => ServerError::Forbidden,
         ShareError::Unavailable => ServerError::NotFound,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -387,7 +382,6 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
     responses(
         (status = 201, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
         (status = 400, description = "Malformed target, upload mode on an object or dataset, an expiry in the past, or a label or password that is too long", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks access to the target, holds a restricted, assistant or federated session, or a policy denies the link", body = ErrorResponse),
         (status = 404, description = "No such bucket or dataset on this node", body = ErrorResponse),
         (status = 409, description = "`dataset_not_here` when this node holds no copy of the dataset", body = ErrorResponse)
@@ -396,11 +390,11 @@ The caller needs READ on the target, or WRITE for `read_upload` and `upload`.
 )]
 pub async fn create_share(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<CreateShareRequest>,
 ) -> ServerResult<(StatusCode, Json<ShareDetails>)> {
-    let auth = require_creator(&state, auth)?;
-    let now = unix_now();
+    let auth = require_creator(auth)?;
+    let now = unix_timestamp_secs();
     let password = match request.password.as_deref() {
         Some(password) if password.is_empty() || password.len() > MAX_PASSWORD => {
             return Err(ServerError::BadRequestReason(format!(
@@ -413,8 +407,8 @@ pub async fn create_share(
             let hash =
                 tokio::task::spawn_blocking(move || PasswordHash::new(&password, Kdf::SHARE, salt))
                     .await
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?
-                    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                    .map_err(|error| ServerError::InternalError(error.into()))?
+                    .map_err(|error| ServerError::InternalError(error.into()))?;
             Some(hash)
         }
         None => None,
@@ -469,21 +463,19 @@ pub async fn create_share(
   list needs no log reads."#,
     responses(
         (status = 200, description = "The caller's links", body = ShareList, example = json!({"shares": [{"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}]})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_shares(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<ShareList>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let links = drive(ListSharesOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(store_error)?;
     let uses = link_uses(&state, &links).await?;
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let shares = links
         .iter()
         .zip(uses)
@@ -504,7 +496,6 @@ link, every other caller gets 404."#,
     params(("id" = String, Path, description = "Share link id")),
     responses(
         (status = 200, description = "The link and its token", body = ShareDetails, example = json!({"share": {"id": "01JSHARE0123456789ABCDEFGH", "target": {"kind": "folder", "bucket": "project-data", "prefix": "results/"}, "mode": "read", "label": "Results for reviewers", "created_at": "2026-10-31T09:00:00Z", "expires_at": "2026-11-30T00:00:00Z", "password": true, "revoked_at": null, "status": "active", "downloads": 12, "uploads": 0, "last_access_at": "2026-10-31T10:00:00.000Z"}, "token": "01JSHARE0123456789ABCDEFGH.<link-secret-shown-to-the-owner-only>"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
     ),
@@ -512,15 +503,14 @@ link, every other caller gets 404."#,
 )]
 pub async fn get_share(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<ShareDetails>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let link = own_share(&state, &auth, &id).await?;
     let uses = link_uses(&state, std::slice::from_ref(&link)).await?;
     let uses = uses.first().copied().unwrap_or_default();
     Ok(Json(ShareDetails {
-        share: share_info(&link, uses, unix_now()),
+        share: share_info(&link, uses, unix_timestamp_secs()),
         token: link.link_token(),
     }))
 }
@@ -541,7 +531,6 @@ pub async fn get_share(
     params(("id" = String, Path, description = "Share link id")),
     responses(
         (status = 204, description = "Revoked, or already revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
     ),
@@ -549,12 +538,11 @@ pub async fn get_share(
 )]
 pub async fn revoke_share(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let id = Ulid::from_string(&id).map_err(|_| ServerError::NotFound)?;
-    let revoke = RevokeShareOperation::new(auth.user_id, id, unix_now());
+    let revoke = RevokeShareOperation::new(auth.user_id, id, unix_timestamp_secs());
     drive(revoke, &state.get_ctx()).await.map_err(share_error)?;
     tracing::info!(share_id = %id, "Revoked share link");
     Ok(StatusCode::NO_CONTENT)
@@ -574,7 +562,6 @@ pub async fn revoke_share(
     responses(
         (status = 200, description = "One page of the log", body = ShareLog, example = json!({"entries": [{"id": "01JLOG00123456789ABCDEFGHJ", "at": "2026-10-31T10:00:00.000Z", "action": "download", "key": "results/table.csv", "bytes": 2048, "client": "192.0.2.0/24"}], "next": null})),
         (status = 400, description = "Malformed `after` or a limit outside 1 to 1000", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No link of the caller has this id", body = ErrorResponse)
     ),
@@ -582,11 +569,10 @@ pub async fn revoke_share(
 )]
 pub async fn share_log(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<String>,
     Query(query): Query<ShareLogQuery>,
 ) -> ServerResult<Json<ShareLog>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let link = own_share(&state, &auth, &id).await?;
     let limit = query.limit.unwrap_or(LOG_PAGE);
     if !(1..=1000).contains(&limit) {
@@ -637,8 +623,9 @@ fn action_name(action: ShareAction) -> &'static str {
 /// Appends a log entry; a failed write is traced and never fails the visit.
 pub(crate) async fn log_event(state: &ServerState, share_id: Ulid, event: ShareEvent) {
     let entry = Ulid::generate();
-    let operation = aruna_operations::shares::store::LogShareOperation::new(share_id, entry, event);
-    if let Err(error) = drive(operation, &state.get_ctx()).await {
+    let build =
+        || aruna_operations::shares::store::LogShareOperation::new(share_id, entry, event.clone());
+    if let Err(error) = drive_retry(build, &state.get_ctx(), &entry.to_bytes()).await {
         tracing::warn!(share_id = %share_id, error = %error, "Share link log entry not written");
     }
 }

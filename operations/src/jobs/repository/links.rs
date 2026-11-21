@@ -4,36 +4,36 @@
 
 use std::time::{Duration, SystemTime};
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentChange, DocumentOutboxEvent};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     LINK_CONNECTOR_KEYSPACE, LINK_QUEUE_KEYSPACE, LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE,
 };
-use aruna_core::operation::Operation;
-use aruna_core::repository::{
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::repository::RepositoryRecord;
+use aruna_core::repository::credential::RepositoryCredential;
+use aruna_core::repository::link::{
     LinkBusy, LinkFailure, LinkPatch, LinkQueueEntry, LinkReview, LinkStatus, PullCheck,
-    PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryCredential, RepositoryLink,
-    RepositoryRecord, connector_link_key, link_key, link_prefix,
+    PushOutcome, REVIEW_POLL_MS, RemoteState, RepositoryLink, connector_link_key, link_key,
+    schedule_drain,
 };
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
-use aruna_core::structs::execution::job::JobId;
-use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
-use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use aruna_storage::StorageHandle;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::types::{Key, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use ulid::Ulid;
 
-use super::link_queue::ACTIVE_RETRY_MS;
-use crate::driver::{DriverContext, drive};
-use crate::metadata::persistent_id::{MappingRoute, mapping_route};
-use crate::placement::fence;
-use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::metadata::id_mapping::MappingRoute;
+use crate::sync::outbox::record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
+use aruna_core::placement::fence;
 
-const LINK_PAGE: usize = 256;
+/// How often a check waits for a running push before it looks again.
+pub(super) const ACTIVE_RETRY_MS: u64 = 30_000;
 /// How long a pull check waits for a running pull before it looks again.
 const PULL_ACTIVE_MS: u64 = 60_000;
 
@@ -105,21 +105,28 @@ pub enum LinkError {
     Lineage,
 }
 
+impl From<IoError> for LinkError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Unexpected(other.to_string()),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum State {
-    Init,
-    Start,
     Read,
     Fence,
     Write,
     Delete,
-    Commit,
-    Schedule,
-    Aborting,
-    Done,
 }
 
-/// Applies one change to a link and its rows in a single transaction.
+type Step = Result<Next<Option<RepositoryLink>>, LinkError>;
+
+/// Applies one change to a link and its rows in a single transaction, then wakes the link
+/// drain and the sync outbox drain when the change queued work for them.
 #[derive(Debug, PartialEq)]
 pub struct ChangeLinkOperation {
     document_id: Ulid,
@@ -127,14 +134,14 @@ pub struct ChangeLinkOperation {
     change: LinkChange,
     now: SystemTime,
     state: State,
-    txn_id: Option<TxnId>,
     deletes: Vec<(String, Key)>,
     schedule: bool,
     route: Option<MappingRoute>,
     stored: Option<RepositoryLink>,
     queued: Option<LinkQueueEntry>,
-    pending: usize,
-    output: Option<Result<Option<RepositoryLink>, LinkError>>,
+    /// The link as the change leaves it, `None` once deleted.
+    changed: Option<Option<RepositoryLink>>,
+    ids: IdMint,
 }
 
 impl ChangeLinkOperation {
@@ -144,15 +151,14 @@ impl ChangeLinkOperation {
             link_id,
             change,
             now,
-            state: State::Init,
-            txn_id: None,
+            state: State::Read,
             deletes: Vec::new(),
             schedule: false,
             route: None,
             stored: None,
             queued: None,
-            pending: 0,
-            output: None,
+            changed: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -162,12 +168,52 @@ impl ChangeLinkOperation {
         self
     }
 
-    fn fail(&mut self, error: LinkError) -> Effects {
-        self.output = Some(Err(error));
-        self.abort()
+    /// Keeps the stored link and queue row, then reads the placement fence when the change
+    /// replicates under a generation.
+    fn keep_rows(&mut self, result: IoResult) -> Step {
+        let [link, queued] = values::<2>(result)?;
+        let stored = link
+            .map(|bytes| RepositoryLink::from_bytes(&bytes))
+            .transpose()?;
+        // An unreadable queue row is replaced like a missing one.
+        self.queued = queued.and_then(|bytes| postcard::from_bytes(&bytes).ok());
+        // A departing holder's close either rejects this write or conflicts with it.
+        match self.route.as_ref().filter(|route| route.generation > 0) {
+            Some(route) => {
+                let row = fence::fence_read(&route.realm_id, &route.placement);
+                self.stored = stored;
+                self.state = State::Fence;
+                Ok(Next::Call(IoCall::Read(vec![row])))
+            }
+            None => self.plan(stored),
+        }
     }
 
-    fn plan(&mut self, stored: Option<RepositoryLink>) -> Result<Effects, LinkError> {
+    /// The drains this change woke, run once it committed.
+    fn finish(&mut self) -> Step {
+        let changed = self.changed.take().flatten();
+        let mut calls = Vec::new();
+        if self.schedule {
+            calls.push(IoCall::Effect(Box::new(schedule_drain(Duration::ZERO))));
+        }
+        if self
+            .route
+            .as_ref()
+            .is_some_and(|route| !route.peers.is_empty())
+        {
+            calls.push(IoCall::Effect(Box::new(schedule_drain_effect())));
+        }
+        // Queue and outbox rows are durable, so the periodic rearm covers a lost timer.
+        Ok(match calls.is_empty() {
+            true => Next::Done(changed),
+            false => Next::Then {
+                output: changed,
+                calls,
+            },
+        })
+    }
+
+    fn plan(&mut self, stored: Option<RepositoryLink>) -> Step {
         let link_row = (
             REPOSITORY_LINK_KEYSPACE.to_string(),
             ByteView::from(link_key(self.document_id, self.link_id)),
@@ -300,7 +346,8 @@ impl ChangeLinkOperation {
                 ]);
                 if let Some(route) = &self.route {
                     let change = link.delete_change(route.placement);
-                    writes.extend(sync_rows(route, &link, change, None)?);
+                    let outbox_id = self.ids.mint(now_ms);
+                    writes.extend(sync_rows((route, outbox_id), &link, change, None)?);
                 }
                 None
             }
@@ -335,7 +382,8 @@ impl ChangeLinkOperation {
             let bytes = link.to_bytes()?;
             if let Some(route) = &self.route {
                 let change = link.sync_change(route.placement);
-                writes.extend(sync_rows(route, link, change, Some(bytes.clone()))?);
+                let place = (route, self.ids.mint(now_ms));
+                writes.extend(sync_rows(place, link, change, Some(bytes.clone()))?);
             }
             writes.push((link_row.0, link_row.1, ByteView::from(bytes)));
         }
@@ -354,37 +402,9 @@ impl ChangeLinkOperation {
             writes.push((queue_row.0, queue_row.1, ByteView::from(value)));
             self.schedule = true;
         }
-        self.output = Some(Ok(result));
-        Ok(if writes.is_empty() {
-            self.delete_rows()
-        } else {
-            self.state = State::Write;
-            smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: self.txn_id,
-            })]
-        })
-    }
-
-    fn delete_rows(&mut self) -> Effects {
-        if self.deletes.is_empty() {
-            return self.commit();
-        }
-        self.state = State::Delete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.deletes),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn commit(&mut self) -> Effects {
-        match self.txn_id {
-            Some(txn_id) => {
-                self.state = State::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            None => self.fail(LinkError::Unexpected("missing transaction".into())),
-        }
+        self.changed = Some(result);
+        self.state = State::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -392,157 +412,46 @@ impl Operation for ChangeLinkOperation {
     type Output = Option<RepositoryLink>;
     type Error = LinkError;
 
-    fn start(&mut self) -> Effects {
-        self.state = State::Start;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Aborting {
-            return match event {
-                Event::Storage(
-                    StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
-                ) => {
-                    self.state = State::Done;
-                    smallvec![]
-                }
-                other => {
-                    self.state = State::Done;
-                    self.output = Some(Err(LinkError::Unexpected(format!("{other:?}"))));
-                    smallvec![]
-                }
-            };
-        }
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match (self.state, event) {
-            (State::Start, Event::Storage(StorageEvent::TransactionStarted { txn_id })) => {
-                self.txn_id = Some(txn_id);
-                self.state = State::Read;
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            REPOSITORY_LINK_KEYSPACE.to_string(),
-                            ByteView::from(link_key(self.document_id, self.link_id)),
-                        ),
-                        (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id)),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (State::Read, Event::Storage(StorageEvent::BatchReadResult { mut values }))
-                if values.len() == 2 =>
-            {
-                let queued = values.pop().and_then(|(_, value)| value);
-                let link = values.pop().and_then(|(_, value)| value);
-                let stored = match link
-                    .map(|bytes| RepositoryLink::from_bytes(&bytes))
-                    .transpose()
-                {
-                    Ok(stored) => stored,
-                    Err(error) => return self.fail(error.into()),
-                };
-                // An unreadable queue row is replaced like a missing one.
-                self.queued = queued.and_then(|bytes| postcard::from_bytes(&bytes).ok());
-                // A departing holder's close either rejects this write or conflicts with it.
-                match self.route.as_ref().filter(|route| route.generation > 0) {
-                    Some(route) => {
-                        let (key_space, key) = fence::fence_read(&route.realm_id, &route.placement);
-                        self.stored = stored;
-                        self.state = State::Fence;
-                        smallvec![Effect::Storage(StorageEffect::Read {
-                            key_space,
-                            key,
-                            txn_id: self.txn_id,
-                        })]
-                    }
-                    None => self.plan(stored).unwrap_or_else(|error| self.fail(error)),
-                }
-            }
-            (State::Fence, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> Step {
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                REPOSITORY_LINK_KEYSPACE.to_string(),
+                ByteView::from(link_key(self.document_id, self.link_id)),
+            ),
+            (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id)),
+        ])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match (self.state, result) {
+            (State::Read, result) => self.keep_rows(result),
+            (State::Fence, result) => {
+                let [value] = values::<1>(result)?;
                 let generation = self.route.as_ref().map_or(0, |route| route.generation);
                 if !fence::admits(value.as_ref(), generation) {
-                    return self.fail(LinkError::Fenced);
+                    return Err(LinkError::Fenced);
                 }
                 let stored = self.stored.take();
-                self.plan(stored).unwrap_or_else(|error| self.fail(error))
+                self.plan(stored)
             }
-            (State::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                self.delete_rows()
+            (State::Write, IoResult::Done) => {
+                self.state = State::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
             }
-            (State::Delete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                self.commit()
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                let mut effects = Effects::new();
-                if self.schedule {
-                    effects.push(schedule_drain(Duration::ZERO));
-                }
-                if self
-                    .route
-                    .as_ref()
-                    .is_some_and(|route| !route.peers.is_empty())
-                {
-                    effects.push(schedule_drain_effect());
-                }
-                self.pending = effects.len();
-                self.state = if effects.is_empty() {
-                    State::Done
-                } else {
-                    State::Schedule
-                };
-                effects
-            }
-            // Queue and outbox rows are durable, so the periodic rearm covers a lost timer.
-            (State::Schedule, Event::Task(_)) => {
-                self.pending = self.pending.saturating_sub(1);
-                if self.pending == 0 {
-                    self.state = State::Done;
-                }
-                smallvec![]
-            }
-            (_, other) => self.fail(LinkError::Unexpected(format!("{other:?}"))),
+            (State::Delete, IoResult::Done) => self.finish(),
+            (_, other) => Err(LinkError::Unexpected(other.label().to_string())),
         }
     }
-
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match (self.state, self.output) {
-            (State::Done, Some(output)) => output,
-            (_, Some(Err(error))) => Err(error),
-            _ => Err(LinkError::Unexpected("link change did not finish".into())),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        if matches!(self.output, Some(Ok(_))) && self.state != State::Commit {
-            self.output = Some(Err(LinkError::Unexpected("link change aborted".into())));
-        }
-        match self.txn_id.take() {
-            Some(txn_id) if self.state != State::Commit => {
-                self.state = State::Aborting;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => {
-                self.state = State::Done;
-                smallvec![]
-            }
-        }
-    }
-}
-
-pub fn schedule_drain(after: Duration) -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainLinkQueue,
-        after,
-    })
 }
 
 fn millis(time: SystemTime) -> u64 {
@@ -550,10 +459,10 @@ fn millis(time: SystemTime) -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// Sidecar, manifest entry and outbox publish that replicate one stored link change.
-/// Without `bytes` the change removes the row.
+/// Sidecar, manifest entry and outbox publish under `outbox_id` that replicate one stored link
+/// change. Without `bytes` the change removes the row.
 fn sync_rows(
-    route: &MappingRoute,
+    (route, outbox_id): (&MappingRoute, Ulid),
     link: &RepositoryLink,
     change: DocumentChange,
     bytes: Option<Vec<u8>>,
@@ -566,7 +475,8 @@ fn sync_rows(
     let mut rows = vec![sync_revision_entry(&target, &change)?];
     rows.extend(shard_manifest_entry(&target, &change)?);
     if !route.peers.is_empty() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            outbox_id,
             route.actor,
             target,
             route.peers.clone(),
@@ -578,95 +488,6 @@ fn sync_rows(
         rows.push(outbox_write_entry(&record)?);
     }
     Ok(rows)
-}
-
-/// Applies a change on the link's owner node and replicates it to the document's holders.
-pub async fn change_link(
-    context: &DriverContext,
-    link: &RepositoryLink,
-    change: LinkChange,
-) -> Result<Option<RepositoryLink>, LinkError> {
-    let route = match context.net_handle.as_ref() {
-        Some(net) if net.node_id() != link.owner_node => {
-            return Err(LinkError::NotOwner(link.owner_node_url.clone()));
-        }
-        Some(net) => mapping_route(context, *net.realm_id(), link.document_id)
-            .await
-            .map_err(|error| LinkError::Unexpected(error.to_string()))?,
-        None => None,
-    };
-    // These changes can end a failure and enable the link again.
-    let revives = matches!(link.status, LinkStatus::Failed { .. })
-        && matches!(
-            change,
-            LinkChange::Rotate(_) | LinkChange::Begin(_) | LinkChange::Accept(_)
-        );
-    let enabled = match &change {
-        LinkChange::Create { link, .. } => Some(link.as_ref()),
-        LinkChange::Patch(patch) if patch.paused == Some(false) => Some(link),
-        _ if revives => Some(link),
-        _ => None,
-    };
-    if let Some(enabled) = enabled {
-        Box::pin(ensure_lineage(&context.storage_handle, enabled)).await?;
-    }
-    if let LinkChange::Accept(state) = &change
-        && let Some(record) = state.latest.as_ref().filter(|record| record.published)
-    {
-        register_accepted(context, link, record).await?;
-    }
-    let operation =
-        ChangeLinkOperation::new(link.document_id, link.link_id, change, SystemTime::now())
-            .routed(route);
-    drive(operation, context).await
-}
-
-/// Queues a published record that the link adopts outside a push, such as after a community
-/// review, as `Published` identifiers of the dataset.
-async fn register_accepted(
-    context: &DriverContext,
-    link: &RepositoryLink,
-    record: &RepositoryRecord,
-) -> Result<(), LinkError> {
-    let identifiers = record.identifiers.clone();
-    if identifiers.is_empty() {
-        return Ok(());
-    }
-    let owner = context
-        .net_handle
-        .as_ref()
-        .map_or(link.owner_node, |net| net.node_id());
-    let spec = RegisterIdentifiersSpec {
-        document_id: link.document_id,
-        identifiers,
-        auth_context: super::push::creator_auth(context, link),
-    };
-    let key = format!("identifiers/{}/{}", link.link_id, record.id);
-    crate::jobs::service::submit_identifiers(context, spec, owner, key)
-        .await
-        .map(|_| ())
-        .map_err(|error| LinkError::Submit(error.to_string()))
-}
-
-/// One lineage cannot have an enabled push link and an enabled pull link on one dataset.
-pub(super) async fn ensure_lineage(
-    storage: &StorageHandle,
-    link: &RepositoryLink,
-) -> Result<(), LinkError> {
-    let pulls = link.pull().is_some();
-    let conflict = list_links(storage, link.document_id)
-        .await?
-        .into_iter()
-        .any(|(other, _)| {
-            other.link_id != link.link_id
-                && other.status == LinkStatus::Enabled
-                && other.pull().is_some() != pulls
-                && other.same_lineage(link)
-        });
-    if conflict {
-        return Err(LinkError::Lineage);
-    }
-    Ok(())
 }
 
 pub(crate) fn id_key(id: Ulid) -> Key {
@@ -684,120 +505,82 @@ fn secret_row(
     ))
 }
 
-async fn send(storage: &StorageHandle, effect: StorageEffect) -> Result<Event, LinkError> {
-    match storage.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => Ok(event),
-    }
+/// The push-check row of `link_id`.
+pub(super) fn queue_row(
+    link_id: Ulid,
+    entry: &LinkQueueEntry,
+) -> Result<(String, Key, Value), ConversionError> {
+    Ok((
+        LINK_QUEUE_KEYSPACE.to_string(),
+        id_key(link_id),
+        ByteView::from(postcard::to_allocvec(entry)?),
+    ))
 }
 
-/// The document's links with whether each still has a push check queued.
-pub async fn list_links(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<Vec<(RepositoryLink, bool)>, LinkError> {
-    let links = document_links(storage, document_id).await?;
-    let reads = links
-        .iter()
-        .map(|link| (LINK_QUEUE_KEYSPACE.to_string(), id_key(link.link_id)))
-        .collect::<Vec<_>>();
-    if reads.is_empty() {
-        return Ok(Vec::new());
-    }
-    let event = send(
-        storage,
-        StorageEffect::BatchRead {
-            reads,
-            txn_id: None,
-        },
-    )
-    .await?;
-    let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-        return Err(LinkError::Unexpected(format!("{event:?}")));
-    };
-    Ok(links
-        .into_iter()
-        .zip(values)
-        .map(|(link, (_, queued))| (link, queued.is_some()))
-        .collect())
+/// Deletes the queued push check of `link_id`, or with `retry_at` moves it there, in one write
+/// transaction. A change written since `queued` was read stays, due no later than `retry_at`;
+/// a removed check stays removed.
+#[derive(Debug, PartialEq)]
+pub(super) struct SettleCheckOperation {
+    link_id: Ulid,
+    queued: Value,
+    retry_at: Option<u64>,
+    written: bool,
 }
 
-/// All links of the document, read page by page.
-pub(crate) async fn document_links(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<Vec<RepositoryLink>, LinkError> {
-    let mut links = Vec::new();
-    let mut start = None;
-    loop {
-        let event = send(
-            storage,
-            StorageEffect::Iter {
-                key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
-                prefix: Some(ByteView::from(link_prefix(document_id))),
-                start: start.take().map(IterStart::After),
-                limit: LINK_PAGE,
-                txn_id: None,
-            },
-        )
-        .await?;
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return Err(LinkError::Unexpected(format!("{event:?}")));
+impl SettleCheckOperation {
+    pub(super) fn new(link_id: Ulid, queued: Value, retry_at: Option<u64>) -> Self {
+        Self {
+            link_id,
+            queued,
+            retry_at,
+            written: false,
+        }
+    }
+
+    fn settle(&mut self, current: Option<Value>) -> Result<Next<()>, LinkError> {
+        let unchanged = current.as_ref() == Some(&self.queued);
+        let entry = |bytes: &Value| postcard::from_bytes::<LinkQueueEntry>(bytes).ok();
+        let call = match (current.as_ref(), self.retry_at) {
+            (Some(_), None) if unchanged => {
+                let row = (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id));
+                IoCall::Delete(vec![row])
+            }
+            (Some(current), Some(retry_at)) => {
+                let base = if unchanged { None } else { entry(current) };
+                let Some(mut next) = base.clone().or_else(|| entry(&self.queued)) else {
+                    return Err(LinkError::Unexpected("unreadable link queue entry".into()));
+                };
+                next.due_at_ms = base.map_or(retry_at, |base| base.due_at_ms.min(retry_at));
+                IoCall::Write(vec![queue_row(self.link_id, &next)?])
+            }
+            _ => return Ok(Next::Done(())),
         };
-        for (_, value) in values {
-            links.push(RepositoryLink::from_bytes(&value)?);
-        }
-        match next_start_after {
-            Some(next) => start = Some(next),
-            None => return Ok(links),
-        }
+        self.written = true;
+        Ok(Next::Call(call))
     }
 }
 
-pub async fn read_link(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    link_id: Ulid,
-) -> Result<Option<RepositoryLink>, LinkError> {
-    let event = send(
-        storage,
-        StorageEffect::Read {
-            key_space: REPOSITORY_LINK_KEYSPACE.to_string(),
-            key: ByteView::from(link_key(document_id, link_id)),
-            txn_id: None,
-        },
-    )
-    .await?;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|bytes| RepositoryLink::from_bytes(&bytes))
-            .transpose()?),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
-    }
-}
+impl Operation for SettleCheckOperation {
+    type Output = ();
+    type Error = LinkError;
 
-pub(crate) async fn read_secret(
-    storage: &StorageHandle,
-    link_id: Ulid,
-) -> Result<Option<RepositoryCredential>, LinkError> {
-    let event = send(
-        storage,
-        StorageEffect::Read {
-            key_space: LINK_SECRET_KEYSPACE.to_string(),
-            key: id_key(link_id),
-            txn_id: None,
-        },
-    )
-    .await?;
-    match event {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .map(|bytes| postcard::from_bytes(&bytes).map_err(ConversionError::from))
-            .transpose()?),
-        other => Err(LinkError::Unexpected(format!("{other:?}"))),
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<()>, LinkError> {
+        let row = (LINK_QUEUE_KEYSPACE.to_string(), id_key(self.link_id));
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, LinkError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        let [current] = values::<1>(result)?;
+        self.settle(current)
     }
 }
 

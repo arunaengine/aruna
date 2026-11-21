@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::compute::backend::{DOCKER_DEFAULT_HOST, RuntimeDestination, local_daemon};
 use aruna_core::compute::runtimes::{SESSION_CLIENT_MODE, SESSION_HELPER_PATH};
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptRef, AttemptStatus, BackendError,
@@ -38,7 +39,10 @@ use super::channel::ChannelStream;
 use super::config::{DockerConfig, SESSION_NETWORK};
 use super::logs::BoundedTail;
 use super::staging::StageLayout;
-use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
+use super::{
+    BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, host_capabilities,
+};
+use aruna_clock::unix_timestamp_millis;
 
 /// Label recording the effective walltime ceiling in milliseconds.
 const WALLTIME_LABEL: &str = "aruna-engine.org/max-walltime-ms";
@@ -54,20 +58,21 @@ const MAX_SCAN_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
 
 mod archive;
 mod control;
-mod session;
+pub mod session;
 
 use archive::{
     ArchivePlan, BuildError, UPLOAD_LIMIT, build_archive, container_path, count_limited,
     list_archive, output_spec, stream_output,
 };
 use control::{ControlGuard, ControlRecord, DaemonLock};
-pub use session::session_gateway;
 
 /// Local Docker/OCI executor backend over bollard.
 pub struct DockerBackend {
     docker: Docker,
     config: DockerConfig,
     daemon_lock: Arc<DaemonLock>,
+    /// The daemon runs on this node; a remote daemon is no local site and hosts no sessions.
+    local: bool,
 }
 
 enum RemoveOutcome {
@@ -83,16 +88,28 @@ impl DockerBackend {
     }
 
     pub fn with_config(config: DockerConfig) -> Result<Self, BackendError> {
-        let docker = Docker::connect_with_defaults().map_err(|e| classify(&e))?;
+        let host = config
+            .docker_host
+            .clone()
+            .or_else(|| std::env::var("DOCKER_HOST").ok())
+            .unwrap_or_else(|| DOCKER_DEFAULT_HOST.to_string());
+        let docker = Docker::connect_with_host(&host).map_err(|e| classify(&e))?;
+        let config = DockerConfig {
+            docker_host: Some(host),
+            ..config
+        };
         Self::from_parts(docker, config)
     }
 
+    /// A client without an address in `config` counts as the local daemon.
     pub fn from_parts(docker: Docker, config: DockerConfig) -> Result<Self, BackendError> {
         let daemon_lock = Arc::new(DaemonLock::acquire(&config.state_root)?);
+        let local = config.docker_host.as_deref().is_none_or(local_daemon);
         Ok(Self {
             docker,
             config,
             daemon_lock,
+            local,
         })
     }
 
@@ -403,7 +420,7 @@ impl DockerBackend {
             self.verify_layout(container_id, plan).await?;
         }
         self.cancel_submission(attempt, cancel).await?;
-        guard.mark_start()?;
+        guard.mark_start().await?;
         let started = self.start_by_name(container_id).await;
         self.cancel_submission(attempt, cancel).await?;
         started?;
@@ -700,14 +717,19 @@ impl ExecutorBackend for DockerBackend {
         ExecutorKind::Docker
     }
 
+    fn destination(&self) -> Option<RuntimeDestination> {
+        Some(RuntimeDestination::Docker {
+            host: (self.config.docker_host.clone()).unwrap_or_else(|| DOCKER_DEFAULT_HOST.into()),
+            state_root: self.config.state_root.display().to_string(),
+        })
+    }
+
     fn capabilities(&self) -> BackendCaps {
+        // A remote daemon runs elsewhere, so it holds no session and no local site.
         BackendCaps {
-            file_staging: true,
-            direct_s3: true,
-            local_site: true,
-            session: true,
-            limits: self.config.envelope,
-            ..BackendCaps::default()
+            local_site: self.local,
+            session: self.local,
+            ..host_capabilities(self.config.envelope)
         }
     }
 
@@ -723,7 +745,10 @@ impl ExecutorBackend for DockerBackend {
 
     async fn health(&self) -> Result<(), BackendError> {
         self.docker.ping().await.map_err(|e| classify(&e))?;
-        self.daemon_lock.verify()?;
+        let daemon_lock = Arc::clone(&self.daemon_lock);
+        tokio::task::spawn_blocking(move || daemon_lock.verify())
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker health task failed: {error}")))??;
         if let Some(bytes) = self.config.default_disk_bytes {
             self.probe_disk_limit(bytes).await?;
         }
@@ -1392,7 +1417,7 @@ fn lost_status(name: &str) -> AttemptStatus {
         },
         backend_ref: name.to_string(),
         started_at_ms: None,
-        finished_at_ms: Some(now_ms()),
+        finished_at_ms: Some(unix_timestamp_millis()),
         detail: None,
     }
 }
@@ -1587,6 +1612,7 @@ fn parse_rfc3339_ms(s: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use super::session::session_gateway;
     use super::*;
 
     /// A byte bound tests pass explicitly, the size of the former fixed limit.
@@ -1602,6 +1628,61 @@ mod tests {
             attempt_epoch: 1,
             controller_generation: 1,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_daemon_unproven() {
+        // A daemon reached over the network is not this node: no local site, no sessions.
+        let dir = tempfile::tempdir().unwrap();
+        let backend = |host: &str, root: &str| {
+            DockerBackend::with_config(DockerConfig {
+                docker_host: Some(host.to_string()),
+                state_root: dir.path().join(root),
+                ..DockerConfig::default()
+            })
+            .unwrap()
+            .capabilities()
+        };
+
+        let remote = backend("tcp://10.0.0.5:2376", "remote");
+        assert!(!remote.local_site && !remote.session);
+        let local = backend("unix:///var/run/docker.sock", "local");
+        assert!(local.local_site && local.session);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn digests_follow_config() {
+        // A new daemon address moves the home and the config; a new envelope only the config.
+        let dir = tempfile::tempdir().unwrap();
+        let digests = |host: &str, cores: Option<u32>| {
+            let config = DockerConfig {
+                docker_host: Some(host.to_string()),
+                state_root: dir.path().join("state"),
+                envelope: aruna_core::compute::ResourceEnvelope {
+                    max_cpu_cores: cores,
+                    ..Default::default()
+                },
+                ..DockerConfig::default()
+            };
+            let backend = Arc::new(DockerBackend::with_config(config).unwrap());
+            let registry = crate::registry::ExecutorRegistry::new().with_backend("lab", backend);
+            let home = registry.home_digest("lab").unwrap();
+            (home, registry.config_digest("lab").unwrap())
+        };
+        let local = "unix:///var/run/docker.sock";
+
+        let base = digests(local, Some(4));
+        assert_eq!(
+            digests(local, Some(4)),
+            base,
+            "an unchanged config keeps its digests"
+        );
+        let moved = digests("tcp://10.0.0.5:2376", Some(4));
+        assert!(moved.0 != base.0 && moved.1 != base.1);
+        let grown = digests(local, Some(8));
+        assert!(grown.0 == base.0 && grown.1 != base.1);
     }
 
     #[test]
@@ -2561,5 +2642,16 @@ mod tests {
             "oom-killed must be Failed, got {:?}",
             status.phase
         );
+    }
+
+    #[test]
+    fn passes_vault_env() {
+        let mut spec = TaskSpec::new(AttemptRef::new("j1", 0), "alpine");
+        let password = aruna_core::compute::Secret::new("canary-5e1f");
+        spec.vault_env
+            .insert("WEBIN_PASSWORD".to_string(), password);
+        let body = build_config(&DockerConfig::default(), &fence(), &spec);
+        let env = body.env.unwrap();
+        assert!(env.contains(&"WEBIN_PASSWORD=canary-5e1f".to_string()));
     }
 }

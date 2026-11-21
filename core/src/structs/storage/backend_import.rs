@@ -2,16 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::checksum::HASH_MD5;
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
 use crate::structs::identity::auth::AuthContext;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::{BackendLocation, BackendRef};
 use crate::structs::storage::group_backend::path_bucket;
 use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 use ulid::Ulid;

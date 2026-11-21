@@ -2,9 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::document_sync::reconcile::admin::apply_admin_operation;
-use crate::document_sync::reconcile::cursor::{AppliedCursor, topic_cursor_key};
 use crate::document_sync::storage::batch_write_to;
+use crate::document_sync::tests::runner::apply_admin_operation;
 use crate::document_sync::{DocumentSyncService, node_to_peer};
 use crate::test_support::test_endpoint;
 use ::irokle::Storage as _;
@@ -16,8 +15,11 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
+use aruna_core::document_apply::cursor::AppliedCursor;
+use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
     GRAPH_LIFECYCLE_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
@@ -41,11 +43,13 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::{QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage};
+use aruna_core::structs::sync_quarantine::{
+    QUARANTINE_USAGE_KEY, SyncQuarantineRecord, SyncQuarantineUsage,
+};
 use aruna_core::types::Value;
-use aruna_core::{NodeId, UserId};
-use aruna_storage::FjallPersistPolicy;
-use aruna_storage::StorageHandle;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use irokle::PeerId;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -75,13 +79,14 @@ pub(crate) fn test_genesis(seed: u8) -> ::irokle::OpId {
 
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("temp path"))
-        .expect("storage opens");
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("temp path"))
+            .expect("storage opens");
     (dir, storage)
 }
 
 pub(crate) fn storage_at(path: &Path) -> StorageHandle {
-    aruna_storage::FjallStorage::open(path.to_str().expect("utf-8 storage path"))
+    aruna_storage::storage::worker::FjallStorage::open(path.to_str().expect("utf-8 storage path"))
         .expect("storage opens")
 }
 
@@ -365,14 +370,7 @@ pub(crate) fn config_oidc_providers(
 }
 
 pub(crate) fn test_oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
-    OidcProviderConfig {
-        id: id.to_string(),
-        issuer: format!("https://issuer.example/{issuer_suffix}"),
-        audience: "aruna".to_string(),
-        discovery_url: format!(
-            "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
-        ),
-    }
+    aruna_core::testing::oidc_provider(id, issuer_suffix)
 }
 
 pub(crate) fn test_discovery(node_seed: u8, endpoint_addr: &str) -> RealmDiscoveryConfig {

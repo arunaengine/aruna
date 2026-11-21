@@ -1430,6 +1430,7 @@ async fn caps_flooding_origin() {
                     token_owner: flooder.user_id,
                 },
                 &mut index,
+                ulid::Ulid::generate(),
             )
             .expect("seeded revocation applies");
     }
@@ -1944,10 +1945,11 @@ async fn join_authority_replication() {
             AdminDocumentOperation::GroupJoinRequested {
                 request: request.clone(),
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     assert!(matches!(
-        validate_group_authority(&storage, &requested, None)
+        check_group_authority(&storage, &requested, None)
             .await
             .unwrap(),
         AdminEventValidation::Accepted
@@ -1973,7 +1975,7 @@ async fn join_authority_replication() {
         },
     );
     assert!(matches!(
-        validate_group_authority(&storage, &denied, Some(&reducer))
+        check_group_authority(&storage, &denied, Some(&reducer))
             .await
             .unwrap(),
         AdminEventValidation::Rejected(_)
@@ -1992,6 +1994,7 @@ async fn join_authority_replication() {
                     role_ids: BTreeSet::from([role_id]),
                 },
             },
+            ulid::Ulid::generate(),
         )
         .unwrap();
     let previous = read_reducer_state(&storage, &reducer.target)
@@ -1999,7 +2002,7 @@ async fn join_authority_replication() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        validate_group_authority(&storage, &approved, Some(&previous))
+        check_group_authority(&storage, &approved, Some(&previous))
             .await
             .unwrap(),
         AdminEventValidation::Accepted
@@ -2116,7 +2119,7 @@ async fn policies_authority_gate() {
         .await
         .expect("group auth doc writes");
 
-        let validation = validate_group_authority(&storage, &event, None)
+        let validation = check_group_authority(&storage, &event, None)
             .await
             .expect("validation runs without panic");
         assert_eq!(
@@ -2881,7 +2884,7 @@ async fn oidc_conflict_withholds() {
     let providers = config_oidc_providers(&config);
     assert!(!providers.contains_key("default"));
     assert_eq!(providers.get("untouched"), Some(&untouched));
-    let path = aruna_core::reducer::config_oidc_path("default");
+    let path = aruna_core::reducer::paths::config_oidc_path("default");
     assert!(
         read_storage_value(
             &storage,

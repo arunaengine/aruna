@@ -2,24 +2,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
-    MetadataQueryMode, SearchHitResponse, map_api_error, map_query_mode, map_search_hit,
-};
+use crate::metadata::model::{MetadataQueryMode, SearchHitResponse};
+use crate::metadata::{map_api_error, map_query_mode, map_search_hit};
 use crate::routes::access::users::MIN_QUERY_CHARS;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_core::search::ObjectKeyMatch;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_operations::driver::drive;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::drive;
 use aruna_operations::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
-use aruna_operations::metadata::api::{
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
+use aruna_operations::metadata::api::object_search::search_objects;
+use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectQueryMode, SearchQueryRequest, forwarded_bearer,
-    search_buckets_distributed, search_metadata as run_search_metadata, search_objects,
+    ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
-use aruna_operations::s3::bucket::metadata::dataset_description;
-use aruna_operations::s3::object::search::ObjectKeyMatch;
+use aruna_operations::metadata::forward::read::DatasetSummaryOperation;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -27,7 +30,7 @@ use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -39,16 +42,10 @@ const SEARCH_TYPE_BUCKETS: &str = "buckets";
 const SEARCH_TYPE_GROUPS: &str = "groups";
 const SEARCH_TYPE_USERS: &str = "users";
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "search", description = "Unified realm search"))
-)]
-pub struct SearchApiDoc;
-
 // Object search uses authenticated live heads with explicit partial or strict federation.
 // Pagination is a watermarked live keyset; signed snapshots and directory tiers remain deferred.
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SearchApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(unified_search))
         .routes(routes!(bucket_search))
         .routes(routes!(object_search))
@@ -483,25 +480,27 @@ pub async fn bucket_search(
     }
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
-    let result = search_buckets_distributed(
+    let result = drive(
+        search_buckets_distributed(
+            state.get_realm_id(),
+            state.get_node_id(),
+            BucketSearchRequest {
+                auth: auth.clone(),
+                bearer_token: bearer.clone(),
+                query: query.to_string(),
+                key: None,
+                extras: None,
+                limit: params
+                    .limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_BUCKET_LIMIT),
+                group_id,
+                cursor: params.cursor,
+                target_nodes: None,
+                database: params.database,
+            },
+        ),
         state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        BucketSearchRequest {
-            auth: auth.clone(),
-            bearer_token: bearer.clone(),
-            query: query.to_string(),
-            key: None,
-            extras: None,
-            limit: params
-                .limit
-                .unwrap_or(DEFAULT_SEARCH_LIMIT)
-                .clamp(1, MAX_BUCKET_LIMIT),
-            group_id,
-            cursor: params.cursor,
-            target_nodes: None,
-            database: params.database,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -620,7 +619,6 @@ restrictions and request policies before it can be returned.
             })
         ),
         (status = 400, description = "Query shorter than 2 characters, or a cursor that does not match this query, bucket, match type and mode", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "Strict distributed coverage could not be completed, or the live-head scan was unavailable", body = ErrorResponse)
     ),
@@ -628,11 +626,10 @@ restrictions and request policies before it can be returned.
 )]
 pub async fn object_search(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ObjectParams>,
 ) -> ServerResult<(StatusCode, Json<ObjectResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let query = params.q.trim();
     if query.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
@@ -647,28 +644,36 @@ pub async fn object_search(
         ObjectMatchMode::Prefix => ObjectKeyMatch::Prefix,
         ObjectMatchMode::Metadata => ObjectKeyMatch::Metadata,
     };
-    let result = search_objects(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        SearchQueryRequest {
-            auth,
-            bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
-            query: query.to_string(),
-            key_match,
-            bucket,
-            limit: params
-                .limit
-                .unwrap_or(DEFAULT_SEARCH_LIMIT)
-                .clamp(1, MAX_SEARCH_LIMIT),
-            cursor: params.cursor,
-            mode: match mode {
-                ObjectMode::Local => ObjectQueryMode::Local,
-                ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
-                ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
+    let result = drive(
+        search_objects(
+            state.get_realm_id(),
+            state.get_node_id(),
+            SearchQueryRequest {
+                auth,
+                bearer_token: bearer_token.map(|carrier| carrier.as_str().to_string()),
+                query: query.to_string(),
+                key_match,
+                bucket,
+                limit: params
+                    .limit
+                    .unwrap_or(DEFAULT_SEARCH_LIMIT)
+                    .clamp(1, MAX_SEARCH_LIMIT),
+                cursor: params.cursor,
+                mode: match mode {
+                    ObjectMode::Local => ObjectQueryMode::Local,
+                    ObjectMode::DistributedBestEffort => ObjectQueryMode::DistributedBestEffort,
+                    ObjectMode::DistributedStrict => ObjectQueryMode::DistributedStrict,
+                },
+                target_nodes: None,
             },
-            target_nodes: None,
-        },
+            state
+                .get_ctx()
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;
@@ -866,18 +871,16 @@ so a caller never learns of a group it may not read, and the user directory sear
             })
         ),
         (status = 400, description = "Query shorter than 2 characters, unknown type, malformed group id, or a cursor that is unsupported, sent with more than one type, or does not match the original query", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn unified_search(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<SearchParams>,
 ) -> ServerResult<(StatusCode, Json<SearchResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let bearer = bearer_token.map(|carrier| carrier.as_str().to_string());
     Ok((
         StatusCode::OK,
@@ -952,22 +955,24 @@ async fn run_buckets(
     if !requested {
         return Ok(None);
     }
-    let result = search_buckets_distributed(
+    let result = drive(
+        search_buckets_distributed(
+            state.get_realm_id(),
+            state.get_node_id(),
+            BucketSearchRequest {
+                auth: auth.clone(),
+                bearer_token: bearer_token.clone(),
+                query: query.to_string(),
+                key: None,
+                extras: None,
+                limit: limit.min(MAX_BUCKET_LIMIT),
+                group_id: None,
+                cursor: None,
+                target_nodes: None,
+                database: false,
+            },
+        ),
         state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        BucketSearchRequest {
-            auth: auth.clone(),
-            bearer_token: bearer_token.clone(),
-            query: query.to_string(),
-            key: None,
-            extras: None,
-            limit: limit.min(MAX_BUCKET_LIMIT),
-            group_id: None,
-            cursor: None,
-            target_nodes: None,
-            database: false,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -997,7 +1002,8 @@ async fn describe_hits(
     let ctx = state.get_ctx();
     let reads = datasets.into_iter().map(|dataset| {
         let token = forwarded_bearer(bearer).ok().flatten();
-        let read = dataset_description(&ctx, state.get_realm_id(), dataset, (Some(auth), token));
+        let read = DatasetSummaryOperation::new(state.get_realm_id(), dataset, (Some(auth), token));
+        let read = drive(read, &ctx);
         async move { (dataset, read.await.ok()) }
     });
     let found: std::collections::BTreeMap<_, _> = futures_util::stream::iter(reads)
@@ -1061,22 +1067,24 @@ async fn run_documents(
         return Ok(None);
     }
     let ctx = state.get_ctx();
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            state.get_realm_id(),
+            state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(auth.clone()),
+                bearer_token,
+                graph_iris: None,
+                query: query.to_string(),
+                conforms_to,
+                group_id,
+                limit: Some(limit),
+                cursor,
+                mode: map_query_mode(mode),
+                target_nodes: None,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(auth.clone()),
-            bearer_token,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to,
-            group_id,
-            limit: Some(limit),
-            cursor,
-            mode: map_query_mode(mode),
-            target_nodes: None,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -1121,7 +1129,7 @@ async fn run_groups(
             &state.get_ctx(),
         )
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.into()))?;
         let raw_next = output.next_start_after;
         let total = output.groups.len();
         for (index, group) in output.groups.into_iter().enumerate() {
@@ -1192,7 +1200,7 @@ async fn run_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok(Some(UsersSection {
         hits: output
             .users

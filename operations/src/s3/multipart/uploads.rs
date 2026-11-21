@@ -3,28 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::UPLOAD_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::storage::listing::ListUploadsResult;
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_core::types::{Effects, Key};
-use smallvec::smallvec;
+use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::s3::listing::{ListMarker, build_page, retain_after_marker};
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListUploadsState {
-    Init,
-    StartTransaction,
-    ReadUploads,
-    CommitTransaction,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ListUploadsError {
@@ -34,19 +23,20 @@ pub enum ListUploadsError {
     ConversionError(#[from] ConversionError),
     #[error("multipart upload scan budget exhausted")]
     ScanBudgetExceeded,
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: ListUploadsState,
-        expected: &'static str,
-        received: Event,
-    },
-    #[error("No transaction found")]
-    NoTransactionFound,
-    #[error("ListMultipartUploads failed")]
-    ListUploadsFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error("ListMultipartUploads failed: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for ListUploadsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<ListUploadsResult>, ListUploadsError>;
 
 #[derive(Debug, PartialEq)]
 pub struct ListUploadsInput {
@@ -58,27 +48,15 @@ pub struct ListUploadsInput {
     pub max_uploads: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListUploadsResult {
-    pub uploads: Vec<MultipartUpload>,
-    pub common_prefixes: Vec<String>,
-    pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_upload_marker: Option<Ulid>,
-}
-
 #[derive(Debug, PartialEq)]
 pub struct ListUploadsOperation {
     input: ListUploadsInput,
-    state: ListUploadsState,
-    txn_id: Option<Ulid>,
     uploads: Vec<MultipartUpload>,
     scan_cursor: Option<Key>,
     scan_rows: usize,
     scan_round_limit: usize,
     max_scan_rows: usize,
     include_in_progress: bool,
-    output: Option<Result<ListUploadsResult, ListUploadsError>>,
 }
 
 impl ListUploadsOperation {
@@ -89,15 +67,12 @@ impl ListUploadsOperation {
     pub fn new(input: ListUploadsInput) -> Self {
         Self {
             input,
-            state: ListUploadsState::Init,
-            txn_id: None,
             uploads: Vec::new(),
             scan_cursor: None,
             scan_rows: 0,
             scan_round_limit: Self::SCAN_ROUND_LIMIT,
             max_scan_rows: Self::MAX_SCAN_ROWS,
             include_in_progress: false,
-            output: None,
         }
     }
 
@@ -115,73 +90,17 @@ impl ListUploadsOperation {
         self
     }
 
-    #[cfg(test)]
-    fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
-        self.scan_round_limit = scan_round_limit;
-        self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
-        self.max_scan_rows = max_scan_rows;
-        self
-    }
-
-    fn emit_error(&mut self, error: ListUploadsError) -> Effects {
-        self.state = ListUploadsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        // Mirror the key listings: max_uploads=0 returns an empty,
-        // non-truncated result instead of truncating without a resume marker.
-        if self.input.max_uploads == 0 {
-            self.state = ListUploadsState::Finish;
-            self.output = Some(Ok(ListUploadsResult {
-                uploads: Vec::new(),
-                common_prefixes: Vec::new(),
-                is_truncated: false,
-                next_key_marker: None,
-                next_upload_marker: None,
-            }));
-            return smallvec![];
-        }
-
-        self.state = ListUploadsState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListUploadsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
-            });
-        };
-
-        self.txn_id = Some(txn_id);
-        self.issue_upload_round()
-    }
-
-    fn issue_upload_round(&mut self) -> Effects {
-        let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
-        };
+    fn upload_round(&mut self) -> Step {
+        let remaining = self.max_scan_rows.saturating_sub(self.scan_rows);
         if remaining == 0 {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
+            return Err(ListUploadsError::ScanBudgetExceeded);
         }
-        self.state = ListUploadsState::ReadUploads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: UPLOAD_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.scan_cursor.take().map(IterStart::After),
+        Ok(Next::Call(IoCall::Page {
+            space: UPLOAD_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.scan_cursor.take(),
             limit: self.scan_round_limit.min(remaining),
-            txn_id: self.txn_id,
-        })]
+        }))
     }
 
     fn prefix(&self) -> Option<&str> {
@@ -191,32 +110,15 @@ impl ListUploadsOperation {
             .filter(|prefix| !prefix.is_empty())
     }
 
-    fn handle_uploads_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(ListUploadsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
-        };
-
-        let Some(remaining) = self.max_scan_rows.checked_sub(self.scan_rows) else {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
-        };
+    fn uploads_read(&mut self, values: Vec<(Key, Value)>, next_start_after: Option<Key>) -> Step {
+        let remaining = self.max_scan_rows.saturating_sub(self.scan_rows);
         if values.len() > remaining {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
+            return Err(ListUploadsError::ScanBudgetExceeded);
         }
         self.scan_rows += values.len();
 
         for (_key, value) in values {
-            let record = match MultipartUpload::from_bytes(value.as_ref()) {
-                Ok(record) => record,
-                Err(err) => return self.emit_error(err.into()),
-            };
+            let record = MultipartUpload::from_bytes(value.as_ref())?;
             if record.bucket != self.input.bucket
                 || (!self.include_in_progress && record.status != MultipartUploadStatus::Open)
             {
@@ -234,17 +136,17 @@ impl ListUploadsOperation {
         self.uploads = uploads;
 
         if next_start_after.is_none() {
-            return self.finish_upload_scan();
+            return Ok(self.finish_upload_scan());
         }
         if self.scan_rows >= self.max_scan_rows {
-            return self.emit_error(ListUploadsError::ScanBudgetExceeded);
+            return Err(ListUploadsError::ScanBudgetExceeded);
         }
 
         self.scan_cursor = next_start_after;
-        self.issue_upload_round()
+        self.upload_round()
     }
 
-    fn finish_upload_scan(&mut self) -> Effects {
+    fn finish_upload_scan(&mut self) -> Next<ListUploadsResult> {
         let mut uploads = std::mem::take(&mut self.uploads);
         uploads.sort_by(|left, right| {
             left.key
@@ -269,11 +171,7 @@ impl ListUploadsOperation {
         );
     }
 
-    fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListUploadsError::NoTransactionFound);
-        };
-
+    fn finish(&mut self, uploads: Vec<MultipartUpload>) -> Next<ListUploadsResult> {
         let page = build_page(
             &uploads,
             self.input.max_uploads,
@@ -290,28 +188,13 @@ impl ListUploadsOperation {
             None => (None, None),
         };
 
-        self.state = ListUploadsState::CommitTransaction;
-        self.output = Some(Ok(ListUploadsResult {
+        Next::Done(ListUploadsResult {
             uploads: page.entries,
             common_prefixes: page.prefixes,
             is_truncated: page.truncated,
             next_key_marker,
             next_upload_marker,
-        }));
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListUploadsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
-            });
-        };
-
-        self.state = ListUploadsState::Finish;
-        smallvec![]
+        })
     }
 }
 
@@ -319,68 +202,54 @@ impl Operation for ListUploadsOperation {
     type Output = ListUploadsResult;
     type Error = ListUploadsError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListUploadsError::StorageError(error));
+    fn first(&mut self) -> Step {
+        // Mirror the key listings: max_uploads=0 returns an empty,
+        // non-truncated result instead of truncating without a resume marker.
+        if self.input.max_uploads == 0 {
+            return Ok(Next::Done(ListUploadsResult {
+                uploads: Vec::new(),
+                common_prefixes: Vec::new(),
+                is_truncated: false,
+                next_key_marker: None,
+                next_upload_marker: None,
+            }));
         }
-
-        match self.state {
-            ListUploadsState::Init => self.handle_init(),
-            ListUploadsState::StartTransaction => self.handle_transaction_started(event),
-            ListUploadsState::ReadUploads => self.handle_uploads_read(event),
-            ListUploadsState::CommitTransaction => self.handle_transaction_committed(event),
-            ListUploadsState::Finish | ListUploadsState::Error => smallvec![],
-        }
+        self.upload_round()
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListUploadsState::Finish | ListUploadsState::Error
-        )
+    fn next(&mut self, result: IoResult) -> Step {
+        let (values, next) = result.page()?;
+        self.uploads_read(values, next)
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(ListUploadsError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+    /// The upload pages are read in one snapshot, so a state change between pages never shows.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::BackendRef;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
+    use aruna_test_support::s3::seed_upload;
     use std::time::{Duration, SystemTime};
     use tempfile::tempdir;
 
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
+    impl ListUploadsOperation {
+        fn with_scan_limit(mut self, scan_round_limit: usize) -> Self {
+            self.scan_round_limit = scan_round_limit;
+            self
+        }
+
+        fn with_scan_budget(mut self, max_scan_rows: usize) -> Self {
+            self.max_scan_rows = max_scan_rows;
+            self
         }
     }
 
@@ -414,17 +283,6 @@ mod test {
         }
     }
 
-    async fn seed_upload(storage_handle: &storage::StorageHandle, record: &MultipartUpload) {
-        let _ = storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: UPLOAD_KEYSPACE.to_string(),
-                key: record.upload_id.to_bytes().to_vec().into(),
-                value: record.to_bytes().unwrap().into(),
-                txn_id: None,
-            })
-            .await;
-    }
-
     fn input(bucket: &str, max_uploads: usize) -> ListUploadsInput {
         ListUploadsInput {
             bucket: bucket.to_string(),
@@ -440,8 +298,8 @@ mod test {
     async fn bucket_filters() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -479,8 +337,8 @@ mod test {
     async fn scans_foreign_rounds() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -514,8 +372,8 @@ mod test {
     async fn scan_budget_fails() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a", "b", "c"].into_iter().enumerate() {
             seed_upload(
@@ -538,8 +396,8 @@ mod test {
     async fn sorts_before_cutoff() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -573,8 +431,8 @@ mod test {
     async fn zero_limit_empty() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         seed_upload(
             &storage_handle,
@@ -596,8 +454,8 @@ mod test {
     async fn key_order_stable() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let first = Ulid::generate();
         let second = Ulid::generate();
@@ -641,8 +499,8 @@ mod test {
     async fn orders_same_key() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = {
             let first = Ulid::generate();
@@ -695,8 +553,8 @@ mod test {
     async fn markers_paginate() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a", "b", "c", "d"] {
             seed_upload(
@@ -741,8 +599,8 @@ mod test {
     async fn resumes_same_key() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let ids = [
             Ulid::from_bytes([1; 16]),
@@ -808,8 +666,8 @@ mod test {
     async fn resumes_missing_marker() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let lower = Ulid::from_bytes([1; 16]);
         let marker = Ulid::from_bytes([2; 16]);
@@ -850,8 +708,8 @@ mod test {
     async fn prefix_filters() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["docs/1", "docs/2", "images/1", "readme"] {
             seed_upload(
@@ -887,8 +745,8 @@ mod test {
     async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         for key in ["a.txt", "dir/1", "dir/2", "z.txt"] {
             seed_upload(

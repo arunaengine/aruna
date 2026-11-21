@@ -11,13 +11,13 @@ use aruna_core::keyspaces::NODE_STATS_KEYSPACE;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BlobCleanupWork;
 use aruna_core::structs::storage::replication::ArunaArn;
+use aruna_core::structs::storage::replication_queue::MemberTarget;
+use aruna_core::structs::storage::replication_queue::ReplicateScopeInput;
+use aruna_core::structs::storage::replication_queue::{BlobJobRecord, blob_job_key};
+use aruna_core::structs::storage::replication_queue::{ReferenceAdvance, SyncOrigin};
 use aruna_core::structs::storage::usage::{
     NodeUsageSnapshot, USAGE_GLOBAL_PREFIX, USAGE_GROUP_PREFIX, USAGE_PROGRESS_KEY, UsageCounters,
 };
-use aruna_operations::replication::members::MemberTarget;
-use aruna_operations::replication::protocol::{ReferenceAdvance, SyncOrigin};
-use aruna_operations::replication::queue::{BlobJobRecord, blob_job_key};
-use aruna_operations::replication::version_replication::ReplicateScopeInput;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -270,7 +270,6 @@ mod tests {
     use super::super::migrate_output;
     use super::super::tests::{read, write};
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::keyspaces::{
         BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, COPY_WAIT_KEYSPACE, IRI_INDEX_KEYSPACE,
         PLAINTEXT_COPY_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
@@ -281,10 +280,11 @@ mod tests {
         BackendLocation, BackendRef, CurrentVersionPointer, WriteOwner,
     };
     use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_operations::replication::protocol::ReplicationMode;
-    use aruna_operations::replication::version_replication::{
+    use aruna_core::structs::storage::replication_queue::ReplicationMode;
+    use aruna_core::structs::storage::replication_queue::{
         ReplicateScopeInput, ReplicateScopeTarget,
     };
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use ulid::Ulid;
@@ -403,7 +403,7 @@ mod tests {
             replicate_delete_markers: true,
             mode: ReplicationMode::Live,
         };
-        BlobJobRecord::new(input, None, 5)
+        BlobJobRecord::new(input, None, 5, Ulid::generate())
     }
 
     /// The bytes alpha.200 stored for `job`: the record without its trailing job id.

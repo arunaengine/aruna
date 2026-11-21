@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_operations::device::wipe as device_wipe;
+use aruna_core::device_wipe;
 
 use crate::shutdown::{
     NodeShutdown, ShutdownOutcome, arm_signal_exit, shutdown_grace_env, wait_for_signal,
@@ -301,69 +301,31 @@ async fn run_node_owned(
                 "Required listener {service:?} exited during background startup"
             ));
         }
+        BackgroundOutcome::DiscardFailed => {
+            failure =
+                Some("Stale execution state was not discarded; the next start retries".into());
+        }
     }
 
     let ServerBindings {
         rest_handle,
         s3_handle,
-        mut portal_handle,
-        mut session_s3_handle,
-        mut https_handle,
+        portal_handle,
+        session_s3_handle,
+        https_handle,
         realm_id: _,
         node_id: _,
         is_initial_boot: _,
         device_wipe,
     } = bindings;
-
-    let mut rest_handle = Some(rest_handle);
-    let mut s3_handle = s3_handle;
-
-    // Every long-lived server exit is classified by the one named policy: a
-    // `StopsNode` exit ends serving with its message, a `ReportedOnly` exit is
-    // logged and the node keeps waiting on the remaining servers.
-    loop {
-        let observed = tokio::select! {
-            message = s3_exit(s3_handle.as_mut()) => {
-                Some((Service::S3, message))
-            }
-            result = rest_handle.as_mut().expect("rest server handle is present") => {
-                rest_handle = None;
-                Some((Service::Rest, match result {
-                    Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
-                    Ok(Err(error)) => format!("REST server failed: {error}"),
-                    Err(error) => format!("REST server panicked: {error}"),
-                }))
-            }
-            message = portal_exit(portal_handle.as_mut()) => {
-                portal_handle = None;
-                Some((Service::Portal, message))
-            }
-            message = session_s3_exit(session_s3_handle.as_mut()) => {
-                Some((Service::SessionS3, message))
-            }
-            message = https_exit(https_handle.as_mut()) => {
-                Some((Service::Https, message))
-            }
-            _ = device_wipe_armed(device_wipe.as_ref()) => None,
-            _ = stop_token.cancelled() => None,
-        };
-        let Some((service, message)) = observed else {
-            break;
-        };
-        match exit_effect(service, &message) {
-            Some(_) => {
-                failure = Some(message);
-                break;
-            }
-            None => {
-                tracing::warn!(
-                    service = ?service,
-                    message = %message,
-                    "Server exited; the node keeps serving"
-                );
-            }
-        }
-    }
+    let mut listeners = Listeners {
+        rest: Some(rest_handle),
+        s3: s3_handle,
+        portal: portal_handle,
+        session_s3: session_s3_handle,
+        https: https_handle,
+    };
+    let failure = supervise(&mut listeners, device_wipe.as_ref(), &stop_token, failure).await;
 
     if let Some(failure) = failure.as_ref() {
         tracing::error!(error = %failure, "Shutting down after a server failure");
@@ -377,18 +339,19 @@ async fn run_node_owned(
     let shutdown_outcome = NodeShutdown {
         shutdown: resources.shutdown,
         readiness: resources.readiness,
-        rest: rest_handle,
-        s3: s3_handle,
-        portal: portal_handle,
-        session_s3: session_s3_handle,
-        https: https_handle,
+        rest: listeners.rest,
+        s3: listeners.s3,
+        portal: listeners.portal,
+        session_s3: listeners.session_s3,
+        https: listeners.https,
         monitoring: Some(resources.monitoring),
         task_handle: resources.task_handle,
         jobs_runtime: resources.jobs_runtime,
         net_handle: resources.driver_ctx.net_handle.clone(),
-        metadata_handle: resources.driver_ctx.metadata_handle.clone(),
+        graph_handle: resources.driver_ctx.graph_handle.clone(),
         blob_handle: resources.driver_ctx.blob_handle.clone(),
         storage_handle: resources.driver_ctx.storage_handle.clone(),
+        driver_ctx: resources.driver_ctx.clone(),
         ops: Some(resources.ops_handle),
         grace: shutdown_grace_env(),
     }
@@ -400,7 +363,11 @@ async fn run_node_owned(
     // the owner's wipe erases the roots here, and only a completed sequence may
     // reach the destructive purge.
     if let Some(wipe) = device_wipe.filter(|wipe| wipe.is_armed()) {
-        return Ok(decide_wipe(&wipe, shutdown_complete, device_wipe::purge));
+        return Ok(decide_wipe(
+            &wipe,
+            shutdown_complete,
+            aruna_tasks::wipe::purge,
+        ));
     }
 
     Ok(match (failure, shutdown_complete) {
@@ -408,6 +375,70 @@ async fn run_node_owned(
         (None, true) => ProcessOutcome::Stopped,
         (None, false) => ProcessOutcome::StoppedIncomplete,
     })
+}
+
+/// The long-lived listeners the node supervises once its start has run.
+struct Listeners {
+    rest: Option<tokio::task::JoinHandle<Result<(), aruna_api::error::ServerSetupError>>>,
+    s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    portal: Option<tokio::task::JoinHandle<()>>,
+    session_s3: Option<aruna_api::s3::server::S3ServerHandle>,
+    https: Option<aruna_api::https::listener::HttpsHandle>,
+}
+
+/// Waits until serving ends and answers the failure that ended it. Every long-lived server exit
+/// is classified by the one named policy: a `StopsNode` exit ends serving with its message, a
+/// `ReportedOnly` exit is logged. A start that already failed ends at once, healthy listeners or not.
+async fn supervise(
+    listeners: &mut Listeners,
+    device_wipe: Option<&std::sync::Arc<device_wipe::DeviceWipe>>,
+    stop: &tokio_util::sync::CancellationToken,
+    failure: Option<String>,
+) -> Option<String> {
+    if failure.is_some() {
+        return failure;
+    }
+    loop {
+        let observed = tokio::select! {
+            message = s3_exit(listeners.s3.as_mut()) => {
+                Some((Service::S3, message))
+            }
+            result = listeners.rest.as_mut().expect("rest server handle is present") => {
+                listeners.rest = None;
+                Some((Service::Rest, match result {
+                    Ok(Ok(())) => "REST server stopped unexpectedly".to_string(),
+                    Ok(Err(error)) => format!("REST server failed: {error}"),
+                    Err(error) => format!("REST server panicked: {error}"),
+                }))
+            }
+            message = portal_exit(listeners.portal.as_mut()) => {
+                listeners.portal = None;
+                Some((Service::Portal, message))
+            }
+            message = session_s3_exit(listeners.session_s3.as_mut()) => {
+                Some((Service::SessionS3, message))
+            }
+            message = https_exit(listeners.https.as_mut()) => {
+                Some((Service::Https, message))
+            }
+            _ = device_wipe_armed(device_wipe) => None,
+            _ = stop.cancelled() => None,
+        };
+        let Some((service, message)) = observed else {
+            break;
+        };
+        match exit_effect(service, &message) {
+            Some(_) => return Some(message),
+            None => {
+                tracing::warn!(
+                    service = ?service,
+                    message = %message,
+                    "Server exited; the node keeps serving"
+                );
+            }
+        }
+    }
+    None
 }
 
 /// Decides the armed wipe: an unfinished shutdown declines the destructive
@@ -549,9 +580,10 @@ async fn release_unready(
         task_handle,
         jobs_runtime,
         net_handle: driver_ctx.net_handle.clone(),
-        metadata_handle: driver_ctx.metadata_handle.clone(),
+        graph_handle: driver_ctx.graph_handle.clone(),
         blob_handle: driver_ctx.blob_handle.clone(),
         storage_handle: driver_ctx.storage_handle.clone(),
+        driver_ctx: driver_ctx.clone(),
         ops: Some(ops_handle),
         grace: shutdown_grace_env(),
     }
@@ -562,6 +594,34 @@ async fn release_unready(
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    // A start that failed before serving, such as a discard that did not finish, goes on to the
+    // shutdown at once although every listener is healthy; a start that succeeded keeps waiting.
+    #[tokio::test]
+    async fn failed_start_exits() {
+        use futures_util::FutureExt;
+        let healthy = || Listeners {
+            rest: Some(tokio::spawn(std::future::pending())),
+            s3: None,
+            portal: None,
+            session_s3: None,
+            https: None,
+        };
+        let stop = tokio_util::sync::CancellationToken::new();
+        let failure = Some("Stale execution state was not discarded".to_string());
+        let mut failed = healthy();
+        let ended = supervise(&mut failed, None, &stop, failure.clone()).now_or_never();
+        assert_eq!(ended, Some(failure));
+        let mut serving = healthy();
+        assert!(
+            supervise(&mut serving, None, &stop, None)
+                .now_or_never()
+                .is_none()
+        );
+        for listeners in [failed, serving] {
+            listeners.rest.expect("the listener is kept").abort();
+        }
+    }
 
     #[test]
     fn supervision_policies() {
@@ -921,7 +981,7 @@ mod tests {
         assert!(signals.escalation_action.is_none());
     }
 
-    fn startup_settings(path: &str) -> crate::settings::Settings {
+    fn startup_settings(path: &str) -> aruna_config::settings::Settings {
         let map: std::collections::BTreeMap<String, String> = [
             ("DATABASE_DIR".to_string(), path.to_string()),
             ("SOCKET_ADDRESS".to_string(), "127.0.0.1:0".to_string()),
@@ -933,7 +993,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        crate::settings::read_settings_from(&map).expect("settings parse")
+        aruna_config::settings::read_settings_from(&map).expect("settings parse")
     }
 
     /// A tracked timer handler that holds the production task drain at its
@@ -1002,7 +1062,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let settings = startup_settings(&path);
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_tasks::TaskHandle::new();
 
         // The tracked handler blocks the real tasks-phase join that cleanup
@@ -1088,7 +1148,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let settings = startup_settings(&path);
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_tasks::TaskHandle::new();
 
         let mut checkpoint = |stage: StartupStage| -> Result<(), Box<dyn std::error::Error>> {
@@ -1188,8 +1248,8 @@ mod tests {
     /// The same minimal owner set as the shutdown-module helper, so the
     /// mapping test runs a real `NodeShutdown` sequence.
     fn node_shutdown(
-        shutdown: aruna_core::shutdown::Shutdown,
-        storage_handle: aruna_storage::StorageHandle,
+        shutdown: aruna_tasks::shutdown::Shutdown,
+        storage_handle: aruna_storage::storage::handle::StorageHandle,
         grace: std::time::Duration,
     ) -> NodeShutdown {
         NodeShutdown {
@@ -1202,9 +1262,12 @@ mod tests {
             https: None,
             monitoring: None,
             task_handle: aruna_tasks::TaskHandle::new(),
-            jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
+            jobs_runtime: aruna_drivers::jobs::runtime::JobsRuntime::new(),
+            driver_ctx: std::sync::Arc::new(aruna_drivers::driver::DriverContext::storage_only(
+                storage_handle.clone(),
+            )),
             net_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             blob_handle: None,
             storage_handle,
             ops: None,
@@ -1218,12 +1281,13 @@ mod tests {
     #[tokio::test]
     async fn cancellation_requires_cleanup() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage_handle =
-            aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
-                .expect("storage opens");
+        let storage_handle = aruna_storage::storage::worker::FjallStorage::open(
+            dir.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
 
         let complete = node_shutdown(
-            aruna_core::shutdown::Shutdown::new(),
+            aruna_tasks::shutdown::Shutdown::new(),
             storage_handle.clone(),
             crate::shutdown::MIN_SHUTDOWN_GRACE,
         )
@@ -1235,7 +1299,7 @@ mod tests {
             ProcessOutcome::StartupCancelled
         );
 
-        let shutdown = aruna_core::shutdown::Shutdown::new();
+        let shutdown = aruna_tasks::shutdown::Shutdown::new();
         shutdown.spawn(std::future::pending());
         let incomplete = node_shutdown(
             shutdown,
@@ -1263,7 +1327,7 @@ mod tests {
         let wipe = device_wipe::DeviceWipe::new(vec![root.path().to_path_buf()], Vec::new());
 
         assert_eq!(
-            decide_wipe(&wipe, false, device_wipe::purge),
+            decide_wipe(&wipe, false, aruna_tasks::wipe::purge),
             ProcessOutcome::WipeIncomplete
         );
         assert!(
@@ -1272,7 +1336,7 @@ mod tests {
         );
 
         assert_eq!(
-            decide_wipe(&wipe, true, device_wipe::purge),
+            decide_wipe(&wipe, true, aruna_tasks::wipe::purge),
             ProcessOutcome::WipeComplete
         );
         assert!(

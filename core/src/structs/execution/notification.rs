@@ -2,17 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 use byteview::ByteView;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
+use crate::effects::Effect;
 use crate::errors::ConversionError;
-use crate::structs::execution::notification_watch::WatchAuthorizationBinding;
+use crate::id::NodeId;
+use crate::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+};
 use crate::structs::identity::realm::RealmId;
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
 
 pub const DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 pub const TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -254,13 +260,14 @@ impl NotificationRecord {
     }
 
     pub fn new(
+        notification_id: Ulid,
         recipient: UserId,
         class: NotificationClass,
         kind: NotificationKind,
         created_at_ms: u64,
     ) -> Self {
         Self {
-            notification_id: Ulid::generate(),
+            notification_id,
             recipient,
             class,
             kind,
@@ -420,6 +427,131 @@ pub fn notification_outbox_key(outbox_id: Ulid) -> Key {
     ByteView::from(outbox_id.to_bytes())
 }
 
+/// One request to the notification holder `node`, answered by one frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotificationRequest {
+    pub node: NodeId,
+    pub message: NotificationTransportMessage,
+}
+
+/// Bytes of one request or answer frame.
+pub const MAX_NOTIFICATION_SIZE: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NotificationTransportMessage {
+    DeliverBatch {
+        records: Vec<NotificationRecord>,
+    },
+    DeliverAck {
+        written: u32,
+    },
+    List {
+        recipient: UserId,
+        cursor: Option<Vec<u8>>,
+        limit: u32,
+    },
+    ListResult {
+        records: Vec<NotificationRecord>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    UnreadCount {
+        recipient: UserId,
+    },
+    UnreadCountResult {
+        count: u32,
+        capped: bool,
+    },
+    MarkRead {
+        recipient: UserId,
+        ids: Vec<Ulid>,
+        up_to_ms: Option<u64>,
+    },
+    MarkReadResult {
+        marked: u32,
+    },
+    Reject(String),
+    CreateWatch {
+        owner: UserId,
+        path_prefix: String,
+        event_mask: WatchEventMask,
+        authorization: WatchAuthorizationBinding,
+    },
+    WatchCreated {
+        subscription: WatchSubscription,
+    },
+    DeleteWatch {
+        owner: UserId,
+        watch_id: Ulid,
+    },
+    WatchDeleted,
+    ListWatches {
+        owner: UserId,
+    },
+    WatchList {
+        subscriptions: Vec<WatchSubscription>,
+    },
+    DeliverWatchEvents {
+        events: Vec<WatchEvent>,
+    },
+    WatchEventsAck {
+        written: u32,
+    },
+    /// The holder could not take the request now and stored nothing; the sender keeps it and
+    /// tries again later, unlike after a `Reject`.
+    Unavailable(String),
+}
+
+impl NotificationTransportMessage {
+    pub fn label(&self) -> &'static str {
+        match self {
+            NotificationTransportMessage::DeliverBatch { .. } => "deliver_batch",
+            NotificationTransportMessage::DeliverAck { .. } => "deliver_ack",
+            NotificationTransportMessage::List { .. } => "list",
+            NotificationTransportMessage::ListResult { .. } => "list_result",
+            NotificationTransportMessage::UnreadCount { .. } => "unread_count",
+            NotificationTransportMessage::UnreadCountResult { .. } => "unread_count_result",
+            NotificationTransportMessage::MarkRead { .. } => "mark_read",
+            NotificationTransportMessage::MarkReadResult { .. } => "mark_read_result",
+            NotificationTransportMessage::Reject(_) => "reject",
+            NotificationTransportMessage::CreateWatch { .. } => "create_watch",
+            NotificationTransportMessage::WatchCreated { .. } => "watch_created",
+            NotificationTransportMessage::DeleteWatch { .. } => "delete_watch",
+            NotificationTransportMessage::WatchDeleted => "watch_deleted",
+            NotificationTransportMessage::ListWatches { .. } => "list_watches",
+            NotificationTransportMessage::WatchList { .. } => "watch_list",
+            NotificationTransportMessage::DeliverWatchEvents { .. } => "deliver_watch_events",
+            NotificationTransportMessage::WatchEventsAck { .. } => "watch_events_ack",
+            NotificationTransportMessage::Unavailable(_) => "unavailable",
+        }
+    }
+}
+
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
+/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
+/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxWriteOutcome {
+    pub written: usize,
+    pub recipients: Vec<UserId>,
+    pub purged: usize,
+    pub cutoffs: usize,
+    /// Batch records the inbox holds after the write, new or already present, never discarded.
+    pub held: Vec<NotificationRecord>,
+}
+
+/// The outbox row of one notification record.
+pub fn new_outbox_record(outbox_id: Ulid, record: NotificationRecord) -> NotificationOutboxRecord {
+    NotificationOutboxRecord { outbox_id, record }
+}
+
+/// Arms the notification outbox drain now.
+pub fn schedule_drain_effect() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainNotificationOutbox,
+        after: Duration::ZERO,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,7 +698,13 @@ mod tests {
                 actor_user_id: user(1, 6),
             },
         ] {
-            let record = NotificationRecord::new(recipient, NotificationClass::Direct, kind, 1234);
+            let record = NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                1234,
+            );
             let bytes = record.to_bytes().unwrap();
             assert_eq!(NotificationRecord::from_bytes(&bytes).unwrap(), record);
         }
@@ -621,8 +759,20 @@ mod tests {
     fn prune_index_expiry() {
         let r = user(1, 2);
         let t = 1_000_000u64;
-        let transient = NotificationRecord::new(r, NotificationClass::Transient, added(3), t);
-        let direct = NotificationRecord::new(r, NotificationClass::Direct, added(3), t);
+        let transient = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Transient,
+            added(3),
+            t,
+        );
+        let direct = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            t,
+        );
         let kt = notification_prune_key(&transient);
         let kd = notification_prune_key(&direct);
         assert!(kt < kd);
@@ -656,7 +806,13 @@ mod tests {
     #[test]
     fn write_entries_index() {
         let r = user(1, 2);
-        let record = NotificationRecord::new(r, NotificationClass::Direct, added(3), 1000);
+        let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            1000,
+        );
 
         let writes = inbox_write_entries(&record).unwrap();
         assert_eq!(writes.len(), 2);
@@ -690,6 +846,7 @@ mod tests {
     #[test]
     fn expires_at_saturates() {
         let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
             user(1, 2),
             NotificationClass::Direct,
             NotificationKind::NodeOnboarded {
@@ -801,6 +958,7 @@ mod tests {
             size_bytes: 1,
         };
         let deleted = NotificationRecord::new(
+            ulid::Ulid::generate(),
             recipient,
             NotificationClass::Direct,
             NotificationKind::BucketDeleted {
@@ -811,7 +969,13 @@ mod tests {
             100,
         );
         let notice = |recipient, kind, at| {
-            NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
         };
         assert!(deleted.purges(&notice(recipient, upload("raw", node_id), 100)));
         // Later notices belong to a new bucket of the name; others name another bucket or user.

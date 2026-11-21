@@ -5,11 +5,21 @@
 // Every member node counts its own member bucket in its usage totals, so a realm or group sum of
 // node totals holds a distributed bucket once per member; these counts take that back out.
 
-use aruna_core::structs::storage::distribution::{DistributionSnapshot, MemberState};
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::keyspaces::DISTRIBUTION_KEYSPACE;
+use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
+use aruna_core::structs::storage::distribution::MemberState;
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView,
+};
 use aruna_core::types::GroupId;
+use thiserror::Error;
 
-use crate::distribution::resolve::scan_sets;
-use crate::driver::DriverContext;
+/// At most this many distribution records are read by one scan of this node's records.
+pub(crate) const MAX_SETS: usize = 4096;
+/// Distribution records one page reads.
+const PAGE: usize = 256;
 
 /// The distributed buckets in a bucket total, and the member buckets their nodes count.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -40,39 +50,86 @@ impl SetCounts {
             complete: true,
             ..Self::default()
         };
-        for snapshot in snapshots {
-            let deleted =
-                (snapshot.lifecycle.deletion.as_ref()).is_some_and(|deletion| deletion.committed);
-            let members = (snapshot.config.members.iter())
-                .filter(|member| member.state != MemberState::Failed)
-                .count() as u64;
-            if members == 0 {
-                continue;
-            }
-            if deleted {
-                counts.deleting += 1;
-                continue;
-            }
-            counts.sets += 1;
-            counts.members += members;
-        }
+        snapshots
+            .into_iter()
+            .for_each(|snapshot| counts.add(snapshot));
         counts
+    }
+
+    fn add(&mut self, snapshot: &DistributionSnapshot) {
+        let deleted =
+            (snapshot.lifecycle.deletion.as_ref()).is_some_and(|deletion| deletion.committed);
+        let members = (snapshot.config.members.iter())
+            .filter(|member| member.state != MemberState::Failed)
+            .count() as u64;
+        if members == 0 {
+            return;
+        }
+        if deleted {
+            self.deleting += 1;
+            return;
+        }
+        self.sets += 1;
+        self.members += members;
     }
 }
 
-/// The counts of every set this node holds a record of, or of one owner group's sets.
-pub async fn set_counts(
-    context: &DriverContext,
+/// The counts of every set this node holds a record of, or of one owner group's sets. Reads
+/// the records page by page; more than [`MAX_SETS`] records leave the counts incomplete.
+#[derive(Debug, PartialEq)]
+pub struct SetCountsOperation {
     group: Option<GroupId>,
-) -> Result<SetCounts, String> {
-    let keep = |snapshot: &DistributionSnapshot| {
-        group.is_none_or(|group| snapshot.config.owner_group == group)
-    };
-    let (snapshots, dropped) = scan_sets(context, keep, usize::MAX).await?;
-    Ok(SetCounts {
-        complete: !dropped,
-        ..SetCounts::of(&snapshots)
-    })
+    counts: SetCounts,
+    seen: usize,
+    pages: PrefixPages,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum CountsError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
+impl SetCountsOperation {
+    pub fn new(group: Option<GroupId>) -> Self {
+        Self {
+            group,
+            counts: SetCounts {
+                complete: true,
+                ..SetCounts::default()
+            },
+            seen: 0,
+            pages: PrefixPages::new(DISTRIBUTION_KEYSPACE, Vec::new(), PAGE),
+        }
+    }
+}
+
+impl Operation for SetCountsOperation {
+    type Output = SetCounts;
+    type Error = CountsError;
+
+    fn first(&mut self) -> Result<Next<SetCounts>, CountsError> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<SetCounts>, CountsError> {
+        let values = self.pages.take(result)?;
+        self.seen += values.len();
+        // An unreadable record is skipped, as every reader of the records does.
+        let views =
+            (values.iter()).filter_map(|(_, value)| DistributionView::from_bytes(value).ok());
+        for view in views {
+            let snapshot = view.snapshot();
+            if (self.group).is_none_or(|group| snapshot.config.owner_group == group) {
+                self.counts.add(snapshot);
+            }
+        }
+        if !self.pages.done() && self.seen < MAX_SETS {
+            return Ok(Next::Call(self.pages.call()));
+        }
+        self.counts.complete = self.pages.done();
+        Ok(Next::Done(self.counts))
+    }
 }
 
 #[cfg(test)]

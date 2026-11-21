@@ -23,22 +23,20 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_core::structs::storage::distribution::{
-    DistributionSettings, DistributionSnapshot, OriginalEpoch, Publication,
-};
+use aruna_core::structs::storage::distribution::delivery::Publication;
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::{DistributionSettings, OriginalEpoch};
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::TempDir;
 use ulid::Ulid;
 
 use super::*;
-use crate::distribution::test_record::{
-    binding, member, realm, replicated, secret, store_record, with_settings,
-};
+use crate::distribution::test_record::{binding, member, realm, replicated, secret, with_settings};
 use crate::distribution::test_store::{context, install, open};
-use crate::driver::drive;
-use crate::replication::protocol::VersionReplicationManifest;
+use aruna_core::replication_protocol::VersionReplicationManifest;
+use aruna_drivers::driver::drive;
 
 struct Member {
     _dir: TempDir,
@@ -51,7 +49,13 @@ struct Member {
 async fn member_two(policies: bool) -> Member {
     let (dir, handle) = open();
     let (snapshot, bytes) = replicated(true, 1);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     install(&handle, snapshot.set_id(), &snapshot.config.ranges).await;
     let mut bucket = BucketInfo {
         group_id: snapshot.config.owner_group,
@@ -251,10 +255,25 @@ async fn applies_page_once() {
 
 /// The object keys of the uploads this node journaled, in journal order.
 async fn journaled(handle: &StorageHandle) -> Vec<String> {
-    let rows =
-        crate::storage_read::scan_all(handle, EVENT_JOURNAL_KEYSPACE, Some(b"j".to_vec().into()))
-            .await
-            .unwrap();
+    let (mut rows, mut after) = (Vec::new(), None);
+    loop {
+        let prefix = Some(b"j".to_vec().into());
+        let (page, next) = aruna_storage::scan::iter_prefix_page(
+            handle,
+            EVENT_JOURNAL_KEYSPACE,
+            prefix,
+            after.take(),
+            256,
+            None,
+        )
+        .await
+        .unwrap();
+        rows.extend(page);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
     let mut keys: Vec<String> = (rows.iter())
         .map(|(_, value)| SourceEvent::from_bytes(value).unwrap())
         .map(|event| {
@@ -299,7 +318,13 @@ async fn feeds_searched_sets() {
         ..DistributionSettings::default()
     };
     let (snapshot, bytes) = with_settings(true, 1, settings);
-    store_record(&member.handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &member.handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let second = record("b", 2, 1, &member.publication);
     let answer = apply(&member, page(&member, vec![second]), 1).await;
     assert!(matches!(answer, PageAnswer::Applied { applied: 1, .. }));

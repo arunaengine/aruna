@@ -9,11 +9,12 @@ use thiserror::Error;
 use ulid::Ulid;
 use url::Url;
 
-use crate::UserId;
+use crate::calls::IoError;
 use crate::federation::{FederationError, RealmDescriptor, Signable, Signed, valid_federation_url};
 use crate::handoff::{HANDOFF_SKEW_SECS, descriptor_digest, secret_nonce};
 use crate::structs::identity::realm::RealmId;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 pub const INTENT_DOMAIN: &str = "aruna-import-intent-v1";
 pub const GRANT_DOMAIN: &str = "aruna-export-grant-v1";
@@ -229,6 +230,56 @@ pub fn check_issued(
         return Err(TransferError::Unbound);
     }
     check_lifetime(grant.payload.issued_at, grant.payload.expires_at, now)
+}
+
+/// The node-local record beside a finished export job that its grant is checked against.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantRecord {
+    pub grant: Signed<ExportGrant>,
+    pub principal: UserId,
+    pub document_path: String,
+    pub with_files: bool,
+    pub sources: Vec<PinnedSource>,
+    pub revoked: bool,
+}
+
+/// A selected file version read on this node, rechecked on every artifact read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PinnedSource {
+    pub bucket: String,
+    pub key: String,
+    pub path: String,
+    pub version_id: Ulid,
+    pub blake3: [u8; 32],
+    pub size: u64,
+    /// The bucket key generation of an encrypted version.
+    pub key_ref: Option<crate::structs::storage::encryption::BucketKeyRef>,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum GrantError {
+    #[error("the export is not finished or left out a selected file")]
+    Unfinished,
+    #[error("no grant was issued for this export")]
+    Missing,
+    #[error("the grant was revoked")]
+    Revoked,
+    #[error("the export is no longer allowed")]
+    Denied,
+    #[error("only a current key holder of the encrypted bucket `{0}` may export its files")]
+    NotHolder(String),
+    #[error(transparent)]
+    Transfer(#[from] TransferError),
+    #[error(transparent)]
+    Sign(#[from] FederationError),
+    #[error("grant storage failed: {0}")]
+    Storage(String),
+}
+
+impl From<IoError> for GrantError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.to_string())
+    }
 }
 
 #[cfg(test)]

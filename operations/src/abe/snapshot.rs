@@ -4,8 +4,9 @@
 
 use super::*;
 use crate::auth::permission_rules::{CollectedRole, PermissionRules};
-use crate::auth::request_policy::{PolicyRequestExtras, policy_request, policy_request_with};
-use aruna_core::request_policy::{CompiledPolicySet, RequestPolicy};
+use aruna_core::request_policy::{
+    CompiledPolicySet, PolicyRequestExtras, RequestPolicy, policy_request, policy_request_with,
+};
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
@@ -21,17 +22,14 @@ pub(super) struct Snapshot {
     pub revisions: Vec<[u8; 32]>,
     pub rules: PermissionRules,
     pub holder: bool,
-    pub holders: std::collections::BTreeSet<aruna_core::UserId>,
+    pub holders: std::collections::BTreeSet<aruna_core::user::id::UserId>,
     pub policies: bool,
     pub due: bool,
     /// The realm and group CEL policies each enumerated write is checked against.
     pub checks: [Vec<RequestPolicy>; 2],
 }
 impl KeyOperation {
-    pub(super) fn snapshot_read(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-    ) -> Result<(), KeyError> {
+    pub(super) fn snapshot_read(&mut self, values: Vec<Option<Value>>) -> Result<(), KeyError> {
         if !matches!(values.len(), 8 | 9) {
             return Err(AbeError::Context.into());
         }
@@ -46,10 +44,10 @@ impl KeyOperation {
         // Without a local user row the account status is unknown, so the grant waits and retries.
         // Users of another realm have no row here; their cutoff below still applies.
         let local = self.recipient().realm_id == self.auth.realm_id;
-        if issues && local && values[7].1.is_none() {
+        if issues && local && values[7].is_none() {
             return Err(KeyError::Storage);
         }
-        let bytes = |index: usize| values[index].1.as_deref().ok_or(KeyError::Missing);
+        let bytes = |index: usize| values[index].as_deref().ok_or(KeyError::Unprepared);
         let realm =
             RealmAuthorizationDocument::from_bytes(bytes(0)?).map_err(|_| AbeError::Context)?;
         let group =
@@ -74,14 +72,13 @@ impl KeyOperation {
         let admin = holders.contains(&self.auth.user_id);
         holders.insert(info.created_by);
         let explicit = values[6]
-            .1
             .as_ref()
             .map(|v| BucketHolder::from_bytes(v))
             .transpose()
             .map_err(|_| AbeError::Context)?
             .is_some_and(|h| h.user_id == self.auth.user_id && h.origin == HolderOrigin::Explicit);
         let recipient = self.recipient();
-        let user = values[7].1.as_deref().map(User::from_bytes).transpose();
+        let user = values[7].as_deref().map(User::from_bytes).transpose();
         let deactivated = user
             .map_err(|_| AbeError::Context)?
             .is_some_and(|u| u.is_deactivated());
@@ -119,7 +116,7 @@ impl KeyOperation {
             PermissionRules::from_roles(roles, restrictions).map_err(|_| KeyError::Denied)?;
         let revisions = values[..3]
             .iter()
-            .map(|(_, v)| *blake3::hash(v.as_deref().unwrap_or_default()).as_bytes())
+            .map(|v| *blake3::hash(v.as_deref().unwrap_or_default()).as_bytes())
             .collect();
         let policies = config
             .request_policies
@@ -134,7 +131,7 @@ impl KeyOperation {
             holder: info.created_by == self.auth.user_id || admin || explicit,
             holders,
             policies,
-            due: values.get(8).is_some_and(|(_, v)| v.is_some()),
+            due: values.get(8).is_some_and(Option::is_some),
             checks: [config.request_policies.clone(), group.policies.clone()],
         });
         Ok(())
@@ -266,7 +263,7 @@ impl KeyOperation {
             &self.bucket,
         ))
     }
-    pub(super) fn recipient(&self) -> aruna_core::UserId {
+    pub(super) fn recipient(&self) -> aruna_core::user::id::UserId {
         match &self.action {
             KeyAction::Publish(grant) => grant.context.request.recipient_user,
             KeyAction::Member(user) => *user,

@@ -3,26 +3,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::forwarded_auth_token;
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::VaultQuery;
 use aruna_core::errors::StorageError;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::user::vault::{
-    MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultRecordError, VaultRecords, VaultRevision,
+    MAX_PREDECESSORS, MAX_VAULT_BYTES, VaultAppended, VaultChange, VaultRecordError, VaultRecords,
+    VaultRefusal, VaultRevision,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::users::vault_read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_operations::users::vault_route::{VaultRefusal, VaultRouteError, append_vault_routed};
-use aruna_operations::users::vault_write::{
-    AppendVaultConfig, AppendVaultError, VaultAppended, VaultChange,
-};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::drive;
+use aruna_operations::forward::routing::HolderWriteError;
+use aruna_operations::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use aruna_operations::users::vault::route::{AppendRoutedOperation, VaultRouteError};
+use aruna_operations::users::vault::write::{AppendVaultConfig, AppendVaultError};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -91,7 +91,7 @@ fn map_read_error(error: ReadVaultError) -> ServerError {
         | ReadVaultError::RealmConfigMissing => {
             ServerError::ServiceUnavailableReason("vault_unavailable".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -113,8 +113,8 @@ fn map_route_error(error: VaultRouteError) -> ServerError {
         VaultRouteError::Append(AppendVaultError::Storage(StorageError::TransactionConflict)) => {
             ServerError::Conflict("the vault is being written concurrently; retry".to_string())
         }
-        VaultRouteError::Forward(MetadataWriteError::Unauthorized) => ServerError::Unauthorized,
-        VaultRouteError::Forward(MetadataWriteError::Forbidden) => ServerError::Forbidden,
+        VaultRouteError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
+        VaultRouteError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
         VaultRouteError::Forward(_)
         | VaultRouteError::Append(
             AppendVaultError::PlacementResolve(_)
@@ -122,7 +122,7 @@ fn map_route_error(error: VaultRouteError) -> ServerError {
             | AppendVaultError::PlacementFenced
             | AppendVaultError::RealmConfigMissing,
         ) => ServerError::ServiceUnavailableReason("vault_unavailable".to_string()),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -150,11 +150,14 @@ pub(super) async fn append(
         user_id: auth.user_id,
         record_id: Ulid::generate(),
         change,
-        now_ms: aruna_core::time::unix_timestamp_millis(),
+        now_ms: aruna_clock::unix_timestamp_millis(),
     };
-    append_vault_routed(&state.get_ctx(), config, auth_token)
-        .await
-        .map_err(map_route_error)
+    drive(
+        AppendRoutedOperation::new(config, auth_token),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_route_error)
 }
 
 pub(super) async fn read(
@@ -208,7 +211,6 @@ refused. The vault is self-scoped, so a caller reaches only their own.
                     "updated_at": "2026-10-01T12:30:00Z"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 503, description = "No vault holder answered", body = ErrorResponse)
     ),
@@ -216,16 +218,15 @@ refused. The vault is self-scoped, so a caller reaches only their own.
 )]
 pub async fn get_vault(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
 ) -> ServerResult<(StatusCode, Json<VaultResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let auth_token = forwarded_auth_token(bearer_token)?;
     let heads = match read(&state, auth.user_id, VaultQuery::Heads { auth_token }).await? {
         VaultRecords::Heads(heads) => heads,
         VaultRecords::Keys(_) => {
             return Err(ServerError::InternalError(
-                "vault read answered key records".to_string(),
+                "vault read answered key records".to_string().into(),
             ));
         }
     };
@@ -273,7 +274,6 @@ refused. The vault is self-scoped, so a caller writes only their own.
                 }]
             })),
         (status = 400, description = "A predecessor is not a revision id, or there are too many", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 409, description = "The holder lost a concurrent write; retry", body = ErrorResponse),
         (status = 413, description = "The payload exceeds 64 KiB", body = ErrorResponse),
@@ -283,11 +283,10 @@ refused. The vault is self-scoped, so a caller writes only their own.
 )]
 pub async fn put_vault(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<SaveVaultRequest>,
 ) -> ServerResult<(StatusCode, Json<VaultResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if request.payload.len() > MAX_VAULT_BYTES {
         return Err(ServerError::PayloadTooLarge(
             "a vault payload may hold at most 64 KiB".to_string(),
@@ -301,7 +300,7 @@ pub async fn put_vault(
     match append(&state, &auth, auth_token, change).await? {
         VaultAppended::Heads(heads) => Ok((StatusCode::OK, Json(vault_response(heads)))),
         VaultAppended::Key(_) => Err(ServerError::InternalError(
-            "vault save answered a key record".to_string(),
+            "vault save answered a key record".to_string().into(),
         )),
     }
 }
@@ -322,7 +321,6 @@ refused. The vault is self-scoped, so a caller deletes only their own.
 - Deleting a vault that is not there, or one already deleted, answers 204 without a write."#,
     responses(
         (status = 204, description = "The vault is deleted or was never there"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 503, description = "No vault holder accepted the delete", body = ErrorResponse)
     ),
@@ -330,10 +328,9 @@ refused. The vault is self-scoped, so a caller deletes only their own.
 )]
 pub async fn delete_vault(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let auth_token = forwarded_auth_token(bearer_token)?;
     append(&state, &auth, auth_token, VaultChange::Delete).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -342,14 +339,16 @@ pub async fn delete_vault(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use crate::tests::routes::{test_context, test_state, test_storage, write_doc};
+    use crate::tests::routes::{test_state, test_storage, write_doc};
     use crate::tests::users::{realm_auth, setup_state};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_drivers::testing::test_context;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use axum::response::IntoResponse;
     use tempfile::TempDir;
 
@@ -415,7 +414,7 @@ pub(super) mod tests {
     ) -> Result<Vec<VaultHead>, StatusCode> {
         get_vault(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
         )
         .await
@@ -435,7 +434,7 @@ pub(super) mod tests {
         };
         put_vault(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
             Json(request),
         )
@@ -450,7 +449,7 @@ pub(super) mod tests {
     ) -> Result<StatusCode, StatusCode> {
         delete_vault(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Extension(None),
         )
         .await
@@ -572,19 +571,10 @@ pub(super) mod tests {
     async fn requires_unrestricted_token() {
         let (state, _dir, mut auth) = vault_realm(true).await;
         auth.path_restrictions = Some(Vec::new());
-        assert_eq!(
-            read_heads(&state, &auth).await.unwrap_err(),
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            save(&state, &auth, "sealed", &[]).await.unwrap_err(),
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            delete(&state, &auth).await.unwrap_err(),
-            StatusCode::FORBIDDEN
-        );
-        let missing = get_vault(State(state.clone()), Extension(None), Extension(None)).await;
-        assert_eq!(status(missing.unwrap_err()), StatusCode::UNAUTHORIZED);
+        // The vault routes take `UnrestrictedAuth`, so these refusals are the extractor's.
+        let delegated = crate::auth::extract::<UnrestrictedAuth>(&state, Some(auth)).await;
+        assert_eq!(delegated.err(), Some(StatusCode::FORBIDDEN));
+        let missing = crate::auth::extract::<UnrestrictedAuth>(&state, None).await;
+        assert_eq!(missing.err(), Some(StatusCode::UNAUTHORIZED));
     }
 }

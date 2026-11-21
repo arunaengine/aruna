@@ -3,50 +3,51 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::jobs::{
     JobRequestError, MAX_OUTPUT_PREFIXES, mount_permission_path, native_input, native_outputs,
     output_buckets, validate_output_prefixes, workspace_request,
 };
-use aruna_core::UserId;
-use aruna_core::id::NodeId;
+use crate::tests::execution::{auth_for, build_state, management_state, node_id, realm};
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{
-    ArtifactRef, ExportOmissionCounts, ExportRoCrateResult, ExportRoCrateSpec,
-    ImportMetadataTarget, ImportReportDetail, ImportRoCrateResult, ImportRoCrateSource,
-    ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, JobProgress, JobResultPayload, ReasonCode,
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    ArtifactRef, CollisionPolicy, ComputeResources, ExecutionSpec, ExportOmissionCounts,
+    ExportRoCrateResult, ExportRoCrateSpec, ImportMetadataTarget, ImportRoCrateResult,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, OutputDestination,
     RoCrateLimits,
 };
-use aruna_core::structs::execution::job::{
-    CollisionPolicy, ComputeResources, ExecutionSpec, OutputDestination, WorkspaceMode,
+use aruna_core::structs::execution::job::local::{
+    JobProgress, JobRecord, JobResultPayload, WorkspaceMode,
 };
-use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction, Permission};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
-use aruna_operations::driver::DriverContext;
+use aruna_core::user::id::UserId;
 use aruna_operations::jobs::command::{
     ExecutionInput, ExecutionOutput, InputMode, WorkspaceMode as CommandWorkspaceMode,
     WorkspaceSpec,
 };
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, claim_job, complete_job, insert_job, put_job_entry, transition_to_running,
-};
-use aruna_storage::FjallStorage;
+use aruna_operations::jobs::lifecycle::report::FamilyReport;
+use aruna_operations::jobs::store::job_calls::ClaimOutcome;
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{claim_job, complete_job, transition_to_running};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use std::collections::HashMap;
 use std::time::SystemTime;
-use tempfile::TempDir;
 use ulid::Ulid;
 
 /// One reduced family with a duplicate success and a locally exhausted view.
 fn family_report_fixture() -> FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec,
-        LogicalJobState, OutputObject, SubmissionId,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+        SubmissionId,
     };
+    use aruna_core::structs::execution::job::input::ExecutionSpec;
+    use aruna_core::structs::execution::job::local::OutputObject;
     use aruna_core::structs::placement::record::PlacementRef;
 
     let created_by = user(2);
@@ -69,8 +70,9 @@ fn family_report_fixture() -> FamilyReport {
         command: vec!["true".to_string()],
         workdir: None,
         env: BTreeMap::new(),
-        resources: aruna_core::structs::execution::job::ComputeResources::default(),
+        resources: aruna_core::structs::execution::job::input::ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -85,6 +87,7 @@ fn family_report_fixture() -> FamilyReport {
             state: JobState::Indeterminate,
             attempts: 2,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             finished_at_ms: None,
@@ -106,7 +109,7 @@ fn family_report_fixture() -> FamilyReport {
             group_id: payload.group_id,
             created_by,
             created_at_ms: 10,
-            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
             payload,
             request_digest: [7u8; 32],
             spec_digest: [8u8; 32],
@@ -219,35 +222,12 @@ fn reads_without_endpoint() {
     assert!(response.outputs[0].endpoint_url.is_none());
 }
 
-fn realm() -> RealmId {
-    RealmId([1u8; 32])
-}
-
-fn node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[7u8; 32]).public()
-}
-
 fn user(byte: u8) -> UserId {
     UserId::new(Ulid::from_bytes([byte; 16]), realm())
 }
 
 fn job_id(timestamp_ms: u64) -> JobId {
-    JobId::from_parts(
-        timestamp_ms,
-        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-        BucketId::new(0).unwrap(),
-        0,
-    )
-    .unwrap()
-}
-
-fn auth_for(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
+    aruna_core::testing::job_at(timestamp_ms, 0)
 }
 
 fn restricted_auth_for(user_id: UserId) -> Option<AuthContext> {
@@ -260,30 +240,6 @@ fn restricted_auth_for(user_id: UserId) -> Option<AuthContext> {
         }]),
         session: None,
     })
-}
-
-async fn build_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    });
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        NodeCapabilities::user_node(realm()).unwrap(),
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
 }
 
 fn job_for(job_id: JobId, owner: UserId, created_at_ms: u64) -> JobRecord {
@@ -333,27 +289,12 @@ fn import_job(job_id: JobId, owner: UserId) -> JobRecord {
 }
 
 fn report_row(entry_key: &str) -> ImportReportRow {
-    ImportReportRow {
-        entry_key: entry_key.to_string(),
-        code: ReasonCode::Imported,
-        message: None,
-        detail: ImportReportDetail {
-            archive_path: entry_key.to_string(),
-            target_key: Some(entry_key.to_string()),
-            version_id: None,
-            blake3: None,
-            size: None,
-            arn: None,
-            w3id: None,
-            validation: None,
-        },
-    }
+    aruna_core::testing::report_row(entry_key)
 }
 
 #[test]
 fn decodes_session_report() {
-    use aruna_core::structs::execution::job::{SessionReportDetail, SessionReportRow};
-
+    use aruna_core::structs::execution::job::input::{SessionReportDetail, SessionReportRow};
     let row = SessionReportRow {
         entry_key: "input/0000".to_string(),
         detail: SessionReportDetail::Input {
@@ -451,26 +392,26 @@ fn export_job(job_id: JobId, owner: UserId, expires_at_ms: u64) -> JobRecord {
 
 async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8; 32] {
     let context = state.get_ctx();
-    let storage = &context.storage_handle;
-    insert_job(storage, &import_job(job_id, owner))
+    insert_job(&context, &import_job(job_id, owner))
         .await
         .unwrap();
-    let ClaimOutcome::Claimed(record) = claim_job(storage, job_id, node_id(), 2_000).await.unwrap()
+    let ClaimOutcome::Claimed(record) =
+        claim_job(&context, job_id, node_id(), 2_000).await.unwrap()
     else {
         panic!("job was not claimed")
     };
     let token = record.claim.unwrap().claim_token;
-    put_job_entry(storage, job_id, token, b"b", &report_row("b"))
+    put_job_entry(&context, job_id, token, b"b", &report_row("b"))
         .await
         .unwrap();
-    put_job_entry(storage, job_id, token, b"a", &report_row("a"))
+    put_job_entry(&context, job_id, token, b"a", &report_row("a"))
         .await
         .unwrap();
-    transition_to_running(storage, job_id, token, 2_500)
+    transition_to_running(&context, job_id, token, 2_500)
         .await
         .unwrap();
     complete_job(
-        storage,
+        &context,
         job_id,
         token,
         JobResultPayload::ImportRoCrate(ImportRoCrateResult {
@@ -487,7 +428,7 @@ async fn finish_report(state: &ServerState, job_id: JobId, owner: UserId) -> [u8
             unit: "entries".to_string(),
             paused_until: None,
         },
-        aruna_core::time::unix_timestamp_millis(),
+        aruna_clock::unix_timestamp_millis(),
     )
     .await
     .unwrap()
@@ -507,17 +448,14 @@ async fn list_newest_first() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     for seq in 1..=3u64 {
-        insert_job(
-            &state.get_ctx().storage_handle,
-            &job_for(job_id(seq), owner, seq * 1000),
-        )
-        .await
-        .unwrap();
+        insert_job(&state.get_ctx(), &job_for(job_id(seq), owner, seq * 1000))
+            .await
+            .unwrap();
     }
 
     let (_, Json(page1)) = list_jobs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Query(ListJobsQuery {
             limit: Some(2),
             ..Default::default()
@@ -532,7 +470,7 @@ async fn list_newest_first() {
 
     let (_, Json(page2)) = list_jobs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Query(ListJobsQuery {
             limit: Some(2),
             cursor: Some(cursor),
@@ -555,7 +493,7 @@ async fn report_pages_frozen() {
 
     let first = get_job_report(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery {
@@ -572,7 +510,7 @@ async fn report_pages_frozen() {
 
     let second = get_job_report(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery {
@@ -594,7 +532,7 @@ async fn report_pages_frozen() {
     let conflict = URL_SAFE_NO_PAD.encode(postcard::to_allocvec(&conflict).unwrap());
     let response = get_job_report(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery {
@@ -608,7 +546,7 @@ async fn report_pages_frozen() {
 
     let foreign = get_job_report(
         State(state),
-        Extension(auth_for(user(3))),
+        UnrestrictedAuth(auth_for(user(3)).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery::default()),
@@ -622,13 +560,13 @@ async fn report_pending_typed() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     let job_id = JobId::from_bytes([10u8; 16]);
-    insert_job(&state.get_ctx().storage_handle, &import_job(job_id, owner))
+    insert_job(&state.get_ctx(), &import_job(job_id, owner))
         .await
         .unwrap();
 
     let response = get_job_report(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
         Query(ReportQuery::default()),
@@ -644,9 +582,9 @@ async fn report_pending_typed() {
 #[test]
 fn submit_conflict_typed() {
     let existing_job_id = JobId::from_bytes([15u8; 16]);
-    let error = map_submit_error(
-        aruna_operations::jobs::submit::SubmitJobError::JobPlanConflict { existing_job_id },
-    );
+    let error = map_submit_error(aruna_core::job_request::SubmitJobError::JobPlanConflict {
+        existing_job_id,
+    });
     assert!(matches!(
         error,
         ServerError::JobPlanConflict(message)
@@ -684,12 +622,8 @@ async fn artifact_head_headers() {
     let owner = user(2);
     let job_id = JobId::from_bytes([11u8; 16]);
     insert_job(
-        &state.get_ctx().storage_handle,
-        &export_job(
-            job_id,
-            owner,
-            aruna_core::time::unix_timestamp_millis() + 60_000,
-        ),
+        &state.get_ctx(),
+        &export_job(job_id, owner, aruna_clock::unix_timestamp_millis() + 60_000),
     )
     .await
     .unwrap();
@@ -731,12 +665,9 @@ async fn artifact_expiry_gone() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     let job_id = JobId::from_bytes([12u8; 16]);
-    insert_job(
-        &state.get_ctx().storage_handle,
-        &export_job(job_id, owner, 1),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &export_job(job_id, owner, 1))
+        .await
+        .unwrap();
 
     let response = head_job_artifact(
         State(state),
@@ -817,16 +748,13 @@ async fn names_owner_url() {
         .await;
     let owner = user(2);
     let job_id = JobId::from_bytes([14u8; 16]);
-    insert_job(
-        &state.get_ctx().storage_handle,
-        &job_for(job_id, owner, 1000),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &job_for(job_id, owner, 1000))
+        .await
+        .unwrap();
 
     let (_, Json(response)) = get_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -897,16 +825,13 @@ async fn remote_owner_url() {
 async fn foreign_not_found() {
     let (_dir, state) = build_state().await;
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx().storage_handle,
-        &job_for(job_id, user(2), 1000),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &job_for(job_id, user(2), 1000))
+        .await
+        .unwrap();
 
     let result = get_job(
         State(state.clone()),
-        Extension(auth_for(user(3))),
+        UnrestrictedAuth(auth_for(user(3)).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -920,7 +845,6 @@ async fn delete_job_rules() {
     // second delete answers 404.
     let (_dir, state) = build_state().await;
     let owner = user(2);
-    let storage = &state.get_ctx().storage_handle;
     let finished = JobId::from_bytes([0xA1; 16]);
     let running = JobId::from_bytes([0xA2; 16]);
     let mut record = job_for(finished, owner, 1000);
@@ -936,6 +860,7 @@ async fn delete_job_rules() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -944,17 +869,17 @@ async fn delete_job_rules() {
     });
     record.state = JobState::Succeeded;
     record.finished_at_ms = Some(2000);
-    insert_job(storage, &record).await.unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
     let mut live = record.clone();
     live.job_id = running;
     live.state = JobState::Running;
     live.finished_at_ms = None;
-    insert_job(storage, &live).await.unwrap();
+    insert_job(&state.get_ctx(), &live).await.unwrap();
 
     let call = |who: UserId, id: JobId| {
         delete_job(
             State(state.clone()),
-            Extension(auth_for(who)),
+            UnrestrictedAuth(auth_for(who).expect("a signed-in caller")),
             Path(id.to_string()),
         )
     };
@@ -973,7 +898,7 @@ async fn delete_job_rules() {
     ));
     let result = get_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(finished.to_string()),
     )
@@ -993,20 +918,19 @@ async fn exhausted_job_removable() {
     record.locally_exhausted = true;
     let mut running = job_for(live, owner, 1000);
     running.state = JobState::Running;
-    let storage = &state.get_ctx().storage_handle;
-    insert_job(storage, &record).await.unwrap();
-    insert_job(storage, &running).await.unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
+    insert_job(&state.get_ctx(), &running).await.unwrap();
     let delete = |id: JobId| {
         delete_job(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(id.to_string()),
         )
     };
 
     let (_, Json(cancelled)) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(stuck.to_string()),
     )
@@ -1022,7 +946,7 @@ async fn exhausted_job_removable() {
     assert!(reason.contains("running"), "{reason}");
     // A job still waiting in the queue is cancelled and deleted in one call.
     let waiting = JobId::from_bytes([0x63; 16]);
-    insert_job(storage, &job_for(waiting, owner, 1000))
+    insert_job(&state.get_ctx(), &job_for(waiting, owner, 1000))
         .await
         .unwrap();
     assert_eq!(delete(waiting).await.unwrap(), StatusCode::NO_CONTENT);
@@ -1037,13 +961,11 @@ async fn cancel_is_idempotent() {
     // A prior run keeps repeated cancellation on the live, cancel-requested path.
     let mut record = job_for(job_id, owner, 1000);
     record.has_run = true;
-    insert_job(&state.get_ctx().storage_handle, &record)
-        .await
-        .unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
 
     let (status, _) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -1054,7 +976,7 @@ async fn cancel_is_idempotent() {
     // Repeated cancel of a still-live job stays 202.
     let (status, Json(body)) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -1072,13 +994,11 @@ async fn cancel_terminal_noop() {
     let mut record = job_for(job_id, owner, 1000);
     record.state = JobState::Succeeded;
     record.finished_at_ms = Some(2000);
-    insert_job(&state.get_ctx().storage_handle, &record)
-        .await
-        .unwrap();
+    insert_job(&state.get_ctx(), &record).await.unwrap();
 
     let (status, _) = cancel_job(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Extension(None),
         Path(job_id.to_string()),
     )
@@ -1118,38 +1038,14 @@ async fn restricted_token_rejected() {
     let (_dir, state) = build_state().await;
     let owner = user(2);
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx().storage_handle,
-        &job_for(job_id, owner, 1000),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &job_for(job_id, owner, 1000))
+        .await
+        .unwrap();
 
-    let list = list_jobs(
-        State(state.clone()),
-        Extension(restricted_auth_for(owner)),
-        Query(ListJobsQuery::default()),
-    )
-    .await;
-    assert!(matches!(list, Err(ServerError::Forbidden)));
-
-    let get = get_job(
-        State(state.clone()),
-        Extension(restricted_auth_for(owner)),
-        Extension(None),
-        Path(job_id.to_string()),
-    )
-    .await;
-    assert!(matches!(get, Err(ServerError::Forbidden)));
-
-    let cancel = cancel_job(
-        State(state.clone()),
-        Extension(restricted_auth_for(owner)),
-        Extension(None),
-        Path(job_id.to_string()),
-    )
-    .await;
-    assert!(matches!(cancel, Err(ServerError::Forbidden)));
+    // The job routes take `UnrestrictedAuth`, so the refusal is the extractor's.
+    let refused =
+        crate::auth::extract::<UnrestrictedAuth>(&state, restricted_auth_for(owner)).await;
+    assert_eq!(refused.err(), Some(StatusCode::FORBIDDEN));
 }
 
 fn local_request() -> SubmitExecutionRequest {
@@ -1170,6 +1066,7 @@ fn local_request() -> SubmitExecutionRequest {
         ram_bytes: None,
         max_walltime_ms: None,
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         output_prefixes: Vec::new(),
@@ -1178,32 +1075,6 @@ fn local_request() -> SubmitExecutionRequest {
         workspace: None,
         target: Some(super::ExecutionTarget::Local),
     }
-}
-
-async fn management_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    });
-    let capabilities =
-        NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        capabilities,
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
 }
 
 async fn enroll_device(state: &ServerState, owner: UserId) {
@@ -1277,6 +1148,33 @@ async fn device_checks_group() {
 }
 
 #[tokio::test]
+async fn refuses_plugin_tags() {
+    // Only the plugin host tags the jobs of plugin tasks; REST and MCP share this check.
+    let (_dir, state) = build_state().await;
+    let mut request = local_request();
+    request.target = None;
+    request.tags.insert(
+        "aruna-engine.org/plugin-install".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let result = submit_job(
+        State(state),
+        Extension(auth_for(user(2))),
+        Extension(None),
+        Json(request),
+    )
+    .await;
+
+    match result {
+        Err(ServerError::BadRequestMessage(message)) => {
+            assert!(message.contains("reserved for plugin tasks"), "{message}");
+        }
+        other => panic!("expected a refusal, got {:?}", other.err()),
+    }
+}
+
+#[tokio::test]
 async fn local_refuses_stranger() {
     let (_dir, state) = build_state().await;
     enroll_device(&state, user(2)).await;
@@ -1330,6 +1228,7 @@ async fn rejects_huge_ram() {
             ram_bytes: Some(ram_bytes),
             max_walltime_ms: None,
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             outputs: Vec::new(),
             output_prefixes: Vec::new(),
@@ -1563,7 +1462,7 @@ async fn invalid_cursor_rejected() {
     let (_dir, state) = build_state().await;
     let result = list_jobs(
         State(state.clone()),
-        Extension(auth_for(user(2))),
+        UnrestrictedAuth(auth_for(user(2)).expect("a signed-in caller")),
         Query(ListJobsQuery {
             cursor: Some("not-base64!".to_string()),
             ..Default::default()
@@ -1583,4 +1482,42 @@ fn mount_path_checked() {
         mount_permission_path(bucket.clone(), "raw/2024/"),
         format!("{bucket}/raw/2024")
     );
+}
+
+#[test]
+fn reports_placed_backend() {
+    // The placement and every candidate name the backend next to the executor kind.
+    use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::scheduling::{CandidateVerdict, PlanCandidate};
+    use aruna_operations::jobs::lifecycle::report::PlanEstimate;
+    let node = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+    let mut report = family_report_fixture();
+    report.plan = Some(PlanEstimate {
+        target: Some(ExecutionTargetId {
+            node_id: node,
+            backend: "lab".to_string(),
+            executor_kind: "docker".to_string(),
+        }),
+        scheduler_node_id: None,
+        estimated_transfer_bytes: 0,
+        estimated_transfer_ms: 0,
+        alternatives: 0,
+        rejected: 0,
+        omitted: 0,
+        stored_at_ms: 1,
+        inputs: Vec::new(),
+        candidates: vec![PlanCandidate {
+            node_id: node,
+            backend: Some("lab".to_string()),
+            executor_kind: Some("docker".to_string()),
+            verdict: CandidateVerdict::Selected,
+            rank: None,
+            reason: None,
+        }],
+    });
+    let placement = family_response(&report)
+        .placement
+        .expect("a plan was stored");
+    assert_eq!(placement.backend.as_deref(), Some("lab"));
+    assert_eq!(placement.candidates[0].backend.as_deref(), Some("lab"));
 }

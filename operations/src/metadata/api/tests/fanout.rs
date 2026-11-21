@@ -4,7 +4,7 @@
 
 use super::list::{auth_for, user_role, write_policy_docs};
 use super::*;
-use crate::metadata::api::search::RangeLayout;
+use crate::metadata::api::search_types::RangeLayout;
 
 // Fan-out follows the live holders of the stored bucket; the event-time
 // holder stamp on the record is ignored, and no config means local only.
@@ -28,7 +28,7 @@ fn query_fans_out() {
     let strategy = config
         .strategy(&config.default_strategy_id.expect("default strategy"))
         .expect("default strategy resolves");
-    let placement = crate::placement::choose_origin_bucket(
+    let placement = aruna_core::placement::choose_origin_bucket(
         &config,
         strategy,
         local_node_id,
@@ -207,27 +207,13 @@ async fn write_policy_denies() {
     )
     .await;
 
-    let denied = ensure_permission(
-        &test.context,
-        TEST_REALM_ID,
-        auth_for(user),
-        group_id,
-        path.clone(),
-        Permission::WRITE,
-        None,
-    )
-    .await;
+    let scope = (TEST_REALM_ID, group_id);
+    let write =
+        PathPermissionOperation::new(scope, auth_for(user), path.clone(), Permission::WRITE);
+    let denied = drive(write, &test.context).await;
     // The same role allows the read, so the denial comes from the policy.
-    let allowed = ensure_permission(
-        &test.context,
-        TEST_REALM_ID,
-        auth_for(user),
-        group_id,
-        path,
-        Permission::READ,
-        None,
-    )
-    .await;
+    let read = PathPermissionOperation::new(scope, auth_for(user), path, Permission::READ);
+    let allowed = drive(read, &test.context).await;
 
     assert!(matches!(denied, Err(MetadataApiError::Forbidden)));
     assert!(allowed.is_ok());

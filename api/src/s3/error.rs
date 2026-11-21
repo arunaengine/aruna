@@ -3,42 +3,43 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::s3::checksum::checksum_mismatch_error;
+use aruna_core::bucket_read::GetBucketError;
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
+use aruna_core::managed_copy::ManagedCopyError;
 use aruna_core::structs::storage::abe::AbeError;
-use aruna_core::structs::storage::distribution::RouteError;
+use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
-use aruna_operations::blob::managed_copy::ManagedCopyError;
 use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::inventory::InventoryError;
-use aruna_operations::driver::{GateContextError, RoutingInputsError};
-use aruna_operations::groups::imports::ImportRuleError;
-use aruna_operations::node::usage_stats::UsageUpdateError;
-use aruna_operations::placement::policy::PolicyGateError;
+use aruna_operations::groups::routing::RoutingInputsError;
+use aruna_operations::placement::policy::gate::{GateContextError, PolicyGateError};
 use aruna_operations::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
 use aruna_operations::s3::bucket::create::CreateBucketError;
 use aruna_operations::s3::bucket::delete::DeleteBucketError;
-use aruna_operations::s3::bucket::get::GetBucketError;
 use aruna_operations::s3::bucket::list::ListBucketsError;
+use aruna_operations::s3::imports::ImportRuleError;
 use aruna_operations::s3::multipart::abort::AbortUploadError;
 use aruna_operations::s3::multipart::complete::CompleteUploadError;
 use aruna_operations::s3::multipart::create::CreateMultipartError;
-use aruna_operations::s3::multipart::part_copy::PartCopyError;
 use aruna_operations::s3::multipart::part_upload::UploadPartError;
 use aruna_operations::s3::multipart::parts::ListPartsError;
 use aruna_operations::s3::multipart::uploads::ListUploadsError;
 use aruna_operations::s3::object::attributes::GetAttributesError;
-use aruna_operations::s3::object::copy::CopyObjectError;
 use aruna_operations::s3::object::delete::DeleteObjectError;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::head::HeadObjectError;
+use aruna_operations::s3::object::head_source::HeadSourceError;
 use aruna_operations::s3::object::list::ListBucketError;
 use aruna_operations::s3::object::put::PutObjectError;
+use aruna_operations::s3::object::reference::MaterializeReferenceError;
 use aruna_operations::s3::object::versions::ListVersionsError;
 use aruna_operations::s3::purge_fence::PurgeFenceError;
-use aruna_operations::staging::reference::MaterializeReferenceError;
+use aruna_operations::s3::usage::UsageUpdateError;
+use aruna_operations::transfer::copy::CopyObjectError;
+use aruna_operations::transfer::part_copy::PartCopyError;
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
 use tracing::warn;
@@ -154,6 +155,12 @@ fn usage_update_error(error: &UsageUpdateError) -> S3Error {
     let UsageUpdateError::Inventory(inventory) = error else {
         return usage_accounting_error();
     };
+    inventory_error(inventory)
+}
+
+/// The retryable inventory refusals of a distributed bucket; other inventory faults are an
+/// accounting failure.
+fn inventory_error(inventory: &InventoryError) -> S3Error {
     let message = match inventory {
         InventoryError::RangeMissing { .. } => {
             "This node holds no open range of the distributed bucket for the key yet; retry later."
@@ -210,6 +217,56 @@ fn policy_gate_error(error: &PolicyGateError, action: &str) -> S3Error {
     }
 }
 
+/// A bucket key that is locked or does not open answers as the read paths do; an encryption
+/// change during the request is a conflict, as `PutBucketEncryption` reports it.
+fn bucket_key_error(error: &BucketKeyError) -> S3Error {
+    match error {
+        BucketKeyError::Locked(_) => bucket_locked_error(),
+        BucketKeyError::InvalidToken => s3_error!(
+            InvalidToken,
+            "The security token does not open the bucket key"
+        ),
+        BucketKeyError::StaleGeneration { .. } => s3_error!(
+            OperationAborted,
+            "The bucket encryption changed during the request"
+        ),
+        other => internal_error(other),
+    }
+}
+
+/// A reference source that cannot be headed answers as `HeadObject` does.
+fn head_source_error(error: HeadSourceError) -> S3Error {
+    match error {
+        HeadSourceError::Resolve(error) => source_resolution_error(error),
+        HeadSourceError::Staging(error) => staging_source_error(error),
+        err => internal_error(err),
+    }
+}
+
+/// A reference source that cannot be resolved now is a retryable 503.
+fn source_resolution_error(error: SourceResolutionError) -> S3Error {
+    match error {
+        SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => s3_error!(
+            ServiceUnavailable,
+            "Reference source is currently unavailable"
+        ),
+        err => internal_error(err),
+    }
+}
+
+/// A lost reference source is 404, a refused one 403, and any other failure a retryable 503.
+fn staging_source_error(error: StagingSourceError) -> S3Error {
+    match error {
+        StagingSourceError::NotFound => {
+            s3_error!(NoSuchKey, "The referenced source object does not exist.")
+        }
+        StagingSourceError::AccessDenied => {
+            s3_error!(AccessDenied, "Access to the referenced source was denied.")
+        }
+        err => s3_error!(ServiceUnavailable, "{}", err),
+    }
+}
+
 /// A named backend that has reached its operator quota. Refusing loudly beats
 /// hiding exhaustion by writing somewhere the rule did not name.
 fn backend_full_error(backend: &str) -> S3Error {
@@ -231,9 +288,8 @@ pub(crate) fn routing_inputs_error(error: RoutingInputsError) -> S3Error {
 /// A destination gate that could not be built at all. An admission stop is not
 /// one: `policy_gate_error` reports that, and only for a write carrying refs.
 pub(crate) fn gate_context_error(error: GateContextError) -> S3Error {
-    match error {
-        GateContextError::Routing(error) => routing_inputs_error(error),
-    }
+    warn!(error = %error, "Refusing write with unreadable routing inputs");
+    s3_error!(InternalError, "Storage routing inputs are unavailable")
 }
 
 fn missing_upload_error() -> S3Error {
@@ -451,7 +507,18 @@ impl IntoS3Error for CreateMultipartError {
                 backend_full_error(&backend.to_string())
             }
             CreateMultipartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            CreateMultipartError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
             CreateMultipartError::Distribution(ref error) => guard_error(error),
+            CreateMultipartError::PolicyGateError(ref error) => {
+                policy_gate_error(error, "CreateMultipartUpload")
+            }
+            error @ CreateMultipartError::UnsupportedChecksum(_) => {
+                s3_error!(InvalidRequest, "{error}")
+            }
+            CreateMultipartError::BucketKey(ref error) => bucket_key_error(error),
+            CreateMultipartError::Inventory(ref error) => inventory_error(error),
             CreateMultipartError::BlobError(BlobError::KeyTooLong) => long_key_error(),
             err => internal_error(err),
         }
@@ -477,6 +544,9 @@ impl IntoS3Error for UploadPartError {
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
             UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            UploadPartError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
             UploadPartError::BlobWriteFailed(ref message) => part_store_error(message),
             err => internal_error(err),
         }
@@ -561,6 +631,7 @@ impl IntoS3Error for CompleteUploadError {
             }
             CompleteUploadError::Distribution(ref error) => guard_error(error),
             CompleteUploadError::UsageUpdateError(ref error) => usage_update_error(error),
+            CompleteUploadError::BucketKey(ref error) => bucket_key_error(error),
             CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),
             // The parts cannot move to another path, so only a new upload can succeed.
             CompleteUploadError::BlobError(BlobError::PathTaken) => s3_error!(
@@ -585,6 +656,7 @@ impl IntoS3Error for AbortUploadError {
             | AbortUploadError::UploadTargetMismatch
             | AbortUploadError::UploadNotOpen => missing_upload_error(),
             AbortUploadError::CompletionInProgress => completion_lease_error(),
+            AbortUploadError::Inventory(ref error) => inventory_error(error),
             err => internal_error(err),
         }
     }
@@ -675,24 +747,8 @@ impl IntoS3Error for GetObjectError {
             GetObjectError::InvalidRange => {
                 s3_error!(InvalidRange, "The requested range is not satisfiable.")
             }
-            GetObjectError::ResolveReferenceError(error) => match error {
-                SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => {
-                    s3_error!(
-                        ServiceUnavailable,
-                        "Reference source is currently unavailable"
-                    )
-                }
-                err => internal_error(err),
-            },
-            GetObjectError::StagingSourceError(error) => match error {
-                StagingSourceError::NotFound => {
-                    s3_error!(NoSuchKey, "The referenced source object does not exist.")
-                }
-                StagingSourceError::AccessDenied => {
-                    s3_error!(AccessDenied, "Access to the referenced source was denied.")
-                }
-                err => s3_error!(ServiceUnavailable, "{}", err),
-            },
+            GetObjectError::ResolveReferenceError(error) => source_resolution_error(error),
+            GetObjectError::StagingSourceError(error) => staging_source_error(error),
             err => internal_error(err),
         }
     }
@@ -711,9 +767,20 @@ impl IntoS3Error for CopyObjectError {
             CopyObjectError::Reference(MaterializeReferenceError::Usage(err)) => {
                 usage_update_error(&err)
             }
-            CopyObjectError::Reference(err) => {
-                S3Error::with_message(S3ErrorCode::InternalError, err.to_string())
+            // A policy refusal names no rule: the rule ids stay out of the answer.
+            CopyObjectError::Reference(MaterializeReferenceError::Policy(_)) => {
+                placement_denied_error("CopyObject")
             }
+            CopyObjectError::Reference(MaterializeReferenceError::Purge(
+                PurgeFenceError::Suspended,
+            )) => purge_progress_error(),
+            CopyObjectError::Reference(MaterializeReferenceError::Purge(
+                PurgeFenceError::Distribution(err),
+            )) => guard_error(&err),
+            CopyObjectError::Reference(MaterializeReferenceError::Head(err)) => {
+                head_source_error(err)
+            }
+            CopyObjectError::Reference(err) => internal_error(err),
             CopyObjectError::PreconditionFailed => s3_error!(
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."
@@ -729,24 +796,8 @@ impl IntoS3Error for HeadObjectError {
             HeadObjectError::NoSuchVersion => missing_version_error(),
             HeadObjectError::DeleteMarker => delete_marker_error(),
             HeadObjectError::NoSuchKey => missing_key_error(),
-            HeadObjectError::ResolveReferenceError(error) => match error {
-                SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound => {
-                    s3_error!(
-                        ServiceUnavailable,
-                        "Reference source is currently unavailable"
-                    )
-                }
-                err => internal_error(err),
-            },
-            HeadObjectError::StagingSourceError(error) => match error {
-                StagingSourceError::NotFound => {
-                    s3_error!(NoSuchKey, "The referenced source object does not exist.")
-                }
-                StagingSourceError::AccessDenied => {
-                    s3_error!(AccessDenied, "Access to the referenced source was denied.")
-                }
-                err => s3_error!(ServiceUnavailable, "{}", err),
-            },
+            HeadObjectError::ResolveReferenceError(error) => source_resolution_error(error),
+            HeadObjectError::StagingSourceError(error) => staging_source_error(error),
             err => internal_error(err),
         }
     }
@@ -769,6 +820,10 @@ impl IntoS3Error for DeleteObjectError {
         match self {
             DeleteObjectError::NoSuchVersion => missing_version_error(),
             DeleteObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            DeleteObjectError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
+            DeleteObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             DeleteObjectError::UsageUpdateError(ref error) => usage_update_error(error),
             DeleteObjectError::Distribution(ref error) => guard_error(error),
             error @ DeleteObjectError::DistributedVersion => s3_error!(InvalidRequest, "{error}"),
@@ -1105,7 +1160,7 @@ mod tests {
         );
     }
 
-    // HEAD and GET of one reference answer a source failure alike: lost is 404, refused is 403,
+    // HEAD, GET and a reference copy answer a source failure alike: lost is 404, refused is 403,
     // and an outage or a changing source is a retryable 503.
     #[test]
     fn reference_failures_agree() {
@@ -1125,18 +1180,59 @@ mod tests {
             S3ErrorCode::ServiceUnavailable,
             S3ErrorCode::ServiceUnavailable,
         ];
-        let pairs = failures().into_iter().zip(failures()).zip(expected);
-        for ((get, head), code) in pairs {
+        let copied = |error| CopyObjectError::Reference(MaterializeReferenceError::Head(error));
+        let pairs = failures().into_iter().zip(failures()).zip(failures());
+        for (((get, head), copy), code) in pairs.zip(expected) {
             let get = GetObjectError::StagingSourceError(get).into_s3_error();
             let head = HeadObjectError::StagingSourceError(head).into_s3_error();
-            assert_eq!((get.code(), head.code()), (&code, &code));
+            let copy = copied(HeadSourceError::Staging(copy)).into_s3_error();
+            assert_eq!(
+                (get.code(), head.code(), copy.code()),
+                (&code, &code, &code)
+            );
             assert_eq!(get.status_code(), head.status_code());
+            assert_eq!(get.status_code(), copy.status_code());
         }
         let resolve = || SourceResolutionError::ResolveFailed;
         let get = GetObjectError::ResolveReferenceError(resolve()).into_s3_error();
         let head = HeadObjectError::ResolveReferenceError(resolve()).into_s3_error();
+        let copy = copied(HeadSourceError::Resolve(resolve())).into_s3_error();
         assert_eq!(get.code(), &S3ErrorCode::ServiceUnavailable);
         assert_eq!(head.code(), get.code());
+        assert_eq!(copy.code(), get.code());
+    }
+
+    // An encryption change during create or complete is a conflict as on `PutBucketEncryption`,
+    // and an abort refused by the inventory retries like a create; other faults stay internal.
+    #[test]
+    fn multipart_conflicts_mapped() {
+        let stale = || BucketKeyError::StaleGeneration {
+            requested: 0,
+            current: 1,
+        };
+        for error in [
+            CreateMultipartError::BucketKey(stale()).into_s3_error(),
+            CompleteUploadError::from(stale()).into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::OperationAborted);
+            assert_eq!(error.status_code(), Some(http::StatusCode::CONFLICT));
+        }
+        let retired = || InventoryError::RangeRetired(ulid::Ulid::from_bytes([7; 16]));
+        let aborted = AbortUploadError::from(retired()).into_s3_error();
+        let created = CreateMultipartError::Inventory(retired()).into_s3_error();
+        let unavailable = S3ErrorCode::Custom("DistributedBucketUnavailable".into());
+        assert_eq!(
+            (aborted.code(), created.code()),
+            (&unavailable, &unavailable)
+        );
+        assert_eq!(
+            aborted.status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        let fault = CompleteUploadError::from(BucketKeyError::Unsupported).into_s3_error();
+        assert_eq!(*fault.code(), S3ErrorCode::InternalError);
+        let fault = AbortUploadError::StorageError(StorageError::KeyNotFound).into_s3_error();
+        assert_eq!(*fault.code(), S3ErrorCode::InternalError);
     }
 
     #[test]
@@ -1167,11 +1263,46 @@ mod tests {
     }
 
     #[test]
+    fn hides_refusal_ids() {
+        // Multipart and copy refusals answer like a refused put and name no policy.
+        let policy_id = ulid::Ulid::from_bytes([9u8; 16]);
+        let multipart = CreateMultipartError::PolicyGateError(PolicyGateError::Denied {
+            policy_ids: vec![policy_id],
+        })
+        .into_s3_error();
+        let copy = CopyObjectError::Reference(MaterializeReferenceError::Policy(
+            aruna_core::structs::placement::policy::PlacementPolicyError::ConflictingRefs {
+                policy_id,
+            },
+        ))
+        .into_s3_error();
+        for refused in [multipart, copy] {
+            assert_eq!(
+                *refused.code(),
+                S3ErrorCode::Custom("PlacementPolicyDenied".into())
+            );
+            assert_eq!(refused.status_code(), Some(http::StatusCode::FORBIDDEN));
+            assert!(!format!("{refused:?}").contains(&policy_id.to_string()));
+        }
+    }
+
+    #[test]
+    fn maps_delete_refusal() {
+        // A delete refused by a managed copy answers as the read paths do, not as a 500.
+        let error =
+            DeleteObjectError::ManagedCopyError(ManagedCopyError::Unregistered).into_s3_error();
+        let expected = managed_copy_error(&ManagedCopyError::Unregistered);
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.status_code(), expected.status_code());
+    }
+
+    #[test]
     fn maps_usage_failure() {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
-            aruna_operations::node::usage_stats::UsageUpdateError::UnexpectedEvent(
-                aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished),
+            aruna_operations::s3::usage::UsageUpdateError::UnexpectedEvent(
+                aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished)
+                    .label(),
             ),
         )
         .into_s3_error();
@@ -1336,7 +1467,7 @@ mod tests {
         let accounting = S3ErrorCode::Custom("UsageAccountingFailed".into());
         let other = UsageUpdateError::Inventory(InventoryError::Storage(StorageError::KeyNotFound));
         assert_eq!(*usage_update_error(&other).code(), accounting);
-        let event = UsageUpdateError::UnexpectedEvent(aruna_core::events::Event::Search());
+        let event = UsageUpdateError::UnexpectedEvent(aruna_core::events::Event::Search().label());
         assert_eq!(*usage_update_error(&event).code(), accounting);
         let deleted = DeleteObjectError::UsageUpdateError(UsageUpdateError::Inventory(
             InventoryError::Collision(set_id),

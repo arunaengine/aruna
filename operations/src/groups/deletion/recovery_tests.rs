@@ -12,20 +12,22 @@ use aruna_core::storage_entries::pending_projection_key;
 use aruna_core::structs::identity::group_delete::*;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use ulid::Ulid;
 
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
-use super::tests::{Fixture, context, node, read, write};
+use super::tests::{commit, prepare};
+use aruna_test_support::groups::{Fixture, context, node, read, write};
 
 #[tokio::test]
 async fn unauthorized_prepare_refuses() {
     let mut fixture = Fixture::new(&[1]).await;
     fixture.plan.requested_by =
-        aruna_core::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
     assert_eq!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(GroupDeletionError::Unauthorized)
     );
     assert!(
@@ -42,7 +44,8 @@ async fn unauthorized_prepare_refuses() {
 #[tokio::test]
 async fn realm_admin_deletes() {
     let mut fixture = Fixture::new(&[1]).await;
-    let admin = aruna_core::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
+    let admin =
+        aruna_core::user::id::UserId::local(Ulid::from_bytes([8; 16]), fixture.plan.realm_id);
     fixture.plan.requested_by = admin;
     fixture.actor.user_id = admin;
     fixture.auth.user_id = admin;
@@ -60,8 +63,8 @@ async fn realm_admin_deletes() {
         authorization.to_bytes(&fixture.actor).unwrap(),
     )
     .await;
-    let proof = fixture.prepare(1).await.unwrap();
-    fixture.commit(vec![proof]).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
+    commit(&fixture, vec![proof]).await.unwrap();
     let key = aruna_core::structs::identity::group::owner_group_key(
         fixture.plan.owner,
         fixture.plan.group_id,
@@ -73,16 +76,16 @@ async fn realm_admin_deletes() {
     );
 }
 use crate::connectors::repository::read_secret_effect;
-use crate::driver::drive;
 use crate::groups::fence::GroupWriteOperation;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
+use aruna_drivers::driver::drive;
 
 #[tokio::test]
 async fn prepared_restart_survives() {
     let fixture = Fixture::new(&[1]).await;
-    fixture.prepare(1).await.unwrap();
+    prepare(&fixture, 1).await.unwrap();
     fixture.context.storage_handle.close().await;
     let reopened = context(fixture.dir.path());
     let writes = vec![(
@@ -133,12 +136,12 @@ async fn prepared_restart_survives() {
 #[tokio::test]
 async fn committed_restart_replays() {
     let fixture = Fixture::new(&[1]).await;
-    let proof = fixture.prepare(1).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
     let certificate = GroupDeleteCertificate {
         plan: fixture.plan.clone(),
         proofs: vec![proof.clone()],
     };
-    let event = fixture.commit(vec![proof]).await.unwrap();
+    let event = commit(&fixture, vec![proof]).await.unwrap();
     fixture.context.storage_handle.close().await;
     let reopened = context(fixture.dir.path());
     let replayed = drive(
@@ -157,7 +160,7 @@ async fn committed_restart_replays() {
         .await
         .is_none()
     );
-    let (outbox, _) = crate::jobs::store::iter_prefix_page(
+    let (outbox, _) = aruna_storage::scan::iter_prefix_page(
         &reopened.storage_handle,
         SYNC_OUTBOX_KEYSPACE,
         None,
@@ -175,14 +178,14 @@ async fn peers_commit_once() {
     let first = Fixture::new(&[1, 2]).await;
     let second = Fixture::new(&[1, 2]).await;
     let proofs = vec![
-        first.prepare(1).await.unwrap(),
-        second.prepare(2).await.unwrap(),
+        prepare(&first, 1).await.unwrap(),
+        prepare(&second, 2).await.unwrap(),
     ];
     let certificate = GroupDeleteCertificate {
         plan: first.plan.clone(),
         proofs: proofs.clone(),
     };
-    let event = first.commit(proofs).await.unwrap();
+    let event = commit(&first, proofs).await.unwrap();
     for _ in 0..2 {
         drive(
             CommitOperation::new(
@@ -214,7 +217,7 @@ async fn peers_commit_once() {
 #[tokio::test]
 async fn missing_vote_refuses() {
     let fixture = Fixture::new(&[1, 2]).await;
-    let proof = fixture.prepare(1).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
     let mut operation = CommitOperation::new(
         GroupDeleteCertificate {
             plan: fixture.plan.clone(),
@@ -224,9 +227,8 @@ async fn missing_vote_refuses() {
         Some(fixture.auth.clone()),
         None,
     );
-    assert!(operation.start().is_empty());
     assert!(matches!(
-        operation.finalize(),
+        operation.first(),
         Err(GroupDeletionError::Invalid(_))
     ));
     assert!(
@@ -243,7 +245,7 @@ async fn missing_vote_refuses() {
 #[tokio::test]
 async fn frozen_write_atomic() {
     let fixture = Fixture::new(&[1]).await;
-    fixture.prepare(1).await.unwrap();
+    prepare(&fixture, 1).await.unwrap();
     let writes = vec![(
         SOURCE_INDEX_KEYSPACE.to_string(),
         b"connector".to_vec().into(),
@@ -321,7 +323,7 @@ async fn pending_metadata_refuses() {
     )
     .await;
     assert_eq!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(super::tests::empty("pending metadata creation"))
     );
 }
@@ -337,7 +339,7 @@ async fn corrupt_resource_refuses() {
     )
     .await;
     assert!(matches!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(GroupDeletionError::Unavailable(_))
     ));
     assert!(
@@ -383,7 +385,17 @@ async fn unavailable_peer_preserves() {
     fixture.context.net_handle = Some(net.clone());
     let context = Arc::new(fixture.context);
     assert!(matches!(
-        super::coordinator::delete_group(&context, fixture.auth, None, fixture.plan.group_id).await,
+        drive(
+            super::coordinator::DeleteGroupOperation::new(
+                context.node_and_realm(),
+                fixture.auth,
+                None,
+                fixture.plan.group_id,
+                Ulid::generate()
+            ),
+            &context
+        )
+        .await,
         Err(GroupDeletionError::Unavailable(_))
     ));
     assert!(

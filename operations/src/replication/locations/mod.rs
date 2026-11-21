@@ -2,23 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod local;
-mod queued;
-mod relationships;
-mod remote;
+pub mod holders;
+pub mod local;
+pub mod queued;
+pub mod relationships;
+pub mod remote;
 
+use aruna_core::calls::IoError;
 use aruna_core::errors::{BlobError, ConversionError};
 use thiserror::Error;
-
-pub use local::{LocalSummary, LocationSummaryOperation};
-pub use queued::{QueuedNodesOperation, QueuedReplicas};
-pub use relationships::{RelationshipNodesOperation, ReplicaTarget};
-pub use remote::RemoteLocationOperation;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum LocationSummaryError {
     #[error(transparent)]
-    ManagedCopy(#[from] crate::blob::managed_copy::ManagedCopyError),
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
     #[error(transparent)]
@@ -33,6 +30,18 @@ pub enum LocationSummaryError {
     Unexpected { state: &'static str, event: String },
     #[error("peer did not answer before the request deadline")]
     Aborted,
+    #[error("could not read the locations: {0}")]
+    Io(IoError),
+}
+
+/// A run cut off at its deadline counts as a peer that did not answer in time.
+impl From<IoError> for LocationSummaryError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Aborted | IoError::Hung { .. } => Self::Aborted,
+            other => Self::Io(other),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -7,12 +7,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::federation::{
     FederationError, FederationSettings, Layout, MAX_NAME_LEN, RealmDescriptor, Signable, Signed,
     valid_federation_url,
 };
 use crate::structs::identity::realm::RealmId;
+use crate::user::id::UserId;
 
 pub const HANDOFF_DOMAIN: &str = "aruna-login-handoff-v1";
 /// Longest lifetime of a handoff.
@@ -93,6 +93,7 @@ impl LoginHandoff {
         nonce: String,
         name: Option<String>,
         now: u64,
+        handoff_id: Ulid,
     ) -> Result<Self, HandoffError> {
         let target = &audience.payload;
         audience.verify(&target.realm_id)?;
@@ -114,7 +115,7 @@ impl LoginHandoff {
             name: name.map(|name| name.chars().take(MAX_NAME_LEN).collect()),
             issued_at: now,
             expires_at: now.saturating_add(MAX_HANDOFF_SECS),
-            handoff_id: Ulid::generate(),
+            handoff_id,
         })
     }
 }
@@ -228,6 +229,7 @@ mod tests {
             secret_nonce(SECRET),
             Some("Ada".to_string()),
             NOW,
+            Ulid::from_bytes([7; 16]),
         )
         .unwrap();
         edit(&mut payload);
@@ -342,11 +344,27 @@ mod tests {
         // The home realm verifies the audience descriptor and never targets itself.
         let mut tampered = accepting().descriptor;
         tampered.payload.name = "Other".to_string();
-        let result = LoginHandoff::new(realm(1), user(), &tampered, String::new(), None, NOW);
+        let result = LoginHandoff::new(
+            realm(1),
+            user(),
+            &tampered,
+            String::new(),
+            None,
+            NOW,
+            Ulid::from_bytes([7; 16]),
+        );
         assert!(matches!(result, Err(HandoffError::Signature(_))));
         let own = settings(AcceptedRealms::Any, 10).descriptor;
         let local = UserId::new(Ulid::from_bytes([5; 16]), realm(2));
-        let result = LoginHandoff::new(realm(2), local, &own, String::new(), None, NOW);
+        let result = LoginHandoff::new(
+            realm(2),
+            local,
+            &own,
+            String::new(),
+            None,
+            NOW,
+            Ulid::from_bytes([7; 16]),
+        );
         assert_eq!(result, Err(HandoffError::WrongAudience));
     }
 }

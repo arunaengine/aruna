@@ -3,10 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
+use crate::auth::RealmAuth;
+use crate::metadata::model::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::metadata::documents::create_metadata_document;
-use crate::routes::metadata::tests::{TestState, drain_metadata_background};
+use crate::routes::metadata::tests::TestState;
 use crate::tests::distributed::{bucket_info, write};
+use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use axum::extract::State;
 use axum::{Extension, Json};
@@ -73,7 +75,7 @@ async fn store_document(
 ) -> Ulid {
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),

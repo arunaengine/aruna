@@ -8,10 +8,11 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::admin_documents::{AdminDocumentClock, AdminDocumentTarget};
+use crate::id::NodeId;
 use crate::plugins::{valid_digest, valid_name, valid_version};
 use crate::secrets::{SecretName, SecretScope};
 use crate::types::{GroupId, RoleId};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 
 /// Bytes of the setting values, as JSON.
 pub const MAX_SETTINGS: usize = 64 * 1024;
@@ -374,13 +375,15 @@ pub(crate) mod tests {
                 install: install.map(Box::new),
             };
         let other = set(Ulid::from_parts(2, 2), Some(record.clone()));
-        let refused = state.apply_operation(&actor, other);
+        let refused = state.apply_operation(&actor, other, ulid::Ulid::generate());
         assert_eq!(refused.err(), Some(AdminDocumentError::InvalidInstall));
         let written = set(record.install_id, Some(record.clone()));
-        state.apply_operation(&actor, written).unwrap();
+        state
+            .apply_operation(&actor, written, ulid::Ulid::generate())
+            .unwrap();
         assert_eq!(state.materialized_installs(), vec![record.clone()]);
         state
-            .apply_operation(&actor, set(record.install_id, None))
+            .apply_operation(&actor, set(record.install_id, None), ulid::Ulid::generate())
             .unwrap();
         assert!(state.materialized_installs().is_empty());
     }

@@ -31,15 +31,7 @@ async fn git(directory: &Path, args: &[&str]) -> String {
 }
 
 fn document(parts: Value, extra: Vec<Value>) -> Value {
-    let mut graph = vec![
-        json!({"@id": "ro-crate-metadata.json", "@type": "CreativeWork",
-            "about": {"@id": "./"}, "conformsTo": {"@id": "https://w3id.org/ro/crate/1.2"}}),
-        json!({"@id": "./", "@type": "Dataset", "name": "Plain", "description": "Plain crate",
-            "datePublished": "2026-09-28", "hasPart": parts,
-            "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"}}),
-    ];
-    graph.extend(extra);
-    json!({"@context": "https://w3id.org/ro/crate/1.2/context", "@graph": graph})
+    aruna_core::testing::crate_document(parts, extra)
 }
 
 fn listed() -> Value {
@@ -388,7 +380,9 @@ async fn reports_main_layout() {
             document_id: id,
             revision: revision.into(),
         };
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         match store.execute(effect, actor).await.expect("layout runs") {
             aruna_core::git::GitEvent::Layout(layout) => layout,
             _ => panic!("unexpected event"),

@@ -276,7 +276,7 @@ fn put_errors_mapped() {
 // A version held only by other members is this node's failure to read, never a missing key.
 #[test]
 fn held_read_internal() {
-    let held = aruna_operations::distribution::pull::HeldElsewhere {
+    let held = aruna_operations::distribution::held::HeldElsewhere {
         set_id: ulid::Ulid::from_bytes([4; 16]),
         version_id: ulid::Ulid::from_bytes([5; 16]),
         identity: [6; 32],
@@ -300,7 +300,7 @@ async fn lists_readable_objects() {
     use rmcp::handler::server::wrapper::Parameters;
     let node = crate::tests::distributed::node_state().await;
     let bucket = crate::tests::distributed::BUCKET;
-    let info = crate::routes::storage::deletion::bucket_info(&node.state, bucket)
+    let info = crate::lookup::bucket_info(&node.state, bucket)
         .await
         .unwrap();
     for key in ["a.md", "secret.md", "z.md"] {
@@ -415,7 +415,7 @@ mod distributed {
     async fn hidden_link(members: &Members, key: &str) {
         use aruna_core::structs::storage::link::LinkTarget;
         use aruna_core::structs::storage::replication::VersionedObjectArn;
-        use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+        use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
         let node = &members.nodes[0];
         let target = LinkTarget {
             arn: VersionedObjectArn {
@@ -451,7 +451,16 @@ mod distributed {
             restrictions: None,
             mirror_guards: Vec::new(),
         };
-        write_reference_version(&node.context, write).await.unwrap();
+        aruna_drivers::driver::drive(
+            WriteReferenceOperation::new(
+                write,
+                std::time::SystemTime::now(),
+                ulid::Ulid::generate(),
+            ),
+            &node.context,
+        )
+        .await
+        .unwrap();
     }
 
     // A text write to a key this member coordinates is stored here as a new version, and the
@@ -628,7 +637,7 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let descriptor = PortableSourceDescriptor {
         kind: SourceConnectorKind::Http,
         public_config: HashMap::new(),
@@ -668,9 +677,12 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.state.get_ctx(), write)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.state.get_ctx(),
+    )
+    .await
+    .unwrap();
 }
 
 // READ that a public role grants on a prefix lists that prefix, external references included,
@@ -681,7 +693,7 @@ async fn lists_public_prefix() {
     use aruna_core::structs::identity::auth::Actor;
     use rmcp::handler::server::wrapper::Parameters;
     let node = node_state().await;
-    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+    let info = crate::lookup::bucket_info(&node.state, BUCKET)
         .await
         .unwrap();
     for key in ["closed.md", "open/b.md"] {
@@ -763,7 +775,7 @@ async fn aggregate_hides_keys() {
     use aruna_core::structs::identity::auth::Actor;
     use rmcp::handler::server::wrapper::Parameters;
     let node = node_state().await;
-    let info = crate::routes::storage::deletion::bucket_info(&node.state, BUCKET)
+    let info = crate::lookup::bucket_info(&node.state, BUCKET)
         .await
         .unwrap();
     for key in ["open.txt", "open.txt.secret"] {
@@ -816,9 +828,7 @@ async fn aggregate_work_bounded() {
     use rmcp::handler::server::wrapper::Parameters;
     let node = node_state().await;
     let state = &node.state;
-    let info = crate::routes::storage::deletion::bucket_info(state, BUCKET)
-        .await
-        .unwrap();
+    let info = crate::lookup::bucket_info(state, BUCKET).await.unwrap();
     let input = WriteObjectInput {
         node_id: None,
         bucket: BUCKET.to_string(),

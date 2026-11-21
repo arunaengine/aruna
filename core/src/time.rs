@@ -1,4 +1,4 @@
-//! Reads the current Unix time in seconds and in milliseconds.
+//! Reads the current Unix time for test helpers, which cannot depend on `aruna-clock`.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 

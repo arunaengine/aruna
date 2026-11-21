@@ -4,16 +4,18 @@
 
 use std::sync::Mutex;
 
-use aruna_core::structs::execution::job::{JobId, RunCrateStatus, RunLink};
-use aruna_operations::jobs::store::put_crate_outcome;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{RunCrateStatus, RunLink};
+use aruna_test_support::jobs::put_crate_outcome;
 use axum::Router;
 use axum::http::StatusCode;
 use ulid::Ulid;
 
 use super::*;
-use crate::routes::storage::relay::RELAY_NODE_HEADER;
+use crate::auth::RealmAuth;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{LOCAL, Node, PEER, node_id, node_state, publish_api};
+use aruna_operations::s3::object::member::rest::RELAY_NODE_HEADER;
 
 async fn run(
     node: &Node,
@@ -28,7 +30,7 @@ async fn run(
     );
     get_run(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Path(run_id.to_string()),
@@ -52,8 +54,7 @@ async fn answers_directed_reads() {
     let status = RunCrateStatus::Written {
         resource: document_id.to_string(),
     };
-    let storage = &node.state.get_ctx().storage_handle;
-    put_crate_outcome(storage, run_id, &status, &link)
+    put_crate_outcome(&node.state.get_ctx(), run_id, &status, &link)
         .await
         .unwrap();
 

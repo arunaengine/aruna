@@ -3,6 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::reducer::placement::{
+    transition_abort_path, transition_barrier_path, transition_drain_path, transition_force_path,
+    transition_path, transition_proof_path, transition_stall_path,
+};
 
 impl AdminDocumentState {
     pub(super) fn apply_transition(

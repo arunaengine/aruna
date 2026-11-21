@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, GROUP_POLICIES_PATH};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::reducer::paths::GROUP_POLICIES_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -18,18 +20,18 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
-use crate::sync::document_outbox::{
+use crate::auth::epoch_due::DueMarks;
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::fence::WriteFence;
+use aruna_core::placement::target_placement_ref;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetGroupConfig {
@@ -44,45 +46,13 @@ pub struct SetGroupConfig {
     pub expected_hash: Option<[u8; 32]>,
 }
 
-/// Replaces a group's deny-only request policy set. Rides the group admin
-/// document machinery, mirroring the realm-scoped set: the value replicates as
-/// one last-writer-wins register carried on the group authorization document.
+/// Replaces a group's deny-only request policy set through the group admin document machinery,
+/// so the value replicates as one last-writer-wins register on the group authorization document.
+/// The write reruns after a lost conflict, since background writes touch the same rows.
 #[derive(Debug, PartialEq)]
 pub struct SetGroupOperation {
     config: SetGroupConfig,
-    txn_id: Option<TxnId>,
-    /// Bucket the authorization row publishes onto, read inside the write
-    /// transaction.
-    fence: crate::placement::fence::WriteFence,
-    state: SetGroupState,
-    conflicts: u8,
-    output: Option<Result<GroupAuthorizationDocument, SetGroupError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SetGroupState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocumentState {
-        document: GroupAuthorizationDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: GroupAuthorizationDocument,
-    },
-    ReadBucketFence {
-        document: GroupAuthorizationDocument,
-    },
-    CommitTransaction {
-        document: GroupAuthorizationDocument,
-    },
-    ScheduleSyncDrain {
-        document: GroupAuthorizationDocument,
-    },
-    Finish,
-    Error,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -101,8 +71,6 @@ pub enum SetGroupError {
     StaleHash,
     #[error("invalid policy set: {reason}")]
     InvalidPolicies { reason: String },
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("the group's bucket cut over to a new holder set; retry the change")]
     PlacementFenced,
     #[error("operation did not finish")]
@@ -111,33 +79,32 @@ pub enum SetGroupError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
+}
+
+impl From<IoError> for SetGroupError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SetGroup".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 impl SetGroupOperation {
     pub fn new(config: SetGroupConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            fence: Default::default(),
-            state: SetGroupState::Init,
-            conflicts: 0,
-            output: None,
-        }
-    }
-
-    /// A conflicted commit already discarded its transaction, so the retry
-    /// opens a fresh one and rereads every row, including the realm config.
-    fn restart_after_conflict(&mut self) -> Effects {
-        self.conflicts += 1;
-        self.fence = Default::default();
-        self.start()
-    }
-
-    fn document_ref(&self) -> DocumentTarget {
-        DocumentTarget::GroupAuthorization {
-            group_id: self.config.group_id,
+            authorized: false,
         }
     }
 
@@ -148,34 +115,110 @@ impl SetGroupOperation {
         )
     }
 
-    fn admin_target(&self) -> AdminDocumentTarget {
-        AdminDocumentTarget::Group {
+    fn change(&self) -> IoCall {
+        let config = self.config.clone();
+        let seed = self.config.group_id.to_bytes();
+        let build = move || GroupPoliciesWrite::new(config.clone());
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
+
+impl Operation for SetGroupOperation {
+    type Output = GroupAuthorizationDocument;
+    type Error = SetGroupError;
+
+    fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return Err(SetGroupError::Unauthorized);
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: self.admin_config_path(),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
+        if self.authorized {
+            return result
+                .child::<GroupAuthorizationDocument, SetGroupError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                Ok(Next::Call(self.change()))
+            }
+            Ok(false) => Err(SetGroupError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Group policy authorization check failed");
+                match error {
+                    AuthorizationError::StorageError(error) => Err(error.into()),
+                    _ => Err(SetGroupError::Unauthorized),
+                }
+            }
+        }
+    }
+}
+
+/// What the group policy transaction waits for.
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Read,
+    Write,
+    Delete,
+    Fence,
+    Marks,
+}
+
+/// Reads, validates and stores the group's policy set in one write transaction, takes the bucket
+/// fence, and marks the group's key epochs due, since a new deny can narrow access.
+#[derive(Debug, PartialEq)]
+struct GroupPoliciesWrite {
+    config: SetGroupConfig,
+    stage: Stage,
+    /// Bucket the authorization row publishes onto, read inside the write transaction.
+    fence: WriteFence,
+    document: Option<GroupAuthorizationDocument>,
+    deletes: Vec<(KeySpace, Key)>,
+    marks: DueMarks,
+    ids: IdMint,
+    now_ms: u64,
+}
+
+impl GroupPoliciesWrite {
+    fn new(config: SetGroupConfig) -> Self {
+        let marks = DueMarks::new(Some(config.group_id), 0);
+        Self {
+            config,
+            stage: Stage::Read,
+            fence: Default::default(),
+            document: None,
+            deletes: Vec::new(),
+            marks,
+            ids: IdMint::default(),
+            now_ms: 0,
+        }
+    }
+
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::GroupAuthorization {
             group_id: self.config.group_id,
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = SetGroupState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-                (
-                    REALM_CONFIG_KEYSPACE.to_string(),
-                    ByteView::from(*self.config.actor.realm_id.as_bytes()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+    fn admin_target(&self) -> AdminDocumentTarget {
+        AdminDocumentTarget::Group {
+            group_id: self.config.group_id,
+        }
     }
 
     fn emit_write_state(
@@ -183,10 +226,7 @@ impl SetGroupOperation {
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
         realm_config_value: Option<Value>,
-    ) -> Result<Effects, SetGroupError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(SetGroupError::MissingTransaction);
-        };
+    ) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
         validate_policy_set(&self.config.policies)
             .map_err(|reason| SetGroupError::InvalidPolicies { reason })?;
 
@@ -224,6 +264,7 @@ impl SetGroupOperation {
             AdminDocumentOperation::GroupPoliciesSet {
                 policies: self.config.policies.clone(),
             },
+            self.ids.mint(self.now_ms),
         )?;
         apply_reducer_policies(&mut document, &reducer_state);
 
@@ -263,228 +304,111 @@ impl SetGroupOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = SetGroupState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document);
+        self.deletes = stale_conflict_deletes;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    /// Takes the bucket's fence inside the transaction before committing, so a
-    /// departing holder's close rejects or conflicts this write.
-    fn emit_commit_transaction(&mut self, document: GroupAuthorizationDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetGroupError::MissingTransaction);
-        };
+    /// Takes the bucket's fence inside the transaction before committing, so a departing
+    /// holder's close rejects or conflicts this write.
+    fn after_writes(&mut self) -> Next<GroupAuthorizationDocument> {
         if self.fence.is_empty() {
-            return self.emit_commit(document);
+            return self.marks();
         }
-        self.state = SetGroupState::ReadBucketFence { document };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
+        self.stage = Stage::Fence;
+        Next::Call(IoCall::Read(self.fence.reads()))
     }
 
-    fn emit_commit(&mut self, document: GroupAuthorizationDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetGroupError::MissingTransaction);
-        };
-        self.state = SetGroupState::CommitTransaction { document };
-        smallvec![crate::abe::mark_due(Some(self.config.group_id), txn_id)]
+    fn marks(&mut self) -> Next<GroupAuthorizationDocument> {
+        self.stage = Stage::Marks;
+        Next::Call(self.marks.first())
     }
 
-    fn fail(&mut self, error: SetGroupError) -> Effects {
-        let cleanup = self.abort();
-        self.state = SetGroupState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(SetGroupError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
+        let output = self.document.take().ok_or(SetGroupError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl Operation for SetGroupOperation {
+impl Operation for GroupPoliciesWrite {
     type Output = GroupAuthorizationDocument;
     type Error = SetGroupError;
 
-    fn start(&mut self) -> Effects {
-        if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetGroupError::Unauthorized);
-        }
-        self.state = SetGroupState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: self.admin_config_path(),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let (SetGroupState::CommitTransaction { .. }, Some(txn_id)) = (&self.state, self.txn_id)
-            && let Some(next) = crate::abe::marked(&event, txn_id)
-        {
-            return next.unwrap_or_else(|error| self.fail(error.into()));
-        }
-        match self.state.clone() {
-            SetGroupState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => {
-                            self.state = SetGroupState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
-                        Ok(false) => self.fail(SetGroupError::Unauthorized),
-                        Err(error) => {
-                            warn!(error = %error, "Group policy authorization check failed");
-                            match error {
-                                AuthorizationError::StorageError(error) => {
-                                    self.fail(SetGroupError::StorageError(error))
-                                }
-                                _ => self.fail(SetGroupError::Unauthorized),
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
-            },
-            SetGroupState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            SetGroupState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [
-                        (_, document_value),
-                        (_, reducer_state_value),
-                        (_, realm_config_value),
-                    ] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            "storage batch read result with group auth doc, admin state, and realm config",
-                            format!("{values:?}"),
-                        );
-                    };
-                    match self.emit_write_state(
-                        document_value.clone(),
-                        reducer_state_value.clone(),
-                        realm_config_value.clone(),
-                    ) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
-            },
-            SetGroupState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetGroupError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetGroupState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
-                    }
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            SetGroupState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
-            SetGroupState::ReadBucketFence { document } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if self.fence.admits(&values) {
-                        self.emit_commit(document)
-                    } else {
-                        self.fail(SetGroupError::PlacementFenced)
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("bucket fence read result", format!("{other:?}")),
-            },
-            SetGroupState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetGroupState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    if error == StorageError::TransactionConflict
-                        && self.conflicts < super::CONFLICT_RETRIES
-                    {
-                        return self.restart_after_conflict();
-                    }
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            SetGroupState::ScheduleSyncDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetGroupState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetGroupState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
-            },
-            SetGroupState::Finish | SetGroupState::Error | SetGroupState::Init => {
-                smallvec![]
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        self.marks.stamp(now_ms);
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn conflict_retries() -> u32 {
+        u32::from(super::CONFLICT_RETRIES)
+    }
+
+    fn first(&mut self) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
+        let document = self.document_ref();
+        let target = self.admin_target();
+        Ok(Next::Call(IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE.to_string(),
+                ByteView::from(*self.config.actor.realm_id.as_bytes()),
+            ),
+        ])))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer, realm_config] = aruna_core::rows::values::<3>(result)?;
+                self.emit_write_state(document, reducer, realm_config)
             }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SetGroupState::Finish | SetGroupState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SetGroupError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            Stage::Write if !self.deletes.is_empty() => {
+                result.done()?;
+                self.stage = Stage::Delete;
+                Ok(Next::Call(IoCall::Delete(std::mem::take(
+                    &mut self.deletes,
+                ))))
+            }
+            Stage::Write | Stage::Delete => {
+                result.done()?;
+                Ok(self.after_writes())
+            }
+            Stage::Fence => {
+                let IoResult::Values(values) = result else {
+                    return Err(SetGroupError::NotFinished);
+                };
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(SetGroupError::PlacementFenced);
+                }
+                Ok(self.marks())
+            }
+            Stage::Marks => match self.marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => self.finish(),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
+            },
         }
     }
 }
@@ -504,22 +428,22 @@ fn apply_reducer_policies(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetGroupConfig, SetGroupError, SetGroupOperation, SetGroupState};
-    use crate::driver::{DriverContext, drive};
+    use super::{GroupPoliciesWrite, SetGroupConfig, SetGroupError, SetGroupOperation};
+    use crate::document_repository::{GetGroupConfig, GetGroupOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use crate::groups::get_group::{GetGroupConfig, GetGroupOperation};
-    use aruna_core::UserId;
-    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+    use aruna_core::effects::StorageEffect;
     use aruna_core::errors::{AuthorizationError, StorageError};
-    use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
-    use aruna_core::operation::Operation;
+    use aruna_core::operation::{Operation, TransactionMode};
     use aruna_core::request_policy::RequestPolicy;
     use aruna_core::structs::identity::auth::{Actor, AuthContext};
     use aruna_core::structs::identity::group::GroupAuthorizationDocument;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
-    use aruna_core::types::TxnId;
-    use aruna_storage::storage::FjallStorage;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -533,12 +457,7 @@ mod tests {
     }
 
     fn auth(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn group_config(
@@ -593,9 +512,10 @@ mod tests {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_id = RealmId([23u8; 32]);
         let actor = actor(realm_id);
@@ -723,135 +643,58 @@ mod tests {
         assert!(auth_doc.policies.is_empty());
     }
 
-    #[test]
-    fn retries_commit_conflict() {
-        let realm_id = RealmId([24u8; 32]);
+    fn checked(
+        allowed: Result<bool, AuthorizationError>,
+    ) -> Result<Next<GroupAuthorizationDocument>, SetGroupError> {
+        let realm_id = RealmId([23u8; 32]);
         let actor = actor(realm_id);
-        let group_id = Ulid::from_bytes([10u8; 16]);
-        let config = group_config(&actor, group_id, Vec::new(), None);
-        let conflict = || {
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            })
-        };
-        let mut operation = SetGroupOperation::new(config.clone());
-        let commit = |operation: &mut SetGroupOperation| {
-            operation.txn_id = Some(TxnId::generate());
-            operation.state = SetGroupState::CommitTransaction {
-                document: GroupAuthorizationDocument {
-                    group_id,
-                    policies: Vec::new(),
-                    roles: Default::default(),
-                },
-            };
-            operation.step(conflict())
-        };
-
-        for _ in 0..crate::groups::CONFLICT_RETRIES {
-            let effects = commit(&mut operation);
-            assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-            assert_eq!(operation.state, SetGroupState::Auth);
-            assert_eq!(operation.txn_id, None);
-        }
-        assert!(commit(&mut operation).is_empty());
-        assert_eq!(
-            operation.finalize(),
-            Err(SetGroupError::StorageError(
-                StorageError::TransactionConflict
-            ))
-        );
-
-        // Before the commit the transaction is still open, so a conflict aborts it.
-        let mut operation = SetGroupOperation::new(config);
-        let txn_id = TxnId::generate();
-        operation.txn_id = Some(txn_id);
-        operation.state = SetGroupState::ReadCurrent;
-        let effects = operation.step(conflict());
+        let group_id = Ulid::from_bytes([5u8; 16]);
+        let mut operation =
+            SetGroupOperation::new(group_config(&actor, group_id, Vec::new(), None));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { txn_id: id })] if *id == txn_id
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        assert_eq!(operation.state, SetGroupState::Error);
+        operation.next(IoResult::Child(ChildOutcome::new(allowed)))
     }
 
     #[test]
-    fn start_checks_permission() {
-        let realm_id = RealmId([23u8; 32]);
-        let group_id = Ulid::from_bytes([5u8; 16]);
-        let actor = actor(realm_id);
-        let mut operation =
-            SetGroupOperation::new(group_config(&actor, group_id, Vec::new(), None));
-        let effects = operation.start();
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let emitted = format!("{effects:?}");
-        assert!(emitted.contains(&format!("/{realm_id}/g/{group_id}/admin/config")));
-        assert!(emitted.contains("WRITE"));
+    fn retries_commit_conflict() {
+        // A lost commit reruns the whole write, rereading every row, up to the retry bound.
+        let conflict = SetGroupError::from(IoError::Conflict);
+        assert!(GroupPoliciesWrite::is_conflict(&conflict));
+        assert_eq!(
+            GroupPoliciesWrite::conflict_retries(),
+            u32::from(crate::groups::CONFLICT_RETRIES)
+        );
+        let actor = actor(RealmId([24u8; 32]));
+        let config = group_config(&actor, Ulid::from_bytes([10u8; 16]), Vec::new(), None);
+        assert_eq!(
+            GroupPoliciesWrite::new(config).transaction(),
+            TransactionMode::Write
+        );
     }
 
     #[test]
     fn denied_is_terminal() {
-        let realm_id = RealmId([23u8; 32]);
-        let actor = actor(realm_id);
-        let mut operation = SetGroupOperation::new(group_config(
-            &actor,
-            Ulid::from_bytes([5u8; 16]),
-            Vec::new(),
-            None,
-        ));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(SetGroupError::Unauthorized));
+        assert_eq!(checked(Ok(false)), Err(SetGroupError::Unauthorized));
     }
 
     #[test]
     fn capacity_not_denied() {
         // Storage exhaustion inside the check is infrastructure, not a verdict.
-        let realm_id = RealmId([23u8; 32]);
-        let actor = actor(realm_id);
-        let mut operation = SetGroupOperation::new(group_config(
-            &actor,
-            Ulid::from_bytes([5u8; 16]),
-            Vec::new(),
-            None,
-        ));
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult {
-                allowed: Err(AuthorizationError::StorageError(
-                    StorageError::CleanupCapacity,
-                )),
-            },
-        ));
-        assert!(operation.is_complete());
+        let capacity = AuthorizationError::StorageError(StorageError::CleanupCapacity);
         assert_eq!(
-            operation.finalize(),
+            checked(Err(capacity)),
             Err(SetGroupError::StorageError(StorageError::CleanupCapacity))
         );
     }
 
     #[test]
-    fn allowed_starts_transaction() {
-        let realm_id = RealmId([23u8; 32]);
-        let actor = actor(realm_id);
-        let mut operation = SetGroupOperation::new(group_config(
-            &actor,
-            Ulid::from_bytes([5u8; 16]),
-            Vec::new(),
-            None,
+    fn allowed_starts_write() {
+        assert!(matches!(
+            checked(Ok(true)),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        );
     }
 }

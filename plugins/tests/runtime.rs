@@ -8,18 +8,22 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aruna_plugins::artifact::read_manifest;
+use aruna_plugin_types::artifact::read_manifest;
+use aruna_plugin_types::calls::{
+    Created, Document, Entry, ErrorKind, FilePage, HostError, Intent, JobStatus, Listing,
+    ObjectInfo, ObjectPage, Response,
+};
+use aruna_plugin_types::manifest::Manifest;
+use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, FileChange, FilePage, HostError,
-    Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobUpload, MetadataCreate,
+    MetadataPatch, SendRequest, StatePut, StateRemove,
 };
+use aruna_plugins::host::Limit;
+use aruna_plugins::host::wit::aruna::plugin::types::{FailureKind, Trigger, WatchEvent};
 use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Permission;
-use aruna_plugins::{
-    CancellationToken, FailureKind, Invocation, InvokeError, Limit, Runtime, Trigger, WatchEvent,
-};
+use aruna_plugins::runtime::{CompileError, Invocation, InvokeError, Runtime};
 use wasm_encoder::{ComponentSection, CustomSection};
 
 const FIXTURE: &[u8] = include_bytes!("fixture.wasm");
@@ -35,6 +39,8 @@ struct Recorder {
     abandoned: Mutex<Vec<u32>>,
     /// Signals that a call to the `block` resource is waiting.
     blocked: tokio::sync::Notify,
+    /// Lets a write to the `slow` resource finish.
+    released: tokio::sync::Notify,
 }
 
 impl Recorder {
@@ -68,6 +74,7 @@ impl Broker for Recorder {
                     json: format!(r#"{{"name":"{}"}}"#, "x".repeat(8192)),
                 });
             }
+            // Real time: a host call that takes wall time while the guest waits on it.
             "slow" => tokio::time::sleep(Duration::from_millis(50)).await,
             "block" => {
                 self.blocked.notify_one();
@@ -103,7 +110,7 @@ impl Broker for Recorder {
         self.intents.lock().unwrap().push(patch.intent);
         match patch.resource.as_str() {
             "stall" => std::future::pending::<()>().await,
-            "slow" => tokio::time::sleep(Duration::from_millis(1500)).await,
+            "slow" => self.released.notified().await,
             _ => {}
         }
         self.note("metadata_patch_done");
@@ -334,6 +341,24 @@ fn runtime() -> Runtime {
     let mut config = RuntimeConfig::default();
     config.ceiling.fuel = 1 << 50;
     Runtime::new(config).unwrap()
+}
+
+#[tokio::test]
+async fn refuses_large_first() {
+    // An artifact over the limit is refused at once, before it is hashed or waits for a slot.
+    let config = RuntimeConfig {
+        max_artifact: 4,
+        ..RuntimeConfig::default()
+    };
+    let runtime = Runtime::new(config).unwrap();
+    let mut prepared = std::pin::pin!(runtime.prepare(vec![0; 5]));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    let first = prepared.as_mut().poll(&mut context);
+    let refused = matches!(
+        first,
+        std::task::Poll::Ready(Err(CompileError::TooLarge { size: 5, limit: 4 }))
+    );
+    assert!(refused, "the first poll refuses the artifact");
 }
 
 fn call(trigger: Trigger) -> Invocation {
@@ -638,7 +663,7 @@ async fn narrow_requests_compile() {
         .permissions
         .optional
         .remove(&Permission::MetadataWrite);
-    let artifact = aruna_plugins::artifact::attach_manifest(component, &narrow).unwrap();
+    let artifact = aruna_plugin_types::artifact::attach_manifest(component, &narrow).unwrap();
     assert!(runtime().compile(&artifact).is_ok());
     let runtime = runtime();
     let compiled = runtime.compile(FIXTURE).unwrap();
@@ -683,7 +708,12 @@ async fn write_outlives_timeout() {
     );
     patch.limits.wall = Duration::from_secs(1);
     patch.limits.write = Duration::from_secs(5);
-    let ended = invoke(patch, broker.clone()).await;
+    // The write ends after the wall limit and inside the write limit, on paused time.
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        broker.released.notify_one();
+    };
+    let (ended, ()) = tokio::join!(invoke(patch, broker.clone()), release);
     assert!(matches!(ended, Err(InvokeError::Timeout)), "{ended:?}");
     assert_eq!(
         broker.calls(),

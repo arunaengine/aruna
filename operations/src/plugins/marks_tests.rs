@@ -3,13 +3,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::PluginWorkSpec;
+use crate::plugins::calls::*;
+use aruna_core::structs::execution::job::input::PluginWorkSpec;
+use aruna_drivers::driver::drive;
 
 use super::*;
-use crate::jobs::plugin_work::tests::ready_copy;
-use crate::plugins::install::read_config;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::work::{retire_work, update_work};
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::values_result;
+use crate::plugins::rows::write_rows;
+use crate::plugins::test_support::edit_work;
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_core::calls::IoCall;
+use aruna_drivers::driver::DriverContext;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::ready_copy;
 
 /// The current version of the copy's source object `in/a.txt`.
 async fn source_version(ctx: &DriverContext) -> Ulid {
@@ -30,10 +37,8 @@ async fn mark(ctx: &DriverContext, version: Version<'_>, (install_id, work_id): 
         kind: WorkKind::Download,
         at_ms: 1,
     };
-    let write = transact(ctx, async |txn: &Txn<'_>| {
-        mark_in(txn, version, &mark).await
-    });
-    write.await.unwrap();
+    let marked = mark_row(version, &mark).unwrap();
+    drive(write_rows(vec![marked]), ctx).await.unwrap();
 }
 
 fn work_of(spec: &PluginWorkSpec) -> (Ulid, Ulid) {
@@ -52,13 +57,29 @@ async fn sweep_awaits_work() {
     mark(&blob, ("in", "b.txt", orphan), unknown).await;
     // The orphan's work is gone and its version absent; the copy's work may still write.
     assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
-    assert!(!is_marked(&blob, ("in", "b.txt", orphan)).await.unwrap());
-    assert!(is_marked(&blob, ("in", "a.txt", absent)).await.unwrap());
-    let settle = update_work(&blob, work_of(&spec), |row| row.state = WorkState::Settled);
+    assert!(
+        !drive(is_marked(("in", "b.txt", orphan)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
+    assert!(
+        drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
+    let settle = edit_work(&blob, work_of(&spec), |row| row.state = WorkState::Settled);
     settle.await.unwrap();
     assert_eq!(sweep_marks(&blob).await.unwrap(), 1);
-    assert!(!is_marked(&blob, ("in", "a.txt", absent)).await.unwrap());
-    assert!(is_marked(&blob, ("in", "a.txt", present)).await.unwrap());
+    assert!(
+        !drive(is_marked(("in", "a.txt", absent)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
+    assert!(
+        drive(is_marked(("in", "a.txt", present)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
 
     // Removing the install deletes its work rows, never its marks; a written version keeps its
     // mark for any later install.
@@ -66,5 +87,95 @@ async fn sweep_awaits_work() {
     config.installs.clear();
     assert_eq!(retire_work(&blob, &config, 9).await.unwrap(), 1);
     assert_eq!(sweep_marks(&blob).await.unwrap(), 0);
-    assert!(is_marked(&blob, ("in", "a.txt", present)).await.unwrap());
+    assert!(
+        drive(is_marked(("in", "a.txt", present)).unwrap(), &blob)
+            .await
+            .unwrap()
+    );
+}
+
+#[test]
+fn mark_work_ended() {
+    let mark = Mark {
+        install_id: Ulid::from_parts(1, 1),
+        work_id: Ulid::from_parts(2, 2),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let mut plan = MarkEnded {
+        lookup: WorkLookup::new(mark.install_id, mark.work_id),
+        key: Some(b"mark".to_vec()),
+        deleted: false,
+    };
+    assert!(matches!(plan.first().unwrap(), Next::Call(IoCall::Read(_))));
+    // A gone work row ends the mark, which goes in the same transaction.
+    let delete = delete_call(vec![(PLUGIN_WORK_KEYSPACE, b"mark".to_vec())]);
+    assert_eq!(
+        plan.next(values_result(vec![None])).unwrap(),
+        Next::Call(delete)
+    );
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(true));
+    let mut check = MarkEnded {
+        lookup: WorkLookup::new(mark.install_id, mark.work_id),
+        key: None,
+        deleted: false,
+    };
+    assert_eq!(
+        check.next(values_result(vec![None])).unwrap(),
+        Next::Done(true)
+    );
+}
+
+fn mark_row_of(version: Ulid) -> (Vec<u8>, Vec<u8>) {
+    let mark = Mark {
+        install_id: Ulid::from_parts(1, 1),
+        work_id: Ulid::from_parts(2, 2),
+        job: None,
+        kind: WorkKind::Download,
+        at_ms: 1,
+    };
+    let key = mark_key(("b", "k", version)).unwrap();
+    (key, encode(&mark).unwrap())
+}
+
+fn marks_page(rows: Vec<(Vec<u8>, Vec<u8>)>) -> IoResult {
+    crate::plugins::rows::tests::page_result(rows, None)
+}
+
+fn is_child(next: Next<usize>) -> bool {
+    matches!(next, Next::Call(IoCall::Child(_)))
+}
+
+#[test]
+fn sweep_drops_ended() {
+    let mut sweep = SweepMarks::new();
+    assert!(matches!(sweep.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let page = marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]);
+    assert!(is_child(sweep.next(page).unwrap()), "the work is asked");
+    let ended = child_result(Ok::<bool, StoreError>(true));
+    assert!(is_child(sweep.next(ended).unwrap()), "the version is asked");
+    let gone = child_result(Ok::<bool, ()>(true));
+    assert!(is_child(sweep.next(gone).unwrap()), "the mark goes");
+    let dropped = child_result(Ok::<bool, StoreError>(true));
+    assert_eq!(sweep.next(dropped), Ok(Next::Done(1)));
+}
+
+#[test]
+fn sweep_keeps_live() {
+    let mut running = SweepMarks::new();
+    running
+        .next(marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]))
+        .unwrap();
+    let busy = child_result(Ok::<bool, StoreError>(false));
+    assert_eq!(running.next(busy), Ok(Next::Done(0)));
+    let mut present = SweepMarks::new();
+    present
+        .next(marks_page(vec![mark_row_of(Ulid::from_parts(3, 3))]))
+        .unwrap();
+    present
+        .next(child_result(Ok::<bool, StoreError>(true)))
+        .unwrap();
+    let there = child_result(Ok::<bool, ()>(false));
+    assert_eq!(present.next(there), Ok(Next::Done(0)));
 }

@@ -4,8 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::routes::{test_context, test_state, test_storage};
-use aruna_core::UserId;
+use crate::auth::UnrestrictedAuth;
+use crate::tests::routes::{test_state, test_storage};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::handle::Handle;
@@ -16,18 +16,16 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::identity::user::User;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
+use aruna_drivers::testing::test_context;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 use ulid::Ulid;
 
 /// Stores the realm config with this node as its only manager, and an email profile when
 /// `email` is set.
-async fn store_config(
-    context: &aruna_operations::driver::DriverContext,
-    actor: &Actor,
-    email: bool,
-) {
+async fn store_config(context: &aruna_drivers::driver::DriverContext, actor: &Actor, email: bool) {
     let mut config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     config.ensure_node(actor.node_id, RealmNodeKind::Management);
     config.email = email.then(|| RealmEmailProfile {
@@ -64,7 +62,7 @@ fn request(address: &str) -> Json<EmailRequest> {
 }
 
 /// A management node of a realm whose id is the realm key, and a caller with a verified address.
-async fn management_state() -> (TempDir, Arc<ServerState>, Actor, Option<AuthContext>) {
+async fn management_state() -> (TempDir, Arc<ServerState>, Actor, AuthContext) {
     let (dir, storage) = test_storage();
     let realm_key = SigningKey::from_bytes(&[5u8; 32]);
     let realm_id = RealmId::from_bytes(realm_key.verifying_key().to_bytes());
@@ -79,16 +77,16 @@ async fn management_state() -> (TempDir, Arc<ServerState>, Actor, Option<AuthCon
     seed_user(&context, &actor).await;
     let capabilities = NodeCapabilities::management_node(realm_key).unwrap();
     let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
-    let auth = Some(AuthContext {
+    let auth = AuthContext {
         user_id,
         realm_id,
         path_restrictions: None,
         session: None,
-    });
+    };
     (dir, state, actor, auth)
 }
 
-async fn seed_user(context: &aruna_operations::driver::DriverContext, actor: &Actor) {
+async fn seed_user(context: &aruna_drivers::driver::DriverContext, actor: &Actor) {
     let user = User {
         user_id: actor.user_id,
         name: "Ada".to_string(),
@@ -118,7 +116,7 @@ async fn route_needs_verification() {
     let set = |address: &'static str| {
         set_email(
             State(state.clone()),
-            Extension(auth.clone()),
+            UnrestrictedAuth(auth.clone()),
             request(address),
         )
     };
@@ -137,18 +135,18 @@ async fn write_stores_locally() {
     store_config(&state.get_ctx(), &actor, true).await;
     let set = set_email(
         State(state.clone()),
-        Extension(auth.clone()),
+        UnrestrictedAuth(auth.clone()),
         request("ada@example.org"),
     );
     let Json(created) = set.await.unwrap();
-    let Json(read) = get_email(State(state.clone()), Extension(auth.clone()))
+    let Json(read) = get_email(State(state.clone()), UnrestrictedAuth(auth.clone()))
         .await
         .unwrap();
     assert_eq!(read, created);
     assert!(!serde_json::to_string(&read).unwrap().contains("ada@"));
-    let removed = delete_email(State(state.clone()), Extension(auth.clone())).await;
+    let removed = delete_email(State(state.clone()), UnrestrictedAuth(auth.clone())).await;
     assert_eq!(removed.unwrap(), StatusCode::NO_CONTENT);
-    let read = get_email(State(state), Extension(auth)).await;
+    let read = get_email(State(state), UnrestrictedAuth(auth)).await;
     assert!(matches!(read, Err(ServerError::NotFound)));
 }
 
@@ -166,21 +164,21 @@ fn storage_error_internal() {
 #[tokio::test]
 async fn config_error_unavailable() {
     let (_dir, state, _actor, auth) = management_state().await;
-    let read = get_email(State(state.clone()), Extension(auth.clone())).await;
+    let read = get_email(State(state.clone()), UnrestrictedAuth(auth.clone())).await;
     assert!(matches!(
         read,
         Err(ServerError::ServiceUnavailableReason(_))
     ));
     let set = set_email(
         State(state.clone()),
-        Extension(auth.clone()),
+        UnrestrictedAuth(auth.clone()),
         request("ada@example.org"),
     );
     assert!(matches!(
         set.await,
         Err(ServerError::ServiceUnavailableReason(_))
     ));
-    let removed = delete_email(State(state), Extension(auth)).await;
+    let removed = delete_email(State(state), UnrestrictedAuth(auth)).await;
     assert!(matches!(
         removed,
         Err(ServerError::ServiceUnavailableReason(_))
@@ -195,21 +193,21 @@ async fn device_node_refuses() {
     let context = Arc::new(test_context(storage));
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
     let state = Arc::new(test_state(context, realm_id, node_id, capabilities).await);
-    let auth = Some(AuthContext {
+    let auth = AuthContext {
         user_id: UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
-    });
-    let read = get_email(State(state.clone()), Extension(auth.clone())).await;
+    };
+    let read = get_email(State(state.clone()), UnrestrictedAuth(auth.clone())).await;
     assert!(matches!(read, Err(ServerError::Conflict(_))));
     let set = set_email(
         State(state.clone()),
-        Extension(auth.clone()),
+        UnrestrictedAuth(auth.clone()),
         request("ada@example.org"),
     );
     assert!(matches!(set.await, Err(ServerError::Conflict(_))));
-    let removed = delete_email(State(state), Extension(auth)).await;
+    let removed = delete_email(State(state), UnrestrictedAuth(auth)).await;
     assert!(matches!(removed, Err(ServerError::Conflict(_))));
 }
 
@@ -248,7 +246,9 @@ async fn get_shows_current() {
             .send_effect(Effect::Storage(write))
             .await;
     }
-    let Json(read) = get_email(State(state), Extension(auth)).await.unwrap();
+    let Json(read) = get_email(State(state), UnrestrictedAuth(auth))
+        .await
+        .unwrap();
     assert_eq!(read.created_at_ms, 3);
     assert!(!serde_json::to_string(&read).unwrap().contains("canary"));
 }

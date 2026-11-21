@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::compute::Secret;
 use crate::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret, EncryptionError};
 use crate::errors::ConversionError;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
@@ -141,9 +141,10 @@ impl AssistantProvider {
         &mut self,
         key: &CredentialEncryptionKey,
         secret: &AssistantProviderSecret,
+        nonce: [u8; 24],
     ) -> Result<(), AssistantSecretError> {
         let plaintext = serde_json::to_string(secret)?;
-        self.secret = EncryptedS3Secret::encrypt(key, &plaintext, &self.field_aad(1))?;
+        self.secret = EncryptedS3Secret::encrypt(key, &plaintext, &self.field_aad(1), nonce)?;
         Ok(())
     }
 
@@ -159,9 +160,10 @@ impl AssistantProvider {
         &mut self,
         key: &CredentialEncryptionKey,
         headers: &AssistantHeaders,
+        nonce: [u8; 24],
     ) -> Result<(), AssistantSecretError> {
         let plaintext = serde_json::to_string(headers)?;
-        self.headers = EncryptedS3Secret::encrypt(key, &plaintext, &self.field_aad(2))?;
+        self.headers = EncryptedS3Secret::encrypt(key, &plaintext, &self.field_aad(2), nonce)?;
         Ok(())
     }
 

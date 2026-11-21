@@ -3,42 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobKind, JobStatusView};
-use aruna_core::keyspaces::FAMILY_ALIAS_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    ExecutionRole, JobError, JobFamilyId, JobFamilyRecord, JobId, JobPayload, JobProgress,
-    JobProjection, JobRecord, JobResultPayload, JobState, LogicalJobSpec, LogicalJobState,
-    PhysicalExecutionState, ResultMessage, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    JobProjection, LogicalJobSpec, LogicalJobState, PhysicalExecutionState, ResultMessage,
 };
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::unix_timestamp_millis;
-
-use std::time::Duration;
-
-use super::ids::{session_of, workspace_of};
-use crate::driver::{DriverContext, drive};
-use crate::jobs::records::keys::{alias_family, alias_prefix};
-use crate::jobs::records::{
-    FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily, RecordStoreError,
-    load_family_complete,
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobProgress, JobResultPayload, WorkspaceMode,
 };
-use crate::jobs::service::{RoutedJobStatus, read_owned_job};
-use crate::jobs::store::iter_prefix_page;
-use crate::jobs::{JobRouteError, MUTATE_MAX_ATTEMPTS};
 
-/// Families one alias may resolve to. Two families claiming one id is an
-/// anomaly that stays visible instead of rebinding the first one.
-const MAX_ALIAS_FAMILIES: usize = 8;
+use crate::jobs::records::project::ProjectedFamily;
+use crate::jobs::route::JobRouteError;
+use aruna_core::job_request::workspace_of;
 
 /// Why a partial projection answers nothing: it reduced only part of its
 /// family, so its state, executions, and outputs are unknown, never absent.
 const TRUNCATED: &str = "job family projection is truncated";
-
-/// A projection that lost its transaction every time is busy, not failed: the
-/// caller reads again rather than seeing a storage error.
-const BUSY: &str = "job status is busy, try again";
 
 /// Whether a projection may be decided on. An audit read may inspect a
 /// truncated one; a status answer or a routing choice may not.
@@ -47,214 +27,6 @@ pub(crate) fn decidable(projected: &ProjectedFamily) -> Result<(), JobRouteError
         true => Err(JobRouteError::Unavailable(TRUNCATED.to_string())),
         false => Ok(()),
     }
-}
-
-/// The request family one accepted alias belongs to. Ordered by key, so two
-/// families claiming one alias resolve identically on every replica.
-pub async fn family_of_alias(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<JobFamilyId>, JobRouteError> {
-    let (rows, _) = iter_prefix_page(
-        &context.storage_handle,
-        FAMILY_ALIAS_KEYSPACE,
-        Some(alias_prefix(job_id)),
-        None,
-        MAX_ALIAS_FAMILIES,
-        None,
-    )
-    .await
-    .map_err(JobRouteError::Unavailable)?;
-    Ok(rows.iter().filter_map(|(key, _)| alias_family(key)).min())
-}
-
-/// Drives one projection, retrying a lost optimistic transaction with the same
-/// bounded backoff a job mutation uses. `None` names no family here.
-async fn project_alias(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<ProjectedFamily>, JobRouteError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        match drive(
-            ProjectFamilyOperation::new(ProjectFamilyConfig {
-                family: FamilyRef::Alias(job_id),
-                now_ms: unix_timestamp_millis(),
-                rebuild: false,
-            }),
-            context,
-        )
-        .await
-        {
-            Ok(projected) => return Ok(Some(projected)),
-            Err(RecordStoreError::UnknownAlias) => return Ok(None),
-            Err(error) if error.is_conflict() => {
-                tokio::time::sleep(Duration::from_millis(1 << attempt.min(6))).await;
-            }
-            Err(error) => return Err(JobRouteError::Unavailable(error.to_string())),
-        }
-    }
-    Err(JobRouteError::Unavailable(BUSY.to_string()))
-}
-
-/// The reduced family of one alias plus the stored spec of its canonical claim.
-pub async fn family_projection(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<(ProjectedFamily, LogicalJobSpec)>, JobRouteError> {
-    let Some(projected) = project_alias(context, job_id).await? else {
-        return Ok(None);
-    };
-    let canonical = projected
-        .projection
-        .as_ref()
-        .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?
-        .canonical_job_id;
-    let records = load_family_complete(context, projected.family)
-        .await
-        .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
-    let spec = records.iter().find_map(|envelope| match &envelope.record {
-        JobFamilyRecord::Spec(spec) if spec.job_id == canonical => Some(spec.as_ref().clone()),
-        _ => None,
-    });
-    Ok(Some((
-        projected,
-        spec.ok_or_else(|| JobRouteError::Unavailable("job family spec unavailable".to_string()))?,
-    )))
-}
-
-/// Answers one status read from the family. `None` means the alias names no
-/// family here, so the caller keeps its ordinary routing.
-pub async fn family_status(
-    context: &DriverContext,
-    auth: &AuthContext,
-    job_id: JobId,
-) -> Option<Result<RoutedJobStatus, JobRouteError>> {
-    let (projected, spec) = match family_projection(context, job_id).await {
-        Ok(Some(projected)) => projected,
-        Ok(None) => return None,
-        Err(error) => return Some(Err(error)),
-    };
-    // Reads stay self-scoped: another submitter's job is absent, never refused.
-    if spec.created_by != auth.user_id {
-        return Some(Err(JobRouteError::NotFound));
-    }
-    if let Err(error) = decidable(&projected) {
-        return Some(Err(error));
-    }
-    let projection = projected.projection?;
-    Some(Ok(RoutedJobStatus {
-        job: status_view(job_id, &projection, &spec),
-        run_crate: None,
-    }))
-}
-
-/// Resolves an owner's public session alias and its durable physical execution.
-pub async fn session_job(
-    context: &DriverContext,
-    user_id: UserId,
-    job_id: JobId,
-) -> Result<(JobRecord, Option<JobId>), JobRouteError> {
-    let Some((projected, spec)) = family_projection(context, job_id).await? else {
-        let record = read_owned_job(context, user_id, job_id)
-            .await
-            .map_err(JobRouteError::Internal)?
-            .ok_or(JobRouteError::NotFound)?;
-        match &record.payload {
-            JobPayload::Execution(spec) if session_of(spec).is_some() => {
-                return Ok((record, Some(job_id)));
-            }
-            _ => return Err(JobRouteError::NotFound),
-        }
-    };
-    if spec.created_by != user_id || session_of(&spec.payload).is_none() {
-        return Err(JobRouteError::NotFound);
-    }
-    decidable(&projected)?;
-    let projection = projected.projection.ok_or(JobRouteError::NotFound)?;
-    let status = status_view(job_id, &projection, &spec);
-    let execution = projection
-        .executions
-        .iter()
-        .find(|execution| Some(execution.execution_id) == projection.canonical_execution_id)
-        .or_else(|| {
-            projection.executions.iter().max_by_key(|execution| {
-                (
-                    !execution.state.is_terminal(),
-                    execution.started_at_ms,
-                    execution.execution_id,
-                )
-            })
-        });
-    let mut record = JobRecord::new(
-        job_id,
-        JobPayload::Execution(spec.payload),
-        user_id,
-        execution.map_or(spec.origin_node_id, |execution| execution.executor_node_id),
-        spec.created_at_ms,
-        spec.created_at_ms,
-        None,
-    );
-    record.state = status.state;
-    record.updated_at_ms = status.updated_at_ms;
-    record.attempts = status.attempts;
-    record.cancel_requested = status.cancel_requested;
-    record.last_error = status.last_error;
-    record.progress = status.progress;
-    record.started_at_ms = execution.and_then(|execution| execution.started_at_ms);
-    record.workspace_bucket = status.workspace_bucket;
-    record.workspace_mode = status.workspace_mode;
-    record.finished_at_ms = status.finished_at_ms;
-    let physical = match execution {
-        Some(execution) => {
-            let records = load_family_complete(context, projected.family)
-                .await
-                .map_err(|error| JobRouteError::Unavailable(error.to_string()))?;
-            Some(
-                records
-                    .iter()
-                    .find_map(|envelope| match &envelope.record {
-                        JobFamilyRecord::Receipt(receipt)
-                            if receipt.execution_id == execution.execution_id =>
-                        {
-                            Some(receipt.physical_job_id)
-                        }
-                        _ => None,
-                    })
-                    .ok_or_else(|| {
-                        JobRouteError::Unavailable("execution receipt unavailable".to_string())
-                    })?,
-            )
-        }
-        None => None,
-    };
-    Ok((record, physical))
-}
-
-/// The canonical execution's node, otherwise a successful execution's node,
-/// otherwise any execution's node.
-pub async fn family_responder(
-    context: &DriverContext,
-    job_id: JobId,
-) -> Result<Option<NodeId>, JobRouteError> {
-    let Some((projected, _)) = family_projection(context, job_id).await? else {
-        return Ok(None);
-    };
-    decidable(&projected)?;
-    let projection = projected
-        .projection
-        .ok_or_else(|| JobRouteError::Unavailable("job family has no projection".to_string()))?;
-    Ok(projection
-        .executions
-        .iter()
-        .find(|execution| execution.role == ExecutionRole::Canonical)
-        .or_else(|| {
-            projection
-                .executions
-                .iter()
-                .find(|execution| execution.state == PhysicalExecutionState::Succeeded)
-        })
-        .or_else(|| projection.executions.first())
-        .map(|execution| execution.executor_node_id))
 }
 
 /// The current response shape, rebuilt from immutable records. Extra fields of
@@ -297,6 +69,7 @@ pub(crate) fn status_view(
         state: local_state(projection.state),
         attempts: projection.executions.len() as u32,
         cancel_requested: projection.cancel_requested,
+        expiry_reason: projection.expiry_reason,
         created_at_ms: spec.created_at_ms,
         updated_at_ms,
         finished_at_ms: local_state(projection.state)
@@ -367,12 +140,13 @@ fn local_state(state: LogicalJobState) -> JobState {
         LogicalJobState::Succeeded => JobState::Succeeded,
         LogicalJobState::Cancelled => JobState::Cancelled,
         LogicalJobState::Failed => JobState::Failed,
+        LogicalJobState::NotRun => JobState::NotRun,
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use aruna_core::structs::execution::job::SubmissionId;
+    use aruna_core::structs::execution::job::family::{JobFamilyId, SubmissionId};
 
     use super::*;
 

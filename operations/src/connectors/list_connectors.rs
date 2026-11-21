@@ -2,17 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
+use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_connector::SourceConnector;
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 
-use crate::connectors::repository::{
-    StorageReadError, iter_connectors_effect, parse_connector_iter,
-};
+use crate::connectors::repository::{LIST_CONNECTOR_SIZE, source_connector_prefix};
+use aruna_core::errors::StorageReadError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListSourceInput {
@@ -24,22 +23,12 @@ pub struct ListSourceResult {
     pub connectors: Vec<SourceConnector>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListSourceState {
-    Init,
-    IterConnectors,
-    Finish,
-    Error,
-}
-
 #[derive(Debug, Error, PartialEq)]
 pub enum ListSourceError {
     #[error(transparent)]
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("ListSourceConnectors failed")]
-    ListConnectorsFailed,
 }
 
 impl From<StorageReadError> for ListSourceError {
@@ -51,59 +40,33 @@ impl From<StorageReadError> for ListSourceError {
     }
 }
 
+impl From<IoError> for ListSourceError {
+    fn from(error: IoError) -> Self {
+        StorageReadError::from(error).into()
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub struct ListSourceOperation {
     input: ListSourceInput,
-    state: ListSourceState,
-    next_start_after: Option<Key>,
     connectors: Vec<SourceConnector>,
-    output: Option<Result<ListSourceResult, ListSourceError>>,
 }
 
 impl ListSourceOperation {
     pub fn new(input: ListSourceInput) -> Self {
         Self {
             input,
-            state: ListSourceState::Init,
-            next_start_after: None,
             connectors: Vec::new(),
-            output: None,
         }
     }
 
-    fn emit_error(&mut self, error: ListSourceError) -> Effects {
-        self.state = ListSourceState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn handle_init(&mut self) -> Effects {
-        self.state = ListSourceState::IterConnectors;
-        smallvec![iter_connectors_effect(self.input.group_id, None, None)]
-    }
-
-    fn handle_connector_iter(&mut self, event: Event) -> Effects {
-        match parse_connector_iter(event) {
-            Ok((connectors, next_start_after)) => {
-                self.connectors.extend(connectors);
-                self.next_start_after = next_start_after;
-
-                if let Some(start_after) = self.next_start_after.clone() {
-                    return smallvec![iter_connectors_effect(
-                        self.input.group_id,
-                        Some(start_after),
-                        None,
-                    )];
-                }
-
-                self.state = ListSourceState::Finish;
-                self.output = Some(Ok(ListSourceResult {
-                    connectors: self.connectors.clone(),
-                }));
-                smallvec![]
-            }
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn page(&self, after: Option<Key>) -> Next<ListSourceResult> {
+        Next::Call(IoCall::Page {
+            space: SOURCE_INDEX_KEYSPACE.to_string(),
+            prefix: source_connector_prefix(self.input.group_id),
+            after,
+            limit: LIST_CONNECTOR_SIZE,
+        })
     }
 }
 
@@ -111,36 +74,21 @@ impl Operation for ListSourceOperation {
     type Output = ListSourceResult;
     type Error = ListSourceError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Result<Next<Self::Output>, ListSourceError> {
+        Ok(self.page(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ListSourceState::Init => self.handle_init(),
-            ListSourceState::IterConnectors => self.handle_connector_iter(event),
-            ListSourceState::Finish => smallvec![],
-            ListSourceState::Error => self.abort(),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ListSourceError> {
+        let (values, next) = result.page()?;
+        for (_, value) in values {
+            self.connectors.push(SourceConnector::from_bytes(&value)?);
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, ListSourceState::Finish | ListSourceState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if self.state == ListSourceState::Error {
-            if let Some(Err(error)) = self.output {
-                return Err(error);
-            }
-            return Err(ListSourceError::ListConnectorsFailed);
-        }
-
-        self.output.ok_or(ListSourceError::ListConnectorsFailed)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        Ok(match next {
+            Some(after) => self.page(Some(after)),
+            None => Next::Done(ListSourceResult {
+                connectors: std::mem::take(&mut self.connectors),
+            }),
+        })
     }
 }
 
@@ -148,8 +96,8 @@ impl Operation for ListSourceOperation {
 mod tests {
     use super::*;
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
-    use crate::driver::{DriverContext, drive};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::collections::HashMap;
     use tempfile::tempdir;
@@ -157,14 +105,16 @@ mod tests {
     #[tokio::test]
     async fn lists_created_connectors() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let group_id = ulid::Ulid::generate();
 

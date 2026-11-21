@@ -4,20 +4,25 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::NodeId;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordEnvelope, JobRecordError, JobRecordKey, LocalExecution,
-    RecordVerdict,
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordEnvelope, JobRecordError, JobRecordKey, JobRecordKind,
+    LocalExecution, RecordVerdict,
+};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::prune::{FamilyTombstone, Freshness, spec_freshness};
+use aruna_core::structs::execution::job::record_keys::budget_key;
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
 };
 use tracing::warn;
 
-use super::rows::{ConflictRecord, PendingNeed, PendingRecord};
 use super::verify::{EvidenceSet, FamilyView};
 
 /// Records one family may retain pending at once.
 pub const MAX_PENDING_RECORDS: usize = 64;
 /// Admission attempts one pending record may consume before it is dropped.
-pub const MAX_PENDING_ATTEMPTS: u32 = 32;
+const MAX_PENDING_ATTEMPTS: u32 = 32;
 
 /// What became of one candidate record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,6 +42,14 @@ pub enum Admission {
     Conflict,
     /// Forged or invalid: dropped without a row.
     Rejected(JobRecordError),
+    /// The family is being pruned here; the record is refused for now and offered again later.
+    Pruning,
+    /// This node holds no accepted spec of the family; the record must come with its spec.
+    SpecNeeded,
+    /// The spec that would start the family here is older than the horizon. Refused for good.
+    Stale,
+    /// The spec belongs to an incarnation this node pruned. Refused for good.
+    Pruned,
 }
 
 /// Everything one admission is decided against.
@@ -52,6 +65,8 @@ pub struct FamilyState<'a> {
     /// This node's own fenced execution, if it is the one publishing.
     pub local: Option<&'a LocalExecution>,
     pub now_ms: u64,
+    /// This node's tombstone of the family, if it pruned it.
+    pub tombstone: Option<&'a FamilyTombstone>,
 }
 
 /// One record that becomes visible in this admission.
@@ -88,8 +103,17 @@ pub fn plan_append(
     let mut plan = AppendPlan::default();
     let mut visible: BTreeMap<JobRecordKey, [u8; 32]> = BTreeMap::new();
 
+    if let Some(refused) = gate(state, &candidate, relayed_by.is_some()) {
+        return (refused, plan);
+    }
     let key = candidate.key();
-    let outcome = admit_one(state, &evidence, &candidate);
+    let outcome = match admit_one(state, &evidence, &candidate) {
+        Admission::Authentic => fresh(state, &candidate).unwrap_or(Admission::Authentic),
+        outcome => outcome,
+    };
+    if matches!(outcome, Admission::Stale | Admission::Pruned) {
+        return (outcome, plan);
+    }
     let retained_row = match &outcome {
         Admission::Pending(_) => retained
             .iter()
@@ -155,13 +179,179 @@ pub fn plan_append(
         Admission::Rejected(error) => {
             warn!(kind = ?key.kind, error = %error, "Refusing an unauthentic job record");
         }
-        Admission::Duplicate | Admission::PendingFull => {}
+        // The gate answered these before the candidate was judged.
+        Admission::Duplicate
+        | Admission::PendingFull
+        | Admission::Pruning
+        | Admission::SpecNeeded
+        | Admission::Stale
+        | Admission::Pruned => {}
     }
 
     if !visible.is_empty() {
         cascade(state, retained, &mut evidence, &mut visible, &mut plan);
     }
     (outcome, plan)
+}
+
+/// The rules that keep a pruned family from coming back, checked before any record is judged.
+/// A peer's record of a family without a held spec waits for its spec instead of pending here.
+fn gate(
+    state: &FamilyState<'_>,
+    candidate: &JobRecordEnvelope,
+    relayed: bool,
+) -> Option<Admission> {
+    if state.tombstone.is_some_and(|tombstone| !tombstone.finished) {
+        return Some(Admission::Pruning);
+    }
+    let spec = matches!(candidate.record, JobFamilyRecord::Spec(_));
+    (relayed && !spec && !holds_spec(state)).then_some(Admission::SpecNeeded)
+}
+
+/// An authentic spec that would start the family here must be newer than the horizon and than
+/// the last record of a pruned incarnation.
+fn fresh(state: &FamilyState<'_>, candidate: &JobRecordEnvelope) -> Option<Admission> {
+    let JobFamilyRecord::Spec(spec) = &candidate.record else {
+        return None;
+    };
+    if holds_spec(state) {
+        return None;
+    }
+    let pruned = state.tombstone.map(|tombstone| tombstone.last_record_ms);
+    match spec_freshness(spec.created_at_ms, state.now_ms, pruned) {
+        Freshness::Fresh => None,
+        Freshness::Stale => Some(Admission::Stale),
+        Freshness::Pruned => Some(Admission::Pruned),
+    }
+}
+
+fn holds_spec(state: &FamilyState<'_>) -> bool {
+    (state.stored.values()).any(|stored| matches!(stored.record, JobFamilyRecord::Spec(_)))
+}
+
+/// Admits the records a peer sent along with `candidate`, then `candidate`, as one plan: the spec
+/// it binds, or the launch and budget its receipt binds. A stale or pruned spec refuses all.
+pub fn plan_bundle(
+    state: &FamilyState<'_>,
+    retained: &[(JobRecordKey, PendingRecord)],
+    candidate: JobRecordEnvelope,
+    attached: &[JobRecordEnvelope],
+    relayed_by: Option<NodeId>,
+) -> (Admission, AppendPlan) {
+    let spec =
+        (attached.iter()).find(|envelope| matches!(envelope.record, JobFamilyRecord::Spec(_)));
+    let Some(spec) = spec.filter(|_| !holds_spec(state)) else {
+        return plan_recovery(state, retained, candidate, attached, relayed_by);
+    };
+    let (outcome, mut plan) = plan_append(state, retained, spec.clone(), relayed_by);
+    match outcome {
+        Admission::Authentic => {}
+        Admission::Stale | Admission::Pruned => return (outcome, AppendPlan::default()),
+        outcome => return (outcome, plan),
+    }
+    let mut stored = state.stored.clone();
+    for admitted in &plan.admitted {
+        stored.insert(admitted.envelope.key(), admitted.envelope.clone());
+    }
+    let left: Vec<_> = (retained.iter())
+        .filter(|(key, _)| !plan.cleared.contains(key))
+        .cloned()
+        .collect();
+    let next = FamilyState {
+        stored: &stored,
+        ..*state
+    };
+    let (outcome, more) = plan_recovery(&next, &left, candidate, attached, relayed_by);
+    merge(&mut plan, more);
+    (outcome, plan)
+}
+
+/// A receipt whose launch this node lacks comes with that launch and, unless it is held, the
+/// scheduler's budget. The receipt is their historical authority; all are admitted or none.
+fn plan_recovery(
+    state: &FamilyState<'_>,
+    retained: &[(JobRecordKey, PendingRecord)],
+    candidate: JobRecordEnvelope,
+    attached: &[JobRecordEnvelope],
+    relayed_by: Option<NodeId>,
+) -> (Admission, AppendPlan) {
+    let JobFamilyRecord::Receipt(receipt) = &candidate.record else {
+        return plan_append(state, retained, candidate, relayed_by);
+    };
+    let launch = (attached.iter()).find(|envelope| match &envelope.record {
+        JobFamilyRecord::Launch(launch) => launch.launch_id == receipt.launch_id,
+        _ => false,
+    });
+    let launch = launch.filter(|launch| !state.stored.contains_key(&launch.key()));
+    let (Some(launch), Some(view)) = (launch, state.view) else {
+        return plan_append(state, retained, candidate, relayed_by);
+    };
+    let JobFamilyRecord::Launch(intent) = &launch.record else {
+        return plan_append(state, retained, candidate, relayed_by);
+    };
+    let refused = |outcome| (outcome, AppendPlan::default());
+    if let Some(outcome) = gate(state, &candidate, relayed_by.is_some()) {
+        return refused(outcome);
+    }
+    let mut evidence = EvidenceSet::default();
+    for envelope in state.stored.values() {
+        evidence.insert(&envelope.record);
+    }
+    evidence.insert(&candidate.record);
+    let mut bundle = Vec::new();
+    let budget_held =
+        (state.stored).contains_key(&budget_key(&launch.family(), intent.scheduler_node_id));
+    if !budget_held {
+        let budget = (attached.iter()).find(|envelope| match &envelope.record {
+            JobFamilyRecord::Budget(budget) => budget.scheduler_node_id == intent.scheduler_node_id,
+            _ => false,
+        });
+        let Some(budget) = budget else {
+            let need = PendingNeed::Evidence(JobRecordKind::Budget);
+            return refused(Admission::Pending(need));
+        };
+        let mut proof = evidence.select(&budget.record);
+        proof.launch = Some(&**intent);
+        proof.receipt = Some(&**receipt);
+        match budget.verify(&view.context(proof, None)) {
+            Ok(RecordVerdict::Authentic) => {}
+            Ok(_) => return refused(Admission::SpecNeeded),
+            Err(error) => return refused(Admission::Rejected(error)),
+        }
+        evidence.insert(&budget.record);
+        bundle.push(budget.clone());
+    }
+    match admit_one(state, &evidence, launch) {
+        Admission::Authentic => bundle.push(launch.clone()),
+        outcome => return refused(outcome),
+    }
+    let mut stored = state.stored.clone();
+    stored.extend((bundle.iter()).map(|envelope| (envelope.key(), envelope.clone())));
+    let next = FamilyState {
+        stored: &stored,
+        ..*state
+    };
+    let (outcome, more) = plan_append(&next, retained, candidate, relayed_by);
+    if outcome != Admission::Authentic {
+        return refused(outcome);
+    }
+    let admitted = bundle.into_iter().map(|envelope| AdmittedRecord {
+        authentic: true,
+        envelope,
+    });
+    let mut plan = AppendPlan {
+        admitted: admitted.collect(),
+        ..AppendPlan::default()
+    };
+    merge(&mut plan, more);
+    (outcome, plan)
+}
+
+fn merge(plan: &mut AppendPlan, more: AppendPlan) {
+    plan.admitted.extend(more.admitted);
+    plan.pending.extend(more.pending);
+    plan.cleared.extend(more.cleared);
+    plan.conflicts.extend(more.conflicts);
 }
 
 /// Re-admits retained records in rounds until no further one is unblocked.
@@ -195,7 +385,13 @@ fn cascade(
                     plan.cleared.push(*key);
                     settled.push(*key);
                 }
-                Admission::Duplicate | Admission::Rejected(_) | Admission::PendingFull => {
+                Admission::Duplicate
+                | Admission::Rejected(_)
+                | Admission::PendingFull
+                | Admission::Pruning
+                | Admission::SpecNeeded
+                | Admission::Stale
+                | Admission::Pruned => {
                     plan.cleared.push(*key);
                     settled.push(*key);
                 }

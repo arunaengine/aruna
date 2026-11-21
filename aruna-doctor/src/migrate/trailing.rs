@@ -7,7 +7,8 @@ use super::session_refs::{self, Layout};
 use super::{decode_error, row_note};
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::{
-    ADMIN_AUDIT_KEYSPACE, HARVEST_SOURCE_KEYSPACE, MIRROR_REPAIR_KEYSPACE,
+    ADMIN_AUDIT_KEYSPACE, HARVEST_SOURCE_KEYSPACE, MIRROR_REPAIR_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    TASK_TIMER_KEYSPACE,
 };
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Serialize;
@@ -30,6 +31,10 @@ pub(super) const AUDIT: Shapes = (
 pub(super) const HARVEST: Shapes = (HARVEST_SOURCE_KEYSPACE, &[&[("HarvestSource", 12)]]);
 /// Pending sync mirror repairs before `rollback`.
 pub(super) const MIRROR: Shapes = (MIRROR_REPAIR_KEYSPACE, &[&[("SyncMirrorRecord", 5)]]);
+/// Queued document publishes before `incarnation`: none, as for a first write.
+pub(super) const OUTBOX: Shapes = (SYNC_OUTBOX_KEYSPACE, &[&[("DocumentOutboxRecord", 9)]]);
+/// Persisted timers before `admission`: no scheduler admission, so the restored wake owns them.
+pub(super) const TIMERS: Shapes = (TASK_TIMER_KEYSPACE, &[&[("PersistedTaskTimer", 2)]]);
 
 /// Rows read, and rewritten at most, per transaction.
 const BATCH_ROWS: usize = 1024;

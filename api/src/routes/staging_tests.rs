@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::openapi::ApiDoc;
 use crate::tests::routes::{
-    seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
+    seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
 };
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -21,6 +21,7 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
     VersionKey,
@@ -28,8 +29,10 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::testing::test_context;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
@@ -113,7 +116,7 @@ async fn references_hide_denied() {
 
     let (_, Json(page)) = list_references(
         State(test.state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -138,7 +141,7 @@ async fn references_list_bindings() {
 
     let (status, Json(mut first)) = list_references(
         State(test.state.clone()),
-        Extension(Some(test.auth_bucket_read.clone())),
+        RealmAuth(test.auth_bucket_read.clone()),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -153,7 +156,7 @@ async fn references_list_bindings() {
 
     let (_, Json(second)) = list_references(
         State(test.state.clone()),
-        Extension(Some(test.auth_bucket_read.clone())),
+        RealmAuth(test.auth_bucket_read.clone()),
         Query(ReferenceListQuery {
             bucket: test.bucket.clone(),
             prefix: Some("data/".to_string()),
@@ -224,7 +227,7 @@ async fn references_deny_read() {
 
     let result = list_references(
         State(test.state),
-        Extension(Some(test.without_source_read)),
+        RealmAuth(test.without_source_read),
         Query(ReferenceListQuery {
             bucket: test.bucket,
             prefix: None,
@@ -291,7 +294,7 @@ async fn queue_failure_repairable() {
 #[test]
 fn staging_submit_classifies() {
     // Job admission refusals must keep their status instead of collapsing into 500.
-    use aruna_operations::jobs::submit::SubmitJobError;
+    use aruna_core::job_request::SubmitJobError;
 
     assert_eq!(
         map_submit_error(SubmitJobError::PlacementUnavailable(
@@ -394,7 +397,7 @@ async fn batch_rejects_cap() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -420,7 +423,7 @@ async fn batch_rejects_node() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: Some(other_node.to_string()),
@@ -442,7 +445,9 @@ async fn batch_rejects_node() {
 // Every job store state reads as itself or its collapsed class; nothing settled reads as running.
 #[test]
 fn job_states_mapped() {
-    use aruna_core::structs::execution::job::{JobId, JobRecord, StagingJobSpec};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::StagingJobSpec;
+    use aruna_core::structs::execution::job::local::JobRecord;
     let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
     let user_id = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
     let spec = StagingJobSpec {
@@ -508,7 +513,7 @@ async fn batch_sync_unimplemented() {
 
     let result = stage_batch(
         State(test.state),
-        Extension(Some(test.auth_source_read)),
+        RealmAuth(test.auth_source_read),
         Json(StageBatchRequest {
             group_id: test.bucket_group_id.to_string(),
             node_id: None,
@@ -850,27 +855,6 @@ async fn setup_state() -> TestState {
     }
 }
 
-async fn write_doc(
-    driver_ctx: &Arc<DriverContext>,
-    key_space: &str,
-    key: byteview::ByteView,
-    value: byteview::ByteView,
-) {
-    let event = driver_ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
-}
-
 async fn read_doc(
     driver_ctx: &Arc<DriverContext>,
     key_space: &str,
@@ -1066,7 +1050,7 @@ mod distributed {
     ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
         submit_staging(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             axum::http::HeaderMap::new(),
             Json(request),
@@ -1085,7 +1069,7 @@ mod distributed {
         let stage = |key: &str| {
             stage_blob(
                 State(node.state.clone()),
-                Extension(Some(node.owner.clone())),
+                RealmAuth(node.owner.clone()),
                 bearer(),
                 axum::http::HeaderMap::new(),
                 Json(StageRequest::Snapshot(target(&node, key))),
@@ -1206,7 +1190,7 @@ mod distributed {
         blocking.table = table("{url|basename}");
         let refused = stage_batch(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Json(blocking),
         )
         .await;
@@ -1219,7 +1203,7 @@ mod distributed {
         let run = |request: StageBatchRequest| {
             stage_batch(
                 State(node.state.clone()),
-                Extension(Some(node.owner.clone())),
+                RealmAuth(node.owner.clone()),
                 Json(request),
             )
         };
@@ -1261,7 +1245,7 @@ async fn references_state_completeness() {
     let page = |prefix: &str| {
         list_references(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Query(ReferenceListQuery {
                 bucket: BUCKET.to_string(),
                 prefix: Some(prefix.to_string()),

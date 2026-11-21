@@ -2,27 +2,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
+use crate::lookup::actor;
+use crate::metadata::model::{
     CreateMetadataRequest, CreateMetadataResponse, ListMetadataQuery, ListMetadataResponse,
-    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse, commit_message,
-    crate_entities, ensure_readable_files, forwarded_auth_token, local_write_record, map_api_error,
-    map_write_error, parse_document_id, run_create_metadata, run_document_list,
-    serialize_jsonld_object, with_global_ids,
+    MetadataDocumentSummary, MetadataPathQuery, MetadataPathResponse,
+};
+use crate::metadata::{
+    commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
+    local_write_record, map_api_error, map_write_error, parse_document_id, run_create_metadata,
+    run_document_list, serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_drivers::driver::drive;
 use aruna_operations::git::GitError;
-use aruna_operations::metadata::api::{
-    GetVisibleRequest, MetadataLookupRequest, lookup_metadata_path as run_lookup_metadata_path,
-};
-use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::{
-    get_metadata_routed as run_get_visible_metadata_document,
-    route_metadata_delete as run_delete_metadata_document,
-};
+use aruna_operations::metadata::api::export_types::GetVisibleRequest;
+use aruna_operations::metadata::api::path::LookupPathOperation;
+use aruna_operations::metadata::api::path_types::MetadataLookupRequest;
+use aruna_operations::metadata::forward::routed::read::RoutedReadOperation;
+use aruna_operations::metadata::forward::routed::write::RouteDeleteOperation;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -132,7 +135,6 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
             )
         ),
         (status = 400, description = "Malformed body, unknown fields, a group id that is not a ULID, an empty document path, a message over 4096 bytes or with control characters other than line breaks and tabs, a non-object RO-Crate, an invalid storage location bucket or prefix, a Profile root (prof:Profile) at a path outside profiles/, or RO-Crate validation violations, which are listed in the error body", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is denied on the group's metadata path, the new document's path or the chosen storage location", body = ErrorResponse),
         (status = 404, description = "The chosen storage location names a bucket this node does not have", body = ErrorResponse),
         (status = 409, description = "Concurrent create conflict; the create was not accepted and may be retried. Or the group's default storage location is unusable on this node, which the message explains; choose a storage location or change the group default", body = ErrorResponse),
@@ -142,11 +144,10 @@ text of at most 4096 bytes after trimming; an empty message counts as none."#,
 )]
 pub async fn create_metadata_document(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateMetadataRequest>,
 ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let message = commit_message(match &request {
         CreateMetadataRequest::Scaffold(request) => request.message.clone(),
         CreateMetadataRequest::RoCrate(request) => request.message.clone(),
@@ -181,10 +182,17 @@ pub async fn create_metadata_document(
             },
         ),
     };
-    let resolved =
-        aruna_operations::git::location::resolve(&state.get_ctx(), &auth, group_id, chosen)
-            .await
-            .map_err(map_location_error)?;
+    let resolved = drive(
+        aruna_operations::git::location::resolve(
+            state.get_ctx().node_id(),
+            &auth,
+            group_id,
+            chosen,
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_location_error)?;
     let result = run_create_metadata(
         &state,
         &auth,
@@ -197,7 +205,17 @@ pub async fn create_metadata_document(
         message,
     )
     .await?;
-    aruna_operations::git::location::establish(&state.get_ctx(), &auth, &result, resolved).await;
+    drive(
+        aruna_operations::git::location::establish(
+            state.get_ctx().node_id(),
+            &auth,
+            &result,
+            resolved,
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .ok();
 
     Ok((
         StatusCode::CREATED,
@@ -435,18 +453,16 @@ pub async fn get_metadata_path(
     Query(query): Query<MetadataPathQuery>,
 ) -> ServerResult<(StatusCode, Json<MetadataPathResponse>)> {
     let group_id = parse_group_id(&group_id)?;
-    let result = run_lookup_metadata_path(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        MetadataLookupRequest {
-            group_id,
-            document_path: query.path,
-            auth,
-        },
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let ctx = state.get_ctx();
+    let request = MetadataLookupRequest {
+        group_id,
+        document_path: query.path,
+        auth,
+    };
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let auth_token = forwarded_auth_token(bearer_token)?;
+    let lookup = LookupPathOperation::new(state.get_realm_id(), request, auth_token, local_node);
+    let result = drive(lookup, ctx.as_ref()).await.map_err(map_api_error)?;
     Ok((
         StatusCode::OK,
         Json(MetadataPathResponse {
@@ -511,14 +527,11 @@ pub async fn get_metadata_document(
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let record = run_get_visible_metadata_document(
-        &ctx,
-        state.get_realm_id(),
-        GetVisibleRequest { document_id, auth },
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let request = GetVisibleRequest { document_id, auth };
+    let token = forwarded_auth_token(bearer_token)?;
+    let read = RoutedReadOperation::new(local_node, state.get_realm_id(), request, token);
+    let record = drive(read, ctx.as_ref()).await.map_err(map_api_error)?;
     Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&record))))
 }
 
@@ -551,28 +564,23 @@ caller's own token.
 )]
 pub async fn delete_metadata_document(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    run_delete_metadata_document(
-        &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
-        record.as_ref(),
+    let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+    let token = forwarded_auth_token(bearer_token)?;
+    let delete = RouteDeleteOperation::new(
+        (actor(&state, &auth), local_node),
+        record,
         document_id,
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_write_error)?;
+        token,
+    );
+    drive(delete, ctx.as_ref()).await.map_err(map_write_error)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

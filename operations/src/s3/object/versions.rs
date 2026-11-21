@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
@@ -10,23 +11,23 @@ use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE,
     NODE_SUBJECT_KEYSPACE, PENDING_LOCATION_KEYSPACE,
 };
-use aruna_core::operation::Operation;
-use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobHeadKey, BlobLocationKey, BlobVersion, BlobVersionState,
     CurrentVersionPointer, ManagedCopyKey, VersionKey,
 };
-use aruna_core::types::{Effects, Key, Value};
-use smallvec::smallvec;
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
+use aruna_core::types::{Key, Value};
 use std::collections::VecDeque;
 use std::time::SystemTime;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::blob::managed_copy::{CopyRequest, validate_registration};
-use crate::s3::listing::{PrefixTracker, common_prefix_of, split_after_marker};
+use crate::s3::listing::{PrefixTracker, split_after_marker};
+use aruna_core::managed_copy::{CopyRequest, validate_registration};
+use aruna_core::structs::storage::blob::common_prefix_of;
 
 /// Whether this node still holds a serveable registration for one governed
 /// copy. A listing never fails on the answer; it only stops describing bytes.
@@ -55,15 +56,10 @@ pub(crate) fn served_copy(
 const VERSION_SCAN_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListVersionsState {
-    Init,
-    StartTransaction,
-    ReadHeads,
-    ReadVersionsKey,
-    ReadBlobLocations,
-    CommitTransaction,
-    Finish,
-    Error,
+enum ListVersionsState {
+    Heads,
+    VersionsKey,
+    BlobLocations,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -72,21 +68,21 @@ pub enum ListVersionsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: ListVersionsState,
-        expected: &'static str,
-        received: Event,
-    },
-    #[error("No transaction found")]
-    NoTransactionFound,
+    #[error("ListObjectVersions failed: unexpected {0}")]
+    UnexpectedEvent(&'static str),
     #[error("ListObjectVersions failed")]
     ListVersionsFailed,
-    #[error("operation did not finish")]
-    NotFinished,
     #[error("a key holds more versions than this listing may read")]
     TooManyVersions,
 }
+
+impl From<IoError> for ListVersionsError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+type VersionsTurn = Result<Next<ListVersionsResult>, ListVersionsError>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListVersionsInput {
@@ -96,35 +92,6 @@ pub struct ListVersionsInput {
     pub key_marker: Option<String>,
     pub version_id_marker: Option<Ulid>,
     pub max_keys: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ListVersionsItem {
-    Version {
-        key: String,
-        version_id: Ulid,
-        is_latest: bool,
-        location: Option<BackendLocation>,
-        source_metadata: Option<SourceMetadata>,
-        created_at: SystemTime,
-        /// A link's binding, so a listing shows it only to callers who may read its target.
-        link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
-    },
-    DeleteMarker {
-        key: String,
-        version_id: Ulid,
-        is_latest: bool,
-        created_at: SystemTime,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ListVersionsResult {
-    pub items: Vec<ListVersionsItem>,
-    pub common_prefixes: Vec<String>,
-    pub is_truncated: bool,
-    pub next_key_marker: Option<String>,
-    pub next_version_marker: Option<Ulid>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -145,7 +112,6 @@ enum PendingItem {
 pub struct ListVersionsOperation {
     input: ListVersionsInput,
     state: ListVersionsState,
-    txn_id: Option<Ulid>,
     scan_prefix: Vec<u8>,
     pending_start: Option<IterStart>,
     last_head_key: Option<Vec<u8>>,
@@ -169,7 +135,6 @@ pub struct ListVersionsOperation {
     last_marker: Option<(String, Option<Ulid>)>,
     next_key_marker: Option<String>,
     next_version_marker: Option<Ulid>,
-    output: Option<Result<ListVersionsResult, ListVersionsError>>,
 }
 
 impl ListVersionsOperation {
@@ -179,8 +144,7 @@ impl ListVersionsOperation {
     pub fn new(input: ListVersionsInput) -> Self {
         Self {
             input,
-            state: ListVersionsState::Init,
-            txn_id: None,
+            state: ListVersionsState::Heads,
             scan_prefix: Vec::new(),
             pending_start: None,
             last_head_key: None,
@@ -203,7 +167,6 @@ impl ListVersionsOperation {
             last_marker: None,
             next_key_marker: None,
             next_version_marker: None,
-            output: None,
         }
     }
 
@@ -211,24 +174,6 @@ impl ListVersionsOperation {
     pub fn with_row_budget(mut self, budget: usize) -> Self {
         self.row_budget = Some(budget);
         self
-    }
-
-    #[cfg(test)]
-    fn with_round_limit(mut self, max_scan_rounds: usize) -> Self {
-        self.max_scan_rounds = max_scan_rounds;
-        self
-    }
-
-    #[cfg(test)]
-    fn with_scan_limit(mut self, version_scan_limit: usize) -> Self {
-        self.version_scan_limit = version_scan_limit;
-        self
-    }
-
-    fn emit_error(&mut self, error: ListVersionsError) -> Effects {
-        self.state = ListVersionsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
     }
 
     fn max_keys(&self) -> usize {
@@ -246,43 +191,22 @@ impl ListVersionsOperation {
             .filter(|prefix| !prefix.is_empty())
     }
 
-    fn handle_init(&mut self) -> Effects {
+    fn start_scan(&mut self) -> VersionsTurn {
         if self.max_keys() == 0 {
-            self.state = ListVersionsState::Finish;
-            self.output = Some(Ok(ListVersionsResult {
+            return Ok(Next::Done(ListVersionsResult {
                 items: Vec::new(),
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_key_marker: None,
                 next_version_marker: None,
             }));
-            return smallvec![];
         }
 
-        self.state = ListVersionsState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    }
-
-    fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(ListVersionsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
-            });
-        };
-
-        self.txn_id = Some(txn_id);
         let prefix = match self.prefix_str() {
             Some(prefix) => BlobHeadKey::object_prefix(&self.input.bucket, prefix),
             None => BlobHeadKey::bucket_prefix(&self.input.bucket),
         };
-        let prefix = match prefix {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
+        let prefix = prefix?;
 
         let delimiter = self
             .input
@@ -303,13 +227,10 @@ impl ListVersionsOperation {
 
         let start = match key_marker {
             Some(key_marker) => {
-                let start_key = match BlobHeadKey::object_prefix(&self.input.bucket, key_marker) {
-                    Ok(start_key) => start_key,
-                    Err(err) => return self.emit_error(err.into()),
-                };
+                let start_key = BlobHeadKey::object_prefix(&self.input.bucket, key_marker)?;
                 if start_key.as_slice() > prefix.as_slice() && !start_key.starts_with(&prefix) {
                     self.scan_prefix = prefix;
-                    return self.commit();
+                    return self.finish();
                 }
                 // Include the marker key itself when we still owe its older
                 // versions (version_id_marker) or need to skip its group.
@@ -327,7 +248,7 @@ impl ListVersionsOperation {
         self.issue_head_round()
     }
 
-    fn issue_head_round(&mut self) -> Effects {
+    fn issue_head_round(&mut self) -> VersionsTurn {
         self.scan_rounds += 1;
         self.head_round_limit = self
             .max_keys()
@@ -348,35 +269,27 @@ impl ListVersionsOperation {
                 .map(|key| IterStart::After(key.into()))
         };
 
-        self.state = ListVersionsState::ReadHeads;
-        smallvec![Effect::Storage(StorageEffect::Iter {
+        self.state = ListVersionsState::Heads;
+        // An inclusive start needs the storage scan itself; it joins the read snapshot.
+        let scan = Effect::Storage(StorageEffect::Iter {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
             prefix: Some(self.scan_prefix.clone().into()),
             start,
             limit: self.head_round_limit,
-            txn_id: self.txn_id,
-        })]
+            txn_id: None,
+        });
+        Ok(Next::Call(scan.into()))
     }
 
-    fn handle_heads_read(&mut self, event: Event) -> Effects {
+    fn handle_heads_read(&mut self, event: Event) -> VersionsTurn {
         let Event::Storage(StorageEvent::IterResult { values, .. }) = event else {
-            return self.emit_error(ListVersionsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
+            return Err(ListVersionsError::UnexpectedEvent(event.label()));
         };
 
         let round_len = values.len();
         for (key, value) in values {
-            let head = match BlobHeadKey::from_bytes(key.as_ref()) {
-                Ok(head) => head,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-                Ok(pointer) => pointer,
-                Err(err) => return self.emit_error(err.into()),
-            };
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
             self.pending_heads.push_back((head.key, pointer.version_id));
         }
 
@@ -387,42 +300,41 @@ impl ListVersionsOperation {
         self.advance()
     }
 
-    fn advance(&mut self) -> Effects {
+    fn advance(&mut self) -> VersionsTurn {
         loop {
             if self.is_truncated {
-                return self.commit();
+                return self.finish();
             }
 
             let Some((key, head_version_id)) = self.pending_heads.pop_front() else {
                 if self.head_exhausted {
-                    return self.commit();
+                    return self.finish();
                 }
                 if self.scan_rounds >= self.max_scan_rounds {
                     self.truncate();
-                    return self.commit();
+                    return self.finish();
                 }
                 return self.issue_head_round();
             };
 
-            self.last_head_key = match BlobHeadKey::object_prefix(&self.input.bucket, &key) {
-                Ok(bytes) => Some(bytes),
-                Err(err) => return self.emit_error(err.into()),
+            self.last_head_key = {
+                let bytes = BlobHeadKey::object_prefix(&self.input.bucket, &key)?;
+                Some(bytes)
             };
 
             match common_prefix_of(&key, self.prefix_str(), self.input.delimiter.as_deref()) {
                 Some(group) => {
                     let already_emitted = self.prefixes.already_emitted(&group);
-                    self.cursor_group_prefix =
-                        match BlobHeadKey::object_prefix(&self.input.bucket, &group) {
-                            Ok(bytes) => Some(bytes),
-                            Err(err) => return self.emit_error(err.into()),
-                        };
+                    self.cursor_group_prefix = {
+                        let bytes = BlobHeadKey::object_prefix(&self.input.bucket, &group)?;
+                        Some(bytes)
+                    };
                     if already_emitted {
                         continue;
                     }
                     self.prefixes.set_resume(None);
                     if self.emit_common_prefix(group) {
-                        return self.commit();
+                        return self.finish();
                     }
                     continue;
                 }
@@ -439,59 +351,40 @@ impl ListVersionsOperation {
         }
     }
 
-    fn issue_version_iter(&mut self, key: &str) -> Effects {
-        let prefix = match VersionKey::object_prefix(&self.input.bucket, key) {
-            Ok(prefix) => prefix,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let start = self.version_scan_cursor.take().map(IterStart::After);
-        self.state = ListVersionsState::ReadVersionsKey;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start,
+    fn issue_version_iter(&mut self, key: &str) -> VersionsTurn {
+        let prefix = VersionKey::object_prefix(&self.input.bucket, key)?;
+        self.state = ListVersionsState::VersionsKey;
+        Ok(Next::Call(IoCall::Page {
+            space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: self.version_scan_cursor.take(),
             limit: match self.row_budget {
-                Some(budget) =>
-                    (budget.saturating_sub(self.rows_read) + 1).min(self.version_scan_limit),
+                Some(budget) => {
+                    (budget.saturating_sub(self.rows_read) + 1).min(self.version_scan_limit)
+                }
                 None => self.version_scan_limit,
             },
-            txn_id: self.txn_id,
-        })]
+        }))
     }
 
-    fn handle_versions_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(ListVersionsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
-        };
-
+    fn handle_versions_read(
+        &mut self,
+        (values, next_start_after): (Vec<(Key, Value)>, Option<Key>),
+    ) -> VersionsTurn {
         let Some((key, head_version_id)) = self.current_key.clone() else {
-            return self.emit_error(ListVersionsError::ListVersionsFailed);
+            return Err(ListVersionsError::ListVersionsFailed);
         };
         self.rows_read += values.len();
         if self
             .row_budget
             .is_some_and(|budget| self.rows_read > budget)
         {
-            return self.emit_error(ListVersionsError::TooManyVersions);
+            return Err(ListVersionsError::TooManyVersions);
         }
 
         for (version_key, value) in values {
-            let version_key = match VersionKey::from_bytes(version_key.as_ref()) {
-                Ok(version_key) => version_key,
-                Err(err) => return self.emit_error(err.into()),
-            };
-            let version = match BlobVersion::from_bytes(value.as_ref()) {
-                Ok(version) => version,
-                Err(err) => return self.emit_error(err.into()),
-            };
+            let version_key = VersionKey::from_bytes(version_key.as_ref())?;
+            let version = BlobVersion::from_bytes(value.as_ref())?;
             self.version_window
                 .push_back((version_key.version_id, version));
         }
@@ -576,10 +469,7 @@ impl ListVersionsOperation {
                         VersionKey::new(self.input.bucket.clone(), key.clone(), version_id),
                         backend,
                     );
-                    let bytes = match copy_key.to_bytes() {
-                        Ok(bytes) => bytes,
-                        Err(error) => return self.emit_error(error.into()),
-                    };
+                    let bytes = copy_key.to_bytes()?;
                     location_reads.push((MANAGED_COPY_KEYSPACE.to_string(), bytes.into()));
                     Some((copy_key, version.placement_policies.clone()))
                 }
@@ -609,23 +499,8 @@ impl ListVersionsOperation {
             );
         }
 
-        self.state = ListVersionsState::ReadBlobLocations;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: location_reads,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn handle_locations_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(ListVersionsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
-            });
-        };
-
-        self.finish_current_key(values)
+        self.state = ListVersionsState::BlobLocations;
+        Ok(Next::Call(IoCall::Read(location_reads)))
     }
 
     /// Whether this page carries a governed entry, so the batch leads with the
@@ -642,15 +517,12 @@ impl ListVersionsOperation {
         })
     }
 
-    fn finish_current_key(
-        &mut self,
-        locations: Vec<(aruna_core::types::Key, Option<Value>)>,
-    ) -> Effects {
+    fn finish_current_key(&mut self, locations: Vec<Option<Value>>) -> VersionsTurn {
         let mut locations = locations.into_iter();
         let subject = match self.pending_subject() {
             true => locations
                 .next()
-                .and_then(|(_, value)| value)
+                .flatten()
                 .and_then(|value| NodeSubjectRecord::from_bytes(value.as_ref()).ok()),
             false => None,
         };
@@ -664,14 +536,14 @@ impl ListVersionsOperation {
                     created_at,
                     governed,
                 } => {
-                    let Some((_key, value)) = locations.next() else {
-                        return self.emit_error(ListVersionsError::ListVersionsFailed);
+                    let Some(value) = locations.next() else {
+                        return Err(ListVersionsError::ListVersionsFailed);
                     };
                     let registration = match governed.as_ref() {
                         Some(_) => match locations.next() {
-                            Some((_, value)) => value,
+                            Some(value) => value,
                             None => {
-                                return self.emit_error(ListVersionsError::ListVersionsFailed);
+                                return Err(ListVersionsError::ListVersionsFailed);
                             }
                         },
                         None => None,
@@ -681,10 +553,7 @@ impl ListVersionsOperation {
                     let Some(value) = value else {
                         continue;
                     };
-                    let location = match BackendLocation::from_bytes(value.as_ref()) {
-                        Ok(location) => location,
-                        Err(err) => return self.emit_error(err.into()),
-                    };
+                    let location = BackendLocation::from_bytes(value.as_ref())?;
                     // A governed head this node cannot answer for is still
                     // listed, but without describing bytes it may not serve.
                     let described = governed.is_none_or(|(copy_key, refs)| {
@@ -702,7 +571,7 @@ impl ListVersionsOperation {
                 }
             };
             if self.try_emit(entry) {
-                return self.commit();
+                return self.finish();
             }
         }
 
@@ -746,33 +615,14 @@ impl ListVersionsOperation {
         }
     }
 
-    fn commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(ListVersionsError::NoTransactionFound);
-        };
-
-        self.state = ListVersionsState::CommitTransaction;
-        self.output = Some(Ok(ListVersionsResult {
+    fn finish(&mut self) -> VersionsTurn {
+        Ok(Next::Done(ListVersionsResult {
             items: std::mem::take(&mut self.items),
             common_prefixes: self.prefixes.take(),
             is_truncated: self.is_truncated,
             next_key_marker: self.next_key_marker.take(),
             next_version_marker: self.next_version_marker.take(),
-        }));
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.emit_error(ListVersionsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
-            });
-        };
-
-        self.state = ListVersionsState::Finish;
-        smallvec![]
+        }))
     }
 }
 
@@ -780,55 +630,65 @@ impl Operation for ListVersionsOperation {
     type Output = ListVersionsResult;
     type Error = ListVersionsError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> VersionsTurn {
+        self.start_scan()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(ListVersionsError::StorageError(error));
-        }
-
+    fn next(&mut self, result: IoResult) -> VersionsTurn {
         match self.state {
-            ListVersionsState::Init => self.handle_init(),
-            ListVersionsState::StartTransaction => self.handle_transaction_started(event),
-            ListVersionsState::ReadHeads => self.handle_heads_read(event),
-            ListVersionsState::ReadVersionsKey => self.handle_versions_read(event),
-            ListVersionsState::ReadBlobLocations => self.handle_locations_read(event),
-            ListVersionsState::CommitTransaction => self.handle_transaction_committed(event),
-            ListVersionsState::Finish | ListVersionsState::Error => smallvec![],
+            ListVersionsState::Heads => self.handle_heads_read(result.event()?),
+            ListVersionsState::VersionsKey => self.handle_versions_read(result.page()?),
+            ListVersionsState::BlobLocations => self.finish_current_key(result.values()?),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListVersionsState::Finish | ListVersionsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(ListVersionsError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use aruna_core::UserId;
+    use aruna_core::structs::execution::source_access::SourceMetadata;
+    use aruna_drivers::driver::drive;
+
+    fn limited_rounds(
+        mut operation: ListVersionsOperation,
+        rounds: usize,
+    ) -> ListVersionsOperation {
+        operation.max_scan_rounds = rounds;
+        operation
+    }
+
+    fn limited_scan(mut operation: ListVersionsOperation, rows: usize) -> ListVersionsOperation {
+        operation.version_scan_limit = rows;
+        operation
+    }
+
+    #[test]
+    fn scans_in_snapshot() {
+        // No key is read for an empty page; any other listing scans heads in one snapshot.
+        let input = |max_keys| ListVersionsInput {
+            bucket: "bucket".to_string(),
+            prefix: None,
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: Some(max_keys),
+        };
+        let mut empty = ListVersionsOperation::new(input(0));
+        assert!(matches!(empty.first(), Ok(Next::Done(_))));
+        let mut listing = ListVersionsOperation::new(input(1));
+        assert_eq!(listing.transaction(), TransactionMode::ReadSnapshot);
+        assert!(matches!(listing.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let stray = IoResult::Event(Box::new(Event::Search()));
+        assert!(matches!(
+            listing.next(stray),
+            Err(ListVersionsError::UnexpectedEvent(_))
+        ));
+    }
+
     use aruna_core::effects::StorageEffect;
     use aruna_core::structs::checksum::HASH_MD5;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -839,21 +699,12 @@ mod test {
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::format::EncodingClass;
     use aruna_core::structs::storage::format::StoredFormat;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::testing::test_context;
     use aruna_storage::storage;
     use std::collections::HashMap;
     use std::time::{Duration, UNIX_EPOCH};
     use tempfile::tempdir;
-
-    fn driver_context(storage_handle: storage::StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
 
     fn created_by() -> UserId {
         UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
@@ -885,7 +736,11 @@ mod test {
         }
     }
 
-    async fn seed_head(storage_handle: &storage::StorageHandle, key: &str, version_id: Ulid) {
+    async fn seed_head(
+        storage_handle: &storage::handle::StorageHandle,
+        key: &str,
+        version_id: Ulid,
+    ) {
         let _ = storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -900,7 +755,7 @@ mod test {
     }
 
     async fn seed_version(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key: &str,
         version_id: Ulid,
         version: BlobVersion,
@@ -919,7 +774,7 @@ mod test {
     }
 
     async fn seed_materialized(
-        storage_handle: &storage::StorageHandle,
+        storage_handle: &storage::handle::StorageHandle,
         key: &str,
         version_id: Ulid,
         hash: [u8; 32],
@@ -965,8 +820,8 @@ mod test {
     async fn newest_first_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
         let (older, newer) = (versions[0], versions[1]);
@@ -1013,8 +868,8 @@ mod test {
     async fn head_breaks_tie() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
         let (newer_head, older_larger_ulid) = (versions[0], versions[1]);
@@ -1052,8 +907,8 @@ mod test {
     async fn delete_markers_included() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let versions = ordered_ulids(2);
         let (older, newer) = (versions[0], versions[1]);
@@ -1097,8 +952,8 @@ mod test {
     async fn markers_resume() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         // Two keys, "a" with two versions and "b" with one version.
         let a_versions = ordered_ulids(2);
@@ -1159,8 +1014,8 @@ mod test {
     async fn delimiter_groups() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["a.txt", "dir/1", "dir/2", "z.txt"].iter().enumerate() {
             let version_id = Ulid::generate();
@@ -1199,8 +1054,8 @@ mod test {
     async fn reference_metadata_returned() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         let version_id = Ulid::generate();
         let source_metadata = SourceMetadata {
@@ -1267,8 +1122,8 @@ mod test {
     async fn keys_sort() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         for (index, key) in ["b", "aa", "a/1"].iter().enumerate() {
             let version_id = Ulid::generate();
@@ -1298,8 +1153,8 @@ mod test {
     async fn scan_cap_truncates() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         // Three delimiter groups; each head round makes bounded progress so the
         // low scan-round cap trips before the "c/" group is reached.
@@ -1313,15 +1168,17 @@ mod test {
         }
 
         let first = drive(
-            ListVersionsOperation::new(ListVersionsInput {
-                bucket: "bucket".to_string(),
-                prefix: None,
-                delimiter: Some("/".to_string()),
-                key_marker: None,
-                version_id_marker: None,
-                max_keys: Some(3),
-            })
-            .with_round_limit(2),
+            limited_rounds(
+                ListVersionsOperation::new(ListVersionsInput {
+                    bucket: "bucket".to_string(),
+                    prefix: None,
+                    delimiter: Some("/".to_string()),
+                    key_marker: None,
+                    version_id_marker: None,
+                    max_keys: Some(3),
+                }),
+                2,
+            ),
             &driver_ctx,
         )
         .await
@@ -1332,15 +1189,17 @@ mod test {
         assert_eq!(first.next_key_marker.as_deref(), Some("b/"));
 
         let second = drive(
-            ListVersionsOperation::new(ListVersionsInput {
-                bucket: "bucket".to_string(),
-                prefix: None,
-                delimiter: Some("/".to_string()),
-                key_marker: first.next_key_marker.clone(),
-                version_id_marker: first.next_version_marker,
-                max_keys: Some(3),
-            })
-            .with_round_limit(2),
+            limited_rounds(
+                ListVersionsOperation::new(ListVersionsInput {
+                    bucket: "bucket".to_string(),
+                    prefix: None,
+                    delimiter: Some("/".to_string()),
+                    key_marker: first.next_key_marker.clone(),
+                    version_id_marker: first.next_version_marker,
+                    max_keys: Some(3),
+                }),
+                2,
+            ),
             &driver_ctx,
         )
         .await
@@ -1354,8 +1213,8 @@ mod test {
     async fn keeps_all_versions() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
-        let driver_ctx = driver_context(storage_handle.clone());
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+        let driver_ctx = test_context(storage_handle.clone());
 
         // Seed more versions than the scan limit; every storage page must
         // remain available for response pagination.
@@ -1366,8 +1225,10 @@ mod test {
         seed_head(&storage_handle, "obj", versions[4]).await;
 
         let result = drive(
-            ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS))
-                .with_scan_limit(3),
+            limited_scan(
+                ListVersionsOperation::new(input(ListVersionsOperation::DEFAULT_MAX_KEYS)),
+                3,
+            ),
             &driver_ctx,
         )
         .await
@@ -1407,7 +1268,7 @@ mod test {
 #[cfg(test)]
 mod pure_tests {
     use super::served_copy;
-    use crate::blob::managed_copy::register_entry;
+    use aruna_core::managed_copy::register_entry;
     use aruna_core::structs::placement::node_subject::NodeSubjectRecord;
     use aruna_core::structs::placement::policy::{PlacementPolicyRef, PlacementSubject};
     use aruna_core::structs::storage::blob::{
@@ -1466,7 +1327,7 @@ mod pure_tests {
     }
 
     fn registration() -> Vec<u8> {
-        let (_, _, value) = register_entry(crate::blob::managed_copy::CopyRegistration {
+        let (_, _, value) = register_entry(aruna_core::managed_copy::CopyRegistration {
             version: version(),
             node_id: node(),
             location: &location(),

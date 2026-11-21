@@ -7,31 +7,34 @@ use super::{
     ModelInput, PROXY_BODY_LIMIT, ProviderModel, ensure_enabled, forbidden_header, model_ids,
     parse_json, parse_provider_kind, provider_base_url, provider_summary,
 };
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::unix_rfc3339;
 use crate::routes::info::is_realm_admin;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
-    AssistantProviderStatus, AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, SESSION_HEADER,
-    USER_HEADER, secs_to_midnight, utc_day,
+    AssistantProviderStatus,
 };
-use aruna_core::time::unix_timestamp_secs;
+use aruna_core::structs::central_assistant::{
+    AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, SESSION_HEADER, USER_HEADER,
+    secs_to_midnight, utc_day,
+};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::drive;
 use aruna_operations::assistant::central::{
     CentralRead, CentralStoreError, ChargeUsageOperation, GetCentralOperation, SetCentralOperation,
 };
-use aruna_operations::driver::drive;
+use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::info;
@@ -89,7 +92,7 @@ fn map_central_error(error: CentralStoreError) -> ServerError {
         CentralStoreError::Stale => {
             ServerError::Conflict("central assistant changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -99,11 +102,7 @@ async fn load_central(state: &ServerState, user_id: UserId) -> ServerResult<Cent
         .map_err(map_central_error)
 }
 
-async fn require_admin(
-    state: &ServerState,
-    auth: Option<AuthContext>,
-) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
+async fn require_admin(state: &ServerState, auth: AuthContext) -> ServerResult<AuthContext> {
     if is_realm_admin(state, &auth).await? {
         Ok(auth)
     } else {
@@ -168,7 +167,9 @@ fn central_secret(
         Some(current) => current
             .provider
             .open_secret(state.credential_encryption_key())
-            .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string())),
+            .map_err(|_| {
+                ServerError::InternalError("provider secret unavailable".to_string().into())
+            }),
         None => Ok(AssistantProviderSecret::empty()),
     }
 }
@@ -213,9 +214,15 @@ fn build_central(
     let secret = central_secret(state, request.api_key, current)?;
     let key = state.credential_encryption_key();
     provider
-        .encrypt_secret(key, &secret)
-        .and_then(|_| provider.encrypt_headers(key, &AssistantHeaders(Default::default())))
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .encrypt_secret(key, &secret, rand::random::<[u8; 24]>())
+        .and_then(|_| {
+            provider.encrypt_headers(
+                key,
+                &AssistantHeaders(Default::default()),
+                rand::random::<[u8; 24]>(),
+            )
+        })
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     Ok(CentralAssistant {
         provider,
         daily_limit: request.daily_limit,
@@ -260,7 +267,6 @@ refused.
                 "used_today": 12,
                 "resets_at": "2026-11-03T00:00:00Z"
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No central assistant is set up, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 503, description = "The holder node is not reachable", body = ErrorResponse)
@@ -269,10 +275,9 @@ refused.
 )]
 pub async fn get_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<CentralResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (central, usage) = load_central(&state, auth.user_id).await?;
     let central = central.ok_or(ServerError::NotFound)?;
     let admin = is_realm_admin(&state, &auth).await?;
@@ -334,7 +339,6 @@ pub async fn get_central(
                 }
             })),
         (status = 400, description = "Unknown or ChatGPT kind, invalid base URL, or an invalid header name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse),
         (status = 409, description = "The setup changed concurrently", body = ErrorResponse),
@@ -344,7 +348,7 @@ pub async fn get_central(
 )]
 pub async fn put_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     request: Request,
 ) -> ServerResult<(StatusCode, Json<CentralResponse>)> {
     ensure_enabled(&state)?;
@@ -384,7 +388,6 @@ pub async fn put_central(
 - The removal is written to the holder node's audit log."#,
     responses(
         (status = 204, description = "Central assistant removed"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No central assistant is set up, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "The setup changed concurrently", body = ErrorResponse),
@@ -394,7 +397,7 @@ pub async fn put_central(
 )]
 pub async fn delete_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
     ensure_enabled(&state)?;
     let auth = require_admin(&state, auth).await?;
@@ -435,7 +438,6 @@ pub async fn delete_central(
                 "message": "Provider is ready",
                 "models": [{"id": "deepseek-v4.1", "static": false}]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not a realm admin, or the token carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No central assistant is set up, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 503, description = "The holder node is not reachable", body = ErrorResponse)
@@ -444,7 +446,7 @@ pub async fn delete_central(
 )]
 pub async fn test_central(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<CentralTestResponse>)> {
     ensure_enabled(&state)?;
     let auth = require_admin(&state, auth).await?;
@@ -552,7 +554,7 @@ fn central_body(
         object.insert("user".to_string(), pseudonym);
     }
     serde_json::to_vec(&value)
-        .map_err(|_| ServerError::InternalError("proxy JSON encoding failed".to_string()))
+        .map_err(|_| ServerError::InternalError("proxy JSON encoding failed".to_string().into()))
 }
 
 fn session_id(headers: &HeaderMap) -> ServerResult<String> {
@@ -570,10 +572,12 @@ fn session_id(headers: &HeaderMap) -> ServerResult<String> {
 }
 
 fn identity_header(name: &str, value: &str) -> ServerResult<(HeaderName, HeaderValue)> {
-    let name = HeaderName::try_from(name)
-        .map_err(|_| ServerError::InternalError("stored header name is invalid".to_string()))?;
-    let value = HeaderValue::try_from(value)
-        .map_err(|_| ServerError::InternalError("identity header value is invalid".to_string()))?;
+    let name = HeaderName::try_from(name).map_err(|_| {
+        ServerError::InternalError("stored header name is invalid".to_string().into())
+    })?;
+    let value = HeaderValue::try_from(value).map_err(|_| {
+        ServerError::InternalError("identity header value is invalid".to_string().into())
+    })?;
     Ok((name, value))
 }
 

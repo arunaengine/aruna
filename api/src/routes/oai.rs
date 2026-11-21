@@ -3,31 +3,30 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_drivers::driver::drive;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{ConnectInfo, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::Response;
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::harvest::oai_pmh::mapping::jsonld_to_dc;
 use aruna_operations::harvest::oai_pmh::request::format_from;
-use aruna_operations::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, RoCrateExportView,
-};
-use aruna_operations::metadata::forward::export_rocrate_routed;
-use aruna_operations::metadata::get_document::load_document_record;
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
+use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::visibility_index::{
-    VisibilityError, earliest_visible, effective_datestamp, visible_page,
+    AnonReadableOperation, EarliestVisibleOperation, EffectiveDatestampOperation, VisibilityError,
+    VisiblePageOperation,
 };
 
 use crate::forwarded::external_base_url;
@@ -61,14 +60,8 @@ const OAI_PMH_OPEN: &str = concat!(
     "http://www.openarchives.org/OAI/2.0/OAI-PMH.xsd\">"
 );
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "oai", description = "OAI-PMH 2.0 metadata harvesting"))
-)]
-pub struct OaiApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OaiApiDoc::openapi()).routes(routes!(handle_oai, handle_oai_post))
+    OpenApiRouter::new().routes(routes!(handle_oai, handle_oai_post))
 }
 
 /// The six protocol arguments, already validated against the verb's matrix.
@@ -377,7 +370,7 @@ fn validate_pairs(pairs: &[(String, String)]) -> Result<OaiParams, OaiFault> {
 }
 
 async fn identify(ctx: &DriverContext, base_url: &str) -> Result<String, OaiFault> {
-    let earliest = match earliest_visible(ctx).await {
+    let earliest = match drive(EarliestVisibleOperation::new(), ctx).await {
         Ok(Some(updated_at_ms)) => {
             format_from(updated_at_ms).unwrap_or_else(|| EARLIEST_FALLBACK.to_string())
         }
@@ -421,9 +414,8 @@ async fn list(
     let (from_ms, until_ms, start_cursor) = resolve_window(params)?;
     // One entry beyond the page is the visible lookahead: a token is only issued
     // when another record actually exists.
-    let page = visible_page(ctx.as_ref(), from_ms, until_ms, start_cursor, PAGE_SIZE + 1)
-        .await
-        .map_err(visibility_fault)?;
+    let page = VisiblePageOperation::new((from_ms, until_ms), start_cursor, PAGE_SIZE + 1);
+    let page = drive(page, ctx.as_ref()).await.map_err(visibility_fault)?;
     // Empty partial batches continue; only an exhausted initial window yields `noRecordsMatch`.
     // An emptied continuation closes with a terminal token to preserve the partial harvest.
     if page.entries.is_empty() && !page.more && params.resumption_token.is_none() {
@@ -606,7 +598,7 @@ async fn get_record(
     let Some(document_id) = parse_identifier(identifier) else {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     };
-    let record = load_document_record(ctx.as_ref(), document_id)
+    let record = drive(DocumentRecordOperation::new(document_id), ctx.as_ref())
         .await
         .map_err(|_| OaiFault::Internal)?
         // A record from another realm is not this repository's to serve, and a
@@ -618,7 +610,8 @@ async fn get_record(
     if !anon_can_read(ctx.as_ref(), &record).await? {
         return Err(protocol("idDoesNotExist", "Unknown identifier"));
     }
-    record.updated_at_ms = effective_datestamp(ctx.as_ref(), &record)
+    let datestamp = EffectiveDatestampOperation::new(record.clone());
+    record.updated_at_ms = drive(datestamp, ctx.as_ref())
         .await
         .map_err(visibility_fault)?;
     Ok(format!(
@@ -633,9 +626,8 @@ async fn anon_can_read(
     ctx: &DriverContext,
     record: &MetadataRegistryRecord,
 ) -> Result<bool, OaiFault> {
-    aruna_operations::metadata::visibility_index::anon_readable(ctx, record)
-        .await
-        .map_err(visibility_fault)
+    let readable = AnonReadableOperation::new(record.clone());
+    drive(readable, ctx).await.map_err(visibility_fault)
 }
 
 fn render_header(record: &MetadataRegistryRecord) -> String {
@@ -683,12 +675,15 @@ async fn read_jsonld(
         offset: None,
         after: None,
     };
-    match export_rocrate_routed(
+    match drive(
+        RoutedExportOperation::new(
+            ctx.net_handle.as_ref().map(|net| net.node_id()),
+            realm_id,
+            request,
+            None,
+            state.rocrate_limits().metadata_bytes,
+        ),
         ctx,
-        realm_id,
-        request,
-        None,
-        state.rocrate_limits().metadata_bytes,
     )
     .await
     {
@@ -775,6 +770,7 @@ fn status_response(status: StatusCode) -> Response {
 
 /// Escapes the five XML entities and drops characters XML 1.0 cannot represent,
 /// so a conforming harvester can always parse the response.
+/// Not `quick_xml::escape::escape`: that one writes `\r` as `&#13;`, this keeps it raw.
 fn escape_xml(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -809,15 +805,11 @@ fn encode_token(until_ms: u64, cursor: Vec<u8>) -> String {
         prefix: METADATA_PREFIX.to_string(),
         cursor,
     };
-    let bytes = postcard::to_allocvec(&payload).expect("postcard token is infallible");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    aruna_core::cursor::encode_value(&payload).expect("postcard token is infallible")
 }
 
 fn decode_token(token: &str) -> Option<TokenPayload> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token)
-        .ok()?;
-    postcard::from_bytes(&bytes).ok()
+    aruna_core::cursor::decode_value(token).ok()
 }
 
 #[cfg(test)]

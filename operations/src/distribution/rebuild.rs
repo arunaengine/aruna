@@ -3,14 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterEnd, IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::errors::ConversionError;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     INVENTORY_KEYSPACE, NODE_STATS_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE,
     UPLOAD_INVENTORY_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::distribution::accounting::{
     Charge, CounterOverflow, Cursor, RangeAccount, RangeCounters, Rebuild, account_key,
     generation_key,
@@ -19,9 +21,9 @@ use aruna_core::structs::storage::distribution::inventory::{
     Entry, HeadEntry, Position, VersionEntry, range_interval,
 };
 use aruna_core::structs::storage::usage::dirty_share_key;
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
 use super::handoff::{
@@ -45,9 +47,7 @@ pub enum RebuildError {
     #[error(transparent)]
     Overflow(#[from] CounterOverflow),
     #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error("rebuild received unexpected event: {0:?}")]
-    UnexpectedEvent(Box<Event>),
+    Io(#[from] IoError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,54 +79,12 @@ enum Walk {
     Uploads,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum State {
-    Init,
-    ReadAccount,
-    BeginTxn,
-    BeginRead,
-    Probe,
-    PageTxn,
-    PageAccount,
-    PageRead,
-    PageCount,
-    PageWrite,
-    ActivateTxn,
-    ActivateRead,
-    ActivateWrite,
-    ActivateDelete,
-    ActivateCount,
-    Commit,
-    Abort,
-    Done,
-}
-
 /// What the open transaction commits: the next account rows and the deletes that go along.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Plan {
     writes: Vec<(String, Key, Value)>,
     deletes: Vec<(String, Key)>,
     counters: Vec<(Key, RangeCounters)>,
-    account: Option<RangeAccount>,
-    /// The outcome the commit finishes the run with; `None` continues the walk.
-    finish: Option<RebuildOutcome>,
-    /// The transaction commits one page of the walk.
-    page: bool,
-}
-
-#[derive(Debug, PartialEq)]
-pub struct RebuildOperation {
-    config: RebuildConfig,
-    state: State,
-    account: Option<RangeAccount>,
-    walk: Walk,
-    probe_end: Option<Vec<u8>>,
-    terminal: bool,
-    txn_id: Option<TxnId>,
-    plan: Plan,
-    pages: usize,
-    conflicts: usize,
-    outcome: Option<Result<RebuildOutcome, RebuildError>>,
 }
 
 /// What one walked row contributes to the new generation.
@@ -143,123 +101,197 @@ fn contribution(walk: Walk, key: &[u8], value: &[u8]) -> Result<RangeCounters, C
     })
 }
 
-impl RebuildOperation {
-    pub fn new(config: RebuildConfig) -> Self {
+fn walked(walk: Walk, rebuild: &Rebuild) -> &Cursor {
+    match walk {
+        Walk::Versions => &rebuild.versions,
+        Walk::Uploads => &rebuild.uploads,
+    }
+}
+
+/// One page read of `walk`, from its cursor in `account` up to `end`.
+fn walk_read(config: &RebuildConfig, walk: Walk, account: &RangeAccount, end: IterEnd) -> IoCall {
+    let (lower, _) = range_interval(config.set_id, &account.lower, account.upper.as_deref());
+    let cursor = account
+        .rebuild
+        .as_ref()
+        .map(|rebuild| walked(walk, rebuild));
+    let start = match cursor {
+        Some(Cursor::At(position)) => IterStart::After(position.clone().into()),
+        _ => IterStart::At(lower.into()),
+    };
+    let key_space = match walk {
+        Walk::Versions => INVENTORY_KEYSPACE,
+        Walk::Uploads => UPLOAD_INVENTORY_KEYSPACE,
+    };
+    let range = StorageEffect::IterRange {
+        key_space: key_space.to_string(),
+        start,
+        end,
+        limit: config.page_rows,
+        max_bytes: config.page_bytes,
+        txn_id: None,
+    };
+    IoCall::Effect(Box::new(Effect::Storage(range)))
+}
+
+fn range_end(config: &RebuildConfig, account: &RangeAccount) -> Vec<u8> {
+    range_interval(config.set_id, &account.lower, account.upper.as_deref()).1
+}
+
+/// What one transaction of a rebuild does.
+#[derive(Clone, Debug, PartialEq)]
+enum StepKind {
+    /// Records the rebuild of the next generation.
+    Begin,
+    /// Counts one page of `walk`, ending at what the probe saw.
+    Page {
+        walk: Walk,
+        probe_end: Option<Vec<u8>>,
+        terminal: bool,
+    },
+    /// Activates the finished generation or hands the split off.
+    Activate,
+}
+
+/// How one transaction of a rebuild ended.
+#[derive(Clone, Debug, PartialEq)]
+enum StepEnd {
+    /// The account moved on; `page` tells whether a page of the budget was spent.
+    Advanced {
+        account: RangeAccount,
+        page: bool,
+    },
+    Finished(RebuildOutcome),
+    /// The committed account differs from the one this step was planned against.
+    Stale,
+}
+
+/// What the pending call of a step answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StepState {
+    Read,
+    PageRows,
+    Write,
+    Delete,
+    Count,
+}
+
+/// One rebuild transaction: re-reads the account, plans from it and commits the plan.
+#[derive(Debug, PartialEq)]
+struct RebuildStepOperation {
+    config: RebuildConfig,
+    account: RangeAccount,
+    kind: StepKind,
+    state: StepState,
+    plan: Plan,
+    end: Option<StepEnd>,
+    now_ms: u64,
+    mint: IdMint,
+}
+
+impl RebuildStepOperation {
+    fn new(config: RebuildConfig, account: RangeAccount, kind: StepKind) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             config,
-            state: State::Init,
-            account: None,
-            walk: Walk::Versions,
-            probe_end: None,
-            terminal: false,
-            txn_id: None,
+            account,
+            kind,
+            state: StepState::Read,
             plan: Plan::default(),
-            pages: 0,
-            conflicts: 0,
-            outcome: None,
+            end: None,
         }
     }
 
-    fn key(&self) -> Key {
-        account_key(self.config.set_id, self.config.range_id).into()
-    }
-
-    fn finish(&mut self, outcome: Result<RebuildOutcome, RebuildError>) -> Effects {
-        self.state = State::Done;
-        self.outcome = Some(outcome);
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn invalid(&self, reason: &'static str) -> RebuildError {
+        RebuildError::InvalidAccount {
+            range_id: self.config.range_id,
+            reason,
         }
     }
 
-    fn fail(&mut self, error: impl Into<RebuildError>) -> Effects {
-        self.finish(Err(error.into()))
-    }
-
-    fn read_account(&mut self) -> Effects {
-        self.state = State::ReadAccount;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: RANGE_ACCOUNT_KEYSPACE.to_string(),
-            key: self.key(),
-            txn_id: None,
-        })]
-    }
-
-    fn start_txn(&mut self, state: State) -> Effects {
+    fn call(&mut self, state: StepState, call: IoCall) -> Result<Next<StepEnd>, RebuildError> {
         self.state = state;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        Ok(Next::Call(call))
     }
 
-    /// Decides the next step from the last committed account row.
-    fn advance(&mut self) -> Effects {
-        let Some(account) = self.account.clone() else {
-            return self.read_account();
-        };
-        let range_id = self.config.range_id;
-        let Some(rebuild) = account.rebuild.as_ref() else {
-            return match account.charge {
-                Charge::Active(_) => self.start_txn(State::BeginTxn),
-                Charge::Retired { .. } => self.fail(HandoffError::RangeRetired(range_id)),
-                Charge::Child { .. } => self.fail(RebuildError::InvalidAccount {
-                    range_id,
-                    reason: "a split child has no rebuild",
-                }),
-            };
-        };
-        if rebuild.is_done() {
-            return self.start_txn(State::ActivateTxn);
+    fn write_plan(&mut self) -> Result<Next<StepEnd>, RebuildError> {
+        let writes = std::mem::take(&mut self.plan.writes);
+        self.call(StepState::Write, IoCall::Write(writes))
+    }
+
+    fn count_plan(&mut self) -> Result<Next<StepEnd>, RebuildError> {
+        let deltas = std::mem::take(&mut self.plan.counters);
+        if deltas.is_empty() {
+            return self.finish();
         }
-        if self.pages >= self.config.max_pages {
-            return self.finish(Ok(RebuildOutcome::Paused));
+        let add = IoCall::AddCounters {
+            space: RANGE_COUNTER_KEYSPACE.to_string(),
+            deltas,
+        };
+        self.call(StepState::Count, add)
+    }
+
+    fn finish(&mut self) -> Result<Next<StepEnd>, RebuildError> {
+        let end = self.end.take();
+        Ok(Next::Done(
+            end.ok_or(self.invalid("the rebuild step planned nothing"))?,
+        ))
+    }
+
+    fn planned(&mut self, values: Vec<Option<Value>>) -> Result<Next<StepEnd>, RebuildError> {
+        let (set_id, range_id) = (self.config.set_id, self.config.range_id);
+        let current = decode_account(values.first().and_then(Option::as_ref), range_id)?;
+        if current != self.account {
+            return Ok(Next::Done(StepEnd::Stale));
         }
-        self.walk = match rebuild.versions {
-            Cursor::End => Walk::Uploads,
-            _ => Walk::Versions,
-        };
-        self.state = State::Probe;
-        let (start, end) = self.bounds(&account);
-        smallvec![self.page_read(start, end, None)]
-    }
-
-    fn cursor<'a>(&self, account: &'a RangeAccount) -> Option<&'a Cursor> {
-        let rebuild = account.rebuild.as_ref()?;
-        Some(match self.walk {
-            Walk::Versions => &rebuild.versions,
-            Walk::Uploads => &rebuild.uploads,
-        })
-    }
-
-    /// Where the walk continues and the exclusive end of the range.
-    fn bounds(&self, account: &RangeAccount) -> (IterStart, Vec<u8>) {
-        let (lower, upper) =
-            range_interval(self.config.set_id, &account.lower, account.upper.as_deref());
-        let start = match self.cursor(account) {
-            Some(Cursor::At(position)) => IterStart::After(position.clone().into()),
-            _ => IterStart::At(lower.into()),
-        };
-        (start, upper)
-    }
-
-    fn page_read(&self, start: IterStart, end: Vec<u8>, txn_id: Option<TxnId>) -> Effect {
-        let end = match (&self.probe_end, txn_id, self.terminal) {
-            (Some(probe_end), Some(_), false) => IterEnd::Through(probe_end.clone().into()),
-            _ => IterEnd::Before(end.into()),
-        };
-        let key_space = match self.walk {
-            Walk::Versions => INVENTORY_KEYSPACE,
-            Walk::Uploads => UPLOAD_INVENTORY_KEYSPACE,
-        };
-        Effect::Storage(StorageEffect::IterRange {
-            key_space: key_space.to_string(),
-            start,
-            end,
-            limit: self.config.page_rows,
-            max_bytes: self.config.page_bytes,
-            txn_id,
-        })
+        match self.kind.clone() {
+            StepKind::Begin => {
+                let Charge::Active(generation) = current.charge else {
+                    return Ok(Next::Done(StepEnd::Stale));
+                };
+                let next = RangeAccount {
+                    rebuild: Some(Rebuild::new(generation.saturating_add(1))),
+                    ..current
+                };
+                self.plan.writes = vec![account_row(set_id, range_id, &next)?];
+                self.end = Some(StepEnd::Advanced {
+                    account: next,
+                    page: false,
+                });
+                self.write_plan()
+            }
+            StepKind::Page {
+                walk,
+                probe_end,
+                terminal,
+            } => {
+                let end = match (probe_end, terminal) {
+                    (Some(probe_end), false) => IterEnd::Through(probe_end.into()),
+                    _ => IterEnd::Before(range_end(&self.config, &current).into()),
+                };
+                let read = walk_read(&self.config, walk, &current, end);
+                self.call(StepState::PageRows, read)
+            }
+            StepKind::Activate => match plan_activation(set_id, range_id, values)? {
+                Some(mut activation) => {
+                    if let Some(group) = self.config.group_id {
+                        let key = dirty_share_key(group).into();
+                        let generation = self.mint.mint(self.now_ms).to_bytes().to_vec().into();
+                        let marker = (NODE_STATS_KEYSPACE.to_string(), key, generation);
+                        activation.writes.push(marker);
+                    }
+                    self.plan = Plan {
+                        writes: activation.writes,
+                        deletes: activation.deletes,
+                        counters: activation.counters,
+                    };
+                    self.end = Some(StepEnd::Finished(RebuildOutcome::Done));
+                    self.write_plan()
+                }
+                None => Ok(Next::Done(StepEnd::Finished(RebuildOutcome::Waiting))),
+            },
+        }
     }
 
     /// Counts one page read inside the transaction and plans the cursor it ends at.
@@ -267,252 +299,177 @@ impl RebuildOperation {
         &mut self,
         values: Vec<(Key, Value)>,
         truncated: Option<Key>,
-    ) -> Result<Effects, RebuildError> {
-        let (Some(txn_id), Some(mut account)) = (self.txn_id, self.account.clone()) else {
-            return Err(RebuildError::InvalidAccount {
-                range_id: self.config.range_id,
-                reason: "a page needs an open transaction",
-            });
+    ) -> Result<Next<StepEnd>, RebuildError> {
+        let StepKind::Page {
+            walk,
+            probe_end,
+            terminal,
+        } = self.kind.clone()
+        else {
+            return Err(self.invalid("only a page step reads a page"));
         };
         let mut total = RangeCounters::default();
         for (key, value) in &values {
-            total = total.merge(contribution(self.walk, key, value)?)?;
+            total = total.merge(contribution(walk, key, value)?)?;
         }
-        let cursor = match (truncated, self.terminal, self.probe_end.clone()) {
+        let cursor = match (truncated, terminal, probe_end) {
             (Some(last), _, _) => Cursor::At(last.to_vec()),
             (None, true, _) | (None, false, None) => Cursor::End,
             (None, false, Some(probe_end)) => Cursor::At(probe_end),
         };
-        let rebuild = account
-            .rebuild
-            .as_mut()
-            .ok_or(RebuildError::InvalidAccount {
-                range_id: self.config.range_id,
-                reason: "the rebuild ended during a page",
-            })?;
+        let mut account = self.account.clone();
+        let rebuild =
+            (account.rebuild.as_mut()).ok_or(self.invalid("the rebuild ended during a page"))?;
         let generation = rebuild.generation;
-        match self.walk {
+        match walk {
             Walk::Versions => rebuild.versions = cursor,
             Walk::Uploads => rebuild.uploads = cursor,
         }
         let (set_id, range_id) = (self.config.set_id, self.config.range_id);
-        self.plan = Plan {
-            writes: vec![account_row(set_id, range_id, &account)?],
-            account: Some(account),
+        self.plan.writes = vec![account_row(set_id, range_id, &account)?];
+        if !total.is_zero() {
+            let row = generation_key(set_id, range_id, generation);
+            self.plan.counters = vec![(row.into(), total)];
+        }
+        self.end = Some(StepEnd::Advanced {
+            account,
             page: true,
-            ..Plan::default()
+        });
+        self.write_plan()
+    }
+}
+
+impl Operation for RebuildStepOperation {
+    type Output = StepEnd;
+    type Error = RebuildError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> Result<Next<StepEnd>, RebuildError> {
+        let (set_id, range_id) = (self.config.set_id, self.config.range_id);
+        let reads = match self.kind {
+            StepKind::Activate => activation_reads(set_id, range_id, &self.account),
+            _ => {
+                let key = account_key(set_id, range_id).into();
+                vec![(RANGE_ACCOUNT_KEYSPACE.to_string(), key)]
+            }
         };
-        if total.is_zero() {
-            return Ok(self.write_plan(txn_id));
-        }
-        self.state = State::PageCount;
-        let row = generation_key(set_id, range_id, generation);
-        Ok(smallvec![Effect::Storage(StorageEffect::AddCounters {
-            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-            deltas: vec![(row.into(), total)],
-            txn_id,
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn write_plan(&mut self, txn_id: TxnId) -> Effects {
-        if self.plan.writes.is_empty() {
-            return self.delete_plan(txn_id);
+    fn next(&mut self, result: IoResult) -> Result<Next<StepEnd>, RebuildError> {
+        match self.state {
+            StepState::Read => self.planned(result.values()?),
+            StepState::PageRows => {
+                let (rows, truncated) = result.page()?;
+                self.plan_page(rows, truncated)
+            }
+            StepState::Write => {
+                result.done()?;
+                let deletes = std::mem::take(&mut self.plan.deletes);
+                self.call(StepState::Delete, IoCall::Delete(deletes))
+            }
+            StepState::Delete => {
+                result.done()?;
+                self.count_plan()
+            }
+            StepState::Count => {
+                result.done()?;
+                self.finish()
+            }
         }
-        self.state = match self.state {
-            State::ActivateRead => State::ActivateWrite,
-            _ => State::PageWrite,
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: std::mem::take(&mut self.plan.writes),
-            txn_id: Some(txn_id),
-        })]
     }
 
-    fn delete_plan(&mut self, txn_id: TxnId) -> Effects {
-        if self.plan.deletes.is_empty() {
-            return self.count_plan(txn_id);
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// What the pending call of a rebuild run answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum State {
+    Account,
+    Probe(Walk),
+    Step,
+}
+
+/// Rebuilds a range's counters: decides each step from the last committed account and runs it
+/// as its own [`RebuildStepOperation`].
+#[derive(Debug, PartialEq)]
+pub struct RebuildOperation {
+    config: RebuildConfig,
+    state: State,
+    account: Option<RangeAccount>,
+    pages: usize,
+    conflicts: usize,
+}
+
+impl RebuildOperation {
+    pub fn new(config: RebuildConfig) -> Self {
+        Self {
+            config,
+            state: State::Account,
+            account: None,
+            pages: 0,
+            conflicts: 0,
         }
-        self.state = State::ActivateDelete;
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: std::mem::take(&mut self.plan.deletes),
-            txn_id: Some(txn_id),
-        })]
     }
 
-    fn count_plan(&mut self, txn_id: TxnId) -> Effects {
-        if self.plan.counters.is_empty() {
-            self.state = State::Commit;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        }
-        self.state = State::ActivateCount;
-        smallvec![Effect::Storage(StorageEffect::AddCounters {
-            key_space: RANGE_COUNTER_KEYSPACE.to_string(),
-            deltas: std::mem::take(&mut self.plan.counters),
-            txn_id,
-        })]
+    fn read_account(&mut self) -> Next<RebuildOutcome> {
+        self.state = State::Account;
+        let key = account_key(self.config.set_id, self.config.range_id);
+        Next::Call(read_row(RANGE_ACCOUNT_KEYSPACE, key))
     }
 
-    fn handle(&mut self, event: Event) -> Result<Effects, RebuildError> {
+    fn step(&mut self, account: RangeAccount, kind: StepKind) -> Next<RebuildOutcome> {
+        self.state = State::Step;
+        let step = RebuildStepOperation::new(self.config.clone(), account, kind);
+        Next::Call(IoCall::child(step))
+    }
+
+    /// Decides the next step from the last committed account row.
+    fn advance(&mut self, account: RangeAccount) -> Result<Next<RebuildOutcome>, RebuildError> {
         let range_id = self.config.range_id;
-        let set_id = self.config.set_id;
-        match (&self.state, event) {
-            (State::ReadAccount, Event::Storage(StorageEvent::ReadResult { value, .. })) => {
-                self.account = Some(decode_account(value.as_ref(), range_id)?);
-                Ok(self.advance())
-            }
-            (
-                State::BeginTxn | State::PageTxn | State::ActivateTxn,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.txn_id = Some(txn_id);
-                let reads = match (&self.state, self.account.as_ref()) {
-                    (State::ActivateTxn, Some(account)) => {
-                        activation_reads(set_id, range_id, account)
-                    }
-                    _ => vec![(RANGE_ACCOUNT_KEYSPACE.to_string(), self.key())],
-                };
-                self.state = match self.state {
-                    State::BeginTxn => State::BeginRead,
-                    State::PageTxn => State::PageAccount,
-                    _ => State::ActivateRead,
-                };
-                Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: Some(txn_id),
-                })])
-            }
-            (State::BeginRead, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let current =
-                    decode_account(values.first().and_then(|(_, v)| v.as_ref()), range_id)?;
-                if Some(&current) != self.account.as_ref() {
-                    return Ok(self.restart());
-                }
-                let Charge::Active(generation) = current.charge else {
-                    return Ok(self.restart());
-                };
-                let next = RangeAccount {
-                    rebuild: Some(Rebuild::new(generation.saturating_add(1))),
-                    ..current
-                };
-                self.plan = Plan {
-                    writes: vec![account_row(set_id, range_id, &next)?],
-                    account: Some(next),
-                    ..Plan::default()
-                };
-                Ok(self.write_plan(self.txn_id.unwrap_or_default()))
-            }
-            (
-                State::Probe,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
+        self.account = Some(account.clone());
+        let Some(rebuild) = account.rebuild.as_ref() else {
+            return match account.charge {
+                Charge::Active(_) => Ok(self.step(account, StepKind::Begin)),
+                Charge::Retired { .. } => Err(HandoffError::RangeRetired(range_id).into()),
+                Charge::Child { .. } => Err(RebuildError::InvalidAccount {
+                    range_id,
+                    reason: "a split child has no rebuild",
                 }),
-            ) => {
-                self.terminal = next_start_after.is_none();
-                self.probe_end = values.last().map(|(key, _)| key.to_vec());
-                Ok(self.start_txn(State::PageTxn))
-            }
-            (State::PageAccount, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let current =
-                    decode_account(values.first().and_then(|(_, v)| v.as_ref()), range_id)?;
-                if Some(&current) != self.account.as_ref() {
-                    return Ok(self.restart());
-                }
-                self.state = State::PageRead;
-                let (start, end) = self.bounds(&current);
-                Ok(smallvec![self.page_read(start, end, self.txn_id)])
-            }
-            (
-                State::PageRead,
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }),
-            ) => self.plan_page(values, next_start_after),
-            (State::PageCount, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(self.write_plan(self.txn_id.unwrap_or_default()))
-            }
-            (State::ActivateRead, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let current =
-                    decode_account(values.first().and_then(|(_, v)| v.as_ref()), range_id)?;
-                if Some(&current) != self.account.as_ref() {
-                    return Ok(self.restart());
-                }
-                let values = values.into_iter().map(|(_, value)| value).collect();
-                match plan_activation(set_id, range_id, values)? {
-                    Some(mut activation) => {
-                        if let Some(group) = self.config.group_id {
-                            let key = dirty_share_key(group).into();
-                            let generation = Ulid::generate().to_bytes().to_vec().into();
-                            let marker = (NODE_STATS_KEYSPACE.to_string(), key, generation);
-                            activation.writes.push(marker);
-                        }
-                        self.plan = Plan {
-                            writes: activation.writes,
-                            deletes: activation.deletes,
-                            counters: activation.counters,
-                            finish: Some(RebuildOutcome::Done),
-                            ..Plan::default()
-                        };
-                        Ok(self.write_plan(self.txn_id.unwrap_or_default()))
-                    }
-                    None => Ok(self.finish(Ok(RebuildOutcome::Waiting))),
-                }
-            }
-            (
-                State::PageWrite | State::ActivateWrite,
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => Ok(self.delete_plan(self.txn_id.unwrap_or_default())),
-            (State::ActivateDelete, Event::Storage(StorageEvent::BatchDeleteResult { .. })) => {
-                Ok(self.delete_plan(self.txn_id.unwrap_or_default()))
-            }
-            (State::ActivateCount, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                Ok(self.count_plan(self.txn_id.unwrap_or_default()))
-            }
-            (State::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                if let Some(outcome) = self.plan.finish.take() {
-                    return Ok(self.finish(Ok(outcome)));
-                }
-                if self.plan.page {
-                    self.pages += 1;
-                }
-                self.account = self.plan.account.take();
-                Ok(self.advance())
-            }
-            (
-                State::Commit,
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }),
-            ) => {
-                self.txn_id = None;
-                Ok(self.restart())
-            }
-            (State::Abort, Event::Storage(_)) => {
-                self.txn_id = None;
-                Ok(self.read_account())
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (_, event) => Err(RebuildError::UnexpectedEvent(Box::new(event))),
+            };
+        };
+        if rebuild.is_done() {
+            return Ok(self.step(account, StepKind::Activate));
         }
+        if self.pages >= self.config.max_pages {
+            return Ok(Next::Done(RebuildOutcome::Paused));
+        }
+        let walk = match rebuild.versions {
+            Cursor::End => Walk::Uploads,
+            _ => Walk::Versions,
+        };
+        self.state = State::Probe(walk);
+        let end = IterEnd::Before(range_end(&self.config, &account).into());
+        Ok(Next::Call(walk_read(&self.config, walk, &account, end)))
     }
 
-    /// Drops the open transaction, if any, and starts over from the committed account.
-    fn restart(&mut self) -> Effects {
+    /// Starts over from the committed account, until the conflict budget runs out.
+    fn restart(&mut self) -> Next<RebuildOutcome> {
         self.conflicts += 1;
-        self.plan = Plan::default();
         if self.conflicts > MAX_CONFLICTS {
-            return self.finish(Ok(RebuildOutcome::Paused));
+            return Next::Done(RebuildOutcome::Paused);
         }
         self.account = None;
-        match self.txn_id {
-            Some(txn_id) => {
-                self.state = State::Abort;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => self.read_account(),
-        }
+        self.read_account()
     }
 }
 
@@ -520,36 +477,141 @@ impl Operation for RebuildOperation {
     type Output = RebuildOutcome;
     type Error = RebuildError;
 
-    fn start(&mut self) -> Effects {
-        self.read_account()
+    fn first(&mut self) -> Result<Next<RebuildOutcome>, RebuildError> {
+        Ok(self.read_account())
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if self.state == State::Done {
-            return smallvec![];
+    fn next(&mut self, result: IoResult) -> Result<Next<RebuildOutcome>, RebuildError> {
+        match self.state {
+            State::Account => {
+                let stored = result.value()?;
+                let account = decode_account(stored.as_ref(), self.config.range_id)?;
+                self.advance(account)
+            }
+            State::Probe(walk) => {
+                let (rows, more) = result.page()?;
+                let kind = StepKind::Page {
+                    walk,
+                    probe_end: rows.last().map(|(key, _)| key.to_vec()),
+                    terminal: more.is_none(),
+                };
+                let account = self.account.clone().ok_or(RebuildError::InvalidAccount {
+                    range_id: self.config.range_id,
+                    reason: "a page needs a read account",
+                })?;
+                Ok(self.step(account, kind))
+            }
+            State::Step => match result.child::<StepEnd, RebuildError>()? {
+                Ok(StepEnd::Advanced { account, page }) => {
+                    self.pages += usize::from(page);
+                    self.advance(account)
+                }
+                Ok(StepEnd::Finished(outcome)) => Ok(Next::Done(outcome)),
+                Ok(StepEnd::Stale) | Err(RebuildError::Io(IoError::Conflict)) => Ok(self.restart()),
+                Err(error) => Err(error),
+            },
         }
-        match self.handle(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+    }
+}
+
+/// The set, range and account of one range account row; `None` for a malformed row.
+pub(crate) fn decode(key: &[u8], value: &[u8]) -> Option<(Ulid, Ulid, RangeAccount)> {
+    let set_id = Ulid::from_bytes(key.get(..16)?.try_into().ok()?);
+    let range_id = Ulid::from_bytes(key.get(16..32)?.try_into().ok()?);
+    let account = RangeAccount::from_bytes(value).ok()?;
+    (key.len() == 32).then_some((set_id, range_id, account))
+}
+
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct BeginRebuildsError(String);
+
+impl From<IoError> for BeginRebuildsError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+/// Begins a counter rebuild of every active range account without one, a page at a time, and
+/// outputs how many began. A rebuild that does not begin is logged and skipped.
+#[derive(Debug, PartialEq)]
+pub struct BeginRebuildsOperation {
+    walk: (usize, usize),
+    pages: PrefixPages,
+    /// Accounts of the page still to begin, the next one last.
+    pending: Vec<(Ulid, Ulid)>,
+    /// The account whose rebuild is running.
+    current: Option<(Ulid, Ulid)>,
+    begun: usize,
+}
+
+impl BeginRebuildsOperation {
+    /// Pages of `account_page` accounts; each rebuild records walk pages of `walk` rows and bytes.
+    pub(crate) fn new(account_page: usize, walk: (usize, usize)) -> Self {
+        Self {
+            walk,
+            pages: PrefixPages::new(RANGE_ACCOUNT_KEYSPACE, Vec::new(), account_page),
+            pending: Vec::new(),
+            current: None,
+            begun: 0,
         }
     }
 
-    fn is_complete(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn finalize(self) -> Result<RebuildOutcome, RebuildError> {
-        self.outcome.unwrap_or(Err(RebuildError::InvalidAccount {
-            range_id: self.config.range_id,
-            reason: "the rebuild stopped before it finished",
-        }))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn read_page(&mut self, rows: Vec<(Key, Value)>) {
+        // Reversed, so the accounts are popped in key order.
+        for (key, value) in rows.into_iter().rev() {
+            let Some((set_id, range_id, account)) = decode(&key, &value) else {
+                continue;
+            };
+            if account.rebuild.is_none() && matches!(account.charge, Charge::Active(_)) {
+                self.pending.push((set_id, range_id));
+            }
         }
+    }
+
+    fn next_rebuild(&mut self) -> Next<usize> {
+        let Some((set_id, range_id)) = self.pending.pop() else {
+            return match self.pages.done() {
+                true => Next::Done(self.begun),
+                false => Next::Call(self.pages.call()),
+            };
+        };
+        // No page budget: the run only records the new generation's rebuild.
+        let config = RebuildConfig {
+            set_id,
+            range_id,
+            page_rows: self.walk.0,
+            page_bytes: self.walk.1,
+            max_pages: 0,
+            group_id: None,
+        };
+        self.current = Some((set_id, range_id));
+        Next::Call(IoCall::child(RebuildOperation::new(config)))
+    }
+}
+
+impl Operation for BeginRebuildsOperation {
+    type Output = usize;
+    type Error = BeginRebuildsError;
+
+    fn first(&mut self) -> Result<Next<usize>, BeginRebuildsError> {
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, BeginRebuildsError> {
+        match self.current.take() {
+            Some((set_id, range_id)) => match result.child::<RebuildOutcome, RebuildError>()? {
+                Ok(_) => self.begun += 1,
+                Err(error) => {
+                    warn!(%set_id, %range_id, %error, "A range counter rebuild did not begin")
+                }
+            },
+            None => {
+                let rows = self.pages.take(result)?;
+                self.read_page(rows);
+            }
+        }
+        Ok(self.next_rebuild())
     }
 }
 

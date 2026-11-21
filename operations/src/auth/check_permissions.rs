@@ -2,13 +2,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::Event;
+use aruna_core::events::{Event, SubOperationEvent};
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::types::{Effects, TxnId};
+use aruna_core::types::{Key, KeySpace};
 
-use crate::auth::permission_rules::{PermissionRulesConfig, PermissionRulesOperation};
+use crate::auth::permission_rules::{read_rules, rule_reads};
+
+/// Maps any authorization sub-operation onto the shared result event.
+pub fn authorization_event(allowed: Result<bool, AuthorizationError>) -> Event {
+    Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed })
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckPermissionsConfig {
@@ -17,71 +23,53 @@ pub struct CheckPermissionsConfig {
     pub required_permission: Permission,
 }
 
+impl CheckPermissionsConfig {
+    /// The rows the check reads, for a parent that folds the check into its own transaction.
+    pub(crate) fn reads(&self) -> Result<Vec<(KeySpace, Key)>, AuthorizationError> {
+        rule_reads(&self.path)
+    }
+
+    /// Whether the rows [`Self::reads`] named, answered in that order, allow the path.
+    pub(crate) fn allowed(
+        &self,
+        values: Vec<Option<aruna_core::types::Value>>,
+    ) -> Result<bool, AuthorizationError> {
+        let rules = read_rules(&self.auth_context, values)?;
+        Ok(rules.allows(&self.path, &self.required_permission))
+    }
+}
+
 /// Decides a single path. Rule collection and evaluation live in
 /// `permission_rules`, so read paths that filter many paths at once share
 /// exactly these semantics.
 #[derive(Debug, PartialEq)]
 pub struct CheckPermissionsOperation {
-    rules: PermissionRulesOperation,
-    path: String,
-    required_permission: Permission,
+    config: CheckPermissionsConfig,
 }
 
 impl CheckPermissionsOperation {
     pub fn new(config: CheckPermissionsConfig) -> Self {
-        CheckPermissionsOperation {
-            rules: PermissionRulesOperation::new(PermissionRulesConfig {
-                auth_context: config.auth_context,
-                path: config.path.clone(),
-            }),
-            path: config.path,
-            required_permission: config.required_permission,
-        }
-    }
-
-    pub fn new_with_txn(config: CheckPermissionsConfig, txn_id: TxnId) -> Self {
-        CheckPermissionsOperation {
-            rules: PermissionRulesOperation::new_with_txn(
-                PermissionRulesConfig {
-                    auth_context: config.auth_context,
-                    path: config.path.clone(),
-                },
-                txn_id,
-            ),
-            path: config.path,
-            required_permission: config.required_permission,
-        }
+        CheckPermissionsOperation { config }
     }
 }
 
 impl Operation for CheckPermissionsOperation {
     type Output = bool;
-
     type Error = AuthorizationError;
 
-    fn start(&mut self) -> Effects {
-        self.rules.start()
+    fn first(&mut self) -> Result<Next<bool>, AuthorizationError> {
+        Ok(Next::Call(IoCall::Read(self.config.reads()?)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        self.rules.step(event)
-    }
-
-    fn is_complete(&self) -> bool {
-        self.rules.is_complete()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        let CheckPermissionsOperation {
-            rules,
-            path,
-            required_permission,
-        } = self;
-        Ok(rules.finalize()?.allows(&path, &required_permission))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.rules.abort()
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, AuthorizationError> {
+        let IoResult::Values(values) = result else {
+            return Err(AuthorizationError::UnexpectedEvent {
+                state: "CheckPermissions".to_string(),
+                expected: "IoResult::Values",
+                got: result.label().to_string(),
+            });
+        };
+        self.config.allowed(values).map(Next::Done)
     }
 }
 
@@ -89,29 +77,30 @@ impl Operation for CheckPermissionsOperation {
 mod test {
     use std::collections::{HashMap, HashSet};
 
-    use aruna_core::UserId;
     use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_core::user::id::UserId;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
     use ulid::Ulid;
 
     use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::groups::add_member::{AddUserInput, AddUserOperation};
     use crate::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
     use crate::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
     use crate::realm::assign_role::{AssignRolesInput, AssignRolesOperation};
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     #[tokio::test]
     pub async fn public_roles_readonly() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -128,9 +117,10 @@ mod test {
             storage_handle,
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_id = RealmId([3u8; 32]);
@@ -282,7 +272,7 @@ mod test {
     pub async fn test_check_permissions() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -300,9 +290,10 @@ mod test {
             storage_handle,
             blob_handle: None,
             net_handle: Some(net_handle.clone()),
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let realm_id = RealmId([0u8; 32]);

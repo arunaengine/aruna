@@ -63,6 +63,20 @@ fn enrols_tagged_experiment() {
 }
 
 #[test]
+fn malformed_listing_stops() {
+    // A listed experiment without its change time fails the pass instead of being skipped.
+    let runner = Runner::new();
+    let id = runner.world.experiment("Run 1", "", &["aruna"]);
+    let mut inner = runner.world.lock();
+    let experiment = inner.experiments.get_mut(&id).unwrap();
+    experiment.as_object_mut().unwrap().remove("modified_at");
+    drop(inner);
+    let polled = runner.at(|sync| sync.poll());
+    assert_eq!(polled.unwrap_err().kind, Kind::Invalid);
+    assert!(runner.world.lock().datasets.is_empty());
+}
+
+#[test]
 fn link_fields_repaired() {
     let runner = Runner::new();
     let id = runner.world.experiment("Run 7", "", &["aruna"]);

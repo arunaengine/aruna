@@ -3,24 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod content;
-mod records;
+pub(crate) mod records;
+use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::relay::{copy_miss, read_holders, relay_read};
+use crate::routes::storage::relay::{RestRead, holder_json, missed_json};
 use crate::server::state::ServerState;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_operations::abe::KeyError;
+use aruna_drivers::driver::{DriverContext, drive, drive_retry};
 use aruna_operations::abe::envelope::EnvelopeOperation;
-use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
+use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
 use axum::extract::{Query, State};
 use axum::{Extension, Json};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, StatusCode};
-pub(crate) use records::ScopeView;
-pub(crate) use records::{epoch_due, epoch_run, member_requests};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -66,13 +65,30 @@ fn abe_error(error: AbeError) -> ServerError {
     };
     ServerError::Refused(status, code, error.to_string())
 }
+/// Runs a key action, rerunning it from the start after a transaction conflict.
+pub(crate) async fn drive_key(
+    bucket: String,
+    auth: AuthContext,
+    node: aruna_core::id::NodeId,
+    action: KeyAction,
+    context: &DriverContext,
+) -> Result<KeyResult, KeyError> {
+    let seed = Ulid::generate().to_bytes();
+    let build = || {
+        let now = aruna_clock::unix_timestamp_millis();
+        KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
+    };
+    drive_retry(build, context, &seed).await
+}
 pub(crate) fn key_error(error: KeyError) -> ServerError {
     let message = error.to_string();
     match error {
         KeyError::Abe(e) => abe_error(e),
         KeyError::Missing => ServerError::NotFound,
         KeyError::Denied => ServerError::Forbidden,
-        KeyError::Storage | KeyError::Conflict => ServerError::ServiceUnavailable,
+        KeyError::Storage | KeyError::Conflict | KeyError::Unprepared => {
+            ServerError::ServiceUnavailable
+        }
         KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
         KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),
         KeyError::Bound(_) => {
@@ -149,26 +165,28 @@ async fn read_envelope(
         (status = 503, body = ErrorResponse, description = "Storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn envelope(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> ServerResult<Json<EnvelopeView>> {
-    let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let path = version_path("/data/blobs/envelope", &query);
-    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        return relay_read(&state, &holders, &path, bearer.as_ref())
-            .await
-            .map(Json);
+    let relayed = RestRead {
+        info: &info,
+        key: &query.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &relayed).await? {
+        return Ok(Json(answer));
     }
     let read = read_envelope(&state, &query, version).await;
     if matches!(read, Err(ServerError::NotFound))
-        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+        && let Some(answer) = missed_json(&state, &relayed).await?
     {
-        return relay_read(&state, &coordinator, &path, bearer.as_ref())
-            .await
-            .map(Json);
+        return Ok(Json(answer));
     }
     let (envelope, _) = read?;
     let c = &envelope.context;
@@ -189,18 +207,12 @@ pub async fn envelope(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::operation::Operation;
+    use aruna_core::calls::IoError;
 
     #[test]
     fn storage_unavailable_maps() {
-        let mut operation = EnvelopeOperation::new("b".into(), "k".into(), Ulid::generate());
-        operation.start();
-        operation.step(aruna_core::events::Event::Storage(
-            aruna_core::events::StorageEvent::Error {
-                error: aruna_core::errors::StorageError::Timeout,
-            },
-        ));
-        let error = operation.finalize().unwrap_err();
+        let timeout = IoError::Storage(aruna_core::errors::StorageError::Timeout);
+        let error = AbeError::from(timeout);
         assert_eq!(error, AbeError::Unavailable);
         assert!(matches!(abe_error(error), ServerError::ServiceUnavailable));
     }

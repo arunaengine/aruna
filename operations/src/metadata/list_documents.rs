@@ -4,167 +4,86 @@
 
 use std::collections::HashSet;
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::GRAPH_LIFECYCLE_KEYSPACE;
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::keyspaces::{GRAPH_LIFECYCLE_KEYSPACE, METADATA_INDEX_KEYSPACE};
 use aruna_core::metadata::GraphLifecycleRecord;
 use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, decode};
+use aruna_core::storage_entries::metadata_registry_prefix;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
-use thiserror::Error;
+use aruna_core::types::{GroupId, Key};
 
-use crate::metadata::repository::{
-    LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
-};
+use crate::metadata::repository::LIST_METADATA_SIZE;
 
+type ListTurn = Result<Next<Vec<MetadataRegistryRecord>>, IoError>;
+
+/// Pages through every graph lifecycle to collect the deleted graphs, then through the group's
+/// registry rows, keeping the documents whose graph is not deleted.
 #[derive(Debug, PartialEq)]
 pub struct ListDocumentsOperation {
     group_id: GroupId,
+    lifecycles: PrefixPages,
+    /// The registry pages once every lifecycle was read.
+    registry: Option<PrefixPages>,
     documents: Vec<MetadataRegistryRecord>,
     deleted_graph_iris: HashSet<String>,
-    state: ListDocumentsState,
-    output: Option<Result<Vec<MetadataRegistryRecord>, ListDocumentsError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum ListDocumentsState {
-    Init,
-    ListDeleted,
-    ListDocuments,
-    Finish,
-    Error,
-}
-
-#[derive(Debug, Error, PartialEq)]
-pub enum ListDocumentsError {
-    #[error(transparent)]
-    StorageError(#[from] aruna_core::errors::StorageError),
-    #[error(transparent)]
-    ConversionError(#[from] aruna_core::errors::ConversionError),
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
 }
 
 impl ListDocumentsOperation {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
+            lifecycles: PrefixPages::new(
+                GRAPH_LIFECYCLE_KEYSPACE,
+                Key::from(Vec::new()),
+                LIST_METADATA_SIZE,
+            ),
+            registry: None,
             documents: Vec::new(),
             deleted_graph_iris: HashSet::new(),
-            state: ListDocumentsState::Init,
-            output: None,
         }
     }
 
-    fn fail(&mut self, error: ListDocumentsError) -> Effects {
-        self.state = ListDocumentsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(ListDocumentsError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
-    }
-
-    fn iter_effect(&self, start_after: Option<Key>) -> Effect {
-        iter_registry_effect(self.group_id, start_after, None)
-    }
-
-    fn lifecycle_iter_effect(start_after: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            prefix: None,
-            start: start_after.map(IterStart::After),
-            limit: LIST_METADATA_SIZE,
-            txn_id: None,
-        })
+    fn lifecycle_page(&mut self, result: IoResult) -> ListTurn {
+        for (_, value) in self.lifecycles.take(result)? {
+            let lifecycle: GraphLifecycleRecord = decode(&value)?;
+            if lifecycle.is_deleted() {
+                self.deleted_graph_iris.insert(lifecycle.graph_iri);
+            }
+        }
+        if !self.lifecycles.done() {
+            return Ok(Next::Call(self.lifecycles.call()));
+        }
+        let prefix = metadata_registry_prefix(self.group_id);
+        let registry = PrefixPages::new(METADATA_INDEX_KEYSPACE, prefix, LIST_METADATA_SIZE);
+        let call = registry.call();
+        self.registry = Some(registry);
+        Ok(Next::Call(call))
     }
 }
 
 impl Operation for ListDocumentsOperation {
     type Output = Vec<MetadataRegistryRecord>;
-    type Error = ListDocumentsError;
+    type Error = IoError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ListDocumentsState::ListDeleted;
-        smallvec![Self::lifecycle_iter_effect(None)]
+    fn first(&mut self) -> ListTurn {
+        Ok(Next::Call(self.lifecycles.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            ListDocumentsState::ListDeleted => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (_, value) in values {
-                        match postcard::from_bytes::<GraphLifecycleRecord>(&value) {
-                            Ok(lifecycle) => {
-                                if lifecycle.is_deleted() {
-                                    self.deleted_graph_iris.insert(lifecycle.graph_iri);
-                                }
-                            }
-                            Err(error) => {
-                                return self
-                                    .fail(aruna_core::errors::ConversionError::from(error).into());
-                            }
-                        }
-                    }
-                    if next_start_after.is_some() {
-                        return smallvec![Self::lifecycle_iter_effect(next_start_after)];
-                    }
-                    self.state = ListDocumentsState::ListDocuments;
-                    smallvec![self.iter_effect(None)]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self
-                    .unexpected_event("metadata graph lifecycle iter result", format!("{other:?}")),
-            },
-            ListDocumentsState::ListDocuments => match parse_registry_iter(event) {
-                Ok((page, next_start_after)) => {
-                    self.documents.extend(
-                        page.into_iter()
-                            .filter(|record| !self.deleted_graph_iris.contains(&record.graph_iri)),
-                    );
-                    if next_start_after.is_some() {
-                        return smallvec![self.iter_effect(next_start_after)];
-                    }
-                    self.state = ListDocumentsState::Finish;
-                    self.output = Some(Ok(std::mem::take(&mut self.documents)));
-                    smallvec![]
-                }
-                Err(StorageReadError::Storage(error)) => self.fail(error.into()),
-                Err(StorageReadError::Conversion(error)) => self.fail(error.into()),
-            },
-            ListDocumentsState::Finish | ListDocumentsState::Error | ListDocumentsState::Init => {
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> ListTurn {
+        let Some(registry) = self.registry.as_mut() else {
+            return self.lifecycle_page(result);
+        };
+        for (_, value) in registry.take(result)? {
+            let record: MetadataRegistryRecord = decode(&value)?;
+            if !self.deleted_graph_iris.contains(&record.graph_iri) {
+                self.documents.push(record);
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListDocumentsState::Finish | ListDocumentsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Ok(Vec::new()))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if !registry.done() {
+            return Ok(Next::Call(registry.call()));
+        }
+        Ok(Next::Done(std::mem::take(&mut self.documents)))
     }
 }
 
@@ -172,19 +91,33 @@ impl Operation for ListDocumentsOperation {
 mod tests {
     use super::*;
 
+    use aruna_core::calls::IoCall;
+    use aruna_core::effects::{Effect, StorageEffect};
+    use aruna_core::errors::ConversionError;
     use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
-    use aruna_core::metadata::GraphLifecycleRecord;
+    use aruna_core::rows::encode;
+    use aruna_core::storage_entries::metadata_registry_key;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_storage::FjallStorage;
-    use byteview::ByteView;
+    use aruna_core::types::{TxnId, Value};
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    use crate::driver::{DriverContext, drive};
-    use crate::metadata::repository::{write_graph_lifecycle, write_registry_effect};
+    use aruna_core::storage_entries::graph_lifecycle_entry;
+    use aruna_drivers::driver::{DriverContext, drive};
+
+    fn write_registry_effect(
+        record: &MetadataRegistryRecord,
+        txn_id: Option<TxnId>,
+    ) -> Result<Effect, ConversionError> {
+        Ok(Effect::Storage(StorageEffect::Write {
+            key_space: METADATA_INDEX_KEYSPACE.to_string(),
+            key: metadata_registry_key(record.group_id, record.document_id),
+            value: postcard::to_allocvec(record)?.into(),
+            txn_id,
+        }))
+    }
 
     #[tokio::test]
     async fn lists_across_multiple() {
@@ -230,9 +163,10 @@ mod tests {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(ListDocumentsOperation::new(group_id), &context)
@@ -274,29 +208,31 @@ mod tests {
             deleted_id,
             1,
         );
-        let event = storage_handle
-            .send_effect(write_graph_lifecycle(&lifecycle, None).unwrap())
-            .await;
-        assert!(matches!(
-            event,
-            aruna_core::events::Event::Storage(
-                aruna_core::events::StorageEvent::WriteResult { .. }
-            )
-        ));
+        let row = graph_lifecycle_entry(&lifecycle).unwrap();
+        aruna_drivers::testing::write_entries(&storage_handle, vec![row]).await;
 
         let context = DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let result = drive(ListDocumentsOperation::new(group_id), &context)
             .await
             .unwrap();
         assert_eq!(result, vec![active]);
+    }
+
+    fn page(rows: Vec<(Key, Value)>) -> IoResult {
+        IoResult::Page { rows, next: None }
+    }
+
+    fn row<T: serde::Serialize>(seed: u8, value: &T) -> (Key, Value) {
+        (Key::from(vec![seed]), encode(value).unwrap())
     }
 
     #[test]
@@ -314,46 +250,45 @@ mod tests {
         );
 
         let mut operation = ListDocumentsOperation::new(group_id);
-        let effects = operation.start();
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter {
-                key_space,
-                prefix: None,
-                start: None,
-                ..
-            })] if key_space == GRAPH_LIFECYCLE_KEYSPACE
-        ));
+        let lifecycles = PrefixPages::new(
+            GRAPH_LIFECYCLE_KEYSPACE,
+            Key::from(Vec::new()),
+            LIST_METADATA_SIZE,
+        );
+        assert_eq!(operation.first(), Ok(Next::Call(lifecycles.call())));
+        let registry = PrefixPages::new(
+            METADATA_INDEX_KEYSPACE,
+            metadata_registry_prefix(group_id),
+            LIST_METADATA_SIZE,
+        );
+        assert_eq!(
+            operation.next(page(vec![row(1, &lifecycle)])),
+            Ok(Next::Call(registry.call()))
+        );
+        assert_eq!(
+            operation.next(page(vec![row(2, &active), row(3, &deleted)])),
+            Ok(Next::Done(vec![active]))
+        );
+    }
 
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                ByteView::from(vec![1u8]),
-                ByteView::from(postcard::to_allocvec(&lifecycle).unwrap()),
-            )],
-            next_start_after: None,
-        }));
+    #[test]
+    fn follows_next_pages() {
+        let group_id = Ulid::from_parts(1, 1);
+        let mut operation = ListDocumentsOperation::new(group_id);
+        operation.first().unwrap();
+        let more = IoResult::Page {
+            rows: Vec::new(),
+            next: Some(Key::from(vec![9])),
+        };
+        let Ok(Next::Call(IoCall::Page { space, after, .. })) = operation.next(more) else {
+            panic!("expected the next lifecycle page");
+        };
+        assert_eq!(space, GRAPH_LIFECYCLE_KEYSPACE);
+        assert_eq!(after, Some(Key::from(vec![9])));
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-                if key_space == METADATA_INDEX_KEYSPACE
+            operation.next(page(vec![(Key::from(vec![1]), vec![0xff].into())])),
+            Err(IoError::Codec(_))
         ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![
-                (
-                    ByteView::from(vec![2u8]),
-                    ByteView::from(postcard::to_allocvec(&active).unwrap()),
-                ),
-                (
-                    ByteView::from(vec![3u8]),
-                    ByteView::from(postcard::to_allocvec(&deleted).unwrap()),
-                ),
-            ],
-            next_start_after: None,
-        }));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize().unwrap(), vec![active]);
     }
 
     fn metadata_record(

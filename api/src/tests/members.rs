@@ -8,29 +8,35 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use aruna_blob::blob::BlobHandler;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::capacity::with_unopened;
 use aruna_core::structs::storage::distribution::presets::shard_layout;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::SetRoot;
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
-use aruna_core::{NodeId, UserId};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::distribution::admit::{AdmitConfig, AdmitOperation};
-use aruna_operations::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -172,8 +178,8 @@ struct Started {
 async fn start(realm_id: RealmId, seed: u8) -> Started {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap().to_string();
-    let storage = aruna_storage::FjallStorage::open(&root).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    let storage = aruna_storage::storage::worker::FjallStorage::open(&root).unwrap();
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let secret = iroh::SecretKey::from_bytes(&[seed; 32]);
     let config = NetConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -200,9 +206,10 @@ async fn start(realm_id: RealmId, seed: u8) -> Started {
         storage_handle: storage,
         net_handle: Some(net),
         blob_handle: Some(blob),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     Started {

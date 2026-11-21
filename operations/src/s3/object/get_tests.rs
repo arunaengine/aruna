@@ -1,21 +1,17 @@
-//! Tests GetObject range resolution, holder failure reporting and reference drift successors.
+//! Tests GetObject range resolution, the reads of hidden, managed and linked versions and reference
+//! drift successors.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::connectors::repository::source_connector_key;
-use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate};
-use crate::replication::bao_read::BaoReadError;
-use crate::replication::protocol::{BaoReadRefusal, ReferenceAdvance};
-use crate::replication::queue::LiveObligationRecord;
 use crate::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectState, HolderFailures,
-    MAX_AUTO_ADVANCES, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, ObjectRangeRequest, RoutedRead,
-    get_object_routed, promote_leased, routed_info, slice_blob,
+    AdvanceEnd, AdvanceReference, AdvanceStep, GetObjectError, GetObjectInput, GetObjectOperation,
+    GetObjectResult, GetObjectState, MAX_DRIFT_ATTEMPTS, MIN_ADVANCE_INTERVAL, Turn,
 };
+use crate::s3::usage::{RowChange, UsageCounterUpdate};
+use crate::transfer::read::GetRoutedOperation;
 use aruna_blob::blob::BlobHandler;
-use aruna_blob::hash::Hasher;
-use aruna_core::UserId;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, ConversionError, StagingSourceError};
@@ -23,10 +19,12 @@ use aruna_core::events::SubOperationEvent;
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
-    CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::operation::Operation;
 use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, HASH_MD5, HASH_SHA256};
 use aruna_core::structs::execution::source_access::{
     DigestOrigin, DigestScope, ResolvedSourceAccess, SourceDigest, SourceMetadata, SourceStats,
@@ -44,9 +42,14 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_core::structs::storage::multipart::{MultipartChecksumType, MultipartObjectSummary};
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, MAX_AUTO_ADVANCES};
 use aruna_core::structs::storage::usage::{UsageDelta, usage_group_key};
-use aruna_net::{NetConfig, NetHandle};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use axum::{Router, routing::get};
 use bytes::Bytes;
@@ -58,7 +61,74 @@ use tempfile::tempdir;
 use tokio::net::TcpListener;
 use ulid::Ulid;
 
-fn test_node_id() -> aruna_core::NodeId {
+/// The result that answers `event`, as the runner hands it to the read.
+fn answer(event: Event) -> IoResult {
+    match event {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => IoResult::Values(vec![value]),
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => IoResult::Page {
+            rows: values,
+            next: next_start_after,
+        },
+        Event::Storage(
+            StorageEvent::WriteResult { .. }
+            | StorageEvent::BatchWriteResult { .. }
+            | StorageEvent::DeleteResult { .. }
+            | StorageEvent::BatchDeleteResult { .. },
+        ) => IoResult::Done,
+        other => IoResult::Event(Box::new(other)),
+    }
+}
+
+fn step<O: Operation>(operation: &mut O, event: Event) -> Result<Next<O::Output>, O::Error> {
+    operation.next(answer(event))
+}
+
+/// The effect a step asks the adapter for.
+fn asked<T: std::fmt::Debug, E: std::fmt::Debug>(turn: &Result<Next<T>, E>) -> &Effect {
+    match turn {
+        Ok(Next::Call(IoCall::Effect(effect))) => effect,
+        other => panic!("expected an effect, got {other:?}"),
+    }
+}
+
+/// The key space of the first row a step reads in the read snapshot.
+fn read_space<T: std::fmt::Debug, E: std::fmt::Debug>(turn: &Result<Next<T>, E>) -> &str {
+    match turn {
+        Ok(Next::Call(IoCall::Read(reads))) => &reads[0].0,
+        other => panic!("expected a read, got {other:?}"),
+    }
+}
+
+/// The rows a step writes.
+fn written_rows<T: std::fmt::Debug, E: std::fmt::Debug>(
+    turn: &Result<Next<T>, E>,
+) -> &[(String, aruna_core::types::Key, aruna_core::types::Value)] {
+    match turn {
+        Ok(Next::Call(IoCall::Write(writes))) => writes,
+        other => panic!("expected a write, got {other:?}"),
+    }
+}
+
+/// The result a step ends the read with.
+fn served(turn: Turn) -> GetObjectResult {
+    match turn {
+        Ok(Next::Done(result)) => result,
+        other => panic!("expected the read result, got {other:?}"),
+    }
+}
+
+/// A restart reads the records again, each outside the first snapshot.
+fn restarted(turn: &Turn, operation: &GetObjectOperation) -> bool {
+    matches!(turn, Ok(Next::Call(IoCall::Child(_)))) && operation.restarted
+}
+
+fn test_node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[7; 32]).public()
 }
 
@@ -73,171 +143,6 @@ async fn spawn_reference_server(body: &'static [u8]) -> String {
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{}", addr)
-}
-
-// A holder-backed read with no serving holder keeps infrastructure failure
-// and integrity failure distinct from genuine absence.
-#[test]
-fn failure_causes_preserved() {
-    let mut unavailable = HolderFailures::default();
-    unavailable.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
-    assert_eq!(unavailable.into_error(), GetObjectError::HoldersUnavailable);
-
-    let mut integrity = HolderFailures::default();
-    integrity.record(BaoReadError::Refused(BaoReadRefusal::HashMismatch));
-    assert_eq!(
-        integrity.into_error(),
-        GetObjectError::HolderIntegrityFailure
-    );
-
-    let mut denied = HolderFailures::default();
-    denied.record(BaoReadError::Refused(BaoReadRefusal::ReadDenied));
-    assert_eq!(denied.into_error(), GetObjectError::HolderAccessDenied);
-
-    let mut governed = HolderFailures::default();
-    governed.record(BaoReadError::GovernedUnavailable);
-    assert_eq!(governed.into_error(), GetObjectError::GovernedUnavailable);
-
-    let mut absent = HolderFailures::default();
-    absent.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
-    assert_eq!(absent.into_error(), GetObjectError::NoSuchKey);
-
-    let mut mixed = HolderFailures::default();
-    mixed.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
-    mixed.record(BaoReadError::Refused(BaoReadRefusal::BackendFailure));
-    assert_eq!(mixed.into_error(), GetObjectError::HoldersUnavailable);
-
-    let metadata_only = HolderFailures {
-        contacted: true,
-        metadata_only: true,
-        ..HolderFailures::default()
-    };
-    assert_eq!(
-        metadata_only.into_error(),
-        GetObjectError::HoldersUnavailable
-    );
-
-    assert_eq!(
-        HolderFailures::default().into_error(),
-        GetObjectError::HoldersUnavailable
-    );
-}
-
-#[test]
-fn failure_priority_stable() {
-    let cases = [
-        (
-            vec![
-                BaoReadError::Refused(BaoReadRefusal::BackendFailure),
-                BaoReadError::Refused(BaoReadRefusal::ReadDenied),
-            ],
-            GetObjectError::HolderAccessDenied,
-        ),
-        (
-            vec![
-                BaoReadError::Refused(BaoReadRefusal::ReadDenied),
-                BaoReadError::Refused(BaoReadRefusal::HashMismatch),
-            ],
-            GetObjectError::HolderIntegrityFailure,
-        ),
-        (
-            vec![
-                BaoReadError::Refused(BaoReadRefusal::HashMismatch),
-                BaoReadError::GovernedUnavailable,
-            ],
-            GetObjectError::GovernedUnavailable,
-        ),
-    ];
-
-    for (errors, expected) in cases {
-        let mut failures = HolderFailures::default();
-        for error in errors {
-            failures.record(error);
-        }
-        assert_eq!(failures.into_error(), expected);
-    }
-}
-
-#[test]
-fn transient_then_success() {
-    let mut failures = HolderFailures::default();
-    assert!(
-        failures
-            .consider(Err(BaoReadError::Refused(BaoReadRefusal::BackendFailure)))
-            .is_none()
-    );
-    let served = failures.consider(Ok(crate::replication::bao_read::BaoReadOutput::Stream {
-        blob: BackendStream::new(stream::iter(Vec::<Result<Bytes, std::io::Error>>::new())),
-        size: 0,
-        blake3: [9u8; 32],
-        etag: None,
-        hashes: HashMap::new(),
-    }));
-
-    assert!(matches!(
-        served,
-        Some(crate::replication::bao_read::BaoReadOutput::Stream { .. })
-    ));
-}
-
-#[test]
-fn routed_facts_preserved() {
-    let version_created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(12);
-    let read = RoutedRead {
-        user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
-        realm_id: RealmId::from_bytes([3u8; 32]),
-        blake3: [9u8; 32],
-        version_id: Some(Ulid::from(7u128)),
-        metadata: HashMap::new(),
-        version_created_at: Some(version_created_at),
-        source_policies: Vec::new(),
-        restrictions: None,
-    };
-    let hashes = HashMap::from([
-        (HASH_MD5.to_string(), vec![4u8; 16]),
-        (HASH_SHA256.to_string(), vec![5u8; 32]),
-    ]);
-    let composite_hashes = HashMap::from([(HASH_SHA256.to_string(), vec![6u8; 32])]);
-    let summary = MultipartObjectSummary {
-        checksum_type: MultipartChecksumType::Composite,
-        part_count: 3,
-        composite_hashes: composite_hashes.clone(),
-    };
-
-    let etag = Some(hex::encode(&hashes[HASH_MD5]));
-    let info = routed_info(&read, 42, etag.clone(), hashes.clone(), Some(summary));
-
-    assert_eq!(info.size, 42);
-    assert_eq!(info.version_created_at, Some(version_created_at));
-    assert_eq!(info.etag, etag);
-    assert_eq!(info.hashes, hashes);
-    assert_eq!(info.checksum_type, MultipartChecksumType::Composite);
-    assert_eq!(info.composite_hashes, composite_hashes);
-    assert_eq!(info.part_count, Some(3));
-}
-
-#[test]
-fn routed_empty_preserved() {
-    let read = RoutedRead {
-        user_id: UserId::nil(RealmId::from_bytes([3u8; 32])),
-        realm_id: RealmId::from_bytes([3u8; 32]),
-        blake3: [9u8; 32],
-        version_id: Some(Ulid::from(7u128)),
-        metadata: HashMap::new(),
-        version_created_at: Some(SystemTime::UNIX_EPOCH),
-        source_policies: Vec::new(),
-        restrictions: None,
-    };
-    let hashes = HashMap::from([(HASH_MD5.to_string(), vec![0u8; 16])]);
-
-    let etag = Some(hex::encode(&hashes[HASH_MD5]));
-    let info = routed_info(&read, 0, etag.clone(), hashes.clone(), None);
-
-    assert_eq!(info.size, 0);
-    assert_eq!(info.etag, etag);
-    assert_eq!(info.hashes, hashes);
-    assert_eq!(info.checksum_type, MultipartChecksumType::FullObject);
-    assert_eq!(info.part_count, None);
 }
 
 // A version this node knows without its bytes must name the blob a routed
@@ -256,7 +161,6 @@ fn reports_missing_blob() {
         realm_id: RealmId::from_bytes([3u8; 32]),
         node_id: test_node_id(),
     });
-    operation.txn_id = Some(Ulid::generate());
     let version = BlobVersion::materialized(
         blake3,
         BackendRef::node_default(),
@@ -266,20 +170,23 @@ fn reports_missing_blob() {
         None,
     )
     .with_metadata(HashMap::from([("k".to_string(), "v".to_string())]));
-    operation.read_version(version_id, version, true);
+    operation.read_version(version_id, version, true).unwrap();
 
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::<u8>::new().into(),
-        value: None,
-    }));
+    let turn = step(
+        &mut operation,
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: None,
+        }),
+    );
 
     assert!(matches!(
-        operation.output,
-        Some(Err(GetObjectError::BlobNotLocal {
+        turn,
+        Err(GetObjectError::BlobNotLocal {
             blake3: hash,
             version_id: Some(seen),
             ..
-        })) if hash == blake3 && seen == version_id
+        }) if hash == blake3 && seen == version_id
     ));
 }
 
@@ -296,7 +203,6 @@ fn pending_content_refused() {
         realm_id: RealmId::from_bytes([3u8; 32]),
         node_id: test_node_id(),
     });
-    operation.txn_id = Some(Ulid::generate());
     let location = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
     let version = BlobVersion::pending(
         location,
@@ -306,65 +212,13 @@ fn pending_content_refused() {
     );
 
     // Nothing is read for an archive whose content hash is unknown.
-    let effects = operation.read_version(version_id, version, true);
-    assert!(
-        !effects
-            .iter()
-            .any(|effect| matches!(effect, Effect::Blob(_)))
-    );
+    let turn = operation.read_version(version_id, version, true);
     assert!(matches!(
-        operation.output,
-        Some(Err(GetObjectError::ConversionError(
-            ConversionError::BucketKey(BucketKeyError::Unsupported)
+        turn,
+        Err(GetObjectError::ConversionError(ConversionError::BucketKey(
+            BucketKeyError::Unsupported
         )))
     ));
-}
-
-#[test]
-fn explicit_range_resolves() {
-    let resolved = ObjectRangeRequest::StartEnd { start: 2, end: 5 }
-        .resolve(10)
-        .unwrap();
-
-    assert_eq!(resolved.range, 2..6);
-    assert_eq!(resolved.content_length, 4);
-    assert_eq!(resolved.content_range, "bytes 2-5/10");
-}
-
-#[test]
-fn suffix_range_resolves() {
-    let resolved = ObjectRangeRequest::Suffix { length: 3 }
-        .resolve(10)
-        .unwrap();
-
-    assert_eq!(resolved.range, 7..10);
-    assert_eq!(resolved.content_length, 3);
-    assert_eq!(resolved.content_range, "bytes 7-9/10");
-}
-
-#[test]
-fn open_range_resolves() {
-    let resolved = ObjectRangeRequest::Start { start: 4 }.resolve(10).unwrap();
-
-    assert_eq!(resolved.range, 4..10);
-    assert_eq!(resolved.content_length, 6);
-    assert_eq!(resolved.content_range, "bytes 4-9/10");
-}
-
-#[test]
-fn invalid_ranges_rejected() {
-    assert_eq!(
-        ObjectRangeRequest::Suffix { length: 1 }.resolve(0),
-        Err(GetObjectError::InvalidRange)
-    );
-    assert_eq!(
-        ObjectRangeRequest::Start { start: 10 }.resolve(10),
-        Err(GetObjectError::InvalidRange)
-    );
-    assert_eq!(
-        ObjectRangeRequest::StartEnd { start: 6, end: 5 }.resolve(10),
-        Err(GetObjectError::InvalidRange)
-    );
 }
 
 #[test]
@@ -379,7 +233,6 @@ fn materialized_range_reads() {
         realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
-    let txn_id = Ulid::generate();
     let location = BackendLocation {
         backend: BackendRef::node_default(),
         storage_class: None,
@@ -395,22 +248,22 @@ fn materialized_range_reads() {
         blob_size: 10,
         hashes: HashMap::new(),
     };
-    operation.txn_id = Some(txn_id);
     operation.location = Some(location.clone());
 
-    operation.read_blob();
+    operation.read_blob().unwrap();
     // The bucket has no encryption settings, so the plain copy is read without a lease.
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"s3test".to_vec().into(),
-        value: None,
-    }));
+    let turn = step(
+        &mut operation,
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"s3test".to_vec().into(),
+            value: None,
+        }),
+    );
 
     assert!(matches!(
-        effects.as_slice(),
-        [
-            Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id }),
-            Effect::Blob(BlobEffect::ReadRange { location: emitted_location, range })
-        ] if *committed_txn_id == txn_id && emitted_location == &location && range == &(2..5)
+        asked(&turn),
+        Effect::Blob(BlobEffect::ReadRange { location: emitted_location, range })
+            if emitted_location == &location && range == &(2..5)
     ));
 }
 
@@ -426,34 +279,26 @@ fn reference_range_reads() {
         realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
     });
-    let txn_id = Ulid::generate();
     let access = ResolvedSourceAccess::OpenDal {
         kind: SourceConnectorKind::S3,
         config: HashMap::new(),
         path: "folder/file.txt".to_string(),
         version: None,
     };
-    operation.txn_id = Some(txn_id);
     operation.reference_access = Some(access.clone());
 
-    operation.read_reference();
-    // The bucket has no encryption settings, so the read commits without a key check.
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"s3test".to_vec().into(),
-        value: None,
-    }));
+    operation.read_reference().unwrap();
+    // The bucket has no encryption settings, so the source is headed without a key check.
+    let turn = step(
+        &mut operation,
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"s3test".to_vec().into(),
+            value: None,
+        }),
+    );
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { txn_id: committed_txn_id })]
-            if *committed_txn_id == txn_id
-    ));
-
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Head { access: emitted_access })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Head { access: emitted_access })
             if emitted_access == &access
     ));
 
@@ -467,29 +312,37 @@ fn reference_range_reads() {
     };
     // Baseline matches the live head, so this undrifted read serves directly, bound to it.
     operation.reference_cached = Some(metadata.clone());
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: metadata.clone(),
-    }));
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: metadata.clone(),
+        }),
+    );
 
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read {
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read {
             access: emitted_access,
             range,
             expected,
-        })]
+        })
             if emitted_access == &access && range == &Some(6..10)
                 && expected.as_ref() == Some(&metadata)
     ));
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {
-        metadata,
-        stream: aruna_core::stream::BackendStream::new(stream::iter(vec![
-            Ok::<_, std::io::Error>(Bytes::from_static(b"ence")),
-        ])),
-    }));
-    assert!(effects.is_empty());
-    let result = operation.finalize().unwrap();
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata,
+            stream: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"ence"),
+            )])),
+        }),
+    );
+    let result = served(turn);
     let resolved_range = result.resolved_range.unwrap();
     assert_eq!(resolved_range.range, 6..10);
     assert_eq!(resolved_range.content_length, 4);
@@ -523,35 +376,36 @@ fn range_drift_restarts() {
     );
     operation.state = GetObjectState::ReadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::ReadResult {
-        metadata: SourceMetadata {
-            content_length: 11,
-            content_type: None,
-            etag: None,
-            last_modified: None,
-            source_version: None,
-            digests: Default::default(),
-        },
-        stream: aruna_core::stream::BackendStream::new(stream::iter(vec![
-            Ok::<_, std::io::Error>(Bytes::from_static(b"bad")),
-        ])),
-    }));
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::ReadResult {
+            metadata: SourceMetadata {
+                content_length: 11,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            },
+            stream: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<
+                _,
+                std::io::Error,
+            >(
+                Bytes::from_static(b"bad"),
+            )])),
+        }),
+    );
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    ));
-    assert_eq!(operation.state, GetObjectState::StartTransaction);
+    assert!(restarted(&turn, &operation));
+    assert_eq!(operation.state, GetObjectState::GetCurrentVersion);
 }
 
 #[tokio::test]
 pub async fn test_get_object() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -669,9 +523,10 @@ pub async fn test_get_object() {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket,
@@ -713,7 +568,7 @@ pub async fn test_get_object() {
 async fn routed_missing_blob() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
 
     let bucket = "s3test".to_string();
     let key = "missing.txt".to_string();
@@ -769,41 +624,48 @@ async fn routed_missing_blob() {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
-    let read = get_object_routed(
+    let read = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+                range: None,
+                group_id: Ulid::generate(),
+                user_identity,
+                realm_id: user_identity.realm_id,
+                node_id: test_node_id(),
+            },
+            None,
+            None,
+        ),
         &driver_ctx,
-        GetObjectInput {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            version_id: None,
-            range: None,
-            group_id: Ulid::generate(),
-            user_identity,
-            realm_id: user_identity.realm_id,
-            node_id: test_node_id(),
-        },
-        None,
     )
     .await;
     assert!(matches!(read, Err(GetObjectError::GetObjectFailed)));
 
-    let ranged = get_object_routed(
+    let ranged = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket,
+                key,
+                version_id: None,
+                range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
+                group_id: Ulid::generate(),
+                user_identity,
+                realm_id: user_identity.realm_id,
+                node_id: test_node_id(),
+            },
+            None,
+            None,
+        ),
         &driver_ctx,
-        GetObjectInput {
-            bucket,
-            key,
-            version_id: None,
-            range: Some(ObjectRangeRequest::StartEnd { start: 0, end: 1 }),
-            group_id: Ulid::generate(),
-            user_identity,
-            realm_id: user_identity.realm_id,
-            node_id: test_node_id(),
-        },
-        None,
     )
     .await;
     assert!(matches!(ranged, Err(GetObjectError::GetObjectFailed)));
@@ -813,8 +675,8 @@ async fn routed_missing_blob() {
 pub async fn hash_mismatch_rejected() {
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -931,9 +793,10 @@ pub async fn hash_mismatch_rejected() {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let operation = GetObjectOperation::new(GetObjectInput {
         bucket,
@@ -969,9 +832,9 @@ async fn bound_connector_used() {
     let endpoint = spawn_reference_server(b"hello reference").await;
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -995,9 +858,10 @@ async fn bound_connector_used() {
         storage_handle: storage_handle.clone(),
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let bucket = "s3test".to_string();
@@ -1151,9 +1015,9 @@ async fn drift_creates_successor() {
     let endpoint = spawn_reference_server(b"hello reference").await;
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -1177,9 +1041,10 @@ async fn drift_creates_successor() {
         storage_handle: storage_handle.clone(),
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let version_id = Ulid::generate();
@@ -1361,14 +1226,10 @@ async fn drift_creates_successor() {
 }
 
 fn observation(content_length: u64) -> SourceMetadata {
-    SourceMetadata {
+    aruna_test_support::staging::sized_source(
         content_length,
-        content_type: None,
-        etag: Some(format!("etag-{content_length}")),
-        last_modified: None,
-        source_version: None,
-        digests: Default::default(),
-    }
+        Some(format!("etag-{content_length}")),
+    )
 }
 
 fn reference_source() -> VersionSourceBinding {
@@ -1453,25 +1314,28 @@ fn current_version(created_at: SystemTime, advance_count: u16) -> Event {
     })
 }
 
-/// Drives a drifted read through the head CAS up to the version reread.
-fn advance_to_reread(operation: &mut GetObjectOperation, headed: Ulid) -> Ulid {
-    let txn_id = Ulid::generate();
+/// Drives the advance of a drifted read through the bucket and the head CAS up to the version
+/// reread.
+fn advance_to_reread(operation: &mut GetObjectOperation, headed: Ulid) -> AdvanceReference {
     operation.resolved_version_id = Some(headed);
-    operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::ReadHeadAdvance;
-    let effects = operation.step(head_read(headed));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { .. })]
-    ));
-    assert_eq!(operation.state, GetObjectState::ReadAdvance);
-    txn_id
+    let mut advance = operation.advance().unwrap();
+    assert_eq!(read_space(&advance.first()), S3_BUCKET_KEYSPACE);
+    step(
+        &mut advance,
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"s3test".to_vec().into(),
+            value: None,
+        }),
+    )
+    .unwrap();
+    let turn = step(&mut advance, head_read(headed));
+    assert_eq!(read_space(&turn), BLOB_VERSIONS_KEYSPACE);
+    assert_eq!(advance.step, AdvanceStep::ReadVersion);
+    advance
 }
 
-fn written_successor(effects: &[Effect]) -> BlobVersion {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects else {
-        panic!("expected a single batch write, got {effects:?}")
-    };
+fn written_successor(turn: &Result<Next<AdvanceEnd>, GetObjectError>) -> BlobVersion {
+    let writes = written_rows(turn);
     BlobVersion::from_bytes(writes[0].2.as_ref()).unwrap()
 }
 
@@ -1485,7 +1349,7 @@ fn source_read(metadata: SourceMetadata) -> Event {
 }
 
 // A distributed bucket records source changes only through the coordinated refresh, so a
-// drifted read there releases its transaction, queues a refresh and fails.
+// drifted read there writes nothing, queues a refresh and fails.
 #[test]
 fn bound_never_advances() {
     use aruna_core::structs::storage::blob::BucketInfo;
@@ -1493,9 +1357,8 @@ fn bound_never_advances() {
     use aruna_core::structs::storage::format::Compression;
 
     let mut operation = drifted_operation();
-    let txn_id = Ulid::generate();
-    operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::ReadBucketAdvance;
+    let mut advance = operation.advance().unwrap();
+    advance.first().unwrap();
     let bucket = BucketInfo {
         group_id: Ulid::from_bytes([2; 16]),
         created_at: SystemTime::UNIX_EPOCH,
@@ -1512,45 +1375,62 @@ fn bound_never_advances() {
             revision: Default::default(),
         }),
     };
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(bucket.to_bytes().unwrap().into()),
-    }));
-    assert_eq!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+    let turn = step(
+        &mut advance,
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: Some(bucket.to_bytes().unwrap().into()),
+        }),
     );
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted { txn_id }));
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    assert!(matches!(turn, Ok(Next::Done(AdvanceEnd::Distributed))));
+
+    operation.state = GetObjectState::AdvanceReference;
+    let ended = IoResult::Child(ChildOutcome::new(Ok::<_, GetObjectError>(
+        AdvanceEnd::Distributed,
+    )));
+    let turn = operation.next(ended);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(operation.state, GetObjectState::QueueChangedRefresh);
-    operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {
-        result: Ok(()),
-    }));
-    assert!(matches!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
-    ));
+    let turn = step(
+        &mut operation,
+        Event::SubOperation(SubOperationEvent::RefreshQueued { result: Ok(()) }),
+    );
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceSourceChanged));
 }
 
 // CAS: only the reader whose head still matches may write the successor;
-// a concurrent winner makes this read abort and restart.
+// a concurrent winner makes this read restart.
 #[test]
 fn advance_conflict_restarts() {
     let mut operation = drifted_operation();
-    let txn_id = Ulid::generate();
     operation.resolved_version_id = Some(Ulid::generate());
-    operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::ReadHeadAdvance;
+    let mut advance = operation.advance().unwrap();
+    advance.first().unwrap();
+    step(
+        &mut advance,
+        Event::Storage(StorageEvent::ReadResult {
+            key: b"bucket".to_vec().into(),
+            value: None,
+        }),
+    )
+    .unwrap();
 
     // The head already names a different (winning) successor.
-    let effects = operation.step(head_read(Ulid::generate()));
+    let turn = step(&mut advance, head_read(Ulid::generate()));
+    assert!(matches!(turn, Ok(Next::Done(AdvanceEnd::Conflict))));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
-            if *aborted == txn_id
-    ));
-    assert_eq!(operation.state, GetObjectState::RestartReference);
+    // A lost conflict at commit restarts the same way.
+    for ended in [
+        Ok(AdvanceEnd::Conflict),
+        Err(GetObjectError::StorageError(
+            aruna_core::errors::StorageError::TransactionConflict,
+        )),
+    ] {
+        let mut operation = drifted_operation();
+        operation.state = GetObjectState::AdvanceReference;
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(ended)));
+        assert!(restarted(&turn, &operation));
+    }
 }
 
 // The successor's replication obligation must be committed with it, or peers
@@ -1562,22 +1442,21 @@ fn advance_writes_obligation() {
         permission: Permission::READ,
     }];
     let mut operation = drifted_operation().with_restrictions(Some(restrictions));
+    operation.stamp(millis(SystemTime::UNIX_EPOCH + MIN_ADVANCE_INTERVAL));
     let creator = operation.reference_creator.unwrap();
     let reader_auth = operation.auth_context();
     let headed = Ulid::generate();
-    advance_to_reread(&mut operation, headed);
+    let mut advance = advance_to_reread(&mut operation, headed);
 
-    let effects = operation.step(current_version(SystemTime::UNIX_EPOCH, 0));
+    let turn = step(&mut advance, current_version(SystemTime::UNIX_EPOCH, 0));
 
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected a single batch write, got {effects:?}")
-    };
+    let writes = written_rows(&turn);
     let [
         (_, _, version_value),
         (_, _, head_value),
         (key_space, _, obligation_value),
         (reference_space, ..),
-    ] = writes.as_slice()
+    ] = writes
     else {
         panic!("expected version, head, obligation and reference writes, got {writes:?}")
     };
@@ -1589,7 +1468,7 @@ fn advance_writes_obligation() {
     let next_pointer = CurrentVersionPointer::from_bytes(head_value.as_ref()).unwrap();
     assert_eq!(key_space, REPLICATION_OBLIGATION_KEYSPACE);
     let record = LiveObligationRecord::from_bytes(obligation_value.as_ref()).unwrap();
-    assert_eq!(Some(record.version_id), operation.resolved_version_id);
+    assert_eq!(Some(record.version_id), advance.advanced.map(|(id, _)| id));
     assert_ne!(record.version_id, headed);
     assert_eq!(next_pointer.version_id, record.version_id);
     assert_eq!(next_pointer.generation, 2);
@@ -1611,56 +1490,42 @@ fn advance_writes_obligation() {
 fn advance_at_boundary() {
     let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL);
-    advance_to_reread(&mut operation, Ulid::generate());
+    operation.stamp(millis(created_at + MIN_ADVANCE_INTERVAL));
+    let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
-    let effects = operation.step(current_version(created_at, 7));
+    let turn = step(&mut advance, current_version(created_at, 7));
 
-    let successor = written_successor(effects.as_slice());
+    let successor = written_successor(&turn);
     assert_eq!(successor.created_at, created_at + MIN_ADVANCE_INTERVAL);
     assert_eq!(successor.advance_count(), Some(8));
 }
 
-// One second inside the cooldown fails closed and releases the transaction
-// instead of minting another durable successor.
+// One second inside the cooldown fails closed instead of minting another durable successor.
 #[test]
 fn advance_rejects_early() {
     let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL - Duration::from_secs(1));
-    let txn_id = advance_to_reread(&mut operation, Ulid::generate());
-
-    let effects = operation.step(current_version(created_at, 0));
-
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
-            if *aborted == txn_id
+    operation.stamp(millis(
+        created_at + MIN_ADVANCE_INTERVAL - Duration::from_secs(1),
     ));
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
-    );
+    let mut advance = advance_to_reread(&mut operation, Ulid::generate());
+
+    let turn = step(&mut advance, current_version(created_at, 0));
+
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceSourceChanged));
 }
 
 // A backwards clock must not grant an unbounded advance budget.
 #[test]
 fn advance_rejects_rollback() {
-    let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let created_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at - Duration::from_secs(3_600));
-    advance_to_reread(&mut operation, Ulid::generate());
+    operation.stamp(millis(created_at - Duration::from_secs(3_600)));
+    let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
-    let effects = operation.step(current_version(created_at, 0));
+    let turn = step(&mut advance, current_version(created_at, 0));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
-    );
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceSourceChanged));
 }
 
 // Count 99 may still mint the hundredth successor.
@@ -1668,13 +1533,16 @@ fn advance_rejects_rollback() {
 fn advance_at_cap() {
     let created_at = SystemTime::UNIX_EPOCH;
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + MIN_ADVANCE_INTERVAL);
-    advance_to_reread(&mut operation, Ulid::generate());
+    operation.stamp(millis(created_at + MIN_ADVANCE_INTERVAL));
+    let mut advance = advance_to_reread(&mut operation, Ulid::generate());
 
-    let effects = operation.step(current_version(created_at, MAX_AUTO_ADVANCES - 1));
+    let turn = step(
+        &mut advance,
+        current_version(created_at, MAX_AUTO_ADVANCES - 1),
+    );
 
     assert_eq!(
-        written_successor(effects.as_slice()).advance_count(),
+        written_successor(&turn).advance_count(),
         Some(MAX_AUTO_ADVANCES)
     );
 }
@@ -1685,22 +1553,19 @@ fn advance_at_cap() {
 fn advance_rejects_exhausted() {
     let created_at = SystemTime::UNIX_EPOCH;
     let mut operation = drifted_operation();
-    operation.now_override = Some(created_at + Duration::from_secs(86_400));
-    let txn_id = advance_to_reread(&mut operation, Ulid::generate());
+    operation.stamp(millis(created_at + Duration::from_secs(86_400)));
+    let mut advance = advance_to_reread(&mut operation, Ulid::generate());
     let attempts = operation.drift_attempts;
 
-    let effects = operation.step(current_version(created_at, MAX_AUTO_ADVANCES));
+    let turn = step(&mut advance, current_version(created_at, MAX_AUTO_ADVANCES));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { txn_id: aborted })]
-            if *aborted == txn_id
-    ));
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceAdvanceExhausted));
+    // The read reports the advance's own error.
+    operation.state = GetObjectState::AdvanceReference;
+    let failed = Err::<AdvanceEnd, _>(GetObjectError::ReferenceAdvanceExhausted);
+    let turn = operation.next(IoResult::Child(ChildOutcome::new(failed)));
     assert_eq!(operation.drift_attempts, attempts);
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceAdvanceExhausted)
-    );
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceAdvanceExhausted));
 }
 
 // A committed successor is enqueued for live replication before its bytes
@@ -1708,32 +1573,32 @@ fn advance_rejects_exhausted() {
 #[test]
 fn commit_queues_replication() {
     let mut operation = drifted_operation();
-    let txn_id = Ulid::generate();
-    operation.resolved_version_id = Some(Ulid::generate());
-    operation.reference_advance = Some(ReferenceAdvance {
-        generation: 2,
-        predecessor: Ulid::generate(),
-    });
-    operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::CommitAdvance;
+    operation.state = GetObjectState::AdvanceReference;
+    let committed = AdvanceEnd::Committed {
+        version_id: Ulid::generate(),
+        advance: ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::generate(),
+        },
+    };
 
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
+    let ended = IoResult::Child(ChildOutcome::new(Ok::<_, GetObjectError>(committed)));
+    let turn = operation.next(ended);
 
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
     assert_eq!(operation.state, GetObjectState::QueueSuccessorReplication);
 
     // A failed enqueue leaves the durable obligation for repair and serves.
-    let effects = operation.step(Event::SubOperation(
-        SubOperationEvent::LiveReplicationQueued {
+    let turn = step(
+        &mut operation,
+        Event::SubOperation(SubOperationEvent::LiveReplicationQueued {
             result: Err("queue unavailable".to_string()),
-        },
-    ));
+        }),
+    );
 
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { .. })
     ));
 }
 
@@ -1742,16 +1607,28 @@ fn commit_queues_replication() {
 #[test]
 fn successor_charges_size() {
     let mut operation = drifted_operation();
-    let txn_id = Ulid::generate();
     operation.reference_cached = Some(observation(4));
-    operation.txn_id = Some(txn_id);
-    operation.state = GetObjectState::WriteSuccessor;
+    let mut advance = operation.advance().unwrap();
+    advance.step = AdvanceStep::WriteSuccessor;
+    advance.advanced = Some((
+        Ulid::generate(),
+        ReferenceAdvance {
+            generation: 2,
+            predecessor: Ulid::generate(),
+        },
+    ));
 
-    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
+    let turn = advance.next(IoResult::Done);
 
-    assert_eq!(operation.state, GetObjectState::UpdateReferenceUsage);
+    assert_eq!(advance.step, AdvanceStep::UpdateUsage);
+    let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = turn else {
+        panic!("expected the usage update, got {turn:?}")
+    };
+    let group_key = usage_group_key(operation.input.group_id);
+    let (_, delta) = (deltas.iter())
+        .find(|(key, _)| key.as_ref() == group_key.as_slice())
+        .expect("the group is charged");
+    assert_eq!(delta.referenced_bytes, 9);
     let mut expected = UsageCounterUpdate::for_group(
         operation.input.group_id,
         UsageDelta {
@@ -1760,8 +1637,9 @@ fn successor_charges_size() {
         },
     )
     .in_bucket(&operation.input.bucket, RowChange::AddedVersion);
-    let _ = expected.start(txn_id);
-    assert_eq!(operation.usage_update, Some(expected));
+    // The successor id is given here, so the advance's first mint is the markers' generation.
+    let _ = expected.start_calls(aruna_core::id_mint::IdMint::default().mint(0));
+    assert_eq!(advance.usage, Some(expected));
 }
 
 #[test]
@@ -1770,15 +1648,14 @@ fn drift_limit_fails() {
     operation.drift_attempts = MAX_DRIFT_ATTEMPTS;
     operation.state = GetObjectState::HeadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
-
-    assert!(effects.is_empty());
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }),
     );
+
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceSourceChanged));
 }
 
 // The source can drift again between the head and the read; those bytes must
@@ -1793,15 +1670,10 @@ fn read_drift_restarts() {
     operation.source_metadata = Some(headed);
     operation.state = GetObjectState::ReadReferenceSource;
 
-    let effects = operation.step(source_read(read));
+    let turn = step(&mut operation, source_read(read));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    ));
-    assert_eq!(operation.state, GetObjectState::StartTransaction);
+    assert!(restarted(&turn, &operation));
+    assert_eq!(operation.state, GetObjectState::GetCurrentVersion);
     assert!(operation.advance_observation.is_none());
 }
 
@@ -1816,12 +1688,11 @@ fn historical_read_fails() {
     operation.source_metadata = Some(headed);
     operation.state = GetObjectState::ReadReferenceSource;
 
-    let effects = operation.step(source_read(read));
+    let turn = step(&mut operation, source_read(read));
 
-    assert!(effects.is_empty());
     assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::HistoricalReferenceUnavailable)
+        turn.err(),
+        Some(GetObjectError::HistoricalReferenceUnavailable)
     );
 }
 
@@ -1849,6 +1720,10 @@ fn spooled(sha256: u8) -> Event {
     })
 }
 
+fn source_head(metadata: SourceMetadata) -> Event {
+    Event::StagingSource(StagingSourceEvent::HeadResult { metadata })
+}
+
 // An unknown observation is checked against the version's recorded digests on the whole spooled
 // bytes before anything is served, and the result keeps those digests.
 #[test]
@@ -1860,27 +1735,22 @@ fn unknown_keeps_digests() {
     operation.reference_cached = Some(stored.clone());
     operation.state = GetObjectState::HeadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh.clone(),
-    }));
+    let turn = step(&mut operation, source_head(fresh.clone()));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read {
-            expected: None,
-            ..
-        })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { expected: None, .. })
     ));
+    let turn = step(&mut operation, source_read(fresh));
     assert!(matches!(
-        operation.step(source_read(fresh)).as_slice(),
-        [Effect::Blob(BlobEffect::SpoolLocal {
+        asked(&turn),
+        Effect::Blob(BlobEffect::SpoolLocal {
             size: 9,
             range: None,
             ..
-        })]
+        })
     ));
-    assert!(operation.step(spooled(7)).is_empty());
 
-    let result = operation.finalize().unwrap();
+    let result = served(step(&mut operation, spooled(7)));
     assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
     assert_eq!(result.last_refresh, None);
 }
@@ -1896,31 +1766,22 @@ fn drift_digest_decides() {
     operation.reference_cached = Some(stored.clone());
     operation.state = GetObjectState::HeadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh.clone(),
-    }));
+    let turn = step(&mut operation, source_head(fresh.clone()));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { .. })
     ));
-    operation.step(source_read(fresh));
-    assert!(operation.step(spooled(7)).is_empty());
+    step(&mut operation, source_read(fresh)).unwrap();
 
-    let result = operation.finalize().unwrap();
+    let result = served(step(&mut operation, spooled(7)));
     assert_eq!(result.source_metadata.unwrap().digests, stored.digests);
 
     // A different length can never match the digests, so it fails without a read.
     let mut operation = drifted_operation();
     operation.reference_cached = Some(digested(9, 7));
     operation.state = GetObjectState::HeadReferenceSource;
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(10),
-    }));
-    assert!(effects.is_empty());
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceChecksumMismatch)
-    );
+    let turn = step(&mut operation, source_head(observation(10)));
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceChecksumMismatch));
 }
 
 // Bytes that miss the recorded digests are never served: the spool stream is dropped, the read
@@ -1934,16 +1795,11 @@ fn pinned_unknown_verified() {
     operation.reference_explicit = true;
     operation.state = GetObjectState::HeadReferenceSource;
 
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
-    operation.step(source_read(observation(9)));
-    assert!(operation.step(spooled(8)).is_empty());
+    step(&mut operation, source_head(observation(9))).unwrap();
+    step(&mut operation, source_read(observation(9))).unwrap();
+    let turn = step(&mut operation, spooled(8));
 
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceChecksumMismatch)
-    );
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceChecksumMismatch));
 }
 
 // Equal length and a second-rounded date call changed bytes the same, so a pin without a strong
@@ -1957,19 +1813,15 @@ fn same_still_verified() {
     operation.reference_cached = Some(stored.clone());
     operation.state = GetObjectState::HeadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: stored.clone(),
-    }));
+    let turn = step(&mut operation, source_head(stored.clone()));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read {
-            expected: None,
-            ..
-        })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { expected: None, .. })
     ));
+    let turn = step(&mut operation, source_read(stored));
     assert!(matches!(
-        operation.step(source_read(stored)).as_slice(),
-        [Effect::Blob(BlobEffect::SpoolLocal { .. })]
+        asked(&turn),
+        Effect::Blob(BlobEffect::SpoolLocal { .. })
     ));
 }
 
@@ -1981,22 +1833,21 @@ fn spool_budget_refused() {
     stored.etag = None;
     operation.reference_cached = Some(stored.clone());
     operation.state = GetObjectState::HeadReferenceSource;
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: stored.clone(),
-    }));
+    step(&mut operation, source_head(stored.clone())).unwrap();
+    let turn = step(&mut operation, source_read(stored));
     assert!(matches!(
-        operation.step(source_read(stored)).as_slice(),
-        [Effect::Blob(BlobEffect::SpoolLocal { size: 9, .. })]
+        asked(&turn),
+        Effect::Blob(BlobEffect::SpoolLocal { size: 9, .. })
     ));
 
-    operation.step(Event::Blob(BlobEvent::Error(
-        BlobError::SpoolBudgetExhausted { limit: 1 },
-    )));
-
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::SpoolBudgetExhausted)
+    let turn = step(
+        &mut operation,
+        Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted {
+            limit: 1,
+        })),
     );
+
+    assert_eq!(turn.err(), Some(GetObjectError::SpoolBudgetExhausted));
 }
 
 // A spool larger than the whole budget fails the read for good, naming the limit.
@@ -2007,18 +1858,17 @@ fn oversized_spool_refused() {
     stored.etag = None;
     operation.reference_cached = Some(stored.clone());
     operation.state = GetObjectState::HeadReferenceSource;
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: stored.clone(),
-    }));
-    operation.step(source_read(stored));
+    step(&mut operation, source_head(stored.clone())).unwrap();
+    step(&mut operation, source_read(stored)).unwrap();
 
-    operation.step(Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge {
-        limit: 4,
-    })));
+    let turn = step(
+        &mut operation,
+        Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit: 4 })),
+    );
 
     assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceTooLarge { limit: 4 })
+        turn.err(),
+        Some(GetObjectError::ReferenceTooLarge { limit: 4 })
     );
 }
 
@@ -2032,13 +1882,11 @@ fn unbound_pin_served() {
     operation.reference_explicit = true;
     operation.state = GetObjectState::HeadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: stored,
-    }));
+    let turn = step(&mut operation, source_head(stored));
 
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { .. })
     ));
     assert_eq!(operation.state, GetObjectState::ReadReferenceSource);
 }
@@ -2059,11 +1907,11 @@ fn unproven_pin_refused() {
         operation.source_metadata = Some(observation(9));
         operation.state = GetObjectState::ReadReferenceSource;
 
-        operation.step(source_read(read));
+        let turn = step(&mut operation, source_read(read));
 
         assert_eq!(
-            operation.finalize(),
-            Err(GetObjectError::HistoricalReferenceUnavailable)
+            turn.err(),
+            Some(GetObjectError::HistoricalReferenceUnavailable)
         );
     }
 
@@ -2072,9 +1920,7 @@ fn unproven_pin_refused() {
     operation.reference_explicit = true;
     operation.source_metadata = Some(observation(9));
     operation.state = GetObjectState::ReadReferenceSource;
-    let effects = operation.step(source_read(observation(9)));
-    assert!(effects.is_empty());
-    assert_eq!(operation.state, GetObjectState::Finish);
+    served(step(&mut operation, source_read(observation(9))));
 }
 
 // A bound read whose condition fails queues a request to observe the source, which the refresh
@@ -2085,18 +1931,19 @@ fn failed_condition_refreshes() {
     operation.source_metadata = Some(observation(9));
     operation.state = GetObjectState::ReadReferenceSource;
 
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
-        error: StagingSourceError::ConditionFailed,
-    }));
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-    operation.step(Event::SubOperation(SubOperationEvent::RefreshQueued {
-        result: Ok(()),
-    }));
-
-    assert_eq!(
-        operation.finalize(),
-        Err(GetObjectError::ReferenceSourceChanged)
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::Error {
+            error: StagingSourceError::ConditionFailed,
+        }),
     );
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let turn = step(
+        &mut operation,
+        Event::SubOperation(SubOperationEvent::RefreshQueued { result: Ok(()) }),
+    );
+
+    assert_eq!(turn.err(), Some(GetObjectError::ReferenceSourceChanged));
 }
 
 // A matching read is served, and the stale promise is cleared with it.
@@ -2106,41 +1953,9 @@ fn read_match_serves() {
     operation.source_metadata = Some(observation(9));
     operation.state = GetObjectState::ReadReferenceSource;
 
-    let effects = operation.step(source_read(observation(9)));
+    served(step(&mut operation, source_read(observation(9))));
 
-    assert!(effects.is_empty());
-    assert_eq!(operation.state, GetObjectState::Finish);
     assert!(operation.advance_observation.is_none());
-}
-
-// The restart must observe its own abort before re-reading the head.
-#[test]
-fn restart_needs_abort() {
-    let mut operation = drifted_operation();
-    operation.state = GetObjectState::RestartReference;
-
-    let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-        key: b"unrelated".to_vec().into(),
-    }));
-
-    assert!(effects.is_empty());
-    assert!(matches!(
-        operation.finalize(),
-        Err(GetObjectError::InvalidStateEvent { .. })
-    ));
-
-    let mut operation = drifted_operation();
-    operation.state = GetObjectState::RestartReference;
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: Ulid::generate(),
-    }));
-
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    ));
 }
 
 async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> SourceMetadata {
@@ -2172,9 +1987,10 @@ async fn read_reference_version(ctx: &DriverContext, version_id: Ulid) -> Source
 // observation it supersedes, and a recount agrees.
 #[tokio::test]
 async fn offered_drift_replaces() {
-    use crate::staging::offered_directory::{OfferDirectoryInput, offer_directory};
+    use crate::staging::offer::run::offer_directory;
+    use crate::staging::offered_directory::OfferDirectoryInput;
 
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let root = tempdir().unwrap();
     let file = root.path().join("data.bin");
@@ -2188,10 +2004,12 @@ async fn offered_drift_replaces() {
         node_id: test_node_id(),
         user_id: UserId::new(Ulid::generate(), realm_id),
     };
-    offer_directory(context, offer.clone()).await.unwrap();
+    drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
 
-    let mut operation = GetObjectOperation::new(GetObjectInput {
+    let operation = GetObjectOperation::new(GetObjectInput {
         bucket: offer.bucket.clone(),
         key: "data.bin".to_string(),
         version_id: None,
@@ -2201,8 +2019,9 @@ async fn offered_drift_replaces() {
         realm_id,
         node_id: offer.node_id,
     });
-    operation.now_override = Some(SystemTime::now() + 2 * MIN_ADVANCE_INTERVAL);
-    let mut stream = drive(operation, context).await.unwrap().blob;
+    // The run's clock is two cooldowns ahead, so the changed file may advance at once.
+    let ahead = 2 * MIN_ADVANCE_INTERVAL.as_millis() as u64;
+    let mut stream = drive(Ahead(operation, ahead), context).await.unwrap().blob;
     while let Some(Ok(_)) = stream.next().await {}
 
     let usage = || async {
@@ -2222,7 +2041,7 @@ async fn offered_drift_replaces() {
     let counters = usage().await;
     assert_eq!((counters.objects, counters.referenced_bytes), (1, 11));
     drive(
-        crate::node::usage_stats::RebuildStatsOperation::new(),
+        crate::node::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await
@@ -2237,9 +2056,9 @@ async fn historical_drift_fails() {
     let endpoint = spawn_reference_server(b"hello reference").await;
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    storage_handle.open_vault(aruna_core::node_vault::NodeVaultKey::random());
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::with_egress(
@@ -2263,9 +2082,10 @@ async fn historical_drift_fails() {
         storage_handle: storage_handle.clone(),
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let version_id = Ulid::generate();
@@ -2342,12 +2162,12 @@ async fn historical_drift_fails() {
 }
 
 mod sealed {
-    use super::test_node_id;
-    use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-    use aruna_core::UserId;
-    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+    use super::{asked, served, step, test_node_id};
+    use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, Turn};
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
     use aruna_core::errors::{BlobError, ConversionError};
-    use aruna_core::events::{BlobEvent, Event, StorageEvent};
+    use aruna_core::events::{BlobEvent, Event};
     use aruna_core::operation::Operation;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -2358,6 +2178,7 @@ mod sealed {
         BucketEncryption, BucketKeyError, BucketKeyRef, EncryptionMode, ReadLease,
     };
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
+    use aruna_core::user::id::UserId;
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::SystemTime;
@@ -2368,7 +2189,7 @@ mod sealed {
     }
 
     fn operation() -> GetObjectOperation {
-        let mut operation = GetObjectOperation::new(GetObjectInput {
+        GetObjectOperation::new(GetObjectInput {
             bucket: "bucket".to_string(),
             key: "sealed.bin".to_string(),
             version_id: None,
@@ -2377,9 +2198,7 @@ mod sealed {
             user_identity: UserId::nil(RealmId::from_bytes([3u8; 32])),
             realm_id: RealmId::from_bytes([3u8; 32]),
             node_id: test_node_id(),
-        });
-        operation.txn_id = Some(Ulid::generate());
-        operation
+        })
     }
 
     fn sealed_location() -> BackendLocation {
@@ -2405,10 +2224,16 @@ mod sealed {
         }
     }
 
-    fn committed() -> Event {
-        Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id: Ulid::generate(),
-        })
+    fn locked_error() -> Option<GetObjectError> {
+        Some(GetObjectError::ConversionError(ConversionError::BucketKey(
+            BucketKeyError::Locked(key().bucket_id),
+        )))
+    }
+
+    fn locked() -> Event {
+        Event::Blob(BlobEvent::Error(BlobError::BucketKey(
+            BucketKeyError::Locked(key().bucket_id),
+        )))
     }
 
     #[test]
@@ -2416,21 +2241,21 @@ mod sealed {
         let mut operation = operation();
         let location = sealed_location();
         operation.location = Some(location.clone());
-        let effects = operation.read_blob();
+        let turn = operation.read_blob();
         let archive = ArchiveKey::of(&location);
         assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Storage(StorageEffect::CommitTransaction { .. }),
-                Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: pinned }),
-            ] if *admitted == key() && *pinned == archive
+            asked(&turn),
+            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: pinned })
+                if *admitted == key() && *pinned == archive
         ));
-        assert!(operation.step(committed()).is_empty());
         let lease = ReadLease::new(key(), archive, Ulid::generate(), Arc::new(()));
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        let turn = step(
+            &mut operation,
+            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+        );
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::ReadSealed { range: None, .. })]
+            asked(&turn),
+            Effect::Blob(BlobEffect::ReadSealed { range: None, .. })
         ));
     }
 
@@ -2438,37 +2263,29 @@ mod sealed {
     fn locked_read_typed() {
         let mut operation = operation();
         operation.location = Some(sealed_location());
-        operation.read_blob();
-        operation.step(committed());
-        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
-        operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert_eq!(
-            operation.finalize().err(),
-            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
-                BucketKeyError::Locked(key().bucket_id)
-            )))
-        );
+        operation.read_blob().unwrap();
+        assert_eq!(step(&mut operation, locked()).err(), locked_error());
     }
 
     #[test]
     fn foreign_lease_refused() {
         let mut operation = operation();
         operation.location = Some(sealed_location());
-        operation.read_blob();
-        operation.step(committed());
+        operation.read_blob().unwrap();
         let other = ArchiveKey::new(Ulid::generate(), BackendRef::node_default());
         let lease = ReadLease::new(key(), other, Ulid::generate(), Arc::new(()));
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
-        assert!(
-            !effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::Blob(BlobEffect::ReadSealed { .. })))
+        let turn = step(
+            &mut operation,
+            Event::Blob(BlobEvent::ReadAdmitted { lease }),
         );
-        assert!(operation.is_complete());
+        assert!(matches!(
+            turn,
+            Err(GetObjectError::InvalidStateEvent { .. })
+        ));
     }
 
     /// Steps a reference read of a bucket with `settings` up to its key check.
-    fn reference(settings: &BucketEncryption) -> (GetObjectOperation, Vec<Effect>) {
+    fn reference(settings: &BucketEncryption) -> (GetObjectOperation, Turn) {
         let mut operation = operation();
         operation.reference_access = Some(ResolvedSourceAccess::OpenDal {
             kind: SourceConnectorKind::S3,
@@ -2476,16 +2293,10 @@ mod sealed {
             path: "source".to_string(),
             version: None,
         });
-        operation.read_reference();
+        operation.read_reference().unwrap();
         let row = Some(settings.to_bytes().unwrap().into());
-        let mut effects: Vec<Effect> = operation
-            .step(Event::Storage(StorageEvent::ReadResult {
-                key: b"bucket".to_vec().into(),
-                value: row,
-            }))
-            .into_vec();
-        effects.extend(operation.step(committed()));
-        (operation, effects)
+        let turn = operation.next(IoResult::Values(vec![row]));
+        (operation, turn)
     }
 
     #[test]
@@ -2496,63 +2307,37 @@ mod sealed {
             key_generation: 1,
             ..Default::default()
         };
-        let (mut operation, effects) = reference(&settings);
+        let (mut operation, turn) = reference(&settings);
         let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
-        assert!(effects.iter().any(|effect| matches!(
-            effect,
+        assert!(matches!(
+            asked(&turn),
             Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
                 if *admitted == key() && *named == archive
-        )));
-        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
-        operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert_eq!(
-            operation.finalize().err(),
-            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
-                BucketKeyError::Locked(key().bucket_id)
-            )))
-        );
+        ));
+        assert_eq!(step(&mut operation, locked()).err(), locked_error());
 
         // An unlocked bucket admits the read, and its lease rides with the source stream.
         let (mut operation, _) = reference(&settings);
         let guard = Arc::new(());
         let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        let turn = step(
+            &mut operation,
+            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+        );
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::StagingSource(StagingSourceEffect::Head { .. })]
+            asked(&turn),
+            Effect::StagingSource(StagingSourceEffect::Head { .. })
         ));
         assert_eq!(Arc::strong_count(&guard), 2);
     }
 
     #[test]
     fn plain_reference_unchanged() {
-        let (_, effects) = reference(&BucketEncryption::default());
+        let (_, turn) = reference(&BucketEncryption::default());
         assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Storage(StorageEffect::CommitTransaction { .. }),
-                Effect::StagingSource(StagingSourceEffect::Head { .. }),
-            ]
+            asked(&turn),
+            Effect::StagingSource(StagingSourceEffect::Head { .. })
         ));
-    }
-
-    #[test]
-    fn remote_lock_typed() {
-        use crate::replication::bao_read::BaoReadError;
-        use crate::replication::protocol::BaoReadRefusal;
-        use crate::s3::object::get::HolderFailures;
-
-        let mut failures = HolderFailures::default();
-        failures.record(BaoReadError::Refused(BaoReadRefusal::NotFound));
-        failures.record(BaoReadError::Refused(BaoReadRefusal::BucketLocked(
-            key().bucket_id,
-        )));
-        assert_eq!(
-            failures.into_error(),
-            GetObjectError::ConversionError(ConversionError::BucketKey(BucketKeyError::Locked(
-                key().bucket_id
-            )))
-        );
     }
 
     fn encrypting() -> BucketEncryption {
@@ -2565,53 +2350,43 @@ mod sealed {
     }
 
     /// A raw copy still waiting for conversion, read with the bucket's current `settings`.
-    fn plain_read(settings: &BucketEncryption) -> (GetObjectOperation, Vec<Effect>) {
+    fn plain_read(settings: &BucketEncryption) -> (GetObjectOperation, Turn) {
         let mut operation = operation();
         let mut location = sealed_location();
         location.format = StoredFormat::default();
         operation.location = Some(location);
-        operation.read_blob();
+        assert!(matches!(
+            operation.read_blob(),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
         let row = Some(settings.to_bytes().unwrap().into());
-        let effects = operation
-            .step(Event::Storage(StorageEvent::ReadResult {
-                key: b"bucket".to_vec().into(),
-                value: row,
-            }))
-            .into_vec();
-        (operation, effects)
+        let turn = operation.next(IoResult::Values(vec![row]));
+        (operation, turn)
     }
 
     #[test]
     fn unconverted_copy_gated() {
         // The lease pins the physical copy, not a bucket-wide placeholder.
         let archive = ArchiveKey::of(&sealed_location());
-        let (mut operation, effects) = plain_read(&encrypting());
+        let (mut operation, turn) = plain_read(&encrypting());
         assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Storage(StorageEffect::CommitTransaction { .. }),
-                Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named }),
-            ] if *admitted == key() && *named == archive
+            asked(&turn),
+            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
+                if *admitted == key() && *named == archive
         ));
-        assert!(operation.step(committed()).is_empty());
-        let locked = BlobError::BucketKey(BucketKeyError::Locked(key().bucket_id));
-        operation.step(Event::Blob(BlobEvent::Error(locked)));
-        assert_eq!(
-            operation.finalize().err(),
-            Some(GetObjectError::ConversionError(ConversionError::BucketKey(
-                BucketKeyError::Locked(key().bucket_id)
-            )))
-        );
+        assert_eq!(step(&mut operation, locked()).err(), locked_error());
 
         // Unlocked, the raw bytes are read and the stream keeps the bucket lease.
         let (mut operation, _) = plain_read(&encrypting());
-        operation.step(committed());
         let guard = Arc::new(());
         let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
-        let effects = operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+        let turn = step(
+            &mut operation,
+            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+        );
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::Read { .. })]
+            asked(&turn),
+            Effect::Blob(BlobEffect::Read { .. })
         ));
         let blob = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
             _,
@@ -2619,11 +2394,13 @@ mod sealed {
         >(
             bytes::Bytes::from_static(b"plain"),
         )]));
-        operation.step(Event::Blob(BlobEvent::ReadFinished {
-            blob,
-            stream_size: 5,
-        }));
-        let output = operation.finalize().unwrap();
+        let output = served(step(
+            &mut operation,
+            Event::Blob(BlobEvent::ReadFinished {
+                blob,
+                stream_size: 5,
+            }),
+        ));
         assert_eq!(Arc::strong_count(&guard), 2);
         drop(output);
         assert_eq!(Arc::strong_count(&guard), 1);
@@ -2631,13 +2408,10 @@ mod sealed {
 
     #[test]
     fn plain_bucket_ungated() {
-        let (_, effects) = plain_read(&BucketEncryption::default());
+        let (_, turn) = plain_read(&BucketEncryption::default());
         assert!(matches!(
-            effects.as_slice(),
-            [
-                Effect::Storage(StorageEffect::CommitTransaction { .. }),
-                Effect::Blob(BlobEffect::Read { .. }),
-            ]
+            asked(&turn),
+            Effect::Blob(BlobEffect::Read { .. })
         ));
     }
 
@@ -2652,78 +2426,8 @@ mod sealed {
             operation.input.user_identity,
             None,
         );
-        let effects = operation.read_version(Ulid::generate(), version, false);
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        assert_eq!(
-            operation.finalize().err(),
-            Some(GetObjectError::PendingContent(archive))
-        );
-    }
-}
-
-#[tokio::test]
-async fn promotes_serving_realm() {
-    // A user of another realm promotes pending content into the serving realm's hash index.
-    use crate::blob::promote::tests::received::{fixture, pending};
-    use aruna_core::events::BlobEvent;
-    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
-    use aruna_core::structs::execution::job::RoCrateLimits;
-    use aruna_core::structs::storage::blob::{ArchiveKey, HashIndex};
-
-    let (_temp, context, plan, _) = fixture().await;
-    let (serving, group_id) = (RealmId([1; 32]), Ulid::from_bytes([8; 16]));
-    let foreign = UserId::local(Ulid::generate(), RealmId([9; 32]));
-    let data = b"foreign content".to_vec();
-    let hash = *blake3::hash(&data).as_bytes();
-    let (location, version) = pending(&context, plan, foreign, "foreign", data, hash, false).await;
-    let archive = ArchiveKey::of(&location);
-    let admit = BlobEffect::AdmitRead {
-        key: plan.key,
-        archive: archive.clone(),
-    };
-    let blob = context.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::ReadAdmitted { lease }) = blob.send_blob_effect(admit).await else {
-        panic!("read not admitted");
-    };
-    let node_id = context.net_handle.as_ref().unwrap().node_id();
-    let input = GetObjectInput {
-        bucket: "bucket".to_string(),
-        key: "foreign".to_string(),
-        version_id: None,
-        range: None,
-        group_id,
-        user_identity: foreign,
-        realm_id: serving,
-        node_id,
-    };
-    let limits = RoCrateLimits::default();
-    promote_leased(&context, &input, archive, lease, &limits)
-        .await
-        .unwrap();
-
-    for (realm_id, indexed) in [(serving, true), (foreign.realm_id, false)] {
-        let alias = HashIndex::new(
-            hash,
-            version.version_id,
-            realm_id,
-            group_id,
-            node_id,
-            "bucket".to_string(),
-            "foreign".to_string(),
-        );
-        let read = StorageEffect::Read {
-            key_space: PATHS_INDEX_KEYSPACE.to_string(),
-            key: alias.to_bytes().unwrap().into(),
-            txn_id: None,
-        };
-        let event = context.storage_handle.send_storage_effect(read).await;
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            panic!("index read failed: {event:?}");
-        };
-        assert_eq!(value.is_some(), indexed);
+        let turn = operation.read_version(Ulid::generate(), version, false);
+        assert_eq!(turn.err(), Some(GetObjectError::PendingContent(archive)));
     }
 }
 
@@ -2736,10 +2440,7 @@ async fn slices_routed_range() {
             .into_iter()
             .map(|chunk| Ok(bytes::Bytes::from_static(chunk.as_bytes())))
             .collect();
-        let mut blob = slice_blob(
-            BackendStream::new(futures_util::stream::iter(chunks)),
-            range,
-        );
+        let mut blob = BackendStream::new(futures_util::stream::iter(chunks)).slice(range);
         let mut bytes = Vec::new();
         while let Some(chunk) = blob.0.next().await {
             bytes.extend_from_slice(&chunk.unwrap());
@@ -2754,7 +2455,7 @@ async fn slices_routed_range() {
 }
 
 fn distributed_operation() -> GetObjectOperation {
-    let mut operation = GetObjectOperation::new(GetObjectInput {
+    GetObjectOperation::new(GetObjectInput {
         bucket: "spire".to_string(),
         key: "a.txt".to_string(),
         version_id: None,
@@ -2763,9 +2464,7 @@ fn distributed_operation() -> GetObjectOperation {
         user_identity: UserId::local(Ulid::from_parts(2, 2), RealmId([0u8; 32])),
         realm_id: RealmId([0u8; 32]),
         node_id: test_node_id(),
-    });
-    operation.txn_id = Some(Ulid::from_parts(9, 9));
-    operation
+    })
 }
 
 // A version this member holds only the record of looks for a kept copy, then hands the read to
@@ -2788,16 +2487,14 @@ fn held_version_pulls() {
     .with_identity(Some([3; 32]));
     let version_id = Ulid::from_parts(4, 4);
 
-    let effects = operation.read_version(version_id, version, false);
+    let turn = operation.read_version(version_id, version, false);
 
-    let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() else {
+    let Ok(Next::Call(IoCall::Read(reads))) = turn else {
         panic!("expected the kept copy reads")
     };
     assert_eq!(reads[0].1.to_vec(), attachment_key(set_id, version_id));
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![(Vec::new().into(), None), (Vec::new().into(), None)],
-    }));
-    let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
+    let turn = operation.next(IoResult::Values(vec![None, None]));
+    let Err(GetObjectError::HeldElsewhere(held)) = turn else {
         panic!("expected a read through holders")
     };
     assert_eq!(
@@ -2825,12 +2522,8 @@ fn kept_reference_served() {
         SystemTime::UNIX_EPOCH,
     )
     .with_identity(Some([6; 32]));
-    let effects = operation.read_version(Ulid::from_parts(4, 4), version, false);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == aruna_core::keyspaces::S3_BUCKET_KEYSPACE
-    ));
+    let turn = operation.read_version(Ulid::from_parts(4, 4), version, false);
+    assert_eq!(read_space(&turn), S3_BUCKET_KEYSPACE);
     let bucket = aruna_core::structs::storage::blob::BucketInfo {
         group_id: Ulid::from_parts(5, 5),
         created_at: SystemTime::UNIX_EPOCH,
@@ -2847,14 +2540,14 @@ fn kept_reference_served() {
             revision: DistributionRevision::default(),
         }),
     };
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::<u8>::new().into(),
-        value: Some(bucket.to_bytes().unwrap().into()),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == 2
-    ));
+    let turn = step(
+        &mut operation,
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(bucket.to_bytes().unwrap().into()),
+        }),
+    );
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == 2));
     let location = BackendLocation {
         backend: BackendRef::node_default(),
         storage_class: None,
@@ -2874,17 +2567,19 @@ fn kept_reference_served() {
         blake3: [2; 32],
         location,
     };
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (Vec::new().into(), Some(attached.to_bytes().unwrap().into())),
-            (Vec::new().into(), None),
-        ],
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE
-    ));
+    let turn = step(
+        &mut operation,
+        Event::Storage(StorageEvent::BatchReadResult {
+            values: vec![
+                (Vec::new().into(), Some(attached.to_bytes().unwrap().into())),
+                (Vec::new().into(), None),
+            ],
+        }),
+    );
+    assert_eq!(
+        read_space(&turn),
+        aruna_core::keyspaces::OBJECT_METADATA_KEYSPACE
+    );
     assert_eq!(operation.state, GetObjectState::ReadMultipartSummary);
 }
 
@@ -2902,7 +2597,9 @@ fn failed_source_identity() {
         SystemTime::UNIX_EPOCH,
     )
     .with_identity(Some([6; 32]));
-    operation.read_version(Ulid::from_parts(4, 4), version, false);
+    operation
+        .read_version(Ulid::from_parts(4, 4), version, false)
+        .unwrap();
     let bucket = aruna_core::structs::storage::blob::BucketInfo {
         group_id: Ulid::from_parts(5, 5),
         created_at: SystemTime::UNIX_EPOCH,
@@ -2919,12 +2616,16 @@ fn failed_source_identity() {
             revision: DistributionRevision::default(),
         }),
     };
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::<u8>::new().into(),
-        value: Some(bucket.to_bytes().unwrap().into()),
-    }));
-    operation.source_failed(GetObjectError::GetObjectFailed);
-    let Err(GetObjectError::HeldElsewhere(held)) = operation.finalize() else {
+    step(
+        &mut operation,
+        Event::Storage(StorageEvent::ReadResult {
+            key: Vec::<u8>::new().into(),
+            value: Some(bucket.to_bytes().unwrap().into()),
+        }),
+    )
+    .unwrap();
+    let turn = operation.source_failed(GetObjectError::GetObjectFailed);
+    let Err(GetObjectError::HeldElsewhere(held)) = turn else {
         panic!("expected a read through holders")
     };
     assert_eq!((held.identity, held.blake3), ([6; 32], None));
@@ -2940,7 +2641,7 @@ fn http_access(path: &str) -> ResolvedSourceAccess {
     }
 }
 
-/// A current read of a reference with a second source, in its open read transaction.
+/// A current read of a reference with a second source, in its read snapshot.
 fn mirrored_operation(stored: SourceMetadata) -> GetObjectOperation {
     let mut binding = reference_source();
     let mut mirror = binding.descriptor.clone();
@@ -2952,7 +2653,6 @@ fn mirrored_operation(stored: SourceMetadata) -> GetObjectOperation {
     let mut operation = drifted_operation();
     operation.advance_observation = None;
     operation.reference_access = None;
-    operation.txn_id = Some(Ulid::generate());
     let version = BlobVersion::reference(
         binding,
         stored,
@@ -2965,10 +2665,7 @@ fn mirrored_operation(stored: SourceMetadata) -> GetObjectOperation {
 }
 
 /// Resolves both sources, ranks them with `failing` and opens the read up to the first HEAD.
-fn ranked_head(
-    operation: &mut GetObjectOperation,
-    failing: Vec<bool>,
-) -> aruna_core::types::Effects {
+fn ranked_head(operation: &mut GetObjectOperation, failing: Vec<bool>) -> Turn {
     let stats = failing.into_iter().map(|failing| SourceStats {
         failing,
         ..SourceStats::default()
@@ -2978,32 +2675,18 @@ fn ranked_head(
 
 /// Resolves both sources, ranks them with `stats` and `draw` and opens the read up to the
 /// first HEAD.
-fn ranked_with(
-    operation: &mut GetObjectOperation,
-    stats: Vec<SourceStats>,
-    draw: u64,
-) -> aruna_core::types::Effects {
+fn ranked_with(operation: &mut GetObjectOperation, stats: Vec<SourceStats>, draw: u64) -> Turn {
     let accesses = vec![
         http_access("folder/file.txt"),
         http_access("mirror/file.txt"),
     ];
     resolve_all(operation, accesses, &[]);
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
-        stats,
-        draw,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { .. })]
-    ));
-    let txn_id = operation.txn_id.unwrap();
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }))
+    let turn = step(
+        operation,
+        Event::StagingSource(StagingSourceEvent::HealthResult { stats, draw }),
+    );
+    assert_eq!(read_space(&turn), BUCKET_ENCRYPTION_KEYSPACE);
+    operation.next(IoResult::Values(vec![None]))
 }
 
 /// Resolves `accesses` in slot order and answers the connector read with `connectors`, up to
@@ -3013,14 +2696,13 @@ fn resolve_all(
     accesses: Vec<ResolvedSourceAccess>,
     connectors: &[SourceConnector],
 ) {
-    let mut effects = aruna_core::types::Effects::new();
+    let mut turn: Turn = Err(GetObjectError::GetObjectFailed);
     for access in accesses {
         let result = Ok(access);
-        effects = operation.step(Event::SubOperation(
-            SubOperationEvent::VersionAccessResolved { result },
-        ));
+        let resolved = SubOperationEvent::VersionAccessResolved { result };
+        turn = step(operation, Event::SubOperation(resolved));
     }
-    if let [Effect::Storage(StorageEffect::BatchRead { reads, .. })] = effects.as_slice() {
+    if let Ok(Next::Call(IoCall::Read(reads))) = &turn {
         let row = |key: &aruna_core::types::Key| {
             let connector = connectors.iter().find(|connector| {
                 *key == source_connector_key(connector.group_id, connector.connector_id)
@@ -3031,17 +2713,20 @@ fn resolve_all(
             .iter()
             .map(|(_, key)| (key.clone(), row(key)))
             .collect();
-        effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        turn = step(
+            operation,
+            Event::Storage(StorageEvent::BatchReadResult { values }),
+        );
     }
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Health { accesses })] if accesses.len() == 2
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Health { accesses }) if accesses.len() == 2
     ));
 }
 
-fn headed_path(effects: &aruna_core::types::Effects) -> String {
-    let [Effect::StagingSource(StagingSourceEffect::Head { access })] = effects.as_slice() else {
-        panic!("expected a source HEAD, got {effects:?}")
+fn headed_path(turn: &Turn) -> String {
+    let Effect::StagingSource(StagingSourceEffect::Head { access }) = asked(turn) else {
+        panic!("expected a source HEAD, got {turn:?}")
     };
     let ResolvedSourceAccess::OpenDal { path, .. } = access;
     path.clone()
@@ -3053,35 +2738,38 @@ fn headed_path(effects: &aruna_core::types::Effects) -> String {
 fn sources_fail_over() {
     let stored = digested(9, 7);
     let mut operation = mirrored_operation(stored.clone());
-    let effects = ranked_head(&mut operation, vec![true, false]);
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let turn = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
     let failed = StagingSourceError::StatError("timed out".to_string());
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
-        error: failed,
-    }));
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::Error { error: failed }),
+    );
+    assert_eq!(headed_path(&turn), "folder/file.txt");
     let mut operation = mirrored_operation(stored.clone());
-    let effects = ranked_head(&mut operation, vec![false, false]);
-    assert_eq!(headed_path(&effects), "folder/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
-        error: StagingSourceError::StatError("refused".to_string()),
-    }));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let turn = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&turn), "folder/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::Error {
+            error: StagingSourceError::StatError("refused".to_string()),
+        }),
+    );
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
     let mut fresh = observation(9);
     fresh.etag = Some("mirror-etag".to_string());
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh.clone(),
-    }));
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: fresh.clone(),
+        }),
+    );
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read {
-            expected: None,
-            ..
-        })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { expected: None, .. })
     ));
-    operation.step(source_read(fresh));
-    assert!(operation.step(spooled(7)).is_empty());
-    let result = operation.finalize().unwrap();
+    step(&mut operation, source_read(fresh)).unwrap();
+    let result = served(step(&mut operation, spooled(7)));
     assert_eq!(result.source_metadata.unwrap().etag, stored.etag);
     let served = result.served_source.unwrap();
     assert_eq!(served.descriptor.source_path, "mirror/file.txt");
@@ -3108,18 +2796,21 @@ fn absence_needs_all() {
     ];
     for (first, second, expected) in cases {
         let mut operation = mirrored_operation(observation(9));
-        let effects = ranked_head(&mut operation, vec![false, false]);
-        assert_eq!(headed_path(&effects), "folder/file.txt");
-        let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
-            error: first,
-        }));
-        assert_eq!(headed_path(&effects), "mirror/file.txt");
-        operation.step(Event::StagingSource(StagingSourceEvent::Error {
-            error: second,
-        }));
-        assert!(operation.is_complete());
-        let error = operation.finalize().unwrap_err();
-        assert_eq!(error, GetObjectError::StagingSourceError(expected));
+        let turn = ranked_head(&mut operation, vec![false, false]);
+        assert_eq!(headed_path(&turn), "folder/file.txt");
+        let turn = step(
+            &mut operation,
+            Event::StagingSource(StagingSourceEvent::Error { error: first }),
+        );
+        assert_eq!(headed_path(&turn), "mirror/file.txt");
+        let turn = step(
+            &mut operation,
+            Event::StagingSource(StagingSourceEvent::Error { error: second }),
+        );
+        assert_eq!(
+            turn.err(),
+            Some(GetObjectError::StagingSourceError(expected))
+        );
     }
 }
 
@@ -3128,31 +2819,36 @@ fn absence_needs_all() {
 #[test]
 fn unproven_source_skipped() {
     let mut operation = mirrored_operation(observation(9));
-    let effects = ranked_head(&mut operation, vec![true, false]);
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let turn = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
     let mut fresh = observation(9);
     fresh.etag = Some("mirror-etag".to_string());
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh,
-    }));
-    assert_eq!(headed_path(&effects), "folder/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult { metadata: fresh }),
+    );
+    assert_eq!(headed_path(&turn), "folder/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }),
+    );
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { .. })
     ));
     // With every source failing, the last failure is reported.
     let mut operation = mirrored_operation(observation(9));
-    ranked_head(&mut operation, vec![false, true]);
+    ranked_head(&mut operation, vec![false, true]).unwrap();
+    let mut turn = Ok(Next::Done(()));
     for _ in 0..2 {
-        operation.step(Event::StagingSource(StagingSourceEvent::Error {
-            error: StagingSourceError::StatError("down".to_string()),
-        }));
+        let down = StagingSourceError::StatError("down".to_string());
+        let failed = Event::StagingSource(StagingSourceEvent::Error { error: down });
+        turn = step(&mut operation, failed).map(|_| Next::Done(()));
     }
     assert!(matches!(
-        operation.finalize(),
+        turn,
         Err(GetObjectError::StagingSourceError(
             StagingSourceError::StatError(_)
         ))
@@ -3164,19 +2860,23 @@ fn unproven_source_skipped() {
 #[test]
 fn disagreeing_source_drifts() {
     let mut operation = mirrored_operation(observation(9));
-    let effects = ranked_head(&mut operation, vec![false, false]);
-    assert_eq!(headed_path(&effects), "folder/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::Error {
-        error: StagingSourceError::StatError("down".to_string()),
-    }));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(12),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction { .. })]
-    ));
+    let turn = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&turn), "folder/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::Error {
+            error: StagingSourceError::StatError("down".to_string()),
+        }),
+    );
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(12),
+        }),
+    );
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, GetObjectState::AdvanceReference);
     let binding = operation.source_binding.clone().unwrap();
     assert_eq!(binding.descriptor.source_path, "mirror/file.txt");
     assert_eq!(binding.mirrors[0].descriptor.source_path, "folder/file.txt");
@@ -3184,17 +2884,24 @@ fn disagreeing_source_drifts() {
     // A pinned version never serves bytes another source disagrees on.
     let mut pinned = mirrored_operation(digested(9, 7));
     pinned.reference_explicit = true;
-    ranked_head(&mut pinned, vec![false, false]);
-    pinned.step(Event::StagingSource(StagingSourceEvent::Error {
-        error: StagingSourceError::StatError("down".to_string()),
-    }));
-    pinned.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: digested(9, 8),
-    }));
-    assert!(matches!(
-        pinned.finalize(),
-        Err(GetObjectError::HistoricalReferenceUnavailable)
-    ));
+    ranked_head(&mut pinned, vec![false, false]).unwrap();
+    step(
+        &mut pinned,
+        Event::StagingSource(StagingSourceEvent::Error {
+            error: StagingSourceError::StatError("down".to_string()),
+        }),
+    )
+    .unwrap();
+    let turn = step(
+        &mut pinned,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: digested(9, 8),
+        }),
+    );
+    assert_eq!(
+        turn.err(),
+        Some(GetObjectError::HistoricalReferenceUnavailable)
+    );
 }
 
 // A randomly picked source whose size or bytes fail their proof was not served, so the read
@@ -3202,22 +2909,29 @@ fn disagreeing_source_drifts() {
 #[test]
 fn failed_proof_advances() {
     let mut operation = mirrored_operation(digested(9, 7));
-    let effects = ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(12),
-    }));
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let turn = ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(12),
+        }),
+    );
+    assert_eq!(headed_path(&turn), "folder/file.txt");
     let mut operation = mirrored_operation(digested(9, 7));
-    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
+    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX).unwrap();
     let mut fresh = observation(9);
     fresh.etag = Some("mirror-etag".to_string());
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh.clone(),
-    }));
-    operation.step(source_read(fresh));
-    let effects = operation.step(spooled(8));
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: fresh.clone(),
+        }),
+    )
+    .unwrap();
+    step(&mut operation, source_read(fresh)).unwrap();
+    let turn = step(&mut operation, spooled(8));
+    assert_eq!(headed_path(&turn), "folder/file.txt");
 }
 
 // An HTTP source does not enforce its ETag, so an equal ETag alone never lets another source
@@ -3225,12 +2939,15 @@ fn failed_proof_advances() {
 #[test]
 fn etag_alone_refused() {
     let mut operation = mirrored_operation(observation(9));
-    let effects = ranked_head(&mut operation, vec![true, false]);
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let turn = ranked_head(&mut operation, vec![true, false]);
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }),
+    );
+    assert_eq!(headed_path(&turn), "folder/file.txt");
 }
 
 // Another source's own content type is what its read must repeat; the version's type is only
@@ -3240,22 +2957,22 @@ fn mirror_type_kept() {
     let mut stored = digested(9, 7);
     stored.content_type = Some("text/plain".to_string());
     let mut operation = mirrored_operation(stored);
-    ranked_head(&mut operation, vec![true, false]);
+    ranked_head(&mut operation, vec![true, false]).unwrap();
     let mut fresh = observation(9);
     fresh.content_type = Some("application/octet-stream".to_string());
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh.clone(),
-    }));
-    let effects = operation.step(source_read(fresh));
-    assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::SpoolLocal { .. })]
-        ),
-        "{effects:?}"
-    );
-    assert!(operation.step(spooled(7)).is_empty());
-    let result = operation.finalize().unwrap();
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: fresh.clone(),
+        }),
+    )
+    .unwrap();
+    let turn = step(&mut operation, source_read(fresh));
+    assert!(matches!(
+        asked(&turn),
+        Effect::Blob(BlobEffect::SpoolLocal { .. })
+    ));
+    let result = served(step(&mut operation, spooled(7)));
     let served = result.source_metadata.unwrap();
     assert_eq!(served.content_type.as_deref(), Some("text/plain"));
 }
@@ -3265,45 +2982,53 @@ fn mirror_type_kept() {
 #[test]
 fn broken_spool_failover() {
     let mut operation = mirrored_operation(digested(9, 7));
-    let effects = ranked_head(&mut operation, vec![false, false]);
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let turn = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&turn), "folder/file.txt");
     let mut fresh = observation(9);
     fresh.etag = None;
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: fresh.clone(),
-    }));
-    let effects = operation.step(source_read(fresh));
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: fresh.clone(),
+        }),
+    )
+    .unwrap();
+    let turn = step(&mut operation, source_read(fresh));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Blob(BlobEffect::SpoolLocal { .. })]
+        asked(&turn),
+        Effect::Blob(BlobEffect::SpoolLocal { .. })
     ));
     let broken = BlobError::StreamFailed("connection reset".to_string());
-    let effects = operation.step(Event::Blob(BlobEvent::Error(broken)));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let turn = step(&mut operation, Event::Blob(BlobEvent::Error(broken)));
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
 }
 
 // Equal sources share reads by the draw; a read keeps the source it picked when it restarts.
 #[test]
 fn read_keeps_source() {
     let mut operation = mirrored_operation(digested(9, 7));
-    let effects = ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let turn = ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
     let mut operation = mirrored_operation(digested(9, 7));
-    let effects = ranked_with(&mut operation, vec![SourceStats::default(); 2], 0);
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let turn = ranked_with(&mut operation, vec![SourceStats::default(); 2], 0);
+    assert_eq!(headed_path(&turn), "folder/file.txt");
     // A restarted read picks again with a draw that favours the other source, yet keeps its own.
     let mut operation = mirrored_operation(digested(9, 7));
-    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
-    operation.resolve_reference();
+    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX).unwrap();
+    operation.resolve_reference().unwrap();
     let accesses = vec![
         http_access("folder/file.txt"),
         http_access("mirror/file.txt"),
     ];
     resolve_all(&mut operation, accesses, &[]);
-    operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
-        stats: vec![SourceStats::default(); 2],
-        draw: 0,
-    }));
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HealthResult {
+            stats: vec![SourceStats::default(); 2],
+            draw: 0,
+        }),
+    )
+    .unwrap();
     let Some(ResolvedSourceAccess::OpenDal { path, .. }) = &operation.reference_access else {
         panic!("expected a picked source")
     };
@@ -3324,11 +3049,11 @@ fn unproven_mirror_waits() {
         ..SourceStats::default()
     };
     let mut operation = mirrored_operation(observation(9));
-    let effects = ranked_with(&mut operation, vec![slow, fast], u64::MAX);
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let turn = ranked_with(&mut operation, vec![slow, fast], u64::MAX);
+    assert_eq!(headed_path(&turn), "folder/file.txt");
     let mut operation = mirrored_operation(digested(9, 7));
-    let effects = ranked_with(&mut operation, vec![slow, fast], u64::MAX / 2);
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    let turn = ranked_with(&mut operation, vec![slow, fast], u64::MAX / 2);
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
 }
 
 // The operator's weight comes from the connector as it is now, not from the stored binding.
@@ -3359,10 +3084,14 @@ fn connector_weight_counts() {
     resolve_all(&mut operation, accesses, &[connector]);
     assert_eq!(operation.source_weights, [1.0, 1000.0]);
     // A draw that picks the first of two equal sources picks the heavy mirror.
-    operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
-        stats: vec![SourceStats::default(); 2],
-        draw: u64::MAX / 4,
-    }));
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HealthResult {
+            stats: vec![SourceStats::default(); 2],
+            draw: u64::MAX / 4,
+        }),
+    )
+    .unwrap();
     let Some(ResolvedSourceAccess::OpenDal { path, .. }) = &operation.reference_access else {
         panic!("expected a picked source")
     };
@@ -3373,19 +3102,23 @@ fn connector_weight_counts() {
 #[test]
 fn kept_source_moves() {
     let mut operation = mirrored_operation(digested(9, 7));
-    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX);
+    ranked_with(&mut operation, vec![SourceStats::default(); 2], u64::MAX).unwrap();
     let binding = operation.source_binding.clone().unwrap();
     operation.source_binding = binding.promoted(1);
-    operation.resolve_reference();
+    operation.resolve_reference().unwrap();
     let accesses = vec![
         http_access("mirror/file.txt"),
         http_access("folder/file.txt"),
     ];
     resolve_all(&mut operation, accesses, &[]);
-    operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
-        stats: vec![SourceStats::default(); 2],
-        draw: u64::MAX,
-    }));
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HealthResult {
+            stats: vec![SourceStats::default(); 2],
+            draw: u64::MAX,
+        }),
+    )
+    .unwrap();
     let Some(ResolvedSourceAccess::OpenDal { path, .. }) = &operation.reference_access else {
         panic!("expected a picked source")
     };
@@ -3451,90 +3184,140 @@ fn matched_weight_counts() {
 #[test]
 fn first_proof_advances() {
     let mut operation = mirrored_operation(digested(9, 7));
-    let effects = ranked_head(&mut operation, vec![false, false]);
-    assert_eq!(headed_path(&effects), "folder/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
+    let turn = ranked_head(&mut operation, vec![false, false]);
+    assert_eq!(headed_path(&turn), "folder/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }),
+    );
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read { .. })]
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read { .. })
     ));
-    operation.step(source_read(observation(9)));
-    let effects = operation.step(spooled(8));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
+    step(&mut operation, source_read(observation(9))).unwrap();
+    let turn = step(&mut operation, spooled(8));
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
     let mut pinned = mirrored_operation(digested(9, 7));
     pinned.reference_explicit = true;
-    ranked_head(&mut pinned, vec![false, false]);
-    let effects = pinned.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: digested(12, 7),
-    }));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
-    pinned.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: digested(12, 7),
-    }));
-    assert!(matches!(
-        pinned.finalize(),
-        Err(GetObjectError::HistoricalReferenceUnavailable)
-    ));
+    ranked_head(&mut pinned, vec![false, false]).unwrap();
+    let turn = step(
+        &mut pinned,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: digested(12, 7),
+        }),
+    );
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
+    let turn = step(
+        &mut pinned,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: digested(12, 7),
+        }),
+    );
+    assert_eq!(
+        turn.err(),
+        Some(GetObjectError::HistoricalReferenceUnavailable)
+    );
 }
 
 /// A pinned read of a version without checksums whose second source is an S3 mirror, up to the
 /// first source's HEAD.
-fn pinned_s3_mirror() -> (GetObjectOperation, aruna_core::types::Effects) {
+fn pinned_s3_mirror() -> (GetObjectOperation, Turn) {
     let mut operation = mirrored_operation(observation(9));
     operation.reference_explicit = true;
     let accesses = vec![http_access("folder/file.txt"), s3_access("mirror/file.txt")];
     resolve_all(&mut operation, accesses, &[]);
-    operation.step(Event::StagingSource(StagingSourceEvent::HealthResult {
-        stats: vec![SourceStats::default(); 2],
-        draw: 0,
-    }));
-    let txn_id = operation.txn_id.unwrap();
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    (operation, effects)
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HealthResult {
+            stats: vec![SourceStats::default(); 2],
+            draw: 0,
+        }),
+    )
+    .unwrap();
+    let turn = operation.next(IoResult::Values(vec![None]));
+    (operation, turn)
 }
 
 // A pinned read whose first source answers without the recorded validator moves on to a mirror
 // that enforces the recorded strong ETag; with none left it is refused.
 #[test]
 fn missing_validator_advances() {
-    let (mut operation, effects) = pinned_s3_mirror();
-    assert_eq!(headed_path(&effects), "folder/file.txt");
+    let (mut operation, turn) = pinned_s3_mirror();
+    assert_eq!(headed_path(&turn), "folder/file.txt");
     let mut unvalidated = observation(9);
     unvalidated.etag = None;
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: unvalidated.clone(),
-    }));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
-    let effects = operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: unvalidated.clone(),
+        }),
+    );
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }),
+    );
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::StagingSource(StagingSourceEffect::Read {
+        asked(&turn),
+        Effect::StagingSource(StagingSourceEffect::Read {
             expected: Some(_),
             ..
-        })]
+        })
     ));
     // The same on the read: its answer lacks the validator its HEAD showed.
     let (mut operation, _) = pinned_s3_mirror();
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: observation(9),
-    }));
-    let effects = operation.step(source_read(unvalidated.clone()));
-    assert_eq!(headed_path(&effects), "mirror/file.txt");
-    operation.step(Event::StagingSource(StagingSourceEvent::HeadResult {
-        metadata: unvalidated,
-    }));
-    assert!(matches!(
-        operation.finalize(),
-        Err(GetObjectError::HistoricalReferenceUnavailable)
-    ));
+    step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: observation(9),
+        }),
+    )
+    .unwrap();
+    let turn = step(&mut operation, source_read(unvalidated.clone()));
+    assert_eq!(headed_path(&turn), "mirror/file.txt");
+    let turn = step(
+        &mut operation,
+        Event::StagingSource(StagingSourceEvent::HeadResult {
+            metadata: unvalidated,
+        }),
+    );
+    assert_eq!(
+        turn.err(),
+        Some(GetObjectError::HistoricalReferenceUnavailable)
+    );
+}
+
+/// `time` on the runner clock.
+fn millis(time: SystemTime) -> u64 {
+    let since = time.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    u64::try_from(since.as_millis()).unwrap()
+}
+
+/// Runs a read on a clock `.1` milliseconds ahead of the runner's.
+#[derive(Debug, PartialEq)]
+struct Ahead(GetObjectOperation, u64);
+
+impl Operation for Ahead {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Result<Next<GetObjectResult>, GetObjectError> {
+        self.0.first()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<GetObjectResult>, GetObjectError> {
+        self.0.next(result)
+    }
+
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        self.0.transaction()
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.0.stamp(now_ms + self.1);
+    }
 }

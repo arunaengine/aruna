@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::openapi::ApiDoc;
 use crate::tests::storage_routing::setup_state;
 
@@ -23,7 +24,7 @@ async fn bucket_rules_roundtrip() {
 
     let Json(stored) = put_bucket_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Json(BucketRoutingRequest {
             rules: vec![class_rule("cold")],
@@ -38,7 +39,7 @@ async fn bucket_rules_roundtrip() {
 
     let Json(fetched) = get_bucket_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
     )
     .await
@@ -53,7 +54,7 @@ async fn rejects_operator_backend() {
 
     let result = put_bucket_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Json(BucketRoutingRequest {
             rules: vec![RoutingRuleRequest {
@@ -77,7 +78,7 @@ async fn rejects_non_admin() {
 
     let result = put_bucket_routing(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path(test.bucket.clone()),
         Json(BucketRoutingRequest { rules: Vec::new() }),
     )
@@ -92,7 +93,7 @@ async fn group_default_roundtrip() {
 
     let Json(empty) = get_group_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
     )
     .await
@@ -101,7 +102,7 @@ async fn group_default_roundtrip() {
 
     let Json(stored) = put_group_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
@@ -124,7 +125,7 @@ async fn group_default_roundtrip() {
 
     let Json(cleared) = put_group_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
@@ -143,7 +144,7 @@ async fn rejects_invalid_class() {
 
     let result = put_group_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
@@ -166,7 +167,7 @@ async fn bucket_needs_storage() {
 
     let result = put_group_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: Some("lab-default".to_string()),
@@ -184,7 +185,7 @@ async fn bucket_needs_storage() {
     // A bucket template too.
     let result = put_group_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(GroupRoutingRequest {
             bucket: None,
@@ -207,7 +208,7 @@ async fn rejects_foreign_backend() {
 
     let result = put_bucket_routing(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Json(BucketRoutingRequest {
             rules: vec![RoutingRuleRequest {
@@ -247,7 +248,7 @@ async fn lists_readable_buckets() {
     let list = |auth: AuthContext| {
         list_group_buckets(
             State(test.state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Path(test.group_id.to_string()),
             axum::extract::Query(BucketPageQuery {
                 limit: Some(1),
@@ -339,7 +340,7 @@ async fn lists_bucket_jobs() {
         };
         let listed = list_group_buckets(
             State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Path(test.group_id.to_string()),
             axum::extract::Query(query),
         );
@@ -372,7 +373,9 @@ async fn lists_bucket_jobs() {
 async fn lists_unrouted_import() {
     // A running import shows also for a rule whose write storage is gone from routing.
     use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE};
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::JobRecord;
     use aruna_core::structs::storage::backend_import::{BackendImport, BackendImportSpec};
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
@@ -421,8 +424,7 @@ async fn lists_unrouted_import() {
     let payload = JobPayload::BackendImport(spec);
     let (user, node) = (test.auth.user_id, test.state.get_node_id());
     let record = JobRecord::new(job_id, payload, user, node, 1, 1, None);
-    let storage = &context.storage_handle;
-    aruna_operations::jobs::store::insert_job(storage, &record)
+    aruna_test_support::jobs::insert_job(&context, &record)
         .await
         .unwrap();
     let query = BucketPageQuery {
@@ -431,7 +433,7 @@ async fn lists_unrouted_import() {
     };
     let listed = list_group_buckets(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         axum::extract::Query(query),
     );

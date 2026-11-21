@@ -8,9 +8,10 @@ use std::time::Duration;
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_operations::s3::multipart::complete::{CompleteMultipartPart, CompleteUploadResult};
-use aruna_tasks::join_registry::{JoinRegistry, JoinWatch, await_joined};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use ulid::Ulid;
+
+use crate::s3::join_registry::{JoinRegistry, JoinWatch, await_joined};
 
 /// Retention lets a retry recover the completed object's ETag and version.
 const COMPLETION_RETENTION: Duration = Duration::from_secs(600);

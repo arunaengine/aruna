@@ -15,13 +15,26 @@ blake3 = { workspace = true }
 fjall = { workspace = true }
 thiserror = { workspace = true }
 crossfire = { workspace = true }
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 ulid = { workspace = true }
 byteview = { workspace = true }
+getrandom = { workspace = true }
 hex = { workspace = true }
+lru = { workspace = true }
+postcard = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
+tantivy = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[features]
+# Smaller key index limits for tests of crates that use the storage handle.
+test-hooks = []
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 tempfile = { workspace = true }

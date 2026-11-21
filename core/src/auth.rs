@@ -2,7 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
 pub const REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
+pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 
 /// Maximum bearer-token lifetime accepted by replicated revocation admission.
 /// 366 days covers every 12-calendar-month token, including leap years.
@@ -13,6 +17,11 @@ pub const MAX_TOKEN_LIFETIME: u64 = 366 * 24 * 60 * 60;
 /// is treated as a rollback rather than as skew.
 pub const REVOCATION_GRACE_SECS: u64 = 5 * 60;
 
+/// Maximum number of issuer keys a process cache retains.
+pub const KEY_CACHE_CAPACITY: usize = 1024;
+/// Time a cached issuer key is retained before it is checked again.
+pub const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
+
 pub fn credential_hash(value: impl AsRef<[u8]>) -> String {
     blake3::hash(value.as_ref()).to_string()
 }
@@ -22,7 +31,7 @@ pub fn bearer_token_hash(token: &str) -> String {
 }
 
 /// Revocation hash that stands for every credential of one user issued before a cutoff.
-pub fn user_cutoff_hash(user_id: &crate::UserId) -> String {
+pub fn user_cutoff_hash(user_id: &crate::user::id::UserId) -> String {
     credential_hash(format!("aruna user cutoff {user_id}"))
 }
 

@@ -1,4 +1,5 @@
-//! Tests publish genesis rules and that an evicted event replays after a lost tie-break.
+//! Tests publish genesis rules, held later events and that an evicted event replays after a lost
+//! tie-break.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -151,6 +152,7 @@ async fn blocked_allows_ready() {
             published_indices,
             retry_indices,
             error,
+            ..
         } => {
             assert_eq!(published_indices, vec![1]);
             assert_eq!(retry_indices, vec![0]);
@@ -168,6 +170,263 @@ async fn blocked_allows_ready() {
         service.has_topic(ready_topic).expect("ready topic lookup"),
         "ready record behind not-ready record must publish"
     );
+}
+
+// An appended event is reported published only with the lineage it stands on; an evicted one or
+// an unreadable lineage makes it retry.
+#[test]
+fn unknown_lineage_retries() {
+    use crate::document_sync::publish::confirmed_lineage;
+    assert_eq!(confirmed_lineage(Ok(Some([1; 32])), None), Some([1; 32]));
+    assert_eq!(confirmed_lineage(Ok(None), None), None);
+    let unreadable = Err(NetError::Bootstrap("down".to_string()));
+    assert_eq!(confirmed_lineage(unreadable, None), None);
+}
+
+// A later entry of a batch is bound to the lineage an earlier entry of its topic was confirmed
+// on, so a history received between them makes it retry instead of confirming it there.
+#[test]
+fn batch_root_carried() {
+    use crate::document_sync::publish::{bound_lineage, confirmed_lineage};
+    let (topic, other) = (
+        ::irokle::TopicId::hash(b"topic"),
+        ::irokle::TopicId::hash(b"other"),
+    );
+    let confirmed = BTreeMap::from([(topic, [1; 32])]);
+    let bound = bound_lineage(None, &confirmed, topic);
+    assert_eq!(bound, Some([1; 32]));
+    assert_eq!(confirmed_lineage(Ok(Some([2; 32])), bound), None);
+    assert_eq!(bound_lineage(None, &confirmed, other), None);
+    assert_eq!(
+        bound_lineage(Some([3; 32]), &confirmed, topic),
+        Some([3; 32])
+    );
+}
+
+// An event bound to one lineage whose append a received history moved to another is not
+// reported published, so its row stays and it appends again after the earlier events.
+#[test]
+fn moved_append_retries() {
+    use crate::document_sync::publish::confirmed_lineage;
+    assert_eq!(confirmed_lineage(Ok(Some([2; 32])), Some([1; 32])), None);
+    assert_eq!(
+        confirmed_lineage(Ok(Some([1; 32])), Some([1; 32])),
+        Some([1; 32])
+    );
+}
+
+// An event bound to a lineage appends only while its topic still has that lineage; otherwise it
+// retries and holds its topic for the later events.
+#[tokio::test]
+async fn moved_lineage_held() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([82; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(82).await,
+        storage,
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: local_node,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(82, 3),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement: PlacementRef::NIL,
+    };
+    let upsert = |time| DocumentSyncPublish::Upsert {
+        event_id: Ulid::from_parts(time, 4),
+        target: target.clone(),
+        bytes: b"interest".to_vec(),
+        change,
+        allow_genesis: true,
+    };
+    let first = service.publish_documents(vec![upsert(1)], Vec::new()).await;
+    let DocumentNetEvent::DocumentsPublished { lineages, .. } = first else {
+        panic!("the first event publishes: {first:?}");
+    };
+    let current = lineages.first().copied().flatten();
+    let genesis = (service.node().storage().topic_state(&topic_id))
+        .expect("topic state reads")
+        .expect("the publish created the topic")
+        .genesis;
+    assert_eq!(current, Some(crate::shard_manifest::lineage_root(&genesis)));
+
+    let moved = vec![Some([0; 32]), None];
+    let held = (service.publish_expecting(vec![upsert(2), upsert(3)], Vec::new(), moved)).await;
+    assert!(
+        matches!(held, DocumentNetEvent::Error { .. }),
+        "an event on a moved lineage and the later one must retry: {held:?}"
+    );
+    let kept = (service.publish_expecting(vec![upsert(2)], Vec::new(), vec![current])).await;
+    assert!(matches!(kept, DocumentNetEvent::DocumentsPublished { .. }));
+}
+
+// An event that must retry holds back the later events of its topic, so none of them lands in the
+// oplog ahead of it; other topics still publish.
+#[tokio::test]
+async fn later_event_held() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([63; 32]);
+    let placement = PlacementRef::NIL;
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(63).await,
+        storage,
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let held_target = DocumentTarget::NodeUsage {
+        realm_id,
+        node_id: local_node,
+        group_id: None,
+    };
+    let ready_target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: local_node,
+    };
+    let held_topic = held_target.sync_topic_id(realm_id, &placement);
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_parts(63, 3),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement,
+    };
+    let upsert = |time, target: &DocumentTarget, allow_genesis| DocumentSyncPublish::Upsert {
+        event_id: Ulid::from_parts(time, 4),
+        target: target.clone(),
+        bytes: b"usage".to_vec(),
+        change,
+        allow_genesis,
+    };
+
+    let published = service
+        .publish_documents(
+            vec![
+                upsert(1, &held_target, false),
+                upsert(2, &held_target, true),
+                upsert(3, &ready_target, true),
+            ],
+            Vec::new(),
+        )
+        .await;
+
+    match published {
+        DocumentNetEvent::DocumentsPartiallyPublished {
+            published_indices,
+            retry_indices,
+            ..
+        } => assert_eq!((published_indices, retry_indices), (vec![2], vec![0, 1])),
+        other => panic!("expected partial publish, got {other:?}"),
+    }
+    assert!(
+        !service.has_topic(held_topic).expect("held topic lookup"),
+        "the later event of the waiting topic must not append"
+    );
+}
+
+// An admin event held by its waiting topic holds its origin too, so a later event of that origin
+// on a ready topic stays behind it and holds that topic; another origin elsewhere still publishes.
+#[tokio::test]
+async fn held_topic_origin() {
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([81; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(81).await,
+        storage,
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let shard = |shard| PlacementRef {
+        strategy_id: Ulid::from_parts(81, 7),
+        shard,
+    };
+    let (held_shard, ready_shard, other_shard) = (shard(1), shard(2), shard(3));
+    let user_id = UserId::local(Ulid::from_parts(81, 1), realm_id);
+    let topic = |placement| DocumentTarget::User { user_id }.sync_topic_id(realm_id, &placement);
+    let topics = [topic(held_shard), topic(ready_shard), topic(other_shard)];
+    assert!(topics[0] != topics[1] && topics[1] != topics[2] && topics[0] != topics[2]);
+    service
+        .ensure_sync_topics(&topics, Vec::new())
+        .expect("shard topic genesis");
+    let admin = |seed: u8, origin_seq: u64, placement: PlacementRef, signed: bool| {
+        let event = test_admin_event(
+            Ulid::from_parts(81, u128::from(seed) * 10 + u128::from(origin_seq)),
+            AdminDocumentTarget::User { user_id },
+            &test_actor(seed, user_id, realm_id),
+            origin_seq,
+            AdminDocumentOperation::UserNameSet {
+                name: format!("name-{seed}-{origin_seq}"),
+            },
+        );
+        let origin_signature = signed.then(|| sign_as_origin(&event, &placement));
+        DocumentSyncPublish::AdminOperation {
+            target: DocumentTarget::User { user_id },
+            event: Box::new(event),
+            placement,
+            allow_genesis: true,
+            origin_signature,
+        }
+    };
+
+    // The first event comes from a foreign origin without the signature this node cannot add,
+    // so it retries and holds its shard topic.
+    let documents = vec![
+        admin(4, 1, held_shard, false),
+        admin(2, 1, held_shard, true),
+        admin(2, 2, ready_shard, true),
+        admin(3, 1, other_shard, true),
+    ];
+    match service.publish_documents(documents, Vec::new()).await {
+        DocumentNetEvent::DocumentsPartiallyPublished {
+            published_indices,
+            retry_indices,
+            lineages,
+            ..
+        } => {
+            assert_eq!((published_indices, retry_indices), (vec![3], vec![0, 1, 2]));
+            // Only the published event reports the lineage it was appended on.
+            let reported: Vec<bool> = lineages.iter().map(Option::is_some).collect();
+            assert_eq!(reported, vec![false, false, false, true]);
+        }
+        other => panic!("expected partial publish, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -292,6 +551,17 @@ async fn lost_eviction_replays() {
         "the loser's publish must leave a cursor covering its own chain"
     );
 
+    // The loser's own event reports the lineage it was appended on only while that chain stands.
+    let (_, own_id) = (loser_node.storage().actor_tip(&topic_id, &loser_actor))
+        .expect("own tip reads")
+        .expect("own tip");
+    let own = (loser_node.storage().get_op(&own_id))
+        .expect("own op reads")
+        .expect("own op");
+    let losing_root = crate::shard_manifest::lineage_root(&genesis(loser_node));
+    let appended = loser.appended_lineage(&own).expect("lineage reads");
+    assert_eq!(appended, Some(losing_root));
+
     let winner_ops =
         ::irokle::oplog::topological(winner_node.storage(), &topic_id).expect("winner ops");
     let (_ack, evictions) = loser_node
@@ -308,6 +578,11 @@ async fn lost_eviction_replays() {
     // exactly the state a crash or a failed delete leaves behind.
     loser.decode_eviction(evictions.into_iter().next().expect("one eviction"));
     let winning_genesis = genesis(loser_node);
+    assert_eq!(
+        loser.appended_lineage(&own).expect("lineage reads"),
+        None,
+        "an evicted event must not report the winning lineage"
+    );
     assert!(
         loser
             .storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id),)
@@ -346,6 +621,38 @@ async fn lost_eviction_replays() {
             .is_empty(),
         "an unchanged genesis must keep its cursor instead of reapplying"
     );
+
+    // The loser's own advance runs only now, after the reset and the winner's progress: first
+    // with its old position empty on the winner, then with other ops of the loser in it.
+    let read_cursor =
+        || loser.storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id));
+    let winning = read_cursor().await.expect("cursor read");
+    let own_seq = own.signed.body.actor_seq;
+    for fill in [false, true] {
+        while fill
+            && loser_node
+                .storage()
+                .actor_clock(&topic_id)
+                .unwrap()
+                .get(&loser_actor)
+                < own_seq
+        {
+            loser
+                .publish_raw_event(topic_id, b"not an event".to_vec())
+                .expect("a later op of the loser appends");
+        }
+        let mut delayed = PublishedOps::default();
+        delayed.observe(&own, losing_root);
+        loser
+            .advance_topic_cursors(BTreeMap::from([(topic_id, delayed)]))
+            .await
+            .expect("the delayed advance ends");
+        assert_eq!(
+            read_cursor().await.expect("cursor read"),
+            winning,
+            "a delayed advance of the lost chain must leave the winning cursor alone"
+        );
+    }
 }
 
 /// Opens a document sync service of node `seed` on `doc_dir` with fresh node storage.

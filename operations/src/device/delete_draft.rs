@@ -2,70 +2,59 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
-use aruna_core::operation::Operation;
-use aruna_core::types::{Effects, TxnId};
-use smallvec::smallvec;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::publish_queue::{PublishEntry, PublishState, publish_key, read_publish_entry};
+use super::publish_queue::{PublishEntry, PublishState, publish_key, read_entry};
 
+/// Deletes the queued draft and its fence row in one transaction and outputs the deleted entry.
 #[derive(Debug, PartialEq)]
 pub struct DeleteDraftOperation {
     draft_id: Ulid,
-    state: DeleteDraftState,
-    output: Option<Result<PublishEntry, DeleteDraftError>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum DeleteDraftState {
-    Init,
-    StartTransaction,
-    ReadEntry {
-        txn_id: TxnId,
-    },
-    DeleteEntry {
-        txn_id: TxnId,
-        entry: Box<PublishEntry>,
-    },
-    CommitTransaction {
-        entry: Box<PublishEntry>,
-    },
-    Finish,
-    Error,
+    /// The deleted entry, once the delete is asked for.
+    entry: Option<Box<PublishEntry>>,
 }
 
 #[derive(Debug, Error, PartialEq)]
 pub enum DeleteDraftError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
     #[error("queued draft not found")]
     NotFound,
     #[error("the draft is being published; retry once it settles")]
     PublishInFlight,
-    #[error("deleting the queued draft did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
 }
 
 impl DeleteDraftOperation {
     pub fn new(draft_id: Ulid) -> Self {
         Self {
             draft_id,
-            state: DeleteDraftState::Init,
-            output: None,
+            entry: None,
         }
+    }
+
+    fn delete(&mut self, result: IoResult) -> Result<IoCall, DeleteDraftError> {
+        let [value] = values::<1>(result)?;
+        let bytes = value.ok_or(DeleteDraftError::NotFound)?;
+        let entry = PublishEntry::from_bytes(&bytes)?;
+        // A forward may already have reached a holder, so the outcome
+        // must be recorded before the owner can drop the entry.
+        if matches!(entry.state, PublishState::Publishing { .. }) {
+            return Err(DeleteDraftError::PublishInFlight);
+        }
+        self.entry = Some(Box::new(entry));
+        let key = publish_key(self.draft_id);
+        Ok(IoCall::Delete(vec![
+            (DEVICE_INTAKE_KEYSPACE.to_string(), key.clone()),
+            (DEVICE_FENCE_KEYSPACE.to_string(), key),
+        ]))
     }
 }
 
@@ -73,137 +62,22 @@ impl Operation for DeleteDraftOperation {
     type Output = PublishEntry;
     type Error = DeleteDraftError;
 
-    fn start(&mut self) -> Effects {
-        self.state = DeleteDraftState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn first(&mut self) -> Result<Next<PublishEntry>, DeleteDraftError> {
+        Ok(Next::Call(read_entry(self.draft_id)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, DeleteDraftError::StorageError(error));
-            }
-            other => other,
-        };
-
-        match self.state.clone() {
-            DeleteDraftState::StartTransaction => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return fail(
-                        self,
-                        DeleteDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction started",
-                            got,
-                        },
-                    );
-                };
-                self.state = DeleteDraftState::ReadEntry { txn_id };
-                smallvec![read_publish_entry(self.draft_id, Some(txn_id))]
-            }
-            DeleteDraftState::ReadEntry { txn_id } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return fail(
-                        self,
-                        DeleteDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "read result",
-                            got,
-                        },
-                    );
-                };
-                let Some(bytes) = value else {
-                    return fail(self, DeleteDraftError::NotFound);
-                };
-                let entry = match PublishEntry::from_bytes(&bytes) {
-                    Ok(entry) => entry,
-                    Err(error) => return fail(self, DeleteDraftError::ConversionError(error)),
-                };
-                // A forward may already have reached a holder, so the outcome
-                // must be recorded before the owner can drop the entry.
-                if matches!(entry.state, PublishState::Publishing { .. }) {
-                    return fail(self, DeleteDraftError::PublishInFlight);
-                }
-                self.state = DeleteDraftState::DeleteEntry {
-                    txn_id,
-                    entry: Box::new(entry),
-                };
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: vec![
-                        (
-                            DEVICE_INTAKE_KEYSPACE.to_string(),
-                            publish_key(self.draft_id)
-                        ),
-                        (
-                            DEVICE_FENCE_KEYSPACE.to_string(),
-                            publish_key(self.draft_id)
-                        ),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
-            }
-            DeleteDraftState::DeleteEntry { txn_id, entry } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-                    return fail(
-                        self,
-                        DeleteDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch delete result",
-                            got,
-                        },
-                    );
-                };
-                self.state = DeleteDraftState::CommitTransaction { entry };
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            DeleteDraftState::CommitTransaction { entry } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return fail(
-                        self,
-                        DeleteDraftError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction committed",
-                            got,
-                        },
-                    );
-                };
-                self.state = DeleteDraftState::Finish;
-                self.output = Some(Ok(*entry));
-                smallvec![]
-            }
-            DeleteDraftState::Init | DeleteDraftState::Finish | DeleteDraftState::Error => {
-                smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<PublishEntry>, DeleteDraftError> {
+        match self.entry.take() {
+            None => Ok(Next::Call(self.delete(result)?)),
+            Some(entry) => {
+                result.done()?;
+                Ok(Next::Done(*entry))
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            DeleteDraftState::Finish | DeleteDraftState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(DeleteDraftError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &self.state {
-            DeleteDraftState::ReadEntry { txn_id }
-            | DeleteDraftState::DeleteEntry { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction {
-                    txn_id: *txn_id
-                })]
-            }
-            _ => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -214,22 +88,14 @@ impl Operation for DeleteDraftOperation {
     }
 }
 
-fn fail(operation: &mut DeleteDraftOperation, error: DeleteDraftError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = DeleteDraftState::Error;
-    operation.output = Some(Err(error));
-    cleanup
-}
-
 #[cfg(test)]
 mod tests {
     use super::{DeleteDraftError, DeleteDraftOperation};
     use crate::device::publish_queue::{PublishEntry, PublishState, publish_entry};
-    use crate::driver::{DriverContext, drive};
     use crate::tests::device::context;
-    use aruna_core::UserId;
-    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use ulid::Ulid;
 
     fn entry() -> PublishEntry {
@@ -240,20 +106,37 @@ mod tests {
             "/notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         )
     }
 
     async fn store(context: &DriverContext, entry: &PublishEntry) {
         let (key_space, key, value) = publish_entry(entry).unwrap();
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await;
+        aruna_drivers::testing::write_value(&context.storage_handle, &key_space, key, value).await;
+    }
+
+    // The entry and its fence row are deleted in the transaction; a draft in flight stays.
+    #[test]
+    fn deletes_both_rows() {
+        use super::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE, publish_key};
+        use aruna_core::calls::{IoCall, IoResult, Next};
+        use aruna_core::operation::Operation;
+        let entry = entry();
+        let mut delete = DeleteDraftOperation::new(entry.draft_id);
+        assert_eq!(
+            delete.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
+        delete.first().unwrap();
+        let (_, _, value) = publish_entry(&entry).unwrap();
+        let key = publish_key(entry.draft_id);
+        let rows = IoCall::Delete(vec![
+            (DEVICE_INTAKE_KEYSPACE.to_string(), key.clone()),
+            (DEVICE_FENCE_KEYSPACE.to_string(), key),
+        ]);
+        let read = IoResult::Values(vec![Some(value)]);
+        assert_eq!(delete.next(read), Ok(Next::Call(rows)));
+        assert_eq!(delete.next(IoResult::Done), Ok(Next::Done(entry)));
     }
 
     #[tokio::test]

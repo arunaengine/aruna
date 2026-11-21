@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
+use crate::auth::RealmAuth;
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::driver::DriverContext;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use ulid::Ulid;
 
@@ -29,9 +31,10 @@ async fn setup() -> Fixture {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[31u8; 32])
@@ -74,7 +77,7 @@ async fn setup() -> Fixture {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -114,7 +117,7 @@ async fn stores_and_enforces() {
 
     let (_, Json(stored)) = set_realm_policies(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(body(
             "permission == 'write' && path.contains('/admin/roles')",
         )),
@@ -124,10 +127,9 @@ async fn stores_and_enforces() {
     assert_eq!(stored.policies.len(), 1);
     assert!(!stored.set_hash.is_empty());
 
-    let (_, Json(read)) =
-        get_realm_policies(State(fx.state.clone()), Extension(Some(fx.admin.clone())))
-            .await
-            .unwrap();
+    let (_, Json(read)) = get_realm_policies(State(fx.state.clone()), RealmAuth(fx.admin.clone()))
+        .await
+        .unwrap();
     assert_eq!(read.policies.len(), 1);
 
     let denied = ensure_permission(&fx.state, &fx.admin, denied_path, Permission::WRITE).await;
@@ -142,7 +144,7 @@ async fn stale_hash_conflicts() {
     request.expected_hash = Some("ff".repeat(32));
     let result = set_realm_policies(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(request),
     )
     .await;
@@ -166,7 +168,7 @@ async fn group_authz_boundary() {
 
     let (_, Json(stored)) = set_group_policies(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Path(group.group_id.to_string()),
         Json(body("permission == 'write'")),
     )
@@ -182,7 +184,7 @@ async fn group_authz_boundary() {
     };
     let result = set_group_policies(
         State(fx.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Path(group.group_id.to_string()),
         Json(body("true")),
     )
@@ -195,7 +197,7 @@ async fn validate_reports_unknowns() {
     let fx = setup().await;
     let (_, Json(result)) = validate_policy(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(ValidatePolicyRequest {
             kind: "deny".to_string(),
             when: None,
@@ -226,7 +228,7 @@ async fn validate_needs_admin() {
     };
     let result = validate_policy(
         State(fx.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Json(ValidatePolicyRequest {
             kind: "deny".to_string(),
             when: None,
@@ -243,7 +245,7 @@ async fn traces_candidates() {
     let fx = setup().await;
     let (_, Json(run)) = dry_run_policy(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(DryRunRequest {
             path: "/r/g/x/data/y".to_string(),
             permission: "write".to_string(),
@@ -280,7 +282,7 @@ async fn rejects_oversized_expression() {
     let fx = setup().await;
     let result = dry_run_policy(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(DryRunRequest {
             path: "/r/g/x/data/y".to_string(),
             permission: "write".to_string(),
@@ -313,7 +315,7 @@ async fn deny_covers_routes() {
     let fx = setup().await;
     let (_, Json(_stored)) = set_realm_policies(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(body("permission == 'write'")),
     )
     .await
@@ -356,7 +358,7 @@ async fn deny_covers_routes() {
     // The config route itself must honour the deny, not only the RBAC check.
     let denied = set_realm_policies(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        RealmAuth(fx.admin.clone()),
         Json(body("true")),
     )
     .await;
@@ -375,7 +377,7 @@ async fn requires_admin() {
     };
     let result = set_realm_policies(
         State(fx.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Json(body("true")),
     )
     .await;

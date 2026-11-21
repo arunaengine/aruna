@@ -2,37 +2,44 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::user_origin;
 use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
-use aruna_operations::forward::routing::is_user_origin;
-use aruna_operations::metadata::api::forwarded_bearer;
-use aruna_operations::metadata::audit::{
-    AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest, list_audit as gather_audit,
-};
+use aruna_drivers::driver::drive;
+use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
+use aruna_operations::metadata::audit::{AUDIT_DEADLINE_SECS, ListAuditError, ListAuditRequest};
+use aruna_operations::metadata::audit_entry::AuditListOperation;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "metadata/audit", description = "Audit trail reads"))
-)]
-pub struct AuditApiDoc;
+/// Realm-wide audit reads this node runs at once; one more answers unavailable.
+const AUDIT_OUTBOUND_LIMIT: usize = 16;
+static AUDIT_OUTBOUND_ADMISSION: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(AUDIT_OUTBOUND_LIMIT)));
+
+/// A permit for one realm-wide audit read, or `None` while this node is saturated. The caller
+/// holds it while the read runs.
+pub fn outbound_admission() -> Option<OwnedSemaphorePermit> {
+    AUDIT_OUTBOUND_ADMISSION.clone().try_acquire_owned().ok()
+}
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(AuditApiDoc::openapi()).routes(routes!(list_audit))
+    OpenApiRouter::new().routes(routes!(list_audit))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -174,12 +181,11 @@ forwards the read under the caller's own token and every peer re-checks that sam
 )]
 pub async fn list_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<AuditPageResponse>)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(AUDIT_DEADLINE_SECS);
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&query.group_id)?;
     let document_id = query
         .document_id
@@ -187,13 +193,9 @@ pub async fn list_audit(
         .map(|id| Ulid::from_str(id).map_err(|_| ServerError::BadRequest))
         .transpose()?;
     let ctx = state.get_ctx();
-    let user_origin = tokio::time::timeout_at(
-        deadline,
-        is_user_origin(&ctx, state.get_realm_id(), state.get_node_id()),
-    )
-    .await
-    .map_err(|_| ServerError::ServiceUnavailable)?
-    .map_err(map_api_error)?;
+    let user_origin = tokio::time::timeout_at(deadline, user_origin(&state))
+        .await
+        .map_err(|_| ServerError::ServiceUnavailable)??;
     // A device holds no audit rows of its own, so this read is pure fan-out and
     // every peer re-checks the same group-admin authority on the caller's token.
     if !user_origin {
@@ -222,27 +224,26 @@ pub async fn list_audit(
         forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
             .map_err(map_api_error)?
     };
-    let page = gather_audit(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        forward_token,
-        ListAuditRequest {
-            group_id,
-            document_id,
-            cursor: query.cursor,
-            limit: query.limit,
-            local_authorized: !user_origin,
-        },
-        deadline,
-    )
-    .await
-    .map_err(|error| match error {
-        ListAuditError::Unavailable => ServerError::ServiceUnavailable,
-        ListAuditError::Unauthorized => ServerError::Unauthorized,
-        ListAuditError::InvalidCursor => ServerError::BadRequest,
-        ListAuditError::Storage(message) => ServerError::InternalError(message),
-    })?;
+    let request = ListAuditRequest {
+        group_id,
+        document_id,
+        cursor: query.cursor,
+        limit: query.limit,
+        local_authorized: !user_origin,
+    };
+    let _admission = outbound_admission().ok_or(ServerError::ServiceUnavailable)?;
+    let node = (state.get_realm_id(), state.get_node_id());
+    let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let list = AuditListOperation::new(node, forward_token, request, wait);
+    let page = tokio::time::timeout_at(deadline, drive(list, ctx.as_ref()))
+        .await
+        .map_err(|_| ServerError::ServiceUnavailable)?
+        .map_err(|error| match error {
+            ListAuditError::Unavailable => ServerError::ServiceUnavailable,
+            ListAuditError::Unauthorized => ServerError::Unauthorized,
+            ListAuditError::InvalidCursor => ServerError::BadRequest,
+            ListAuditError::Storage(message) => ServerError::InternalError(message.into()),
+        })?;
 
     Ok((
         StatusCode::OK,
@@ -271,4 +272,19 @@ pub async fn list_audit(
             missing_overflow: page.missing_overflow,
         }),
     ))
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    #[test]
+    fn outbound_saturates() {
+        let permits: Vec<_> = (0..AUDIT_OUTBOUND_LIMIT)
+            .map(|_| outbound_admission().unwrap())
+            .collect();
+        assert!(outbound_admission().is_none());
+        drop(permits);
+        assert!(outbound_admission().is_some());
+    }
 }

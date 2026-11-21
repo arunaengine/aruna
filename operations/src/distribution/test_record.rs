@@ -4,37 +4,41 @@
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::distribution::presets::shard_layout;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, Statement, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use ulid::Ulid;
 
-pub(crate) fn secret(seed: u8) -> iroh::SecretKey {
+pub fn secret(seed: u8) -> iroh::SecretKey {
     iroh::SecretKey::from_bytes(&[seed; 32])
 }
 
-pub(crate) fn realm() -> RealmId {
+pub fn realm() -> RealmId {
     RealmId::from_bytes([9; 32])
 }
 
-pub(crate) fn member(seed: u8) -> Ulid {
+pub fn member(seed: u8) -> Ulid {
     Ulid::from_bytes([seed; 16])
 }
 
 /// Two shards split at "m"; member 1 coordinates the lower one. Both admitted with
 /// incarnation 5; `active` decides whether the set was activated.
-pub(crate) fn record(active: bool) -> (DistributionSnapshot, Vec<u8>) {
+pub fn record(active: bool) -> (DistributionSnapshot, Vec<u8>) {
     replicated(active, 0)
 }
 
 /// The two shards of [`record`], each with `replicas` copies on the other member.
-pub(crate) fn replicated(active: bool, replicas: usize) -> (DistributionSnapshot, Vec<u8>) {
+pub fn replicated(active: bool, replicas: usize) -> (DistributionSnapshot, Vec<u8>) {
     with_settings(active, replicas, DistributionSettings::default())
 }
 
 /// The record of [`replicated`] with its lower shard split at `key` by its coordinator.
-pub(crate) fn split_lower(replicas: usize, key: &str) -> (DistributionSnapshot, Vec<u8>) {
+pub fn split_lower(replicas: usize, key: &str) -> (DistributionSnapshot, Vec<u8>) {
     let (head, _) = replicated(true, replicas);
     let signer = head.member(member(1)).unwrap();
     let lower = &head.config.ranges[0];
@@ -49,7 +53,7 @@ pub(crate) fn split_lower(replicas: usize, key: &str) -> (DistributionSnapshot, 
 }
 
 /// The active record of [`record`] with a search index kept.
-pub(crate) fn searched() -> (DistributionSnapshot, Vec<u8>) {
+pub fn searched() -> (DistributionSnapshot, Vec<u8>) {
     let settings = DistributionSettings {
         search_index: true,
         ..DistributionSettings::default()
@@ -57,7 +61,7 @@ pub(crate) fn searched() -> (DistributionSnapshot, Vec<u8>) {
     with_settings(true, 0, settings)
 }
 
-pub(crate) fn with_settings(
+pub fn with_settings(
     active: bool,
     replicas: usize,
     settings: DistributionSettings,
@@ -100,7 +104,7 @@ pub(crate) fn with_settings(
     (head, view.to_bytes().unwrap())
 }
 
-pub(crate) fn binding(
+pub fn binding(
     snapshot: &DistributionSnapshot,
     seed: u8,
     incarnation: u128,
@@ -113,28 +117,8 @@ pub(crate) fn binding(
     }
 }
 
-/// Stores record bytes as this node's view of their set.
-pub(crate) async fn store_record(
-    handle: &aruna_storage::storage::StorageHandle,
-    set_id: Ulid,
-    bytes: Vec<u8>,
-) {
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    let write = StorageEffect::Write {
-        key_space: aruna_core::keyspaces::DISTRIBUTION_KEYSPACE.to_string(),
-        key: set_id.to_bytes().to_vec().into(),
-        value: bytes.into(),
-        txn_id: None,
-    };
-    assert!(matches!(
-        handle.send_storage_effect(write).await,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
-}
-
 /// The answer to a record and fence read with these values.
-pub(crate) fn authority_rows(
+pub fn authority_rows(
     record: Option<Vec<u8>>,
     fence: Option<Vec<u8>>,
 ) -> aruna_core::events::Event {

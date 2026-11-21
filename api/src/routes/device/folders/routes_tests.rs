@@ -4,22 +4,26 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::OwnerAuth;
+use crate::auth::extract;
 use crate::routes::device::buckets::{CreateBucketRequest, create_device_bucket};
 use crate::routes::device::dto::FolderStateName;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::structs::synced_folder::{EntryState, SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::sync::repository::{action_entry, base_entry, folder_entry};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
 
@@ -63,9 +67,10 @@ async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
     serve(dir, context, capabilities).await
 }
@@ -131,12 +136,12 @@ async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey
     let path = dir.path().to_str().unwrap().to_string();
     let storage = FjallStorage::open(&path).unwrap();
     let net = aruna_net::NetHandle::new(
-        aruna_net::NetConfig {
+        aruna_net::config::NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
             realm_id: realm_id(),
-            discovery_method: aruna_net::DiscoveryMethod::None,
-            relay_method: aruna_net::RelayMethod::None,
-            ..aruna_net::NetConfig::default()
+            discovery_method: aruna_net::config::DiscoveryMethod::None,
+            relay_method: aruna_net::config::RelayMethod::None,
+            ..aruna_net::config::NetConfig::default()
         },
         storage.clone(),
     )
@@ -163,21 +168,17 @@ async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey
         storage_handle: storage,
         net_handle: None,
         blob_handle: Some(blob),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle),
         compute_handle: None,
+        outbound_handle: None,
     };
     let capabilities = NodeCapabilities::user_node(realm_id()).unwrap();
     (serve(dir, context, capabilities).await, fired)
 }
 
 fn owner_auth(fixture: &Fixture) -> AuthContext {
-    AuthContext {
-        user_id: fixture.owner,
-        realm_id: fixture.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(fixture.owner, fixture.realm_id)
 }
 
 fn sample_folder(id: Ulid, fixture: &Fixture, root: &str, state: FolderState) -> SyncedFolder {
@@ -235,38 +236,28 @@ fn sample_action(folder_id: Ulid, actor: UserId) -> SyncActionRecord {
 #[tokio::test]
 async fn owner_boundary() {
     // The device plane exists only on a user node, and only for its owner.
+    // `list_synced_folders` takes `OwnerAuth`, so these refusals are the extractor's.
     let user = setup().await;
-    let anonymous = list_synced_folders(State(user.state.clone()), Extension(None))
-        .await
-        .unwrap_err();
-    assert_eq!(anonymous.status_code(), StatusCode::UNAUTHORIZED);
+    let anonymous = extract::<OwnerAuth>(&user.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 
     let stranger = AuthContext {
         user_id: UserId::local(Ulid::from_bytes([1u8; 16]), user.realm_id),
         ..owner_auth(&user)
     };
-    let foreign = list_synced_folders(State(user.state.clone()), Extension(Some(stranger)))
-        .await
-        .unwrap_err();
-    assert_eq!(foreign.status_code(), StatusCode::FORBIDDEN);
+    let foreign = extract::<OwnerAuth>(&user.state, Some(stranger)).await;
+    assert_eq!(foreign.err(), Some(StatusCode::FORBIDDEN));
 
     let restricted = AuthContext {
         path_restrictions: Some(Vec::new()),
         ..owner_auth(&user)
     };
-    let delegated = list_synced_folders(State(user.state.clone()), Extension(Some(restricted)))
-        .await
-        .unwrap_err();
-    assert_eq!(delegated.status_code(), StatusCode::FORBIDDEN);
+    let delegated = extract::<OwnerAuth>(&user.state, Some(restricted)).await;
+    assert_eq!(delegated.err(), Some(StatusCode::FORBIDDEN));
 
     let mgmt = setup_with(NodeCapabilities::management_node(realm_key()).unwrap()).await;
-    let no_plane = list_synced_folders(
-        State(mgmt.state.clone()),
-        Extension(Some(owner_auth(&mgmt))),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(no_plane.status_code(), StatusCode::NOT_FOUND);
+    let no_plane = extract::<OwnerAuth>(&mgmt.state, Some(owner_auth(&mgmt))).await;
+    assert_eq!(no_plane.err(), Some(StatusCode::NOT_FOUND));
 }
 
 #[tokio::test]
@@ -285,7 +276,7 @@ async fn binds_bad_input() {
     let node = iroh::SecretKey::from_bytes(&[5u8; 32]).public().to_string();
     let bad_group = bind_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Json(request("nope", &node)),
     )
     .await
@@ -295,7 +286,7 @@ async fn binds_bad_input() {
     let group = Ulid::from_bytes([10u8; 16]).to_string();
     let bad_node = bind_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Json(request(&group, "not-a-node")),
     )
     .await
@@ -308,7 +299,7 @@ async fn lists_folders() {
     let fixture = setup().await;
     let Json(empty) = list_synced_folders(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
     )
     .await
     .unwrap();
@@ -322,7 +313,7 @@ async fn lists_folders() {
     .await;
     let Json(listed) = list_synced_folders(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
     )
     .await
     .unwrap();
@@ -335,7 +326,7 @@ async fn reads_folder() {
     let fixture = setup().await;
     let bad = get_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("not-a-ulid".to_string()),
     )
     .await
@@ -344,7 +335,7 @@ async fn reads_folder() {
 
     let missing = get_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(Ulid::from_bytes([21u8; 16]).to_string()),
     )
     .await
@@ -359,7 +350,7 @@ async fn reads_folder() {
     .await;
     let Json(view) = get_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -372,7 +363,7 @@ async fn unbinds_folder() {
     let fixture = setup().await;
     let bad = unbind_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("bad".to_string()),
     )
     .await
@@ -381,7 +372,7 @@ async fn unbinds_folder() {
 
     let missing = unbind_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(Ulid::from_bytes([23u8; 16]).to_string()),
     )
     .await
@@ -396,7 +387,7 @@ async fn unbinds_folder() {
     .await;
     let Json(unbound) = unbind_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -404,7 +395,7 @@ async fn unbinds_folder() {
     assert_eq!(unbound.folder_id, id.to_string());
     let Json(deleting) = get_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -423,7 +414,7 @@ async fn toggles_deletes() {
     .await;
     let Json(updated) = update_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Json(UpdateFolderRequest {
             propagate_deletes: false,
@@ -440,7 +431,7 @@ async fn toggles_deletes() {
     seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
     let refused = update_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(download.to_string()),
         Json(UpdateFolderRequest {
             propagate_deletes: true,
@@ -456,7 +447,7 @@ async fn pause_resume() {
     let fixture = setup().await;
     let bad = pause_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("bad".to_string()),
     )
     .await
@@ -471,7 +462,7 @@ async fn pause_resume() {
     .await;
     let Json(paused) = pause_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -480,7 +471,7 @@ async fn pause_resume() {
 
     let Json(resumed) = resume_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -502,7 +493,7 @@ async fn pause_resume() {
     .await;
     let refused = pause_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(deleting.to_string()),
     )
     .await
@@ -525,7 +516,7 @@ async fn refuses_binding_pause() {
     .await;
     let Json(view) = get_synced_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -536,7 +527,7 @@ async fn refuses_binding_pause() {
             true => {
                 pause_folder(
                     State(fixture.state.clone()),
-                    Extension(Some(owner_auth(&fixture))),
+                    OwnerAuth(owner_auth(&fixture)),
                     Path(id.to_string()),
                 )
                 .await
@@ -544,7 +535,7 @@ async fn refuses_binding_pause() {
             false => {
                 resume_folder(
                     State(fixture.state.clone()),
-                    Extension(Some(owner_auth(&fixture))),
+                    OwnerAuth(owner_auth(&fixture)),
                     Path(id.to_string()),
                 )
                 .await
@@ -559,7 +550,7 @@ async fn sync_needs_active() {
     let fixture = setup().await;
     let bad = sync_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("bad".to_string()),
     )
     .await
@@ -568,7 +559,7 @@ async fn sync_needs_active() {
 
     let missing = sync_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(Ulid::from_bytes([27u8; 16]).to_string()),
     )
     .await
@@ -583,7 +574,7 @@ async fn sync_needs_active() {
     .await;
     let paused = sync_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
@@ -608,16 +599,18 @@ async fn sync_skips_scan() {
 
     let Json(view) = sync_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
     )
     .await
     .unwrap();
     assert_eq!(view.counters.observed, 0);
-    let offers =
-        aruna_operations::staging::offered_directory::list_offers(&fixture.state.get_ctx())
-            .await
-            .unwrap();
+    let offers = aruna_drivers::driver::drive(
+        aruna_operations::staging::offer::list::ListOffersOperation::new(),
+        &fixture.state.get_ctx(),
+    )
+    .await
+    .unwrap();
     assert!(offers.is_empty(), "the request must not walk the folder");
     let woken = tokio::time::timeout(std::time::Duration::from_secs(300), async {
         while let Some(key) = fired.recv().await {
@@ -648,7 +641,7 @@ async fn refuses_missing_root() {
         let root = root.to_string_lossy().to_string();
         let bind = bind_synced_folder(
             State(fixture.state.clone()),
-            Extension(Some(owner_auth(&fixture))),
+            OwnerAuth(owner_auth(&fixture)),
             Json(BindFolderRequest {
                 root: root.clone(),
                 group_id: Ulid::from_bytes([10u8; 16]).to_string(),
@@ -669,7 +662,7 @@ async fn refuses_missing_root() {
         seed_row(&fixture.state, folder_entry(&folder).unwrap()).await;
         let sync = sync_folder(
             State(fixture.state.clone()),
-            Extension(Some(owner_auth(&fixture))),
+            OwnerAuth(owner_auth(&fixture)),
             Path(id.to_string()),
         )
         .await
@@ -689,7 +682,7 @@ async fn bucket_bad_input() {
     let create = |auth: AuthContext, name: &str, group: &str, node: &str| {
         create_device_bucket(
             State(fixture.state.clone()),
-            Extension(Some(auth)),
+            OwnerAuth(auth),
             Json(CreateBucketRequest {
                 name: name.to_string(),
                 group_id: group.to_string(),
@@ -701,10 +694,9 @@ async fn bucket_bad_input() {
         user_id: UserId::local(Ulid::from_bytes([1u8; 16]), fixture.realm_id),
         ..owner_auth(&fixture)
     };
-    let foreign = create(stranger, "lab-data", &group, &outsider)
-        .await
-        .unwrap_err();
-    assert_eq!(foreign.status_code(), StatusCode::FORBIDDEN);
+    // `create_device_bucket` takes `OwnerAuth`, so the refusal is the extractor's.
+    let foreign = extract::<OwnerAuth>(&fixture.state, Some(stranger)).await;
+    assert_eq!(foreign.err(), Some(StatusCode::FORBIDDEN));
 
     for (name, group, node) in [
         ("Lab_Data", group.as_str(), outsider.as_str()),
@@ -737,7 +729,7 @@ async fn list_entries() {
     let fixture = setup().await;
     let bad = list_folder_entries(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("bad".to_string()),
         Query(EntryQuery {
             state: None,
@@ -751,7 +743,7 @@ async fn list_entries() {
     let id = Ulid::from_bytes([29u8; 16]);
     let bad_cursor = list_folder_entries(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Query(EntryQuery {
             state: None,
@@ -769,7 +761,7 @@ async fn list_entries() {
     .await;
     let Json(page) = list_folder_entries(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Query(EntryQuery {
             state: None,
@@ -783,7 +775,7 @@ async fn list_entries() {
 
     let Json(filtered) = list_folder_entries(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Query(EntryQuery {
             state: Some("conflict".to_string()),
@@ -801,7 +793,7 @@ async fn entry_action_guard() {
     let request = |action, expected| EntryActionRequest { action, expected };
     let bad = act_on_entry(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(("bad".to_string(), "notes.txt".to_string())),
         Json(request(EntryAction::Resolve, None)),
     )
@@ -812,7 +804,7 @@ async fn entry_action_guard() {
     let id = Ulid::from_bytes([30u8; 16]);
     let missing = act_on_entry(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path((id.to_string(), "notes.txt".to_string())),
         Json(request(EntryAction::ReplaceLocal, None)),
     )
@@ -827,7 +819,7 @@ async fn entry_action_guard() {
     };
     let bad_hash = act_on_entry(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path((id.to_string(), "notes.txt".to_string())),
         Json(request(EntryAction::ReplaceLocal, Some(expected))),
     )
@@ -846,7 +838,7 @@ async fn folder_action_guard() {
     };
     let bad_id = act_on_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("bad".to_string()),
         Json(request(
             EntryAction::ReplaceLocal,
@@ -861,7 +853,7 @@ async fn folder_action_guard() {
     let id = Ulid::from_bytes([31u8; 16]);
     let wrong_action = act_on_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Json(request(
             EntryAction::KeepLocal,
@@ -875,7 +867,7 @@ async fn folder_action_guard() {
 
     let wrong_scope = act_on_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Json(request(
             EntryAction::ReplaceLocal,
@@ -889,7 +881,7 @@ async fn folder_action_guard() {
 
     let missing = act_on_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Json(request(
             EntryAction::ReplaceLocal,
@@ -914,7 +906,7 @@ async fn folder_action_guard() {
     .await;
     let wrong_confirm = act_on_folder(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Json(request(
             EntryAction::ReplaceLocal,
@@ -932,7 +924,7 @@ async fn list_actions() {
     let fixture = setup().await;
     let bad = list_folder_actions(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path("bad".to_string()),
         Query(ActionQuery { cursor: None }),
     )
@@ -943,7 +935,7 @@ async fn list_actions() {
     let id = Ulid::from_bytes([32u8; 16]);
     let bad_cursor = list_folder_actions(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Query(ActionQuery {
             cursor: Some("!!!".to_string()),
@@ -960,11 +952,41 @@ async fn list_actions() {
     .await;
     let Json(page) = list_folder_actions(
         State(fixture.state.clone()),
-        Extension(Some(owner_auth(&fixture))),
+        OwnerAuth(owner_auth(&fixture)),
         Path(id.to_string()),
         Query(ActionQuery { cursor: None }),
     )
     .await
     .unwrap();
     assert_eq!(page.actions.len(), 1);
+}
+
+// A request with one fault keeps its answer; only a request with two faults now
+// meets the owner check first.
+#[tokio::test]
+async fn owner_keeps_faults() {
+    use crate::tests::routes::send_json;
+    let user = setup().await;
+    let stranger = AuthContext {
+        user_id: UserId::local(Ulid::from_bytes([1u8; 16]), user.realm_id),
+        ..owner_auth(&user)
+    };
+    let post = |body| ("POST", "/device/wipe", body);
+    let valid = r#"{"confirm_node_id":"none"}"#;
+    let cases = [
+        (None, valid, StatusCode::UNAUTHORIZED),
+        (Some(stranger), valid, StatusCode::FORBIDDEN),
+        (Some(owner_auth(&user)), "{", StatusCode::BAD_REQUEST),
+        (None, "{", StatusCode::UNAUTHORIZED),
+    ];
+    for (auth, body, expected) in cases {
+        let route = crate::routes::device::router();
+        let status = send_json(route, user.state.clone(), auth, post(body)).await;
+        assert_eq!(status, expected, "body {body}");
+    }
+    let mgmt = setup_with(NodeCapabilities::management_node(realm_key()).unwrap()).await;
+    let route = crate::routes::device::router();
+    let auth = Some(owner_auth(&mgmt));
+    let status = send_json(route, mgmt.state.clone(), auth, post(valid)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

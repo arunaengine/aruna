@@ -5,22 +5,22 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::NodeId;
+use aruna_core::cursor;
+use aruna_core::cursor::SEARCH_CURSOR_CONTEXT;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataSearchHit;
 use aruna_core::types::GroupId;
-use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::api::ApiQueryMode;
+use super::api::read_types::ApiQueryMode;
 
 pub const SEARCH_PAGE_SIZE: usize = 25;
 pub const SEARCH_MAX_PAGE: usize = 100;
 pub const MAX_PAGINATION_DEPTH: usize = 1000;
 
 const SEARCH_CURSOR_VERSION: u8 = 2;
-const SIGNATURE_CONTEXT: &[u8] = b"aruna.metadata.search.cursor.v2";
 // Cursors are signed, but keep a resume cap to bound fan-out if a trusted signer
 // issues an unexpectedly large continuation.
 const MAX_RESUME_NODES: usize = 64;
@@ -55,8 +55,7 @@ pub(crate) enum CursorEnvelopeError {
 
 impl<P: Serialize> SignedCursor<P> {
     pub(crate) fn encode(&self) -> Result<String, postcard::Error> {
-        let bytes = postcard::to_allocvec(self)?;
-        Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        Ok(cursor::encode(postcard::to_allocvec(self)?))
     }
 
     pub(crate) fn build_signed(
@@ -79,7 +78,8 @@ impl<P: Serialize> SignedCursor<P> {
         })
     }
 
-    fn signing_bytes(&self, context: &[u8]) -> Result<Vec<u8>, postcard::Error> {
+    /// The bytes the signer signs, under the signature context of this cursor kind.
+    pub(crate) fn signing_bytes(&self, context: &[u8]) -> Result<Vec<u8>, postcard::Error> {
         cursor_signing_bytes(
             context,
             self.version,
@@ -88,6 +88,11 @@ impl<P: Serialize> SignedCursor<P> {
             &self.payload,
         )
     }
+}
+
+/// The signature a cursor carries until the node signs its signing bytes.
+pub(crate) fn blank_signature(_: &[u8]) -> iroh::Signature {
+    iroh::Signature::from_bytes(&[0; 64])
 }
 
 impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
@@ -100,11 +105,7 @@ impl<P: Serialize + DeserializeOwned> SignedCursor<P> {
     where
         F: FnOnce(&Self) -> Result<(), CursorEnvelopeError>,
     {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(raw)
-            .map_err(|_| CursorEnvelopeError::Invalid)?;
-        let cursor: Self =
-            postcard::from_bytes(&bytes).map_err(|_| CursorEnvelopeError::Invalid)?;
+        let cursor: Self = cursor::decode_value(raw).map_err(|_| CursorEnvelopeError::Invalid)?;
         check(&cursor)?;
         let signer =
             NodeId::from_bytes(&cursor.signer).map_err(|_| CursorEnvelopeError::Invalid)?;
@@ -174,7 +175,7 @@ impl From<CursorEnvelopeError> for SearchCursorError {
 }
 
 impl SignedCursor<SearchCursorPayload> {
-    pub fn new_signed(
+    pub(crate) fn new_signed(
         fingerprint: [u8; 32],
         watermark: SearchWatermark,
         resume: Vec<(NodeId, u32)>,
@@ -193,7 +194,7 @@ impl SignedCursor<SearchCursorPayload> {
         }
         Self::build_signed(
             SEARCH_CURSOR_VERSION,
-            SIGNATURE_CONTEXT,
+            SEARCH_CURSOR_CONTEXT,
             fingerprint,
             SearchCursorPayload { watermark, resume },
             signer,
@@ -202,7 +203,7 @@ impl SignedCursor<SearchCursorPayload> {
     }
 
     pub fn decode(raw: &str, authorized_signers: &[NodeId]) -> Result<Self, SearchCursorError> {
-        Self::decode_verified(raw, SIGNATURE_CONTEXT, authorized_signers, |cursor| {
+        Self::decode_verified(raw, SEARCH_CURSOR_CONTEXT, authorized_signers, |cursor| {
             if cursor.version != SEARCH_CURSOR_VERSION
                 || cursor.payload.resume.len() > MAX_RESUME_NODES
             {
@@ -214,7 +215,7 @@ impl SignedCursor<SearchCursorPayload> {
         .map_err(SearchCursorError::from)
     }
 
-    pub fn resume_positions(&self) -> HashMap<NodeId, u32> {
+    pub(crate) fn resume_positions(&self) -> HashMap<NodeId, u32> {
         self.payload
             .resume
             .iter()
@@ -229,7 +230,7 @@ impl SignedCursor<SearchCursorPayload> {
 
 /// Binds a cursor to the query that produced it. Recomputed on every continuation
 /// request; a mismatch rejects the cursor. The query string itself is not stored.
-pub fn query_fingerprint(
+pub(crate) fn query_fingerprint(
     query: &str,
     graph_iris: Option<&[String]>,
     mode: Option<ApiQueryMode>,
@@ -301,7 +302,7 @@ pub struct SearchPage {
 /// Deduplicate hits on `(graph_iri, subject_iri)`, keeping the highest score
 /// (smallest `document_id` on ties) and any title, snippet or subject types;
 /// final order is craqle's: score descending, then a hash of graph and subject.
-pub fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
+pub(crate) fn merge_search_hits(hits: Vec<MetadataSearchHit>) -> Vec<MetadataSearchHit> {
     let mut deduped: HashMap<(String, String), MetadataSearchHit> = HashMap::new();
     for hit in hits {
         let key = (hit.graph_iri.clone(), hit.subject_iri.clone());
@@ -463,7 +464,7 @@ pub fn paginate(
 
 /// Per-node fetch depth: resume position plus one page, defaulting unknown nodes to
 /// the deepest known resume so a newly seen node is not asked too shallow.
-pub fn resume_fetch_limit(
+pub(crate) fn resume_fetch_limit(
     resume: &HashMap<NodeId, u32>,
     node_id: NodeId,
     page_size: usize,
@@ -638,7 +639,7 @@ mod pure_tests {
             resume,
         };
         let signing_bytes = cursor_signing_bytes(
-            SIGNATURE_CONTEXT,
+            SEARCH_CURSOR_CONTEXT,
             SEARCH_CURSOR_VERSION,
             *secret.public().as_bytes(),
             [0u8; 32],

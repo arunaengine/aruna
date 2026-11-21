@@ -4,47 +4,52 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::super::encryption::{
-    EncryptionStatus, RecoveryView, UnlockView, blob_refusal, bucket_group, change_bucket,
-    current_status, holder_report, is_holder, key_refusal, not_encrypted, read_snapshot, refused,
-    settings_refusal, unlock_view,
+    EncryptionStatus, RecoveryView, UnlockView, blob_refusal, change_bucket, current_status,
+    holder_report, is_holder, key_refusal, not_encrypted, read_snapshot, refused, settings_refusal,
+    unlock_view,
 };
 use super::super::routing::ensure_group_admin;
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::compute::{SecretBytes, SharedSecret};
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, HolderOrigin, UnlockStatus};
 use aruna_core::structs::storage::holders::{
     HolderEntry, HolderState, KeyLookup, holder_revision, revision_with_facts,
 };
 use aruna_core::types::GroupId;
-use aruna_operations::driver::{drive, now_ms};
-use aruna_operations::s3::bucket::holders::lookup_keys;
-use aruna_operations::s3::bucket::key_extend::{ExtendBucketOperation, ExtendError, ExtendInput};
-use aruna_operations::s3::bucket::key_grant::{GrantError, GrantHolderOperation, GrantInput};
-use aruna_operations::s3::bucket::key_lock::{LockBucketOperation, LockError, LockInput};
-use aruna_operations::s3::bucket::key_removal::{
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
+use aruna_operations::s3::bucket::holders::LookupKeysOperation;
+use aruna_operations::s3::bucket::key::extend::{ExtendBucketOperation, ExtendError, ExtendInput};
+use aruna_operations::s3::bucket::key::grant::{GrantError, GrantHolderOperation, GrantInput};
+use aruna_operations::s3::bucket::key::lock::{LockBucketOperation, LockError, LockInput};
+use aruna_operations::s3::bucket::key::removal::{
     RemovalError, RemovalInput, RemoveHolderOperation,
 };
-use aruna_operations::s3::bucket::key_unlock::{
-    UnlockBucketOperation, UnlockError, UnlockInput, unlock_and_wake,
-};
+use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockError, UnlockInput};
 use aruna_operations::s3::bucket::rotate::KeyChange;
 use aruna_operations::s3::bucket::seal_missing::{SealMissingInput, SealMissingOperation};
-use aruna_operations::s3::key_status::{AuditPageOperation, KeySnapshot};
+use aruna_operations::transfer::key_status::{AuditPageOperation, KeySnapshot};
+use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -53,12 +58,8 @@ const KEY_BYTES: usize = 32;
 const AUDIT_PAGE: usize = 50;
 const AUDIT_MAX: usize = 500;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BucketKeysDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BucketKeysDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(unlock_bucket))
         .routes(routes!(extend_unlock))
         .routes(routes!(lock_bucket))
@@ -236,7 +237,7 @@ async fn holder_snapshot(
     auth: &AuthContext,
     bucket: &str,
 ) -> ServerResult<KeySnapshot> {
-    let group_id = bucket_group(state, bucket).await?;
+    let group_id = bucket_info(state, bucket).await?.group_id;
     let snapshot = read_snapshot(state, bucket, group_id).await?;
     if !is_holder(&snapshot, auth.user_id) {
         return Err(forbidden_holder());
@@ -257,7 +258,7 @@ fn unlock_key(body: Bytes) -> ServerResult<SharedSecret> {
 }
 
 fn status_view(status: &UnlockStatus) -> UnlockView {
-    unlock_view(Some(status), now_ms())
+    unlock_view(Some(status), unix_timestamp_millis())
 }
 
 #[utoipa::path(
@@ -283,7 +284,6 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
     responses(
         (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`wrong_key` or `invalid_duration`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`stale_generation`, `not_encrypted`, or `no_copy` when the caller has no sealed copy of the generation", body = ErrorResponse),
@@ -293,15 +293,14 @@ fn status_view(status: &UnlockStatus) -> UnlockView {
 )]
 pub async fn unlock_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<UnlockQuery>,
     body: Bytes,
 ) -> ServerResult<Json<UnlockView>> {
     let private_key = unlock_key(body)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let bucket_id = parse_ulid(&query.bucket_id, "bucket_id")?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let input = UnlockInput {
         bucket: bucket.clone(),
         group_id,
@@ -310,12 +309,12 @@ pub async fn unlock_bucket(
         caller: auth.user_id,
         key: BucketKeyRef::new(bucket_id, query.generation),
         duration: query.duration_ms.map(Duration::from_millis),
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let operation = UnlockBucketOperation::new(input, private_key);
     let origin = (state.get_realm_id(), state.get_node_id());
     let context = state.get_ctx();
-    let status = unlock_and_wake(&context, operation, origin, state.rocrate_limits())
+    let status = activate_and_wake(&context, operation, origin, state.rocrate_limits())
         .await
         .map_err(|error| match error {
             UnlockError::Settings(error) => settings_refusal(error),
@@ -327,11 +326,12 @@ pub async fn unlock_bucket(
                 "no_copy",
                 "the caller has no sealed copy of this key generation",
             ),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     seal_missing(&state, &bucket, group_id, status.key).await;
     // An unlocked node is an issuer: a due raise happens now and its requests are issued.
-    if let Err(error) = crate::routes::storage::abe::epoch_run(&state, &auth, &bucket, false).await
+    if let Err(error) =
+        crate::routes::storage::abe::records::epoch_run(&state, &auth, &bucket, false).await
     {
         tracing::warn!(event = "abe.epoch_raise.failed", error = %error);
     }
@@ -355,13 +355,13 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let input = SealMissingInput {
         bucket: bucket.to_string(),
         group_id,
@@ -395,7 +395,6 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
     responses(
         (status = 200, description = "The unlock state", body = UnlockView, example = json!({ "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": 1790003600000_u64, "max_deadline_ms": 1790007200000_u64 })),
         (status = 400, description = "`invalid_duration` or an invalid session id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`session_mismatch`, `bucket_locked` or `not_encrypted`", body = ErrorResponse)
@@ -404,13 +403,12 @@ async fn seal_missing(state: &ServerState, bucket: &str, group_id: GroupId, key:
 )]
 pub async fn extend_unlock(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<ExtendRequest>,
 ) -> ServerResult<Json<UnlockView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let session_id = parse_ulid(&request.session_id, "session_id")?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let input = ExtendInput {
         bucket,
         group_id,
@@ -420,7 +418,7 @@ pub async fn extend_unlock(
         generation: request.generation,
         session_id,
         duration: request.duration_ms.map(Duration::from_millis),
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let status = drive(ExtendBucketOperation::new(input), &state.get_ctx())
         .await
@@ -429,7 +427,7 @@ pub async fn extend_unlock(
             ExtendError::Blob(error) => blob_refusal(error),
             ExtendError::NotEncrypted => not_encrypted(),
             ExtendError::NotHolder => forbidden_holder(),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(status_view(&status)))
 }
@@ -449,7 +447,6 @@ pub async fn extend_unlock(
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (status = 200, description = "The locked state of the active generation", body = UnlockView, example = json!({ "state": "locked", "lock_reason": "manual", "locked_at_ms": 1790000000000_u64, "session_id": null, "unlocked_at_ms": null, "deadline_ms": null, "max_deadline_ms": null })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`not_encrypted`", body = ErrorResponse)
@@ -458,12 +455,11 @@ pub async fn extend_unlock(
 )]
 pub async fn lock_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<UnlockView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
-    let now_ms = now_ms();
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
+    let now_ms = unix_timestamp_millis();
     let input = LockInput {
         bucket,
         group_id,
@@ -480,7 +476,7 @@ pub async fn lock_bucket(
             LockError::Blob(error) => blob_refusal(error),
             LockError::NotEncrypted => not_encrypted(),
             LockError::NotHolder => forbidden_holder(),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let mut view = unlock_view(None, now_ms);
     if !result.locked.is_empty() {
@@ -506,7 +502,6 @@ pub async fn lock_bucket(
     params(("bucket" = String, Path, description = "Bucket name as used on the S3 surface, without a leading slash")),
     responses(
         (status = 200, description = "The holders", body = HoldersResponse, example = json!({ "holders": [{ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "name": null, "origin": "explicit", "state": "ready", "has_recovery": true, "granted_by": "01JAMXS1P3T9V6Q8W2Y4Z7B5CE@realm", "granted_at_ms": 1790000000000_u64 }], "complete": true, "unresolved": 0, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "revision": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`not_encrypted`", body = ErrorResponse)
@@ -515,10 +510,9 @@ pub async fn lock_bucket(
 )]
 pub async fn list_holders(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<HoldersResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
     let report = holder_report(&state, &snapshot)
         .await
@@ -557,7 +551,6 @@ group's admin path.
     responses(
         (status = 200, description = "The new holder", body = HolderView, example = json!({ "user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "name": null, "origin": "explicit", "state": "ready", "has_recovery": true, "granted_by": "01JAMXS1P3T9V6Q8W2Y4Z7B5CE@realm", "granted_at_ms": 1790000000000_u64 })),
         (status = 400, description = "Invalid user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`not_encrypted`", body = ErrorResponse)
@@ -566,25 +559,24 @@ group's admin path.
 )]
 pub async fn grant_holder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<GrantRequest>,
 ) -> ServerResult<Json<HolderView>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let user_id = parse_user(&request.user_id)?;
     // Anonymous identities of any realm never hold a key.
     if user_id.is_nil() {
         return Err(ServerError::BadRequestReason("invalid user".into()));
     }
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
-    let mut lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let mut lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), [user_id]),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        [user_id],
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let lookup = lookups.remove(&user_id).unwrap_or(KeyLookup::Unavailable);
     let has_recovery = match &lookup {
         KeyLookup::Keys(keys) => Some(keys.iter().any(|key| key.has_recovery)),
@@ -599,7 +591,7 @@ pub async fn grant_holder(
         user_id,
         granted_by: auth.user_id,
         lookup,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let result = drive(GrantHolderOperation::new(input), &state.get_ctx())
         .await
@@ -608,7 +600,7 @@ pub async fn grant_holder(
             GrantError::Blob(error) => blob_refusal(error),
             GrantError::NotEncrypted => not_encrypted(),
             GrantError::NotAdmin => ServerError::Forbidden,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let grant = result.grant;
     Ok(Json(HolderView {
@@ -645,7 +637,6 @@ group's admin path.
     responses(
         (status = 204, description = "The grant was removed"),
         (status = 400, description = "Invalid user id or revision", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket or explicit grant not found", body = ErrorResponse),
         (status = 409, description = "`stale_holders`, `recovery_confirmation_required` or `not_encrypted`", body = ErrorResponse)
@@ -654,17 +645,16 @@ group's admin path.
 )]
 pub async fn remove_holder(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((bucket, user)): Path<(String, String)>,
     Query(query): Query<RemovalQuery>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let user_id = parse_user(&user)?;
     let revision: [u8; 32] = hex::decode(&query.revision)
         .ok()
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| ServerError::BadRequestReason("invalid revision".into()))?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let creator = snapshot.info.as_ref().map(|info| info.created_by);
@@ -673,13 +663,13 @@ pub async fn remove_holder(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let input = RemovalInput {
         bucket,
         group_id,
@@ -690,7 +680,7 @@ pub async fn remove_holder(
         revision,
         confirm_recovery: query.confirm_recovery,
         lookups,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     drive(RemoveHolderOperation::new(input), &state.get_ctx())
         .await
@@ -709,7 +699,7 @@ pub async fn remove_holder(
                 "recovery_confirmation_required",
                 "removing this holder breaks the recovery rule",
             ),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -733,7 +723,6 @@ pub async fn remove_holder(
     ),
     responses(
         (status = 200, description = "The caller's copies", body = CopiesResponse, example = json!({ "copies": [{ "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "generation": 1, "key_record": "01JAMXT2V4W6X8Y0Z2A4B6C8DE", "key_id": "laptop", "enc": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "ciphertext": "c2VhbGVkIGtleSBieXRlcw==", "created_at_ms": 1790000000000_u64 }] })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller holds no key of this bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -741,11 +730,10 @@ pub async fn remove_holder(
 )]
 pub async fn my_copies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<CopiesQuery>,
 ) -> ServerResult<Json<CopiesResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let snapshot = holder_snapshot(&state, &auth, &bucket).await?;
     let copies = snapshot
         .copies
@@ -781,7 +769,6 @@ group's admin path.
     request_body(content = RotateRequest, example = json!({ "expected_generation": 1 })),
     responses(
         (status = 200, description = "The status after the rotation started", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "abe": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`stale_generation`, `bucket_locked`, `open_uploads`, `recovery_unmet` or `transition_running`", body = ErrorResponse)
@@ -790,12 +777,11 @@ group's admin path.
 )]
 pub async fn rotate_key(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RotateRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let change = KeyChange::Rotate;
@@ -826,7 +812,6 @@ pub async fn rotate_key(
     responses(
         (status = 200, description = "One page of events", body = AuditResponse, example = json!({ "events": [{ "event_id": "01JAMXV3W5X7Y9Z1A3B5C7D9EF", "at_ms": 1790000000000_u64, "action": "unlock", "actor_user_id": "01JAMXS1P3T9V6Q8W2Y4Z7B5CD@realm", "node_id": "b7c8d9e0f1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c", "generation": 1, "deadline_ms": 1790003600000_u64, "reason": null, "outcome": "applied" }], "next_cursor": "01JAMXV3W5X7Y9Z1A3B5C7D9EF" })),
         (status = 400, description = "Invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Neither a key holder nor a group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -834,11 +819,10 @@ pub async fn rotate_key(
 )]
 pub async fn bucket_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<Json<AuditResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let cursor = query
         .cursor
         .as_deref()
@@ -855,7 +839,7 @@ pub async fn bucket_audit(
     let operation = AuditPageOperation::new(bucket_id, cursor, limit);
     let (events, next) = drive(operation, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let events = events
         .into_iter()
         .map(|event| AuditEventView {
@@ -874,6 +858,31 @@ pub async fn bucket_audit(
         events,
         next_cursor: next.map(|next| next.to_string()),
     }))
+}
+
+/// Runs `operation`, an install or an unlock, then resumes the work that waited for its key; a
+/// failed resume is only reported, since the key is usable either way.
+pub(crate) async fn activate_and_wake<O>(
+    context: &DriverContext,
+    operation: O,
+    origin: (RealmId, NodeId),
+    limits: &RoCrateLimits,
+) -> Result<UnlockStatus, O::Error>
+where
+    O: Operation<Output = UnlockStatus>,
+{
+    let status = drive(operation, context).await?;
+    let now_ms = unix_timestamp_millis();
+    let wake = WakeUnlockedOperation::new(status.key, now_ms, origin, limits);
+    if let Err(error) = drive(wake, context).await {
+        tracing::warn!(
+            bucket_id = %status.key.bucket_id,
+            generation = status.key.generation,
+            error = %error,
+            "Failed to resume work waiting for an activated key"
+        );
+    }
+    Ok(status)
 }
 
 #[cfg(test)]

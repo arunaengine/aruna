@@ -1,0 +1,250 @@
+//! Tests bearer token validation for signatures, expiry, revocation, realms and delegation.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_clock::unix_timestamp_secs;
+use aruna_core::auth::bearer_token_hash;
+use aruna_core::calls::Next;
+use aruna_core::keys::generate_signing_key;
+use aruna_core::operation::Operation;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::auth::TokenClaims;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
+use aruna_operations::auth::bearer_token::{
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
+};
+use aruna_operations::auth::error::ArunaBearerError;
+use aruna_test_support::tokens::sign_token;
+use base64::Engine;
+use ed25519_dalek::{Signer, SigningKey};
+use jsonwebtoken::errors::ErrorKind;
+use std::collections::HashSet;
+use ulid::Ulid;
+
+struct TestAuthState {
+    /// One clock reading per state: claim validation and the token the test
+    /// signs are judged against the same instant.
+    now: u64,
+    revoked_hashes: HashSet<String>,
+    trusted_realms: HashSet<RealmId>,
+}
+
+impl Default for TestAuthState {
+    fn default() -> Self {
+        Self {
+            now: unix_timestamp_secs(),
+            revoked_hashes: HashSet::new(),
+            trusted_realms: HashSet::new(),
+        }
+    }
+}
+
+impl TestAuthState {
+    /// Verifies `token` against this state; a listed revocation needs no storage.
+    fn validate(&self, token: &str) -> Result<AuthContext, ArunaBearerError> {
+        let checks = TokenChecks {
+            trust: IssuerTrust::Listed(self.trusted_realms.clone()),
+            revocation: RevocationCheck::Listed(self.revoked_hashes.iter().cloned().collect()),
+            linked_realm: None,
+            keys: IssuerKeys::Uncached,
+        };
+        let mut decode = DecodeTokenOperation::new(token, checks);
+        decode.stamp(self.now * 1000);
+        match decode.first()? {
+            Next::Done(claims) => claims_auth(claims),
+            _ => Err(ArunaBearerError::RevocationUnavailable),
+        }
+    }
+}
+
+#[test]
+fn validates_management_token() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let claims = token_claims(realm_id, user_id);
+    let token = sign_token(&realm_signing_key, &claims);
+    let state = trusted_state(realm_id);
+
+    let auth = state.validate(&token).unwrap();
+
+    assert_eq!(auth.user_id, user_id);
+    assert_eq!(auth.realm_id, realm_id);
+}
+
+#[test]
+fn rejects_revoked_token() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let claims = token_claims(realm_id, user_id);
+    let token = sign_token(&realm_signing_key, &claims);
+    let mut state = trusted_state(realm_id);
+    state.revoked_hashes.insert(bearer_token_hash(&token));
+
+    let error = state.validate(&token).unwrap_err();
+
+    assert!(matches!(error, ArunaBearerError::TokenRevoked));
+}
+
+#[test]
+fn rejects_bad_signature() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let claims = token_claims(realm_id, user_id);
+    let token = sign_token(&realm_signing_key, &claims);
+    let mut invalid = token.clone();
+    let signature = invalid.rfind('.').unwrap() + 1;
+    let replacement = if invalid.as_bytes()[signature] == b'A' {
+        "B"
+    } else {
+        "A"
+    };
+    invalid.replace_range(signature..signature + 1, replacement);
+    let state = trusted_state(realm_id);
+
+    let error = state.validate(&invalid).unwrap_err();
+
+    assert!(matches!(error, ArunaBearerError::JwtError(_)));
+}
+
+#[test]
+fn rejects_expired_token() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let state = trusted_state(realm_id);
+    let mut claims = token_claims(realm_id, user_id);
+    claims.iat = state.now.saturating_sub(7200);
+    claims.exp = state.now.saturating_sub(3600);
+    let token = sign_token(&realm_signing_key, &claims);
+
+    let error = state.validate(&token).unwrap_err();
+
+    match error {
+        ArunaBearerError::Expired => {}
+        ArunaBearerError::JwtError(error) => {
+            assert!(matches!(error.kind(), ErrorKind::ExpiredSignature));
+        }
+        other => panic!("unexpected expired token error: {other:?}"),
+    }
+}
+
+#[test]
+fn rejects_untrusted_realm() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let claims = token_claims(realm_id, user_id);
+    let token = sign_token(&realm_signing_key, &claims);
+    let state = TestAuthState::default();
+
+    let error = state.validate(&token).unwrap_err();
+
+    assert!(matches!(error, ArunaBearerError::RealmNotTrusted));
+}
+
+#[test]
+fn validates_delegation_signature() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let issuer_signing_key = signing_key();
+    let issuer_pubkey = public_key_base64(&issuer_signing_key);
+    let mut claims = token_claims(realm_id, user_id);
+    claims.issuer_pubkey = Some(issuer_pubkey.clone());
+    claims.delegation_signature =
+        Some(realm_signing_key.sign(issuer_pubkey.as_bytes()).to_string());
+    let token = sign_token(&issuer_signing_key, &claims);
+    let state = trusted_state(realm_id);
+
+    let auth = state.validate(&token).unwrap();
+
+    assert_eq!(auth.user_id, user_id);
+    assert_eq!(auth.realm_id, realm_id);
+}
+
+#[test]
+fn rejects_invalid_delegation() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let issuer_signing_key = signing_key();
+    let issuer_pubkey = public_key_base64(&issuer_signing_key);
+    let other_issuer_pubkey = public_key_base64(&signing_key());
+    let mut claims = token_claims(realm_id, user_id);
+    claims.issuer_pubkey = Some(issuer_pubkey);
+    claims.delegation_signature = Some(
+        realm_signing_key
+            .sign(other_issuer_pubkey.as_bytes())
+            .to_string(),
+    );
+    let token = sign_token(&issuer_signing_key, &claims);
+    let state = trusted_state(realm_id);
+
+    let error = state.validate(&token).unwrap_err();
+
+    assert!(matches!(error, ArunaBearerError::PublicKeyError(_)));
+}
+
+#[test]
+fn rejects_mixed_delegation() {
+    let (realm_signing_key, realm_id, user_id) = realm_fixture();
+    let issuer_pubkey = public_key_base64(&signing_key());
+    let state = trusted_state(realm_id);
+
+    let mut issuer_only = token_claims(realm_id, user_id);
+    issuer_only.issuer_pubkey = Some(issuer_pubkey.clone());
+    let token = sign_token(&realm_signing_key, &issuer_only);
+    let error = state.validate(&token).unwrap_err();
+    assert!(matches!(error, ArunaBearerError::InvalidServerToken));
+
+    let mut delegation_only = token_claims(realm_id, user_id);
+    delegation_only.delegation_signature =
+        Some(realm_signing_key.sign(issuer_pubkey.as_bytes()).to_string());
+    let token = sign_token(&realm_signing_key, &delegation_only);
+    let error = state.validate(&token).unwrap_err();
+    assert!(matches!(error, ArunaBearerError::InvalidServerToken));
+}
+
+#[test]
+fn rejects_context_conversion() {
+    let (realm_signing_key, realm_id, _) = realm_fixture();
+    let (_, other_realm_id, other_user_id) = realm_fixture();
+    let claims = token_claims(realm_id, other_user_id);
+    assert_ne!(realm_id, other_realm_id);
+    let token = sign_token(&realm_signing_key, &claims);
+    let state = trusted_state(realm_id);
+
+    let error = state.validate(&token).unwrap_err();
+
+    assert!(matches!(error, ArunaBearerError::AuthContextConversion(_)));
+}
+
+fn realm_fixture() -> (SigningKey, RealmId, UserId) {
+    let signing_key = signing_key();
+    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+    let user_id = UserId::local(Ulid::generate(), realm_id);
+    (signing_key, realm_id, user_id)
+}
+
+fn signing_key() -> SigningKey {
+    generate_signing_key()
+}
+
+fn trusted_state(realm_id: RealmId) -> TestAuthState {
+    let mut state = TestAuthState::default();
+    state.trusted_realms.insert(realm_id);
+    state
+}
+
+fn token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
+    let now = unix_timestamp_secs();
+    TokenClaims {
+        sub: user_id.to_string(),
+        iss: realm_id.to_string(),
+        iat: now,
+        exp: now + 600,
+        jti: Ulid::generate().to_string(),
+        sid: None,
+        session_kind: None,
+        restrictions: None,
+        issuer_pubkey: None,
+        delegation_signature: None,
+        name: None,
+        via: None,
+        auth_time: None,
+    }
+}
+
+fn public_key_base64(signing_key: &SigningKey) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes())
+}

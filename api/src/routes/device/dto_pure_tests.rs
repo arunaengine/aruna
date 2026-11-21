@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::RemoteBinding;
+use aruna_core::structs::synced_folder::RemoteBinding;
 use ulid::Ulid;
 
 fn base_with(entry: EntryState) -> SyncBase {
@@ -88,7 +88,7 @@ fn folder_error_message() {
         state: FolderState::Error {
             reason: "watcher stopped".to_string(),
         },
-        created_by: aruna_core::UserId::local(
+        created_by: aruna_core::user::id::UserId::local(
             Ulid::from_bytes([5u8; 16]),
             aruna_core::structs::identity::realm::RealmId::from_bytes([5u8; 32]),
         ),
@@ -126,7 +126,7 @@ fn failed_action_reason() {
         scope: ActionScope::Entry {
             relative: "notes.txt".to_string(),
         },
-        actor: aruna_core::UserId::local(
+        actor: aruna_core::user::id::UserId::local(
             Ulid::from_bytes([8u8; 16]),
             aruna_core::structs::identity::realm::RealmId::from_bytes([5u8; 32]),
         ),
@@ -272,7 +272,7 @@ fn projects_deleting_folder() {
         mode: FolderMode::TwoWay,
         propagate_deletes: false,
         state: FolderState::Deleting,
-        created_by: aruna_core::UserId::local(
+        created_by: aruna_core::user::id::UserId::local(
             Ulid::from_bytes([11u8; 16]),
             aruna_core::structs::identity::realm::RealmId::from_bytes([5u8; 32]),
         ),

@@ -12,15 +12,19 @@ rust-version.workspace = true
 # Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
 autotests = false
 
+[features]
+# Exposes the shared metadata test fixtures to the node crate's route tests.
+test-hooks = ["aruna-operations/test-hooks", "aruna-drivers/test-hooks", "dep:aruna-test-support"]
+
 [dependencies]
 zeroize = { workspace = true }
 # Aruna modules
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
-aruna-blob = { workspace = true }
-aruna-compute = { workspace = true, default-features = false }
 aruna-operations = { workspace = true }
-aruna-plugins = { workspace = true }
-aruna-tasks = { workspace = true }
+aruna-drivers = { workspace = true }
+aruna-wire = { workspace = true }
+aruna-test-support = { workspace = true, optional = true }
 
 # General
 ahash = { workspace = true }
@@ -82,9 +86,18 @@ hyper-util = { workspace = true }
 s3s = { workspace = true }
 
 [dev-dependencies]
-aruna-net = { workspace = true }
+aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-test-support = { workspace = true }
+aruna-graph = { workspace = true }
+aruna-operations = { workspace = true, features = ["test-hooks"] }
+aruna-drivers = { workspace = true, features = ["test-hooks"] }
+aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["test-util"] }
+aruna-net = { workspace = true, features = ["test-hooks"] }
 tracing-subscriber = { workspace = true }
-aruna-storage = { workspace = true }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+aruna-tasks = { workspace = true }
 rmcp = { workspace = true, features = [
     "client",
     "transport-streamable-http-client-reqwest",

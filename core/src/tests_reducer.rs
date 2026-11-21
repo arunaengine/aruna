@@ -6,13 +6,14 @@ use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     AdminRoleDefinition,
 };
+use crate::id::NodeId;
 use crate::reducer::*;
 use crate::structs::identity::auth::{Actor, Permission};
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, OidcProviderConfig, RealmDiscoveryConfig, RealmId, RealmNodeKind,
 };
 use crate::types::{GroupId, RoleId};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use std::collections::BTreeMap;
 use ulid::Ulid;
 
@@ -48,14 +49,7 @@ pub(crate) fn role_definition(role_id: RoleId, name: &str) -> AdminRoleDefinitio
 }
 
 pub(crate) fn oidc_provider(id: &str, issuer_suffix: &str) -> OidcProviderConfig {
-    OidcProviderConfig {
-        id: id.to_string(),
-        issuer: format!("https://issuer.example/{issuer_suffix}"),
-        audience: "aruna".to_string(),
-        discovery_url: format!(
-            "https://issuer.example/{issuer_suffix}/.well-known/openid-configuration"
-        ),
-    }
+    crate::testing::oidc_provider(id, issuer_suffix)
 }
 
 pub(crate) fn user_id_seed(seed: u8) -> UserId {

@@ -130,7 +130,7 @@ pub async fn request_tracing_middleware(
     let status_code = response.status().as_u16();
     emit_request_completed(&span, "http", status_code, started);
     let route_key = format!("{method} {route}");
-    HTTP_LATENCY.record(&route_key, elapsed);
+    HTTP_LATENCY.record(&route_key, elapsed, Instant::now());
     let metrics = state.metrics();
     metrics
         .http_requests
@@ -353,7 +353,7 @@ mod tests {
             realm_id,
             issuer: issuer.public(),
             target: iroh::SecretKey::from_bytes(&[3; 32]).public(),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
             grant: TokenGrant {
                 token_hash: marker.to_string(),
                 issuer: realm_id,

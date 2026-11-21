@@ -4,331 +4,402 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
-use aruna_core::effects::IterStart;
-use aruna_core::effects::StorageEffect;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{NOTIFICATION_CUTOFF_KEYSPACE, NOTIFICATION_INBOX_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{inbox_delete_entries, inbox_write_entries};
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
+    InboxWriteOutcome, NotificationClass, NotificationKind, NotificationRecord, TRANSIENT_USER_CAP,
     notification_cutoff_key, notification_inbox_key, notification_inbox_prefix,
 };
-use aruna_core::types::{Key, KeySpace, TxnId, Value};
-use aruna_storage::StorageHandle;
+use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
+use thiserror::Error;
 
-#[derive(Debug)]
-pub(crate) enum UpsertFailure {
+use crate::notifications::unexpected;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum InboxError {
+    #[error("notification inbox upsert conflicted")]
     Conflict,
-    Fatal(String),
+    #[error(transparent)]
+    Storage(StorageError),
+    #[error("stored notification record: {0}")]
+    Decode(String),
+    #[error("notification record could not be encoded: {0}")]
+    Encode(String),
+    #[error("notification transient count for recipient {0} exceeds cap {TRANSIENT_USER_CAP}")]
+    TransientCap(UserId),
+    #[error(transparent)]
+    Io(IoError),
 }
 
-/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
-/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
-/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct InboxWriteOutcome {
-    pub written: usize,
-    pub recipients: Vec<UserId>,
-    pub purged: usize,
-    pub cutoffs: usize,
-    /// Batch records the inbox holds after the write, new or already present, never discarded.
-    pub held: Vec<NotificationRecord>,
-}
-
-/// Idempotent holder-local upsert: existing primary keys are skipped inside the
-/// write transaction, so a duplicate never clobbers a concurrent mark-read's
-/// `read_at_ms`. Returns the number of newly written records.
-pub async fn upsert_inbox_records(
-    storage: &StorageHandle,
-    records: &[NotificationRecord],
-) -> Result<usize, String> {
-    upsert_with_report(storage, records)
-        .await
-        .map(|outcome| outcome.written)
-}
-
-/// Like [`upsert_inbox_records`] but reports the distinct recipients actually
-/// written so a caller with net access can wake their live streams.
-pub async fn upsert_with_report(
-    storage: &StorageHandle,
-    records: &[NotificationRecord],
-) -> Result<InboxWriteOutcome, String> {
-    if records.is_empty() {
-        return Ok(InboxWriteOutcome::default());
+impl From<IoError> for InboxError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => InboxError::Conflict,
+            IoError::Storage(StorageError::TransactionConflict) => InboxError::Conflict,
+            IoError::Storage(error) => InboxError::Storage(error),
+            error => InboxError::Io(error),
+        }
     }
-    match upsert_once(storage, records).await {
-        Ok(outcome) => Ok(outcome),
-        Err(UpsertFailure::Fatal(error)) => Err(error),
-        Err(UpsertFailure::Conflict) => match upsert_once(storage, records).await {
-            Ok(outcome) => Ok(outcome),
-            Err(UpsertFailure::Fatal(error)) => Err(error),
-            Err(UpsertFailure::Conflict) => {
-                Err("notification inbox upsert conflicted twice".to_string())
+}
+
+/// One paged scan of a recipient's inbox: the purge it serves, or the transient count.
+#[derive(Debug, PartialEq)]
+struct InboxScan {
+    recipient: UserId,
+    next: Option<Key>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+enum UpsertState {
+    /// Reads the deletion time of each notice's bucket.
+    ReadCutoffs {
+        checked: Vec<usize>,
+    },
+    /// Scans the inbox of `purges[at]` for the notices its bucket deletion removes.
+    Purge {
+        at: usize,
+        scan: InboxScan,
+    },
+    /// Reads the stored deletion times the purges may raise.
+    ReadTimes {
+        times: Vec<(Key, u64)>,
+    },
+    WriteTimes,
+    DeleteRows,
+    ReadExisting,
+    /// Counts the stored transient notices of `counts[at]`.
+    Count {
+        at: usize,
+        seen: usize,
+        scan: InboxScan,
+    },
+    #[default]
+    WriteRows,
+}
+
+type Turn = Result<Next<InboxWriteOutcome>, InboxError>;
+
+/// Idempotent holder-local upsert that skips stored keys, so a duplicate keeps a mark-read. A
+/// bucket deletion removes its bucket's notices and keeps its time to drop late ones. It runs
+/// in one write transaction, its own or that of an operation that runs its calls.
+#[derive(Debug, PartialEq)]
+pub struct UpsertInboxOperation {
+    records: Vec<NotificationRecord>,
+    state: UpsertState,
+    kept: Vec<usize>,
+    purges: Vec<usize>,
+    deletes: Vec<(KeySpace, Key)>,
+    times: BTreeMap<Key, u64>,
+    writes: Vec<(KeySpace, Key, Value)>,
+    counts: Vec<(UserId, usize)>,
+    outcome: InboxWriteOutcome,
+}
+
+impl UpsertInboxOperation {
+    pub fn new(records: Vec<NotificationRecord>) -> Self {
+        Self {
+            records,
+            state: UpsertState::default(),
+            kept: Vec::new(),
+            purges: Vec::new(),
+            deletes: Vec::new(),
+            times: BTreeMap::new(),
+            writes: Vec::new(),
+            counts: Vec::new(),
+            outcome: InboxWriteOutcome::default(),
+        }
+    }
+
+    fn read_cutoffs(&mut self) -> Turn {
+        let (purges, rest): (Vec<usize>, Vec<usize>) = (0..self.records.len()).partition(|&at| {
+            matches!(
+                self.records[at].kind,
+                NotificationKind::BucketDeleted { .. }
+            )
+        });
+        self.purges = purges;
+        let mut checked = Vec::new();
+        let mut reads = Vec::new();
+        for at in rest {
+            match cutoff_key(&self.records[at]) {
+                Some(key) => {
+                    checked.push(at);
+                    reads.push((NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key));
+                }
+                None => self.keep(at, None),
             }
-        },
-    }
-}
-
-async fn upsert_once(
-    storage: &StorageHandle,
-    records: &[NotificationRecord],
-) -> Result<InboxWriteOutcome, UpsertFailure> {
-    let txn_id = match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(UpsertFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
         }
-    };
-
-    let outcome = match upsert_transactionally(storage, records, txn_id).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            abort_txn(storage, txn_id).await;
-            return Err(error);
+        if reads.is_empty() {
+            return self.next_purge(0);
         }
-    };
-    if outcome.written == 0 && outcome.purged == 0 && outcome.cutoffs == 0 {
-        abort_txn(storage, txn_id).await;
-        return Ok(outcome);
+        self.state = UpsertState::ReadCutoffs { checked };
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    match storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(outcome),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(UpsertFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-pub(crate) async fn upsert_transactionally(
-    storage: &StorageHandle,
-    records: &[NotificationRecord],
-    txn_id: TxnId,
-) -> Result<InboxWriteOutcome, UpsertFailure> {
-    // A bucket deletion is never stored: it removes the notices about its bucket instead, and
-    // keeps its time, so a notice from before it that arrives late is dropped too.
-    let (purges, records): (Vec<&NotificationRecord>, Vec<&NotificationRecord>) = records
-        .iter()
-        .partition(|record| matches!(record.kind, NotificationKind::BucketDeleted { .. }));
-    let mut kept = Vec::new();
-    for record in records {
-        let cutoff = match cutoff_key(record) {
-            Some(key) => read_cutoff(storage, key, txn_id).await?,
-            None => None,
-        };
+    fn keep(&mut self, at: usize, cutoff: Option<u64>) {
+        let record = &self.records[at];
         let late = cutoff.is_some_and(|cutoff| record.created_at_ms <= cutoff);
-        if !late && !purges.iter().any(|purge| purge.purges(record)) {
-            kept.push(record);
+        let purged = (self.purges.iter()).any(|&purge| self.records[purge].purges(record));
+        if !late && !purged {
+            self.kept.push(at);
         }
     }
-    let records = kept;
-    let mut outcome = InboxWriteOutcome::default();
-    let mut deletes = Vec::new();
-    let mut times = BTreeMap::new();
-    for purge in &purges {
-        let purged = purged_records(storage, purge, txn_id).await?;
-        if !purged.is_empty() && !outcome.recipients.contains(&purge.recipient) {
-            outcome.recipients.push(purge.recipient);
+
+    fn scan(&self, scan: &InboxScan, limit: usize) -> Turn {
+        Ok(Next::Call(IoCall::Page {
+            space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            prefix: notification_inbox_prefix(scan.recipient),
+            after: scan.next.clone(),
+            limit,
+        }))
+    }
+
+    fn next_purge(&mut self, at: usize) -> Turn {
+        let Some(&purge) = self.purges.get(at) else {
+            return self.read_times();
+        };
+        let scan = InboxScan {
+            recipient: self.records[purge].recipient,
+            next: None,
+        };
+        let turn = self.scan(&scan, TRANSIENT_USER_CAP);
+        self.state = UpsertState::Purge { at, scan };
+        turn
+    }
+
+    fn purge_page(
+        &mut self,
+        at: usize,
+        scan: InboxScan,
+        values: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Turn {
+        let purge = &self.records[self.purges[at]];
+        let mut removed = 0;
+        for (_, value) in values {
+            let record = NotificationRecord::from_bytes(&value)
+                .map_err(|error| InboxError::Decode(error.to_string()))?;
+            if purge.purges(&record) {
+                self.deletes.extend(inbox_delete_entries(&record));
+                removed += 1;
+            }
         }
-        outcome.purged += purged.len();
-        deletes.extend(purged.iter().flat_map(inbox_delete_entries));
+        if removed > 0 && !self.outcome.recipients.contains(&purge.recipient) {
+            self.outcome.recipients.push(purge.recipient);
+        }
+        self.outcome.purged += removed;
+        if let Some(next) = next {
+            let scan = InboxScan {
+                recipient: scan.recipient,
+                next: Some(next),
+            };
+            let turn = self.scan(&scan, TRANSIENT_USER_CAP);
+            self.state = UpsertState::Purge { at, scan };
+            return turn;
+        }
         if let Some(key) = cutoff_key(purge) {
-            let time = times.entry(key).or_insert(purge.created_at_ms);
+            let time = self.times.entry(key).or_insert(purge.created_at_ms);
             *time = (*time).max(purge.created_at_ms);
         }
-    }
-    let mut cutoffs = Vec::new();
-    for (key, time) in times {
-        let stored = read_cutoff(storage, key.clone(), txn_id).await?;
-        if stored.is_none_or(|stored| stored < time) {
-            let time = time.to_be_bytes().to_vec();
-            cutoffs.push((NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key, time.into()));
-            outcome.cutoffs += 1;
-        }
-    }
-    if !cutoffs.is_empty() {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes: cutoffs,
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-            other => {
-                return Err(UpsertFailure::Fatal(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        }
-    }
-    if !deletes.is_empty() {
-        match storage
-            .send_storage_effect(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
-            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-            other => {
-                return Err(UpsertFailure::Fatal(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        }
-    }
-    if records.is_empty() {
-        return Ok(outcome);
+        self.next_purge(at + 1)
     }
 
-    let reads: Vec<(KeySpace, Key)> = records
-        .iter()
-        .map(|record| {
-            (
-                NOTIFICATION_INBOX_KEYSPACE.to_string(),
-                notification_inbox_key(
+    fn read_times(&mut self) -> Turn {
+        let times: Vec<(Key, u64)> = std::mem::take(&mut self.times).into_iter().collect();
+        if times.is_empty() {
+            return self.delete_rows();
+        }
+        let space = || NOTIFICATION_CUTOFF_KEYSPACE.to_string();
+        let reads = times
+            .iter()
+            .map(|(key, _)| (space(), key.clone()))
+            .collect();
+        self.state = UpsertState::ReadTimes { times };
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn write_times(&mut self, times: Vec<(Key, u64)>, values: Vec<Option<Value>>) -> Turn {
+        let mut writes = Vec::new();
+        for ((key, time), stored) in times.into_iter().zip(values) {
+            if stored_time(stored.as_ref()).is_none_or(|stored| stored < time) {
+                let time = Value::from(time.to_be_bytes().to_vec());
+                writes.push((NOTIFICATION_CUTOFF_KEYSPACE.to_string(), key, time));
+                self.outcome.cutoffs += 1;
+            }
+        }
+        if writes.is_empty() {
+            return self.delete_rows();
+        }
+        self.state = UpsertState::WriteTimes;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    fn delete_rows(&mut self) -> Turn {
+        let deletes = std::mem::take(&mut self.deletes);
+        if deletes.is_empty() {
+            return self.read_existing();
+        }
+        self.state = UpsertState::DeleteRows;
+        Ok(Next::Call(IoCall::Delete(deletes)))
+    }
+
+    fn read_existing(&mut self) -> Turn {
+        if self.kept.is_empty() {
+            return Ok(Next::Done(std::mem::take(&mut self.outcome)));
+        }
+        let reads = (self.kept.iter())
+            .map(|&at| {
+                let record = &self.records[at];
+                let key = notification_inbox_key(
                     record.recipient,
                     record.created_at_ms,
                     record.notification_id,
-                ),
-            )
-        })
-        .collect();
-
-    let existing = match storage
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(UpsertFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    };
-
-    let mut writes: Vec<(KeySpace, Key, Value)> = Vec::new();
-    let mut transient_counts = BTreeMap::new();
-    for (record, (_, existing_value)) in records.iter().zip(existing) {
-        outcome.held.push((*record).clone());
-        if existing_value.is_some() {
-            continue;
-        }
-        match inbox_write_entries(record) {
-            Ok(entries) => {
-                writes.extend(entries);
-                outcome.written += 1;
-                if !outcome.recipients.contains(&record.recipient) {
-                    outcome.recipients.push(record.recipient);
-                }
-                if record.class == NotificationClass::Transient {
-                    *transient_counts.entry(record.recipient).or_insert(0) += 1;
-                }
-            }
-            Err(error) => {
-                return Err(UpsertFailure::Fatal(error.to_string()));
-            }
-        }
-    }
-
-    for (recipient, added) in transient_counts {
-        let existing = count_transient(storage, recipient, txn_id).await?;
-        if existing.saturating_add(added) > TRANSIENT_USER_CAP {
-            return Err(UpsertFailure::Fatal(format!(
-                "notification transient count for recipient {recipient} exceeds cap {TRANSIENT_USER_CAP}"
-            )));
-        }
-    }
-
-    if writes.is_empty() {
-        return Ok(outcome);
-    }
-
-    match storage
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-        Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-        other => {
-            return Err(UpsertFailure::Fatal(format!(
-                "unexpected storage event: {other:?}"
-            )));
-        }
-    }
-
-    Ok(outcome)
-}
-
-async fn count_transient(
-    storage: &StorageHandle,
-    recipient: UserId,
-    txn_id: TxnId,
-) -> Result<usize, UpsertFailure> {
-    let mut count = 0usize;
-    let mut start_after = None;
-    let prefix = notification_inbox_prefix(recipient);
-
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start_after.take().map(IterStart::After),
-                limit: TRANSIENT_USER_CAP.saturating_add(1),
-                txn_id: Some(txn_id),
+                );
+                (NOTIFICATION_INBOX_KEYSPACE.to_string(), key)
             })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-            other => {
-                return Err(UpsertFailure::Fatal(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        };
+            .collect();
+        self.state = UpsertState::ReadExisting;
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
 
+    fn plan_writes(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let kept = std::mem::take(&mut self.kept);
+        for (at, existing) in kept.into_iter().zip(values) {
+            let record = &self.records[at];
+            self.outcome.held.push(record.clone());
+            if existing.is_some() {
+                continue;
+            }
+            let entries = inbox_write_entries(record)
+                .map_err(|error| InboxError::Encode(error.to_string()))?;
+            self.writes.extend(entries);
+            self.outcome.written += 1;
+            if !self.outcome.recipients.contains(&record.recipient) {
+                self.outcome.recipients.push(record.recipient);
+            }
+            if record.class == NotificationClass::Transient {
+                match self
+                    .counts
+                    .iter_mut()
+                    .find(|(user, _)| *user == record.recipient)
+                {
+                    Some((_, added)) => *added += 1,
+                    None => self.counts.push((record.recipient, 1)),
+                }
+            }
+        }
+        self.counts.sort_by_key(|(user, _)| *user);
+        self.next_count(0)
+    }
+
+    fn next_count(&mut self, at: usize) -> Turn {
+        let Some(&(recipient, _)) = self.counts.get(at) else {
+            return self.write_rows();
+        };
+        let scan = InboxScan {
+            recipient,
+            next: None,
+        };
+        let turn = self.scan(&scan, TRANSIENT_USER_CAP.saturating_add(1));
+        self.state = UpsertState::Count { at, seen: 0, scan };
+        turn
+    }
+
+    fn count_page(
+        &mut self,
+        at: usize,
+        mut seen: usize,
+        scan: InboxScan,
+        values: Vec<(Key, Value)>,
+        next: Option<Key>,
+    ) -> Turn {
         for (_, value) in values {
             let record = NotificationRecord::from_bytes(&value)
-                .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
+                .map_err(|error| InboxError::Decode(error.to_string()))?;
             if record.class == NotificationClass::Transient {
-                count = count.saturating_add(1);
-                if count >= TRANSIENT_USER_CAP {
-                    return Ok(count);
+                seen = seen.saturating_add(1);
+                if seen >= TRANSIENT_USER_CAP {
+                    return self.check_count(at, seen);
                 }
             }
         }
-
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(count),
+        match next {
+            Some(next) => {
+                let scan = InboxScan {
+                    recipient: scan.recipient,
+                    next: Some(next),
+                };
+                let turn = self.scan(&scan, TRANSIENT_USER_CAP.saturating_add(1));
+                self.state = UpsertState::Count { at, seen, scan };
+                turn
+            }
+            None => self.check_count(at, seen),
         }
+    }
+
+    fn check_count(&mut self, at: usize, seen: usize) -> Turn {
+        let (recipient, added) = self.counts[at];
+        if seen.saturating_add(added) > TRANSIENT_USER_CAP {
+            return Err(InboxError::TransientCap(recipient));
+        }
+        self.next_count(at + 1)
+    }
+
+    fn write_rows(&mut self) -> Turn {
+        let writes = std::mem::take(&mut self.writes);
+        if writes.is_empty() {
+            return Ok(Next::Done(std::mem::take(&mut self.outcome)));
+        }
+        self.state = UpsertState::WriteRows;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+}
+
+impl Operation for UpsertInboxOperation {
+    type Output = InboxWriteOutcome;
+    type Error = InboxError;
+
+    fn first(&mut self) -> Turn {
+        if self.records.is_empty() {
+            return Ok(Next::Done(InboxWriteOutcome::default()));
+        }
+        self.read_cutoffs()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn {
+        match (std::mem::take(&mut self.state), result) {
+            (UpsertState::ReadCutoffs { checked }, IoResult::Values(values)) => {
+                for (at, value) in checked.into_iter().zip(values) {
+                    self.keep(at, stored_time(value.as_ref()));
+                }
+                self.kept.sort_unstable();
+                self.next_purge(0)
+            }
+            (UpsertState::Purge { at, scan }, IoResult::Page { rows, next }) => {
+                self.purge_page(at, scan, rows, next)
+            }
+            (UpsertState::ReadTimes { times }, IoResult::Values(values)) => {
+                self.write_times(times, values)
+            }
+            (UpsertState::WriteTimes, IoResult::Done) => self.delete_rows(),
+            (UpsertState::DeleteRows, IoResult::Done) => self.read_existing(),
+            (UpsertState::ReadExisting, IoResult::Values(values)) => self.plan_writes(values),
+            (UpsertState::Count { at, seen, scan }, IoResult::Page { rows, next }) => {
+                self.count_page(at, seen, scan, rows, next)
+            }
+            (UpsertState::WriteRows, IoResult::Done) => {
+                Ok(Next::Done(std::mem::take(&mut self.outcome)))
+            }
+            (_, other) => Err(unexpected("an inbox storage result", &other).into()),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -338,93 +409,41 @@ fn cutoff_key(record: &NotificationRecord) -> Option<Key> {
     Some(notification_cutoff_key(record.recipient, node_id, bucket))
 }
 
-/// The newest deletion time stored for a recipient's bucket.
-async fn read_cutoff(
-    storage: &StorageHandle,
-    key: Key,
-    txn_id: TxnId,
-) -> Result<Option<u64>, UpsertFailure> {
-    let read = StorageEffect::Read {
-        key_space: NOTIFICATION_CUTOFF_KEYSPACE.to_string(),
-        key,
-        txn_id: Some(txn_id),
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value
-            .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok())
-            .map(u64::from_be_bytes)),
-        Event::Storage(StorageEvent::Error { error }) => Err(classify(error)),
-        other => Err(UpsertFailure::Fatal(format!(
-            "unexpected storage event: {other:?}"
-        ))),
-    }
-}
-
-/// The stored notices of the purge's recipient that its bucket deletion removes.
-async fn purged_records(
-    storage: &StorageHandle,
-    purge: &NotificationRecord,
-    txn_id: TxnId,
-) -> Result<Vec<NotificationRecord>, UpsertFailure> {
-    let mut purged = Vec::new();
-    let mut start_after = None;
-    loop {
-        let event = storage
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: NOTIFICATION_INBOX_KEYSPACE.to_string(),
-                prefix: Some(notification_inbox_prefix(purge.recipient)),
-                start: start_after.take().map(IterStart::After),
-                limit: TRANSIENT_USER_CAP,
-                txn_id: Some(txn_id),
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(classify(error)),
-            other => {
-                return Err(UpsertFailure::Fatal(format!(
-                    "unexpected storage event: {other:?}"
-                )));
-            }
-        };
-        for (_, value) in values {
-            let record = NotificationRecord::from_bytes(&value)
-                .map_err(|error| UpsertFailure::Fatal(error.to_string()))?;
-            if purge.purges(&record) {
-                purged.push(record);
-            }
-        }
-        match next_start_after {
-            Some(next) => start_after = Some(next),
-            None => return Ok(purged),
-        }
-    }
-}
-
-fn classify(error: StorageError) -> UpsertFailure {
-    if matches!(error, StorageError::TransactionConflict) {
-        UpsertFailure::Conflict
-    } else {
-        UpsertFailure::Fatal(error.to_string())
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    let _ = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
+/// A stored deletion time; a malformed one counts as none.
+fn stored_time(value: Option<&Value>) -> Option<u64> {
+    value
+        .and_then(|value| <[u8; 8]>::try_from(value.as_ref()).ok())
+        .map(u64::from_be_bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::notifications::{record, temp_storage, user};
+    use crate::tests::notifications::{context, record, temp_storage, user};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
     use aruna_core::storage_entries::inbox_update_entry;
     use aruna_core::structs::execution::notification::NotificationClass;
+    use aruna_drivers::driver::drive;
+    use aruna_storage::storage::handle::StorageHandle;
+
+    async fn upsert_with_report(
+        storage: &StorageHandle,
+        records: &[NotificationRecord],
+    ) -> Result<InboxWriteOutcome, InboxError> {
+        let upsert = UpsertInboxOperation::new(records.to_vec());
+        drive(upsert, &context(storage)).await
+    }
+
+    async fn upsert_inbox_records(
+        storage: &StorageHandle,
+        records: &[NotificationRecord],
+    ) -> Result<usize, InboxError> {
+        upsert_with_report(storage, records)
+            .await
+            .map(|outcome| outcome.written)
+    }
 
     fn make_record() -> NotificationRecord {
         record(user(1, 2), NotificationClass::Direct, 1_000)
@@ -505,7 +524,13 @@ mod tests {
                 key: "key".to_string(),
                 size_bytes: 1,
             };
-            NotificationRecord::new(recipient, NotificationClass::Direct, kind, at)
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
         };
         let gone = notice(recipient, "raw", 1_000);
         let kept = [
@@ -517,6 +542,7 @@ mod tests {
         assert_eq!(upsert_inbox_records(&storage, &stored).await, Ok(4));
 
         let deletion = NotificationRecord::new(
+            ulid::Ulid::generate(),
             recipient,
             NotificationClass::Direct,
             NotificationKind::BucketDeleted {
@@ -552,8 +578,15 @@ mod tests {
         let recipient = user(1, 2);
         let node_id = iroh::SecretKey::from_bytes(&[7; 32]).public();
         let group_id = ulid::Ulid::from_parts(1, 1);
-        let record =
-            |kind, at| NotificationRecord::new(recipient, NotificationClass::Direct, kind, at);
+        let record = |kind, at| {
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
+        };
         let notice = |bucket: &str, at| {
             let kind = NotificationKind::ShareUpload {
                 share_id: ulid::Ulid::generate(),
@@ -704,7 +737,7 @@ mod tests {
         let error = upsert_inbox_records(&storage, &[transient_record()])
             .await
             .expect_err("transient cap must reject extra records");
-        assert!(error.contains("exceeds cap"));
+        assert!(matches!(error, InboxError::TransientCap(_)));
         assert_eq!(
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
             TRANSIENT_USER_CAP
@@ -732,5 +765,71 @@ mod tests {
             count_keyspace(&storage, NOTIFICATION_INBOX_KEYSPACE).await,
             TRANSIENT_USER_CAP
         );
+    }
+}
+
+#[cfg(test)]
+mod call_tests {
+    use super::*;
+    use crate::tests::notifications::{record, user};
+
+    fn notice() -> NotificationRecord {
+        record(user(1, 2), NotificationClass::Direct, 1_000)
+    }
+
+    fn inbox_key(record: &NotificationRecord) -> Key {
+        notification_inbox_key(
+            record.recipient,
+            record.created_at_ms,
+            record.notification_id,
+        )
+    }
+
+    #[test]
+    fn upsert_success_calls() {
+        let record = notice();
+        let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
+        assert_eq!(
+            upsert.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
+        let space = NOTIFICATION_INBOX_KEYSPACE.to_string();
+        assert_eq!(
+            upsert.first(),
+            Ok(Next::Call(IoCall::Read(vec![(space, inbox_key(&record))])))
+        );
+        let Ok(Next::Call(IoCall::Write(writes))) = upsert.next(IoResult::Values(vec![None]))
+        else {
+            panic!("one write");
+        };
+        assert_eq!(writes, inbox_write_entries(&record).unwrap());
+        let Ok(Next::Done(outcome)) = upsert.next(IoResult::Done) else {
+            panic!("done");
+        };
+        assert_eq!(
+            (outcome.written, outcome.recipients),
+            (1, vec![record.recipient])
+        );
+    }
+
+    #[test]
+    fn redelivery_writes_nothing() {
+        let record = notice();
+        let mut upsert = UpsertInboxOperation::new(vec![record.clone()]);
+        upsert.first().unwrap();
+        let stored = IoResult::Values(vec![Some(Value::from(vec![1]))]);
+        let Ok(Next::Done(outcome)) = upsert.next(stored) else {
+            panic!("done");
+        };
+        assert_eq!((outcome.written, outcome.held), (0, vec![record]));
+    }
+
+    #[test]
+    fn empty_batch_done() {
+        let mut upsert = UpsertInboxOperation::new(Vec::new());
+        assert_eq!(upsert.first(), Ok(Next::Done(InboxWriteOutcome::default())));
+        let mut other = UpsertInboxOperation::new(vec![notice()]);
+        other.first().unwrap();
+        assert!(other.next(IoResult::Woke).is_err());
     }
 }

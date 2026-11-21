@@ -3,10 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-use crate::UserId;
 use crate::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget};
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use crate::permission_path::compile_permission_matcher;
 use crate::structs::identity::auth::{Permission, Role};
 use crate::structs::identity::group::GroupAuthorizationDocument;
@@ -16,6 +15,7 @@ use crate::structs::placement::policy::{
 };
 use crate::structs::placement::record::PlacementRef;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;

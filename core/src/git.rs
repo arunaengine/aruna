@@ -2,12 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::time::Duration;
+
+use crate::effects::Effect;
+use crate::errors::ConversionError;
+use crate::git_state::{Ancestry, Projection, ProjectionInputs};
+use crate::id::NodeId;
 use crate::keyspaces::GIT_RECORD_KEYSPACE;
-use crate::structs::identity::realm::RealmId;
+use crate::operation::SubOperation;
+use crate::structs::identity::realm::{NodeRealm, RealmId};
 use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::dataset_location::DatasetLocation;
+use crate::structs::storage::routing::NodeRouting;
+use crate::task::{TaskEffect, TaskKey};
 use crate::types::{GroupId, Key, KeySpace, Value};
-use crate::{NodeId, UserId};
+use crate::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
@@ -76,6 +85,7 @@ impl LfsObject {
     }
 }
 
+#[derive(PartialEq)]
 pub struct GitRequest {
     pub repository: GitRepository,
     pub method: String,
@@ -92,7 +102,7 @@ pub struct GitRequest {
     pub push_key: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitSnapshot {
     pub document_id: Ulid,
     pub event_id: Ulid,
@@ -104,7 +114,7 @@ pub struct GitSnapshot {
     pub message: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LinkedObject {
     pub entity: String,
     pub object: StoredObject,
@@ -112,7 +122,7 @@ pub struct LinkedObject {
     pub path: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GitStatus {
     pub event_id: Ulid,
     pub commit: Option<String>,
@@ -127,39 +137,6 @@ pub struct PendingMerge {
     pub user_id: UserId,
     pub old: String,
     pub new: String,
-}
-
-/// One async lock per document, created on first use and dropped once nobody holds it.
-#[derive(Debug, Default)]
-pub struct DocumentLocks(
-    std::sync::Mutex<std::collections::HashMap<Ulid, std::sync::Weak<tokio::sync::Mutex<()>>>>,
-);
-
-impl DocumentLocks {
-    pub async fn lock(&self, document_id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
-        self.mutex(document_id).lock_owned().await
-    }
-
-    /// The lock when no one holds it, without waiting.
-    pub fn try_lock(&self, document_id: Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        self.mutex(document_id).try_lock_owned().ok()
-    }
-
-    fn mutex(&self, document_id: Ulid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
-            Some(lock) => lock,
-            None => {
-                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(document_id, std::sync::Arc::downgrade(&lock));
-                lock
-            }
-        }
-    }
 }
 
 /// One commit as read from the repository, without verifying its signature.
@@ -203,6 +180,7 @@ pub enum MergeOutcome {
     Failed(String),
 }
 
+#[derive(PartialEq)]
 pub enum GitEffect {
     Initialize(Ulid),
     /// SHA-256 digests of the packs the local cache already holds.
@@ -317,6 +295,7 @@ pub enum GitEffect {
     },
 }
 
+#[derive(PartialEq)]
 pub enum GitEvent {
     Initialized,
     Imported(std::collections::BTreeSet<String>),
@@ -347,6 +326,200 @@ pub enum GitEvent {
     },
     Layout(Option<crate::repo_layout::Layout>),
     File(Option<Bytes>),
+}
+
+/// Names the request only: its body and token never reach a log.
+impl std::fmt::Debug for GitRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (formatter.debug_struct("GitRequest"))
+            .field("repository", &self.repository)
+            .field("action", &self.action)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Names the effect only: graphs and packs never reach a log.
+impl std::fmt::Debug for GitEffect {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Initialize(_) => "Initialize",
+            Self::Imported(_) => "Imported",
+            Self::Import { .. } => "Import",
+            Self::MarkImported { .. } => "MarkImported",
+            Self::Refs(_) => "Refs",
+            Self::Ancestry { .. } => "Ancestry",
+            Self::SetRefs { .. } => "SetRefs",
+            Self::Pack { .. } => "Pack",
+            Self::Generate { .. } => "Generate",
+            Self::Export { .. } => "Export",
+            Self::Resolve { .. } => "Resolve",
+            Self::MergeBase { .. } => "MergeBase",
+            Self::Peel { .. } => "Peel",
+            Self::Commits { .. } => "Commits",
+            Self::Log { .. } => "Log",
+            Self::Diff { .. } => "Diff",
+            Self::Edit { .. } => "Edit",
+            Self::Merge { .. } => "Merge",
+            Self::MergeMetadata { .. } => "MergeMetadata",
+            Self::ReadFile { .. } => "ReadFile",
+            Self::Http(_) => "Http",
+            Self::Layout { .. } => "Layout",
+        })
+    }
+}
+
+/// Names the answer only: packs, files and exports never reach a log.
+impl std::fmt::Debug for GitEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Initialized => "Initialized",
+            Self::Imported(_) => "Imported",
+            Self::Refs(_) => "Refs",
+            Self::Ancestry(_) => "Ancestry",
+            Self::Packed(_) => "Packed",
+            Self::Generated { .. } => "Generated",
+            Self::GenerateFailed(_) => "GenerateFailed",
+            Self::Exported(_) => "Exported",
+            Self::Resolved(_) => "Resolved",
+            Self::Peeled(_) => "Peeled",
+            Self::Log(_) => "Log",
+            Self::Diff(_) => "Diff",
+            Self::Edited(_) => "Edited",
+            Self::Merged(_) => "Merged",
+            Self::MetadataMerged(_) => "MetadataMerged",
+            Self::Response { .. } => "Response",
+            Self::Layout(_) => "Layout",
+            Self::File(_) => "File",
+        })
+    }
+}
+
+/// One call to this node's Git store.
+#[derive(Debug, PartialEq)]
+pub enum GitCall {
+    /// Runs a repository effect for `actor`.
+    Run { effect: GitEffect, actor: UserId },
+    /// Whether the local repository still has its files and settings.
+    Configured(Ulid),
+    /// Whether another run holds the document's repository right now.
+    Busy(Ulid),
+    /// Reads a stream to its end, stopping once it holds more than `limit` bytes.
+    Collect {
+        blob: crate::stream::BackendStream<Result<Bytes, crate::stream::StreamError>>,
+        limit: u64,
+    },
+    /// Runs a receive-pack request under a new push key that lasts as long as the run.
+    Push {
+        request: Box<GitRequest>,
+        actor: UserId,
+    },
+    /// Whether `proof` is the key of the push now running for the document.
+    PushKeyValid { document_id: Ulid, proof: PushProof },
+    /// The remembered projection of the document, if `inputs` still match it.
+    Recent {
+        document_id: Ulid,
+        inputs: ProjectionInputs,
+    },
+    /// The last completed projection of the document, whatever changed since.
+    Last(Ulid),
+    Remember {
+        document_id: Ulid,
+        inputs: ProjectionInputs,
+        projection: Box<Projection>,
+    },
+    /// Drops the remembered projection, so the next refresh projects again.
+    Forget(Ulid),
+    /// The ancestry answers kept for the document.
+    KnownAncestry(Ulid),
+    /// Keeps a finished projection's true ancestry answers and the refs it served.
+    Projected {
+        document_id: Ulid,
+        ancestry: Ancestry,
+        refs: Refs,
+    },
+    /// The refs this node last served for the document, which a push must build on.
+    ServedRefs(Ulid),
+    /// How often this process stored a Git record of the document.
+    RecordWrites(Ulid),
+    /// Notes a durably stored record or pack; `forget` also drops the remembered projection.
+    RecordStored { document_id: Ulid, forget: bool },
+    /// The next id in the order pending merges are accepted.
+    NextSequence,
+    /// Starts `child` beside the caller unless a refresh of the document already runs.
+    RefreshOnce {
+        document_id: Ulid,
+        child: Box<dyn SubOperation>,
+    },
+    /// Runs `child` under its own stage timers and answers them with its event.
+    Timed(Box<dyn SubOperation>),
+    /// The canonical digest of a JSON-LD graph, timed as a request stage.
+    Canonicalize(String),
+    /// Adds finished stage times, in milliseconds, to the current request.
+    Stages(Vec<(&'static str, u64)>),
+}
+
+/// A push key a receive hook presents; it never reaches a log.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PushProof(pub String);
+
+impl std::fmt::Debug for PushProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PushProof(..)")
+    }
+}
+
+/// What the Git store answered.
+#[derive(Debug, PartialEq)]
+pub enum GitAnswer {
+    Ran(GitEvent),
+    Configured(bool),
+    Busy(bool),
+    Collected(Bytes),
+    /// The answer of [`GitCall::Recent`] or [`GitCall::Last`].
+    Projection(Option<Box<Projection>>),
+    Ancestry(Ancestry),
+    ServedRefs(Option<Refs>),
+    RecordWrites(u64),
+    Sequence(Ulid),
+    PushKeyValid(bool),
+    /// Whether [`GitCall::RefreshOnce`] started its child.
+    RefreshStarted(bool),
+    Timed {
+        event: Box<crate::events::Event>,
+        stages: String,
+    },
+    Canonical(Option<[u8; 32]>),
+    /// A cache update or stage report was taken.
+    Noted,
+    /// The store is missing or the effect failed.
+    Failed(String),
+}
+
+/// What the receive hook reports about one push, next to the pack of its new objects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushRequest {
+    pub refs: Vec<RefUpdate>,
+    /// SHA-256 ids of LFS objects the pushed commits point to.
+    pub lfs: Vec<String>,
+    /// Files the push changes, checked against other users' LFS locks.
+    pub paths: Vec<String>,
+}
+
+/// A length-prefixed JSON request followed by the raw pack.
+pub fn encode_push(request: &PushRequest, pack: &[u8]) -> Option<Vec<u8>> {
+    let json = serde_json::to_vec(request).ok()?;
+    let length = u32::try_from(json.len()).ok()?;
+    Some([&length.to_be_bytes()[..], &json, pack].concat())
+}
+
+/// The request and pack of an [`encode_push`] body.
+pub fn decode_push(body: Bytes) -> Option<(PushRequest, Bytes)> {
+    let length = <[u8; 4]>::try_from(body.get(..4)?).ok()?;
+    let end = usize::try_from(u32::from_be_bytes(length))
+        .ok()?
+        .checked_add(4)?;
+    let request = serde_json::from_slice(body.get(4..end)?).ok()?;
+    Some((request, body.slice(end..)))
 }
 
 /// One replicated Git fact of a metadata document. Every holder rebuilds its local
@@ -678,26 +851,50 @@ pub fn record_change(record: &GitRecord) -> crate::document::DocumentChange {
     }
 }
 
+/// What the Git operations need to know about this node; the input reads it from its context.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GitNode {
+    pub ids: NodeRealm,
+    pub routing: NodeRouting,
+}
+
+impl GitNode {
+    pub fn node(&self) -> Option<NodeId> {
+        self.ids.map(|(node_id, _)| node_id)
+    }
+}
+
+/// A materialized graph waiting for its Git snapshot, stored under its document and the capture
+/// sequence its finish gave it, so a document's marks are captured in finish order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureMark {
+    /// The event whose graph the snapshot shows, and that graph as JSON-LD.
+    pub event_id: Ulid,
+    pub jsonld: String,
+}
+
+impl CaptureMark {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Arms the Git capture drain to run now.
+pub fn schedule_capture_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainCaptures,
+        after: Duration::ZERO,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn reads_skip_busy() {
-        let locks = DocumentLocks::default();
-        let id = Ulid::from(1);
-        let held = locks.lock(id).await;
-        assert!(
-            locks.try_lock(id).is_none(),
-            "a held lock is not handed out"
-        );
-        assert!(
-            locks.try_lock(Ulid::from(2)).is_some(),
-            "other documents stay free"
-        );
-        drop(held);
-        assert!(locks.try_lock(id).is_some());
-    }
     use crate::document::DocumentTarget;
 
     fn record(change: GitChange) -> GitRecord {
@@ -843,7 +1040,7 @@ mod tests {
         };
         assert_eq!(
             target.topic_id(),
-            crate::TopicId::metadata(record.document_id)
+            crate::id::TopicId::metadata(record.document_id)
         );
         assert!(target.uses_shard_topic());
         let (keyspace, key, _) = git_record_entry(&record).expect("entry");

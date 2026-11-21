@@ -8,6 +8,7 @@ use super::visit::{
     create_ticket, download_file, list_files, open_share, upload_file,
 };
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::members::{BUCKET, Members, members};
 use crate::tests::routes::test_state;
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -27,7 +28,12 @@ struct Shared {
 }
 
 async fn shared() -> Shared {
-    let members = members(2, &["m"], 0).await;
+    shared_ranges(&["m"]).await
+}
+
+/// Two members whose bucket ranges start at `bounds`.
+async fn shared_ranges(bounds: &[&str]) -> Shared {
+    let members = members(2, bounds, 0).await;
     let node = &members.nodes[0];
     let capabilities = NodeCapabilities::user_node(members.realm_id).unwrap();
     let context = node.context.clone();
@@ -56,7 +62,7 @@ async fn s3_request<T>(
     let mut extensions = http::Extensions::new();
     extensions.insert(shared.members.user_on(on));
     extensions.insert(node.bucket().await);
-    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    extensions.insert(aruna_core::request_policy::PolicyRequestExtras::rest());
     s3s::S3Request {
         input,
         method,
@@ -138,8 +144,10 @@ async fn visit(shared: &Shared, mode: ShareModeBody) -> (ShareDetails, String) {
         password: None,
     };
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
-    let (_, Json(link)) = create_share(state, auth, Json(request)).await.unwrap();
+    let auth = shared.owner.clone();
+    let (_, Json(link)) = create_share(state, UnrestrictedAuth(auth), Json(request))
+        .await
+        .unwrap();
     let headers = share_headers(&link.token);
     let opened = open_share(
         State(shared.state.clone()),
@@ -282,8 +290,9 @@ async fn holder_policy_hides() {
 // share policy on this member hides them, and no cursor names a hidden entry.
 #[tokio::test]
 async fn serving_policy_hides() {
-    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    use aruna_operations::s3::object::pages::decode_resume;
     let shared = shared().await;
+    put(&shared, 1, "a.txt", "first").await;
     put(&shared, 1, "private/secret.txt", "closed").await;
     put(&shared, 1, "public.txt", "open").await;
     let expression = "request.session.kind == 'share' && path.contains('/private/')";
@@ -295,13 +304,14 @@ async fn serving_policy_hides() {
     assert_eq!(code(error), "share_unavailable");
     assert_eq!(
         names(&shared, &visit, "", 100).await.unwrap(),
-        ["public.txt"]
+        ["a.txt", "public.txt"]
     );
     let listed = page(&shared, &visit, ("private/", None, None))
         .await
         .unwrap();
     assert!(listed.files.is_empty() && listed.folders.is_empty());
-    let (mut cursor, mut shown) = (None, Vec::new());
+    // One entry a page puts a cursor next to the hidden folder; every cursor must decode.
+    let (mut cursor, mut shown, mut cursors) = (None, Vec::new(), 0);
     loop {
         let listed = page(&shared, &visit, ("", cursor, Some(1))).await.unwrap();
         shown.extend(listed.files.into_iter().map(|file| file.name));
@@ -309,14 +319,118 @@ async fn serving_policy_hides() {
         let Some(next) = listed.next_cursor else {
             break;
         };
-        if let Ok(Resume::After { key, group }) = decode_resume::<()>(&next) {
-            assert!(
-                !key.contains("private") && group.is_none_or(|group| !group.contains("private"))
-            );
-        }
+        let resume = decode_resume(&next).expect("a visit cursor decodes");
+        let fields = visible_fields(&resume);
+        assert!(
+            fields.iter().all(|field| !field.contains("private")),
+            "{resume:?}"
+        );
+        cursors += 1;
         cursor = Some(next);
     }
-    assert_eq!(shown, ["public.txt"]);
+    assert!(cursors > 0, "the listing needs a cursor");
+    assert_eq!(shown, ["a.txt", "public.txt"]);
+}
+
+/// Every field of a cursor a visitor can read; each cursor shape is named, so a new one must
+/// be added here.
+fn visible_fields(resume: &aruna_operations::s3::object::pages::Resume) -> Vec<String> {
+    use aruna_operations::s3::object::pages::Resume;
+    match resume {
+        Resume::After { key, group } => [Some(key.clone()), group.clone()]
+            .into_iter()
+            .flatten()
+            .collect(),
+        Resume::From(lower) => vec![lower.clone()],
+        Resume::Hidden {
+            lower,
+            cursor,
+            group,
+            ..
+        } => [Some(lower.clone()), Some(cursor.clone()), group.clone()]
+            .into_iter()
+            .flatten()
+            .collect(),
+    }
+}
+
+// A page that visits its bound of empty ranges goes on from the next range's lower bound.
+#[tokio::test]
+async fn empty_ranges_resume() {
+    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    let bounds: Vec<String> = (0..64).map(|n| format!("k{n:02}")).collect();
+    let bounds: Vec<&str> = bounds.iter().map(String::as_str).collect();
+    let shared = shared_ranges(&bounds).await;
+    put(&shared, 0, "z.txt", "last").await;
+    let (_, visit) = visit(&shared, ShareModeBody::Read).await;
+    let listed = page(&shared, &visit, ("", None, Some(10))).await.unwrap();
+    assert!(listed.files.is_empty() && listed.folders.is_empty());
+    let next = listed.next_cursor.expect("the range bound ends the page");
+    assert_eq!(
+        decode_resume(&next).unwrap(),
+        Resume::From("k63".to_string())
+    );
+    let rest = page(&shared, &visit, ("", Some(next), Some(10)))
+        .await
+        .unwrap();
+    let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
+    assert_eq!(names, ["z.txt"]);
+}
+
+// The serving member's own policy hides a run longer than its scan budget: the page stops among
+// the hidden entries with a sealed cursor that names none of them. A holder's sealed cursor is
+// followed by the serving member's own scan, so only this member's rules end a page there.
+#[tokio::test]
+async fn hidden_run_resumes() {
+    use aruna_operations::s3::object::pages::{Resume, decode_resume};
+    use aruna_operations::s3::object::visible::SCAN_BUDGET;
+    let shared = shared().await;
+    // Member 0 coordinates the keys below "m"; the visible key sorts after the hidden run.
+    for n in 0..=SCAN_BUDGET {
+        put(&shared, 0, &format!("hidden{n:04}.txt"), "closed").await;
+    }
+    put(&shared, 0, "i.txt", "open").await;
+    let expression = "request.session.kind == 'share' && path.contains('/hidden')";
+    shared.members.deny_on(0, expression).await;
+    let (_, visit) = visit(&shared, ShareModeBody::Read).await;
+    let listed = page(&shared, &visit, ("", None, Some(10))).await.unwrap();
+    assert!(listed.files.is_empty());
+    let next = listed.next_cursor.expect("the scan budget ends the page");
+    let resume = decode_resume(&next).unwrap();
+    assert!(matches!(resume, Resume::Hidden { .. }), "{resume:?}");
+    let fields = visible_fields(&resume);
+    assert!(
+        fields.iter().all(|field| !field.contains("hidden")),
+        "{resume:?}"
+    );
+    let rest = page(&shared, &visit, ("", Some(next), Some(10)))
+        .await
+        .unwrap();
+    let names: Vec<_> = rest.files.into_iter().map(|file| file.name).collect();
+    assert_eq!(names, ["i.txt"]);
+}
+
+#[test]
+fn cursor_fields_named() {
+    // Each cursor shape shows the path parts it carries, so the check above sees them.
+    use aruna_operations::s3::object::pages::Resume;
+    let after = Resume::After {
+        key: "private/a".into(),
+        group: Some("private/".into()),
+    };
+    assert_eq!(visible_fields(&after), ["private/a", "private/"]);
+    assert_eq!(
+        visible_fields(&Resume::From("private/b".into())),
+        ["private/b"]
+    );
+    let hidden = Resume::Hidden {
+        lower: "private/c".into(),
+        node: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        copy: false,
+        cursor: "sealed".into(),
+        group: None,
+    };
+    assert_eq!(visible_fields(&hidden), ["private/c", "sealed"]);
 }
 
 // A range whose coordinator is down cannot be listed or written, and the visitor is told to
@@ -373,9 +487,9 @@ async fn uploads_reach_coordinator() {
     assert_eq!(stored(&shared, 1, "y (1).txt").await.unwrap(), b"other");
     assert_eq!(stored(&shared, 1, "z.txt").await.unwrap(), b"again");
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
+    let auth = shared.owner.clone();
     let query = Query(ShareLogQuery::default());
-    let Json(log) = share_log(state, auth, Path(link.share.id), query)
+    let Json(log) = share_log(state, UnrestrictedAuth(auth), Path(link.share.id), query)
         .await
         .unwrap();
     let sizes: Vec<_> = log.entries.iter().filter_map(|entry| entry.bytes).collect();
@@ -441,9 +555,9 @@ async fn remote_key_downloads() {
         "not_found"
     );
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
+    let auth = shared.owner.clone();
     let query = Query(ShareLogQuery::default());
-    let Json(log) = share_log(state, auth, Path(link.share.id), query)
+    let Json(log) = share_log(state, UnrestrictedAuth(auth), Path(link.share.id), query)
         .await
         .unwrap();
     let download = log
@@ -462,15 +576,15 @@ async fn ticket_error(shared: &Shared, visit: &str, name: &str) -> ServerError {
 // a ticket already handed out and a listing alike.
 #[tokio::test]
 async fn ended_link_refused() {
-    use aruna_core::effects::Effect;
-    use aruna_operations::shares::store::save_effect;
+    use aruna_core::effects::StorageEffect;
+    use aruna_operations::shares::store::save_rows;
     let shared = shared().await;
     put(&shared, 1, "y.txt", "far").await;
     let (link, opened) = visit(&shared, ShareModeBody::Read).await;
     let issued = ticket(&shared, &opened, "y.txt").await.unwrap();
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
-    revoke_share(state, auth, Path(link.share.id))
+    let auth = shared.owner.clone();
+    revoke_share(state, UnrestrictedAuth(auth), Path(link.share.id))
         .await
         .unwrap();
     assert_eq!(
@@ -488,9 +602,11 @@ async fn ended_link_refused() {
         .await
         .unwrap()
         .unwrap();
-    stored.expires_at = Some(unix_now() - 1);
-    let Effect::Storage(write) = save_effect(&stored).unwrap() else {
-        panic!("a link record is one storage write");
+    stored.expires_at = Some(unix_timestamp_secs() - 1);
+    let writes = save_rows(&stored).unwrap();
+    let write = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
     };
     context.storage_handle.send_storage_effect(write).await;
     assert_eq!(
@@ -564,8 +680,9 @@ async fn member_part(
         expires_at: None,
         password: None,
     };
-    let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request)).await?;
+    let auth = test.auth.clone();
+    let (_, Json(link)) =
+        create_share(State(state.clone()), UnrestrictedAuth(auth), Json(request)).await?;
     let open = Some(Json(OpenShareRequest::default()));
     let headers = share_headers(&link.token);
     let opened = open_share(State(state.clone()), peer(), headers, open).await;
@@ -629,12 +746,12 @@ async fn dataset_part_group() {
 async fn index_content(state: &ServerState, set_id: Ulid, hash: [u8; 32]) -> Ulid {
     use crate::tests::distributed::write;
     use aruna_core::keyspaces::{CONTENT_INDEX_KEYSPACE, VERSION_INDEX_KEYSPACE};
-    use aruna_core::structs::storage::distribution::hint::mint_version;
+    use aruna_core::structs::storage::distribution::OriginalEpoch;
+    use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
     use aruna_core::structs::storage::distribution::inventory::{
         IndexEntry, VersionEntry, content_key, index_key, version_position,
     };
-    use aruna_core::structs::storage::distribution::{OriginalEpoch, SetHint};
-    let version = mint_version(Some(SetHint::of_set(set_id)));
+    let version = mint_version(Ulid::generate(), Some(SetHint::of_set(set_id)));
     let position = version_position(set_id, "x/a.txt", OriginalEpoch(1), 1, version);
     let entry = IndexEntry {
         position,
@@ -685,8 +802,8 @@ async fn dataset_global_parts() {
         expires_at: None,
         password: None,
     };
-    let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+    let auth = test.auth.clone();
+    let (_, Json(link)) = create_share(State(state.clone()), UnrestrictedAuth(auth), Json(request))
         .await
         .unwrap();
     let open = Some(Json(OpenShareRequest::default()));
@@ -748,8 +865,10 @@ async fn escaped_folder_listed() {
         password: None,
     };
     let state = State(shared.state.clone());
-    let auth = Extension(Some(shared.owner.clone()));
-    let (_, Json(link)) = create_share(state, auth, Json(request)).await.unwrap();
+    let auth = shared.owner.clone();
+    let (_, Json(link)) = create_share(state, UnrestrictedAuth(auth), Json(request))
+        .await
+        .unwrap();
     let open = Some(Json(OpenShareRequest::default()));
     let opened = open_share(
         State(shared.state.clone()),
@@ -769,7 +888,7 @@ async fn content_skips_unreadable() {
     use crate::tests::distributed::{LOCAL, PEER, distribute, node_id, publish_urls};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::storage::data::identity::content_id;
-    use aruna_core::structs::storage::distribution::SetRoot;
+    use aruna_core::structs::storage::distribution::statement::SetRoot;
     let test = crate::routes::metadata::tests::setup_network_state().await;
     let state = test.state.clone();
     let set_of = |owner_group| {
@@ -788,7 +907,7 @@ async fn content_skips_unreadable() {
     let [unreadable, readable] = groups;
     assert!(set_of(unreadable) < set_of(readable));
     let (context, realm) = (state.get_ctx(), test.auth.realm_id);
-    let stranger = aruna_core::UserId::local(Ulid::from_bytes([98; 16]), realm);
+    let stranger = aruna_core::user::id::UserId::local(Ulid::from_bytes([98; 16]), realm);
     // The link's creator owns the readable group only; a stranger owns the other one.
     for (group, name, owner) in [
         (unreadable, "closed", stranger),
@@ -821,8 +940,8 @@ async fn content_skips_unreadable() {
         expires_at: None,
         password: None,
     };
-    let auth = Extension(Some(test.auth.clone()));
-    let (_, Json(link)) = create_share(State(state.clone()), auth, Json(request))
+    let auth = test.auth.clone();
+    let (_, Json(link)) = create_share(State(state.clone()), UnrestrictedAuth(auth), Json(request))
         .await
         .unwrap();
     let open = Some(Json(OpenShareRequest::default()));

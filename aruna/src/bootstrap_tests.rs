@@ -7,11 +7,12 @@ use super::{
     publish_core_documents, retry_deadline, sync_peer_topic, sync_with_retry, unique_user_topic,
     watch_target_needed,
 };
-use crate::identity::PersistedNodeIdentity;
-use aruna_core::NodeId;
+use crate::inbound::initialize_incoming_fixture;
+use crate::tasks::incoming::OutboxDrainer;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, WATCH_INTEREST_KEYSPACE};
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::execution::notification_watch::{
@@ -19,18 +20,20 @@ use aruna_core::structs::execution::notification_watch::{
     interest_node_key,
 };
 use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::interest::publish_watch_interest;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_operations::notifications::watch::interest::PublishInterestOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_operations::sync::document_outbox::read_outbox_records;
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
-use aruna_operations::tasks::incoming::OutboxDrainer;
-use aruna_storage::FjallStorage;
+use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::documents::read_outbox_records;
+use aruna_test_support::documents::reconcile_topics;
 use byteview::ByteView;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,10 +43,10 @@ use tempfile::tempdir;
 fn user_topics_deduplicate() {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let first = DocumentTarget::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([2u8; 16]), realm_id),
     };
     let second = DocumentTarget::User {
-        user_id: aruna_core::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([3u8; 16]), realm_id),
     };
     let first_shard = aruna_core::structs::placement::record::PlacementRef {
         strategy_id: ulid::Ulid::from_bytes([4u8; 16]),
@@ -105,7 +108,7 @@ fn unreachable_peer_waited() {
 // selects it: infrastructure keeps fetching its documents over sync.
 #[test]
 fn device_identity_routes() {
-    let owner = aruna_core::UserId::nil(RealmId::from_bytes([2u8; 32]));
+    let owner = aruna_core::user::id::UserId::nil(RealmId::from_bytes([2u8; 32]));
     assert_eq!(PersistedNodeIdentity::User { owner }.owner(), Some(owner));
     assert_eq!(
         PersistedNodeIdentity::Server {
@@ -134,28 +137,18 @@ fn watch_target_cases() {
     assert!(!watch_target_needed(false, false, false));
 }
 
-fn context(storage_handle: aruna_storage::StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
-}
-
 fn context_net(
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     net_handle: NetHandle,
 ) -> DriverContext {
     DriverContext {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
@@ -242,7 +235,7 @@ async fn write_config_nodes(
         .collect();
     let actor = Actor {
         node_id,
-        user_id: aruna_core::UserId::nil(realm_id),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
         realm_id,
     };
     assert!(matches!(
@@ -304,7 +297,7 @@ async fn seed_topic(
     let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     assert!(net.sync_topic_exists(topic).unwrap());
     assert_eq!(net.realm_peers().await, vec![peer_id]);
-    net.reconcile_sync_topics(vec![topic]).await.unwrap();
+    reconcile_topics(context, vec![topic]).await.unwrap();
     topic
 }
 
@@ -397,7 +390,11 @@ async fn restart_stays_quiet() {
             .await
             .unwrap();
         assert!(!targets.contains(&target));
-        assert!(!publish_watch_interest(&context, node_id).await.unwrap());
+        assert!(
+            !drive(PublishInterestOperation::new(Some(node_id)), &context)
+                .await
+                .unwrap()
+        );
         assert!(read_marker(&context, realm_id).await.is_none());
         let batch = read_outbox_records(&context.storage_handle, &[], None, 8)
             .await
@@ -414,8 +411,8 @@ async fn joiner_announces_watch() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 11).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_incoming_fixture(bootstrap_context.clone());
-    initialize_incoming_fixture(joiner_context.clone());
+    let _bootstrap_incoming = initialize_incoming_fixture(bootstrap_context.clone());
+    let _joiner_incoming = initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -454,7 +451,7 @@ async fn joiner_announces_watch() {
     )
     .await;
     sync_peer_topic(
-        &joiner_net,
+        &joiner_context,
         topic,
         bootstrap_id,
         &bootstrap_target,
@@ -501,8 +498,8 @@ async fn retries_until_seeded() {
     let (_joiner_dir, joiner_context, joiner_net) = net_context(realm_id, 13).await;
     let bootstrap_context = Arc::new(bootstrap_context);
     let joiner_context = Arc::new(joiner_context);
-    initialize_incoming_fixture(bootstrap_context.clone());
-    initialize_incoming_fixture(joiner_context.clone());
+    let _bootstrap_incoming = initialize_incoming_fixture(bootstrap_context.clone());
+    let _joiner_incoming = initialize_incoming_fixture(joiner_context.clone());
     let bootstrap_id = bootstrap_net.node_id();
     let joiner_id = joiner_net.node_id();
     write_config_nodes(
@@ -535,7 +532,7 @@ async fn retries_until_seeded() {
     let topic = target.sync_topic_id(realm_id, &PlacementRef::NIL);
     let (sync, seeded) = tokio::join!(
         sync_with_retry(
-            &joiner_net,
+            &joiner_context,
             topic,
             bootstrap_id,
             &target,
@@ -602,7 +599,11 @@ async fn publication_retries() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
 
-    assert!(publish_watch_interest(&context, node_id).await.is_err());
+    assert!(
+        drive(PublishInterestOperation::new(Some(node_id)), &context)
+            .await
+            .is_err()
+    );
     assert!(read_marker(&context, realm_id).await.is_some());
 
     write_config(&context, realm_id, node_id).await;
@@ -632,7 +633,11 @@ async fn publication_retries() {
     );
     OutboxDrainer::new(restarted.clone()).run_once().await;
     assert!(net.sync_topic_exists(topic).unwrap());
-    assert!(publish_watch_interest(&restarted, node_id).await.unwrap());
+    assert!(
+        drive(PublishInterestOperation::new(Some(node_id)), &restarted)
+            .await
+            .unwrap()
+    );
     assert!(read_marker(&restarted, realm_id).await.is_none());
 
     net.shutdown().await;
@@ -687,7 +692,7 @@ fn readiness_requires_all() {
 async fn read_digest(
     context: &DriverContext,
     realm_id: RealmId,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
 ) -> WatchInterestDigest {
     match context
         .storage_handle
@@ -730,7 +735,7 @@ async fn initial_watch_digest() {
 async fn existing_watch_digest() {
     let dir = tempdir().unwrap();
     let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let context = context(storage);
+    let context = test_context(storage);
     let realm_id = RealmId::from_bytes([5u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
     let digest = WatchInterestDigest {
@@ -795,7 +800,7 @@ async fn interrupted_secret_retries() {
     let seed_url = "http://127.0.0.1:1".to_string();
     let orphan = admin_record("orphan");
 
-    let interrupted = context(FjallStorage::open(path).unwrap());
+    let interrupted = test_context(FjallStorage::open(path).unwrap());
     drive(
         CreateSecretOperation::new(CreateSecretInput {
             record: orphan.clone(),
@@ -806,14 +811,14 @@ async fn interrupted_secret_retries() {
     .unwrap();
     interrupted.storage_handle.close().await;
 
-    let retried = context(FjallStorage::open(path).unwrap());
+    let retried = test_context(FjallStorage::open(path).unwrap());
     let secret = ensure_onboarding_secret(&retried, seed_url.clone(), &[3u8; 32], realm_id)
         .await
         .unwrap();
     assert_ne!(secret.enrollment_id, orphan.enrollment_id);
     retried.storage_handle.close().await;
 
-    let reopened = context(FjallStorage::open(path).unwrap());
+    let reopened = test_context(FjallStorage::open(path).unwrap());
     let reloaded = ensure_onboarding_secret(&reopened, seed_url.clone(), &[3u8; 32], realm_id)
         .await
         .unwrap();

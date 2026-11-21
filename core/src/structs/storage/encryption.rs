@@ -3,14 +3,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::compute::{SecretBytes, SharedSecret};
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::key_seal::seal_to;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::blob::ArchiveKey;
+use crate::user::id::UserId;
 use crate::vault_format::key_fingerprint;
+use hpke::rand_core::CryptoRng;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::fmt;
@@ -501,10 +502,10 @@ impl PartialEq for ReadLease {
     }
 }
 
-/// A fresh bucket keypair from the system random number generator.
-pub fn generate_key() -> Result<([u8; 32], SharedSecret), BucketKeyError> {
+/// A fresh bucket keypair drawn from `rng`, which must be secret.
+pub fn generate_key(rng: &mut impl CryptoRng) -> Result<([u8; 32], SharedSecret), BucketKeyError> {
     let mut bytes = Zeroizing::new(vec![0u8; 32]);
-    getrandom::fill(&mut bytes).map_err(|_| BucketKeyError::Seal)?;
+    rng.fill_bytes(&mut bytes);
     let private = SecretBytes::new(std::mem::take(&mut *bytes));
     let public = public_key_of(&private).ok_or(BucketKeyError::Seal)?;
     Ok((public, SharedSecret::new(private)))
@@ -519,6 +520,7 @@ pub fn seal_copies(
     origin: (RealmId, NodeId),
     targets: &[CopyTarget],
     now_ms: u64,
+    rng: &mut impl CryptoRng,
 ) -> Result<Vec<SealedCopy>, BucketKeyError> {
     if !key_matches(private, public_key) {
         return Err(BucketKeyError::WrongKey);
@@ -528,7 +530,7 @@ pub fn seal_copies(
         .iter()
         .map(|target| {
             let info = copy_info(realm_id, node_id, key, target.user_id, target.key_record);
-            let sealed = seal_to(&target.public_key, &info, &[], private.expose())
+            let sealed = seal_to(&target.public_key, &info, &[], private.expose(), rng)
                 .map_err(|_| BucketKeyError::Seal)?;
             Ok(SealedCopy {
                 key,
@@ -805,7 +807,7 @@ mod tests {
 
     #[test]
     fn seals_holder_copies() {
-        let (public, private) = generate_key().unwrap();
+        let (public, private) = generate_key(&mut crate::key_seal::SeedRng::new(&[7; 32])).unwrap();
         assert_eq!(public_key_of(private.bytes()), Some(public));
         let realm = RealmId::from_bytes([1; 32]);
         let node = SecretKey::from_bytes(&[2; 32]).public();
@@ -822,8 +824,16 @@ mod tests {
             })
             .collect();
 
-        let copies =
-            seal_copies(key, &public, private.bytes(), (realm, node), &targets, 9).unwrap();
+        let copies = seal_copies(
+            key,
+            &public,
+            private.bytes(),
+            (realm, node),
+            &targets,
+            9,
+            &mut crate::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .unwrap();
         for ((copy, target), secret) in copies.iter().zip(&targets).zip(&holder_keys) {
             assert_eq!(
                 (copy.user_id, copy.key_record, copy.key),
@@ -838,8 +848,16 @@ mod tests {
             assert_eq!(opened.as_slice(), private.bytes().expose());
         }
         // A key that does not match the generation's public key is never sealed.
-        let (other, _) = generate_key().unwrap();
-        let wrong = seal_copies(key, &other, private.bytes(), (realm, node), &targets, 9);
+        let (other, _) = generate_key(&mut crate::key_seal::SeedRng::new(&[8; 32])).unwrap();
+        let wrong = seal_copies(
+            key,
+            &other,
+            private.bytes(),
+            (realm, node),
+            &targets,
+            9,
+            &mut crate::key_seal::SeedRng::new(&[7; 32]),
+        );
         assert_eq!(wrong, Err(BucketKeyError::WrongKey));
     }
 
@@ -869,7 +887,14 @@ mod tests {
         let private = [9u8; 32];
         let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(private));
         let info = copy_info(realm, node, reference, user(5), record);
-        let sealed = seal_to(public.as_bytes(), &info, &[], b"bucket private key").unwrap();
+        let sealed = seal_to(
+            public.as_bytes(),
+            &info,
+            &[],
+            b"bucket private key",
+            &mut crate::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .unwrap();
         assert_eq!(
             &*open_sealed(&private, &sealed, &info, &[]).unwrap(),
             b"bucket private key"
@@ -905,7 +930,7 @@ mod tests {
 
     #[test]
     fn tokens_parse_strictly() {
-        let (_, token) = generate_key().unwrap();
+        let (_, token) = generate_key(&mut crate::key_seal::SeedRng::new(&[7; 32])).unwrap();
         let text = TokenCredential::encode(token.bytes());
         assert_eq!(text.len(), 64);
         let parsed = TokenCredential::parse("KEY", text.as_bytes()).unwrap();

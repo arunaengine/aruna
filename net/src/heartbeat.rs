@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aruna_core::NodeId;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
+use aruna_core::id::NodeId;
 use parking_lot::Mutex;
 
 /// Shortest gap between two accepted heartbeats of one peer.
@@ -92,7 +92,7 @@ impl HeartbeatTable {
             Held {
                 heartbeat,
                 received: Instant::now(),
-                received_at_ms: aruna_core::time::unix_timestamp_millis(),
+                received_at_ms: aruna_clock::unix_timestamp_millis(),
             },
         );
         true
@@ -113,7 +113,7 @@ impl HeartbeatTable {
             Held {
                 heartbeat,
                 received: Instant::now(),
-                received_at_ms: aruna_core::time::unix_timestamp_millis(),
+                received_at_ms: aruna_clock::unix_timestamp_millis(),
             },
         );
     }

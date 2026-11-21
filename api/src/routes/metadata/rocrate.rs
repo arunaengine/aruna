@@ -2,33 +2,38 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ValidatedBearer, ensure_permission_with, require_realm_auth, require_unrestricted_auth,
-};
+use crate::auth::{RealmAuth, UnrestrictedAuth};
+use crate::auth::{ValidatedBearer, ensure_permission_with};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{
+use crate::job_service::submit_export_job;
+use crate::jobs::job_urls;
+use crate::lookup::actor;
+use crate::metadata::model::{
     JsonLdObject, MetadataDocumentSummary, MetadataRoCrateResponse, MetadataRoCrateView,
     ReplaceRoCrateRequest, RoCrateExportParams, SubmitExportRequest, SubmitExportResponse,
+};
+use crate::metadata::{
     commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
     load_document_record, local_write_record, map_api_error, map_export_response, map_export_view,
     map_write_error, parse_document_id, serialize_jsonld_object, with_global_ids,
 };
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::repository::links::{
     connector, ensure_capable, ensure_requirements, validate_record_id,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::execution::job::ExportRoCrateSpec;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
+use aruna_core::metadata::api::UpdateDocumentMutation;
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::structs::execution::job::input::ExportRoCrateSpec;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
-use aruna_operations::jobs::service::submit_export_job;
-use aruna_operations::metadata::api::ExportMetadataRequest;
-use aruna_operations::metadata::forward::{
-    export_rocrate_routed as run_export_rocrate,
-    route_metadata_update as run_update_metadata_document,
+use aruna_operations::metadata::api::export::ExportOperation;
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
+use aruna_operations::metadata::forward::routed::export::{
+    RoutedExportOperation, ensure_export_limit,
 };
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
+use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -250,23 +255,24 @@ pub async fn export_metadata_rocrate(
     let metadata_bytes = state.rocrate_limits().metadata_bytes;
     let export = match params.here {
         true => {
-            aruna_operations::metadata::forward::export_rocrate_here(
+            // This node's own copy only, for a w3id redirect that chose it.
+            drive(
+                ExportOperation::new(state.get_realm_id(), request),
                 ctx.as_ref(),
-                state.get_realm_id(),
-                request,
-                metadata_bytes,
             )
             .await
+            .and_then(|export| ensure_export_limit(&export, metadata_bytes).map(|()| export))
         }
         false => {
-            run_export_rocrate(
-                &ctx,
+            let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
+            let export = RoutedExportOperation::new(
+                local_node,
                 state.get_realm_id(),
                 request,
                 forwarded_auth_token(bearer_token)?,
                 metadata_bytes,
-            )
-            .await
+            );
+            drive(export, ctx.as_ref()).await
         }
     }
     .map_err(map_api_error)?;
@@ -324,7 +330,6 @@ registry view. A path-restricted delegated token is refused even when it would p
             )
         ),
         (status = 400, description = "Malformed body, unknown fields, or a document id that is not a structured metadata id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "READ denied on the document, the token belongs to another realm, or the token is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node's registry view has no such metadata document", body = ErrorResponse),
         (status = 409, description = "The idempotency key is already bound to a job with a different plan, or the caller's active RO-Crate job limit is reached", body = ErrorResponse)
@@ -333,11 +338,10 @@ registry view. A path-restricted delegated token is refused even when it would p
 )]
 pub async fn submit_rocrate_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
     Json(request): Json<SubmitExportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let record = load_document_record(&state, document_id).await?;
     ensure_permission_with(
@@ -422,11 +426,12 @@ pub async fn submit_rocrate_export(
         Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
         destination.credential = Some(
             seal_token(
-                &state.get_ctx(),
+                state.get_ctx().credential_key(),
                 auth.user_id,
                 &view,
                 None,
                 access_token.as_deref().unwrap_or_default(),
+                rand::random::<[u8; 24]>(),
             )
             .map_err(|error| match error {
                 TransferError::Permanent(message) => ServerError::BadRequestReason(message),
@@ -557,12 +562,11 @@ as none."#,
 )]
 pub async fn replace_metadata_rocrate(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(request): Json<ReplaceRoCrateRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let message = commit_message(request.message)?;
     ensure_readable_files(&state, &auth, &crate_entities(&request.rocrate)).await?;
@@ -575,22 +579,26 @@ pub async fn replace_metadata_rocrate(
         .map(str::parse::<ulid::Ulid>)
         .transpose()
         .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_drivers::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: request.public,
+                mutation: UpdateDocumentMutation::ReplaceRoCrate {
+                    jsonld: serialize_jsonld_object(
+                        &with_global_ids(&state, &request.rocrate).await?,
+                    )?,
+                },
+                expected_revision,
+                commit_message: message,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
-        record.as_ref(),
-        document_id,
-        request.public,
-        UpdateDocumentMutation::ReplaceRoCrate {
-            jsonld: serialize_jsonld_object(&with_global_ids(&state, &request.rocrate).await?)?,
-        },
-        expected_revision,
-        forwarded_auth_token(bearer_token)?,
-        message,
     )
     .await
     .map_err(map_write_error)?;
@@ -674,33 +682,34 @@ caller's own token.
 )]
 pub async fn add_data_entity(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     ensure_readable_files(&state, &auth, &crate_entities(&entity)).await?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_drivers::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::UpsertDataEntity {
+                    jsonld: serialize_jsonld_entity(&with_global_ids(&state, &entity).await?)?,
+                },
+                expected_revision: None,
+                commit_message: None,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
-        record.as_ref(),
-        document_id,
-        None,
-        UpdateDocumentMutation::UpsertDataEntity {
-            jsonld: serialize_jsonld_entity(&with_global_ids(&state, &entity).await?)?,
-        },
-        None,
-        forwarded_auth_token(bearer_token)?,
-        None,
     )
     .await
     .map_err(map_write_error)?;
@@ -778,32 +787,33 @@ caller's own token.
 )]
 pub async fn remove_data_entity(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Query(query): Query<RemovalQuery>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     let expected_revision = (query.expected_revision.parse::<ulid::Ulid>())
         .map_err(|_| ServerError::BadRequestMessage("expected_revision is not a ULID".into()))?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_drivers::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::RemoveDataEntity { id: query.id },
+                expected_revision: Some(expected_revision),
+                commit_message: None,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
-        record.as_ref(),
-        document_id,
-        None,
-        UpdateDocumentMutation::RemoveDataEntity { id: query.id },
-        Some(expected_revision),
-        forwarded_auth_token(bearer_token)?,
-        None,
     )
     .await
     .map_err(map_write_error)?;
@@ -884,33 +894,34 @@ caller's own token.
 )]
 pub async fn add_contextual_entity(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
     Json(entity): Json<Value>,
 ) -> ServerResult<(StatusCode, Json<MetadataDocumentSummary>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
     ensure_readable_files(&state, &auth, &crate_entities(&entity)).await?;
     let ctx = state.get_ctx();
     let record =
         local_write_record(&state, &auth, document_id, PolicyRequestExtras::rest()).await?;
-    let updated = run_update_metadata_document(
+    let updated = aruna_drivers::driver::drive(
+        RouteUpdateOperation::new(
+            (
+                actor(&state, &auth),
+                ctx.net_handle.as_ref().map(|net| net.node_id()),
+            ),
+            (record.clone(), document_id),
+            DocumentUpdate {
+                public: None,
+                mutation: UpdateDocumentMutation::UpsertContextualEntity {
+                    jsonld: serialize_jsonld_entity(&entity)?,
+                },
+                expected_revision: None,
+                commit_message: None,
+            },
+            forwarded_auth_token(bearer_token)?,
+        ),
         &ctx,
-        Actor {
-            node_id: state.get_node_id(),
-            user_id: auth.user_id,
-            realm_id: state.get_realm_id(),
-        },
-        record.as_ref(),
-        document_id,
-        None,
-        UpdateDocumentMutation::UpsertContextualEntity {
-            jsonld: serialize_jsonld_entity(&entity)?,
-        },
-        None,
-        forwarded_auth_token(bearer_token)?,
-        None,
     )
     .await
     .map_err(map_write_error)?;

@@ -1,5 +1,5 @@
 //! Tests the MCP artifact contract: a captured PNG keeps its content type and is served by S3.
-//! Skips when Docker is unavailable.
+//! Ignored by default, since it needs a Docker daemon.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,11 +8,12 @@
 use crate::shared;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use aruna_clock::testing::poll_until;
 use aruna_compute::executor::docker::DockerBackend;
-use aruna_compute::{DockerConfig, ExecutorBackend, ExecutorRegistry};
-use aruna_core::structs::execution::job::JobId;
+use aruna_compute::registry::ExecutorRegistry;
+use aruna_core::structs::execution::job::identity::JobId;
 use aws_sdk_s3::primitives::ByteStream;
 use rmcp::model::{CallToolRequestParams, CallToolResult, ClientConfig, ProtocolVersion};
 use rmcp::service::RunningService;
@@ -35,31 +36,6 @@ plt.bar(["a", "b", "c"], [3, 1, 2])
 plt.savefig("/work/chart.png")
 "#;
 
-/// A reachable, healthy Docker daemon, or `None` (test skips).
-async fn docker_or_skip() -> Option<DockerBackend> {
-    let config = DockerConfig {
-        keep_failed: std::env::var("ARUNA_KEEP_FAILED").is_ok(),
-        // Its own state root, so tests that run at once never contend for one owner lock.
-        state_root: std::env::temp_dir()
-            .join("aruna-compute-tests")
-            .join(ulid::Ulid::generate().to_string()),
-        ..DockerConfig::default()
-    };
-    match DockerBackend::with_config(config) {
-        Ok(backend) => match backend.health().await {
-            Ok(()) => Some(backend),
-            Err(error) => {
-                eprintln!("skipping artifact test: docker daemon unhealthy: {error}");
-                None
-            }
-        },
-        Err(error) => {
-            eprintln!("skipping artifact test: no reachable docker daemon: {error}");
-            None
-        }
-    }
-}
-
 struct Fixture {
     seed: shared::SeedNode,
     group_id: Ulid,
@@ -72,7 +48,7 @@ struct Fixture {
 /// Docker-backed node running its own jobs + a group bucket holding a few dated
 /// objects the aggregation counts.
 async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(Arc::new(backend)));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", Arc::new(backend)));
     let seed = spawn_compute_seed(registry).await?;
     let endpoint = seed.s3.clone().expect("full node exposes S3");
     let bearer = create_bearer_token(
@@ -176,36 +152,45 @@ async fn wait_view(
     idle: Duration,
 ) -> Value {
     let mut progress = None;
-    let mut deadline = Instant::now() + idle;
     let mut last = Err("get_job was never answered".to_string());
     loop {
-        last = job_view(client, job_id).await.or(last);
-        let state = last
-            .as_ref()
-            .ok()
-            .and_then(|job| job["state"].as_str())
-            .map(str::to_string);
-        if matches!(state.as_deref(), Some("succeeded" | "failed" | "cancelled")) {
-            return last.expect("terminal view");
+        // A window ends early when the view moves, so only a stalled view fails.
+        let moved = poll_until(idle, async || {
+            let answer = job_view(client, job_id).await;
+            if answer.is_ok() {
+                last = answer;
+            }
+            let state = last
+                .as_ref()
+                .ok()
+                .and_then(|job| job["state"].as_str())
+                .map(str::to_string);
+            if matches!(state.as_deref(), Some("succeeded" | "failed" | "cancelled")) {
+                return Some(true);
+            }
+            if state.is_some() && state != progress {
+                progress = state;
+                return Some(false);
+            }
+            None
+        })
+        .await;
+        match moved {
+            Some(true) => return last.expect("terminal view"),
+            Some(false) => {}
+            None => {
+                return last.unwrap_or_else(|error| panic!("get_job stayed unavailable: {error}"));
+            }
         }
-        if state.is_some() && state != progress {
-            progress = state;
-            deadline = Instant::now() + idle;
-        }
-        if Instant::now() >= deadline {
-            return last.unwrap_or_else(|error| panic!("get_job stayed unavailable: {error}"));
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
 // A chart written by a script run is discoverable and displayable: the tools
 // name its type, size, filename, and exact version, and S3 serves those bytes.
 #[tokio::test]
+#[ignore = "requires a running Docker daemon"]
 async fn artifact_round_trip() -> TestResult<()> {
-    let Some(backend) = docker_or_skip().await else {
-        return Ok(());
-    };
+    let backend = shared::docker_backend().await;
     let fixture = setup(backend).await?;
     let client = connect(&fixture.seed.base_url, &fixture.bearer).await;
 

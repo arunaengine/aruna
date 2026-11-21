@@ -2,8 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub mod authorization;
-pub mod emit;
-pub mod expand;
+#[cfg(test)]
+mod authorization;
+pub mod check;
+pub mod digest;
+pub mod drain;
+#[cfg(test)]
+mod emit;
+#[cfg(test)]
+mod expand;
+pub mod expansion;
 pub mod interest;
-pub mod subscriptions;
+pub mod listing;
+pub mod origin;
+pub mod paths;
+pub mod records;
+pub mod remove;
+pub mod store;
+#[cfg(test)]
+mod subscriptions;
+pub mod table;

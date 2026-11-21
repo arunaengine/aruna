@@ -3,16 +3,25 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod cleanup;
+pub mod cleanup_timer;
 pub mod hidden;
 pub mod holders;
-pub mod managed_copy;
+pub mod import_rows;
+pub mod merge_copies;
 pub mod migration;
-pub mod pending_reclaim;
-pub mod permission_paths;
-pub mod promote;
+pub mod pause;
+pub(crate) mod pending_reclaim;
+pub(crate) mod promote;
 pub mod purge;
 pub mod reclaim;
-pub mod records;
-pub mod release;
+pub mod reclaim_sweep;
+pub(crate) mod release;
+pub(crate) mod request;
+pub mod sweep_timer;
 pub(crate) mod trail;
 pub mod unify;
+pub mod unlocked;
+
+#[cfg(test)]
+#[path = "paths_tests.rs"]
+mod paths_tests;

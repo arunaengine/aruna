@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::federation::export::{
     INTENT_HEADER, decode_header, grant_header, transfer_refused,
@@ -14,45 +14,41 @@ use crate::routes::rocrate_import::{
     parse_import_metadata, parse_import_target, submit_import, upload_response,
 };
 use crate::server::state::ServerState;
+use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::federation::Signed;
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::execution::job::{RoCrateMediaType, RoCrateUploadRecord};
+use aruna_core::structs::execution::job::input::{RoCrateMediaType, RoCrateUploadRecord};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
 use aruna_core::transfer::{ExportGrant, ImportDestination, ImportIntent, TransferError};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::federation::import::{
-    self, ImportError, ImportRecord, authorize_import, reusable_upload, write_import,
+    AuthorizeImportOperation, GRANT_HEADER, ImportError, ReusableUploadOperation,
+    WriteImportOperation, answer_error, header_value,
 };
+use aruna_operations::federation::records::ImportRecord;
 use aruna_operations::federation::transfer::{
     AdmitTransferConfig, AdmitTransferOperation, IssueIntentConfig, IssueIntentOperation,
     TransferAdmitError,
 };
-use aruna_operations::jobs::import::{
-    CreateRoCrateConfig, CreateRoCrateOperation, load_rocrate_upload, write_rocrate_upload,
-};
+use aruna_operations::jobs::import::upload::{CreateRoCrateConfig, CreateRoCrateOperation};
+use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 const SECRET_LEN: usize = 32;
 const PULL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct ImportApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ImportApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_intent))
         .routes(routes!(create_import))
 }
@@ -126,7 +122,7 @@ fn admission_refused(error: TransferAdmitError) -> ServerError {
         TransferAdmitError::Config(_) => ServerError::ServiceUnavailableReason(message),
         TransferAdmitError::Sign(_)
         | TransferAdmitError::NotFinished
-        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message),
+        | TransferAdmitError::UnexpectedEvent => ServerError::InternalError(message.into()),
     }
 }
 
@@ -157,15 +153,15 @@ async fn admit(
     let context = state.get_ctx();
     let key = drive(admit, &context).await.map_err(admission_refused)?;
     let (payload, source) = (&intent.payload, Some(grant.payload.source));
-    authorize_import(
-        &context,
-        &principal(state, payload),
-        &payload.destination,
+    let authorize = AuthorizeImportOperation::new(
+        principal(state, payload),
+        payload.destination.clone(),
         source,
         state.get_node_id(),
-    )
-    .await
-    .map_err(import_refused)?;
+    );
+    drive(authorize, context.as_ref())
+        .await
+        .map_err(import_refused)?;
     Ok(key)
 }
 
@@ -194,7 +190,8 @@ pub(crate) async fn pushed_upload(
 ) -> ServerResult<Option<UploadRoCrateResponse>> {
     let context = state.get_ctx();
     let (intent, grant) = (&push.intent.payload, &push.grant.payload);
-    let Some(upload_id) = reusable_upload(&context, intent, grant, &push.key)
+    let reuse = ReusableUploadOperation::new(intent.clone(), grant.clone(), &push.key);
+    let Some(upload_id) = drive(reuse, context.as_ref())
         .await
         .map_err(import_refused)?
     else {
@@ -202,9 +199,13 @@ pub(crate) async fn pushed_upload(
     };
     // The source's push confirms its grant again; a paused import resumes with this consent.
     rebind(state, &push.intent, &push.grant, &push.key, upload_id).await?;
-    let record = load_rocrate_upload(&context, upload_id)
-        .await
-        .map_err(ServerError::InternalError)?;
+    let record = aruna_drivers::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let owner_node_url = owner_node_url(state).await?;
     match record {
         Some(record) => upload_response(&record, owner_node_url).map(Some),
@@ -244,7 +245,8 @@ pub(crate) async fn bind_upload(
         confirmed: true,
     };
     let context = state.get_ctx();
-    let bound = write_import(&context, key, record.upload_id, &binding).await;
+    let write = WriteImportOperation::new(key, record.upload_id, binding);
+    let bound = drive(write, context.as_ref()).await;
     if bound == Ok(record.upload_id) {
         return Ok(record.clone());
     }
@@ -253,14 +255,22 @@ pub(crate) async fn bind_upload(
         expires_at_ms: 0,
         ..record.clone()
     };
-    write_rocrate_upload(&context.storage_handle, &losing)
-        .await
-        .map_err(ServerError::ServiceUnavailableReason)?;
+    aruna_drivers::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(losing.clone()),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(ServerError::ServiceUnavailableReason)?;
     let bound = bound.map_err(import_refused)?;
-    load_rocrate_upload(&context, bound)
-        .await
-        .map_err(ServerError::InternalError)?
-        .ok_or(ServerError::NotFound)
+    aruna_drivers::driver::drive(
+        aruna_operations::jobs::import::upload_store::ReadUploadOperation::new(bound),
+        &context,
+    )
+    .await
+    .map_err(|error| error.0)
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or(ServerError::NotFound)
 }
 
 /// Replaces the intent and grant of a bound upload with a fresh consent to the same transfer.
@@ -277,7 +287,8 @@ async fn rebind(
         grant: grant.clone(),
         confirmed: true,
     };
-    let bound = write_import(&state.get_ctx(), key, upload_id, &binding)
+    let write = WriteImportOperation::new(key, upload_id, binding);
+    let bound = drive(write, state.get_ctx().as_ref())
         .await
         .map_err(import_refused)?;
     if bound != upload_id {
@@ -293,8 +304,24 @@ async fn source_request(
     grant: &Signed<ExportGrant>,
 ) -> ServerResult<reqwest::Response> {
     let context = state.get_ctx();
-    let request = import::source_request(&context, method, grant, PULL_TIMEOUT);
-    request.await.map_err(import_refused)
+    let unreachable = |error: String| import_refused(ImportError::Unreachable(error));
+    let blob = context.blob_handle.as_ref().ok_or_else(|| {
+        import_refused(ImportError::Storage("blob handle unavailable".to_string()))
+    })?;
+    let header = header_value(grant)
+        .map_err(|error| import_refused(ImportError::Storage(error.to_string())))?;
+    let response = blob
+        .repository_request(method, grant.payload.artifact_url.clone())
+        .map_err(|error| unreachable(error.to_string()))?
+        .header(GRANT_HEADER, header)
+        .timeout(PULL_TIMEOUT)
+        .send()
+        .await
+        .map_err(|error| unreachable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(import_refused(answer_error(response.status())));
+    }
+    Ok(response)
 }
 
 /// A `Sync` byte stream over a response body, as the upload writer needs.
@@ -357,7 +384,6 @@ async fn pull_artifact(
         (status = 200, description = "The signed import intent", body = serde_json::Value,
             example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "descriptor_digest": "<hex>", "principal": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "destination": { "group_id": "01JGR0VP0123456789ABCDEFGH", "bucket": "lab", "prefix": "imports", "metadata_path": "datasets/run" }, "max_bytes": 1073741824, "nonce": "<hex>", "issued_at": 1791000000, "expires_at": 1791086400, "intent_id": "01J1NTENT0123456789ABCDEFG" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed nonce, id, bucket, prefix or path", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "WRITE or a policy denied the import (code `import_denied`), or federation is not set up (code `federation_disabled`)", body = ErrorResponse),
         (status = 404, description = "The destination bucket does not exist", body = ErrorResponse)
     ),
@@ -365,10 +391,9 @@ async fn pull_artifact(
 )]
 pub async fn create_intent(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<ImportIntentRequest>,
 ) -> ServerResult<Json<Signed<ImportIntent>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if !hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN) {
         return Err(ServerError::BadRequestReason(
             "nonce must be a hex SHA-256 digest".into(),
@@ -393,7 +418,9 @@ pub async fn create_intent(
         metadata_path: metadata.path,
     };
     let context = state.get_ctx();
-    authorize_import(&context, &auth, &destination, None, state.get_node_id())
+    let authorize =
+        AuthorizeImportOperation::new(auth.clone(), destination.clone(), None, state.get_node_id());
+    drive(authorize, context.as_ref())
         .await
         .map_err(import_refused)?;
     let limit = limits.direct_upload_bytes;
@@ -405,6 +432,7 @@ pub async fn create_intent(
         nonce: request.nonce.to_ascii_lowercase(),
         node_capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
+        intent_id: ulid::Ulid::generate(),
     });
     let signed = drive(issue, &context).await.map_err(admission_refused)?;
     Ok(Json(signed))
@@ -443,7 +471,6 @@ binds the call to the portal that requested the intent.
         (status = 202, description = "The import job is recorded", body = SubmitImportResponse,
             example = json!({ "job_id": "01JJ0B0123456789ABCDEFGH1J", "created": true, "owner_node_url": "https://b.example.org/api/v1", "status_url": "https://b.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGH1J", "report_url": "https://b.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGH1J/report" })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not the intent's principal, the intent or grant was refused (code `transfer_rejected`), WRITE or a policy denied the import (code `import_denied`), or the source refused the pull (code `source_refused`)", body = ErrorResponse),
         (status = 409, description = "The import key is bound to a different plan, or to another transfer, owner or artifact (code `import_conflict`)", body = ErrorResponse),
         (status = 502, description = "The source realm could not be reached, failed or was busy (code `pull_unreachable`) or sent another artifact (code `artifact_mismatch`)", body = ErrorResponse)
@@ -452,10 +479,9 @@ binds the call to the portal that requested the intent.
 )]
 pub async fn create_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<FederatedImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (intent, grant) = (request.intent, request.grant);
     if auth.user_id != intent.payload.principal {
         return Err(ServerError::Forbidden);
@@ -466,7 +492,8 @@ pub async fn create_import(
         .ok_or_else(|| ServerError::BadRequestReason("secret must be 32 hex bytes".into()))?;
     let key = admit(&state, &intent, &grant, Some(&secret)).await?;
     let (payload, granted) = (&intent.payload, &grant.payload);
-    let bound = reusable_upload(&state.get_ctx(), payload, granted, &key)
+    let reuse = ReusableUploadOperation::new(payload.clone(), granted.clone(), &key);
+    let bound = drive(reuse, state.get_ctx().as_ref())
         .await
         .map_err(import_refused)?;
     let upload_id = match bound {
@@ -499,7 +526,7 @@ pub async fn create_import(
         },
         idempotency_key: Some(key),
     };
-    submit_import(State(state), Extension(Some(auth)), Json(submit)).await
+    submit_import(State(state), UnrestrictedAuth(auth), Json(submit)).await
 }
 
 #[cfg(test)]

@@ -2,35 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::shared::oidc::spawn_oidc_provider;
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
+use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::auth::OidcValidator;
-use aruna_api::routes::users::RegisterUserResponse;
 use aruna_api::server::state::ServerState;
 use aruna_api::server::{Server, ServerConfig};
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::generate_signing_key;
-use aruna_core::keyspaces::{SUBJECT_INDEX_KEYSPACE, USER_KEYSPACE};
+use aruna_core::keyspaces::SUBJECT_INDEX_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, oidc_subject_key};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::identity::user::User;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
-use aruna_operations::tasks::incoming::start_task_queues;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
-use axum::Json;
-use axum::extract::State;
-use axum::routing::get;
-use axum::{Router, http::StatusCode};
-use base64::Engine;
+use aruna_wire::users::RegisterUserResponse;
+use axum::http::StatusCode;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -41,13 +39,6 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use ulid::Ulid;
-
-#[derive(Clone)]
-struct OidcProviderState {
-    issuer: String,
-    jwks_uri: String,
-    jwks: serde_json::Value,
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct TestOidcClaims {
@@ -65,59 +56,8 @@ struct TestNode {
     base_url: String,
     net: NetHandle,
     server_task: JoinHandle<()>,
-}
-
-async fn oidc_discovery(State(state): State<OidcProviderState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "issuer": state.issuer,
-        "jwks_uri": state.jwks_uri,
-    }))
-}
-
-async fn oidc_jwks(State(state): State<OidcProviderState>) -> Json<serde_json::Value> {
-    Json(state.jwks)
-}
-
-async fn spawn_oidc_provider(
-    issuer: &str,
-    kid: &str,
-    signing_key: &SigningKey,
-) -> (OidcProviderConfig, JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let jwks_uri = format!("http://{addr}/jwks.json");
-    let discovery_url = format!("http://{addr}/.well-known/openid-configuration");
-    let jwks = serde_json::json!({
-        "keys": [{
-            "kty": "OKP",
-            "alg": "EdDSA",
-            "use": "sig",
-            "kid": kid,
-            "crv": "Ed25519",
-            "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
-        }]
-    });
-    let router = Router::new()
-        .route("/.well-known/openid-configuration", get(oidc_discovery))
-        .route("/jwks.json", get(oidc_jwks))
-        .with_state(OidcProviderState {
-            issuer: issuer.to_string(),
-            jwks_uri: jwks_uri.clone(),
-            jwks,
-        });
-    let task = tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
-    });
-
-    (
-        OidcProviderConfig {
-            id: "main".to_string(),
-            issuer: issuer.to_string(),
-            audience: "aruna-api".to_string(),
-            discovery_url,
-        },
-        task,
-    )
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 fn sign_oidc_token(
@@ -148,20 +88,7 @@ fn sign_oidc_token(
 }
 
 async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-    match context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: USER_KEYSPACE.to_string(),
-            key: ByteView::from(user_id.to_bytes()),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => User::from_bytes(&bytes).unwrap(),
-        other => panic!("unexpected user read result: {other:?}"),
-    }
+    aruna_drivers::testing::read_user(context, user_id).await
 }
 
 async fn read_subject_index(context: &DriverContext, subject_key: &str) -> UserId {
@@ -200,16 +127,17 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         storage_handle: storage,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(task_handle.clone()),
         compute_handle: None,
+        outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
-    let shutdown = aruna_core::shutdown::Shutdown::new();
+    let incoming = initialize_incoming_fixture(context.clone());
+    let shutdown = aruna_tasks::shutdown::Shutdown::new();
     start_task_queues(
         context.clone(),
         task_handle,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
         &shutdown,
     )
     .await;
@@ -267,7 +195,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             Some(Arc::new(OidcValidator::new().unwrap())),
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -278,7 +206,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         state,
         ServerConfig {
             http_addr: addr,
-            max_body_size: aruna_api::server::MAX_BODY_SIZE,
+            max_body_size: aruna_core::listener::MAX_BODY_SIZE,
             cors: aruna_api::cors::CorsConfig::default(),
         },
     )
@@ -298,6 +226,7 @@ async fn spawn_test_node(provider: OidcProviderConfig) -> TestNode {
         base_url: format!("http://{addr}"),
         net,
         server_task,
+        _incoming: incoming,
     }
 }
 

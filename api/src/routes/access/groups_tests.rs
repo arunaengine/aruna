@@ -4,15 +4,17 @@
 
 use super::{
     AddMemberRequest, CreateGroupRequest, DataPathKind, DataPathsQuery, GroupInfoResponse,
-    ListGroupsQuery, UpdateGroupRequest, add_group_member, create_group, get_group,
-    get_group_usage, list_data_paths, list_group_members, list_groups, run_get_group,
-    run_group_members, run_group_usage, update_group,
+    UpdateGroupRequest, add_group_member, create_group, get_group, get_group_usage,
+    list_data_paths, list_group_members, run_get_group, run_group_members, run_group_usage,
+    update_group,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::auth::ValidatedBearer;
+use crate::auth::extract;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};
-use aruna_core::UserId;
+use crate::tests::routes::{seed_realm_auth, test_state, test_storage};
+use crate::tests::users::foreign_auth;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -34,8 +36,10 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::driver::drive;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::testing::test_context;
 use aruna_operations::groups::list_groups::ListGroupOperation;
 use aruna_storage::storage;
 use axum::extract::{Path, Query, State};
@@ -121,12 +125,7 @@ async fn store_user(state: &ServerState, user_id: UserId, name: &str) {
 }
 
 fn member_auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: user_id.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, user_id.realm_id)
 }
 
 async fn setup_state() -> (Arc<ServerState>, TempDir) {
@@ -170,27 +169,19 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
     (state, tempdir)
 }
 
-fn foreign_auth() -> AuthContext {
-    let realm_id = RealmId::from_bytes([7u8; 32]);
-    AuthContext {
-        user_id: UserId::local(Ulid::generate(), realm_id),
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
-}
-
 /// A realm whose initial admin is claimed, so the realm admin path grants.
 async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(aruna_tasks::TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -232,7 +223,7 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -246,7 +237,7 @@ async fn update_config(
 ) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -544,24 +535,17 @@ async fn directory_requires_realm() {
     let (state, _tempdir) = setup_state().await;
     let group_id = Ulid::generate().to_string();
 
-    assert!(matches!(
-        list_groups(
-            State(state.clone()),
-            Extension(None),
-            Query(ListGroupsQuery::default())
-        )
-        .await,
-        Err(ServerError::Unauthorized)
-    ));
-    assert!(matches!(
-        list_groups(
-            State(state.clone()),
-            Extension(Some(foreign_auth())),
-            Query(ListGroupsQuery::default())
-        )
-        .await,
-        Err(ServerError::Forbidden)
-    ));
+    // `list_groups` takes `UnrestrictedAuth`, so its refusals are the extractor's.
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&state, None).await.err(),
+        Some(StatusCode::UNAUTHORIZED)
+    );
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&state, Some(foreign_auth()))
+            .await
+            .err(),
+        Some(StatusCode::FORBIDDEN)
+    );
 
     for auth in [None, Some(foreign_auth())] {
         let expected = if auth.is_none() {
@@ -754,7 +738,7 @@ async fn realm_admin_statistics() {
     let stats = |user: UserId| {
         get_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Path(group_id.to_string()),
         )
     };
@@ -763,7 +747,7 @@ async fn realm_admin_statistics() {
     let overview = |user: UserId, offset: u32| {
         list_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Query(super::PaginationParams {
                 limit: Some(1),
                 offset: Some(offset),
@@ -822,14 +806,14 @@ async fn policy_denies_admins() {
     let stats = |user: UserId| {
         get_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Path(group_id.to_string()),
         )
     };
     let tokens = |user: UserId| {
         list_group_tokens(
             State(state.clone()),
-            Extension(Some(member_auth(user))),
+            UnrestrictedAuth(member_auth(user)),
             Path(group_id.to_string()),
             Query(Default::default()),
         )
@@ -837,14 +821,14 @@ async fn policy_denies_admins() {
     let overview = || {
         list_group_statistics(
             State(state.clone()),
-            Extension(Some(member_auth(admin))),
+            UnrestrictedAuth(member_auth(admin)),
             Query(Default::default()),
         )
     };
     let revoke_all = || {
         revoke_user_tokens(
             State(state.clone()),
-            Extension(Some(member_auth(admin))),
+            UnrestrictedAuth(member_auth(admin)),
             Path(owner.to_string()),
         )
     };
@@ -978,7 +962,7 @@ async fn folds_group_buckets() {
 
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1022,7 +1006,7 @@ async fn bucket_folds_objects() {
 
     let (status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
@@ -1076,7 +1060,7 @@ async fn round_trips_bucket() {
 
     let (_status, Json(listing)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1091,7 +1075,7 @@ async fn round_trips_bucket() {
 
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(bucket_path.clone()))),
@@ -1136,7 +1120,7 @@ async fn paginates_object_pages() {
     loop {
         let (_status, Json(body)) = list_data_paths(
             State(state.clone()),
-            Extension(Some(member_auth(owner))),
+            UnrestrictedAuth(member_auth(owner)),
             Extension(None),
             Path(group_id.to_string()),
             Query(DataPathsQuery {
@@ -1179,7 +1163,7 @@ async fn path_matches_helper() {
 
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
@@ -1212,7 +1196,7 @@ async fn hides_foreign_bucket() {
 
     let (_status, Json(body)) = list_data_paths(
         State(state.clone()),
-        Extension(Some(member_auth(owner))),
+        UnrestrictedAuth(member_auth(owner)),
         Extension(None),
         Path(group_id.to_string()),
         Query(browse(Some(prefix))),
@@ -1232,7 +1216,7 @@ async fn non_member_forbidden() {
 
     let result = list_data_paths(
         State(state),
-        Extension(Some(outsider)),
+        UnrestrictedAuth(outsider),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1276,7 +1260,7 @@ async fn empty_role_forbidden() {
 
     let result = list_data_paths(
         State(state),
-        Extension(Some(member_auth(limited))),
+        UnrestrictedAuth(member_auth(limited)),
         Extension(None),
         Path(group_id.to_string()),
         Query(DataPathsQuery::default()),
@@ -1288,15 +1272,9 @@ async fn empty_role_forbidden() {
 #[tokio::test]
 async fn rejects_anonymous_caller() {
     let (state, _tempdir) = setup_state().await;
-    let result = list_data_paths(
-        State(state),
-        Extension(None),
-        Extension(None),
-        Path(Ulid::generate().to_string()),
-        Query(DataPathsQuery::default()),
-    )
-    .await;
-    assert!(matches!(result, Err(ServerError::Unauthorized)));
+    // `list_data_paths` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let result = extract::<UnrestrictedAuth>(&state, None).await;
+    assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -1419,9 +1397,10 @@ async fn prefix_hides_keys() {
 
 mod distributed {
     use super::{DataPathKind, DataPathsQuery, list_data_paths};
+    use crate::auth::UnrestrictedAuth;
     use crate::auth::ValidatedBearer;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
         BUCKET, PEER, distribute, hidden_link, mock_peer, node_id, node_state, publish_api,
     };
@@ -1505,7 +1484,7 @@ mod distributed {
         for _ in 0..6 {
             let (_, Json(paths)) = list_data_paths(
                 State(state.clone()),
-                Extension(Some(node.owner.clone())),
+                UnrestrictedAuth(node.owner.clone()),
                 Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
                 Path(node.group_id.to_string()),
                 Query(DataPathsQuery {
@@ -1565,7 +1544,7 @@ mod distributed {
 
         let (status, Json(paths)) = list_data_paths(
             State(state.clone()),
-            Extension(Some(node.owner.clone())),
+            UnrestrictedAuth(node.owner.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Path(node.group_id.to_string()),
             Query(DataPathsQuery {

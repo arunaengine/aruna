@@ -530,7 +530,7 @@ mod tests {
                 establishing_event_id: event_id,
                 last_event_id: event_id,
             },
-            user_id: aruna_core::UserId::nil(realm_id),
+            user_id: aruna_core::user::id::UserId::nil(realm_id),
             node_id,
             payload,
             occurred_at_ms: 1,
@@ -581,10 +581,10 @@ mod tests {
 
     /// Stores the node identity Aruna keeps beside the Craqle and sync stores.
     fn store_identity(path: &Path) {
-        use aruna::identity::{
+        use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
+        use aruna_core::structs::identity::node_state::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };
-        use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
         let realm = aruna_core::structs::identity::realm::RealmId([3u8; 32]);
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
@@ -594,7 +594,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(realm),
+                owner: aruna_core::user::id::UserId::nil(realm),
             },
         };
         let value = postcard::to_allocvec(&state).unwrap();

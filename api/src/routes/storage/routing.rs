@@ -2,40 +2,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{parse_group_id, permission_granted, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{parse_group_id, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
-use aruna_operations::driver::{drive, node_routing};
+use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::groups::backends::query::GetBackendOperation;
-use aruna_operations::groups::bucket_jobs::{ActiveJob, JobKind};
 use aruna_operations::groups::default_rule::PutDefaultOperation;
 use aruna_operations::groups::storage_routing::{
     GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
+use aruna_operations::transfer::bucket_jobs::{ActiveJob, JobKind};
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageRoutingDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageRoutingDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_bucket_routing, put_bucket_routing))
         .routes(routes!(get_group_routing, put_group_routing))
         .routes(routes!(list_group_buckets))
@@ -213,7 +210,7 @@ async fn target_naming(
     };
     let record = drive(GetBackendOperation::new(*backend_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let record = record.filter(|record| record.group_id == group_id);
     Ok(record.map_or((None, None), |record| {
         let bucket = record.default_bucket().map(str::to_string);
@@ -283,7 +280,7 @@ fn map_group_error(error: PutGroupError) -> ServerError {
         PutGroupError::Unusable(error) => ServerError::BadRequestMessage(error.reason()),
         PutGroupError::Conflict(message) => ServerError::Conflict(message),
         PutGroupError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -291,7 +288,7 @@ fn map_put_error(error: PutRoutingError) -> ServerError {
     match error {
         PutRoutingError::NoSuchBucket | PutRoutingError::GroupMismatch => ServerError::NotFound,
         PutRoutingError::InvalidRules(reason) => ServerError::BadRequestReason(reason.to_string()),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -310,19 +307,6 @@ async fn warnings_for<'a>(
         .catalog
         .with_group_backends(inputs.backend_ids);
     target_warnings(&catalog, targets)
-}
-
-async fn group_of_bucket(state: &ServerState, bucket: &str) -> ServerResult<Ulid> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info.group_id),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
-    }
 }
 
 /// The bucket overview shows the backend a bucket writes to, so reading the
@@ -399,7 +383,6 @@ is part of describing the bucket; changing the rules still takes group admin wri
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -407,18 +390,17 @@ is part of describing the bucket; changing the rules still takes group admin wri
 )]
 pub async fn get_bucket_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = group_of_bucket(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
 
     let rules = drive(GetRoutingOperation::new(bucket.clone()), &state.get_ctx())
         .await
         .map_err(|error| match error {
             GetRoutingError::NoSuchBucket => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
 
     let warnings = warnings_for(&state, group_id, rules.iter().map(|rule| &rule.target)).await;
@@ -498,7 +480,6 @@ pub async fn get_bucket_routing(
             })
         ),
         (status = 400, description = "A rule target is invalid, names a backend the group does not own, or duplicates another rule's prefix and match mode", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse)
     ),
@@ -506,12 +487,11 @@ pub async fn get_bucket_routing(
 )]
 pub async fn put_bucket_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<BucketRoutingRequest>,
 ) -> ServerResult<Json<BucketRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = group_of_bucket(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
 
     let rules = request
@@ -565,23 +545,21 @@ pub async fn put_bucket_routing(
             })
         ),
         (status = 400, description = "The path segment is not a valid group ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_group_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<GroupRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
 
     let record = drive(GroupRoutingOperation::new(group_id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let target = record.and_then(|record| record.default_target);
     let warnings = warnings_for(&state, group_id, target.iter()).await;
@@ -658,7 +636,6 @@ pub async fn get_group_routing(
             })
         ),
         (status = 400, description = "The path segment is not a valid group ULID, the target is invalid or names a backend the group does not own, or the bucket is invalid or cannot be used", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 409, description = "A linked folder uses the bucket, a bucket of the group would have no storage without a shared bucket, or the group is being deleted", body = ErrorResponse)
     ),
@@ -666,11 +643,10 @@ pub async fn get_group_routing(
 )]
 pub async fn put_group_routing(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<GroupRoutingRequest>,
 ) -> ServerResult<Json<GroupRoutingResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
 
@@ -759,7 +735,6 @@ pub async fn put_group_routing(
             "next": null
         })),
         (status = 400, description = "Invalid group id or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 409, description = "Too many buckets in a row are hidden from the caller", body = ErrorResponse)
     ),
@@ -767,13 +742,13 @@ pub async fn put_group_routing(
 )]
 pub async fn list_group_buckets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
 ) -> ServerResult<Json<BucketStoragePage>> {
-    use aruna_operations::groups::bucket_storage::list_bucket_storage;
+    use aruna_drivers::driver::node_routing;
     use aruna_operations::s3::bucket::list::bucket_cursor;
-    let auth = require_realm_auth(&state, auth)?;
+    use aruna_operations::transfer::bucket_storage::BucketStorageOperation;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let limit = page.limit.unwrap_or(200);
@@ -787,9 +762,11 @@ pub async fn list_group_buckets(
     let (mut readable, mut after, mut more) = (Vec::new(), page.after, false);
     for _ in 0..HIDDEN_PAGES {
         let wanted = (after.take(), limit - readable.len());
-        let (buckets, token) = list_bucket_storage(&state.get_ctx(), group_id, wanted)
+        let context = state.get_ctx();
+        let list = BucketStorageOperation::new(node_routing(&context), group_id, wanted);
+        let (buckets, token) = drive(list, &context)
             .await
-            .map_err(ServerError::InternalError)?;
+            .map_err(|error| ServerError::InternalError(error.into()))?;
         for found in buckets {
             let path = bucket_permission_path(
                 state.get_realm_id(),
@@ -814,7 +791,7 @@ pub async fn list_group_buckets(
     let next = match (more, readable.last()) {
         (true, Some(last)) => Some(
             bucket_cursor(&last.bucket)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?,
+                .map_err(|error| ServerError::InternalError(error.into()))?,
         ),
         _ => None,
     };

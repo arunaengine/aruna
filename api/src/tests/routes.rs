@@ -1,41 +1,39 @@
-//! Builds route test fixtures: temporary storage, driver context, state and seeded documents.
+//! Builds route test fixtures: temporary storage, state, seeded documents and requests sent
+//! through a route's router.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::auth::ValidatedBearer;
 use crate::server::state::ServerState;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
-use aruna_core::{NodeId, UserId};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::{FjallStorage, StorageHandle};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::{Extension, Router};
 use byteview::ByteView;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tower::ServiceExt;
 use ulid::Ulid;
+use utoipa_axum::router::OpenApiRouter;
 
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     (directory, storage)
-}
-
-pub(crate) fn test_context(storage: StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
 }
 
 pub(crate) async fn test_state(
@@ -75,6 +73,16 @@ pub(crate) async fn write_doc(
         event,
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
+}
+
+/// Writes one row through the storage of `state`; panics on any other answer.
+pub(crate) async fn write_fixture(
+    state: &ServerState,
+    key_space: &str,
+    key: ByteView,
+    value: ByteView,
+) {
+    write_doc(&state.get_ctx(), key_space, key, value).await;
 }
 
 pub(crate) async fn seed_realm_auth(
@@ -170,4 +178,26 @@ pub(crate) async fn open_paths(
         value.into(),
     )
     .await;
+}
+
+/// Sends a JSON request through `router` with `auth` and no bearer, as the auth middleware does.
+pub(crate) async fn send_json(
+    router: OpenApiRouter<Arc<ServerState>>,
+    state: Arc<ServerState>,
+    auth: Option<AuthContext>,
+    (method, uri, body): (&str, &str, &'static str),
+) -> StatusCode {
+    let (router, _): (Router<Arc<ServerState>>, _) = router.split_for_parts();
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("a valid request");
+    // The middleware always stores both values, also when the request carries no token.
+    let router = router
+        .layer(Extension(auth))
+        .layer(Extension(Option::<ValidatedBearer>::None))
+        .with_state(state);
+    router.oneshot(request).await.expect("an answer").status()
 }

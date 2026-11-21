@@ -3,31 +3,46 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, StorageEffect};
+use super::inventory::{AddedVersion, HeadChange, InventoryChange, InventoryUpdate};
+#[cfg(test)]
+use super::inventory::{InventoryError, open_ranges};
+#[cfg(test)]
+use crate::s3::usage::{UsageCounterUpdate, UsageUpdateError};
+#[cfg(test)]
+use aruna_core::calls::{IoCall, IoError, IoResult};
+#[cfg(test)]
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+#[cfg(test)]
 use aruna_core::events::{Event, StorageEvent};
+#[cfg(test)]
 use aruna_core::keyspaces::{INVENTORY_KEYSPACE, RANGE_ACCOUNT_KEYSPACE, RANGE_COUNTER_KEYSPACE};
-use aruna_core::structs::storage::distribution::accounting::{
-    RangeAccount, RangeCounters, account_key,
-};
+#[cfg(test)]
+use aruna_core::rows::StagedCall;
+use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+#[cfg(test)]
+use aruna_core::structs::storage::distribution::accounting::{RangeAccount, account_key};
 use aruna_core::structs::storage::distribution::inventory::{HeadEntry, VersionEntry};
 use aruna_core::structs::storage::distribution::{KeyRange, OriginalEpoch};
-use aruna_core::types::{Effects, TxnId};
-use aruna_storage::storage::{FjallStorage, StorageHandle};
+#[cfg(test)]
+use aruna_core::types::TxnId;
+#[cfg(test)]
+use aruna_storage::storage::handle::StorageHandle;
+#[cfg(test)]
+use aruna_storage::storage::worker::FjallStorage;
+#[cfg(test)]
 use byteview::ByteView;
+#[cfg(test)]
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use super::inventory::{
-    AddedVersion, HeadChange, InventoryChange, InventoryError, InventoryUpdate, open_ranges,
-};
-
-pub(crate) fn open() -> (TempDir, StorageHandle) {
+#[cfg(test)]
+pub fn open() -> (TempDir, StorageHandle) {
     let dir = tempfile::tempdir().expect("tempdir must be created");
     let handle = FjallStorage::open(dir.path().to_str().expect("utf-8 path")).expect("storage");
     (dir, handle)
 }
 
-pub(crate) fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
+pub fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
     KeyRange {
         range_id: Ulid::from_bytes([seed; 16]),
         lower: lower.to_string(),
@@ -39,25 +54,22 @@ pub(crate) fn range(seed: u8, lower: &str, upper: Option<&str>) -> KeyRange {
     }
 }
 
-pub(crate) async fn send(handle: &StorageHandle, effect: Effect) -> Event {
+#[cfg(test)]
+pub async fn send(handle: &StorageHandle, effect: Effect) -> Event {
     let Effect::Storage(effect) = effect else {
         panic!("only storage effects are expected: {effect:?}");
     };
     handle.send_storage_effect(effect).await
 }
 
-pub(crate) async fn begin(handle: &StorageHandle) -> TxnId {
-    match handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => panic!("unexpected storage event: {other:?}"),
-    }
+#[cfg(test)]
+pub async fn begin(handle: &StorageHandle) -> TxnId {
+    handle.begin_write().await
 }
 
+#[cfg(test)]
 /// True when the commit succeeded, false on a conflict.
-pub(crate) async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
+pub async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
     match handle
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
@@ -68,7 +80,8 @@ pub(crate) async fn commit(handle: &StorageHandle, txn_id: TxnId) -> bool {
     }
 }
 
-pub(crate) async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyRange]) {
+#[cfg(test)]
+pub async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyRange]) {
     let writes = open_ranges(set_id, ranges).expect("ranges encode");
     let event = handle
         .send_storage_effect(StorageEffect::BatchWrite {
@@ -82,25 +95,125 @@ pub(crate) async fn install(handle: &StorageHandle, set_id: Ulid, ranges: &[KeyR
     ));
 }
 
+#[cfg(test)]
+/// Runs one call of an embedded update in `txn_id`; an outside read runs without it.
+async fn run_staged(
+    handle: &StorageHandle,
+    txn_id: TxnId,
+    call: StagedCall,
+) -> Result<IoResult, IoError> {
+    let (call, txn) = match call {
+        StagedCall::InTransaction(call) => (call, Some(txn_id)),
+        StagedCall::Outside(call) => (call, None),
+    };
+    let mut raw = false;
+    let effect = match call {
+        IoCall::Read(reads) => StorageEffect::BatchRead { reads, txn_id: txn },
+        IoCall::Page {
+            space,
+            prefix,
+            after,
+            limit,
+        } => StorageEffect::Iter {
+            key_space: space,
+            prefix: Some(prefix),
+            start: after.map(IterStart::After),
+            limit,
+            txn_id: txn,
+        },
+        IoCall::Write(writes) => StorageEffect::BatchWrite {
+            writes,
+            txn_id: txn,
+        },
+        IoCall::Delete(deletes) => StorageEffect::BatchDelete {
+            deletes,
+            txn_id: txn,
+        },
+        IoCall::AddCounters { space, deltas } => StorageEffect::AddCounters {
+            key_space: space,
+            deltas,
+            txn_id,
+        },
+        IoCall::AddUsage {
+            space,
+            deltas,
+            buckets,
+        } => StorageEffect::AddUsage {
+            key_space: space,
+            deltas,
+            buckets,
+            txn_id,
+        },
+        IoCall::Effect(effect) => {
+            let Effect::Storage(mut storage) = *effect else {
+                panic!("only storage effects are expected: {effect:?}");
+            };
+            if let Some(slot) = storage.txn_slot() {
+                *slot = txn;
+            }
+            raw = true;
+            storage
+        }
+        other => panic!("an update makes no such call: {other:?}"),
+    };
+    let event = handle.send_storage_effect(effect).await;
+    if let Event::Storage(StorageEvent::Error { error }) = event {
+        return Err(IoError::Storage(error));
+    }
+    if raw {
+        return Ok(IoResult::Event(Box::new(event)));
+    }
+    Ok(match event {
+        Event::Storage(StorageEvent::BatchReadResult { values }) => {
+            IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
+        }
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => IoResult::Page {
+            rows: values,
+            next: next_start_after,
+        },
+        Event::Storage(
+            StorageEvent::BatchWriteResult { .. } | StorageEvent::BatchDeleteResult { .. },
+        ) => IoResult::Done,
+        other => panic!("unexpected storage event: {other:?}"),
+    })
+}
+
+#[cfg(test)]
 /// Runs `update` to the end inside the open transaction `txn_id`.
-pub(crate) async fn stage(
+pub async fn stage(
     handle: &StorageHandle,
     txn_id: TxnId,
     update: &mut InventoryUpdate,
 ) -> Result<(), InventoryError> {
-    let mut effects: Effects = update.start(txn_id);
-    while let Some(effect) = effects.pop() {
-        let event = send(handle, effect).await;
-        match update.step(event, txn_id)? {
-            Some(next) => effects = next,
-            None => return Ok(()),
-        }
+    let mut next = update.start_calls();
+    while let Some(call) = next {
+        let answer = run_staged(handle, txn_id, call).await?;
+        next = update.step_calls(answer)?;
     }
     Ok(())
 }
 
+#[cfg(test)]
+/// Runs a counter update to the end inside the open transaction `txn_id`.
+pub async fn stage_usage(
+    handle: &StorageHandle,
+    txn_id: TxnId,
+    update: &mut UsageCounterUpdate,
+) -> Result<(), UsageUpdateError> {
+    let mut next = Some(update.start_calls(ulid::Ulid::from_parts(1, 1)));
+    while let Some(call) = next {
+        let answer = run_staged(handle, txn_id, call).await?;
+        next = update.step_calls(answer)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 /// Stages and commits `update` in its own transaction.
-pub(crate) async fn apply(
+pub async fn apply(
     handle: &StorageHandle,
     update: InventoryUpdate,
 ) -> Result<bool, InventoryError> {
@@ -110,7 +223,8 @@ pub(crate) async fn apply(
     Ok(commit(handle, txn_id).await)
 }
 
-pub(crate) async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -> Option<Vec<u8>> {
+#[cfg(test)]
+pub async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -> Option<Vec<u8>> {
     let event = handle
         .send_storage_effect(StorageEffect::Read {
             key_space: key_space.to_string(),
@@ -124,7 +238,8 @@ pub(crate) async fn get(handle: &StorageHandle, key_space: &str, key: Vec<u8>) -
     }
 }
 
-pub(crate) async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCounters {
+#[cfg(test)]
+pub async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCounters {
     get(handle, RANGE_COUNTER_KEYSPACE, key)
         .await
         .map_or_else(RangeCounters::default, |value| {
@@ -132,26 +247,26 @@ pub(crate) async fn counters(handle: &StorageHandle, key: Vec<u8>) -> RangeCount
         })
 }
 
-pub(crate) async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
+#[cfg(test)]
+pub async fn has_row(handle: &StorageHandle, position: Vec<u8>) -> bool {
     get(handle, INVENTORY_KEYSPACE, position).await.is_some()
 }
 
-pub(crate) fn context(handle: &StorageHandle) -> crate::driver::DriverContext {
-    crate::driver::DriverContext {
+#[cfg(test)]
+pub fn context(handle: &StorageHandle) -> aruna_drivers::driver::DriverContext {
+    aruna_drivers::driver::DriverContext {
         storage_handle: handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
-pub(crate) async fn account(
-    handle: &StorageHandle,
-    set_id: Ulid,
-    range_id: Ulid,
-) -> Option<RangeAccount> {
+#[cfg(test)]
+pub async fn account(handle: &StorageHandle, set_id: Ulid, range_id: Ulid) -> Option<RangeAccount> {
     get(
         handle,
         RANGE_ACCOUNT_KEYSPACE,
@@ -162,7 +277,12 @@ pub(crate) async fn account(
 }
 
 /// A write of a new current version `seed` of `size` bytes at generation 1.
-pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUpdate {
+pub fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUpdate {
+    InventoryUpdate::new(write_change(set_id, key, seed, size))
+}
+
+/// The change [`write`] applies.
+pub fn write_change(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryChange {
     let version_id = Ulid::from_bytes([seed; 16]);
     let entry = VersionEntry {
         marker: false,
@@ -185,11 +305,11 @@ pub(crate) fn write(set_id: Ulid, key: &str, seed: u8, size: u64) -> InventoryUp
         generation: 1,
         version: entry,
     });
-    InventoryUpdate::new(change)
+    change
 }
 
 /// Removes a key's head and the versions `seeds`.
-pub(crate) fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
+pub fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
     let mut change = InventoryChange::new(set_id, key);
     change.removed = seeds
         .iter()
@@ -200,7 +320,7 @@ pub(crate) fn purge(set_id: Ulid, key: &str, seeds: &[u8]) -> InventoryUpdate {
 }
 
 /// Counters of `objects` current versions holding `bytes`, one version each, at epoch 1.
-pub(crate) fn exact(objects: i128, bytes: i128) -> RangeCounters {
+pub fn exact(objects: i128, bytes: i128) -> RangeCounters {
     RangeCounters {
         objects,
         current_bytes: bytes,
@@ -211,8 +331,9 @@ pub(crate) fn exact(objects: i128, bytes: i128) -> RangeCounters {
     }
 }
 
+#[cfg(test)]
 /// Writes `count` sample entries of range `range_seed` with priorities from 1 upwards.
-pub(crate) async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, count: u64) {
+pub async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_seed: u8, count: u64) {
     use aruna_core::keyspaces::KEY_SAMPLE_KEYSPACE;
     use aruna_core::structs::storage::distribution::accounting::SampleEntry;
 
@@ -241,4 +362,43 @@ pub(crate) async fn crowd_sample(handle: &StorageHandle, set_id: Ulid, range_see
         event,
         Event::Storage(StorageEvent::BatchWriteResult { .. })
     ));
+}
+
+/// A range index feeder for tests: its passes keep their cursors, as the node's loop does.
+pub struct Feeder {
+    limits: crate::transfer::feed_walks::FeedLimits,
+    cursors: crate::transfer::feed_walks::FeedCursors,
+}
+
+impl Feeder {
+    pub fn new(limits: crate::transfer::feed_walks::FeedLimits) -> Self {
+        Self {
+            limits,
+            cursors: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    /// One bounded pass over each walk; true when it changed an index or a row.
+    pub async fn pass(&mut self, context: &aruna_drivers::driver::DriverContext) -> bool {
+        let pass = self.next_pass();
+        self.passed(aruna_drivers::driver::drive(pass, context).await)
+    }
+
+    /// The next bounded pass, which takes the kept cursors.
+    pub fn next_pass(&mut self) -> crate::transfer::feed_walks::FeedPassOperation {
+        let cursors = std::mem::take(&mut self.cursors);
+        crate::transfer::feed_walks::FeedPassOperation::new(self.limits, cursors)
+    }
+
+    /// Keeps the cursors of a finished pass; true when it changed an index or a row.
+    pub fn passed<E>(&mut self, pass: Result<crate::transfer::feed_walks::FeedPass, E>) -> bool {
+        match pass {
+            Ok(pass) => {
+                self.cursors = pass.cursors;
+                pass.busy
+            }
+            Err(_) => false,
+        }
+    }
 }

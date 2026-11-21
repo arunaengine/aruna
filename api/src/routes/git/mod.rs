@@ -8,16 +8,15 @@ pub(crate) mod location;
 mod locks;
 mod snapshot;
 mod transport;
-mod versions;
+pub(crate) mod versions;
 
-pub(crate) use versions::expected;
-
-use crate::auth::{map_authorize_error, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::map_authorize_error;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::git::GitNode;
+use aruna_drivers::driver::{drive, node_routing};
 use aruna_operations::git::{self, GitError};
-use axum::Extension;
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::Next;
@@ -26,6 +25,15 @@ use base64::Engine;
 use std::sync::Arc;
 use ulid::Ulid;
 use utoipa_axum::{router::OpenApiRouter, routes};
+
+/// What the Git operations need to know about this node.
+pub(crate) fn git_node(state: &ServerState) -> GitNode {
+    let context = state.get_ctx();
+    GitNode {
+        ids: context.node_and_realm(),
+        routing: node_routing(&context),
+    }
+}
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -136,19 +144,21 @@ async fn base_url(state: &ServerState, id: Ulid) -> ServerResult<String> {
               (status = 503, description = "Records or storage unavailable")))]
 pub async fn push(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(id): Path<Ulid>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (request, pack) = git::push::decode(body).map_err(map_error)?;
     let key = headers
         .get("x-aruna-push-key")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    git::push::accept(&state.get_ctx(), &auth, (id, key), request, pack)
-        .await
-        .map_err(map_error)?;
+    drive(
+        git::push::accept(state.get_ctx().node_id(), &auth, (id, key), request, pack),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }

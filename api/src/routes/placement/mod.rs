@@ -3,11 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth, require_unrestricted_auth};
+use crate::auth::ValidatedBearer;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::forwarded_auth_token;
-use crate::routes::storage::relay::{copy_miss, query_path, read_holders, relay_read};
+use crate::routes::storage::relay::{RestRead, holder_json, missed_json, query_path};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::placement::policy::attachment::{PolicyBlockedReason, PolicyStatus};
 use aruna_core::structs::placement::policy::document::PlacementPolicyDocument;
@@ -17,24 +20,24 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
-use aruna_operations::driver::{drive, gate_context, now_ms};
-use aruna_operations::forward::transport::MetadataWriteError;
+use aruna_drivers::driver::drive;
+use aruna_operations::forward::routing::HolderWriteError;
 use aruna_operations::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
 use aruna_operations::placement::policy::diagnostics::{
     DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
 };
+use aruna_operations::placement::policy::forward::{CreateRoutedOperation, PolicyForwardError};
+use aruna_operations::placement::policy::gate::{GateOperation, PolicyGateError};
 use aruna_operations::placement::policy::list::{
     ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
 };
 use aruna_operations::placement::policy::names::PolicyNamesOperation;
+use aruna_operations::placement::policy::quarantine::{
+    QuarantineError, ResolveQuarantineConfig, ResolveQuarantineOperation,
+};
 use aruna_operations::placement::policy::read::{
     ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
 };
-use aruna_operations::placement::policy::{
-    PolicyForwardError, PolicyGateError, QuarantineError, ResolveQuarantineConfig,
-    ResolveQuarantineOperation, create_policy_routed,
-};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
 use aruna_operations::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
 };
@@ -56,19 +59,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((
-    name = "data/placement",
-    description = "Placement policies, bucket defaults and their application: realm admins publish realm-wide policies, group admins the ones their own group owns"
-)))]
-pub struct PlacementApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PlacementApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_placement_policy, list_placement_policies))
         .routes(routes!(get_placement_policy))
         .routes(routes!(get_placement_diagnostics))
@@ -76,6 +72,10 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(get_object_placement, mint_object_placement))
         .routes(routes!(run_bucket_placement))
         .routes(routes!(get_placement_coverage))
+        .routes(routes!(
+            count::get_coverage_count,
+            count::start_coverage_count
+        ))
         .routes(routes!(resolve_placement_quarantine))
 }
 
@@ -382,7 +382,7 @@ async fn named_refs(
 ) -> ServerResult<Vec<PolicyRefBody>> {
     let names = drive(PolicyNamesOperation::new(realm_id, &refs), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(refs
         .into_iter()
         .map(|policy_ref| {
@@ -405,7 +405,7 @@ impl TryFrom<SelectorBody> for PlacementSelector {
         let node_id = value
             .node_id
             .map(|node_id| {
-                aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::BadRequest)
+                aruna_core::id::NodeId::from_str(&node_id).map_err(|_| ServerError::BadRequest)
             })
             .transpose()?;
         Ok(Self {
@@ -459,7 +459,7 @@ fn decode_cursor(cursor: Option<String>) -> ServerResult<Option<aruna_core::type
 fn policy_response(document: &PlacementPolicyDocument) -> ServerResult<PolicyResponse> {
     let policy_ref = document
         .policy_ref()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(PolicyResponse {
         policy_id: policy_ref.policy_id.to_string(),
         digest: hex::encode(policy_ref.digest),
@@ -490,8 +490,8 @@ fn map_create_error(error: PolicyForwardError) -> ServerError {
         PolicyForwardError::Create(CreatePolicyError::Policy(reason)) => {
             ServerError::BadRequestReason(reason.to_string())
         }
-        PolicyForwardError::Forward(MetadataWriteError::Unauthorized) => ServerError::Unauthorized,
-        PolicyForwardError::Forward(MetadataWriteError::Forbidden) => ServerError::Forbidden,
+        PolicyForwardError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
+        PolicyForwardError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
         other => ServerError::ServiceUnavailableReason(other.to_string()),
     }
 }
@@ -507,7 +507,7 @@ fn map_read_error(error: ReadPolicyError) -> ServerError {
         ReadPolicyError::Authority(_) => {
             ServerError::ServiceUnavailableReason("placement_policy_unverified".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -523,7 +523,7 @@ fn map_default_error(error: PutPlacementError) -> ServerError {
         }
         PutPlacementError::Policy(_) => policy_denied(),
         PutPlacementError::ForeignPolicy { .. } => foreign_policy(),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -544,7 +544,7 @@ fn map_successor_error(error: SuccessorError) -> ServerError {
             ServerError::ServiceUnavailableReason("placement_subject_drift".to_string())
         }
         SuccessorError::Gate(error) => map_gate_error(error),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -603,7 +603,7 @@ fn map_gate_error(error: PolicyGateError) -> ServerError {
         | PolicyGateError::Read(_) => {
             ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -615,7 +615,7 @@ fn map_mutation_error(error: PolicyMutationError) -> ServerError {
         }
         PolicyMutationError::Successor(error) => map_successor_error(error),
         PolicyMutationError::ForeignPolicy { .. } => foreign_policy(),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -625,10 +625,8 @@ fn map_bulk_error(error: BulkError) -> ServerError {
         BulkError::NoSuchBucket => ServerError::NotFound,
         BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
         BulkError::ForeignPolicy { .. } => foreign_policy(),
-        BulkError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
-        other => ServerError::InternalError(other.to_string()),
+        BulkError::Distribution(error) => crate::lookup::map_guard_error(error),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -689,32 +687,19 @@ async fn local_subject(
     state: &ServerState,
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> ServerResult<aruna_core::structs::placement::policy::PlacementSubject> {
-    let gate = gate_context(&state.get_ctx(), realm_id, now_ms())
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
+    let gate = drive(
+        GateOperation::new(realm_id, unix_timestamp_millis()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .ok_or_else(|| ServerError::ServiceUnavailableReason("no_placement_subject".to_string()))?;
     if !gate.admitting {
         return Err(ServerError::ServiceUnavailableReason(
             "placement_admission_stopped".to_string(),
         ));
     }
     Ok(gate.subject)
-}
-
-async fn bucket_info(
-    state: &ServerState,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
-    }
 }
 
 #[utoipa::path(
@@ -761,7 +746,6 @@ read, and every verifier re-runs the same check against its own replicated view.
             "created_at_ms": 1755500000000u64
         })),
         (status = 400, description = "The definition is invalid, or an id, node id or digest could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, no WRITE on the realm-configuration path for a realm-wide rule, or no WRITE on the owning group's admin path for a group-owned one", body = ErrorResponse),
         (status = 409, description = "The policy id already carries a different definition, which is never replaced", body = ErrorResponse),
         (status = 503, description = "No holder could commit the publication; nothing was written", body = ErrorResponse)
@@ -770,11 +754,10 @@ read, and every verifier re-runs the same check against its own replicated view.
 )]
 pub async fn create_placement_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreatePolicyRequest>,
 ) -> ServerResult<Json<PolicyResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let policy_id = request
         .policy_id
         .map(|policy_id| Ulid::from_string(&policy_id).map_err(|_| ServerError::BadRequest))
@@ -801,15 +784,14 @@ pub async fn create_placement_policy(
         },
         auth_context: auth,
         policy,
-        created_at_ms: now_ms(),
+        created_at_ms: unix_timestamp_millis(),
     };
-    let document = create_policy_routed(
-        &state.get_ctx(),
-        config,
-        forwarded_auth_token(bearer_token)?,
-    )
-    .await
-    .map_err(map_create_error)?;
+    let ctx = state.get_ctx();
+    let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
+    let create = CreateRoutedOperation::new(config, forwarded_auth_token(bearer_token)?, local);
+    let document = aruna_drivers::driver::drive(create, &ctx)
+        .await
+        .map_err(map_create_error)?;
     Ok(Json(policy_response(&document)?))
 }
 
@@ -847,7 +829,6 @@ that needs no realm-configuration permission.
             "created_at_ms": 1755500000000u64
         })),
         (status = 400, description = "The id or digest could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or from another realm", body = ErrorResponse),
         (status = 404, description = "No holder has a policy with that id and digest; a mismatched digest is a 404 rather than a substituted rule", body = ErrorResponse),
         (status = 503, description = "No holder answered, or the publication could not be verified here; never a denial", body = ErrorResponse)
@@ -856,11 +837,10 @@ that needs no realm-configuration permission.
 )]
 pub async fn get_placement_policy(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(policy_id): Path<String>,
     Query(query): Query<PolicyRefQuery>,
 ) -> ServerResult<Json<PolicyResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let policy_ref = PolicyRefBody {
         policy_id,
         digest: query.digest,
@@ -922,17 +902,15 @@ The check runs inside the operation, so the listing is no existence oracle.
             "complete": false
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the path the query names", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_placement_policies(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<PolicyListQuery>,
 ) -> ServerResult<Json<PolicyListResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let page = drive(
         ListPoliciesOperation::new(ListPoliciesInput {
             auth_context: auth,
@@ -950,7 +928,7 @@ pub async fn list_placement_policies(
     .await
     .map_err(|error| match error {
         ListPoliciesError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(Json(PolicyListResponse {
         policies: page
@@ -998,7 +976,6 @@ ids.
             ],
             "generation": 3
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration read nor admin read on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
     ),
@@ -1006,10 +983,9 @@ ids.
 )]
 pub async fn get_bucket_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     ensure_placement_read(&state, &auth, info.group_id).await?;
     let policies = named_refs(&state, auth.realm_id, info.placement_policies).await?;
@@ -1065,7 +1041,6 @@ operation.
             "generation": 4
         })),
         (status = 400, description = "A reference could not be parsed, the set is not a valid reference set, a referenced rule is owned by another group, or a placement rule refuses it under a fixed reason that names no policy, reference or node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The stored generation is not the expected one, or the counter is exhausted", body = ErrorResponse),
@@ -1075,11 +1050,10 @@ operation.
 )]
 pub async fn put_bucket_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<BucketPlacementRequest>,
 ) -> ServerResult<Json<BucketPlacementResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
@@ -1092,7 +1066,7 @@ pub async fn put_bucket_placement(
             expected_generation: request.expected_generation,
             auth_context: auth,
             local_node_id: state.get_node_id(),
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &state.get_ctx(),
     )
@@ -1143,7 +1117,6 @@ pub async fn put_bucket_placement(
                 }
             ]
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the object", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node, or the key has no current version here", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
@@ -1152,13 +1125,12 @@ pub async fn put_bucket_placement(
 )]
 pub async fn get_object_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Query(query): Query<ObjectPlacementQuery>,
 ) -> ServerResult<Json<ObjectPlacementView>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     crate::auth::ensure_permission(
         &state,
@@ -1175,10 +1147,15 @@ pub async fn get_object_placement(
     .await?;
     let route = format!("/data/buckets/{bucket}/placement/objects");
     let path = query_path(&route, &[("key", &query.key)]);
-    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        return relay_read(&state, &holders, &path, bearer.as_ref())
-            .await
-            .map(Json);
+    let read = RestRead {
+        info: &info,
+        key: &query.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &read).await? {
+        return Ok(Json(answer));
     }
     let placement = drive(
         ObjectPlacementOperation::new(ObjectPlacementInput {
@@ -1190,14 +1167,12 @@ pub async fn get_object_placement(
     .await
     .map_err(|error| match error {
         ObjectPlacementError::NoSuchKey => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     });
     if matches!(placement, Err(ServerError::NotFound))
-        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+        && let Some(answer) = missed_json(&state, &read).await?
     {
-        return relay_read(&state, &coordinator, &path, bearer.as_ref())
-            .await
-            .map(Json);
+        return Ok(Json(answer));
     }
     let placement = placement?;
     let policies = named_refs(&state, auth.realm_id, placement.policies).await?;
@@ -1267,7 +1242,6 @@ operation.
             ]
         })),
         (status = 400, description = "An id, version id or reference could not be parsed, a referenced rule is owned by another group, or a placement rule refuses the destination under a fixed reason that names no policy, reference or node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No such bucket, or the expected head version no longer exists", body = ErrorResponse),
         (status = 409, description = "The head moved, the bucket changed, the mutation id was reused with other parameters, or the assigned version id is taken", body = ErrorResponse),
@@ -1277,13 +1251,12 @@ operation.
 )]
 pub async fn mint_object_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<crate::auth::ValidatedBearer>>,
     headers: axum::http::HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<ObjectPlacementRequest>,
 ) -> ServerResult<Json<ObjectPlacementResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let realm_id = auth.realm_id;
     let info = bucket_info(&state, &bucket).await?;
@@ -1310,7 +1283,7 @@ pub async fn mint_object_placement(
     let outcome = drive(
         PolicyMutationOperation::new_with_version(
             PolicyMutationConfig {
-                context: aruna_operations::blob::records::HeadAliasContext::new(
+                context: aruna_core::blob_records::HeadAliasContext::new(
                     auth.realm_id,
                     info.group_id,
                     state.get_node_id(),
@@ -1327,9 +1300,9 @@ pub async fn mint_object_placement(
                 target_refs: refs_from(request.policies)?,
                 subject,
                 created_at: SystemTime::now(),
-                now_ms: now_ms(),
+                now_ms: unix_timestamp_millis(),
             },
-            mint_version(hint),
+            mint_version(Ulid::generate(), hint),
         ),
         &state.get_ctx(),
     )
@@ -1432,7 +1405,6 @@ operation.
             "complete": false
         })),
         (status = 400, description = "The operation id or cursor could not be parsed, or the captured default references a rule owned by another group", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither realm-configuration write nor admin write on the bucket's group", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 409, description = "The run was captured against a different bucket record, or the bucket now belongs to another group", body = ErrorResponse),
@@ -1442,13 +1414,12 @@ operation.
 )]
 pub async fn run_bucket_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     headers: axum::http::HeaderMap,
     Json(request): Json<BulkRunRequest>,
 ) -> ServerResult<Json<BulkRunResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_placement_writer(&state, &auth, &bucket).await?;
     let info = bucket_info(&state, &bucket).await?;
     crate::routes::storage::relay::relayed_set(&info, &headers)?;
@@ -1499,7 +1470,7 @@ async fn run_here(
             subject,
             start_after: decode_cursor(cursor)?,
             limit: request.limit.unwrap_or(BULK_DEFAULT_LIMIT),
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
             created_at: SystemTime::now(),
         }),
         &state.get_ctx(),
@@ -1597,7 +1568,6 @@ operation.
             ]
         })),
         (status = 400, description = "The scope, cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse),
         (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse),
         (status = 503, description = "A distributed bucket: no pending coordinator answered, or this node has no record of the set yet", body = ErrorResponse)
@@ -1606,13 +1576,12 @@ operation.
 )]
 pub async fn get_placement_coverage(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CoverageQuery>,
 ) -> ServerResult<Json<CoverageResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     // Checked before the bucket is read, so a refused caller cannot tell which buckets exist.
     crate::auth::ensure_permission(
         &state,
@@ -1655,7 +1624,7 @@ async fn coverage_here(
             scope,
             start_after: decode_cursor(cursor)?,
             limit: query.limit.unwrap_or(SCAN_DEFAULT_LIMIT),
-            auth_context: auth,
+            auth_context: Some(auth),
         }),
         &state.get_ctx(),
     )
@@ -1663,10 +1632,8 @@ async fn coverage_here(
     .map_err(|error| match error {
         CoverageError::Unauthorized => ServerError::Forbidden,
         CoverageError::NoSuchBucket => ServerError::NotFound,
-        CoverageError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
-        other => ServerError::InternalError(other.to_string()),
+        CoverageError::Distribution(error) => crate::lookup::map_guard_error(error),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(coverage_response(bucket, report))
 }
@@ -1785,17 +1752,15 @@ operation.
             "complete": true
         })),
         (status = 400, description = "The cursor or limit could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_placement_diagnostics(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<DiagnosticsQuery>,
 ) -> ServerResult<Json<DiagnosticsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let report = drive(
         PolicyDiagnosticsOperation::new(DiagnosticsInput {
             auth_context: auth,
@@ -1807,7 +1772,7 @@ pub async fn get_placement_diagnostics(
     .await
     .map_err(|error| match error {
         DiagnosticsError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(Json(DiagnosticsResponse {
         subject_generation: report.subject.as_ref().map(|subject| subject.generation),
@@ -1922,31 +1887,29 @@ the operation.
             "cleared": true
         })),
         (status = 400, description = "Unknown `action`, a release without an exact version, or a version that could not be parsed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the realm-configuration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn resolve_placement_quarantine(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<QuarantineResolveRequest>,
 ) -> ServerResult<Json<QuarantineResolveResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let release = quarantine_release(&request)?;
     let resolution = drive(
         ResolveQuarantineOperation::new(ResolveQuarantineConfig {
             auth_context: auth.clone(),
             realm_id: auth.realm_id,
             release,
-            now_ms: now_ms(),
+            now_ms: unix_timestamp_millis(),
         }),
         &state.get_ctx(),
     )
     .await
     .map_err(|error| match error {
         QuarantineError::Unauthorized => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(Json(QuarantineResolveResponse {
         released: resolution.released,
@@ -1986,6 +1949,7 @@ fn quarantine_release(request: &QuarantineResolveRequest) -> ServerResult<Option
 mod tests;
 
 mod coordinators;
+mod count;
 
 #[cfg(test)]
 #[path = "routes_tests.rs"]

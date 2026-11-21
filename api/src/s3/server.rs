@@ -4,13 +4,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 mod activity;
-mod body;
+pub(crate) mod body;
 mod classification;
 mod keepalive;
 mod post;
 mod response;
 
-pub(crate) use body::DeleteObjectsBody;
+use body::DeleteObjectsBody;
 
 use self::activity::{
     ActiveRequestGuard, ConnectionActivity, should_watch_idle, spawn_response_watch,
@@ -30,14 +30,15 @@ use crate::https::HostCheck;
 use crate::https::listener::CombinedListener;
 use crate::rate_limit::{LocalKey, LocalLease};
 use crate::telemetry::{RequestCancelGuard, emit_request_completed, make_request_span};
-use aruna_core::NodeId;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::id::NodeId;
+use aruna_core::listener::S3ServerTimeouts;
 use aruna_core::metrics::{NodeMetrics, RequestLabels, RouteLabels, method_label};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BucketCorsConfiguration;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use aruna_drivers::driver::{DriverContext, drive};
 use axum::serve::Listener;
 use futures_core::future::BoxFuture;
 use http::{Method, Request, header};
@@ -65,8 +66,6 @@ use tokio_util::task::TaskTracker;
 use tracing::instrument::WithSubscriber;
 use tracing::{Instrument, error, info, trace};
 
-const INITIAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const STREAM_LIFETIME_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const EGRESS_LIMIT: usize = 256;
 const CONTROL_EGRESS_LIMIT: usize = 64;
 const CONTROL_REQUEST_LIMIT: usize = 64;
@@ -77,26 +76,6 @@ pub const S3_MAX_CONNECTIONS: usize = 4_096;
 /// Concurrent S3 requests processed at once, acquired before the expensive
 /// s3s parse/body/storage work.
 pub const MAX_CONCURRENT_REQUESTS: usize = 2_048;
-
-/// Listener deadlines of the S3 plane: how long a connection may stay silent
-/// before its first request, how long a request or response may make no I/O
-/// progress, and the total lifetime of one streamed request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct S3ServerTimeouts {
-    pub initial_request: Duration,
-    pub connection_idle: Duration,
-    pub stream_lifetime: Duration,
-}
-
-impl Default for S3ServerTimeouts {
-    fn default() -> Self {
-        Self {
-            initial_request: INITIAL_REQUEST_TIMEOUT,
-            connection_idle: activity::CONNECTION_IDLE_TIMEOUT,
-            stream_lifetime: STREAM_LIFETIME_TIMEOUT,
-        }
-    }
-}
 
 /// Shares the resolved S3 operation between access checks and request metrics.
 /// Request extensions preserve it across `s3s` routing.
@@ -891,6 +870,12 @@ impl S3ServerHandle {
             .is_none_or(tokio::task::JoinHandle::is_finished)
     }
 
+    /// The accepted connections whose tasks still run, for tests that wait on admission.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     /// Stops accepting and asks every connection to close; does not wait.
     pub fn abort(&self) {
         self.abort_connections.cancel();
@@ -1172,14 +1157,17 @@ mod tests {
             .with_writer(move || LogWriter(writer.clone()))
             .finish();
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let mut builder = S3ServiceBuilder::new(TestS3);
         let mut auth = s3s::auth::SimpleAuth::from_single("TOKENKEY", "signing-secret");
@@ -1536,15 +1524,17 @@ mod tests {
         // Behind a trusted proxy every client gets its own bucket; charging the
         // proxy would let one caller throttle every other caller of that proxy.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
-            .expect("storage opens");
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .expect("storage opens");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("local addr");
@@ -1600,14 +1590,17 @@ mod tests {
         // A request refused by the per-IP slot limit still reaches the request
         // metrics, so dashboards count every 503.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
         let address = listener.local_addr().expect("local addr");
@@ -1650,7 +1643,7 @@ mod tests {
             })
             .get();
         assert_eq!(refused, 1);
-        assert!(metrics.render().await.contains(r#"op="local_limited""#));
+        assert!(metrics.render().contains(r#"op="local_limited""#));
 
         task.abort();
     }
@@ -1660,14 +1653,17 @@ mod tests {
         // A nondefault burst of one must reject the second request, proving S3
         // uses the configured quota rather than the default.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
         let server = S3Server::new(
@@ -1722,15 +1718,17 @@ mod tests {
         use tokio::net::TcpListener;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
-            .expect("test storage");
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .expect("test storage");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = iroh::SecretKey::from_bytes(&[0x56; 32]).public();
         let server = S3Server::new(
@@ -1753,7 +1751,7 @@ mod tests {
             .expect("server runs");
 
         // One accepted connection with a partial request keeps a connection
-        // child active; the short wait is the OS boundary, not a schedule guess.
+        // child active; its tracked task is the signal that the server accepted it.
         let mut socket = tokio::net::TcpStream::connect(address)
             .await
             .expect("connect");
@@ -1761,7 +1759,13 @@ mod tests {
             .write_all(b"GET /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .expect("partial request");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while handle.connections.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the server accepts the connection");
 
         handle.abort();
         tokio::time::timeout(std::time::Duration::from_secs(5), handle.wait())
@@ -1777,15 +1781,17 @@ mod tests {
         use tokio::net::TcpListener;
 
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap())
-            .expect("test storage");
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .expect("test storage");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let node_id = iroh::SecretKey::from_bytes(&[0x57; 32]).public();
         let server = S3Server::new(

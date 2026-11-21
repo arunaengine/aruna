@@ -3,32 +3,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{Instant, sleep_until, timeout_at};
 
-use aruna_core::NodeId;
-use aruna_core::effects::StorageEffect;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW};
+use aruna_core::events::PeerRequestError;
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{
-    METADATA_REPLICATION_FACTOR, RealmConfigDocument, RealmId, RealmNodeKind,
+    METADATA_REPLICATION_FACTOR, RealmConfigDocument, RealmNodeKind,
 };
-use byteview::ByteView;
 use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use ed25519_dalek::pkcs8::{DecodePrivateKey, EncodePrivateKey};
 use thiserror::Error;
 
-use crate::driver::{DriverContext, drive};
-use crate::metadata::handle::{MetadataRequestDelivery, MetadataRequestError};
-use crate::metadata::protocol::{MetadataReadError, MetadataTransportMessage, RealmKeyPem};
-use crate::metadata::{MetadataHandle, transport_message_kind};
-use crate::placement::process_placements::load_realm_config;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
 use crate::realm::mutate_placement::{is_management, node_kind};
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, RealmKeyPem, encode_message, peer_call,
+    peer_reply, transport_message_kind,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromoteNodeConfig {
@@ -38,7 +35,7 @@ pub struct PromoteNodeConfig {
     pub realm_signing_key: SigningKey,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum PromoteNodeError {
     #[error("realm config document missing")]
     ConfigMissing,
@@ -72,96 +69,156 @@ const READY_INTERVAL: Duration = Duration::from_millis(500);
 /// Listing attempts of one call; each one that loses its commit to another writer runs again.
 const LIST_ATTEMPTS: usize = 5;
 
+impl From<IoError> for PromoteNodeError {
+    fn from(error: IoError) -> Self {
+        Self::Unreachable(error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Stage {
+    Config,
+    Handoff,
+    List { attempts: usize },
+    Check,
+    Pause,
+}
+
+type PromoteTurn = Result<Next<bool>, PromoteNodeError>;
+
 /// Hands the key first: an unreachable node leaves the realm unchanged and the call can be
-/// repeated. Only a confirmed hand-off marks the node as management. `Ok(true)` means the
-/// node's own config lists it, so its next start applies the promotion.
-pub async fn promote_node(
-    context: &Arc<DriverContext>,
+/// repeated. Only a confirmed hand-off marks the node as management. `true` means the node's
+/// own config lists it, so its next start applies the promotion.
+#[derive(Debug, PartialEq)]
+pub struct PromoteNodeOperation {
     config: PromoteNodeConfig,
-) -> Result<bool, PromoteNodeError> {
-    let deadline = Instant::now() + CALL_BUDGET;
-    let document = load_realm_config(context, config.actor.realm_id)
-        .await
-        .ok_or(PromoteNodeError::ConfigMissing)?;
-    check_target(&document, config.actor.node_id, config.node_id)?;
-    let pem = config
-        .realm_signing_key
-        .to_pkcs8_pem(LineEnding::default())
-        .map_err(|_| PromoteNodeError::KeyEncoding)?;
-    let metadata = context
-        .metadata_handle
-        .as_ref()
-        .ok_or_else(|| PromoteNodeError::Unreachable("metadata transport unavailable".into()))?;
-    let message = MetadataTransportMessage::HandRealmKey {
-        key: RealmKeyPem(pem.to_string()),
-    };
-    let reply = metadata
-        .request_forwarded_write(config.node_id, message)
-        .await;
-    handoff_outcome(reply)?;
-    let target = config.node_id;
-    // Other writers of the realm configuration, such as a joining node's sync, can win the
-    // commit; a refused commit wrote nothing, so the listing runs again.
-    let mut attempts = 1;
-    loop {
-        let listed = drive(
-            EnsureConfigOperation::new(EnsureConfigParams {
-                actor: config.actor.clone(),
-                target_node_id: config.node_id,
+    stage: Stage,
+    now_ms: u64,
+    deadline_ms: u64,
+}
+
+impl PromoteNodeOperation {
+    pub fn new(config: PromoteNodeConfig) -> Self {
+        Self {
+            config,
+            stage: Stage::Config,
+            now_ms: 0,
+            deadline_ms: 0,
+        }
+    }
+
+    fn remaining(&self) -> Duration {
+        Duration::from_millis(self.deadline_ms.saturating_sub(self.now_ms))
+    }
+
+    fn ask(&self, message: &MetadataTransportMessage) -> Result<IoCall, PromoteNodeError> {
+        let frame = encode_message(message).map_err(PromoteNodeError::Unreachable)?;
+        Ok(peer_call(self.config.node_id, frame, self.remaining()))
+    }
+
+    fn hand_key(&mut self, document: &RealmConfigDocument) -> PromoteTurn {
+        check_target(document, self.config.actor.node_id, self.config.node_id)?;
+        let pem = (self.config.realm_signing_key)
+            .to_pkcs8_pem(LineEnding::default())
+            .map_err(|_| PromoteNodeError::KeyEncoding)?;
+        let message = MetadataTransportMessage::HandRealmKey {
+            key: RealmKeyPem(pem.to_string()),
+        };
+        self.stage = Stage::Handoff;
+        Ok(Next::Call(self.ask(&message)?))
+    }
+
+    fn list(&mut self, attempts: usize) -> PromoteTurn {
+        self.stage = Stage::List { attempts };
+        Ok(Next::Call(IoCall::child(EnsureConfigOperation::new(
+            EnsureConfigParams {
+                actor: self.config.actor.clone(),
+                target_node_id: self.config.node_id,
                 target_node_kind: RealmNodeKind::Management,
                 metadata_replication_factor: METADATA_REPLICATION_FACTOR,
                 realm_description: String::new(),
                 create_if_missing: false,
                 reject_kind_mismatch: false,
-            }),
-            context.as_ref(),
-        )
-        .await;
-        match listed {
-            Err(EnsureConfigError::StorageError(StorageError::TransactionConflict))
-                if attempts < LIST_ATTEMPTS =>
-            {
-                attempts += 1;
-            }
-            result => {
-                result?;
-                break;
-            }
-        }
+            },
+        ))))
     }
-    Ok(wait_ready(deadline, READY_INTERVAL, || ask_ready(metadata, target)).await)
+
+    /// The config change reaches the node by replication, which may lag behind the local write.
+    /// Checks and pauses all end at the deadline; a check still waiting then is not ready.
+    fn check(&mut self) -> PromoteTurn {
+        if self.remaining().is_zero() {
+            return Ok(Next::Done(false));
+        }
+        self.stage = Stage::Check;
+        Ok(Next::Call(
+            self.ask(&MetadataTransportMessage::PromotionCheck)?,
+        ))
+    }
+
+    fn pause(&mut self) -> PromoteTurn {
+        if self.remaining() <= READY_INTERVAL {
+            return Ok(Next::Done(false));
+        }
+        self.stage = Stage::Pause;
+        Ok(Next::Call(IoCall::Delay(READY_INTERVAL)))
+    }
 }
 
-async fn ask_ready(metadata: &MetadataHandle, node_id: NodeId) -> bool {
-    let check = MetadataTransportMessage::PromotionCheck;
-    matches!(
-        metadata.request_forwarded_write(node_id, check).await,
-        Ok(MetadataTransportMessage::PromotionReady { result: Ok(true) })
-    )
-}
+impl Operation for PromoteNodeOperation {
+    type Output = bool;
+    type Error = PromoteNodeError;
 
-/// The config change reaches the node by replication, which may lag behind the local write.
-/// Checks and pauses all end at `deadline`; a check still waiting then counts as not ready.
-async fn wait_ready<F, R>(deadline: Instant, interval: Duration, mut ready: F) -> bool
-where
-    F: FnMut() -> R,
-    R: Future<Output = bool>,
-{
-    loop {
-        if matches!(timeout_at(deadline, ready()).await, Ok(true)) {
-            return true;
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> PromoteTurn {
+        self.deadline_ms = self.now_ms.saturating_add(CALL_BUDGET.as_millis() as u64);
+        let realm_id = self.config.actor.realm_id;
+        Ok(Next::Call(IoCall::child(GetConfigOperation::new(realm_id))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PromoteTurn {
+        match self.stage {
+            Stage::Config => {
+                let document = result
+                    .child::<RealmConfigDocument, GetConfigError>()?
+                    .map_err(|_| PromoteNodeError::ConfigMissing)?;
+                self.hand_key(&document)
+            }
+            Stage::Handoff => {
+                handoff_outcome(peer_reply(self.config.node_id, result)?)?;
+                self.list(1)
+            }
+            // Other writers of the realm configuration, such as a joining node's sync, can win
+            // the commit; a refused commit wrote nothing, so the listing runs again.
+            Stage::List { attempts } => {
+                match result.child::<RealmConfigDocument, EnsureConfigError>()? {
+                    Err(EnsureConfigError::StorageError(StorageError::TransactionConflict))
+                        if attempts < LIST_ATTEMPTS =>
+                    {
+                        self.list(attempts + 1)
+                    }
+                    listed => {
+                        listed?;
+                        self.check()
+                    }
+                }
+            }
+            Stage::Check => match peer_reply(self.config.node_id, result)? {
+                Ok(MetadataTransportMessage::PromotionReady { result: Ok(true) }) => {
+                    Ok(Next::Done(true))
+                }
+                _ => self.pause(),
+            },
+            Stage::Pause => self.check(),
         }
-        let next = Instant::now() + interval;
-        if next >= deadline {
-            return false;
-        }
-        sleep_until(next).await;
     }
 }
 
 /// A lost answer can follow a stored key, which no later call can take back.
 fn handoff_outcome(
-    reply: Result<MetadataTransportMessage, MetadataRequestError>,
+    reply: Result<MetadataTransportMessage, PeerRequestError>,
 ) -> Result<(), PromoteNodeError> {
     match reply {
         Ok(MetadataTransportMessage::RealmKeyStored { result: Ok(()) }) => Ok(()),
@@ -172,14 +229,15 @@ fn handoff_outcome(
             "unexpected answer {}",
             transport_message_kind(&other)
         ))),
-        Err(error) => match error.delivery() {
-            MetadataRequestDelivery::DefinitelyNotSent => {
-                Err(PromoteNodeError::Unreachable(error.to_string()))
-            }
-            MetadataRequestDelivery::PossiblySent => {
-                Err(PromoteNodeError::KeyUncertain(error.to_string()))
-            }
-        },
+        Err(PeerRequestError::NotSent(error)) => {
+            Err(PromoteNodeError::Unreachable(error.to_string()))
+        }
+        Err(PeerRequestError::Failed(error)) => {
+            Err(PromoteNodeError::KeyUncertain(error.to_string()))
+        }
+        Err(PeerRequestError::TimedOut) => Err(PromoteNodeError::KeyUncertain(
+            "no answer before the deadline".to_string(),
+        )),
     }
 }
 
@@ -215,92 +273,14 @@ fn request_owner(document: &RealmConfigDocument) -> Option<NodeId> {
         .min()
 }
 
-/// Stores a handed realm key for the next start of this node.
-pub(crate) async fn serve_realm_key(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-    key: RealmKeyPem,
-) -> Result<(), MetadataReadError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let realm_id = *net_handle.realm_id();
-    let document = load_realm_config(context, realm_id)
-        .await
-        .ok_or(MetadataReadError::Unavailable)?;
-    check_handoff(&document, peer, net_handle.node_id(), realm_id, &key)?;
-    let write = StorageEffect::Write {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(PROMOTED_KEY_ROW),
-        value: ByteView::from(key.0.as_bytes()),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(write).await {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        _ => Err(MetadataReadError::Unavailable),
-    }
-}
-
-/// Whether this node's own config lists it as management while it holds a handed key.
-pub(crate) async fn serve_promotion_check(
-    context: &Arc<DriverContext>,
-    peer: NodeId,
-) -> Result<bool, MetadataReadError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(MetadataReadError::Unavailable)?;
-    let document = load_realm_config(context, *net_handle.realm_id())
-        .await
-        .ok_or(MetadataReadError::Unavailable)?;
-    if !is_management(&document, peer) {
-        return Err(MetadataReadError::Forbidden);
-    }
-    if !is_management(&document, net_handle.node_id()) {
-        return Ok(false);
-    }
-    let read = StorageEffect::Read {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(PROMOTED_KEY_ROW),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_some()),
-        _ => Err(MetadataReadError::Unavailable),
-    }
-}
-
-/// Only a current management node may hand the key, never to a device, and only the realm's key.
-fn check_handoff(
-    document: &RealmConfigDocument,
-    peer: NodeId,
-    local: NodeId,
-    realm_id: RealmId,
-    key: &RealmKeyPem,
-) -> Result<(), MetadataReadError> {
-    if !is_management(document, peer)
-        || !matches!(
-            node_kind(document, local),
-            Some(RealmNodeKind::Server | RealmNodeKind::Management)
-        )
-    {
-        return Err(MetadataReadError::Forbidden);
-    }
-    let signing_key =
-        SigningKey::from_pkcs8_pem(&key.0).map_err(|_| MetadataReadError::Unauthorized)?;
-    if signing_key.verifying_key().to_bytes() != *realm_id.as_bytes() {
-        return Err(MetadataReadError::Unauthorized);
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
-    use aruna_core::keys::generate_signing_key;
-    use aruna_core::metadata::MetadataError;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::effects::{Effect, NetEffect};
+    use aruna_core::events::{Event, MetadataAnswer, NetEvent};
+    use aruna_core::metadata::protocol::decode_message;
+    use aruna_core::structs::identity::realm::RealmId;
 
     /// Node ids in ascending order of `rank`, so a test knows which one owns database requests.
     fn node(rank: u8) -> NodeId {
@@ -312,14 +292,7 @@ mod tests {
     }
 
     fn realm() -> (SigningKey, RealmId, RealmConfigDocument) {
-        let key = generate_signing_key();
-        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
-        let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
-        document.ensure_node(node(1), RealmNodeKind::Management);
-        document.ensure_node(node(2), RealmNodeKind::Server);
-        let owner = UserId::nil(realm_id);
-        document.ensure_node(node(3), RealmNodeKind::User { owner });
-        (key, realm_id, document)
+        crate::tests::realm::promotion_realm([node(1), node(2), node(3)])
     }
 
     fn pem(key: &SigningKey) -> RealmKeyPem {
@@ -371,50 +344,16 @@ mod tests {
     }
 
     #[test]
-    fn handoff_checks_sender() {
-        let (key, realm_id, document) = realm();
-        let key = pem(&key);
-        assert_eq!(
-            check_handoff(&document, node(1), node(2), realm_id, &key),
-            Ok(())
-        );
-        assert_eq!(
-            check_handoff(&document, node(2), node(2), realm_id, &key),
-            Err(MetadataReadError::Forbidden),
-            "a server node may not hand a key"
-        );
-        assert_eq!(
-            check_handoff(&document, node(1), node(3), realm_id, &key),
-            Err(MetadataReadError::Forbidden),
-            "a device never stores the realm key"
-        );
-        assert_eq!(
-            check_handoff(&document, node(1), node(9), realm_id, &key),
-            Err(MetadataReadError::Forbidden)
-        );
-    }
-
-    #[test]
-    fn handoff_rejects_foreign() {
-        let (_, realm_id, document) = realm();
-        let foreign = pem(&generate_signing_key());
-        assert_eq!(
-            check_handoff(&document, node(1), node(2), realm_id, &foreign),
-            Err(MetadataReadError::Unauthorized)
-        );
-        let garbage = RealmKeyPem("not a key".to_string());
-        assert_eq!(
-            check_handoff(&document, node(1), node(2), realm_id, &garbage),
-            Err(MetadataReadError::Unauthorized)
-        );
-    }
-
-    #[test]
     fn lost_answer_uncertain() {
-        let lost = MetadataRequestError::possibly_sent(MetadataError::ChannelClosed);
         assert!(matches!(
-            handoff_outcome(Err(lost)),
+            handoff_outcome(Err(PeerRequestError::TimedOut)),
             Err(PromoteNodeError::KeyUncertain(_))
+        ));
+        assert!(matches!(
+            handoff_outcome(Err(PeerRequestError::NotSent(
+                aruna_core::metadata::MetadataError::Backend("no route".to_string(),)
+            ))),
+            Err(PromoteNodeError::Unreachable(_))
         ));
         let refused = MetadataTransportMessage::RealmKeyStored {
             result: Err(MetadataReadError::Forbidden),
@@ -425,42 +364,134 @@ mod tests {
         ));
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn waits_for_replication() {
-        let asked = std::cell::Cell::new(0);
-        let deadline = Instant::now() + CALL_BUDGET;
-        let ready = wait_ready(deadline, Duration::from_secs(1), || {
-            asked.set(asked.get() + 1);
-            let replicated = asked.get() >= 3;
-            async move { replicated }
-        })
-        .await;
-        assert!(ready, "a lagging config change is waited for");
-        assert_eq!(asked.get(), 3);
+    const START_MS: u64 = 1_000_000;
+
+    fn operation() -> (PromoteNodeOperation, RealmConfigDocument) {
+        let (key, realm_id, document) = realm();
+        let config = PromoteNodeConfig {
+            actor: Actor {
+                node_id: node(1),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
+                realm_id,
+            },
+            node_id: node(2),
+            realm_signing_key: key,
+        };
+        let mut operation = PromoteNodeOperation::new(config);
+        operation.stamp(START_MS);
+        (operation, document)
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn slow_checks_bounded() {
-        let started = Instant::now();
-        let asked = std::cell::Cell::new(0);
-        let ready = wait_ready(started + CALL_BUDGET, READY_INTERVAL, || {
-            asked.set(asked.get() + 1);
-            let replicated = asked.get() >= 2;
-            async move {
-                tokio::time::sleep(Duration::from_secs(15)).await;
-                replicated
-            }
-        })
-        .await;
-        assert!(
-            !ready,
-            "a check still waiting at the deadline counts as not ready"
-        );
-        assert_eq!(asked.get(), 2);
+    fn config_answer(document: RealmConfigDocument) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Ok::<_, GetConfigError>(document)))
+    }
+
+    fn listed(result: Result<RealmConfigDocument, EnsureConfigError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn peer_says(message: &MetadataTransportMessage) -> IoResult {
+        let answer = MetadataAnswer {
+            peer: node(2),
+            result: Ok(encode_message(message).unwrap()),
+            elapsed: Duration::ZERO,
+        };
+        let event = Event::Net(NetEvent::MetadataAnswer(Box::new(answer)));
+        IoResult::Event(Box::new(event))
+    }
+
+    fn sent(turn: PromoteTurn) -> (MetadataTransportMessage, Duration) {
+        let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+            panic!("expected a peer request");
+        };
+        let Effect::Net(NetEffect::MetadataRequest(request)) = *effect else {
+            panic!("expected a peer request");
+        };
+        (decode_message(&request.frame).unwrap(), request.timeout)
+    }
+
+    fn stored() -> MetadataTransportMessage {
+        MetadataTransportMessage::RealmKeyStored { result: Ok(()) }
+    }
+
+    fn ready(answer: bool) -> MetadataTransportMessage {
+        MetadataTransportMessage::PromotionReady { result: Ok(answer) }
+    }
+
+    /// Runs up to the first readiness check.
+    fn listed_operation() -> (PromoteNodeOperation, RealmConfigDocument) {
+        let (mut operation, document) = operation();
+        operation.first().unwrap();
+        let handed = sent(operation.next(config_answer(document.clone())));
+        assert!(matches!(
+            handed.0,
+            MetadataTransportMessage::HandRealmKey { .. }
+        ));
+        assert_eq!(handed.1, CALL_BUDGET);
+        let turn = operation.next(peer_says(&stored()));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        (operation, document)
+    }
+
+    #[test]
+    fn waits_for_replication() {
+        let (mut operation, document) = listed_operation();
+        let check = sent(operation.next(listed(Ok(document))));
+        assert_eq!(check.0, MetadataTransportMessage::PromotionCheck);
+        let pause = operation.next(peer_says(&ready(false)));
+        assert!(matches!(
+            pause,
+            Ok(Next::Call(IoCall::Delay(READY_INTERVAL)))
+        ));
+        operation.stamp(START_MS + 5_000);
+        let again = sent(operation.next(IoResult::Woke));
+        assert_eq!(again.1, CALL_BUDGET - Duration::from_secs(5));
         assert_eq!(
-            started.elapsed(),
-            CALL_BUDGET,
-            "the wait ends at the deadline"
+            operation.next(peer_says(&ready(true))),
+            Ok(Next::Done(true))
+        );
+    }
+
+    #[test]
+    fn slow_checks_bounded() {
+        let (mut operation, document) = listed_operation();
+        sent(operation.next(listed(Ok(document))));
+        operation.stamp(START_MS + CALL_BUDGET.as_millis() as u64 - 100);
+        assert_eq!(
+            operation.next(peer_says(&ready(false))),
+            Ok(Next::Done(false)),
+            "no pause fits before the deadline"
+        );
+    }
+
+    #[test]
+    fn conflicts_list_again() {
+        let (mut operation, _) = listed_operation();
+        let lost = || {
+            Err(EnsureConfigError::StorageError(
+                StorageError::TransactionConflict,
+            ))
+        };
+        for _ in 1..LIST_ATTEMPTS {
+            let turn = operation.next(listed(lost()));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        }
+        assert_eq!(
+            operation.next(listed(lost())),
+            Err(PromoteNodeError::Ensure(EnsureConfigError::StorageError(
+                StorageError::TransactionConflict
+            )))
+        );
+    }
+
+    #[test]
+    fn refused_target_silent() {
+        let (mut operation, mut document) = operation();
+        document.nodes.clear();
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(config_answer(document)),
+            Err(PromoteNodeError::NotManagementNode)
         );
     }
 

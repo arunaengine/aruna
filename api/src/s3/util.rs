@@ -8,8 +8,8 @@ use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::storage::blob::{BackendLocation, ensure_confined_path};
 use aruna_core::structs::storage::format::{StoredEncryption, StoredFormat};
 use aruna_core::structs::storage::multipart::{MultipartChecksumHint, MultipartChecksumType};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_operations::s3::multipart::complete::CompleteMultipartPart;
-use aruna_operations::s3::object::get::ObjectRangeRequest;
 use aruna_operations::s3::object::put::PutObjectInput as BlobPutObjectInput;
 use base64::prelude::*;
 use http::HeaderMap;
@@ -462,7 +462,7 @@ mod tests {
     use crate::s3::checksum::parse_upload_checksum;
     use aruna_core::structs::checksum::ChecksumAlgorithm;
     use aruna_core::structs::storage::multipart::MultipartChecksumType;
-    use aruna_operations::s3::object::get::ObjectRangeRequest;
+    use aruna_core::structs::storage::object_read::ObjectRangeRequest;
     use http::HeaderMap;
     use s3s::S3ErrorCode;
     use s3s::dto::CopySource;

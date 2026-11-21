@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    ServerError, bootstrap_onboarding, create_onboarding_secret, get_secret_status,
-    list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
+    ListSecretsQuery, ServerError, bootstrap_onboarding, create_onboarding_secret,
+    get_secret_status, list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
 };
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::admin_documents::AdminDocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
@@ -26,8 +25,10 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::onboarding::finalize_bootstrap::BootstrapFinalizeError;
 use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
@@ -38,7 +39,7 @@ use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::Extension;
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use base64::Engine;
 use crypto_box::{
@@ -58,7 +59,8 @@ async fn setup_management_state() -> (
     TempDir,
 ) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -74,9 +76,10 @@ async fn setup_management_state() -> (
         storage_handle,
         net_handle: Some(net_handle.clone()),
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let realm_signing_key = generate_signing_key();
@@ -123,7 +126,7 @@ async fn setup_management_state() -> (
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -307,7 +310,8 @@ async fn mint_binds_owner() {
     assert_eq!(secret.mode, OnboardingMode::User { owner: user_id });
     assert_eq!(created.enrollment_id, secret.enrollment_id.to_string());
 
-    let (_, Json(listed)) = list_onboarding_secrets(State(state), Extension(Some(auth)))
+    let none = Query(ListSecretsQuery::default());
+    let (_, Json(listed)) = list_onboarding_secrets(State(state), Extension(Some(auth)), none)
         .await
         .unwrap();
     let owner = user_id.to_string();
@@ -315,6 +319,54 @@ async fn mint_binds_owner() {
     assert_eq!(listed.secrets[0].owner.as_deref(), Some(owner.as_str()));
     assert_eq!(listed.secrets[0].enrollment_id, created.enrollment_id);
 
+    net_handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn lists_by_expiry() {
+    // Pages follow the expiry order, and the cursor of one page opens the next.
+    let (state, realm_id, _node_id, user_id, net_handle, _tempdir) = setup_management_state().await;
+    let auth = AuthContext {
+        user_id,
+        realm_id,
+        path_restrictions: None,
+        session: None,
+    };
+    let mut created = Vec::new();
+    for seconds in [900, 300] {
+        let (_, Json(secret)) = create_onboarding_secret(
+            State(state.clone()),
+            Extension(Some(auth.clone())),
+            Json(CreateSecretRequest {
+                seed_url: "http://127.0.0.1:3000".to_string(),
+                mode: RequestedOnboardingMode::User,
+                expires_in_seconds: Some(seconds),
+            }),
+        )
+        .await
+        .unwrap();
+        created.push(secret.enrollment_id);
+    }
+    let first = Query(ListSecretsQuery {
+        cursor: None,
+        limit: Some(1),
+    });
+    let (_, Json(page)) =
+        list_onboarding_secrets(State(state.clone()), Extension(Some(auth.clone())), first)
+            .await
+            .unwrap();
+    assert_eq!(
+        page.secrets[0].enrollment_id, created[1],
+        "the sooner expiry first"
+    );
+    let next = Query(ListSecretsQuery {
+        cursor: page.next_cursor,
+        limit: Some(1),
+    });
+    let (_, Json(page)) = list_onboarding_secrets(State(state), Extension(Some(auth)), next)
+        .await
+        .unwrap();
+    assert_eq!(page.secrets[0].enrollment_id, created[0]);
     net_handle.shutdown().await;
 }
 
@@ -754,9 +806,10 @@ async fn bootstrap_rejects_secret() {
     .await;
     assert!(matches!(result, Err(ServerError::Forbidden)));
 
-    let entries = drive(ListSecretsOperation::new(), &state.get_ctx())
+    let entries = drive(ListSecretsOperation::new(None), &state.get_ctx())
         .await
-        .unwrap();
+        .unwrap()
+        .entries;
     let entry = entries
         .iter()
         .find(|entry| entry.record.enrollment_id == enrollment_id)
@@ -788,8 +841,9 @@ async fn secrets_list_revoke() {
     .await
     .unwrap();
 
+    let none = Query(ListSecretsQuery::default());
     let (_, Json(listed)) =
-        list_onboarding_secrets(State(state.clone()), Extension(Some(auth.clone())))
+        list_onboarding_secrets(State(state.clone()), Extension(Some(auth.clone())), none)
             .await
             .unwrap();
     assert_eq!(listed.secrets.len(), 1);
@@ -812,6 +866,7 @@ async fn secrets_list_revoke() {
             path_restrictions: None,
             session: None,
         })),
+        Query(ListSecretsQuery::default()),
     )
     .await
     .unwrap();
@@ -877,16 +932,19 @@ async fn secret_pruning_correct() {
     .await
     .unwrap();
 
-    let (_, Json(listed)) = list_onboarding_secrets(State(state.clone()), Extension(Some(auth)))
-        .await
-        .unwrap();
+    let none = Query(ListSecretsQuery::default());
+    let (_, Json(listed)) =
+        list_onboarding_secrets(State(state.clone()), Extension(Some(auth)), none)
+            .await
+            .unwrap();
     assert_eq!(listed.secrets.len(), 1);
     assert_eq!(listed.secrets[0].enrollment_id, finalizing_id.to_string());
     assert_eq!(listed.secrets[0].claimed_node_id.as_deref(), Some("node-a"));
 
-    let entries = drive(ListSecretsOperation::new(), &state.get_ctx())
+    let entries = drive(ListSecretsOperation::new(None), &state.get_ctx())
         .await
-        .unwrap();
+        .unwrap()
+        .entries;
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].record.enrollment_id, finalizing_id);
 
@@ -949,9 +1007,11 @@ async fn invalid_proof_preserves() {
     .await;
     assert!(matches!(result, Err(ServerError::Unauthorized)));
 
-    let (_, Json(listed)) = list_onboarding_secrets(State(state.clone()), Extension(Some(auth)))
-        .await
-        .unwrap();
+    let none = Query(ListSecretsQuery::default());
+    let (_, Json(listed)) =
+        list_onboarding_secrets(State(state.clone()), Extension(Some(auth)), none)
+            .await
+            .unwrap();
     assert_eq!(listed.secrets.len(), 1);
 
     let issuer_signature = issuer_key

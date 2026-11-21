@@ -3,10 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
 use std::collections::BTreeSet;
-use std::future::Future;
 
 /// Why a run starts no more rows.
 #[derive(Debug, PartialEq)]
@@ -20,6 +17,7 @@ pub(super) enum Stop {
 /// The version rows of one run in storage order, each with its key and the linked file name a
 /// move gives it. The rows of one key are adjacent and run one after another; two rows of one
 /// key or of one new name never run at once.
+#[derive(Debug, PartialEq)]
 pub(super) struct Batch {
     rows: Vec<(String, Option<String>)>,
     running: Vec<usize>,
@@ -47,7 +45,7 @@ impl Batch {
 
     /// The next row that may start: the next version of a key whose last one finished, else
     /// the first version of the next key, unless a running row has its key or name.
-    fn ready(&self) -> Option<usize> {
+    pub(super) fn ready(&self) -> Option<usize> {
         let free = |row: &usize| {
             !self
                 .running
@@ -78,7 +76,7 @@ impl Batch {
         self.pass_finished();
     }
 
-    fn start(&mut self, row: usize) {
+    pub(super) fn start(&mut self, row: usize) {
         self.waiting.remove(&row);
         if row == self.next {
             self.next = self.key_end(row);
@@ -108,7 +106,17 @@ impl Batch {
         }
     }
 
-    fn finish(&mut self, row: usize) {
+    /// The rows started and not finished.
+    pub(super) fn running(&self) -> usize {
+        self.running.len()
+    }
+
+    /// Takes back a started row that did no work; it stays unfinished.
+    pub(super) fn abandon(&mut self, row: usize) {
+        self.running.retain(|running| *running != row);
+    }
+
+    pub(super) fn finish(&mut self, row: usize) {
         self.running.retain(|running| *running != row);
         self.finished[row] = true;
         // The key's next unfinished row; one an earlier run finished never runs again.
@@ -130,85 +138,19 @@ impl Batch {
     }
 }
 
-/// Starts the rows of `batch` in order, at most `limit` at once, while `proceed` agrees before
-/// each start. Rows already started always finish, also after a stop or an error, and their
-/// results come back by row.
-pub(super) async fn run_rows<T, F, P>(
-    batch: &mut Batch,
-    limit: usize,
-    mut start: impl FnMut(usize) -> F,
-    mut proceed: impl FnMut() -> P,
-) -> (Vec<Option<T>>, Result<Option<Stop>, String>)
-where
-    F: Future<Output = T>,
-    P: Future<Output = Result<Option<Stop>, String>>,
-{
-    let mut results: Vec<Option<T>> = batch.rows.iter().map(|_| None).collect();
-    let mut running = FuturesUnordered::new();
-    let mut stop = Ok(None);
-    loop {
-        while matches!(stop, Ok(None))
-            && running.len() < limit
-            && let Some(row) = batch.ready()
-        {
-            stop = proceed().await;
-            if !matches!(stop, Ok(None)) {
-                break;
-            }
-            batch.start(row);
-            let started = start(row);
-            running.push(async move { (row, started.await) });
-        }
-        let Some((row, result)) = running.next().await else {
-            return (results, stop);
-        };
-        batch.finish(row);
-        results[row] = Some(result);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::{mpsc, oneshot};
 
     fn batch(keys: &[&str]) -> Batch {
         Batch::new(keys.iter().map(|key| (key.to_string(), None)).collect())
     }
 
-    /// A row that runs until the test finishes it.
-    type Started = (usize, oneshot::Sender<()>);
-
-    /// Each started row reports on the channel and runs until its sender is used.
-    fn reporting(starts: mpsc::UnboundedSender<Started>) -> impl FnMut(usize) -> Running {
-        move |row| {
-            let (finish, finished) = oneshot::channel();
-            starts.send((row, finish)).unwrap();
-            Box::pin(async move {
-                finished.await.unwrap();
-                row
-            })
-        }
-    }
-
-    type Running = std::pin::Pin<Box<dyn Future<Output = usize> + Send>>;
-
-    /// Agrees to `allowed` starts, then answers `then`.
-    fn allowing(
-        mut allowed: usize,
-        then: Stop,
-    ) -> impl FnMut() -> std::future::Ready<Result<Option<Stop>, String>> {
-        let mut then = Some(then);
-        move || {
-            let answer = match allowed {
-                0 => then.take(),
-                _ => {
-                    allowed -= 1;
-                    None
-                }
-            };
-            std::future::ready(Ok(answer))
-        }
+    /// Starts the next ready row.
+    fn start_next(rows: &mut Batch) -> Option<usize> {
+        let row = rows.ready()?;
+        rows.start(row);
+        Some(row)
     }
 
     #[test]
@@ -282,99 +224,53 @@ mod tests {
         assert_eq!((rows.ready(), rows.done()), (None, 4));
     }
 
-    #[tokio::test]
-    async fn runs_keys_together() {
-        // Versions of several keys run at once, up to the limit.
-        let (sender, mut starts) = mpsc::unbounded_channel();
+    #[test]
+    fn runs_keys_together() {
+        // Versions of several keys run at once.
         let mut rows = batch(&["a", "b", "c", "d"]);
-        let run = run_rows(&mut rows, 3, reporting(sender), allowing(9, Stop::More));
-        let control = async {
-            let mut open = Vec::new();
-            for expected in 0..3 {
-                let (row, finish) = starts.recv().await.unwrap();
-                assert_eq!(row, expected);
-                open.push(finish);
-            }
-            assert!(starts.try_recv().is_err());
-            open.drain(..).for_each(|finish| finish.send(()).unwrap());
-            let (row, finish) = starts.recv().await.unwrap();
-            assert_eq!(row, 3);
-            finish.send(()).unwrap();
-        };
-        let ((results, stop), ()) = tokio::join!(run, control);
-        assert_eq!(results, vec![Some(0), Some(1), Some(2), Some(3)]);
-        assert_eq!(stop, Ok(None));
+        for expected in 0..4 {
+            assert_eq!(start_next(&mut rows), Some(expected));
+        }
+        assert_eq!(rows.running(), 4);
+        (0..4).for_each(|row| rows.finish(row));
         assert_eq!(rows.done(), 4);
     }
 
-    #[tokio::test]
-    async fn orders_key_versions() {
+    #[test]
+    fn orders_key_versions() {
         // The versions of one key run one after another, in storage order.
-        let (sender, mut starts) = mpsc::unbounded_channel();
         let mut rows = batch(&["a", "a", "b", "b"]);
-        let run = run_rows(&mut rows, 8, reporting(sender), allowing(9, Stop::More));
-        let control = async {
-            let (first, finish_first) = starts.recv().await.unwrap();
-            let (second, finish_second) = starts.recv().await.unwrap();
-            assert_eq!((first, second), (0, 2));
-            assert!(starts.try_recv().is_err());
-            finish_second.send(()).unwrap();
-            let (row, finish) = starts.recv().await.unwrap();
-            assert_eq!(row, 3);
-            assert!(starts.try_recv().is_err());
-            finish_first.send(()).unwrap();
-            finish.send(()).unwrap();
-            let (row, finish) = starts.recv().await.unwrap();
-            assert_eq!(row, 1);
-            finish.send(()).unwrap();
-        };
-        let ((results, _), ()) = tokio::join!(run, control);
-        assert_eq!(results, vec![Some(0), Some(1), Some(2), Some(3)]);
+        assert_eq!(start_next(&mut rows), Some(0));
+        assert_eq!(start_next(&mut rows), Some(2));
+        assert_eq!(rows.ready(), None);
+        rows.finish(2);
+        assert_eq!(start_next(&mut rows), Some(3));
+        assert_eq!(rows.ready(), None);
+        rows.finish(0);
+        rows.finish(3);
+        assert_eq!(start_next(&mut rows), Some(1));
+        rows.finish(1);
+        assert_eq!(rows.done(), 4);
     }
 
-    #[tokio::test]
-    async fn stops_mid_batch() {
-        // A pause starts nothing more, rows already started still finish, and the cursor stops
-        // before the first row that did not finish.
-        let (sender, mut starts) = mpsc::unbounded_channel();
+    #[test]
+    fn stops_mid_batch() {
+        // The cursor stays before the first row that did not finish.
         let mut rows = batch(&["a", "a", "b"]);
-        let run = run_rows(&mut rows, 8, reporting(sender), allowing(2, Stop::Halted));
-        let control = async {
-            let (first, finish_first) = starts.recv().await.unwrap();
-            let (second, finish_second) = starts.recv().await.unwrap();
-            assert_eq!((first, second), (0, 2));
-            finish_second.send(()).unwrap();
-            finish_first.send(()).unwrap();
-        };
-        let ((results, stop), ()) = tokio::join!(run, control);
-        assert!(starts.try_recv().is_err());
-        assert_eq!(results, vec![Some(0), None, Some(2)]);
-        assert_eq!(stop, Ok(Some(Stop::Halted)));
+        assert_eq!(start_next(&mut rows), Some(0));
+        assert_eq!(start_next(&mut rows), Some(2));
+        rows.finish(2);
+        rows.finish(0);
         assert_eq!(rows.done(), 1);
+        assert_eq!(rows.finished_after().collect::<Vec<_>>(), vec![2]);
     }
 
-    #[tokio::test]
-    async fn finishes_after_error() {
-        // A failed check stops the run, but the row already running still finishes.
-        let (sender, mut starts) = mpsc::unbounded_channel();
+    #[test]
+    fn abandoned_row_unfinished() {
+        // A row that stopped before its work frees its key and does not count.
         let mut rows = batch(&["a", "b"]);
-        let mut checks = 0;
-        let proceed = move || {
-            checks += 1;
-            std::future::ready(match checks {
-                1 => Ok(None),
-                _ => Err("unreadable".to_string()),
-            })
-        };
-        let run = run_rows(&mut rows, 8, reporting(sender), proceed);
-        let control = async {
-            let (row, finish) = starts.recv().await.unwrap();
-            assert_eq!(row, 0);
-            finish.send(()).unwrap();
-        };
-        let ((results, stop), ()) = tokio::join!(run, control);
-        assert_eq!(results, vec![Some(0), None]);
-        assert_eq!(stop, Err("unreadable".to_string()));
-        assert_eq!(rows.done(), 1);
+        assert_eq!(start_next(&mut rows), Some(0));
+        rows.abandon(0);
+        assert_eq!((rows.running(), rows.done()), (0, 0));
     }
 }

@@ -4,6 +4,28 @@
 
 use super::*;
 
+fn group_sync_topics<F>(
+    topic_ids: &[::irokle::TopicId],
+    mut select: F,
+) -> BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<::irokle::TopicId>)>
+where
+    F: FnMut(::irokle::TopicId) -> PeerSelection,
+{
+    let mut groups: BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<::irokle::TopicId>)> =
+        BTreeMap::new();
+    for topic_id in topic_ids.iter().copied() {
+        let selection = select(topic_id);
+        let selected = selection.peers.clone();
+        if let Some((group, topics)) = groups.get_mut(&selected) {
+            group.truncated |= selection.truncated;
+            topics.push(topic_id);
+        } else {
+            groups.insert(selected, (selection, vec![topic_id]));
+        }
+    }
+    groups
+}
+
 #[test]
 fn budget_caps_streams() {
     // Per-peer and global caps hold, and dropping a permit restores both.

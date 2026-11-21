@@ -1,0 +1,25 @@
+# Manifest of aruna-plugin-types: plugin manifests, artifact sections and the values of host calls.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-plugin-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hex = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+wasm-encoder = { workspace = true }
+wasmparser = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

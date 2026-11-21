@@ -6,47 +6,54 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use aruna_compute::session::EventKind;
-use aruna_compute::session::events::SessionEvent;
-use aruna_compute::session::{
-    EndReason, MAX_SCRATCH_BYTES, PendingInput, Session, SessionError, StagedInput,
+use crate::job_service::read_session_reason;
+use crate::job_service::{read_job_record, submit_copy_job};
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::compute::ExecutorKind;
+use aruna_core::compute::session::{
+    EndReason, EventKind, MAX_SCRATCH_BYTES, PendingInput, SessionAnswer, SessionError,
+    SessionEvent, SessionRequest, SessionSnapshot, StagedInput,
 };
+use aruna_core::job_request::session_of;
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_core::structs::execution::job::{CopyJobSpec, JobId, JobPayload, JobRecord, JobState};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{CopyJobSpec, ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
-use aruna_operations::driver::drive;
-use aruna_operations::jobs::lifecycle::ids::session_of;
-use aruna_operations::jobs::service::read_session_reason;
-use aruna_operations::jobs::service::submit_copy_job;
-use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object::copy::{
-    CopyObjectInput, CopyReferences, CopySourceConditions, copy_object,
+use aruna_drivers::driver::{drive, node_routing};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::placement::policy::gate::{
+    GateContext, GateOperation, PolicyGateError, gate_decision, write_gate,
 };
-use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_operations::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_operations::transfer::copy::{
+    CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use futures_util::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::VecDeque;
 use std::time::Duration;
-use tokio::sync::broadcast::error::RecvError;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{blob_permission_path, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{blob_permission_path, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::jobs::owned_session_job;
-use crate::routes::execution::jobs::{
-    JobStatusResponse, coded_response, job_status_response, map_job_request, map_submit_error,
-};
+use crate::jobs::{JobStatusResponse, job_status_response};
+use crate::jobs::{owned_session_job, session_call};
+use crate::lookup::bucket_info;
+use crate::routes::execution::jobs::{coded_response, map_submit_error};
+use crate::routes::rocrate_import::map_head_error;
 use crate::routes::staging::queue_live_replication;
 use crate::server::state::ServerState;
 
@@ -55,12 +62,8 @@ const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Objects one staging call brings into the workspace bucket.
 const MAX_STAGED_ITEMS: usize = 64;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "compute/sessions", description = "Interactive notebook sessions")))]
-pub struct JobSessionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobSessionDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_session))
         .routes(routes!(stream_session))
         .routes(routes!(submit_cell))
@@ -232,15 +235,16 @@ pub struct SessionInputsResponse {
     pub failed: Vec<FailedInputResponse>,
 }
 
-/// The live session, or the coded answer that says why there is none here.
-/// A node restart re-adopts the container and opens a new session, so a
+/// The live session's answer to `request`, or the coded answer that says why there is no
+/// session here. A node restart re-adopts the container and opens a new session, so a
 /// non-terminal job without one is starting, never ended.
-async fn live_session(
+async fn ask_session(
     state: &ServerState,
     record: &JobRecord,
     physical_job_id: Option<JobId>,
     state_read: bool,
-) -> Result<Arc<Session>, Response> {
+    request: SessionRequest,
+) -> Result<SessionAnswer, Response> {
     if physical_job_id.is_some() && record.owner_node_id != state.get_node_id() {
         return Err((
             StatusCode::CONFLICT,
@@ -252,15 +256,11 @@ async fn live_session(
         )
             .into_response());
     }
-    let session = state
-        .get_ctx()
-        .compute_handle
-        .as_ref()
-        .and_then(|registry| {
-            physical_job_id.and_then(|id| registry.sessions().get(&id.to_string()))
-        });
-    if let Some(session) = session {
-        return Ok(session);
+    if let Some(job_id) = physical_job_id {
+        match session_call(state, job_id, request).await {
+            SessionAnswer::Missing => {}
+            answer => return Ok(answer),
+        }
     }
     if !state_read {
         return Err(session_error(if record.state.is_terminal() {
@@ -336,8 +336,7 @@ fn base_response(record: &JobRecord) -> SessionResponse {
     }
 }
 
-pub(crate) fn session_response(session: &Session, with_cells: bool) -> SessionResponse {
-    let snapshot = session.snapshot();
+fn session_response(snapshot: SessionSnapshot, with_cells: bool) -> SessionResponse {
     SessionResponse {
         job_id: snapshot.job_id,
         state: snapshot.state.as_str().to_string(),
@@ -365,6 +364,17 @@ pub(crate) fn session_response(session: &Session, with_cells: bool) -> SessionRe
         ended: snapshot.ended.map(|reason| SessionEndedResponse {
             reason: reason.as_str().to_string(),
         }),
+    }
+}
+
+/// The answer to a request whose own answer did not come: a refusal keeps its code, and a
+/// session that closed meanwhile has ended.
+fn other_answer(answer: SessionAnswer) -> Response {
+    match answer {
+        SessionAnswer::Refused(error) => session_error(error),
+        SessionAnswer::Missing => session_error(SessionError::Ended),
+        _ => ServerError::InternalError("unexpected session answer".to_string().into())
+            .into_response(),
     }
 }
 
@@ -428,7 +438,6 @@ like cancel: only the submitter, and anybody else's job answers 404.
             "idle_after_ms": 1800000, "idle_deadline_ms": 1755501800000_u64,
             "credential_expires_at_ms": 1755503600000_u64, "last_event_id": 1, "cells": []
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -437,17 +446,22 @@ like cancel: only the submitter, and anybody else's job answers 404.
 )]
 pub async fn get_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    match live_session(&state, &record, physical_job_id, true).await {
-        Ok(session) => Ok(Json(session_response(&session, true)).into_response()),
-        Err(response) => Ok(response),
-    }
+        .map_err(ServerError::from)?;
+    let request = SessionRequest::Snapshot;
+    Ok(
+        match ask_session(&state, &record, physical_job_id, true, request).await {
+            Ok(SessionAnswer::Snapshot(snapshot)) => {
+                Json(session_response(*snapshot, true)).into_response()
+            }
+            Ok(answer) => other_answer(answer),
+            Err(response) => response,
+        },
+    )
 }
 
 #[utoipa::path(
@@ -474,7 +488,6 @@ like cancel.
     ),
     responses(
         (status = 200, description = "The event stream", body = SessionResponse, content_type = "text/event-stream"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -483,25 +496,32 @@ like cancel.
 )]
 pub async fn stream_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<EventsQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, true).await {
-        Ok(session) => session,
+        .map_err(ServerError::from)?;
+    let request = SessionRequest::Snapshot;
+    let snapshot = match ask_session(&state, &record, physical_job_id, true, request).await {
+        Ok(SessionAnswer::Snapshot(snapshot)) => *snapshot,
+        Ok(answer) => return Ok(other_answer(answer)),
         Err(response) => return Ok(response),
     };
+    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
     let after = query.after.or_else(|| last_event_id(&headers)).unwrap_or(0);
-    let mut initial = vec![frame("session", &session_response(&session, false))];
-    let (backlog, receiver) = match session.subscribe(after) {
-        Ok(resumed) => resumed,
-        Err(_) => {
-            let (backlog, receiver) = session.subscribe_all();
+    let mut initial = vec![frame("session", &session_response(snapshot, false))];
+    let resume = SessionRequest::Subscribe { after: Some(after) };
+    let (backlog, receiver) = match session_call(&state, job_id, resume).await {
+        SessionAnswer::Stream { backlog, live } => (backlog, live),
+        SessionAnswer::Gap => {
+            let all = SessionRequest::Subscribe { after: None };
+            let SessionAnswer::Stream { backlog, live } = session_call(&state, job_id, all).await
+            else {
+                return Ok(session_error(SessionError::Ended));
+            };
             // The lost range is what the ring no longer reaches, so the client
             // sees the window it still holds rather than an inverted one.
             initial.push(frame(
@@ -511,8 +531,9 @@ pub async fn stream_session(
                     "to": backlog.last().map_or(after, |event| event.id),
                 }),
             ));
-            (backlog, receiver)
+            (backlog, live)
         }
+        answer => return Ok(other_answer(answer)),
     };
     let last_id = backlog.last().map_or(after, |event| event.id);
     let ended = stream_ended(&backlog);
@@ -548,7 +569,7 @@ where
 /// The live tail of the stream. It stops right after `ended`, and a reader that
 /// fell behind is told the exact range it lost before the next event.
 fn live_stream(
-    receiver: tokio::sync::broadcast::Receiver<SessionEvent>,
+    receiver: BackendStream<SessionEvent>,
     last_id: u64,
     ended: bool,
 ) -> impl Stream<Item = Event> + Send {
@@ -561,26 +582,19 @@ fn live_stream(
             if done {
                 return None;
             }
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => {
-                        let ended = event.kind == EventKind::Ended;
-                        let id = event.id;
-                        if id > last_id.saturating_add(1) {
-                            pending.push_back(sse_event(event));
-                            let gap = frame(
-                                "gap",
-                                &json!({ "from": last_id.saturating_add(1), "to": id }),
-                            );
-                            return Some((gap, (receiver, id, pending, ended)));
-                        }
-                        last_id = id;
-                        return Some((sse_event(event), (receiver, last_id, pending, ended)));
-                    }
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => return None,
-                }
+            let event = receiver.next().await?;
+            let ended = event.kind == EventKind::Ended;
+            let id = event.id;
+            if id > last_id.saturating_add(1) {
+                pending.push_back(sse_event(event));
+                let gap = frame(
+                    "gap",
+                    &json!({ "from": last_id.saturating_add(1), "to": id }),
+                );
+                return Some((gap, (receiver, id, pending, ended)));
             }
+            last_id = id;
+            Some((sse_event(event), (receiver, last_id, pending, ended)))
         },
     )
 }
@@ -633,7 +647,6 @@ like cancel.
     responses(
         (status = 202, description = "The cell was queued", body = SubmitCellResponse, example = json!({"cell_id": "cell-1", "position": 1})),
         (status = 400, description = "An invalid cell id or oversized code", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session is not ready, or that cell is busy", body = ErrorResponse),
@@ -644,29 +657,31 @@ like cancel.
 )]
 pub async fn submit_cell(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<SubmitCellRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, false).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
+        .map_err(ServerError::from)?;
+    let submit = SessionRequest::SubmitCell {
+        cell_id: request.cell_id.clone(),
+        code: request.code,
     };
-    match session.submit_cell(&request.cell_id, &request.code) {
-        Ok(position) => Ok((
-            StatusCode::ACCEPTED,
-            Json(SubmitCellResponse {
-                cell_id: request.cell_id,
-                position,
-            }),
-        )
-            .into_response()),
-        Err(error) => Ok(session_error(error)),
-    }
+    Ok(
+        match ask_session(&state, &record, physical_job_id, false, submit).await {
+            Ok(SessionAnswer::Position(position)) => (
+                StatusCode::ACCEPTED,
+                Json(SubmitCellResponse {
+                    cell_id: request.cell_id,
+                    position,
+                }),
+            )
+                .into_response(),
+            Ok(answer) => other_answer(answer),
+            Err(response) => response,
+        },
+    )
 }
 
 #[utoipa::path(
@@ -685,7 +700,6 @@ like cancel.
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     responses(
         (status = 202, description = "The interrupt was sent"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -694,21 +708,20 @@ like cancel.
 )]
 pub async fn interrupt_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, false).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
-    };
-    match session.interrupt() {
-        Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({}))).into_response()),
-        Err(error) => Ok(session_error(error)),
-    }
+        .map_err(ServerError::from)?;
+    let request = SessionRequest::Interrupt;
+    Ok(
+        match ask_session(&state, &record, physical_job_id, false, request).await {
+            Ok(SessionAnswer::Done) => (StatusCode::ACCEPTED, Json(json!({}))).into_response(),
+            Ok(answer) => other_answer(answer),
+            Err(response) => response,
+        },
+    )
 }
 
 #[utoipa::path(
@@ -735,7 +748,6 @@ like cancel.
             "updated_at": "2025-08-18T05:33:20Z", "progress": {"current": 0, "total": null, "unit": "items"},
             "workspace_bucket": "lab-data", "workspace_mode": "existing", "locally_exhausted": false
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "Another node runs this session; code `session_not_here`", body = ErrorResponse)
@@ -744,18 +756,16 @@ like cancel.
 )]
 pub async fn end_session(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, false).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
-    };
-    session.end(EndReason::Ended);
+        .map_err(ServerError::from)?;
+    let request = SessionRequest::End(EndReason::Ended);
+    if let Err(response) = ask_session(&state, &record, physical_job_id, false, request).await {
+        return Ok(response);
+    }
     Ok((StatusCode::ACCEPTED, Json(job_status_response(&record))).into_response())
 }
 
@@ -787,7 +797,11 @@ like cancel, and each source additionally needs the caller's read permission on 
 
 **Limits** (refused with 400)
 - At most 64 items per call, and a `dest_key` that is relative and traversal-free.
-- A source on another node: import it into a bucket of this node first."#,
+- A source on another node: import it into a bucket of this node first.
+- A source with placement policies is staged only where every policy allows the execution site
+  of the backend the session runs on. The copy takes exactly the version that was checked, also
+  when no `version_id` was given. A refused item fails with 403; a policy this node cannot
+  resolve right now fails with 503 and is never treated as allowed."#,
     params(("job_id" = String, Path, description = "Job id as returned by submission: a 26-character ULID")),
     request_body(content = SessionInputsRequest, example = json!({
         "items": [{"bucket": "source-data", "key": "input.txt", "dest_key": "data/input.txt"}]
@@ -800,34 +814,34 @@ like cancel, and each source additionally needs the caller's read permission on 
             "failed": []
         })),
         (status = 400, description = "An invalid destination key, too many items, or a source on another node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The token is path-restricted, or the caller may not read a source", body = ErrorResponse),
+        (status = 403, description = "The token is path-restricted, the caller may not read a source, or a source's placement policy does not allow the session's execution site", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
-        (status = 409, description = "The session has ended", body = ErrorResponse)
+        (status = 409, description = "The session has ended", body = ErrorResponse),
+        (status = 503, description = "A source's placement policy cannot be resolved on this node right now", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn stage_inputs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<SessionInputsRequest>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, false).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
-    };
+        .map_err(ServerError::from)?;
+    let probe = SessionRequest::Snapshot;
+    if let Err(response) = ask_session(&state, &record, physical_job_id, false, probe).await {
+        return Ok(response);
+    }
+    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
     if request.items.is_empty() || request.items.len() > MAX_STAGED_ITEMS {
         return Err(ServerError::BadRequestMessage(format!(
             "a call stages 1 to {MAX_STAGED_ITEMS} objects"
         )));
     }
     let bucket = record.workspace_bucket.clone().ok_or_else(|| {
-        ServerError::InternalError("a session has no workspace bucket".to_string())
+        ServerError::InternalError("a session has no workspace bucket".to_string().into())
     })?;
     let node_id = state.get_node_id().to_string();
     let mut items = Vec::with_capacity(request.items.len());
@@ -835,28 +849,34 @@ pub async fn stage_inputs(
         let dest_key = check_item(&item, &node_id)?;
         items.push((item, dest_key));
     }
+    let gate = match running_spec(&state, &record, physical_job_id).await? {
+        Some(spec) => session_gate(&state, &spec).await?,
+        None => None,
+    };
     let mut staged = Vec::with_capacity(items.len());
     let mut pending = Vec::new();
     let mut failed = Vec::new();
     let mut refusal = None;
     for (item, dest_key) in items {
-        match stage_one(&state, &auth, &bucket, item, &dest_key).await {
+        match stage_one(&state, &auth, (&bucket, gate.as_ref()), item, &dest_key).await {
             Ok(InputOutcome::Staged(entry)) => {
-                session.record_input(StagedInput {
+                let input = StagedInput {
                     dest_key: entry.dest_key.clone(),
                     bytes: entry.bytes,
                     blake3: entry.blake3.clone(),
                     source_node_id: entry.source_node_id.clone(),
                     version_id: entry.version_id.clone(),
-                });
+                };
+                session_call(&state, job_id, SessionRequest::RecordInput(input)).await;
                 staged.push(entry);
             }
             Ok(InputOutcome::Pending(entry)) => {
-                session.record_pending(PendingInput {
+                let input = PendingInput {
                     dest_key: entry.dest_key.clone(),
                     job_id: entry.job_id.clone(),
                     source_node_id: entry.source_node_id.clone(),
-                });
+                };
+                session_call(&state, job_id, SessionRequest::RecordPending(input)).await;
                 pending.push(entry);
             }
             Err(error) => {
@@ -868,7 +888,7 @@ pub async fn stage_inputs(
     // A call that neither staged nor queued anything made no progress, so it
     // must not keep the session alive.
     if !staged.is_empty() || !pending.is_empty() {
-        session.touch();
+        session_call(&state, job_id, SessionRequest::Touch).await;
     }
     inputs_outcome(staged, pending, failed, refusal)
 }
@@ -928,23 +948,77 @@ fn failed_input(dest_key: String, error: &ServerError) -> FailedInputResponse {
     }
 }
 
-/// The bucket a name resolves to here. Absence reads as 404 like every other
-/// name the caller may not see.
-async fn bucket_info(
-    context: &aruna_operations::driver::DriverContext,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
-    }
-}
-
 /// What one item became: an object in the bucket, or a job still bringing it.
 enum InputOutcome {
     Staged(StagedInputResponse),
     Pending(PendingInputResponse),
+}
+
+/// The spec of the execution that runs the session. A logical id answers with the request,
+/// while the backend the run was placed on is stored only in its physical execution.
+async fn running_spec(
+    state: &ServerState,
+    record: &JobRecord,
+    physical_job_id: Option<JobId>,
+) -> ServerResult<Option<ExecutionSpec>> {
+    let physical = match physical_job_id {
+        Some(job_id) if job_id != record.job_id => read_job_record(&state.get_ctx(), job_id)
+            .await
+            .map_err(|error| ServerError::InternalError(error.into()))?,
+        _ => Some(record.clone()),
+    };
+    Ok(physical.and_then(|record| match record.payload {
+        JobPayload::Execution(spec) => Some(spec),
+        _ => None,
+    }))
+}
+
+/// The gate context of the backend a session runs on, carrying the subject that backend
+/// advertises: data staged into the session is checked against where its workers really run.
+/// `None` when this node or the backend has no subject, which leaves governed data refused.
+async fn session_gate(
+    state: &ServerState,
+    spec: &ExecutionSpec,
+) -> ServerResult<Option<GateContext>> {
+    let context = state.get_ctx();
+    let read = GateOperation::new(state.get_realm_id(), unix_timestamp_millis());
+    let gate = drive(read, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let (Some(mut gate), Some(registry)) = (gate, context.compute_handle.as_ref()) else {
+        return Ok(None);
+    };
+    let kind = (spec.executor_constraint.as_deref()).map(ExecutorKind::from_wire);
+    let Some((name, _)) = registry.placed(spec.backend.as_deref(), kind.as_ref()) else {
+        return Ok(None);
+    };
+    let advertised = registry.capabilities(&gate.subject, false).ok();
+    let found = (advertised.into_iter().flatten()).find(|capability| capability.backend == name);
+    let Some(capability) = found else {
+        return Ok(None);
+    };
+    gate.subject = capability.subject;
+    Ok(Some(gate))
+}
+
+/// A placement refusal of one staged item: a policy that does not admit the session's site is
+/// forbidden, one this node cannot resolve right now is unavailable; neither grants.
+fn gate_refusal(error: PolicyGateError) -> ServerError {
+    match error {
+        PolicyGateError::Denied { .. }
+        | PolicyGateError::NoSubject
+        | PolicyGateError::ForeignPolicy { .. }
+        | PolicyGateError::Invalid
+        | PolicyGateError::Policy(_) => ServerError::Forbidden,
+        PolicyGateError::Unavailable { .. }
+        | PolicyGateError::Required { .. }
+        | PolicyGateError::Drift
+        | PolicyGateError::AdmissionStopped
+        | PolicyGateError::Read(_) => {
+            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+        }
+        other => ServerError::InternalError(other.to_string().into()),
+    }
 }
 
 /// Brings one object into the workspace bucket. A source stored here is
@@ -952,14 +1026,14 @@ enum InputOutcome {
 async fn stage_one(
     state: &ServerState,
     auth: &AuthContext,
-    bucket: &str,
+    (bucket, gate): (&str, Option<&GateContext>),
     item: SessionInputRequest,
     dest_key: &str,
 ) -> ServerResult<InputOutcome> {
     let node_id = state.get_node_id();
     let context = state.get_ctx();
-    let source_info = bucket_info(&context, &item.bucket).await?;
-    let dest_info = bucket_info(&context, bucket).await?;
+    let source_info = bucket_info(state, &item.bucket).await?;
+    let dest_info = bucket_info(state, bucket).await?;
     ensure_permission(
         state,
         auth,
@@ -982,7 +1056,16 @@ async fn stage_one(
         &context,
     )
     .await
-    .map_err(head_error)?;
+    .map_err(map_head_error)?;
+    // The version's own refs must admit where the session's workers run, and the copy takes
+    // exactly that version, so a write after the check cannot bring in other refs.
+    if let Some(operation) = write_gate(gate, &head.source_policies, None).map_err(gate_refusal)? {
+        let outcome = drive(operation, &context)
+            .await
+            .map_err(|error| gate_refusal(PolicyGateError::Read(error)))?;
+        gate_decision(outcome).map_err(gate_refusal)?;
+    }
+    let version_id = head.resolved_version_id.or(version_id);
     // A stored source deduplicates inline whatever was asked. A reference is
     // either queued for its pull or kept as a reference, which moves no byte.
     if head.location.is_none() && item.strategy == SessionInputStrategy::Snapshot {
@@ -1003,7 +1086,7 @@ async fn stage_one(
     }
     let realm_config = drive(GetConfigOperation::new(state.get_realm_id()), &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let input = CopyObjectInput {
         source_bucket: item.bucket,
         source_key: item.key,
@@ -1042,7 +1125,9 @@ async fn copy_inline(
     dest_key: &str,
 ) -> ServerResult<StagedInputResponse> {
     let bucket = input.dest_bucket.clone();
-    let result = copy_object(&state.get_ctx(), input)
+    let context = state.get_ctx();
+    let copy = CopyObjectOperation::new(input, node_routing(&context));
+    let result = drive(copy, &context)
         .await
         .map_err(|error| ServerError::BadRequestMessage(error.to_string()))?;
     let linked = result.location.is_none();
@@ -1098,17 +1183,6 @@ async fn queue_copy(
     })
 }
 
-/// A missing object reads as 404 like a missing bucket; anything else is the
-/// node's own failure.
-fn head_error(error: HeadObjectError) -> ServerError {
-    match error {
-        HeadObjectError::NoSuchKey
-        | HeadObjectError::NoSuchVersion
-        | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
 #[utoipa::path(
     get,
     path = "/compute/jobs/{job_id}/session/scratch",
@@ -1131,7 +1205,6 @@ like cancel.
             "path": "", "entries": [{"name": "result.txt", "kind": "file", "bytes": 42, "modified_ms": 1755500000000_u64}]
         })),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse)
@@ -1140,26 +1213,25 @@ like cancel.
 )]
 pub async fn list_scratch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<ScratchQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, false).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
-    };
-    session.touch();
-    match session
-        .list_scratch(query.path.as_deref().unwrap_or_default())
-        .await
-    {
-        Ok(body) => Ok(Json(serde_json::Value::Object(body)).into_response()),
-        Err(error) => Ok(session_error(error)),
+        .map_err(ServerError::from)?;
+    let touch = SessionRequest::Touch;
+    if let Err(response) = ask_session(&state, &record, physical_job_id, false, touch).await {
+        return Ok(response);
     }
+    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
+    let path = query.path.unwrap_or_default();
+    Ok(
+        match session_call(&state, job_id, SessionRequest::ListScratch { path }).await {
+            SessionAnswer::Body(body) => Json(serde_json::Value::Object(body)).into_response(),
+            answer => other_answer(answer),
+        },
+    )
 }
 
 #[utoipa::path(
@@ -1184,7 +1256,6 @@ like cancel.
     responses(
         (status = 200, description = "The file bytes", content_type = "application/octet-stream"),
         (status = 400, description = "A path that leaves the working directory", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No such session job, or it was submitted by somebody else", body = ErrorResponse),
         (status = 409, description = "The session has ended", body = ErrorResponse),
@@ -1194,25 +1265,25 @@ like cancel.
 )]
 pub async fn read_scratch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<ScratchReadQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (record, physical_job_id) = owned_session_job(&state, &auth, &job_id)
         .await
-        .map_err(map_job_request)?;
-    let session = match live_session(&state, &record, physical_job_id, false).await {
-        Ok(session) => session,
-        Err(response) => return Ok(response),
+        .map_err(ServerError::from)?;
+    let touch = SessionRequest::Touch;
+    if let Err(response) = ask_session(&state, &record, physical_job_id, false, touch).await {
+        return Ok(response);
+    }
+    let job_id = physical_job_id.ok_or(ServerError::NotFound)?;
+    let read = SessionRequest::ReadScratch {
+        path: query.path.clone(),
+        limit: MAX_SCRATCH_BYTES,
     };
-    session.touch();
-    let body = match session
-        .read_scratch(&query.path, 0, MAX_SCRATCH_BYTES)
-        .await
-    {
-        Ok(body) => body,
-        Err(error) => return Ok(session_error(error)),
+    let body = match session_call(&state, job_id, read).await {
+        SessionAnswer::Body(body) => body,
+        answer => return Ok(other_answer(answer)),
     };
     if body.get("truncated").and_then(serde_json::Value::as_bool) == Some(true) {
         return Err(ServerError::PayloadTooLarge(
@@ -1222,9 +1293,13 @@ pub async fn read_scratch(
     let encoded = body
         .get("base64")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| ServerError::InternalError("session read carries no bytes".to_string()))?;
+        .ok_or_else(|| {
+            ServerError::InternalError("session read carries no bytes".to_string().into())
+        })?;
     let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-        .map_err(|_| ServerError::InternalError("session read is not decodable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("session read is not decodable".to_string().into())
+        })?;
     let content_type = key_content_type(&query.path);
     Ok((
         StatusCode::OK,

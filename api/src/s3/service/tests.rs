@@ -7,7 +7,6 @@ use super::listing::next_marker_of;
 use super::*;
 use crate::s3::checksum::UploadChecksumRequest;
 use crate::s3::scope::resolve_scope;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -19,7 +18,8 @@ use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
 use aruna_core::structs::execution::notification_watch::{
-    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, watch_resource_path,
+    WatchEventKind, WatchEventMask, WatchInterestEntry, WatchInterestTable, WatchSubscription,
+    watch_resource_path,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -39,16 +39,19 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::auth::request_authorization::authorize;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::subscriptions::create_local_watch;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
-use aruna_operations::s3::object::get::ObjectInfo;
+use aruna_core::structs::storage::object_read::ObjectInfo;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::read_value;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::notifications::watch::drain::WatchDrainOperation;
+use aruna_operations::notifications::watch::store::StoreWatchOperation;
 use aruna_operations::s3::object::list::ListContinuationToken;
-use aruna_operations::s3::object::metadata::{
-    QueueRefreshOperation, ReferenceRefresh, refresh_reference_metadata,
-};
+use aruna_operations::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use aruna_operations::s3::object::metadata_drain::RefreshReferenceOperation;
 use aruna_operations::s3::object::put::PutObjectResult;
 use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
@@ -75,14 +78,16 @@ struct TestState {
 
 fn parser_service(realm_id: RealmId, node_id: NodeId) -> (TempDir, ArunaS3Service) {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let state = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     (
         storage_dir,
@@ -392,14 +397,16 @@ fn upload_marker_ignored() {
 #[tokio::test]
 async fn put_survives_queue() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([40u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
@@ -464,7 +471,7 @@ async fn put_survives_queue() {
 
     assert_eq!(response.output.version_id, Some(version_id.to_string()));
     assert!(
-        read_storage_value(
+        read_value(
             &storage_handle,
             REPLICATION_OBLIGATION_KEYSPACE,
             obligation_key.as_ref().to_vec(),
@@ -480,7 +487,8 @@ async fn build_watch_context(
     secret: [u8; 32],
 ) -> (TempDir, Arc<DriverContext>, NetHandle) {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -512,9 +520,10 @@ async fn build_watch_context(
         storage_handle,
         net_handle: Some(net.clone()),
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     (storage_dir, context, net)
 }
@@ -617,15 +626,12 @@ async fn put_expands_watch() {
         watch_prefix.clone(),
     ));
     install_watch_authorization(&context, realm_id, net.node_id(), group_id, watcher).await;
-    create_local_watch(
-        &context.storage_handle,
-        watcher,
-        watch_prefix,
-        WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
-        0,
-    )
-    .await
-    .expect("watch subscription creates");
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let subscription =
+        WatchSubscription::new(ulid::Ulid::generate(), watcher, watch_prefix, mask, 0);
+    drive(StoreWatchOperation::create(subscription, None), &context)
+        .await
+        .expect("watch subscription creates");
     let auth = AuthContext {
         user_id,
         realm_id,
@@ -655,6 +661,10 @@ async fn put_expands_watch() {
         )
         .await
         .expect("committed PUT response should succeed");
+    // The PUT queues its watch event; the drain, armed to run at once, delivers it.
+    drive(WatchDrainOperation::new(), &context)
+        .await
+        .expect("the watch drain runs");
 
     let rows = read_watch_rows(context.as_ref()).await;
     assert_eq!(rows.len(), 1, "the local holder expands immediately");
@@ -732,6 +742,9 @@ async fn anonymous_put_silent() {
         )
         .await
         .expect("committed PUT response should succeed");
+    drive(WatchDrainOperation::new(), &context)
+        .await
+        .expect("the watch drain runs");
 
     assert!(
         read_watch_rows(context.as_ref()).await.is_empty(),
@@ -744,14 +757,16 @@ async fn anonymous_put_silent() {
 #[tokio::test]
 async fn refresh_failure_hidden() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let refresh = ReferenceRefresh {
         bucket: "bucket".to_string(),
@@ -799,6 +814,15 @@ async fn refresh_failure_hidden() {
     assert!(errors.is_empty(), "unexpected stream errors: {errors:?}");
 }
 
+async fn run_refresh(test: &TestState, refresh: ReferenceRefresh) -> Result<(), String> {
+    drive(
+        RefreshReferenceOperation::new(refresh),
+        test.context.as_ref(),
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 #[tokio::test]
 async fn stale_refresh_ignored() {
     let test = setup_state();
@@ -806,8 +830,8 @@ async fn stale_refresh_ignored() {
     let original_metadata = source_metadata(10, "original");
     write_reference_version(&test, original_metadata.clone(), last_refresh).await;
 
-    refresh_reference_metadata(
-        test.context.clone(),
+    run_refresh(
+        &test,
         refresh(
             &test,
             source_metadata(20, "older"),
@@ -818,8 +842,8 @@ async fn stale_refresh_ignored() {
     .unwrap();
     assert_reference_state(&test, &original_metadata, last_refresh).await;
 
-    refresh_reference_metadata(
-        test.context.clone(),
+    run_refresh(
+        &test,
         refresh(&test, source_metadata(30, "equal"), last_refresh),
     )
     .await
@@ -837,26 +861,25 @@ async fn newer_refresh_updates() {
     let original = source_metadata(10, "original");
     write_reference_version(&test, original.clone(), last_refresh).await;
 
-    refresh_reference_metadata(
-        test.context.clone(),
-        refresh(&test, original.clone(), refreshed_at),
-    )
-    .await
-    .unwrap();
+    run_refresh(&test, refresh(&test, original.clone(), refreshed_at))
+        .await
+        .unwrap();
 
     assert_reference_state(&test, &original, refreshed_at).await;
 }
 
 fn setup_state() -> TestState {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = aruna_core::structs::identity::realm::RealmId([9u8; 32]);
 
@@ -892,7 +915,7 @@ fn response_location(created_by: UserId) -> BackendLocation {
 }
 
 async fn write_storage_value(
-    storage: &storage::StorageHandle,
+    storage: &storage::handle::StorageHandle,
     keyspace: &str,
     key: Vec<u8>,
     value: Vec<u8>,
@@ -912,7 +935,11 @@ async fn write_storage_value(
 }
 
 /// Policy loading fails closed without the realm config document.
-async fn write_realm_config(storage: &storage::StorageHandle, realm_id: RealmId, actor: &Actor) {
+async fn write_realm_config(
+    storage: &storage::handle::StorageHandle,
+    realm_id: RealmId,
+    actor: &Actor,
+) {
     write_storage_value(
         storage,
         REALM_CONFIG_KEYSPACE,
@@ -922,25 +949,6 @@ async fn write_realm_config(storage: &storage::StorageHandle, realm_id: RealmId,
             .unwrap(),
     )
     .await;
-}
-
-async fn read_storage_value(
-    storage: &storage::StorageHandle,
-    keyspace: &str,
-    key: Vec<u8>,
-) -> Option<byteview::ByteView> {
-    let Event::Storage(StorageEvent::ReadResult { value, .. }) = storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: keyspace.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    else {
-        panic!("unexpected storage read event")
-    };
-
-    value
 }
 
 async fn write_reference_version(
@@ -1009,20 +1017,14 @@ fn refresh(
     metadata: SourceMetadata,
     refreshed_at: SystemTime,
 ) -> ReferenceRefresh {
-    ReferenceRefresh {
-        bucket: test.bucket.clone(),
-        key: test.key.clone(),
-        version_id: test.version_id,
-        metadata: Some(metadata),
+    let (bucket, key) = (test.bucket.clone(), test.key.clone());
+    aruna_operations::testing::reference_refresh(
+        bucket,
+        key,
+        test.version_id,
+        metadata,
         refreshed_at,
-        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
-        auth_context: aruna_core::structs::identity::auth::AuthContext {
-            user_id: Default::default(),
-            realm_id: aruna_core::structs::identity::realm::RealmId([9u8; 32]),
-            path_restrictions: None,
-            session: None,
-        },
-    }
+    )
 }
 
 fn version_key(test: &TestState) -> Vec<u8> {
@@ -1060,7 +1062,12 @@ fn source_binding() -> VersionSourceBinding {
     }
 }
 
-async fn write_head(storage: &storage::StorageHandle, bucket: &str, key: &str, version_id: Ulid) {
+async fn write_head(
+    storage: &storage::handle::StorageHandle,
+    bucket: &str,
+    key: &str,
+    version_id: Ulid,
+) {
     let _ = storage
         .send_storage_effect(StorageEffect::Write {
             key_space: BLOB_HEAD_KEYSPACE.to_string(),
@@ -1076,7 +1083,7 @@ async fn write_head(storage: &storage::StorageHandle, bucket: &str, key: &str, v
 
 #[allow(clippy::too_many_arguments)]
 async fn write_materialized_version(
-    storage: &storage::StorageHandle,
+    storage: &storage::handle::StorageHandle,
     bucket: &str,
     key: &str,
     version_id: Ulid,
@@ -1134,7 +1141,7 @@ async fn write_materialized_version(
 
 #[allow(clippy::too_many_arguments)]
 async fn write_reference_metadata(
-    storage: &storage::StorageHandle,
+    storage: &storage::handle::StorageHandle,
     bucket: &str,
     key: &str,
     version_id: Ulid,
@@ -2268,8 +2275,12 @@ async fn prefix_token_precedence() {
     .await;
     let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
     request.input.start_after = Some("imaging/z".to_string());
-    let token =
-        crate::s3::service::listing::scoped_marker("study", Some("imaging/0"), None).unwrap();
+    let token = aruna_operations::s3::object::member::merge::merged_marker(
+        "study",
+        Some("imaging/0"),
+        None,
+    )
+    .unwrap();
     request.input.continuation_token = ArunaS3Service::encode_list_token(token.as_ref()).unwrap();
     let output = service.list_objects_v2(request).await.unwrap().output;
     let prefixes: Vec<_> = output
@@ -2377,25 +2388,29 @@ async fn object_path_decides() {
     };
 
     assert!(
-        authorize(
-            &service.state,
-            service.realm_id,
-            &auth_context,
-            &object_path("imaging/scan-a"),
-            &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("imaging/scan-a"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
         )
         .await
         .is_ok()
     );
     assert!(
-        authorize(
-            &service.state,
-            service.realm_id,
-            &auth_context,
-            &object_path("sequencing/reads"),
-            &Permission::READ,
-            PolicyRequestExtras::operation("s3.GetObject"),
+        drive(
+            AuthorizeOperation::new(
+                service.realm_id,
+                &auth_context,
+                &object_path("sequencing/reads"),
+                &Permission::READ,
+                PolicyRequestExtras::operation("s3.GetObject")
+            ),
+            &service.state
         )
         .await
         .is_err()
@@ -2433,14 +2448,16 @@ async fn setup_copy_authorization(
     public: bool,
 ) -> (TempDir, ArunaS3Service, UserAccess, BucketInfo) {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([36u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2620,14 +2637,16 @@ async fn source_policy_denied() {
     // A group deny policy on the source path blocks the copy even when RBAC
     // and destination write are allowed.
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([37u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2715,14 +2734,16 @@ async fn delete_uses_context() {
     // The per-object policy must see the real query parameters and allowlisted
     // headers the access hook captured, not an empty operation-only context.
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([38u8; 32]);
     let node_id = NodeId::from_bytes(&[0u8; 32]).unwrap();
@@ -2845,7 +2866,7 @@ async fn delete_uses_context() {
 }
 
 async fn seed_materialized_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
@@ -2889,14 +2910,16 @@ fn list_request(
 #[tokio::test]
 async fn delimiter_groups_results() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([2u8; 32]);
     let group_id = Ulid::generate();
@@ -2967,14 +2990,16 @@ async fn delimiter_groups_results() {
 #[tokio::test]
 async fn delimiter_paginates() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([3u8; 32]);
     let group_id = Ulid::generate();
@@ -3120,14 +3145,16 @@ fn marker_rescues_page() {
 #[tokio::test]
 async fn prefix_page_complete() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([33u8; 32]);
     let group_id = Ulid::generate();
@@ -3186,14 +3213,16 @@ async fn prefix_page_complete() {
 #[tokio::test]
 async fn listing_counts_entries() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([34u8; 32]);
     let group_id = Ulid::generate();
@@ -3307,14 +3336,16 @@ async fn listing_counts_entries() {
 #[tokio::test]
 async fn large_group_collapses() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([4u8; 32]);
     let group_id = Ulid::generate();
@@ -3391,14 +3422,16 @@ async fn large_group_collapses() {
 #[tokio::test]
 async fn reference_returns_metadata() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([5u8; 32]);
     let group_id = Ulid::generate();
@@ -3574,14 +3607,16 @@ async fn bare_reference_head() {
 #[tokio::test]
 async fn zero_max_honored() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([6u8; 32]);
     let group_id = Ulid::generate();
@@ -3639,14 +3674,16 @@ async fn zero_max_honored() {
 #[tokio::test]
 async fn start_after_prefixes() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([7u8; 32]);
     let group_id = Ulid::generate();
@@ -3714,14 +3751,16 @@ async fn start_after_prefixes() {
 #[tokio::test]
 async fn listing_requires_access() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([8u8; 32]);
     let service =
@@ -3751,14 +3790,16 @@ async fn listing_requires_access() {
 #[tokio::test]
 async fn max_keys_validated() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([35u8; 32]);
     let group_id = Ulid::generate();
@@ -3812,14 +3853,16 @@ async fn max_keys_validated() {
 #[tokio::test]
 async fn listing_applies_encoding() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([36u8; 32]);
     let group_id = Ulid::generate();
@@ -3887,14 +3930,16 @@ async fn listing_applies_encoding() {
 #[tokio::test]
 async fn fetch_owner_group() {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId([37u8; 32]);
     let group_id = Ulid::generate();

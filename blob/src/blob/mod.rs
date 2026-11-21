@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use bao_tree::BlockSize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -21,20 +21,21 @@ mod control_plane;
 mod external;
 mod framed_parts;
 mod frames;
-mod group;
+pub mod group;
 mod in_place;
+pub mod inbound;
 mod io;
 mod local_spool;
 pub mod pithos;
 mod plain;
-mod registry;
+mod read_pins;
+pub mod registry;
 mod replication;
 mod runtime;
 mod source;
 mod unlock;
 
-pub use group::{BackendClaim, GroupHold};
-pub use registry::{BackendRegistry, NodeBackend};
+use registry::BackendRegistry;
 
 #[cfg(test)]
 mod tests;
@@ -87,6 +88,8 @@ pub struct BlobHandler {
     close_lock: Arc<StdRwLock<()>>,
     rejected_writes: Arc<AtomicU64>,
     frame_indexes: Arc<StdMutex<frames::IndexCache>>,
+    /// Reads that hold kept copies; eviction leaves those copies to the hidden sweep.
+    read_pins: read_pins::ReadPins,
     /// This node's measurements of each external source. Memory only.
     source_stats: Arc<StdMutex<source::SourceTable>>,
     writes_in_flight: Arc<AtomicUsize>,
@@ -105,6 +108,8 @@ pub struct BlobHandler {
     spool_files: Arc<Semaphore>,
     /// Disk budget of local spools in MiB permits.
     spool_budget: Arc<Semaphore>,
+    /// Node-local Git repositories, installed once by the node that serves Git.
+    git: Arc<std::sync::OnceLock<Arc<crate::git::GitStore>>>,
 }
 
 #[derive(Clone, Debug)]

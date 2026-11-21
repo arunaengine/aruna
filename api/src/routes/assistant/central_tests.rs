@@ -3,18 +3,21 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::routes::assistant::proxy::proxy_post;
 use crate::routes::management_relay::{RELAY_HOP_HEADER, relay_middleware};
 use crate::tests::assistant::spawn_mock;
 use crate::tests::routes::{test_state, test_storage};
+use crate::tests::users::realm_auth;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::keyspaces::{MANAGEMENT_URL_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_tasks::TaskHandle;
+use axum::Extension;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::Path;
@@ -38,24 +41,17 @@ struct Fixture {
 }
 
 fn context(dir: &TempDir) -> Arc<DriverContext> {
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     })
-}
-
-fn member_of(realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id: UserId::local(Ulid::generate(), realm_id),
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
 }
 
 /// A realm whose only management node is this one, so it holds the central assistant.
@@ -65,7 +61,7 @@ async fn fixture() -> Fixture {
     let context = context(&dir);
     let realm_id = RealmId::from_bytes(generate_signing_key().verifying_key().to_bytes());
     let node_id = iroh::SecretKey::generate().public();
-    let admin = member_of(realm_id);
+    let admin = realm_auth(realm_id);
     let actor = || Actor {
         node_id,
         user_id: admin.user_id,
@@ -92,7 +88,7 @@ async fn fixture() -> Fixture {
         _dir: dir,
         state,
         admin,
-        member: member_of(realm_id),
+        member: realm_auth(realm_id),
     }
 }
 
@@ -119,7 +115,7 @@ fn setup_body(base_url: &str, limit: Option<u32>) -> serde_json::Value {
 async fn set_up(fixture: &Fixture, base_url: &str, limit: Option<u32>) -> CentralResponse {
     let (_, Json(view)) = put_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         json_request(setup_body(base_url, limit)),
     )
     .await
@@ -193,8 +189,8 @@ async fn call(fixture: &Fixture, auth: &AuthContext, request: Request) -> Server
 #[tokio::test]
 async fn visitor_is_refused() {
     let fixture = fixture().await;
-    let refused = get_central(State(fixture.state.clone()), Extension(None)).await;
-    assert!(matches!(refused, Err(ServerError::Unauthorized)));
+    let refused = crate::auth::extract::<UnrestrictedAuth>(&fixture.state, None).await;
+    assert!(matches!(refused, Err(StatusCode::UNAUTHORIZED)));
     let refused = proxy_post(
         State(fixture.state.clone()),
         Extension(None),
@@ -210,14 +206,14 @@ async fn setup_admin_only() {
     let fixture = fixture().await;
     let refused = put_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
         json_request(setup_body("http://127.0.0.1:9", None)),
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let refused = delete_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
@@ -225,7 +221,7 @@ async fn setup_admin_only() {
     chatgpt["kind"] = "chatgpt".into();
     let refused = put_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.admin.clone())),
+        UnrestrictedAuth(fixture.admin.clone()),
         json_request(chatgpt),
     )
     .await;
@@ -240,7 +236,7 @@ async fn key_never_returned() {
     assert!(view.admin.is_some());
     let (_, Json(member)) = get_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
     )
     .await
     .unwrap();
@@ -321,7 +317,7 @@ async fn bad_session_refused() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     let (_, Json(view)) = get_central(
         State(fixture.state.clone()),
-        Extension(Some(fixture.member.clone())),
+        UnrestrictedAuth(fixture.member.clone()),
     )
     .await
     .unwrap();
@@ -393,7 +389,7 @@ async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Ve
 /// A device that is not the holder and knows the holder's address from its installation.
 async fn device_relay(holder_url: String, realm_id: RealmId) -> (TempDir, Router, String) {
     let (dir, storage) = test_storage();
-    let context = Arc::new(crate::tests::routes::test_context(storage));
+    let context = Arc::new(aruna_drivers::testing::test_context(storage));
     let node_id = iroh::SecretKey::generate().public();
     let owner = UserId::local(Ulid::generate(), realm_id);
     let capabilities = NodeCapabilities::user_node(realm_id).unwrap();
@@ -459,7 +455,7 @@ fn compatible_central() -> CentralAssistant {
     CentralAssistant {
         provider: AssistantProvider {
             provider_id: CENTRAL_PROVIDER_ID.to_string(),
-            user_id: member_of(RealmId::from_bytes([3; 32])).user_id,
+            user_id: realm_auth(RealmId::from_bytes([3; 32])).user_id,
             kind: AssistantProviderKind::OpenaiCompatible,
             label: "Realm assistant".to_string(),
             base_url: "https://chat.example.org/api".to_string(),

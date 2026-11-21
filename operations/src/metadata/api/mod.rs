@@ -3,169 +3,123 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::{AuthorizationError, ConversionError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::id::short_display_id;
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GRAPH_LIFECYCLE_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE, EVENT_LOG_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
 };
+use aruna_core::metadata::api::ReferenceNodeExecution;
 use aruna_core::metadata::{
-    GraphLifecycleRecord, MetadataError, MetadataEventRecord, MetadataLifecycleRecord,
-    MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
+    MetadataError, MetadataEventRecord, MetadataQueryResults, MetadataSearchHit,
 };
-use aruna_core::storage_entries::{
-    document_lifecycle_key, event_log_key, graph_lifecycle_key, pending_projection_target,
-};
-use aruna_core::structs::PathClaimRecord;
+use aruna_core::storage_entries::{event_log_key, pending_projection_target};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::path_claim::PathClaimRecord;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BlobVersionState, CurrentVersionPointer, VersionKey,
-    bucket_permission_path, object_permission_path,
+    BlobHeadKey, BlobVersion, BlobVersionState, VersionKey, bucket_permission_path,
+    object_permission_path,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
-use aruna_core::telemetry::record_elapsed_ms;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
-use aruna_core::{MetaResourceId, NodeId};
-use aruna_storage::StorageHandle;
-use futures_util::future::BoxFuture;
-use futures_util::stream;
+use aruna_core::structured_id::MetaResourceId;
+use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{Span, debug_span, field, warn};
+use tracing::{Span, debug_span, field};
 use ulid::Ulid;
 
-pub use self::distributed::{aggregate_query_results, query_form, query_select_limit};
-use self::distributed::{object_search_fingerprint, record_object_result, record_preflight_node};
-use self::export::export_summary_jsonld;
-pub(crate) use self::export::{ENTRY_ROOM, PAGE_DEFAULT, PAGE_MAX};
-pub use self::export::{export_metadata_rocrate, get_visible_document};
-pub use self::fanout::forwarded_bearer;
-pub(crate) use self::fanout::pattern_contains_service;
-use self::fanout::{
-    MetadataFanoutOperation, MetadataNodeCall, fanout_bearer, metadata_node_call, query_union_safe,
-    run_metadata_fanout,
-};
-pub use self::fanout::{lookup_identifier_distributed, search_buckets_distributed};
+use self::distributed_types::object_search_fingerprint;
+
+use self::fanout_types::MetadataFanoutOperation;
+use self::fanout_types::fanout_bearer;
 #[cfg(test)]
-use self::list::{
+use self::list_types::{
     ANONYMOUS_METADATA_LIMIT, ESTIMATE_MIN_LIMIT, LIST_METADATA_LIMIT, MAX_METADATA_LIMIT,
     effective_list_limit,
 };
-use self::list::{
-    check_policy_limit, load_group_records, load_pending_records, merge_pending_records,
+
+use self::path_types::replica_query_nodes;
+use self::path_types::select_fanout_nodes;
+
+use super::search_cursor::{
+    CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchWatermark,
+    SignedCursor, paginate, query_fingerprint,
 };
-pub(crate) use self::path::local_path_candidates;
-use self::path::select_fanout_nodes;
-pub use self::path::{deduplicate_fanout_nodes, replica_query_nodes};
-pub(crate) use self::preflight::{discover_realm_nodes, references_preflight_local};
-pub use self::preflight::{load_realm_config, load_realm_nodes};
-use self::preflight::{reference_document_title, resolve_graph_reference};
-use self::read::ensure_record_materialized;
-pub(crate) use self::read::{
-    can_read_record, ensure_record_readable, filter_live_records, load_live_record,
-    metadata_read_request,
-};
-pub use self::read::{query_metadata, query_metadata_document, references_metadata};
-use super::AuthToken;
-use super::forward::{AuthFailure, ReadDecision, reduce_holder_reads};
-use super::handle::{MAX_RESULT_BYTES, QUERY_MAX_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
-use super::protocol::{
+use crate::groups::list_groups::ListGroupOperation;
+use crate::metadata::repository::LIST_METADATA_SIZE;
+use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::protocol::{
     MetadataPathCandidate, MetadataPathResolution, MetadataPathWinner, MetadataReadError,
     MetadataTransportMessage,
 };
-use super::search_cursor::{
-    CursorEnvelopeError, MAX_PAGINATION_DEPTH, NodeSearchResult, SearchCursor, SearchCursorError,
-    SearchPageCursor, SearchWatermark, SignedCursor, merge_search_hits, paginate,
-    query_fingerprint, resume_fetch_limit,
-};
-use super::summary_cache::summary_cache;
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::permission_rules::GroupPermissionRules;
-use crate::blob::permission_paths::ResolvePathsOperation;
-use crate::driver::{DriverContext, drive};
-use crate::groups::list_groups::ListGroupOperation;
-use crate::metadata::get_document::{load_document_record, record_materialized_read};
-use crate::metadata::repository::{
-    LIST_METADATA_SIZE, StorageReadError, iter_registry_effect, parse_registry_iter,
-    parse_registry_read, read_document_registry,
-};
-use crate::placement::selector::{
+use aruna_core::metadata::{MAX_RESULT_BYTES, QUERY_MAX_ROWS, REGISTRY_CANDIDATE_LIMIT};
+use aruna_core::placement::resolver::meta_bucket_subject;
+use aruna_core::placement::selector::{
     ROLE_NODE, neg_log2_q48, peer_rank, select_top_peers, selector_hash,
 };
-use crate::placement::{
-    holds_placement, meta_bucket_subject, registry_placement, registry_placement_for,
-    registry_strategy, resolve_holders_limit, resolve_shard_holders,
+use aruna_core::placement::{
+    holds_placement, registry_placement, registry_placement_for, registry_strategy,
+    resolve_holders_limit, resolve_shard_holders,
 };
-use crate::realm::get_config::GetConfigOperation;
-use crate::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use crate::s3::bucket::search::{
-    BucketPage, BucketSearchHit, SearchBucketsInput, search_local_buckets,
-};
-use crate::s3::object::search::{
-    ObjectInventoryHit, ObjectKeyMatch, SearchNodePage, SearchObjectsInput, search_local_objects,
+use aruna_core::search::{
+    BucketPage, BucketSearchHit, ObjectInventoryHit, ObjectKeyMatch, SearchNodePage,
 };
 
+pub(crate) mod access;
 mod bucket_page;
+pub mod bucket_search;
 mod distributed;
-mod export;
-mod fanout;
-mod join;
-mod links;
-mod list;
-mod path;
-mod preflight;
-mod read;
-mod search;
+pub mod distributed_types;
+pub mod document_query;
+pub mod export;
+pub mod export_types;
+pub mod fanout;
+pub mod fanout_types;
+mod head_versions;
+pub mod identifier_fanout;
+pub mod links;
+pub mod list;
+pub mod list_types;
+pub mod node_fanout;
+pub mod object_search;
+pub mod path;
+pub mod path_types;
+mod prefix_scan;
+pub mod preflight;
+pub mod preflight_types;
+pub mod query_fanout;
+pub mod read;
+pub mod read_types;
+pub(crate) mod readable;
+pub mod realm_search;
+pub mod references;
+pub mod search;
+pub mod search_types;
+pub(crate) mod title;
 
-pub use self::distributed::MetadataQueryForm;
-pub use self::export::{
-    ExportMetadataRequest, ExportMetadataResult, GetVisibleRequest, RoCrateExportView,
-};
-use self::fanout::MetadataFanoutScope;
-pub use self::fanout::MetadataFanoutStats;
-pub(crate) use self::fanout::RealmNodeDiscovery;
-pub use self::links::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkHit, LinkNodePage, LinkNodeRequest, LinkPage, LinkQuery,
-    PART_OF_LIMIT, PartOf, PartTarget, SetPreview, SetPreviewPage, file_queries, links_distributed,
-    links_local, merge_pages, merge_previews, part_of, resolve_part, set_preview_distributed,
-    set_preview_local,
-};
-pub use self::list::{
-    ListVisibleRequest, ListVisibleResult, ListedMetadataDocument, MetadataListOrder,
-    list_visible_documents,
-};
-pub(crate) use self::path::resolve_local_path;
-pub use self::path::{MetadataLookupRequest, MetadataLookupResult, lookup_metadata_path};
+use self::fanout_types::MetadataFanoutScope;
+use self::fanout_types::MetadataFanoutStats;
+
 #[cfg(test)]
-use self::path::{PathShardView, merge_path_views, reduce_path_candidates, select_path_holders};
-pub use self::preflight::{
-    MetadataExcludedForm, MetadataIndexState, MetadataNodeFreshness, MetadataPreflightLocation,
-    MetadataResolvedTarget, MetadataStorageOperation, MetadataVisibleReference, ReferenceCoverage,
-    ReferenceExecution, ReferenceNodeExecution, ReferenceNodeRequest, ReferenceNodeTarget,
-    ReferenceRequest, ReferenceTarget, ReferenceTargetExecution, references_preflight,
-};
+use self::path_types::PathShardView;
+
 #[cfg(test)]
-use self::preflight::{authorized_realm_nodes, preflight_fingerprint};
-pub use self::read::{
-    ApiQueryMode, DocumentQueryRequest, MetadataQueryExecution, MetadataQueryRequest,
-    MetadataReferenceEntry, MetadataReferencesExecution, MetadataReferencesRequest,
-};
-pub use self::search::{
-    BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
-    ObjectExecution, ObjectPartitionCoverage, ObjectQueryMode, SearchQueryRequest, search_metadata,
-    search_objects,
-};
+use self::preflight_types::authorized_realm_nodes;
+use self::read_types::ApiQueryMode;
+
+use self::search_types::ObjectQueryMode;
 #[cfg(test)]
-use self::search::{ObjectCursor, ObjectPartitionState, PendingBucket};
+use self::search_types::{ObjectCursor, ObjectPartitionState, PendingBucket};
+
+/// A forwarded bearer as Debug output shows it: whether there is one, never its value.
+pub(crate) fn hidden_token(token: &Option<String>) -> Option<&'static str> {
+    token.as_ref().map(|_| "<hidden>")
+}
 
 const REFERENCES_LIMIT: usize = 25;
 
@@ -177,7 +131,7 @@ const QUERY_MAX_NODES: usize = 32;
 
 const DISTRIBUTED_QUERY_DEADLINE: Duration = Duration::from_secs(12);
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum MetadataApiError {
     #[error("bad request")]
     BadRequest,
@@ -195,7 +149,7 @@ pub enum MetadataApiError {
     /// The bucket has no usable activation, so the request cannot be routed.
     /// Never absence: no holder was resolved to answer it.
     #[error("placement unavailable: {0}")]
-    PlacementUnavailable(crate::placement::PlacementResolveError),
+    PlacementUnavailable(aruna_core::placement::PlacementResolveError),
     #[error("{0}")]
     InvalidCursor(String),
     /// The query is valid for the client but cannot be run as asked.
@@ -206,6 +160,13 @@ pub enum MetadataApiError {
     /// Even the smallest page of the answer is larger than the asked byte bound.
     #[error("the answer is larger than the byte bound")]
     TooLarge,
+}
+
+/// A runner failure leaves the request unanswered, so the caller may retry.
+impl From<aruna_core::calls::IoError> for MetadataApiError {
+    fn from(_: aruna_core::calls::IoError) -> Self {
+        Self::ServiceUnavailable
+    }
 }
 
 fn map_event_error(error: MetadataError) -> MetadataApiError {

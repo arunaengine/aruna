@@ -4,16 +4,21 @@
 
 use std::sync::Arc;
 
-use aruna_core::repository::{LinkPatch, LinkStatus, RepositoryLink};
+use crate::job_service::cancel_owned_job;
+use aruna_core::repository::link::{LinkPatch, LinkStatus, RepositoryLink};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::jobs::repository::link_queue::{current_event, refresh_review, start_push};
-use aruna_operations::jobs::repository::links::LinkChange;
-use aruna_operations::jobs::repository::pull::{check_now, start_pull};
-use aruna_operations::jobs::repository::{Action, TransferError, remote_state, seal_link_token};
-use aruna_operations::jobs::service::cancel_owned_job;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::repository::connector::ConnectorViewOperation;
+use aruna_operations::jobs::repository::invenio::remote::RemoteStateOperation;
+use aruna_operations::jobs::repository::link_queue::{
+    PushRevisionOperation, RefreshReviewOperation, StartPushOperation, revision_event,
+};
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
+use aruna_operations::jobs::repository::pull::{CheckNowOperation, StartPullOperation};
+use aruna_operations::jobs::repository::{Action, TransferError, seal_token};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::repository::links::{
@@ -21,6 +26,7 @@ use super::repository::links::{
     ensure_capable, job_response, link_error, link_example, managed, metadata_json, parse_ulid,
     readable, seal_error, view,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
@@ -32,6 +38,25 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .routes(routes!(rotate_token))
         .routes(routes!(accept_remote))
         .routes(routes!(pull_link))
+}
+
+/// Stores a decided review on the link and answers the link as stored.
+async fn refreshed(state: &ServerState, link: &RepositoryLink) -> ServerResult<RepositoryLink> {
+    let context = state.get_ctx();
+    let refresh = RefreshReviewOperation::new(context.node_scope(), link.clone());
+    drive(refresh, context.as_ref()).await.map_err(link_error)
+}
+
+/// Starts a push of the dataset's current revision.
+async fn push_current(
+    context: &DriverContext,
+    link: &RepositoryLink,
+    publish: bool,
+) -> Result<aruna_core::structs::execution::job::identity::JobId, LinkError> {
+    let revision = drive(PushRevisionOperation::new(link.document_id), context).await?;
+    let event = revision_event(revision)?;
+    let push = StartPushOperation::new(context.node_scope(), link.clone(), event, publish);
+    drive(push, context).await
 }
 
 /// Publishing and the push settings act for the creator's repository account, so only the
@@ -96,7 +121,7 @@ The shape matches the list entries. Tokens are never returned."#,
 )]
 pub async fn get_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;
@@ -137,7 +162,7 @@ A metadata value that is not an object returns 400. auto_update on a push link, 
 )]
 pub async fn patch_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
     Json(request): Json<PatchLinkRequest>,
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
@@ -200,7 +225,7 @@ Records and drafts in the repository stay. A running push is cancelled and stops
 )]
 pub async fn delete_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -243,14 +268,12 @@ A paused link, a dataset without a revision, a creator at the active job limit o
 )]
 pub async fn push_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_push(&link)?;
-    let link = refresh_review(state.get_ctx().as_ref(), &link)
-        .await
-        .map_err(link_error)?;
+    let link = refreshed(&state, &link).await?;
     if link.status == LinkStatus::Paused {
         return Err(ServerError::Conflict(
             "resume the link before pushing".into(),
@@ -259,11 +282,7 @@ pub async fn push_link(
     if let Some(job_id) = link.active_job {
         return job_response(&state, job_id).await;
     }
-    let context = state.get_ctx();
-    let event = current_event(&context, link.document_id)
-        .await
-        .map_err(link_error)?;
-    let job_id = start_push(&context, &link, event, false)
+    let job_id = push_current(state.get_ctx().as_ref(), &link, false)
         .await
         .map_err(link_error)?;
     job_response(&state, job_id).await
@@ -304,16 +323,14 @@ A link without an open draft, a running push, a creator at the active job limit 
 )]
 pub async fn publish_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_creator(&auth, &link)?;
     ensure_push(&link)?;
     ensure_capable(link.kind, Action::Drafts)?;
-    let link = refresh_review(state.get_ctx().as_ref(), &link)
-        .await
-        .map_err(link_error)?;
+    let link = refreshed(&state, &link).await?;
     if link.remote.draft_id.is_none() {
         return Err(ServerError::Conflict(
             "the link has no open draft to publish".into(),
@@ -324,11 +341,7 @@ pub async fn publish_link(
             "a push of this link is running; publish after it finished".into(),
         ));
     }
-    let context = state.get_ctx();
-    let event = current_event(&context, link.document_id)
-        .await
-        .map_err(link_error)?;
-    let job_id = start_push(&context, &link, event, true)
+    let job_id = push_current(state.get_ctx().as_ref(), &link, true)
         .await
         .map_err(link_error)?;
     job_response(&state, job_id).await
@@ -366,22 +379,26 @@ An empty token returns 400; a connector whose endpoint changed since the link wa
 )]
 pub async fn rotate_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
     Json(request): Json<RotateTokenRequest>,
 ) -> ServerResult<StatusCode> {
     let (auth, link) = managed(&state, auth, &document_id, &link_id).await?;
     ensure_creator(&auth, &link)?;
     ensure_push(&link)?;
-    let secret = seal_link_token(
-        &state.get_ctx(),
+    let context = state.get_ctx();
+    let connector = ConnectorViewOperation::new(link.group_id, link.connector_id);
+    let connector = drive(connector, context.as_ref())
+        .await
+        .map_err(seal_error)?;
+    let secret = seal_token(
+        context.credential_key(),
         link.created_by,
-        link.group_id,
-        link.connector_id,
-        link.link_id,
+        &connector,
+        Some(link.link_id),
         &request.access_token,
+        rand::random::<[u8; 24]>(),
     )
-    .await
     .map_err(seal_error)?;
     if secret.endpoint != link.endpoint {
         return Err(ServerError::Conflict(
@@ -425,7 +442,7 @@ A running push returns 409. A rejected token returns 409 with reason token_rejec
 )]
 pub async fn accept_remote(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<Json<RepositoryLinkResponse>> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -436,7 +453,9 @@ pub async fn accept_remote(
             "a push of this link is running; accept after it finished".into(),
         ));
     }
-    let remote = remote_state(link.kind, state.get_ctx().as_ref(), &link)
+    let context = state.get_ctx();
+    let remote = RemoteStateOperation::new(context.node_scope(), link.clone());
+    let remote = drive(remote, context.as_ref())
         .await
         .map_err(|error| match error {
             TransferError::Refused(_) => ServerError::Conflict(error.to_string()),
@@ -484,7 +503,7 @@ A paused or push link, a dataset that already holds the latest version, a refuse
 )]
 pub async fn pull_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((document_id, link_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let (_, link) = managed(&state, auth, &document_id, &link_id).await?;
@@ -503,10 +522,14 @@ pub async fn pull_link(
         return job_response(&state, job_id).await;
     }
     let context = state.get_ctx();
-    let checked = check_now(&context, &link)
-        .await
-        .map_err(link_error)?
-        .ok_or(ServerError::NotFound)?;
+    let scope = context.node_scope();
+    let checked = drive(
+        CheckNowOperation::new(scope.clone(), link.clone()),
+        context.as_ref(),
+    )
+    .await
+    .map_err(link_error)?
+    .ok_or(ServerError::NotFound)?;
     if let LinkStatus::Failed { reason } = &checked.status {
         return Err(ServerError::Conflict(format!(
             "the repository refused the check ({})",
@@ -523,6 +546,8 @@ pub async fn pull_link(
             "the dataset already holds the latest version".into(),
         ));
     }
-    let job_id = start_pull(&context, &checked).await.map_err(link_error)?;
+    let job_id = drive(StartPullOperation::new(scope, checked), context.as_ref())
+        .await
+        .map_err(link_error)?;
     job_response(&state, job_id).await
 }

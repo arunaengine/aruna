@@ -6,17 +6,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{DhtGetOptions, StorageEffect};
 use aruna_core::events::{DhtEntry, Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keys::realm_endpoint_key;
-use aruna_core::structs::NetworkDiagnosticsState;
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmEndpointAnnouncement, RealmId, endpoint_signing_bytes,
 };
-use aruna_core::time::unix_timestamp_secs;
-use aruna_storage::StorageHandle;
+use aruna_core::structs::info::NetworkDiagnosticsState;
+use aruna_storage::storage::handle::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr, TransportAddr};
 use parking_lot::RwLock;
@@ -26,7 +26,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::connection_pool::ConnectionPool;
-use crate::dht::{self, DhtHandle};
+use crate::dht::handle::DhtHandle;
+use crate::dht::{self};
 use crate::error::{NetError, Result};
 use crate::unique_peer_nodes;
 

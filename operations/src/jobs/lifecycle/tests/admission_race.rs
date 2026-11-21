@@ -2,25 +2,36 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::future::Future;
 use std::sync::Arc;
 
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::{JobRecordFrame, ReceiptFrame};
 use aruna_core::events::LaunchDecline;
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
-use aruna_core::structs::execution::job::{
-    EffectiveResources, JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordKind, LaunchIntent,
-};
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::family::{JobFamilyRecord, JobRecordKind, LaunchIntent};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::execution::job::record_keys::kind_prefix;
 use aruna_core::types::Key;
 use tokio::sync::Barrier;
+use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use super::{resources, settle};
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::launch_admit::{
+    CommitReceiptOperation, CommitVerdict, SettleLaunchOperation, classify, existing_receipt,
+};
 use crate::jobs::lifecycle::reservation::ReserveExecutionConfig;
-use crate::jobs::lifecycle::target::commit_receipt;
-use crate::jobs::records::keys::kind_prefix;
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::store::{iter_prefix_page, read_job_record};
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::tests::records::{Family, REALM, context};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_storage::scan::iter_prefix_page;
+use aruna_test_support::jobs::read_job_record;
 
 pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -28,16 +39,6 @@ pub(super) fn envelope(max_concurrent: u32) -> ResourceEnvelope {
         max_ram_bytes: Some(8_192),
         max_disk_bytes: Some(16_384),
         max_concurrent: Some(max_concurrent),
-    }
-}
-
-fn resources() -> EffectiveResources {
-    EffectiveResources {
-        cpu_cores: 1,
-        ram_bytes: 1024,
-        disk_bytes: 2048,
-        max_walltime_ms: 60_000,
-        preemptible: false,
     }
 }
 
@@ -113,8 +114,89 @@ pub(super) fn config(
         resources: resources(),
         subject_generation: receipt.subject_generation,
         subject_digest: receipt.subject_digest,
+        config_generation: receipt.config_generation,
+        config_digest: receipt.config_digest,
         record: Box::new(record),
         now_ms: 4_000,
+        fence: None,
+    }
+}
+
+/// Commits one stored receipt with its reservation, as a target does for an offer.
+pub(super) async fn commit_receipt(
+    ctx: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    launch: &LaunchIntent,
+) -> Option<Result<ReceiptFrame, LaunchDecline>> {
+    let commit = CommitReceiptOperation::new(config, launch.clone());
+    let answer = drive(commit, ctx.as_ref()).await.ok()?;
+    settle(ctx, answer).await
+}
+
+/// Commits one stored receipt with `reserve` answering every reservation attempt, the way the
+/// runner would answer the commit operation's other calls.
+pub(super) async fn commit_with<F, Fut>(
+    ctx: &Arc<DriverContext>,
+    config: ReserveExecutionConfig,
+    launch: &LaunchIntent,
+    mut reserve: F,
+) -> Option<Result<ReceiptFrame, LaunchDecline>>
+where
+    F: FnMut(ReserveExecutionConfig) -> Fut,
+    Fut: Future<Output = Result<Ulid, LifecycleError>>,
+{
+    enum Waiting {
+        Reserve,
+        Receipts(CommitVerdict),
+        Settle(Result<ReceiptFrame, LaunchDecline>),
+    }
+    let family = config.receipt.envelope().family();
+    let mut commit = CommitReceiptOperation::new(config.clone(), launch.clone());
+    let mut turn = commit.first();
+    let mut waiting = Waiting::Reserve;
+    loop {
+        match turn {
+            Ok(Next::Done(answer)) => return settle(ctx, answer).await,
+            Ok(Next::Call(IoCall::Child(_))) => {}
+            Ok(other) => panic!("unexpected turn {other:?}"),
+            Err(_) => return None,
+        }
+        let answer = match waiting {
+            Waiting::Reserve => {
+                let reserved = reserve(config.clone()).await;
+                waiting = match &reserved {
+                    Ok(_) => Waiting::Settle(
+                        ReceiptFrame::new(config.receipt.envelope().clone())
+                            .map_err(|_| LaunchDecline::Unauthorized),
+                    ),
+                    Err(error) => Waiting::Receipts(classify(error)),
+                };
+                if let Waiting::Receipts(CommitVerdict::Retry) = waiting {
+                    waiting = Waiting::Reserve;
+                }
+                IoResult::Child(ChildOutcome::new(reserved))
+            }
+            Waiting::Receipts(verdict) => {
+                let read = LoadFamilyOperation::kind(family, JobRecordKind::Receipt);
+                let records = drive(read, ctx.as_ref()).await;
+                let found = records
+                    .as_ref()
+                    .ok()
+                    .and_then(|records| existing_receipt(records, launch));
+                waiting = match found {
+                    Some(found) => Waiting::Settle(found),
+                    None if verdict == CommitVerdict::Raced => Waiting::Reserve,
+                    None => Waiting::Receipts(verdict),
+                };
+                IoResult::Child(ChildOutcome::new(records))
+            }
+            Waiting::Settle(decision) => {
+                let settled = drive(SettleLaunchOperation::new(decision), ctx.as_ref()).await;
+                waiting = Waiting::Reserve;
+                IoResult::Child(ChildOutcome::new(settled))
+            }
+        };
+        turn = commit.next(answer);
     }
 }
 
@@ -146,7 +228,7 @@ pub(super) async fn receipts(ctx: &DriverContext, family: &Family) -> usize {
 pub(super) async fn minted(ctx: &DriverContext) -> usize {
     let mut count = 0;
     for execution in [1u8, 2u8] {
-        if read_job_record(&ctx.storage_handle, physical(execution), None)
+        if read_job_record(ctx, physical(execution), None)
             .await
             .expect("job row read")
             .is_some()

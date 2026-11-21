@@ -8,6 +8,8 @@ use rand::{SeedableRng, rngs::StdRng};
 use std::time::Instant;
 
 use crate::encoding::encode_key;
+use crate::policy::{Attribute, Policy};
+use crate::scheme::{decapsulate, encapsulate, issue, setup_from_seed};
 use crate::*;
 
 #[test]

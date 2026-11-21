@@ -7,25 +7,28 @@ use super::object::restrictions_reach;
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
 use crate::s3::scope::resolve_scope;
+use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::live_version::LiveVersionInput;
+use aruna_core::metadata::AuthToken;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permission_path};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship};
-use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
-use aruna_operations::metadata::AuthToken;
-use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::replication::queue::{LiveVersionInput, LiveVersionOperation};
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::sync::mirror_repair::{
-    SyncMirrorIntent, clear_mirror_repair, delete_sync_mirror, kick_mirror_repair,
-    request_mirror_create,
-};
-use aruna_operations::sync::sync_relationship::{
-    DeleteRelationshipOperation, ListRelationshipsOperation, StoreRelationshipOperation,
-    SyncRelationshipDirection,
-};
+use aruna_core::structs::sync_relationship::{SyncMode, SyncRelationship};
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::replication::live_queue::QueueLiveOperation;
+use aruna_operations::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_operations::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_operations::replication::mirror_repair::remove::RemoveMirrorOperation;
+use aruna_operations::replication::mirror_repair::request::MirrorRequestOperation;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use aruna_operations::replication::sync_relationship::list::ListRelationshipsOperation;
+use aruna_operations::replication::sync_relationship::store::StoreRelationshipOperation;
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,
     ReplicationRule, ReplicationRuleStatus,
@@ -51,18 +54,20 @@ impl ArunaS3Service {
         if !restrictions_reach(user_access.path_restrictions.as_deref(), &bucket_path) {
             return Ok(false);
         }
-        match authorize(
+        match drive(
+            AuthorizeOperation::new(
+                self.realm_id,
+                &AuthContext {
+                    user_id: user_access.user_identity,
+                    realm_id: self.realm_id,
+                    path_restrictions: None,
+                    session: None,
+                },
+                &bucket_path,
+                &Permission::READ,
+                extras.clone(),
+            ),
             &self.state,
-            self.realm_id,
-            &AuthContext {
-                user_id: user_access.user_identity,
-                realm_id: self.realm_id,
-                path_restrictions: None,
-                session: None,
-            },
-            &bucket_path,
-            &Permission::READ,
-            extras.clone(),
         )
         .await
         {
@@ -308,23 +313,25 @@ impl ArunaS3Service {
             )
             .await
             .map_err(IntoS3Error::into_s3_error)?;
-            authorize(
-                &self.state,
-                self.realm_id,
-                &AuthContext {
-                    user_id: user_access.user_identity,
-                    realm_id: self.realm_id,
-                    path_restrictions: user_access.path_restrictions.clone(),
-                    session: None,
-                },
-                &bucket_permission_path(
+            drive(
+                AuthorizeOperation::new(
                     self.realm_id,
-                    bucket_info.group_id,
-                    self.node_id,
-                    target_bucket,
+                    &AuthContext {
+                        user_id: user_access.user_identity,
+                        realm_id: self.realm_id,
+                        path_restrictions: user_access.path_restrictions.clone(),
+                        session: None,
+                    },
+                    &bucket_permission_path(
+                        self.realm_id,
+                        bucket_info.group_id,
+                        self.node_id,
+                        target_bucket,
+                    ),
+                    &Permission::WRITE,
+                    extras.clone(),
                 ),
-                &Permission::WRITE,
-                extras.clone(),
+                &self.state,
             )
             .await
             .map_err(map_authorize_error)?;
@@ -339,31 +346,34 @@ impl ArunaS3Service {
             path_restrictions: user_access.path_restrictions.clone(),
             session: None,
         });
-        request_mirror_create(
-            &self.state,
+        let request = MirrorRequestOperation::create(
             relationship.target.node_id,
             auth_token,
             user_access.group_id,
             relationship.clone(),
             extras.clone(),
-        )
-        .await
-        .map_err(|error| match error {
-            aruna_core::metadata::MetadataError::HandleMissing => {
-                s3_error!(InternalError, "Replication target is unreachable")
-            }
-            aruna_core::metadata::MetadataError::Backend(message) if message == "access_denied" => {
-                s3_error!(AccessDenied, "Permission denied")
-            }
-            aruna_core::metadata::MetadataError::Backend(message) if message == "not_found" => {
-                s3_error!(NoSuchBucket, "Replication target bucket does not exist")
-            }
-            error => s3_error!(InternalError, "Replication target error: {}", error),
-        })
+        );
+        drive(request, &self.state)
+            .await
+            .map_err(|error| match error {
+                aruna_core::metadata::MetadataError::HandleMissing => {
+                    s3_error!(InternalError, "Replication target is unreachable")
+                }
+                aruna_core::metadata::MetadataError::Backend(message)
+                    if message == "access_denied" =>
+                {
+                    s3_error!(AccessDenied, "Permission denied")
+                }
+                aruna_core::metadata::MetadataError::Backend(message) if message == "not_found" => {
+                    s3_error!(NoSuchBucket, "Replication target bucket does not exist")
+                }
+                error => s3_error!(InternalError, "Replication target error: {}", error),
+            })
     }
 
     pub(super) async fn remove_sync_mirror(&self, relationship: &SyncRelationship) -> bool {
-        if let Err(error) = delete_sync_mirror(&self.state, self.node_id, relationship).await {
+        let remove = RemoveMirrorOperation::new(self.node_id, relationship.clone());
+        if let Err(error) = drive(remove, &self.state).await {
             warn!(relationship_id = %relationship.id, %error, "Failed to remove remote sync mirror");
             return false;
         }
@@ -375,9 +385,14 @@ impl ArunaS3Service {
         relationship: &SyncRelationship,
         expected: SyncMirrorIntent,
     ) {
-        if let Err(error) = clear_mirror_repair(&self.state, relationship, expected).await {
+        if let Err(error) = drive(
+            MirrorRecordOperation::clear(relationship.clone(), expected),
+            &self.state,
+        )
+        .await
+        {
             warn!(%error, relationship_id = %relationship.id, "Failed to clear sync mirror repair");
-            kick_mirror_repair(&self.state).await;
+            let _ = drive(KickRepairOperation::new(), &self.state).await;
         }
     }
 
@@ -389,8 +404,8 @@ impl ArunaS3Service {
         version_id: ulid::Ulid,
         delete_marker: bool,
     ) {
-        let result = match drive(
-            LiveVersionOperation::new(LiveVersionInput {
+        if let Err(error) = drive(
+            QueueLiveOperation::new(LiveVersionInput {
                 local_node_id: self.node_id,
                 auth_context,
                 bucket: bucket.clone(),
@@ -402,22 +417,14 @@ impl ArunaS3Service {
         )
         .await
         {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    bucket,
-                    key,
-                    version_id = %version_id,
-                    delete_marker,
-                    "Failed to queue live replication after committed write; durable obligation remains for repair"
-                );
-                return;
-            }
-        };
-
-        if result.queued > 0 && !result.scheduled {
-            warn!(bucket, key, version_id = %version_id, queued = result.queued, "Live replication jobs persisted but drain scheduling was not acknowledged");
+            warn!(
+                error = %error,
+                bucket,
+                key,
+                version_id = %version_id,
+                delete_marker,
+                "Failed to queue live replication after committed write; durable obligation remains for repair"
+            );
         }
     }
 }

@@ -2,20 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::WorkspaceEndpoint;
 use tracing::info;
 
 use super::settings::{
     compute_s3_endpoint, kubernetes_s3_access, kubernetes_workspace, session_s3_port,
 };
 use super::{ComputeBuildError, ComputeSettings, KubernetesSettings};
-use crate::config::Config;
+use aruna_config::Config;
 
 pub(super) async fn build(
     settings: &ComputeSettings,
     kubernetes: &KubernetesSettings,
     config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<super::BuiltBackend, ComputeBuildError> {
     let workspace = kubernetes_workspace(
         settings.local_only,
         compute_s3_endpoint(settings, config).as_deref(),
@@ -27,7 +27,7 @@ pub(super) async fn build(
         kubernetes.mount_driver.clone(),
     );
     let backend = aruna_compute::executor::kubernetes::KubernetesBackend::with_config(
-        aruna_compute::KubernetesConfig {
+        aruna_compute::executor::config::KubernetesConfig {
             namespace: kubernetes.namespace.clone(),
             storage_class: kubernetes.storage_class.clone(),
             helper_image: kubernetes.helper_image.clone(),
@@ -45,7 +45,7 @@ pub(super) async fn build(
                 .clone()
                 .zip(workspace.clone())
                 .map(|(driver, endpoint)| {
-                    Box::new(aruna_compute::KubedalMount {
+                    Box::new(aruna_compute::executor::config::KubedalMount {
                         driver,
                         endpoint,
                         region: "us-east-1".to_string(),
@@ -60,12 +60,12 @@ pub(super) async fn build(
             envelope: settings
                 .envelope
                 .expect("a selected kubernetes backend has an envelope"),
-            ..aruna_compute::KubernetesConfig::default()
+            ..aruna_compute::executor::config::KubernetesConfig::default()
         },
     )
     .await
     .map_err(|error| error.to_string())?;
-    aruna_compute::ExecutorBackend::health(&backend)
+    aruna_compute::executor::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     // Pods keep the policy they started with, so already running sessions only
@@ -80,10 +80,12 @@ pub(super) async fn build(
     );
     // Pods use the in-cluster endpoint when one is set; KubeDAL keeps the public one.
     let session = workspace.as_ref().and(kubernetes.session_endpoint.clone());
-    Ok(ExecutorRegistry::new()
-        .with_backend(std::sync::Arc::new(backend))
-        .with_workspace_endpoint(workspace, "eu-central-1".to_string())
-        .with_session_endpoint(session))
+    let workspace = WorkspaceEndpoint {
+        endpoint: workspace,
+        region: "eu-central-1".to_string(),
+        session_endpoint: session,
+    };
+    Ok((std::sync::Arc::new(backend), workspace))
 }
 
 #[cfg(test)]

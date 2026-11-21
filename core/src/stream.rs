@@ -1,17 +1,23 @@
-//! Wraps a backend byte stream in a boxed type with one error kind and a success callback.
+//! Wraps a backend byte stream in a boxed type with one error kind, a success callback and the
+//! plain transforms operations put on a stream they pass on.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use futures::Stream;
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
+use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 pub type BoxStream<'a, T> = Pin<Box<dyn Stream<Item = T> + Send + Sync + 'a>>;
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
+/// A stream of byte chunks a backend reads or writes.
+pub type ByteStream = BackendStream<Result<bytes::Bytes, StreamError>>;
 
 #[derive(Debug)]
 pub struct StreamError(pub BoxError);
@@ -39,7 +45,6 @@ impl<T> BackendStream<Result<T, StreamError>> {
         S: Stream<Item = Result<T, E>> + Send + Sync + 'static,
         E: Error + Send + Sync + 'static,
     {
-        use futures::StreamExt;
         let mapped = stream.map(|result| result.map_err(|e| StreamError(Box::new(e))));
         BackendStream(Box::pin(mapped))
     }
@@ -48,7 +53,6 @@ impl<T> BackendStream<Result<T, StreamError>> {
     where
         S: Stream<Item = Result<T, BoxError>> + Send + Sync + 'static,
     {
-        use futures::StreamExt;
         let mapped = stream.map(|result| result.map_err(StreamError));
         BackendStream(Box::pin(mapped))
     }
@@ -78,6 +82,60 @@ impl<T> BackendStream<Result<T, StreamError>> {
             failed: false,
             completed: false,
         }))
+    }
+}
+
+impl<T: Send + Sync + 'static> BackendStream<Result<T, StreamError>> {
+    /// A stream that ends at once.
+    pub fn empty() -> Self {
+        BackendStream(Box::pin(futures::stream::empty()))
+    }
+
+    /// A stream of the one `item`.
+    pub fn once(item: T) -> Self {
+        BackendStream(Box::pin(futures::stream::iter([Ok(item)])))
+    }
+
+    /// Keeps `guard` alive until the stream is dropped.
+    pub fn keep<G: Send + Sync + 'static>(self, guard: G) -> Self {
+        BackendStream(Box::pin(self.0.map(move |item| {
+            let _guard = &guard;
+            item
+        })))
+    }
+}
+
+impl BackendStream<Result<Bytes, StreamError>> {
+    /// Adds the length of each chunk to `counter` as the reader takes it.
+    pub fn counted(self, counter: Arc<AtomicU64>) -> Self {
+        BackendStream(Box::pin(self.0.inspect(move |chunk| {
+            if let Ok(chunk) = chunk {
+                counter.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+            }
+        })))
+    }
+
+    /// The bytes of `range` from a stream of the whole object; the rest is skipped.
+    pub fn slice(self, range: Range<u64>) -> Self {
+        let sliced = self
+            .0
+            .scan(0u64, move |offset, chunk| {
+                let start = *offset;
+                let item = match chunk {
+                    Ok(_) if start >= range.end => return futures::future::ready(None),
+                    Ok(chunk) => {
+                        let len = chunk.len() as u64;
+                        *offset = start + len;
+                        let from = range.start.saturating_sub(start).min(len) as usize;
+                        let to = (range.end - start).min(len) as usize;
+                        (from < to).then(|| Ok(chunk.slice(from..to)))
+                    }
+                    Err(error) => Some(Err(error)),
+                };
+                futures::future::ready(Some(item))
+            })
+            .filter_map(futures::future::ready);
+        BackendStream(Box::pin(sliced))
     }
 }
 

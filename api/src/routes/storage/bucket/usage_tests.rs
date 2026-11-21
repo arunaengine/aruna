@@ -209,18 +209,19 @@ async fn answers_held_ranges() {
 // group's: objects, versions and referenced bytes.
 #[tokio::test]
 async fn reference_import_counted() {
-    use aruna_core::structs::execution::job::{
-        JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{
+        JobPayload, StagingJobCheckpoint, StagingJobPhase,
     };
+    use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+    use aruna_drivers::driver::drive;
     use aruna_operations::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_operations::driver::drive;
-    use aruna_operations::staging::page::import::{
-        PageEntry, PageImportInput, PageImportOperation,
-    };
+    use aruna_operations::staging::page::import::PageImportOperation;
+    use aruna_operations::staging::page::rows::{PageEntry, PageImportInput};
     use std::time::{Duration, SystemTime};
 
     let node = node_state().await;
@@ -256,7 +257,7 @@ async fn reference_import_counted() {
         claim_token,
         lease_expires_ms: u64::MAX,
     });
-    aruna_operations::jobs::store::insert_job(&ctx.storage_handle, &record)
+    aruna_test_support::jobs::insert_job(&ctx, &record)
         .await
         .unwrap();
     let checkpoint = StagingJobCheckpoint {

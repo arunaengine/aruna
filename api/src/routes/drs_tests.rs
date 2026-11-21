@@ -11,11 +11,11 @@ use super::{
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
 use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
-    test_storage,
+    seed_group_docs, seed_realm_auth, seed_realm_config, test_state as build_state, test_storage,
 };
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
@@ -27,7 +27,8 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
+use aruna_drivers::testing::test_context;
 use axum::Extension;
 use axum::body::to_bytes;
 use axum::extract::{ConnectInfo, Path, State};
@@ -791,8 +792,8 @@ fn keeps_encoded_keys() {
 mod global {
     use super::super::*;
     use crate::auth::ValidatedBearer;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
         BUCKET, Node, PEER, distribute, mirror, node_id, node_state, peer_heartbeat, publish_api,
         unsigned_token,
@@ -1121,7 +1122,7 @@ mod global {
 
     #[tokio::test]
     async fn redeems_own_tickets() {
-        use aruna_operations::auth::bearer_token::token_grant;
+        use aruna_operations::auth::error::token_grant;
         let node = node_state().await;
         distribute(&node.state, node.group_id, BUCKET).await;
         let id = stored(&node).await;
@@ -1133,7 +1134,7 @@ mod global {
             session: None,
             object_id: id.clone(),
         };
-        let now = now_millis() / 1000;
+        let now = unix_timestamp_millis() / 1000;
         let ticket = issue_ticket(&node.state.get_ctx(), input, now).unwrap();
         let ticket = ticket.encode().unwrap();
         let first = download(&node, None, &id, Some(ticket.clone())).await;

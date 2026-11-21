@@ -1,22 +1,42 @@
-//! Defines the job control request and response verbs and the wire records they carry.
+//! Defines the job control request and response verbs, the wire records they carry, and the
+//! outcome and progress reporter of a job run.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::any::Any;
+use std::collections::BTreeSet;
+use std::fmt;
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Poll, Waker};
+use std::time::{Duration, SystemTime};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use ulid::Ulid;
 
-use crate::UserId;
+use crate::events::Event;
 use crate::metadata::AuthToken;
-use crate::structs::execution::job::{
-    JobError, JobId, JobPayload, JobProgress, JobRecord, JobResultPayload, JobState, KeyWait,
-    StagingJobCheckpoint, WorkspaceMode,
+use crate::operation::SubOperation;
+use crate::rocrate_archive::{ArchiveCompression, ArchiveInspection};
+use crate::stream::{BackendStream, StreamError};
+use crate::structs::execution::job::family::{ExpiryReason, LogicalJobState, SubmissionId};
+use crate::structs::execution::job::identity::{JobId, JobState};
+use crate::structs::execution::job::input::{
+    InputSelection, JobPayload, RoCrateLimits, StagingJobCheckpoint,
 };
+use crate::structs::execution::job::key_wait::KeyWait;
+use crate::structs::execution::job::local::{
+    JobError, JobProgress, JobRecord, JobResultPayload, WorkspaceMode,
+};
+use crate::structs::execution::table::GzipCursor;
+use crate::structs::storage::blob::BackendLocation;
 use crate::structs::storage::encryption::BucketKeyRef;
 use crate::structs::storage::storage_purge::StoragePurgeScope;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobKind {
@@ -103,6 +123,8 @@ pub struct JobStatusView {
     pub state: JobState,
     pub attempts: u32,
     pub cancel_requested: bool,
+    /// Set when a holder cancelled the job because it expired without an outcome.
+    pub expiry_reason: Option<ExpiryReason>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -151,6 +173,7 @@ impl From<&JobRecord> for JobStatusView {
             state: record.state,
             attempts: record.attempts,
             cancel_requested: record.cancel_requested,
+            expiry_reason: None,
             created_at_ms: record.created_at_ms,
             updated_at_ms: record.updated_at_ms,
             finished_at_ms: record.finished_at_ms,
@@ -400,4 +423,408 @@ pub enum JobResponse {
     /// Keys still locked on the answering node; empty means every content is readable.
     KeysLocked(Vec<KeyWait>),
     KeyWakeAcked,
+}
+
+/// The holder's answer to a forwarded submission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubmissionAck {
+    pub job_id: JobId,
+    pub created: bool,
+    pub state: LogicalJobState,
+}
+
+/// Why a holder did not accept a forwarded submission. Only a definitive
+/// refusal ends the ingress; anything else lets it try the next holder.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SubmissionRefusal {
+    Unauthorized,
+    /// This node does not hold the family in its own unconflicted view.
+    NotHolder,
+    /// The recomputed identity or request digest differs from the forwarded one.
+    IdentityMismatch,
+    Conflict {
+        existing_job_id: JobId,
+    },
+    /// The holder read the request and refused it; the reason reaches the caller.
+    Invalid {
+        reason: String,
+    },
+    Unavailable,
+}
+
+/// What a node a plugin task's submission was sent to answers after its admission deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClosureAnswer {
+    /// The node stores a claim of the submission: its request family and alias.
+    Claimed {
+        family: crate::structs::execution::job::family::JobFamilyId,
+        job_id: JobId,
+    },
+    /// No claim, and a committed closure row refuses every later admission there.
+    Absent,
+    /// Nothing decided; ask again.
+    Undecided,
+}
+
+/// How a target answers whether it ever accepted one launch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchClosureAnswer {
+    /// The target holds a receipt for exactly this launch.
+    Receipt(Box<crate::effects::ReceiptFrame>),
+    /// No receipt, and the launch window passed on the target's clock, so none can follow.
+    NeverAccepted,
+    /// The target pruned the family after every execution it ran there had stopped.
+    Pruned,
+    /// The window has not passed on the target's clock yet; ask again later.
+    TooEarly,
+}
+
+/// A failed call leaves the request unanswered, which another holder may still answer.
+impl From<crate::calls::IoError> for SubmissionRefusal {
+    fn from(_: crate::calls::IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
+/// The inputs an ingress asks their source node to resolve and grant for one caller.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputResolveRequest {
+    pub created_by: UserId,
+    pub submission_id: SubmissionId,
+    /// Unix seconds the grants end at, bounded by this node's job retention.
+    pub expires_at: u64,
+    pub inputs: Vec<InputSelection>,
+}
+
+/// What a running job asks its host, the runtime that holds its stop signals, progress and
+/// range turns; never persisted.
+#[derive(Debug, PartialEq)]
+pub enum JobEffect {
+    /// Answers `JobEvent::Stops` with whether the job should stop now.
+    Stops,
+    /// Records progress; answered by `JobEvent::Reported`.
+    Report(JobReport),
+    /// Waits this long, or until the job stops; answered by `JobEvent::Paused`.
+    Pause(Duration),
+    /// Runs `child` while this node's turns of `turns` are held, taken in key order; answered by
+    /// `JobEvent::Finished` with the child's event.
+    InTurns {
+        turns: BTreeSet<(Ulid, Ulid)>,
+        child: Box<dyn SubOperation>,
+    },
+    /// Runs `child` until it ends or the job stops; `JobEvent::Finished` or `JobEvent::Stopped`.
+    UntilStop(Box<dyn SubOperation>),
+    /// Reads a stream to its end; answered by `JobEvent::Collected`.
+    Collect(ByteStream),
+    /// Reads a stream of at most `limit` bytes; answered by `JobEvent::CollectedUpTo`.
+    CollectUpTo { stream: ByteStream, limit: u64 },
+    /// Feeds `work` until its cursor holds the next chunk; answered by `JobEvent::GzipFilled`.
+    FillGzip(Box<GzipWork>),
+    /// Makes a stream fail once the job stops; answered by `JobEvent::Stream`.
+    StoppableStream(ByteStream),
+    /// Inspects a stored archive; answered by `JobEvent::ArchiveInspected`.
+    InspectArchive(Box<ArchiveRead>),
+    /// Opens the expanded bytes of one archive entry; answered by `JobEvent::ArchiveEntry`.
+    OpenArchiveEntry(Box<ArchiveEntryRead>),
+    /// Starts a new archive; answered by `JobEvent::ZipOpened`.
+    OpenZip,
+    /// Writes one whole entry; answered by `JobEvent::ZipWritten`.
+    ZipWhole {
+        zip: ZipWork,
+        path: String,
+        modified_ms: u64,
+        bytes: Vec<u8>,
+    },
+    /// Writes one entry from a stream until it ends or the job stops; answered by
+    /// `JobEvent::ZipStreamed`.
+    ZipStream {
+        zip: ZipWork,
+        path: String,
+        modified_ms: u64,
+        stream: ByteStream,
+    },
+    /// Writes one entry from a stream to its end; answered by `JobEvent::ZipCounted`.
+    ZipCounted {
+        zip: ZipWork,
+        path: String,
+        modified_ms: u64,
+        stream: ByteStream,
+    },
+    /// Ends the archive; answered by `JobEvent::ZipClosed`.
+    ZipClose(ZipWork),
+}
+
+/// One stored archive to inspect.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveRead {
+    pub location: BackendLocation,
+    pub size: u64,
+    pub eln: bool,
+    pub limits: RoCrateLimits,
+    /// The size limit of the metadata file, when it is to be read as well.
+    pub metadata_bytes: Option<u64>,
+}
+
+/// One entry of a stored archive to read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArchiveEntryRead {
+    pub location: BackendLocation,
+    pub size: u64,
+    pub data_offset: u64,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub compression: ArchiveCompression,
+}
+
+/// An archive being written, kept by the adapter between its entries.
+pub struct ZipWork(Mutex<Box<dyn Any + Send>>);
+
+impl ZipWork {
+    pub fn new(writer: Box<dyn Any + Send>) -> Self {
+        Self(Mutex::new(writer))
+    }
+
+    /// The writer, for the adapter that created it.
+    pub fn into_inner(self) -> Box<dyn Any + Send> {
+        self.0.into_inner().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl fmt::Debug for ZipWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ZipWork").finish_non_exhaustive()
+    }
+}
+
+/// Equal only to itself: a writer has no comparable state.
+impl PartialEq for ZipWork {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+/// Why writing an entry from a stream ended early.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ZipFailure {
+    Stopped,
+    /// The source stream failed; `corrupt` when its bytes failed their integrity check.
+    Source {
+        corrupt: bool,
+        message: String,
+    },
+    Sink(String),
+}
+
+/// A stream of bytes read from a source or an object.
+pub type ByteStream = BackendStream<Result<Bytes, StreamError>>;
+
+/// Whether a job was cancelled by its user or its node is shutting down.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobStops {
+    pub cancelled: bool,
+    pub shutdown: bool,
+}
+
+impl JobStops {
+    pub fn any(self) -> bool {
+        self.cancelled || self.shutdown
+    }
+}
+
+/// A change to a job's visible progress.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct JobReport {
+    pub current: Option<u64>,
+    pub total: Option<u64>,
+    pub advance: u64,
+    /// A durable checkpoint advanced, so a later transient failure costs no attempt.
+    pub checkpoint: bool,
+}
+
+/// An open gzip table stream with the cursor that decodes it.
+pub struct GzipWork {
+    pub stream: ByteStream,
+    pub cursor: GzipCursor,
+}
+
+impl fmt::Debug for GzipWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GzipWork").finish_non_exhaustive()
+    }
+}
+
+/// Equal only for the same stream: a decoder has no comparable state.
+impl PartialEq for GzipWork {
+    fn eq(&self, other: &Self) -> bool {
+        self.stream == other.stream
+    }
+}
+
+/// Why filling a gzip chunk stopped: the transport failed or the bytes are no valid gzip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GzipBroken {
+    Stream(String),
+    Gzip(String),
+}
+
+/// The answer to a [`JobEffect`].
+#[derive(Debug, PartialEq)]
+pub enum JobEvent {
+    Stops(JobStops),
+    Reported,
+    Paused {
+        stopped: bool,
+    },
+    Finished(Box<Event>),
+    Stopped,
+    Collected(Result<Vec<u8>, String>),
+    /// The bytes read, `None` when the stream held more than the limit.
+    CollectedUpTo(Result<Option<Vec<u8>>, String>),
+    GzipFilled {
+        work: Box<GzipWork>,
+        result: Result<(), GzipBroken>,
+    },
+    Stream(ByteStream),
+    ArchiveInspected(Result<(ArchiveInspection, Option<String>), String>),
+    ArchiveEntry(Result<ByteStream, String>),
+    ZipOpened {
+        zip: ZipWork,
+        stream: ByteStream,
+    },
+    ZipWritten {
+        zip: Option<ZipWork>,
+        result: Result<(), String>,
+    },
+    ZipStreamed {
+        zip: Option<ZipWork>,
+        result: Result<[u8; 32], ZipFailure>,
+    },
+    /// The bytes the entry holds, or why writing it ended early.
+    ZipCounted {
+        zip: Option<ZipWork>,
+        result: Result<u64, ZipFailure>,
+    },
+    ZipClosed(Result<(), String>),
+}
+
+/// In-memory progress with a persisted snapshot taken on flush and lease renew.
+#[derive(Clone)]
+pub struct ProgressReporter {
+    inner: Arc<ProgressInner>,
+}
+
+struct ProgressInner {
+    current: AtomicU64,
+    total: Mutex<Option<u64>>,
+    unit: String,
+    pause: Mutex<Option<SystemTime>>,
+    /// Set once this execution committed a resumable checkpoint.
+    checkpointed: AtomicBool,
+    /// Set by a committed checkpoint until the heartbeat persists its progress.
+    flush: AtomicBool,
+    /// The heartbeat waiting in `flush_requested`, woken by a checkpoint.
+    waker: Mutex<Option<Waker>>,
+}
+
+impl ProgressReporter {
+    pub fn from_progress(progress: &JobProgress) -> Self {
+        Self {
+            inner: Arc::new(ProgressInner {
+                current: AtomicU64::new(progress.current),
+                total: Mutex::new(progress.total),
+                unit: progress.unit.clone(),
+                pause: Mutex::new(None),
+                checkpointed: AtomicBool::new(false),
+                flush: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn set_total(&self, total: u64) {
+        *self.inner.total.lock().expect("progress mutex poisoned") = Some(total);
+    }
+
+    pub fn set_current(&self, current: u64) {
+        self.inner.current.store(current, Ordering::Relaxed);
+    }
+
+    /// Records the end of a pause a source asked for, `None` once the job goes on.
+    pub fn set_pause(&self, until: Option<SystemTime>) {
+        *self
+            .inner
+            .pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = until;
+    }
+
+    pub fn advance(&self, delta: u64) {
+        self.inner.current.fetch_add(delta, Ordering::Relaxed);
+    }
+
+    /// Records that a durable checkpoint advanced, so a later transient failure costs no attempt.
+    pub fn checkpoint(&self) {
+        self.inner.checkpointed.store(true, Ordering::Relaxed);
+        self.inner.flush.store(true, Ordering::SeqCst);
+        let waker = (self.inner.waker.lock())
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    /// Completes once a checkpoint asked for its progress to be persisted. A request that
+    /// nobody waited for completes the next call at once.
+    pub fn flush_requested(&self) -> impl std::future::Future<Output = ()> + '_ {
+        std::future::poll_fn(move |cx| {
+            if self.inner.flush.swap(false, Ordering::SeqCst) {
+                return Poll::Ready(());
+            }
+            *(self.inner.waker.lock()).unwrap_or_else(PoisonError::into_inner) =
+                Some(cx.waker().clone());
+            // A checkpoint between the first check and the stored waker woke nobody.
+            match self.inner.flush.swap(false, Ordering::SeqCst) {
+                true => Poll::Ready(()),
+                false => Poll::Pending,
+            }
+        })
+    }
+
+    pub fn checkpointed(&self) -> bool {
+        self.inner.checkpointed.load(Ordering::Relaxed)
+    }
+
+    pub fn snapshot(&self) -> JobProgress {
+        JobProgress {
+            current: self.inner.current.load(Ordering::Relaxed),
+            total: *self.inner.total.lock().expect("progress mutex poisoned"),
+            unit: self.inner.unit.clone(),
+            paused_until: *self
+                .inner
+                .pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        }
+    }
+}
+
+/// Most outcomes are small; boxing the result payload would touch every job, so it stays inline.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, PartialEq)]
+pub enum JobRunOutcome {
+    Succeeded(JobResultPayload),
+    Failed(JobError),
+    /// A dependency such as metadata projection is not readable yet. The
+    /// runtime requeues without incrementing the bounded execution attempts.
+    Deferred(JobError),
+    /// Like `Deferred`, but runs again only after the given delay.
+    DeferredFor(JobError, Duration),
+    Cancelled,
+    Interrupted,
+    /// Needs these locked bucket keys; the runtime parks the job without spending an attempt.
+    AwaitingKey(Vec<KeyWait>),
+    /// The outcome cannot be known and the effect must not run again: the job ends
+    /// `Indeterminate` and locally exhausted, never `Failed`.
+    Undecided(JobError),
 }

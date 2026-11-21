@@ -6,43 +6,38 @@
 use std::sync::Arc;
 
 use aruna_core::compute::quota::{ComputeQuota, ResourceTotals};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::node::state::DrainStateOperation;
+use aruna_core::node::state::ReadInfoOperation;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_operations::driver::drive;
-use aruna_operations::node::heartbeat::held_heartbeats;
-use aruna_operations::node::node_info::{
-    departure_report, group_demand, read_info_documents, read_operator_drain, set_operator_drain,
-};
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_drivers::driver::drive;
+use aruna_drivers::driver::node_facts;
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_operations::node::info::flows::{GroupDemandOperation, OperatorDrainOperation};
 use aruna_operations::realm::set_compute::{
     SetComputeConfig, SetComputeError, SetComputeOperation,
 };
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::info::TelemetryState;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((
-    name = "compute/admin",
-    description = "Realm-admin administration of compute links, quotas, pressure and drain"
-)))]
-pub struct ComputeApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ComputeApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_compute_config, put_compute_config))
         .routes(routes!(get_compute_snapshots))
         .routes(routes!(set_compute_drain))
@@ -286,16 +281,15 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
 fn map_config_error(error: GetConfigError) -> ServerError {
     match error {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 async fn require_config_admin(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     permission: Permission,
 ) -> ServerResult<AuthContext> {
-    let auth = require_realm_auth(state, auth)?;
     ensure_permission(state, &auth, policy_admin_path(auth.realm_id), permission).await?;
     Ok(auth)
 }
@@ -348,7 +342,6 @@ async fn require_config_admin(
             "catch_up_after_ms": 300000,
             "session_idle_after_ms": 1800000
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 500, description = "The stored configuration could not be read or decoded here, so absence was never established", body = ErrorResponse)
@@ -357,7 +350,7 @@ async fn require_config_admin(
 )]
 pub async fn get_compute_config(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<Json<ComputeConfigBody>> {
     let auth = require_config_admin(&state, auth, Permission::READ).await?;
     let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
@@ -445,7 +438,7 @@ node serves the call and every other node relays it to one.
                     "from": "us-east",
                     "to": "eu-west",
                     "bandwidth_bytes_per_sec": 62500000_i64
-                }
+                },
             ],
             "pessimistic_bandwidth_bytes_per_sec": 12500000_i64,
             "availability_stale_after_ms": 300000,
@@ -460,25 +453,23 @@ node serves the call and every other node relays it to one.
                     "quota": {
                         "max_jobs": 8,
                         "max_job_walltime_ms": 3600000
-                    }
-                }
+                    },
+                },
             ],
             "catch_up_after_ms": 300000,
             "session_idle_after_ms": 1800000
         })),
         (status = 400, description = "A malformed group id, a duplicate directed link or group entry, an empty or oversized location, a zero bandwidth, a zero witness delay, a zero catch-up wait, or a zero session idle timeout", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn put_compute_config(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ComputeConfigBody>,
 ) -> ServerResult<Json<ComputeConfigBody>> {
     // Request policies live at this boundary; the operation only checks roles.
@@ -486,11 +477,7 @@ pub async fn put_compute_config(
     let compute = compute_config(request)?;
     let stored = drive(
         SetComputeOperation::new(SetComputeConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(&state, &auth),
             auth_context: auth,
             compute,
         }),
@@ -509,15 +496,11 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
             ServerError::Forbidden
         }
         SetComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
-        SetComputeError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
-        SetComputeError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
+        SetComputeError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
         }
-        other => ServerError::InternalError(other.to_string()),
+        SetComputeError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -593,7 +576,6 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
             }
         })),
         (status = 400, description = "`group_id` is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 500, description = "The stored configuration could not be read or decoded here, so absence was never established", body = ErrorResponse)
@@ -602,7 +584,7 @@ fn map_compute_error(error: SetComputeError) -> ServerError {
 )]
 pub async fn get_compute_snapshots(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<SnapshotQuery>,
 ) -> ServerResult<Json<ComputeSnapshotsResponse>> {
     let auth = require_config_admin(&state, auth, Permission::READ).await?;
@@ -618,12 +600,12 @@ pub async fn get_compute_snapshots(
         .map_err(map_config_error)?;
     let members = config
         .node_ids()
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
-    let documents = read_info_documents(&context, &members)
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let documents = drive(ReadInfoOperation::new(members), context.as_ref())
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
 
-    let heartbeats = held_heartbeats(context.net_handle.as_ref());
+    let heartbeats = context.held_heartbeats();
     let nodes = documents
         .values()
         .map(|document| {
@@ -659,14 +641,16 @@ pub async fn get_compute_snapshots(
 
     let group = match group_id {
         Some(group_id) => {
-            let (demand, truncated) =
-                group_demand(&context, auth.realm_id, state.get_node_id(), &group_id)
-                    .await
-                    .map_err(ServerError::InternalError)?;
+            let fresh = context.fresh_heartbeats();
+            let view =
+                GroupDemandOperation::new(auth.realm_id, state.get_node_id(), group_id, fresh);
+            let (demand, truncated) = drive(view, context.as_ref())
+                .await
+                .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
             let quota = config
                 .compute
                 .effective_quota(&group_id)
-                .map_err(|error| ServerError::InternalError(error.to_string()))?;
+                .map_err(|error| ServerError::InternalError(error.into()))?;
             Some(GroupDemandBody {
                 group_id: group_id.to_string(),
                 demand: demand.into(),
@@ -676,23 +660,21 @@ pub async fn get_compute_snapshots(
         }
         None => None,
     };
-    let departure = departure_report(&context)
+    let drain = drive(DrainStateOperation::new(), context.as_ref())
         .await
-        .map_err(ServerError::InternalError)?
-        .map(|report| DepartureBody {
-            departed_at_ms: report.departed_at_ms,
-            membership_generation: report.membership_generation,
-            unresolved: report
-                .unresolved
-                .iter()
-                .map(ulid::Ulid::to_string)
-                .collect(),
-            truncated: report.truncated,
-        });
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    let departure = drain.departure.map(|report| DepartureBody {
+        departed_at_ms: report.departed_at_ms,
+        membership_generation: report.membership_generation,
+        unresolved: report
+            .unresolved
+            .iter()
+            .map(ulid::Ulid::to_string)
+            .collect(),
+        truncated: report.truncated,
+    });
     Ok(Json(ComputeSnapshotsResponse {
-        operator_draining: read_operator_drain(&context)
-            .await
-            .map_err(ServerError::InternalError)?,
+        operator_draining: drain.operator_draining,
         nodes,
         group,
         departure,
@@ -730,7 +712,6 @@ pub async fn get_compute_snapshots(
             "draining": true,
             "changed": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the realm configuration path, or a token of another realm", body = ErrorResponse),
         (status = 503, description = "The advertisement could not be republished; retryable", body = ErrorResponse)
     ),
@@ -738,18 +719,20 @@ pub async fn get_compute_snapshots(
 )]
 pub async fn set_compute_drain(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<DrainRequest>,
 ) -> ServerResult<(StatusCode, Json<DrainResponse>)> {
     let auth = require_config_admin(&state, auth, Permission::WRITE).await?;
-    let changed = set_operator_drain(
-        &state.get_ctx(),
-        state.get_node_id(),
+    let context = state.get_ctx();
+    let drain = OperatorDrainOperation::new(
         auth.realm_id,
+        state.get_node_id(),
         request.draining,
-    )
-    .await
-    .map_err(ServerError::ServiceUnavailableReason)?;
+        node_facts(&context),
+    );
+    let changed = drive(drain, context.as_ref())
+        .await
+        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
     Ok((
         StatusCode::OK,
         Json(DrainResponse {

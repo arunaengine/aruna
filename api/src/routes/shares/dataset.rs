@@ -5,32 +5,35 @@
 
 use std::sync::Arc;
 
+use aruna_core::blob_paths::ResolvePathsOperation;
+use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::share::{ShareLink, ShareTarget, TicketBody};
-use aruna_operations::blob::permission_paths::ResolvePathsOperation;
-use aruna_operations::distribution::guard::bound_view;
-use aruna_operations::distribution::resolve::{GlobalResolution, resolve_content, resolve_version};
-use aruna_operations::distribution::status::read_view;
-use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::{
-    ExportMetadataRequest, ExportMetadataResult, MetadataApiError, RoCrateExportView,
+use aruna_drivers::driver::{drive, drive_until};
+use aruna_operations::distribution::resolve::{
+    GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
 };
-use aruna_operations::metadata::forward::export_rocrate_here;
+use aruna_operations::distribution::routing::bound_view;
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::export::ExportOperation;
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
+use aruna_operations::metadata::forward::routed::export::ensure_export_limit;
 use aruna_operations::shares::dataset::{
     DatasetFile, FilePlace, MemberSet, NamedSets, dataset_files, named_sets,
 };
 use aruna_operations::shares::rules::{
     NodeScope, bucket_pattern, exact_pattern, relative_path, visit_context,
 };
+use aruna_operations::transfer::status::read_view;
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -40,18 +43,14 @@ use super::visit::{
     sign_ticket, unavailable, visit_scope, visited_link,
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::storage::deletion::bucket_info;
+use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
 
 /// How long resolving one global version or content hash of a dataset may take.
 const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DatasetDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DatasetDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(read_dataset))
         .routes(routes!(list_part))
         .routes(routes!(dataset_ticket))
@@ -145,7 +144,13 @@ async fn export_here(
     };
     let metadata_bytes = state.rocrate_limits().metadata_bytes;
     let context = state.get_ctx();
-    match export_rocrate_here(&context, state.get_realm_id(), request, metadata_bytes).await? {
+    let export = drive(
+        ExportOperation::new(state.get_realm_id(), request),
+        &context,
+    )
+    .await?;
+    ensure_export_limit(&export, metadata_bytes)?;
+    match export {
         ExportMetadataResult::Full { record, jsonld } => Ok((record, jsonld)),
         _ => Err(MetadataApiError::ServiceUnavailable),
     }
@@ -196,8 +201,8 @@ async fn local_parts(
     let (record, jsonld) = export_here(state, dataset_reader(link, state), document_id)
         .await
         .map_err(|_| unavailable())?;
-    let rocrate: serde_json::Value = serde_json::from_str(&jsonld)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let rocrate: serde_json::Value =
+        serde_json::from_str(&jsonld).map_err(|error| ServerError::InternalError(error.into()))?;
     let (realm, node) = (state.get_realm_id(), state.get_node_id());
     let named = named_sets(&rocrate, &record.graph_iri, realm);
     let sets = member_sets(state, named).await;
@@ -228,7 +233,18 @@ async fn local_parts(
             }
             FilePlace::Version(version_id) => {
                 let deadline = Instant::now() + RESOLVE_TIMEOUT;
-                let resolved = resolve_version(&state.get_ctx(), *version_id, deadline).await;
+                let resolved = resolved(
+                    drive_until(
+                        resolve_version(
+                            state.get_ctx().node_and_realm(),
+                            *version_id,
+                            RESOLVE_TIMEOUT,
+                        ),
+                        &state.get_ctx(),
+                        deadline,
+                    )
+                    .await,
+                );
                 let GlobalResolution::Found(found) = resolved else {
                     continue;
                 };
@@ -255,7 +271,7 @@ async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
     let context = state.get_ctx();
     let mut buckets = named.buckets;
     for set_id in named.sets {
-        if let Ok(Some(view)) = read_view(&context, set_id).await {
+        if let Ok(Some(view)) = drive(read_view(set_id), &context).await {
             buckets.insert(view.snapshot().config.bucket.clone());
         }
     }
@@ -267,7 +283,7 @@ async fn member_sets(state: &ServerState, named: NamedSets) -> Vec<MemberSet> {
         let Some(binding) = info.distribution.as_ref() else {
             continue;
         };
-        if let Ok(view) = bound_view(&context, binding).await {
+        if let Ok(view) = drive(bound_view(binding), &context).await {
             let members = &view.snapshot().config.members;
             sets.push(MemberSet {
                 set_id: binding.set_id,
@@ -287,7 +303,14 @@ async fn member_content(
     hash: [u8; 32],
 ) -> Option<(String, String, Ulid)> {
     let deadline = Instant::now() + RESOLVE_TIMEOUT;
-    let found = resolve_content(&state.get_ctx(), hash, deadline).await;
+    let found = content_resolved(
+        drive_until(
+            resolve_content(state.get_ctx().node_and_realm(), hash, RESOLVE_TIMEOUT),
+            &state.get_ctx(),
+            deadline,
+        )
+        .await,
+    );
     for found in found.versions {
         let (bucket, key) = (found.bucket.as_str(), found.key.as_str());
         if bound_here(state, found.set_id, bucket).await
@@ -317,7 +340,7 @@ async fn bound_here(state: &ServerState, set_id: Ulid, bucket: &str) -> bool {
     };
     let binding = info.distribution.as_ref();
     match binding.filter(|binding| binding.set_id == set_id) {
-        Some(binding) => bound_view(&state.get_ctx(), binding).await.is_ok(),
+        Some(binding) => drive(bound_view(binding), &state.get_ctx()).await.is_ok(),
         None => false,
     }
 }

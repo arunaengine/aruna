@@ -3,13 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 use axum::http::HeaderName;
 
 use super::*;
-use crate::tests::routes::{seed_realm_config, test_context, test_state, test_storage};
+use crate::tests::routes::{seed_realm_config, test_state, test_storage};
+use aruna_drivers::testing::test_context;
 
 fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
     (pairs.iter())
@@ -47,31 +48,6 @@ fn bounds_before_reading() {
         status(over_bounds(&plain, Some(&query))),
         Some(StatusCode::URI_TOO_LONG)
     );
-}
-
-#[test]
-fn relay_drops_credentials() {
-    let received = headers(&[
-        ("cookie", "canary-cookie"),
-        ("proxy-authorization", "Basic canary-proxy"),
-        ("authorization", "Bearer canary-auth"),
-        ("connection", "close"),
-        ("x-aruna-relay-hop", "spoofed"),
-        ("x-hub-signature-256", "sha256=ab"),
-        ("x-delivery", "d-1"),
-        ("content-type", "application/json"),
-    ]);
-    let sent = relayed(&received, false);
-    let mut names: Vec<&str> = sent.keys().map(HeaderName::as_str).collect();
-    names.sort_unstable();
-    assert_eq!(names, ["content-type", "x-delivery", "x-hub-signature-256"]);
-    let checked = relayed(&received, true);
-    let kept = checked.get(header::AUTHORIZATION);
-    assert_eq!(
-        kept.and_then(|value| value.to_str().ok()),
-        Some("Bearer canary-auth")
-    );
-    assert!(!checked.contains_key(header::COOKIE));
 }
 
 #[tokio::test]

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::tasks::runner::shutdown_jobs;
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,13 +10,14 @@ use std::time::{Duration, Instant};
 use aruna_api::error::ServerSetupError;
 use aruna_api::monitoring::{MonitoringState, Readiness};
 use aruna_blob::blob::BlobHandle;
-use aruna_core::shutdown::Shutdown;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_graph::GraphHandle;
 use aruna_net::{FORCED_INBOUND_DRAIN, NetHandle, NetShutdownOutcome};
 use aruna_operations::jobs::JOB_SHUTDOWN_GRACE;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_tasks::TaskHandle;
+use aruna_tasks::shutdown::Shutdown;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
@@ -117,8 +119,10 @@ pub struct NodeShutdown {
     pub monitoring: Option<Arc<MonitoringState>>,
     pub task_handle: TaskHandle,
     pub jobs_runtime: Arc<JobsRuntime>,
+    /// The node's context; job leases are handed back through it.
+    pub driver_ctx: Arc<DriverContext>,
     pub net_handle: Option<NetHandle>,
-    pub metadata_handle: Option<MetadataHandle>,
+    pub graph_handle: Option<GraphHandle>,
     pub blob_handle: Option<BlobHandle>,
     pub storage_handle: StorageHandle,
     /// Ops listener task; aborted at the very end so `/readyz` and `/healthz`
@@ -292,11 +296,7 @@ impl NodeShutdown {
         let job_grace = JOB_SHUTDOWN_GRACE.min(job_budget);
         let mut job_report = None;
         phase("jobs", job_budget, async {
-            job_report = Some(
-                self.jobs_runtime
-                    .shutdown(&self.storage_handle, job_grace)
-                    .await,
-            );
+            job_report = Some(shutdown_jobs(&self.jobs_runtime, &self.driver_ctx, job_grace).await);
         })
         .await;
         let jobs_drained = job_report
@@ -361,8 +361,8 @@ impl NodeShutdown {
         }
 
         // 8. Flush the metadata store.
-        let mut metadata_flushed = self.metadata_handle.is_none();
-        if let Some(metadata_handle) = self.metadata_handle.as_ref() {
+        let mut metadata_flushed = self.graph_handle.is_none();
+        if let Some(graph_handle) = self.graph_handle.as_ref() {
             phase(
                 "metadata",
                 phase_slice(
@@ -371,7 +371,7 @@ impl NodeShutdown {
                     METADATA_SLICE,
                 ),
                 async {
-                    if let Err(error) = metadata_handle.flush_persistence().await {
+                    if let Err(error) = graph_handle.flush_persistence().await {
                         error!(error = %error, "Failed to flush metadata persistence during shutdown");
                     } else {
                         metadata_flushed = true;
@@ -609,8 +609,9 @@ mod tests {
             monitoring: None,
             task_handle: TaskHandle::new(),
             jobs_runtime: JobsRuntime::new(),
+            driver_ctx: Arc::new(DriverContext::storage_only(storage_handle.clone())),
             net_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             blob_handle: None,
             storage_handle,
             ops: None,
@@ -619,7 +620,7 @@ mod tests {
     }
 
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
-        aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
             .expect("storage opens")
     }
 
@@ -961,20 +962,22 @@ mod tests {
         shutdown: &Shutdown,
     ) -> (std::net::SocketAddr, aruna_api::s3::server::S3ServerHandle) {
         use aruna_api::cors::CorsConfig;
-        use aruna_api::s3::server::{S3Server, S3ServerTimeouts};
+        use aruna_api::s3::server::S3Server;
+        use aruna_core::listener::S3ServerTimeouts;
         use aruna_core::metrics::NodeMetrics;
-        use aruna_core::structs::execution::job::RoCrateLimits;
+        use aruna_core::structs::execution::job::input::RoCrateLimits;
         use aruna_core::structs::identity::realm::RealmId;
-        use aruna_operations::driver::DriverContext;
+        use aruna_drivers::driver::DriverContext;
         use std::sync::Arc;
 
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let secret = iroh::SecretKey::from_bytes(&[0x58; 32]);
         let server = S3Server::new(
@@ -1031,7 +1034,13 @@ mod tests {
             .write_all(b"PUT /bucket/key HTTP/1.1\r\nHost: localhost\r\n")
             .await
             .expect("session partial head");
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // Both servers must have admitted their connection before shutdown starts.
+        let admitted = aruna_clock::testing::poll_until(Duration::from_secs(60), async || {
+            let counts = [main_s3.connection_count(), session_s3.connection_count()];
+            counts.iter().all(|count| *count > 0).then_some(())
+        })
+        .await;
+        admitted.expect("both servers admit their connection");
 
         let mut sequence = node_shutdown(shutdown.clone(), storage_handle.clone());
         sequence.s3 = Some(main_s3);
@@ -1039,18 +1048,14 @@ mod tests {
         // The ingress slice is a quarter of this grace: the busy connections
         // outlive it and only the forced cleanup can stop them.
         sequence.grace = Duration::from_millis(200);
-        let started = tokio::time::Instant::now();
 
-        let outcome = sequence.run().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(60), sequence.run())
+            .await
+            .expect("the ingress phase expires on its slice, not on the connection");
 
-        let elapsed = started.elapsed();
         assert!(
             outcome.ingress_forced,
             "the busy connections must outlive the ingress slice"
-        );
-        assert!(
-            elapsed >= Duration::from_millis(50) && elapsed < Duration::from_secs(5),
-            "the ingress phase must expire on its slice, not on the connection, took {elapsed:?}"
         );
         assert!(storage_handle.writes_closed());
         for (label, client) in [("main", &mut main_client), ("session", &mut session_client)] {

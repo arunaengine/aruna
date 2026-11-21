@@ -2,16 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_plugin_types::calls::{
+    Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, JobStatus, Listing,
+    Method, ObjectInfo, ObjectPage, Response,
+};
 use async_trait::async_trait;
-use sha2::{Digest, Sha256};
-
-pub use crate::host::wit::aruna::plugin::jobs::Status as JobStatus;
-pub use crate::host::wit::aruna::plugin::metadata_create::Created;
-pub use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
-pub use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
-pub use crate::host::wit::aruna::plugin::services::{Method, Response};
-pub use crate::host::wit::aruna::plugin::state::Entry;
-pub use crate::host::wit::aruna::plugin::types::{ErrorKind, Field, HostError};
 
 /// A copy a run starts: object paths as the plugin gave them, the source pinned when a version
 /// is given. The ordinal names the job across reruns.
@@ -53,6 +48,20 @@ pub struct JobUpload {
     pub intent: Intent,
 }
 
+/// A container task a run starts: object paths as the plugin gave them; the ordinal names the
+/// job across reruns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobTask {
+    pub task: String,
+    pub parameters: Vec<Field>,
+    /// Container path, object path and an optional pinned version.
+    pub inputs: Vec<(String, String, Option<String>)>,
+    pub files: Vec<(String, Vec<u8>)>,
+    /// Container directory and object path prefix.
+    pub outputs: Vec<Field>,
+    pub intent: Intent,
+}
+
 /// Identity of the run that issued a host call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallContext {
@@ -60,29 +69,6 @@ pub struct CallContext {
     pub install: String,
     /// The broker must not buffer a reply larger than this.
     pub max_bytes: usize,
-}
-
-/// Identity of one outside effect of a run. The ordinal names it; the digest of all arguments
-/// checks a rerun asks for the same thing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Intent {
-    pub ordinal: u32,
-    pub digest: [u8; 32],
-}
-
-impl Intent {
-    /// Digests length-prefixed parts, so no two argument lists share bytes.
-    pub fn new(ordinal: u32, parts: &[&[u8]]) -> Self {
-        let mut hasher = Sha256::new();
-        for part in parts {
-            hasher.update((part.len() as u64).to_le_bytes());
-            hasher.update(part);
-        }
-        Self {
-            ordinal,
-            digest: hasher.finalize().into(),
-        }
-    }
 }
 
 /// A revision-checked metadata change.
@@ -281,6 +267,17 @@ pub trait Broker: Send + Sync {
         ))
     }
     /// The status of a job of the install; a broker that runs no jobs refuses it.
+    /// Starts a container task; a broker that runs no jobs refuses it.
+    async fn jobs_start_task(
+        &self,
+        _cx: &CallContext,
+        _task: JobTask,
+    ) -> Result<String, HostError> {
+        Err(HostError::new(
+            ErrorKind::Unavailable,
+            "jobs are not run here",
+        ))
+    }
     async fn jobs_get(&self, _cx: &CallContext, _id: &str) -> Result<JobStatus, HostError> {
         Err(HostError::new(
             ErrorKind::Unavailable,
@@ -325,13 +322,4 @@ pub trait Broker: Send + Sync {
     async fn abandoned(&self, cx: &CallContext, intent: &Intent);
     /// Keeps one guest log line, already cut to its bound; a broker may drop it.
     async fn log(&self, _cx: &CallContext, _level: &str, _message: &str) {}
-}
-
-impl HostError {
-    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
 }

@@ -5,89 +5,38 @@
 
 // Nothing is queued.
 
+use aruna_drivers::driver::drive;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
+use aruna_core::jobs::ByteStream;
+use aruna_core::member_read::{MemberBody, MemberMethod};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::blob::{BucketInfo, CONTENT_TYPE_KEY, UserAccess};
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::delegation::{COPY_CONTEXT_HEADER, CopyContext};
-use aruna_core::structs::storage::distribution::{DistributionBinding, ReadRoute, RouteError};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 use aruna_core::structs::storage::origin::{OriginVersion, VersionOrigin};
-use aruna_operations::distribution::guard::{read_coordinator, route_read};
-use aruna_operations::s3::object::copy::{CopySourceConditions, read_copy_source, source_origin};
-use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult, ObjectRangeRequest};
-use futures_util::TryStreamExt;
-use http::Method;
+use aruna_operations::s3::object::get::{GetObjectInput, GetObjectResult};
+use aruna_operations::s3::object::member::write::CopyPath;
+use aruna_operations::s3::object::member::write::{
+    CopyPathError, CopyPathOperation, answered_metadata, answered_policies, copy_headers,
+    source_read,
+};
+use aruna_operations::transfer::copy::{CopySourceConditions, ReadCopyOperation, source_origin};
 use s3s::dto::{
-    CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, StreamingBlob, Timestamp,
-    TimestampFormat, UploadPartCopyOutput,
+    CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, Timestamp, TimestampFormat,
+    UploadPartCopyOutput,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 
-use super::{Forward, ForwardBody, ForwardRequest, answer_text, header, xml_field};
+use super::{header, passed_headers, xml_field};
 use crate::s3::error::{IntoS3Error, guard_error};
 use crate::s3::service::ArunaS3Service;
-
-/// How a copy reaches the coordinator of its destination key.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::s3::service) enum CopyPath {
-    /// This member keeps the source and streams it as a forwarded write.
-    Stream,
-    /// The coordinator keeps the source's records and copies itself.
-    Delegate,
-    /// Only another member keeps the source: this member reads it through that holder.
-    Relay(Forward),
-}
-
-/// The copy conditions of the source as the holder's own read sees them.
-const COPY_CONDITIONS: &[(&str, &str)] = &[
-    ("x-amz-copy-source-if-match", "if-match"),
-    ("x-amz-copy-source-if-none-match", "if-none-match"),
-    ("x-amz-copy-source-if-modified-since", "if-modified-since"),
-    (
-        "x-amz-copy-source-if-unmodified-since",
-        "if-unmodified-since",
-    ),
-    ("x-amz-copy-source-range", "range"),
-];
-
-/// The holder's read of a copy source, as a copy request names it.
-fn source_read(
-    (bucket, key, version_id): (&str, &str, Option<ulid::Ulid>),
-    headers: &http::HeaderMap,
-) -> ForwardRequest {
-    let headers = (COPY_CONDITIONS.iter())
-        .filter_map(|(from, to)| {
-            let value = headers.get(*from)?.to_str().ok()?;
-            Some((to.to_string(), value.to_string()))
-        })
-        .collect();
-    ForwardRequest {
-        method: Method::GET,
-        operation: "GetObject",
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        query: version_id.map(|version_id| format!("versionId={version_id}")),
-        headers,
-        body: ForwardBody::Empty,
-    }
-}
-
-/// The metadata a holder answered with, as a copy keeps it.
-fn answered_metadata(response: &reqwest::Response) -> HashMap<String, String> {
-    let mut metadata: HashMap<String, String> = (response.headers().iter())
-        .filter_map(|(name, value)| {
-            let name = name.as_str().strip_prefix("x-amz-meta-")?;
-            Some((name.to_string(), value.to_str().ok()?.to_string()))
-        })
-        .collect();
-    if let Some(content_type) = header(response, "content-type") {
-        metadata.insert(CONTENT_TYPE_KEY.to_string(), content_type);
-    }
-    metadata
-}
+use aruna_operations::s3::object::member::read::{
+    MemberPayload as ForwardBody, MemberRequest as ForwardRequest, MemberTarget as Forward,
+};
 
 /// The source a member streams: one whole version, or one byte range for a part.
 pub(in crate::s3::service) struct CopySource<'a> {
@@ -116,20 +65,6 @@ fn source_elsewhere(set_id: ulid::Ulid, holders: &[NodeId]) -> S3Error {
     error
 }
 
-/// The headers that store a streamed copy with the metadata it keeps.
-fn copy_headers(metadata: &HashMap<String, String>, length: u64) -> Vec<(String, String)> {
-    let mut headers = vec![("content-length".to_string(), length.to_string())];
-    for (name, value) in metadata {
-        match name.as_str() {
-            CONTENT_TYPE_KEY => headers.push(("content-type".to_string(), value.clone())),
-            // Internal tags of the source stay with the source.
-            name if name.starts_with("aruna") => {}
-            name => headers.push((format!("x-amz-meta-{name}"), value.clone())),
-        }
-    }
-    headers
-}
-
 /// The header that carries what a streamed copy keeps of its source; none for a plain source.
 fn context_header(context: &CopyContext) -> S3Result<Option<(String, String)>> {
     if *context == CopyContext::default() {
@@ -141,15 +76,11 @@ fn context_header(context: &CopyContext) -> S3Result<Option<(String, String)>> {
 }
 
 /// The placement refs a holder answered a copy source read with.
-fn answered_policies(
-    response: &reqwest::Response,
+fn holder_policies(
+    response: &MemberBody,
 ) -> S3Result<Vec<aruna_core::structs::placement::policy::PlacementPolicyRef>> {
-    match header(response, COPY_CONTEXT_HEADER) {
-        Some(value) => CopyContext::decode(&value)
-            .map(|context| context.policies)
-            .map_err(|_| s3_error!(ServiceUnavailable, "The holder named unreadable placement")),
-        None => Ok(Vec::new()),
-    }
+    answered_policies(response)
+        .ok_or_else(|| s3_error!(ServiceUnavailable, "The holder named unreadable placement"))
 }
 
 fn copied_at(text: Option<String>) -> Timestamp {
@@ -162,45 +93,21 @@ fn e_tag(text: Option<String>) -> Option<ETag> {
 }
 
 impl ArunaS3Service {
-    /// Whether this node answers reads of `key` itself: an ordinary bucket, the coordinator of
-    /// the key's range, or for a `pinned` version a caught-up member that keeps its records.
-    async fn keeps_source(
+    /// How a copy reaches its source; `dest` names the destination's coordinator elsewhere.
+    async fn copy_decision(
         &self,
         bucket: &BucketInfo,
-        (key, pinned): (&str, bool),
-    ) -> S3Result<bool> {
+        source: (&str, bool),
+        dest: Option<NodeId>,
+    ) -> S3Result<CopyPath> {
         let Some(binding) = bucket.distribution.as_ref() else {
-            return Ok(true);
+            return Ok(CopyPath::Stream);
         };
-        if !pinned {
-            let coordinator = read_coordinator(self.state.as_ref(), binding, key).await;
-            return coordinator
-                .map(|coordinator| coordinator.is_none())
-                .map_err(|error| guard_error(&error));
-        }
-        match route_read(self.state.as_ref(), binding, key, false).await {
-            Ok(ReadRoute::Local { catching_up }) => Ok(!catching_up),
-            Ok(ReadRoute::Holder { .. }) => Ok(false),
-            Err(error) => Err(guard_error(&error)),
-        }
-    }
-
-    /// The range of the copy source and the nodes that may answer its read: only the
-    /// coordinator for the current version, since a copy may lag behind it.
-    async fn source_holders(
-        &self,
-        binding: &DistributionBinding,
-        (key, pinned): (&str, bool),
-    ) -> S3Result<(ulid::Ulid, Vec<NodeId>)> {
-        let snapshot = self.snapshot(binding).await?;
-        let range = (snapshot.range_for(key))
-            .ok_or_else(|| guard_error(&RouteError::NoRange(binding.set_id).into()))?;
-        let holders = match pinned {
-            true => snapshot.record_holders(range),
-            false => snapshot.list_holder(range).into_iter().collect(),
-        };
-        let holders = holders.into_iter().map(|member| member.node_id).collect();
-        Ok((range.range_id, holders))
+        let decide = CopyPathOperation::new(binding, source, self.node_id, dest);
+        (drive(decide, self.state.as_ref()).await).map_err(|error| match error {
+            CopyPathError::Route(error) => guard_error(&error),
+            CopyPathError::Elsewhere { set_id, holders } => source_elsewhere(set_id, &holders),
+        })
     }
 
     /// Refuses a copy this node writes itself when it does not keep the source.
@@ -209,14 +116,7 @@ impl ArunaS3Service {
         bucket: &BucketInfo,
         source: (&str, bool),
     ) -> S3Result<()> {
-        if self.keeps_source(bucket, source).await? {
-            return Ok(());
-        }
-        let Some(binding) = bucket.distribution.as_ref() else {
-            return Ok(());
-        };
-        let (_, holders) = self.source_holders(binding, source).await?;
-        Err(source_elsewhere(binding.set_id, &holders))
+        self.copy_decision(bucket, source, None).await.map(|_| ())
     }
 
     /// How a copy whose destination `forward` coordinates reaches it.
@@ -226,24 +126,8 @@ impl ArunaS3Service {
         source: (&str, bool),
         forward: &Forward,
     ) -> S3Result<CopyPath> {
-        if self.keeps_source(bucket, source).await? {
-            return Ok(CopyPath::Stream);
-        }
-        let Some(binding) = bucket.distribution.as_ref() else {
-            return Ok(CopyPath::Stream);
-        };
-        let (range_id, holders) = self.source_holders(binding, source).await?;
-        if holders.contains(&forward.node_id) {
-            return Ok(CopyPath::Delegate);
-        }
-        match holders.iter().find(|node_id| **node_id != self.node_id) {
-            Some(node_id) => Ok(CopyPath::Relay(Forward {
-                set_id: binding.set_id,
-                range_id,
-                node_id: *node_id,
-            })),
-            None => Err(source_elsewhere(binding.set_id, &holders)),
-        }
+        self.copy_decision(bucket, source, Some(forward.node_id))
+            .await
     }
 
     /// Reads a copy source through the member that keeps it, under the caller's authority
@@ -254,11 +138,9 @@ impl ArunaS3Service {
         holder: &Forward,
         source: (&str, &str, Option<ulid::Ulid>),
         headers: &http::HeaderMap,
-    ) -> S3Result<reqwest::Response> {
-        match self
-            .forward_read(user, holder, source_read(source, headers))
-            .await
-        {
+    ) -> S3Result<MemberBody> {
+        let request = source_read(source, &passed_headers(headers, None));
+        match self.forward_read(user, holder, request).await {
             Err(error) if error.status_code() == Some(http::StatusCode::NOT_MODIFIED) => Err(
                 s3s::s3_error!(PreconditionFailed, "The copy source changed"),
             ),
@@ -272,18 +154,17 @@ impl ArunaS3Service {
         user: &UserAccess,
         forward: &Forward,
         target: (String, String),
-        read: reqwest::Response,
+        read: MemberBody,
         metadata: Option<HashMap<String, String>>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let version = header(&read, "x-amz-version-id");
-        let length = (header(&read, "content-length").and_then(|value| value.parse().ok()))
-            .ok_or_else(|| s3s::s3_error!(ServiceUnavailable, "The holder named no length"))?;
+        let length = (read
+            .header("content-length")
+            .and_then(|value| value.parse().ok()))
+        .ok_or_else(|| s3s::s3_error!(ServiceUnavailable, "The holder named no length"))?;
         let metadata = metadata.unwrap_or_else(|| answered_metadata(&read));
         // A relayed source is always a distributed version: its global id is the origin.
-        let origin = (version
-            .as_deref()
-            .and_then(|id| ulid::Ulid::from_string(id).ok()))
-        .map(|version_id| VersionOrigin::Copy {
+        let origin = read.version().map(|version_id| VersionOrigin::Copy {
             from: OriginVersion::Global(GlobalId::Version {
                 realm_id: self.realm_id,
                 version_id,
@@ -291,13 +172,12 @@ impl ArunaS3Service {
             job_id: VersionOrigin::copy_job(&user.access_key),
         });
         let context = CopyContext {
-            policies: answered_policies(&read)?,
+            policies: holder_policies(&read)?,
             origin,
         };
         let mut headers = copy_headers(&metadata, length);
         headers.extend(context_header(&context)?);
-        let body = StreamingBlob::wrap(read.bytes_stream().map_err(std::io::Error::other));
-        self.send_copy(user, forward, target, (headers, body), version)
+        self.send_copy(user, forward, target, (headers, read.stream), version)
             .await
     }
 
@@ -307,19 +187,18 @@ impl ArunaS3Service {
         user: &UserAccess,
         forward: &Forward,
         target: (String, String, String),
-        read: reqwest::Response,
+        read: MemberBody,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let version = header(&read, "x-amz-version-id");
         let length = header(&read, "content-length")
             .ok_or_else(|| s3s::s3_error!(ServiceUnavailable, "The holder named no length"))?;
         let context = CopyContext {
-            policies: answered_policies(&read)?,
+            policies: holder_policies(&read)?,
             origin: None,
         };
-        let body = StreamingBlob::wrap(read.bytes_stream().map_err(std::io::Error::other));
         let mut headers = vec![("content-length".to_string(), length)];
         headers.extend(context_header(&context)?);
-        self.send_part(user, forward, target, (headers, body), version)
+        self.send_part(user, forward, target, (headers, read.stream), version)
             .await
     }
 
@@ -328,7 +207,7 @@ impl ArunaS3Service {
     async fn read_copy(
         &self,
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::get::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<GetObjectResult> {
         let input = GetObjectInput {
             bucket: source.name,
@@ -341,7 +220,9 @@ impl ArunaS3Service {
             node_id: self.node_id,
         };
         let restrictions = source.auth.path_restrictions.clone();
-        read_copy_source(&self.state, input, restrictions, source.conditions, token)
+        let conditions = source.conditions;
+        let read = ReadCopyOperation::new(input, restrictions, conditions, token.cloned());
+        drive(read, &self.state)
             .await
             .map_err(IntoS3Error::into_s3_error)
     }
@@ -354,7 +235,7 @@ impl ArunaS3Service {
         (bucket, key): (String, String),
         source: CopySource<'_>,
         metadata: Option<HashMap<String, String>>,
-        token: Option<&aruna_operations::s3::object::get::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let (name, key_of) = (source.name.clone(), source.key.clone());
         let distributed = source.bucket.distribution.is_some();
@@ -370,9 +251,8 @@ impl ArunaS3Service {
             }),
         };
         headers.extend(context_header(&context)?);
-        let body = StreamingBlob::wrap(read.blob);
         let version = version.map(|version| version.to_string());
-        self.send_copy(user, forward, (bucket, key), (headers, body), version)
+        self.send_copy(user, forward, (bucket, key), (headers, read.blob), version)
             .await
     }
 
@@ -382,11 +262,11 @@ impl ArunaS3Service {
         user: &UserAccess,
         forward: &Forward,
         (bucket, key): (String, String),
-        (headers, body): (Vec<(String, String)>, StreamingBlob),
+        (headers, body): (Vec<(String, String)>, ByteStream),
         version: Option<String>,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let request = ForwardRequest {
-            method: Method::PUT,
+            method: MemberMethod::Put,
             operation: "PutObject",
             bucket,
             key,
@@ -420,7 +300,7 @@ impl ArunaS3Service {
         forward: &Forward,
         (bucket, key, query): (String, String, String),
         source: CopySource<'_>,
-        token: Option<&aruna_operations::s3::object::get::TokenRead>,
+        token: Option<&aruna_operations::transfer::read::TokenRead>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let read = self.read_copy(source, token).await?;
         let version = read.resolved_version_id.or(read.version_id);
@@ -432,13 +312,12 @@ impl ArunaS3Service {
             origin: None,
         };
         headers.extend(context_header(&context)?);
-        let body = StreamingBlob::wrap(read.blob);
         let version = version.map(|version| version.to_string());
         self.send_part(
             user,
             forward,
             (bucket, key, query),
-            (headers, body),
+            (headers, read.blob),
             version,
         )
         .await
@@ -450,11 +329,11 @@ impl ArunaS3Service {
         user: &UserAccess,
         forward: &Forward,
         (bucket, key, query): (String, String, String),
-        (headers, body): (Vec<(String, String)>, StreamingBlob),
+        (headers, body): (Vec<(String, String)>, ByteStream),
         version: Option<String>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let request = ForwardRequest {
-            method: Method::PUT,
+            method: MemberMethod::Put,
             operation: "UploadPart",
             bucket,
             key,
@@ -482,11 +361,12 @@ impl ArunaS3Service {
 
     /// The coordinator's answer to a delegated CopyObject.
     pub(in crate::s3::service) async fn delegated_copy(
-        response: reqwest::Response,
+        &self,
+        response: MemberBody,
     ) -> S3Result<S3Response<CopyObjectOutput>> {
         let version_id = header(&response, "x-amz-version-id");
         let source_version = header(&response, "x-amz-copy-source-version-id");
-        let body = answer_text(response).await?;
+        let body = self.answer_text(response).await?;
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: e_tag(xml_field(&body, "ETag")),
@@ -506,10 +386,11 @@ impl ArunaS3Service {
 
     /// The coordinator's answer to a delegated UploadPartCopy.
     pub(in crate::s3::service) async fn delegated_part(
-        response: reqwest::Response,
+        &self,
+        response: MemberBody,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {
         let source_version = header(&response, "x-amz-copy-source-version-id");
-        let body = answer_text(response).await?;
+        let body = self.answer_text(response).await?;
         Ok(S3Response::new(UploadPartCopyOutput {
             copy_part_result: Some(CopyPartResult {
                 e_tag: e_tag(xml_field(&body, "ETag")),
@@ -530,46 +411,6 @@ impl ArunaS3Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn copy_keeps_metadata() {
-        let metadata = HashMap::from([
-            (CONTENT_TYPE_KEY.to_string(), "text/csv".to_string()),
-            ("owner".to_string(), "lab".to_string()),
-            ("aruna.sync.version".to_string(), "x".to_string()),
-        ]);
-        let mut headers = copy_headers(&metadata, 12);
-        headers.sort();
-        assert_eq!(
-            headers,
-            vec![
-                ("content-length".to_string(), "12".to_string()),
-                ("content-type".to_string(), "text/csv".to_string()),
-                ("x-amz-meta-owner".to_string(), "lab".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn read_keeps_conditions() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-amz-copy-source-if-match", "\"abc\"".parse().unwrap());
-        headers.insert("x-amz-copy-source-range", "bytes=0-9".parse().unwrap());
-        headers.insert("authorization", "AWS4-HMAC-SHA256 secret".parse().unwrap());
-        let version = ulid::Ulid::from_bytes([5; 16]);
-        let read = source_read(("spire", "a/b", Some(version)), &headers);
-        assert_eq!(read.operation, "GetObject");
-        assert_eq!(read.query, Some(format!("versionId={version}")));
-        let mut passed = read.headers;
-        passed.sort();
-        assert_eq!(
-            passed,
-            vec![
-                ("if-match".to_string(), "\"abc\"".to_string()),
-                ("range".to_string(), "bytes=0-9".to_string()),
-            ]
-        );
-    }
 
     #[test]
     fn refusal_names_holders() {

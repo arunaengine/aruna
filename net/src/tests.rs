@@ -3,22 +3,24 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::NetConfig;
 
 #[path = "tests_document_sync.rs"]
 pub(crate) mod document_sync_support;
 
 use crate::discovery::{DHT_MAX_SKEW, select_signed_endpoint, validate_endpoint_announcement};
-use crate::eviction::flush_evicted_documents;
+use crate::eviction::{absorb_journal, flush_evicted_documents};
 use crate::test_support::make_secret;
+use aruna_clock::testing::poll_until;
 use aruna_core::events::DhtEntry;
 use aruna_core::structs::identity::realm::{RealmEndpointAnnouncement, endpoint_signing_bytes};
-use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus};
+use aruna_core::structs::info::{ConnectionAddressStatus, PeerConnectionStatus};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 fn make_announcement(
     secret: &iroh::SecretKey,
@@ -109,9 +111,10 @@ impl InboundEventHandler for RecordingEvictedHandler {
 
 async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
     let dir = tempfile::tempdir().expect("eviction service tempdir");
-    let storage =
-        aruna_storage::FjallStorage::open(dir.path().join("storage").to_str().expect("utf-8 path"))
-            .expect("storage opens");
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
+        dir.path().join("storage").to_str().expect("utf-8 path"),
+    )
+    .expect("storage opens");
     let endpoint = Endpoint::builder(presets::Minimal)
         .secret_key(iroh::SecretKey::from_bytes(&[123u8; 32]))
         .relay_mode(iroh::RelayMode::Disabled)
@@ -132,11 +135,33 @@ async fn eviction_test_service() -> (TempDir, Arc<DocumentSyncService>) {
         &[],
         vec![Alpn::DocumentSync.as_bytes().to_vec()],
         ::irokle::net::IrohRuntimeConfig::default(),
-        aruna_storage::FjallPersistPolicy::Buffer,
+        aruna_storage::storage::persistence::FjallPersistPolicy::Buffer,
         RealmId::from_bytes([123u8; 32]),
     )
     .expect("document sync service opens");
     (dir, Arc::new(service))
+}
+
+// A failed startup read of the eviction journal loads nothing, so maintenance reads it again;
+// the later read adds the old entries next to those that arrived meanwhile, once each.
+#[test]
+fn journal_read_retried() {
+    let old = PendingEviction {
+        key: ::irokle::EvictionKey::from_bytes([17; 32]),
+        documents: vec![test_evicted_document(11)],
+    };
+    let arrived = PendingEviction {
+        key: ::irokle::EvictionKey::from_bytes([18; 32]),
+        documents: vec![test_evicted_document(12)],
+    };
+    let mut pending = Vec::new();
+    let failed = Err::<Vec<PendingEviction>, _>("journal read failed");
+    assert!(!absorb_journal(failed, &mut pending));
+    assert!(pending.is_empty());
+    pending.push(arrived.clone());
+    let read = Ok::<_, &str>(vec![old.clone(), arrived.clone()]);
+    assert!(absorb_journal(read, &mut pending));
+    assert_eq!(pending, vec![arrived, old]);
 }
 
 #[tokio::test]
@@ -487,7 +512,7 @@ fn invalid_announcement_timing() {
 #[tokio::test]
 async fn net_handle_creates() -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()
@@ -519,7 +544,7 @@ async fn net_handle_creates() -> Result<()> {
 
 async fn notification_wake_handle() -> Result<(TempDir, NetHandle)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()
@@ -581,14 +606,14 @@ async fn dashboard_wake_arrives() -> Result<()> {
 async fn endpoint_only_unauthorized() -> Result<()> {
     let temp_a = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
     let temp_b = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage_a = aruna_storage::FjallStorage::open(
+    let storage_a = aruna_storage::storage::worker::FjallStorage::open(
         temp_a
             .path()
             .to_str()
             .ok_or_else(|| NetError::Io("Invalid temp path".to_string()))?,
     )
     .map_err(|e| NetError::Io(e.to_string()))?;
-    let storage_b = aruna_storage::FjallStorage::open(
+    let storage_b = aruna_storage::storage::worker::FjallStorage::open(
         temp_b
             .path()
             .to_str()
@@ -667,7 +692,7 @@ impl InboundEventHandler for HoldingInboundHandler {
 
 pub(crate) async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()
@@ -695,15 +720,19 @@ pub(crate) async fn test_net_handle() -> Result<(NetHandle, TempDir)> {
 
 const WAIT_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The first status `done` accepts, or the last one read once the wait timed out.
 async fn wait_for_status(handle: &NetHandle, mut done: impl FnMut(&NetState) -> bool) -> NetState {
-    let deadline = tokio::time::Instant::now() + WAIT_STATUS_TIMEOUT;
-    loop {
+    let mut last = None;
+    let accepted = poll_until(WAIT_STATUS_TIMEOUT, async || {
         let status = handle.get_status().await;
-        if done(&status) || tokio::time::Instant::now() >= deadline {
-            return status;
+        if done(&status) {
+            return Some(status);
         }
-        sleep(Duration::from_millis(20)).await;
-    }
+        last = Some(status);
+        None
+    })
+    .await;
+    accepted.or(last).expect("the wait reads a status")
 }
 
 async fn await_open_connections(handle: &NetHandle, expected: usize) -> NetState {
@@ -788,7 +817,7 @@ async fn config_replaces_peers() -> Result<()> {
     document.ensure_node(
         user_node,
         aruna_core::structs::identity::realm::RealmNodeKind::User {
-            owner: aruna_core::UserId::nil(*handle.realm_id()),
+            owner: aruna_core::user::id::UserId::nil(*handle.realm_id()),
         },
     );
     let expected = unique_peer_nodes(vec![peer_a, peer_b], handle.node_id());
@@ -1144,7 +1173,7 @@ async fn repeat_shutdown_joins() -> Result<()> {
 #[tokio::test]
 async fn peer_warnings() -> Result<()> {
     let temp_dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let storage = aruna_storage::FjallStorage::open(
+    let storage = aruna_storage::storage::worker::FjallStorage::open(
         temp_dir
             .path()
             .to_str()

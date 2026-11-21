@@ -3,32 +3,34 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeSet;
+
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::placement::target_placement_ref;
 use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::reducer::targets::InstallEntry;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, GroupId, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::document_outbox::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::service_account::group_admin_path;
@@ -46,6 +48,34 @@ pub struct InstallEntryConfig {
     pub install: Option<PluginInstall>,
     /// The admin audit row written in the same transaction.
     pub audit: Option<AdminAuditRecord>,
+    /// The groups whose admin rights the caller proved; a resolving deletion over a conflict
+    /// needs every group of its candidates here.
+    pub proven: BTreeSet<GroupId>,
+}
+
+/// Whether a write may go to an install's path as the realm config holds it: a removed path
+/// takes no new record, and a conflict with a deletion resolves only to that deletion, by a
+/// caller who proved admin rights for every candidate's group.
+fn entry_admits(
+    entry: &InstallEntry,
+    writes_record: bool,
+    proven: &BTreeSet<GroupId>,
+) -> Result<(), RecordError> {
+    match entry {
+        InstallEntry::Settled(None) if writes_record => Err(RecordError::Retired),
+        InstallEntry::Conflict { deletion: true, .. } if writes_record => Err(RecordError::Retired),
+        InstallEntry::Conflict {
+            deletion: true,
+            installs,
+        } => match installs
+            .iter()
+            .all(|install| proven.contains(&install.group_id))
+        {
+            true => Ok(()),
+            false => Err(RecordError::Unproven),
+        },
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -68,47 +98,44 @@ pub enum RecordError {
     Mismatch,
     #[error("the node that runs an install cannot change")]
     ReceiverChanged,
-    #[error("missing active transaction")]
-    MissingTransaction,
-    #[error("operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error("this install was removed; install again, which mints a new id")]
+    Retired,
+    #[error("the install changed meanwhile: a candidate of another group appeared")]
+    Unproven,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum RecordState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteState { stale: Vec<(KeySpace, Key)> },
-    DeleteConflicts,
-    CommitTransaction,
-    ScheduleSyncDrain,
-    Finish,
-    Error,
+/// A lost transaction stays a storage conflict, so callers can tell it from other failures.
+impl From<IoError> for RecordError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
 }
 
 #[derive(Debug, PartialEq)]
+enum Phase {
+    Auth,
+    Read,
+    Write { stale: Vec<(KeySpace, Key)> },
+    DeleteConflicts,
+}
+
+/// Checks the caller's group admin right, then reads, checks and writes the record in one
+/// transaction, and wakes the outbox drain after the commit.
+#[derive(Debug, PartialEq)]
 pub struct InstallEntryOperation {
     config: InstallEntryConfig,
-    txn_id: Option<TxnId>,
-    state: RecordState,
-    output: Option<Result<Option<PluginInstall>, RecordError>>,
+    phase: Phase,
+    ids: IdMint,
+    now_ms: u64,
 }
 
 impl InstallEntryOperation {
     pub fn new(config: InstallEntryConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            state: RecordState::Init,
-            output: None,
+            phase: Phase::Auth,
+            ids: IdMint::default(),
+            now_ms: 0,
         }
     }
 
@@ -124,23 +151,19 @@ impl InstallEntryOperation {
         }
     }
 
-    fn emit_read(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = RecordState::ReadCurrent;
+    fn read(&mut self) -> IoCall {
+        self.phase = Phase::Read;
         let document = self.document();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key()
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&self.admin_target())
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&self.admin_target()),
+            ),
+        ])
     }
 
     /// Whether the new record keeps this install's id and group and raises the revision by one.
@@ -153,12 +176,31 @@ impl InstallEntryOperation {
         })
     }
 
-    fn emit_write(
+    fn authorized(&mut self, result: IoResult) -> Result<IoCall, RecordError> {
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => Ok(self.read()),
+            Ok(false) => Err(RecordError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(%error, "Plugin install authorization check failed");
+                Err(RecordError::Unauthorized)
+            }
+        }
+    }
+
+    /// The record as written; the outbox drain wakes once the write committed.
+    fn finish(&self) -> Next<Option<PluginInstall>> {
+        Next::Then {
+            output: self.config.install.clone(),
+            calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
+        }
+    }
+
+    fn write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, RecordError> {
-        let txn_id = self.txn_id.ok_or(RecordError::MissingTransaction)?;
+    ) -> Result<IoCall, RecordError> {
         let document_value = document_value.ok_or(RecordError::ConfigMissing)?;
         let mut document = RealmConfigDocument::from_bytes(&document_value)?;
         if !is_management(&document, self.config.actor.node_id) {
@@ -177,6 +219,8 @@ impl InstallEntryOperation {
         let mut reducer_state = previous
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
+        let entry = reducer_state.install_entry(&self.config.install_id);
+        entry_admits(&entry, self.config.install.is_some(), &self.config.proven)?;
         let current = (reducer_state.materialized_installs().into_iter())
             .find(|install| install.install_id == self.config.install_id);
         if current
@@ -198,7 +242,11 @@ impl InstallEntryOperation {
             install_id: self.config.install_id,
             install: self.config.install.clone().map(Box::new),
         };
-        let event = reducer_state.apply_operation(&self.config.actor, operation)?;
+        let event = reducer_state.apply_operation(
+            &self.config.actor,
+            operation,
+            self.ids.mint(self.now_ms),
+        )?;
         document.installs = reducer_state.materialized_installs();
         let document_target = self.document();
         let placement = target_placement_ref(&document, &document_target, Default::default());
@@ -224,78 +272,10 @@ impl InstallEntryOperation {
         if let Some(audit) = &self.config.audit {
             writes.extend(audit.entries()?);
         }
-        self.output = Some(Ok(self.config.install.clone()));
-        self.state = RecordState::WriteState {
+        self.phase = Phase::Write {
             stale: stale_conflict_deletes(previous.as_ref(), Some(&reducer_state)),
         };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn emit_commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(RecordError::MissingTransaction);
-        };
-        self.state = RecordState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: RecordError) -> Effects {
-        let cleanup = self.abort();
-        self.state = RecordState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
-    }
-
-    fn handle_auth(&mut self, event: Event) -> Effects {
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected("authorization result", format!("{event:?}"));
-        };
-        match allowed {
-            Ok(true) => {
-                self.state = RecordState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
-            Ok(false) => self.fail(RecordError::Unauthorized),
-            Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
-            Err(error) => {
-                warn!(%error, "Plugin install authorization check failed");
-                self.fail(RecordError::Unauthorized)
-            }
-        }
-    }
-
-    fn handle_written(&mut self, event: Event, stale: Vec<(KeySpace, Key)>) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) if stale.is_empty() => {
-                self.emit_commit()
-            }
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                let Some(txn_id) = self.txn_id else {
-                    return self.fail(RecordError::MissingTransaction);
-                };
-                self.state = RecordState::DeleteConflicts;
-                smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                    deletes: stale,
-                    txn_id: Some(txn_id),
-                })]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-            other => self.unexpected("storage batch write result", format!("{other:?}")),
-        }
+        Ok(IoCall::Write(writes))
     }
 }
 
@@ -303,95 +283,94 @@ impl Operation for InstallEntryOperation {
     type Output = Option<PluginInstall>;
     type Error = RecordError;
 
-    fn start(&mut self) -> Effects {
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, RecordError> {
         if self.config.auth_context.realm_id != self.config.actor.realm_id || !self.matches() {
-            return self.fail(RecordError::Mismatch);
+            return Err(RecordError::Mismatch);
         }
-        self.state = RecordState::Auth;
         let realm_id = self.config.actor.realm_id;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: group_admin_path(realm_id, self.config.group_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path: group_admin_path(realm_id, self.config.group_id),
+            required_permission: Permission::WRITE,
+        });
+        Ok(Next::Call(IoCall::child(check)))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
-            RecordState::Auth => self.handle_auth(event),
-            RecordState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read(txn_id)
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, RecordError> {
+        match std::mem::replace(&mut self.phase, Phase::DeleteConflicts) {
+            Phase::Auth => Ok(Next::Call(self.authorized(result)?)),
+            Phase::Read => {
+                let [document, state] = values::<2>(result)?;
+                Ok(Next::Call(self.write(document, state)?))
+            }
+            Phase::Write { stale } => {
+                result.done()?;
+                match stale.is_empty() {
+                    true => Ok(self.finish()),
+                    false => Ok(Next::Call(IoCall::Delete(stale))),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start result", format!("{other:?}")),
-            },
-            RecordState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document), (_, state)] = values.as_slice() else {
-                        return self
-                            .unexpected("realm config and reducer state", format!("{values:?}"));
-                    };
-                    match self.emit_write(document.clone(), state.clone()) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch read result", format!("{other:?}")),
-            },
-            RecordState::WriteState { stale } => self.handle_written(event, stale),
-            RecordState::DeleteConflicts => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.emit_commit(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("storage batch delete result", format!("{other:?}")),
-            },
-            RecordState::CommitTransaction => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = RecordState::ScheduleSyncDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected("transaction commit result", format!("{other:?}")),
-            },
-            RecordState::ScheduleSyncDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = RecordState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule the outbox drain; the durable outbox stays retryable");
-                    self.state = RecordState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected("outbox drain timer schedule", format!("{other:?}")),
-            },
-            RecordState::Finish | RecordState::Error | RecordState::Init => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RecordState::Finish | RecordState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(RecordError::NotFinished);
-        }
-        self.output.unwrap_or(Err(RecordError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+            }
+            Phase::DeleteConflicts => {
+                result.done()?;
+                Ok(self.finish())
+            }
         }
     }
 }
+
+/// Reads the realm config's entry at an install's path, deletions and conflicts included.
+#[derive(Debug, PartialEq)]
+pub struct ReadEntry {
+    realm_id: RealmId,
+    install_id: Ulid,
+}
+
+impl ReadEntry {
+    pub fn new(realm_id: RealmId, install_id: Ulid) -> Self {
+        Self {
+            realm_id,
+            install_id,
+        }
+    }
+}
+
+impl Operation for ReadEntry {
+    type Output = InstallEntry;
+    type Error = RecordError;
+
+    fn first(&mut self) -> Result<Next<InstallEntry>, RecordError> {
+        let target = AdminDocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
+        let key = reducer_state_key(&target);
+        Ok(Next::Call(IoCall::Read(vec![(
+            DOCUMENT_STATE_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<InstallEntry>, RecordError> {
+        let [state] = values::<1>(result)?;
+        let Some(state) = state else {
+            return Ok(Next::Done(InstallEntry::Absent));
+        };
+        let state = decode_reducer_state(state.as_ref()).map_err(ConversionError::from)?;
+        Ok(Next::Done(state.install_entry(&self.install_id)))
+    }
+}
+
+#[cfg(test)]
+#[path = "records_tests.rs"]
+mod tests;

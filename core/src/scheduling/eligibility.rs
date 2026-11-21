@@ -2,11 +2,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::compute::NetworkAccess;
+use crate::compute::backend::{Suitability, WorkloadSuitability};
+use crate::compute::{ExecutorKind, NetworkAccess};
 use crate::scheduling::inputs::{PlanRequest, TargetCandidate};
 use crate::structs::placement::policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, evaluate_placement,
 };
+use crate::types::GroupId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -38,6 +40,14 @@ pub enum RejectionVerdict {
     NoLegalSource {
         destination_key: String,
     },
+    /// The backend refuses this workload kind.
+    Unsuitable,
+    /// The declared walltime exceeds the backend's maximum.
+    WalltimeLimit,
+    /// The backend's allow-list does not name the job's group.
+    GroupNotAllowed,
+    /// The request names another backend.
+    BackendName,
 }
 
 /// Bounded, serializable projection of a [`PlacementDecision`] for audit.
@@ -88,8 +98,46 @@ impl RejectionVerdict {
             RejectionVerdict::NoLegalSource { destination_key } => {
                 format!("no legal source for input {destination_key}")
             }
+            RejectionVerdict::Unsuitable => "the backend refuses this kind of work".to_string(),
+            RejectionVerdict::WalltimeLimit => "walltime above the backend maximum".to_string(),
+            RejectionVerdict::GroupNotAllowed => {
+                "the backend does not serve this group".to_string()
+            }
+            RejectionVerdict::BackendName => "no backend of that name".to_string(),
         }
     }
+}
+
+/// Whether a backend of `kind` hosts a session on `network`. A session kept off the open
+/// network needs the session channel; a Docker backend without one runs on a remote daemon,
+/// which has no session bridge for any session.
+pub fn hosts_session(kind: &str, session: bool, network: NetworkAccess) -> bool {
+    session
+        || (network == NetworkAccess::Open && ExecutorKind::from_wire(kind) != ExecutorKind::Docker)
+}
+
+/// Why a backend's operator settings exclude a run: an allow-list without its group, a declared
+/// walltime above its maximum, or a workload kind it refuses (batch and sessions exist). Taking
+/// the settings directly lets a device without a placement subject select by the same rule.
+pub fn backend_verdict(
+    groups: &[GroupId],
+    max_walltime_ms: Option<u64>,
+    suitability: &WorkloadSuitability,
+    group_id: GroupId,
+    session: bool,
+    walltime_ms: u64,
+) -> Option<RejectionVerdict> {
+    if !groups.is_empty() && !groups.contains(&group_id) {
+        return Some(RejectionVerdict::GroupNotAllowed);
+    }
+    if max_walltime_ms.is_some_and(|max| walltime_ms > max) {
+        return Some(RejectionVerdict::WalltimeLimit);
+    }
+    let suitability = match session {
+        true => suitability.sessions,
+        false => suitability.batch,
+    };
+    (suitability == Suitability::Refused).then_some(RejectionVerdict::Unsuitable)
 }
 
 /// Every hard filter except data-source availability, which needs the routed
@@ -118,13 +166,28 @@ pub fn screen(request: &PlanRequest, candidate: &TargetCandidate) -> Option<Reje
     {
         return Some(RejectionVerdict::ExecutorKind);
     }
+    if let Some(name) = request.backend.as_deref()
+        && name.trim() != candidate.capability.backend
+    {
+        return Some(RejectionVerdict::BackendName);
+    }
     if !candidate.capability.supports(request.staging) {
         return Some(RejectionVerdict::Staging);
     }
-    // An open-network session reaches S3 like any other traffic, so only a
-    // session that must be kept to S3 asks the backend for the capability.
-    if request.session && request.network != NetworkAccess::Open && !candidate.capability.session {
+    let capability = &candidate.capability;
+    if request.session && !hosts_session(&capability.kind, capability.session, request.network) {
         return Some(RejectionVerdict::Session);
+    }
+    let walltime_ms = request.resources.max_walltime_ms;
+    if let Some(verdict) = backend_verdict(
+        &capability.groups,
+        capability.max_walltime_ms,
+        &capability.suitability,
+        request.group_id,
+        request.session,
+        walltime_ms,
+    ) {
+        return Some(verdict);
     }
     if !labels_match(request, &candidate.capability.subject) {
         return Some(RejectionVerdict::RequiredLabels);

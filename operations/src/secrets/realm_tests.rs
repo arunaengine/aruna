@@ -3,25 +3,17 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
 use crate::secrets::tests::{create, name, token};
-use aruna_core::UserId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::secrets::SecretFields;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::path_context;
 use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
-
-fn context(root: &str) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
-}
 
 fn actor() -> Actor {
     let realm_id = RealmId::from_bytes([1u8; 32]);
@@ -86,7 +78,7 @@ fn opened(config: &RealmConfigDocument) -> Vec<SecretFields> {
 #[tokio::test]
 async fn value_follows_record() {
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     seed(&ctx, RealmNodeKind::Management).await;
 
     let created = run(&ctx, create(), 10).await.unwrap().unwrap();
@@ -118,13 +110,13 @@ async fn value_follows_record() {
 #[tokio::test]
 async fn refusals_write_nothing() {
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     seed(&ctx, RealmNodeKind::Server).await;
     let refused = run(&ctx, create(), 10).await;
     assert_eq!(refused, Err(RealmSecretError::NotManagementNode));
 
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     seed(&ctx, RealmNodeKind::Management).await;
     let created = run(&ctx, create(), 10).await.unwrap().unwrap();
     let stale = SecretChange::Replace {
@@ -150,7 +142,7 @@ async fn early_value_kept() {
     use aruna_core::reducer::AdminDocumentState;
     use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     seed(&ctx, RealmNodeKind::Management).await;
     let other = Actor {
         node_id: iroh::SecretKey::from_bytes(&[8; 32]).public(),
@@ -173,7 +165,9 @@ async fn early_value_kept() {
             entry: reference.entry,
             record: Some(record),
         };
-        let value = on_a.apply_operation(&other, vault).unwrap();
+        let value = on_a
+            .apply_operation(&other, vault, ulid::Ulid::generate())
+            .unwrap();
         let SecretChange::Create { name, kind, .. } = crate::secrets::tests::create() else {
             unreachable!("create() builds a create change");
         };
@@ -197,6 +191,7 @@ async fn early_value_kept() {
                 name,
                 info: Some(info),
             },
+            ulid::Ulid::generate(),
         );
         (value, named.unwrap())
     };
@@ -245,7 +240,7 @@ async fn widening_notifies_admins() {
     use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, UseRule};
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
     let dir = tempdir().unwrap();
-    let ctx = context(dir.path().to_str().unwrap());
+    let ctx = path_context(dir.path().to_str().unwrap());
     seed(&ctx, RealmNodeKind::Management).await;
     let mut auth = RealmAuthorizationDocument::default_realm_doc(actor().realm_id);
     for role in auth

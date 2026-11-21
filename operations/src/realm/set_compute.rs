@@ -4,34 +4,35 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, CONFIG_COMPUTE_PATH};
+use aruna_core::events::Event;
+use aruna_core::id_mint::IdMint;
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::reducer::paths::CONFIG_COMPUTE_PATH;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::compute_config::RealmComputeConfig;
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::document_outbox::{
+use crate::realm::write_stage::{WriteStage, WriteStep};
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
+use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetComputeConfig {
     pub actor: Actor,
@@ -42,36 +43,12 @@ pub struct SetComputeConfig {
     pub compute: RealmComputeConfig,
 }
 
+/// Checks the caller's config permission, then writes the change in a write transaction that
+/// reruns after a lost conflict, since a background config write can win its commit.
 #[derive(Debug, PartialEq)]
 pub struct SetComputeOperation {
-    config: SetComputeConfig,
-    txn_id: Option<TxnId>,
-    attempts: usize,
-    state: SetComputeState,
-    output: Option<Result<RealmConfigDocument, SetComputeError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SetComputeState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
-    Finish,
-    Error,
+    config: Arc<SetComputeConfig>,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -90,26 +67,105 @@ pub enum SetComputeError {
     NotManagementNode,
     #[error("invalid compute configuration: {reason}")]
     InvalidCompute { reason: String },
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
+}
+
+impl From<IoError> for SetComputeError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SetCompute".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 impl SetComputeOperation {
     pub fn new(config: SetComputeConfig) -> Self {
         Self {
+            config: Arc::new(config),
+            authorized: false,
+        }
+    }
+
+    fn change(&self) -> IoCall {
+        let config = Arc::clone(&self.config);
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || ComputeWrite::new(Arc::clone(&config));
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
+
+impl Operation for SetComputeOperation {
+    type Output = RealmConfigDocument;
+    type Error = SetComputeError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, SetComputeError> {
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return Err(SetComputeError::Unauthorized);
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetComputeError> {
+        if self.authorized {
+            return result
+                .child::<RealmConfigDocument, SetComputeError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                Ok(Next::Call(self.change()))
+            }
+            Ok(false) => Err(SetComputeError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(error = %error, "Realm compute authorization check failed");
+                Err(SetComputeError::Unauthorized)
+            }
+        }
+    }
+}
+
+/// Reads the realm config and its admin state, then stores the change and its queued admin
+/// events in one write transaction.
+#[derive(Debug, PartialEq)]
+struct ComputeWrite {
+    config: Arc<SetComputeConfig>,
+    write: WriteStage,
+    document: Option<RealmConfigDocument>,
+}
+
+impl ComputeWrite {
+    fn new(config: Arc<SetComputeConfig>) -> Self {
+        Self {
             config,
-            txn_id: None,
-            attempts: 0,
-            state: SetComputeState::Init,
-            output: None,
+            write: WriteStage::default(),
+            document: None,
         }
     }
 
@@ -125,34 +181,11 @@ impl SetComputeOperation {
         }
     }
 
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = SetComputeState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, SetComputeError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(SetComputeError::MissingTransaction);
-        };
+    ) -> Result<Next<RealmConfigDocument>, SetComputeError> {
         self.config
             .compute
             .validate()
@@ -191,6 +224,7 @@ impl SetComputeOperation {
             AdminDocumentOperation::ConfigComputeSet {
                 compute: self.config.compute.clone(),
             },
+            self.write.ids.mint(self.write.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated compute conflict outcomes equal.
         apply_reducer_compute(&mut document, &reducer_state);
@@ -219,194 +253,49 @@ impl SetComputeOperation {
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = SetComputeState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document.clone());
+        self.write.written(stale_conflict_deletes, false);
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetComputeError::MissingTransaction);
-        };
-        self.state = SetComputeState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    /// Opens a transaction that reads, validates and applies the change from the start.
-    fn start_transaction(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = SetComputeState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn fail(&mut self, error: SetComputeError) -> Effects {
-        let cleanup = self.abort();
-        self.state = SetComputeState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(SetComputeError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<RealmConfigDocument>, SetComputeError> {
+        let output = self.document.take().ok_or(SetComputeError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl Operation for SetComputeOperation {
+impl Operation for ComputeWrite {
     type Output = RealmConfigDocument;
     type Error = SetComputeError;
 
-    fn start(&mut self) -> Effects {
-        if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetComputeError::Unauthorized);
-        }
-        self.state = SetComputeState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: policy_admin_path(self.config.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn seed(&mut self, entropy: u128) {
+        self.write.ids = IdMint::new(entropy);
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
-            SetComputeState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => self.start_transaction(),
-                        Ok(false) => self.fail(SetComputeError::Unauthorized),
-                        Err(error) => {
-                            warn!(error = %error, "Realm compute authorization check failed");
-                            match error {
-                                AuthorizationError::StorageError(error) => {
-                                    self.fail(SetComputeError::StorageError(error))
-                                }
-                                _ => self.fail(SetComputeError::Unauthorized),
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
-            },
-            SetComputeState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            SetComputeState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
-                        );
-                    };
-                    match self
-                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
-            },
-            SetComputeState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetComputeError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetComputeState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
-                    }
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            SetComputeState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
-            SetComputeState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetComputeState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) if self.attempts < COMMIT_ATTEMPTS => {
-                    self.txn_id = None;
-                    self.start_transaction()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            SetComputeState::ScheduleSyncDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetComputeState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetComputeState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
-            },
-            SetComputeState::Finish | SetComputeState::Error | SetComputeState::Init => {
-                smallvec![]
-            }
-        }
+    fn stamp(&mut self, now_ms: u64) {
+        self.write.now_ms = now_ms;
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SetComputeState::Finish | SetComputeState::Error)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SetComputeError::NotFinished))
+    fn conflict_retries() -> u32 {
+        COMMIT_ATTEMPTS as u32 - 1
     }
 
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn first(&mut self) -> Result<Next<Self::Output>, SetComputeError> {
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetComputeError> {
+        match self.write.step(result)? {
+            WriteStep::Read([document, reducer]) => self.emit_document_write(document, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }
@@ -424,30 +313,20 @@ fn apply_reducer_compute(document: &mut RealmConfigDocument, reducer_state: &Adm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetConfigOperation;
-    use aruna_core::UserId;
+    use crate::document_repository::GetConfigOperation;
     use aruna_core::compute::quota::ComputeQuota;
-    use aruna_core::document::DocumentTarget;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,
     };
     use aruna_core::structs::placement::compute_config::{GroupComputeQuota, LocationLink};
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn context(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
 
     fn actor(realm_id: RealmId) -> Actor {
         Actor {
@@ -458,12 +337,7 @@ mod tests {
     }
 
     fn auth(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn compute_config(actor: &Actor, compute: RealmComputeConfig) -> SetComputeConfig {
@@ -477,23 +351,7 @@ mod tests {
     /// The realm admin role only grants what the operation checks, so the
     /// permission sub-operation decides on stored rules like production does.
     async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
-        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
-        for role in document.roles.values_mut() {
-            role.assigned_users.insert(actor.user_id);
-        }
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: (*actor.realm_id.as_bytes()).into(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_realm_admin(ctx, actor).await;
     }
 
     fn management_config(realm_id: RealmId, actor: &Actor) -> RealmConfigDocument {
@@ -503,22 +361,7 @@ mod tests {
     }
 
     async fn seed(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: actor.realm_id,
-        };
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_config(ctx, actor, document).await;
     }
 
     fn configured() -> RealmComputeConfig {
@@ -544,7 +387,7 @@ mod tests {
         // The mutation must survive as the document a later read resolves, or
         // the planner and the quota gate would keep deciding on stale values.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -576,7 +419,7 @@ mod tests {
         // A zero bandwidth would make one transfer estimate infinite, so the
         // mutation is refused instead of clamped.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -603,7 +446,7 @@ mod tests {
     async fn refuses_unauthorized_caller() {
         // Nothing is written when the caller holds no realm-config write.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2u8; 32]);
         let actor = actor(realm_id);
         seed(&ctx, &actor, &management_config(realm_id, &actor)).await;
@@ -642,7 +485,7 @@ mod tests {
         // A realm admin token still may not write the config on a server node:
         // peers reject a realm-config event whose origin is not management.
         let dir = tempdir().unwrap();
-        let ctx = context(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let actor = actor(realm_id);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -664,83 +507,52 @@ mod tests {
         assert_eq!(reread.compute, RealmComputeConfig::default());
     }
 
-    #[test]
-    fn start_checks_permission() {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let actor = actor(realm_id);
+    fn checked(
+        allowed: Result<bool, AuthorizationError>,
+    ) -> Result<Next<RealmConfigDocument>, SetComputeError> {
+        let actor = actor(RealmId::from_bytes([1u8; 32]));
         let mut operation =
             SetComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
-        let effects = operation.start();
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let emitted = format!("{effects:?}");
-        assert!(emitted.contains(&policy_admin_path(realm_id)));
-        assert!(emitted.contains("WRITE"));
-    }
-
-    #[test]
-    fn retry_rereads_config() {
-        // A commit lost to a background config write reads again and keeps that write.
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let actor = actor(realm_id);
-        let first = management_config(realm_id, &actor);
-        let mut operation = SetComputeOperation::new(compute_config(&actor, configured()));
-        let written =
-            crate::realm::commit_retry::conflict_then_commit(&mut operation, &actor, &first);
-        assert_eq!(written.compute, configured());
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        operation.next(IoResult::Child(ChildOutcome::new(allowed)))
     }
 
     #[test]
     fn denied_is_terminal() {
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let actor = actor(realm_id);
-        let mut operation =
-            SetComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(SetComputeError::Unauthorized));
+        assert_eq!(checked(Ok(false)), Err(SetComputeError::Unauthorized));
     }
 
     #[test]
     fn capacity_not_denied() {
         // Storage exhaustion inside the check is infrastructure, not a verdict.
-        let realm_id = RealmId::from_bytes([1u8; 32]);
-        let actor = actor(realm_id);
-        let mut operation =
-            SetComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult {
-                allowed: Err(AuthorizationError::StorageError(
-                    StorageError::CleanupCapacity,
-                )),
-            },
-        ));
-        assert!(operation.is_complete());
+        let capacity = AuthorizationError::StorageError(StorageError::CleanupCapacity);
         assert_eq!(
-            operation.finalize(),
+            checked(Err(capacity)),
             Err(SetComputeError::StorageError(StorageError::CleanupCapacity))
         );
     }
 
     #[test]
-    fn allowed_starts_transaction() {
+    fn allowed_runs_write() {
+        // The change runs as a write child that reruns from its read after a lost commit.
+        assert!(matches!(
+            checked(Ok(true)),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        crate::realm::commit_retry::retries_conflicts::<ComputeWrite>();
+    }
+
+    #[test]
+    fn write_stores_compute() {
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let actor = actor(realm_id);
-        let mut operation =
-            SetComputeOperation::new(compute_config(&actor, RealmComputeConfig::default()));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        );
+        let config = management_config(realm_id, &actor);
+        let mut write = ComputeWrite::new(Arc::new(compute_config(&actor, configured())));
+        let (written, output) = crate::realm::commit_retry::write_once(&mut write, &actor, &config);
+        assert_eq!(written.compute, configured());
+        assert_eq!(output, written);
     }
 }

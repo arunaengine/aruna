@@ -6,43 +6,45 @@
 // That transaction holds the signed revision, the accepted request and the outbox row.
 // Only committed revisions are published.
 
-use aruna_core::NodeId;
 use aruna_core::admin_documents::{
     AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
 };
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, SnapshotSignEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{Event, NetEvent, SnapshotSignEvent};
+use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     CATCH_UP_KEYSPACE, DISTRIBUTION_ACCEPT_KEYSPACE, DISTRIBUTION_KEYSPACE,
     DISTRIBUTION_LIFECYCLE_KEYSPACE, DISTRIBUTION_PUBLISHER_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
     NODE_STATS_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminApplyStatus, AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{reducer_state_entry, reducer_state_key};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::group_admin_path;
-use aruna_core::structs::storage::distribution::snapshot::SnapshotClaim;
-use aruna_core::structs::storage::distribution::{
-    DistributionError, DistributionRequest, DistributionRevision, DistributionSnapshot,
-    DistributionView, SetPhase, SignedSnapshot, next_snapshot, publisher_key,
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot, SnapshotClaim,
 };
+use aruna_core::structs::storage::distribution::validate::DistributionError;
+use aruna_core::structs::storage::distribution::{DistributionRevision, SetPhase, publisher_key};
 use aruna_core::structs::storage::usage::dirty_share_key;
-use aruna_core::types::{Effects, TxnId, Value};
-use aruna_core::{TaskEvent, UserId};
+use aruna_core::user::id::UserId;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
-use crate::sync::document_outbox::{
+use crate::auth::check_permissions::CheckPermissionsConfig;
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
 const EVENT_DOMAIN: &[u8] = b"aruna-distribution-event-v1";
 
@@ -85,24 +87,26 @@ pub enum PublishError {
     SignUnavailable(String),
     #[error("operation did not finish")]
     NotFinished,
-    #[error("unexpected event in state {state}: got {got}")]
-    UnexpectedEvent { state: &'static str, got: String },
+    #[error("unexpected answer to the signing request: {0}")]
+    UnexpectedEvent(&'static str),
 }
 
+impl From<IoError> for PublishError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+/// What the pending call of a publication answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishState {
-    Init,
-    StartTransaction,
     ReadState,
     Authorize,
     Sign,
     Write,
-    Commit,
-    Drain,
-    Replay,
-    Finish,
-    Error,
 }
+
+type PublishNext = Result<Next<DistributionRevision>, PublishError>;
 
 /// What the read phase found in the publisher's own storage.
 #[derive(Debug, Default, PartialEq)]
@@ -116,12 +120,16 @@ struct Stored {
 pub struct PublishOperation {
     config: PublishConfig,
     state: PublishState,
-    txn_id: Option<TxnId>,
     stored: Stored,
     next: Option<DistributionSnapshot>,
     /// The head revision an already applied activation answers with.
     current: Option<DistributionRevision>,
-    output: Option<Result<DistributionRevision, PublishError>>,
+    /// The admin check whose rows the acceptance transaction reads.
+    check: Option<CheckPermissionsConfig>,
+    /// The revision the commit publishes.
+    revision: Option<DistributionRevision>,
+    now_ms: u64,
+    mint: IdMint,
 }
 
 /// What the publisher keeps per accepted request, so a retry replays only the same request.
@@ -134,7 +142,7 @@ pub struct AcceptedRequest {
 }
 
 /// The key of an accepted request: set id then request id.
-pub fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
+fn accept_key(set_id: Ulid, request_id: Ulid) -> Vec<u8> {
     let mut key = set_id.to_bytes().to_vec();
     key.extend_from_slice(&request_id.to_bytes());
     key
@@ -154,13 +162,15 @@ fn revision_event(set_id: Ulid, number: u64) -> Ulid {
 impl PublishOperation {
     pub fn new(config: PublishConfig) -> Self {
         Self {
+            now_ms: 0,
+            mint: IdMint::default(),
             config,
-            state: PublishState::Init,
-            txn_id: None,
+            state: PublishState::ReadState,
             stored: Stored::default(),
             next: None,
             current: None,
-            output: None,
+            check: None,
+            revision: None,
         }
     }
 
@@ -186,41 +196,37 @@ impl PublishOperation {
         }
     }
 
-    fn read_state(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = PublishState::ReadState;
+    fn call(&mut self, state: PublishState, call: IoCall) -> PublishNext {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn read_state(&self) -> IoCall {
         let set_id = self.config.set_id;
         let document = self.config_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    DISTRIBUTION_KEYSPACE.to_string(),
-                    set_id.to_bytes().to_vec().into(),
-                ),
-                (
-                    DISTRIBUTION_ACCEPT_KEYSPACE.to_string(),
-                    accept_key(set_id, self.config.request_id).into(),
-                ),
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key()
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&self.target()),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
+        IoCall::Read(vec![
+            (
+                DISTRIBUTION_KEYSPACE.to_string(),
+                set_id.to_bytes().to_vec().into(),
+            ),
+            (
+                DISTRIBUTION_ACCEPT_KEYSPACE.to_string(),
+                accept_key(set_id, self.config.request_id).into(),
+            ),
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&self.target()),
+            ),
+        ])
     }
 
     /// Validates the request against the head; admin requests continue to authorization.
-    fn decide(&mut self, values: Vec<Option<Value>>) -> Result<Effects, PublishError> {
-        let [view, accepted, config, reducer] =
-            <[Option<Value>; 4]>::try_from(values).map_err(|_| PublishError::UnexpectedEvent {
-                state: "read state",
-                got: "a batch of another length".to_string(),
-            })?;
+    fn decide(&mut self, result: IoResult) -> PublishNext {
+        let [view, accepted, config, reducer] = values::<4>(result)?;
         if let Some(accepted) = accepted {
             let accepted: AcceptedRequest =
                 postcard::from_bytes(accepted.as_ref()).map_err(ConversionError::from)?;
@@ -229,8 +235,7 @@ impl PublishOperation {
             {
                 return Err(PublishError::RequestReused);
             }
-            self.output = Some(Ok(accepted.revision));
-            return Ok(self.abort_replay());
+            return Ok(Next::Done(accepted.revision));
         }
         self.stored = Stored {
             view: view
@@ -284,41 +289,47 @@ impl PublishOperation {
             (Err(error), _) => return Err(error.into()),
         };
         if !request.admin() {
-            return Ok(self.sign());
+            return self.sign();
         }
         let Some(auth_context) = self.config.auth_context.clone() else {
             return Err(PublishError::Unauthorized);
         };
-        let txn_id = self.txn_id.ok_or(PublishError::NotFinished)?;
-        self.state = PublishState::Authorize;
         // Roles are read in the acceptance transaction, so a revoked role conflicts the commit.
         let check = CheckPermissionsConfig {
             auth_context,
             path: group_admin_path(self.config.realm_id, owner),
             required_permission: Permission::WRITE,
         };
-        Ok(smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new_with_txn(check, txn_id),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))])
+        let reads = check.reads().map_err(|_| PublishError::Unauthorized)?;
+        self.check = Some(check);
+        self.call(PublishState::Authorize, IoCall::Read(reads))
     }
 
-    fn sign(&mut self) -> Effects {
-        let Some(snapshot) = self.next.clone() else {
-            return self.fail(PublishError::NotFinished);
+    /// Accepts the request once the admin check allowed it; an already applied one replays.
+    fn authorized(&mut self, allowed: Result<bool, AuthorizationError>) -> PublishNext {
+        match allowed {
+            Ok(true) => match self.current {
+                Some(revision) => Ok(Next::Done(revision)),
+                None => self.sign(),
+            },
+            Ok(false) => Err(PublishError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(_) => Err(PublishError::Unauthorized),
+        }
+    }
+
+    fn sign(&mut self) -> PublishNext {
+        let snapshot = self.next.clone().ok_or(PublishError::NotFinished)?;
+        let claim = SnapshotClaim {
+            realm_id: self.config.realm_id,
+            snapshot,
         };
-        self.state = PublishState::Sign;
-        smallvec![Effect::Net(NetEffect::SnapshotSign(Box::new(
-            SnapshotClaim {
-                realm_id: self.config.realm_id,
-                snapshot,
-            }
-        )))]
+        let sign = Effect::Net(NetEffect::SnapshotSign(Box::new(claim)));
+        self.call(PublishState::Sign, IoCall::Effect(Box::new(sign)))
     }
 
     /// The head, the reducer state, the accepted request and the outbox row, in one batch.
-    fn write(&mut self, signed: SignedSnapshot) -> Result<Effects, PublishError> {
-        let txn_id = self.txn_id.ok_or(PublishError::NotFinished)?;
+    fn write(&mut self, signed: SignedSnapshot) -> PublishNext {
         let revision = signed.snapshot.revision();
         let set_id = self.config.set_id;
         let user_id = self
@@ -410,46 +421,10 @@ impl PublishOperation {
         }
         // This node's replica share may shrink with the record: its quota gate stops deducting it.
         let share = dirty_share_key(view.snapshot().config.owner_group).into();
-        let generation = Ulid::generate().to_bytes().to_vec().into();
+        let generation = self.mint.mint(self.now_ms).to_bytes().to_vec().into();
         writes.push((NODE_STATS_KEYSPACE.to_string(), share, generation));
-        self.output = Some(Ok(revision));
-        self.state = PublishState::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
-    }
-
-    fn abort_replay(&mut self) -> Effects {
-        self.state = PublishState::Replay;
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => {
-                self.state = PublishState::Finish;
-                smallvec![]
-            }
-        }
-    }
-
-    fn fail(&mut self, error: PublishError) -> Effects {
-        let cleanup = self.abort();
-        self.state = PublishState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, state: &'static str, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        self.fail(PublishError::UnexpectedEvent {
-            state,
-            got: format!("{event:?}"),
-        })
-    }
-
-    fn settle(&mut self, result: Result<Effects, PublishError>) -> Effects {
-        result.unwrap_or_else(|error| self.fail(error))
+        self.revision = Some(revision);
+        self.call(PublishState::Write, IoCall::Write(writes))
     }
 }
 
@@ -457,106 +432,52 @@ impl Operation for PublishOperation {
     type Output = DistributionRevision;
     type Error = PublishError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PublishState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match (self.state, event) {
-            (
-                PublishState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => self.read_state(txn_id),
-            (PublishState::ReadState, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let values = values.into_iter().map(|(_, value)| value).collect();
-                let decided = self.decide(values);
-                self.settle(decided)
-            }
-            (
-                PublishState::Authorize,
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-            ) => match allowed {
-                Ok(true) => match self.current {
-                    Some(revision) => {
-                        self.output = Some(Ok(revision));
-                        self.abort_replay()
-                    }
-                    None => self.sign(),
-                },
-                Ok(false) => self.fail(PublishError::Unauthorized),
-                Err(AuthorizationError::StorageError(error)) => self.fail(error.into()),
-                Err(_) => self.fail(PublishError::Unauthorized),
-            },
-            (PublishState::Sign, Event::Net(NetEvent::SnapshotSign(signed))) => match signed {
-                SnapshotSignEvent::Signed(signed) => {
-                    let written = self.write(*signed);
-                    self.settle(written)
-                }
-                SnapshotSignEvent::Unavailable(reason) => {
-                    self.fail(PublishError::SignUnavailable(reason))
-                }
-            },
-            (PublishState::Write, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                match self.txn_id {
-                    Some(txn_id) => {
-                        self.state = PublishState::Commit;
-                        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-                    }
-                    None => self.fail(PublishError::NotFinished),
-                }
-            }
-            (PublishState::Commit, Event::Storage(StorageEvent::TransactionCommitted { .. })) => {
-                self.txn_id = None;
-                self.state = PublishState::Drain;
-                smallvec![schedule_drain_effect()]
-            }
-            (PublishState::Drain, Event::Task(TaskEvent::TimerScheduled { .. }))
-            | (PublishState::Drain, Event::Task(TaskEvent::Error { .. })) => {
-                // A missed timer leaves the durable outbox row for the next drain.
-                self.state = PublishState::Finish;
-                smallvec![]
-            }
-            (PublishState::Replay, Event::Storage(StorageEvent::TransactionAborted { .. })) => {
-                self.state = PublishState::Finish;
-                smallvec![]
-            }
-            (PublishState::Finish | PublishState::Error | PublishState::Init, _) => smallvec![],
-            (state, event) => {
-                let name = match state {
-                    PublishState::StartTransaction => "start transaction",
-                    PublishState::ReadState => "read state",
-                    PublishState::Authorize => "authorize",
-                    PublishState::Sign => "sign",
-                    PublishState::Write => "write",
-                    PublishState::Commit => "commit",
-                    PublishState::Drain => "drain",
-                    PublishState::Replay => "replay",
-                    PublishState::Init | PublishState::Finish | PublishState::Error => "done",
+    fn seed(&mut self, entropy: u128) {
+        self.mint = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> PublishNext {
+        Ok(Next::Call(self.read_state()))
+    }
+
+    fn next(&mut self, result: IoResult) -> PublishNext {
+        match self.state {
+            PublishState::ReadState => self.decide(result),
+            PublishState::Authorize => {
+                let values = result.values()?;
+                let allowed = match self.check.take() {
+                    Some(check) => check.allowed(values),
+                    None => Err(AuthorizationError::NotFinished),
                 };
-                self.unexpected(name, event)
+                self.authorized(allowed)
+            }
+            PublishState::Sign => match result.event()? {
+                Event::Net(NetEvent::SnapshotSign(SnapshotSignEvent::Signed(signed))) => {
+                    self.write(*signed)
+                }
+                Event::Net(NetEvent::SnapshotSign(SnapshotSignEvent::Unavailable(reason))) => {
+                    Err(PublishError::SignUnavailable(reason))
+                }
+                other => Err(PublishError::UnexpectedEvent(other.label())),
+            },
+            // A missed drain timer leaves the durable outbox row for the next drain.
+            PublishState::Write => {
+                result.done()?;
+                let output = self.revision.take().ok_or(PublishError::NotFinished)?;
+                Ok(Next::Then {
+                    output,
+                    calls: vec![IoCall::Effect(Box::new(schedule_drain_effect()))],
+                })
             }
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PublishState::Finish | PublishState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        if !self.is_complete() {
-            return Err(PublishError::NotFinished);
-        }
-        self.output.unwrap_or(Err(PublishError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 

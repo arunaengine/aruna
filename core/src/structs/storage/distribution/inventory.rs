@@ -11,6 +11,7 @@ use ulid::Ulid;
 use super::OriginalEpoch;
 use super::source_root::RootEntry;
 use crate::errors::ConversionError;
+use crate::keyspaces::prefix_upper_bound;
 use crate::structs::storage::blob::{BlobVersion, BlobVersionState};
 
 /// Ends an escaped key; it sorts before every continuation of the key.
@@ -94,6 +95,22 @@ pub fn range_interval(set_id: Ulid, lower: &str, upper: Option<&str>) -> (Vec<u8
         }
     };
     (bound_position(set_id, lower), end)
+}
+
+/// The positions of a range `[lower, upper)` narrowed to the keys that start with `prefix`.
+pub fn prefix_interval(
+    set_id: Ulid,
+    lower: &str,
+    upper: Option<&str>,
+    prefix: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let (lower, end) = range_interval(set_id, lower, upper);
+    let bound = bound_position(set_id, prefix);
+    let end = match prefix.is_empty() {
+        true => end,
+        false => prefix_upper_bound(&bound).map_or(end.clone(), |upper| upper.min(end)),
+    };
+    (lower.max(bound), end)
 }
 
 /// The version id index key of a version in a set.

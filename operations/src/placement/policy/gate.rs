@@ -3,19 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
+use aruna_core::rows::values;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::policy::{
     PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
 };
 use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
-use aruna_core::types::{Effects, GroupId, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, TxnId, Value};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use tracing::debug;
@@ -24,7 +24,8 @@ use ulid::Ulid;
 use super::cache::PolicyCacheStats;
 use super::foreign_owner;
 use super::read::ReadPolicyError;
-use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation};
+use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
+use crate::groups::backends::RecordReadError;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyGateConfig {
@@ -55,21 +56,12 @@ pub struct PolicyGateOperation {
     /// Refs still to resolve, in reverse order so the next one pops off the end.
     remaining: Vec<PlacementPolicyRef>,
     current: Option<PlacementPolicyRef>,
-    resolver: Option<ResolvePolicyOperation>,
     resolved: BTreeMap<Ulid, PolicyResolution>,
     foreign_owner: Option<Ulid>,
     stats: PolicyCacheStats,
-    state: GateState,
-    result: Option<Result<PolicyGateOutcome, ReadPolicyError>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum GateState {
-    Init,
-    Resolve,
-    Finish,
-    Error,
-}
+type GateTurn = Result<Next<PolicyGateOutcome>, ReadPolicyError>;
 
 impl PolicyGateOperation {
     pub fn new(config: PolicyGateConfig) -> Self {
@@ -77,35 +69,31 @@ impl PolicyGateOperation {
             config,
             remaining: Vec::new(),
             current: None,
-            resolver: None,
             resolved: BTreeMap::new(),
             foreign_owner: None,
             stats: PolicyCacheStats::default(),
-            state: GateState::Init,
-            result: None,
         }
     }
 
-    fn next_ref(&mut self) -> Effects {
+    /// Resolves the next ref as a child, or decides once every ref has an outcome.
+    fn next_ref(&mut self) -> GateTurn {
         let Some(policy_ref) = self.remaining.pop() else {
             return self.evaluate();
         };
-        let mut resolver = ResolvePolicyOperation::new(ResolvePolicyConfig {
-            realm_id: self.config.realm_id,
-            policy_ref,
-            local_node_id: self.config.local_node_id,
-            now_ms: self.config.now_ms,
-        });
-        let effects = resolver.start();
         self.current = Some(policy_ref);
-        self.resolver = Some(resolver);
-        self.state = GateState::Resolve;
-        effects
+        Ok(Next::Call(IoCall::child(ResolvePolicyOperation::new(
+            ResolvePolicyConfig {
+                realm_id: self.config.realm_id,
+                policy_ref,
+                local_node_id: self.config.local_node_id,
+                now_ms: self.config.now_ms,
+            },
+        ))))
     }
 
     /// Records one resolution. Only an obtained definition becomes `Known`; every
     /// other outcome either blocks the decision or is reported as unresolved.
-    fn record(&mut self, policy_ref: PlacementPolicyRef, result: ResolveResult) -> Effects {
+    fn record(&mut self, policy_ref: PlacementPolicyRef, result: ResolveResult) -> GateTurn {
         match result {
             Ok(resolved) => {
                 self.stats.merge(resolved.stats);
@@ -135,11 +123,11 @@ impl PolicyGateOperation {
                     policy_ids: vec![policy_ref.policy_id],
                 })
             }
-            Err(error) => self.fail(error),
+            Err(error) => Err(error),
         }
     }
 
-    fn evaluate(&mut self) -> Effects {
+    fn evaluate(&mut self) -> GateTurn {
         // A rule another group owns governs its owner's buckets only, whatever
         // its selectors admit.
         self.foreign_owner = self
@@ -150,14 +138,8 @@ impl PolicyGateOperation {
         self.decide(decision)
     }
 
-    fn decide(&mut self, decision: PlacementDecision) -> Effects {
+    fn decide(&mut self, decision: PlacementDecision) -> GateTurn {
         let allowed = decision == PlacementDecision::Allowed && self.foreign_owner.is_none();
-        self.result = Some(Ok(PolicyGateOutcome {
-            decision,
-            foreign_owner: self.foreign_owner,
-            stats: self.stats,
-        }));
-        self.state = GateState::Finish;
         debug!(
             refs = self.config.refs.len(),
             allowed,
@@ -166,17 +148,15 @@ impl PolicyGateOperation {
             evictions = self.stats.evictions,
             "Placement gate decided"
         );
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: ReadPolicyError) -> Effects {
-        self.result = Some(Err(error));
-        self.state = GateState::Error;
-        smallvec![]
+        Ok(Next::Done(PolicyGateOutcome {
+            decision,
+            foreign_owner: self.foreign_owner,
+            stats: self.stats,
+        }))
     }
 }
 
-type ResolveResult = Result<super::resolve::ResolvedPolicy, ReadPolicyError>;
+type ResolveResult = Result<ResolvedPolicy, ReadPolicyError>;
 
 /// The destination details a governed write or serve is evaluated against.
 /// Absent means this node advertises no subject, so nothing governed may be
@@ -189,6 +169,62 @@ pub struct GateContext {
     /// False while this node revalidates its inventory. Only a governed write
     /// is stopped by it; an ungoverned one never consults the gate.
     pub admitting: bool,
+}
+
+/// Why a caller could not build a destination gate. An admission stop is not
+/// one: the gate is built either way and `write_gate` refuses a governed write.
+#[derive(Debug, Error, PartialEq)]
+pub enum GateContextError {
+    #[error("node placement subject unavailable: {0}")]
+    NodeSubject(#[source] RecordReadError),
+}
+
+impl From<IoError> for GateContextError {
+    fn from(error: IoError) -> Self {
+        Self::NodeSubject(error.into())
+    }
+}
+
+/// The destination this node evaluates governed writes and serves against. `None` means no
+/// subject was ever advertised, failing governed operations closed; a node revalidating
+/// inventory reports `admitting: false` to stop governed writes.
+#[derive(Debug, PartialEq)]
+pub struct GateOperation {
+    realm_id: RealmId,
+    now_ms: u64,
+}
+
+impl GateOperation {
+    pub fn new(realm_id: RealmId, now_ms: u64) -> Self {
+        Self { realm_id, now_ms }
+    }
+}
+
+impl Operation for GateOperation {
+    type Output = Option<GateContext>;
+    type Error = GateContextError;
+
+    fn first(&mut self) -> Result<Next<Option<GateContext>>, GateContextError> {
+        let key = Key::from(NODE_SUBJECT_KEY.to_vec());
+        Ok(Next::Call(IoCall::Read(vec![(
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<GateContext>>, GateContextError> {
+        let [value] = values::<1>(result)?;
+        let record = value
+            .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|error| GateContextError::NodeSubject(RecordReadError::Conversion(error)))?;
+        Ok(Next::Done(record.map(|record| GateContext {
+            realm_id: self.realm_id,
+            admitting: !record.serving_blocked && !record.policy_draining,
+            subject: record.subject,
+            now_ms: self.now_ms,
+        })))
+    }
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -384,7 +420,7 @@ impl Operation for PolicyGateOperation {
     type Output = PolicyGateOutcome;
     type Error = ReadPolicyError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> GateTurn {
         match PlacementPolicyRef::canonical_set(&self.config.refs) {
             Ok(refs) => {
                 self.remaining = refs;
@@ -395,40 +431,10 @@ impl Operation for PolicyGateOperation {
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            GateState::Resolve => {
-                let Some(resolver) = self.resolver.as_mut() else {
-                    return self.fail(ReadPolicyError::NotFinished);
-                };
-                let effects = resolver.step(event);
-                if !resolver.is_complete() {
-                    return effects;
-                }
-                let (Some(resolver), Some(policy_ref)) =
-                    (self.resolver.take(), self.current.take())
-                else {
-                    return self.fail(ReadPolicyError::NotFinished);
-                };
-                self.record(policy_ref, resolver.finalize())
-            }
-            GateState::Init | GateState::Finish | GateState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GateState::Finish | GateState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.result.unwrap_or(Err(ReadPolicyError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.resolver.as_mut() {
-            Some(resolver) => resolver.abort(),
-            None => smallvec![],
-        }
+    fn next(&mut self, result: IoResult) -> GateTurn {
+        let policy_ref = self.current.take().ok_or(ReadPolicyError::NotFinished)?;
+        let resolved = result.child::<ResolvedPolicy, ReadPolicyError>()?;
+        self.record(policy_ref, resolved)
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -438,14 +444,12 @@ impl Operation for PolicyGateOperation {
 
 #[cfg(test)]
 mod pure_tests {
-    use super::super::cache::PolicyCacheEntry;
+    use super::super::read::PolicySource;
     use super::*;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::placement::policy::{
         PlacementPolicy, PlacementSelector, VerifiedPolicy,
     };
-    use aruna_core::types::Value;
-    use byteview::ByteView;
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -456,18 +460,7 @@ mod pure_tests {
     }
 
     fn policy(seed: u8, location: &str) -> VerifiedPolicy {
-        let policy = PlacementPolicy::new(
-            Ulid::from_bytes([seed; 16]),
-            "residency".to_string(),
-            vec![PlacementSelector {
-                node_id: None,
-                location: Some(location.to_string()),
-                labels: Vec::new(),
-                executor_kind: None,
-            }],
-        )
-        .expect("policy is valid");
-        VerifiedPolicy::verify(policy).expect("policy verifies")
+        crate::tests::policy::residency(seed, location)
     }
 
     /// The same rule under one group's ownership.
@@ -532,19 +525,42 @@ mod pure_tests {
         })
     }
 
-    fn cached(entry: &PolicyCacheEntry) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(Value::from(entry.to_bytes().expect("entry encodes"))),
-        })
+    /// A resolve child that obtained `policy` from the cache.
+    fn resolved(policy: &VerifiedPolicy) -> IoResult {
+        let stats = PolicyCacheStats {
+            hits: 1,
+            ..PolicyCacheStats::default()
+        };
+        let resolved = ResolvedPolicy {
+            policy: policy.clone(),
+            source: PolicySource::Cached,
+            stats,
+        };
+        IoResult::Child(ChildOutcome::new(Ok::<_, ReadPolicyError>(resolved)))
+    }
+
+    fn failed(error: ReadPolicyError) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Err::<ResolvedPolicy, _>(error)))
+    }
+
+    /// Answers one resolve child per ref and returns the decided outcome.
+    fn decided(operation: &mut PolicyGateOperation, answers: Vec<IoResult>) -> PolicyGateOutcome {
+        let mut turn = operation.first();
+        for answer in answers {
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+            turn = operation.next(answer);
+        }
+        match turn {
+            Ok(Next::Done(outcome)) => outcome,
+            other => panic!("expected a decision, got {other:?}"),
+        }
     }
 
     #[test]
     fn allows_ungoverned() {
         let mut operation = operation(Vec::new(), "eu-west");
-        assert!(operation.start().is_empty());
         assert_eq!(
-            operation.finalize().expect("gate decides").decision,
+            decided(&mut operation, Vec::new()).decision,
             PlacementDecision::Allowed
         );
     }
@@ -555,13 +571,7 @@ mod pure_tests {
         let first = policy(1, "eu-west");
         let second = policy(2, "us-east");
         let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
-        operation.start();
-        operation.step(cached(&PolicyCacheEntry::verified(&document(&first), 10)));
-        operation.step(crate::tests::policy::authority(realm()));
-        operation.step(cached(&PolicyCacheEntry::verified(&document(&second), 10)));
-        operation.step(crate::tests::policy::authority(realm()));
-
-        let outcome = operation.finalize().expect("gate decides");
+        let outcome = decided(&mut operation, vec![resolved(&first), resolved(&second)]);
         assert_eq!(
             outcome.decision,
             PlacementDecision::Denied {
@@ -577,11 +587,7 @@ mod pure_tests {
         let owner = Ulid::from_bytes([8u8; 16]);
         let rule = owned_policy(1, "eu-west", owner);
         let mut operation = operation(vec![rule.policy_ref()], "eu-west");
-        operation.start();
-        operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::tests::policy::group_authority(realm(), owner));
-
-        let outcome = operation.finalize().expect("gate decides");
+        let outcome = decided(&mut operation, vec![resolved(&rule)]);
         assert_eq!(outcome.decision, PlacementDecision::Allowed);
         assert_eq!(
             gate_decision(outcome),
@@ -598,16 +604,10 @@ mod pure_tests {
         let realm_wide = policy(1, "eu-west");
         let owned = owned_policy(2, "eu-west", group());
         let mut operation = operation(vec![realm_wide.policy_ref(), owned.policy_ref()], "eu-west");
-        operation.start();
-        operation.step(cached(&PolicyCacheEntry::verified(
-            &document(&realm_wide),
-            10,
-        )));
-        operation.step(crate::tests::policy::authority(realm()));
-        operation.step(cached(&PolicyCacheEntry::verified(&document(&owned), 10)));
-        operation.step(crate::tests::policy::group_authority(realm(), group()));
-
-        let outcome = operation.finalize().expect("gate decides");
+        let outcome = decided(
+            &mut operation,
+            vec![resolved(&realm_wide), resolved(&owned)],
+        );
         assert_eq!(outcome.foreign_owner, None);
         assert_eq!(gate_decision(outcome), Ok(()));
     }
@@ -619,26 +619,20 @@ mod pure_tests {
         let owner = Ulid::from_bytes([8u8; 16]);
         let rule = owned_policy(1, "eu-west", owner);
         let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
-        operation.start();
-        operation.step(cached(&PolicyCacheEntry::verified(&document(&rule), 10)));
-        operation.step(crate::tests::policy::group_authority(realm(), owner));
-
-        let outcome = operation.finalize().expect("gate decides");
+        let outcome = decided(&mut operation, vec![resolved(&rule)]);
         assert_eq!(outcome.foreign_owner, None);
         assert_eq!(gate_decision(outcome), Ok(()));
     }
 
     #[test]
     fn unresolved_stays_closed() {
-        // A live availability hint must block the subject without denying it, so
-        // a later valid policy is still evaluated on its merits.
+        // An unavailable rule must block the subject without denying it, so a
+        // later valid policy is still evaluated on its merits.
         let rule = policy(1, "eu-west");
         let mut operation = operation(vec![rule.policy_ref()], "eu-west");
-        operation.start();
-        operation.step(cached(&PolicyCacheEntry::unavailable(1_000)));
-
+        let unavailable = ReadPolicyError::Unavailable("recently unreachable".to_string());
         assert_eq!(
-            operation.finalize().expect("gate decides").decision,
+            decided(&mut operation, vec![failed(unavailable)]).decision,
             PlacementDecision::Unavailable {
                 policy_ids: vec![rule.policy().policy_id]
             }
@@ -647,22 +641,31 @@ mod pure_tests {
 
     #[test]
     fn mismatch_stays_closed() {
-        // The cache row holds another definition, so the fetch path answers with
-        // a mismatch and the gate refuses instead of falling back to allow.
+        // A resolve that answers with a mismatch makes the gate refuse instead of
+        // falling back to allow.
         let requested = policy(1, "eu-west");
         let mut operation = operation(vec![requested.policy_ref()], "eu-west");
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: None,
-        }));
-        operation.step(opened(Some(encoded(&policy(1, "us-east")))));
-
         assert_eq!(
-            operation.finalize().expect("gate decides").decision,
+            decided(
+                &mut operation,
+                vec![failed(ReadPolicyError::DigestMismatch)]
+            )
+            .decision,
             PlacementDecision::DigestMismatch {
                 refs: vec![requested.policy_ref()]
             }
+        );
+    }
+
+    #[test]
+    fn storage_fault_fails() {
+        // A resolve that failed for another reason ends the gate in that error.
+        let rule = policy(1, "eu-west");
+        let mut operation = operation(vec![rule.policy_ref()], "eu-west");
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(failed(ReadPolicyError::NotFinished)),
+            Err(ReadPolicyError::NotFinished)
         );
     }
 
@@ -716,37 +719,75 @@ mod pure_tests {
         let gated = GatedBucket::observe(None).stored_under(None, false);
         assert_eq!(gated.check_subject(None), Ok(()));
     }
+}
 
-    fn document(
-        policy: &VerifiedPolicy,
-    ) -> aruna_core::structs::placement::policy::document::PlacementPolicyDocument {
-        crate::tests::policy::signed_document(realm(), policy, 1)
-    }
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use aruna_core::errors::StorageError;
 
-    fn encoded(policy: &VerifiedPolicy) -> Value {
-        ByteView::from(document(policy).to_bytes().expect("document encodes"))
-    }
-
-    /// The realm view and policy row the inner read starts with.
-    fn opened(policy_row: Option<Value>) -> Event {
-        let mut config =
-            aruna_core::structs::identity::realm::RealmConfigDocument::new(realm(), Vec::new(), 2);
-        config.seed_default_placement();
-        for seed in 1..=4u8 {
-            config.ensure_node(
-                node(seed),
-                aruna_core::structs::identity::realm::RealmNodeKind::Server,
-            );
-        }
-        let (config_value, auth_value) =
-            crate::tests::policy::realm_view(&config, crate::tests::policy::admin_user(realm()));
-        let key = ByteView::from(Vec::new());
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (key.clone(), policy_row),
-                (key.clone(), Some(config_value)),
-                (key, Some(auth_value)),
-            ],
+    fn record(blocked: bool) -> NodeSubjectRecord {
+        let mut record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
         })
+        .expect("subject is valid");
+        record.serving_blocked = blocked;
+        record
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    /// Reads the subject row and answers it with `value`.
+    fn answered(value: Option<Vec<u8>>) -> Result<Next<Option<GateContext>>, GateContextError> {
+        let mut operation = GateOperation::new(realm(), 7);
+        let key = Key::from(NODE_SUBJECT_KEY.to_vec());
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(vec![(
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                key
+            )])))
+        );
+        operation.next(IoResult::Values(vec![value.map(Into::into)]))
+    }
+
+    #[test]
+    fn blocked_subject_reads() {
+        // A blocked node still reports its subject; only the gate stops a governed write.
+        let Ok(Next::Done(Some(gate))) = answered(Some(record(true).to_bytes().unwrap())) else {
+            panic!("subject is advertised");
+        };
+        assert!(!gate.admitting);
+        assert_eq!((gate.realm_id, gate.now_ms), (realm(), 7));
+        assert_eq!(gate.subject, record(true).subject);
+
+        let Ok(Next::Done(Some(open))) = answered(Some(record(false).to_bytes().unwrap())) else {
+            panic!("subject is advertised");
+        };
+        assert!(open.admitting);
+    }
+
+    #[test]
+    fn missing_subject_none() {
+        // A node that never advertised a subject has no gate at all.
+        assert_eq!(answered(None), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn read_failures_error() {
+        // A storage error or an undecodable record fails instead of reading as absent.
+        assert!(matches!(
+            answered(Some(vec![0xff; 4])),
+            Err(GateContextError::NodeSubject(_))
+        ));
+        let fault = GateContextError::from(IoError::Storage(StorageError::Timeout));
+        assert!(matches!(fault, GateContextError::NodeSubject(_)));
     }
 }

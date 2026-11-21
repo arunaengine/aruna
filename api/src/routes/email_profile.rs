@@ -6,35 +6,34 @@ use std::sync::Arc;
 
 use aruna_core::compute::SecretBytes;
 use aruna_core::errors::StorageError;
+use aruna_core::outbound::SmtpSettings;
 use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, Permission};
+use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_operations::driver::drive;
-use aruna_operations::notifications::email::{SmtpMailer, SmtpSettings, refresh_mail};
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_operations::notifications::email::{CheckSmtpOperation, RefreshMailOperation};
 use aruna_operations::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
 };
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/realm", description = "Realm configuration, placement and quota")))]
-pub struct ProfileApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ProfileApiDoc::openapi()).routes(routes!(
+    OpenApiRouter::new().routes(routes!(
         get_email_profile,
         set_email_profile,
         delete_email_profile
@@ -148,7 +147,6 @@ impl From<RealmEmailProfile> for EmailProfileView {
     responses(
         (status = 200, description = "Whether email is configured, and the profile for realm config admins", body = EmailProfileResponse,
             example = json!({"configured": true, "profile": {"host": "smtp.example.org", "port": 587, "tls": "starttls", "username": "aruna", "from": "Aruna <aruna@example.org>", "has_password": true, "revision": "01JBX7Y3S5M3Q8Y1V9K2T4R6P0", "changed_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "changed_at_ms": 1762160400000u64}})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
@@ -156,14 +154,13 @@ impl From<RealmEmailProfile> for EmailProfileView {
 )]
 pub async fn get_email_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<EmailProfileResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
         .await
         .map_err(|error| match error {
             GetConfigError::DocumentNotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     let admin = config.email.is_some()
         && ensure_permission(
@@ -209,7 +206,6 @@ management node serves the call and every other node relays it to one.
         (status = 200, description = "The stored profile, without the password", body = EmailProfileView,
             example = json!({"host": "smtp.example.org", "port": 587, "tls": "starttls", "username": "aruna", "from": "Aruna <aruna@example.org>", "has_password": true, "revision": "01JBX7Y3S5M3Q8Y1V9K2T4R6P0", "changed_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "changed_at_ms": 1762160400000u64})),
         (status = 400, description = "Invalid host or sender, a password without username, or a changed username without password", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
@@ -220,7 +216,7 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn set_email_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<EmailProfileRequest>,
 ) -> ServerResult<Json<EmailProfileView>> {
     let settings = SmtpSettings {
@@ -231,7 +227,10 @@ pub async fn set_email_profile(
         password: None,
         from: request.from.trim().to_string(),
     };
-    SmtpMailer::new(&settings).map_err(ServerError::BadRequestReason)?;
+    drive(CheckSmtpOperation::new(settings.clone()), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?
+        .map_err(ServerError::BadRequestReason)?;
     let input = EmailInput {
         host: settings.host,
         port: request.port,
@@ -245,7 +244,7 @@ pub async fn set_email_profile(
     let stored = change_profile(&state, auth, Some(input)).await?;
     stored
         .map(|profile| Json(profile.into()))
-        .ok_or_else(|| ServerError::InternalError("the profile was not stored".to_string()))
+        .ok_or_else(|| ServerError::InternalError("the profile was not stored".to_string().into()))
 }
 
 #[utoipa::path(
@@ -263,7 +262,6 @@ management node serves the call and every other node relays it to one.
   when the change reaches them."#,
     responses(
         (status = 204, description = "No profile is left"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
@@ -274,7 +272,7 @@ management node serves the call and every other node relays it to one.
 )]
 pub async fn delete_email_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
     change_profile(&state, auth, None).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -282,10 +280,9 @@ pub async fn delete_email_profile(
 
 async fn change_profile(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     profile: Option<EmailInput>,
 ) -> ServerResult<Option<RealmEmailProfile>> {
-    let auth = require_unrestricted_auth(state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         state,
@@ -302,11 +299,7 @@ async fn change_profile(
     };
     let stored = drive(
         SetEmailOperation::new(SetEmailConfig {
-            actor: Actor {
-                node_id: state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: state.get_realm_id(),
-            },
+            actor: actor(state, &auth),
             auth_context: auth,
             vault_key: RealmVaultKey::derive(realm_signing_key),
             profile,
@@ -315,8 +308,10 @@ async fn change_profile(
     )
     .await
     .map_err(map_email_error)?;
-    let mail = state.jobs_runtime().mail();
-    refresh_mail(&state.get_ctx(), state.get_realm_id(), Some(&mail)).await;
+    let refresh = RefreshMailOperation::new(state.get_realm_id());
+    if let Err(error) = drive(refresh, &state.get_ctx()).await {
+        tracing::warn!(%error, "Mail settings refresh stopped after a profile change");
+    }
     Ok(stored)
 }
 
@@ -327,15 +322,11 @@ fn map_email_error(error: SetEmailError) -> ServerError {
         SetEmailError::InvalidProfile { .. } | SetEmailError::PasswordRequired => {
             ServerError::BadRequestReason(error.to_string())
         }
-        SetEmailError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm configuration update conflict; retry".to_string(),
-        ),
-        SetEmailError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
+        SetEmailError::StorageError(StorageError::TransactionConflict) => {
+            ServerError::config_conflict()
         }
-        other => ServerError::InternalError(other.to_string()),
+        SetEmailError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

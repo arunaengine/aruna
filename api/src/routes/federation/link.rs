@@ -3,19 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::login::SECRET_LEN;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::Signed;
 use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
-use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::user::User;
-use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::bearer_token::decode_bearer_token;
-use aruna_operations::driver::drive;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::federation::link::{
     ConfirmLinkConfig, ConfirmLinkOperation, LinkLoginConfig, LinkLoginError, LinkLoginOperation,
     UnlinkLoginConfig, UnlinkLoginOperation,
@@ -26,16 +26,12 @@ use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct LinkApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(LinkApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_confirmation))
         .routes(routes!(create_link, list_links))
         .routes(routes!(delete_link))
@@ -80,7 +76,7 @@ fn link_refused(error: LinkLoginError) -> ServerError {
         LinkLoginError::Update(UpdateUserError::AliasMissing) => ServerError::NotFound,
         LinkLoginError::Update(UpdateUserError::Unauthorized) => ServerError::Forbidden,
         LinkLoginError::Storage(_) => ServerError::ServiceUnavailableReason(message),
-        _ => ServerError::InternalError(message),
+        _ => ServerError::InternalError(message.into()),
     }
 }
 
@@ -90,18 +86,11 @@ pub(crate) async fn bearer_auth_time(
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Option<u64>> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
-    let claims = decode_bearer_token(state, bearer.as_str())
+    let claims = state
+        .decode_token(bearer.as_str())
         .await
         .map_err(|_| ServerError::Unauthorized)?;
     Ok(claims.auth_time)
-}
-
-fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    }
 }
 
 #[utoipa::path(
@@ -132,18 +121,16 @@ A provider token without `auth_time` and child sessions give none and are refuse
         (status = 200, description = "The signed link confirmation", body = serde_json::Value,
             example = json!({ "payload": { "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "action": "Link", "local_user": { "user_ulid": "01JDNA0123456789ABCDEFGHJK", "realm_id": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31] }, "foreign_user": { "user_ulid": "01JCNCTR0123456789ABCDEFGH", "realm_id": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7] }, "foreign_issued_at": 1791000000, "issued_at": 1791000010, "expires_at": 1791000310, "confirmation_id": "01J11NK0123456789ABCDEFGHJ" }, "signer": "Realm", "signature": "<hex>" })),
         (status = 400, description = "A malformed secret", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A login is too old, of the wrong kind, of an inactive or service account, or a handoff is invalid, not bound to this attempt, or of a realm no longer admitted (code `link_refused`)", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn create_confirmation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<LinkConfirmationRequest>,
 ) -> ServerResult<Json<Signed<LinkConfirmation>>> {
-    let auth = require_realm_auth(&state, auth)?;
     let auth_time = bearer_auth_time(&state, bearer).await?;
     let secret = hex::decode(&request.secret)
         .ok()
@@ -156,6 +143,7 @@ pub async fn create_confirmation(
         secret,
         node_capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
+        confirmation_id: ulid::Ulid::generate(),
     });
     let confirmation = drive(confirm, &state.get_ctx())
         .await
@@ -189,7 +177,6 @@ account the confirmation names.
     responses(
         (status = 200, description = "The account with its linked logins", body = LinkedLoginsResponse,
             example = json!({ "user_id": "<local user id>", "linked_logins": ["<user id of the other realm>"] })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The confirmation or a login was refused (code `link_refused`)", body = ErrorResponse),
         (status = 409, description = "The login belongs to another account, or the account links another login of that realm (code `link_conflict`)", body = ErrorResponse)
     ),
@@ -197,20 +184,23 @@ account the confirmation names.
 )]
 pub async fn create_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<LinkRequest>,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let auth_time = bearer_auth_time(&state, bearer).await?;
-    let link = LinkLoginOperation::new(LinkLoginConfig {
+    let seed = auth.user_id.to_bytes();
+    let config = LinkLoginConfig {
         actor: actor(&state, &auth),
         auth_context: auth,
         auth_time,
         confirmation: request.confirmation,
         now: unix_timestamp_secs(),
-    });
-    let user = drive(link, &state.get_ctx()).await.map_err(link_refused)?;
+    };
+    let link = || LinkLoginOperation::new(config.clone());
+    let user = drive_retry(link, &state.get_ctx(), &seed)
+        .await
+        .map_err(link_refused)?;
     Ok(Json(linked_logins(&user)))
 }
 
@@ -240,16 +230,14 @@ pub(crate) fn linked_logins(user: &User) -> LinkedLoginsResponse {
     responses(
         (status = 200, description = "The caller's linked logins", body = LinkedLoginsResponse,
             example = json!({ "user_id": "<local user id>", "linked_logins": ["<user id of the other realm>"] })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller has no local account here", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     if auth.user_id.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
@@ -282,7 +270,6 @@ pub async fn list_links(
         (status = 200, description = "The account with its remaining linked logins", body = LinkedLoginsResponse,
             example = json!({ "user_id": "<local user id>", "linked_logins": [] })),
         (status = 400, description = "A malformed user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is neither the owner nor a realm administrator", body = ErrorResponse),
         (status = 404, description = "The account has no such linked login", body = ErrorResponse)
     ),
@@ -290,23 +277,23 @@ pub async fn list_links(
 )]
 pub async fn delete_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((user_id, login)): Path<(String, String)>,
 ) -> ServerResult<Json<LinkedLoginsResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let parse = |value: &str| {
         UserId::from_string(value)
             .map_err(|_| ServerError::BadRequestReason("malformed user id".to_string()))
     };
     let (user_id, alias) = (parse(&user_id)?, parse(&login)?);
-    let unlink = UnlinkLoginOperation::new(UnlinkLoginConfig {
+    let config = UnlinkLoginConfig {
         actor: actor(&state, &auth),
         auth_context: auth,
         user_id,
         alias,
         now: unix_timestamp_secs(),
-    });
-    let user = drive(unlink, &state.get_ctx())
+    };
+    let unlink = || UnlinkLoginOperation::new(config.clone());
+    let user = drive_retry(unlink, &state.get_ctx(), &user_id.to_bytes())
         .await
         .map_err(link_refused)?;
     Ok(Json(linked_logins(&user)))

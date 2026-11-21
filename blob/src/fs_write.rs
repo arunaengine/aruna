@@ -7,7 +7,7 @@ use aruna_core::errors::StagingSourceError;
 use aruna_core::events::{LocalFileEvent, LocalFileRefusal};
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::offered_directory::{FileStat, weak_fingerprint};
-use aruna_core::structs::{SYNC_TRASH_DIR, WriteGuard};
+use aruna_core::structs::synced_folder::{SYNC_TRASH_DIR, WriteGuard};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};
@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::fs_source::{
-    MAX_COPY_ATTEMPTS, SPOOL_DIR, SPOOL_GRACE, canonical_root, jailed_file, map_io_error,
+    KEPT_DIR, MAX_COPY_ATTEMPTS, SPOOL_DIR, SPOOL_GRACE, canonical_root, jailed_file, map_io_error,
 };
 
 /// Why a spooled file could not be published. A refusal is the owner's data
@@ -23,6 +23,9 @@ use crate::fs_source::{
 enum PlaceError {
     Refused(LocalFileRefusal),
     Failed(String),
+    /// The owner's displaced bytes could not be put aside and stay at this path,
+    /// which must survive the cleanup of a failed write.
+    Kept(PathBuf),
 }
 
 /// One fully written temporary file, and the identity of the bytes it holds.
@@ -55,9 +58,10 @@ pub(crate) async fn write_guarded(
         WriteGuard::MustNotExist => place_new(&spooled.path, &target),
         // The weak fingerprint is the operation's own pre-check; what the
         // adapter re-verifies under the swap is the strong hash.
-        WriteGuard::MatchesBase { blake3, .. } => {
-            exchange_guarded(&spooled.path, &target, blake3).await
-        }
+        WriteGuard::MatchesBase { blake3, .. } => match reserved_file(root, KEPT_DIR).await {
+            Ok(kept) => exchange_guarded(&spooled, &kept, &target, blake3).await,
+            Err(message) => Err(PlaceError::Failed(message)),
+        },
     };
     finish_write(spooled, placed, &target, |fingerprint, spooled| {
         LocalFileEvent::Written {
@@ -109,8 +113,8 @@ pub(crate) async fn write_conflicted(
 }
 
 /// Answers the placement outcome and removes the spool when it did not publish.
-/// The fingerprint is read at the published path, because the rename that puts
-/// it there moves the change time a spool fingerprint would carry.
+/// The fingerprint is read at the published path, in the same stable read that
+/// checks its bytes, because the rename moves the change time a spool carries.
 async fn finish_write(
     spooled: Spooled,
     placed: Result<(), PlaceError>,
@@ -120,29 +124,29 @@ async fn finish_write(
     match placed {
         // The hash answers for the spool's bytes, so it is only reported with a
         // file that still has exactly those bytes.
-        Ok(()) => match published_stat(published).await {
-            Some((fingerprint, size)) if size == spooled.size => written(fingerprint, &spooled),
+        Ok(()) => match hash_stable(published).await {
+            Ok((fingerprint, blake3, _)) if blake3 == spooled.blake3 => {
+                written(fingerprint, &spooled)
+            }
             _ => LocalFileEvent::Error {
                 message: "the published file is not the one that was written".to_string(),
             },
         },
-        Err(error) => {
+        Err(PlaceError::Kept(path)) => LocalFileEvent::Error {
+            message: format!(
+                "the displaced local file could not be put aside and was kept at {}",
+                path.display()
+            ),
+        },
+        Err(PlaceError::Refused(reason)) => {
             let _ = tokio::fs::remove_file(&spooled.path).await;
-            match error {
-                PlaceError::Refused(reason) => LocalFileEvent::Refused { reason },
-                PlaceError::Failed(message) => LocalFileEvent::Error { message },
-            }
+            LocalFileEvent::Refused { reason }
+        }
+        Err(PlaceError::Failed(message)) => {
+            let _ = tokio::fs::remove_file(&spooled.path).await;
+            LocalFileEvent::Error { message }
         }
     }
-}
-
-/// The published file's weak fingerprint and its size, read as one stat.
-async fn published_stat(path: &Path) -> Option<(String, u64)> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    Some((
-        weak_fingerprint(&FileStat::from_metadata(&metadata)),
-        metadata.len(),
-    ))
 }
 
 /// Moves one file into the folder's trash. A removal is never an unlink: the
@@ -212,6 +216,10 @@ pub(crate) async fn move_aside(root: &str, relative: &str, guard: &WriteGuard) -
             Err(PlaceError::Refused(LocalFileRefusal::Exists)) => continue,
             Err(PlaceError::Refused(reason)) => return LocalFileEvent::Refused { reason },
             Err(PlaceError::Failed(message)) => return LocalFileEvent::Error { message },
+            Err(PlaceError::Kept(path)) => {
+                let message = format!("the file was kept at {}", path.display());
+                return LocalFileEvent::Error { message };
+            }
         }
     }
     LocalFileEvent::Refused {
@@ -380,10 +388,7 @@ async fn spool_file(
     root: &str,
     blob: BackendStream<Result<Bytes, StreamError>>,
 ) -> Result<Spooled, String> {
-    let relative = format!("{SPOOL_DIR}/{}", Ulid::generate());
-    let (_, path) = jailed_target(root, &relative)
-        .await
-        .map_err(|event| format!("spool path refused: {event:?}"))?;
+    let path = reserved_file(root, SPOOL_DIR).await?;
     match write_temp(&path, blob).await {
         Ok(spooled) => Ok(spooled),
         Err(error) => {
@@ -391,6 +396,15 @@ async fn spool_file(
             Err(error)
         }
     }
+}
+
+/// A fresh path in one of the folder's reserved directories, created when missing.
+async fn reserved_file(root: &str, directory: &str) -> Result<PathBuf, String> {
+    let relative = format!("{directory}/{}", Ulid::generate());
+    let (_, path) = jailed_target(root, &relative)
+        .await
+        .map_err(|event| format!("reserved path refused: {event:?}"))?;
+    Ok(path)
 }
 
 async fn write_temp(
@@ -423,9 +437,9 @@ async fn write_temp(
 /// The second half of the replace rule: the spool and target swap places
 /// atomically, then only displaced bytes matching the guard are discarded;
 /// anything else is restored, or moved aside if restoring fails.
-#[cfg(not(windows))]
 async fn exchange_guarded(
-    spool: &Path,
+    spooled: &Spooled,
+    kept: &Path,
     target: &Path,
     blake3: &[u8; 32],
 ) -> Result<(), PlaceError> {
@@ -435,62 +449,98 @@ async fn exchange_guarded(
     if !link.is_file() {
         return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
     }
-    exchange(spool, target)?;
-    // The displaced file now sits at the spool path, where only its strong
+    swap_in(&spooled.path, kept, target).await?;
+    // The displaced file now sits at the kept path, where only its strong
     // hash can answer for it: the exchange renamed away its fingerprint.
-    let displaced = match hash_stable(spool).await {
-        Ok((_, hash, _)) => &hash == blake3,
-        Err(_) => false,
-    };
-    if displaced {
-        let _ = tokio::fs::remove_file(spool).await;
+    if holds_hash(kept, blake3).await {
+        let _ = tokio::fs::remove_file(kept).await;
         return Ok(());
     }
-    match exchange(spool, target) {
-        Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
-        // The swap back failed, so the owner's bytes stay under a name of their
-        // own instead of being left where the incoming version belongs.
-        Err(_) => match rescue_displaced(spool, target).await {
-            Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
-            Err(error) => Err(error),
-        },
+    Err(swap_back(kept, target, &spooled.blake3).await)
+}
+
+/// Swaps the spool in for the target through the kept path, so the bytes it
+/// displaces never sit where a sweep removes them.
+#[cfg(not(windows))]
+async fn swap_in(spool: &Path, kept: &Path, target: &Path) -> Result<(), PlaceError> {
+    place_new(spool, kept)?;
+    let swapped = exchange(kept, target);
+    if swapped.is_err() {
+        // Nothing moved, so the kept path still holds only the incoming bytes.
+        let _ = tokio::fs::remove_file(kept).await;
+    }
+    swapped
+}
+
+#[cfg(windows)]
+async fn swap_in(spool: &Path, kept: &Path, target: &Path) -> Result<(), PlaceError> {
+    let Err(error) = replace_file(target, spool, kept) else {
+        return Ok(());
+    };
+    if kept.exists() && rescue_displaced(kept, target).await.is_err() {
+        return Err(PlaceError::Kept(kept.to_path_buf()));
+    }
+    Err(PlaceError::Failed(error.to_string()))
+}
+
+/// Puts the displaced owner file at `kept` back at the target.
+#[cfg(not(windows))]
+async fn swap_back(kept: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
+    match exchange(kept, target) {
+        Ok(()) => settle_returned(kept, target, incoming).await,
+        Err(_) => keep_displaced(kept, target).await,
     }
 }
 
 #[cfg(windows)]
-async fn exchange_guarded(
-    spool: &Path,
-    target: &Path,
-    blake3: &[u8; 32],
-) -> Result<(), PlaceError> {
-    let Ok(link) = tokio::fs::symlink_metadata(target).await else {
-        return Err(PlaceError::Refused(LocalFileRefusal::Missing));
-    };
-    if !link.is_file() {
-        return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
+async fn swap_back(kept: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
+    let returned = kept.with_file_name(Ulid::generate().to_string());
+    match replace_file(target, kept, &returned) {
+        Ok(()) => settle_returned(&returned, target, incoming).await,
+        Err(_) => keep_displaced(kept, target).await,
     }
-    let backup = spool.with_file_name(format!("{}.displaced", Ulid::generate()));
-    if let Err(error) = replace_file(target, spool, &backup) {
-        if backup.exists() {
-            let _ = rescue_displaced(&backup, target).await;
-        }
-        return Err(PlaceError::Failed(error.to_string()));
+}
+
+/// Discards the file a swap back displaced only when it is the incoming
+/// download. A save the owner made in the meantime is the newest, so it goes
+/// back to the target and the older save is put beside it.
+async fn settle_returned(returned: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
+    if !holds_hash(returned, incoming).await {
+        let older = swap_newest(returned, target).unwrap_or_else(|_| returned.to_path_buf());
+        return keep_displaced(&older, target).await;
     }
-    let displaced = match hash_stable(&backup).await {
-        Ok((_, hash, _)) => &hash == blake3,
-        Err(_) => false,
-    };
-    if displaced {
-        let _ = tokio::fs::remove_file(&backup).await;
-        return Ok(());
+    let _ = tokio::fs::remove_file(returned).await;
+    PlaceError::Refused(LocalFileRefusal::Drifted)
+}
+
+/// Puts the newer save at `returned` back at the target and answers where the
+/// older save it displaced now sits.
+#[cfg(not(windows))]
+fn swap_newest(returned: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
+    exchange(returned, target)?;
+    Ok(returned.to_path_buf())
+}
+
+#[cfg(windows)]
+fn swap_newest(returned: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
+    let older = returned.with_file_name(Ulid::generate().to_string());
+    replace_file(target, returned, &older)
+        .map_err(|error| PlaceError::Failed(error.to_string()))?;
+    Ok(older)
+}
+
+/// Puts the owner's bytes at `kept` beside the target, or names the path they
+/// stay at when that fails.
+async fn keep_displaced(kept: &Path, target: &Path) -> PlaceError {
+    match rescue_displaced(kept, target).await {
+        Ok(()) => PlaceError::Refused(LocalFileRefusal::Drifted),
+        Err(_) => PlaceError::Kept(kept.to_path_buf()),
     }
-    match replace_file(target, &backup, spool) {
-        Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
-        Err(_) => match rescue_displaced(&backup, target).await {
-            Ok(()) => Err(PlaceError::Refused(LocalFileRefusal::Drifted)),
-            Err(error) => Err(error),
-        },
-    }
+}
+
+/// Whether the file at `path` holds exactly the bytes `blake3` names.
+async fn holds_hash(path: &Path, blake3: &[u8; 32]) -> bool {
+    matches!(hash_stable(path).await, Ok((_, hash, _)) if hash == *blake3)
 }
 
 /// Swaps two existing paths in one step. Neither file is ever destroyed.
@@ -551,12 +601,7 @@ async fn rescue_displaced(spool: &Path, target: &Path) -> Result<(), PlaceError>
         ));
     };
     let relative = target.to_string_lossy().to_string();
-    let stamp = conflict_stamp(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_millis() as u64)
-            .unwrap_or_default(),
-    );
+    let stamp = conflict_stamp(aruna_clock::unix_timestamp_millis());
     for attempt in 1..=MAX_COPY_ATTEMPTS {
         let candidate = parent.join(copy_name(&relative, &stamp, attempt));
         if place_new(spool, &candidate).is_ok() {
@@ -693,21 +738,10 @@ fn sibling_path(relative: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::fs_source::list_local;
-    use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use std::collections::HashMap;
 
     fn access(root: &Path, path: &str) -> ResolvedSourceAccess {
-        ResolvedSourceAccess::OpenDal {
-            kind: SourceConnectorKind::LocalDirectory,
-            config: HashMap::from([(
-                OFFERED_DIRECTORY_ROOT.to_string(),
-                root.to_string_lossy().to_string(),
-            )]),
-            path: path.to_string(),
-            version: None,
-        }
+        crate::fs_source::tests::access(root, path)
     }
 
     fn body(bytes: &'static [u8]) -> BackendStream<Result<Bytes, StreamError>> {
@@ -717,6 +751,28 @@ mod tests {
     async fn identity(path: &Path) -> (String, [u8; 32]) {
         let (fingerprint, blake3, _) = hash_stable(path).await.expect("file must hash");
         (fingerprint, blake3)
+    }
+
+    // A displaced owner file that could not be put aside survives the cleanup.
+    #[tokio::test]
+    async fn keeps_unrescued_file() {
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("displaced");
+        tokio::fs::write(&kept, b"owner edit").await.unwrap();
+        let spooled = Spooled {
+            path: kept.clone(),
+            blake3: [0; 32],
+            size: 10,
+        };
+        let placed = Err(PlaceError::Kept(kept.clone()));
+        let event = finish_write(spooled, placed, &root.path().join("target"), |_, _| {
+            LocalFileEvent::Error {
+                message: "not published".to_string(),
+            }
+        })
+        .await;
+        assert!(matches!(event, LocalFileEvent::Error { .. }));
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
     }
 
     #[tokio::test]
@@ -799,7 +855,7 @@ mod tests {
             panic!("the file must be written");
         };
 
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, true)
             .await
             .unwrap();
         let observed = entries
@@ -835,7 +891,7 @@ mod tests {
             panic!("an unchanged base must be replaced");
         };
         assert_eq!(tokio::fs::read(&file).await.unwrap(), b"newer");
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, true)
             .await
             .unwrap();
         let observed = entries
@@ -879,10 +935,77 @@ mod tests {
             tokio::fs::read(&file).await.unwrap(),
             b"the owner's own edit"
         );
-        let spooled = std::fs::read_dir(root.path().join(SPOOL_DIR))
-            .map(|entries| entries.filter_map(Result::ok).count())
-            .unwrap_or_default();
-        assert_eq!(spooled, 0);
+        for directory in [SPOOL_DIR, KEPT_DIR] {
+            let left = std::fs::read_dir(root.path().join(directory))
+                .map(|entries| entries.filter_map(Result::ok).count())
+                .unwrap_or_default();
+            assert_eq!(left, 0, "{directory} must be empty");
+        }
+    }
+
+    // A save the owner makes while the displaced file is checked is what the
+    // swap back displaces; both owner versions must survive it.
+    #[tokio::test]
+    async fn keeps_second_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let target = root.path().join("note.txt");
+        tokio::fs::write(&target, b"first save").await.unwrap();
+        let spool = reserved_file(&path, SPOOL_DIR).await.unwrap();
+        tokio::fs::write(&spool, b"incoming").await.unwrap();
+        let kept = reserved_file(&path, KEPT_DIR).await.unwrap();
+        assert!(swap_in(&spool, &kept, &target).await.is_ok());
+        // An editor saves by renaming a new file over the target.
+        let save = root.path().join("note.txt.save");
+        tokio::fs::write(&save, b"second save").await.unwrap();
+        tokio::fs::rename(&save, &target).await.unwrap();
+
+        let incoming = *::blake3::hash(b"incoming").as_bytes();
+        let refusal = swap_back(&kept, &target, &incoming).await;
+        assert!(matches!(
+            refusal,
+            PlaceError::Refused(LocalFileRefusal::Drifted)
+        ));
+        // The last writer wins: the second save is at the target, the first beside it.
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second save");
+        let mut versions = Vec::new();
+        for entry in std::fs::read_dir(root.path()).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_file() {
+                versions.push(std::fs::read(entry.path()).unwrap());
+            }
+        }
+        versions.sort();
+        assert_eq!(
+            versions,
+            vec![b"first save".to_vec(), b"second save".to_vec()]
+        );
+        assert!(!kept.exists());
+    }
+
+    // The file an exchange displaces sits where no folder check sweeps, so a
+    // crash before the guard decided still leaves the owner's bytes in place.
+    #[tokio::test]
+    async fn sweep_keeps_displaced() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let target = root.path().join("note.txt");
+        tokio::fs::write(&target, b"owner edit").await.unwrap();
+        let spool = reserved_file(&path, SPOOL_DIR).await.unwrap();
+        tokio::fs::write(&spool, b"incoming").await.unwrap();
+        let kept = reserved_file(&path, KEPT_DIR).await.unwrap();
+        assert!(swap_in(&spool, &kept, &target).await.is_ok());
+        let stale = std::time::SystemTime::now() - SPOOL_GRACE - std::time::Duration::from_secs(60);
+        let file = std::fs::File::options().write(true).open(&kept).unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        drop(file);
+
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"incoming");
     }
 
     #[tokio::test]
@@ -1058,7 +1181,7 @@ mod tests {
             .unwrap();
         age_spool(&root.path().join(SPOOL_DIR).join("stale")).await;
 
-        let (entries, _) = list_local(&access(root.path(), ""), 0, 10, true, true)
+        let (entries, _) = list_local(&access(root.path(), ""), Vec::new(), 10, true, true)
             .await
             .unwrap();
         let mut paths: Vec<&str> = entries.iter().map(|entry| entry.path.as_str()).collect();
@@ -1136,17 +1259,17 @@ mod tests {
     }
 
     // The reported hash is the spool's, so it may only be paired with a file
-    // that still holds exactly those bytes.
+    // that still holds exactly those bytes, even one of the same length.
     #[tokio::test]
     async fn refuses_replaced_publish() {
         let root = tempfile::tempdir().unwrap();
         let spooled = Spooled {
             path: root.path().join("spool"),
-            blake3: [7u8; 32],
+            blake3: *::blake3::hash(b"hello").as_bytes(),
             size: 5,
         };
         let published = root.path().join("note.txt");
-        tokio::fs::write(&published, b"another").await.unwrap();
+        tokio::fs::write(&published, b"olleh").await.unwrap();
 
         let event = finish_write(spooled, Ok(()), &published, |fingerprint, spooled| {
             LocalFileEvent::Written {

@@ -5,13 +5,13 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
-use aruna_core::structs::NetworkDiagnosticsState;
 use aruna_core::structs::execution::notification_watch::WatchInterestTable;
-use aruna_storage::StorageHandle;
+use aruna_core::structs::info::NetworkDiagnosticsState;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
@@ -28,8 +28,7 @@ use crate::connection_pool::{ConnectionPool, ConnectionPoolOptions};
 use crate::connectivity::{
     PeerEvent, PeerManagerState, run_connectivity_manager, send_connectivity_event,
 };
-use crate::dht::DhtHandle;
-use crate::dht::handle::DhtSpawnResources;
+use crate::dht::handle::{DhtHandle, DhtSpawnResources};
 use crate::discovery::{local_endpoint_addr, read_persisted_peers, spawn_signed_publisher};
 use crate::document_sync::DocumentSyncService;
 use crate::effect_handlers::{self, NetEffectContext};
@@ -70,9 +69,15 @@ impl NetHandle {
                 relay_method: runtime.relay_method,
                 realm_peers: peers.realm_peers,
                 config_applied: tokio::sync::Mutex::new(None),
+                config_seen: std::sync::atomic::AtomicU64::new(u64::MAX),
                 inbound_admission: peers.inbound_admission,
                 watch_interest: handle_state.watch_interest,
                 heartbeats: Arc::default(),
+                peer_contacts: Default::default(),
+                issuer_keys: Default::default(),
+                federation_keys: Default::default(),
+                #[cfg(feature = "test-hooks")]
+                dropped_answer: Default::default(),
                 download_gauge: Arc::default(),
                 avoided_holders: Default::default(),
                 notification_watch_metrics: NotificationWatchMetrics::default(),
@@ -361,24 +366,29 @@ impl NetworkServices {
             }
         }
 
-        let document_sync_path = config.sync_storage_path.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("aruna-document-sync-{}", ulid::Ulid::generate()))
-        });
         // Configured bootstrap peers join the persisted realm peers so a fresh
         // joiner admits its seed's pushes before the first realm config applies.
         let mut document_sync_peers = realm_peer_nodes;
         document_sync_peers.extend(runtime.peer_hints.iter().copied());
-        let mut document_sync = match DocumentSyncService::open_with_policy(
-            runtime.endpoint.clone(),
-            storage.clone(),
-            document_sync_path,
-            &document_sync_peers,
-            runtime.app_alpns.clone(),
-            config.document_sync_runtime.unwrap_or_default(),
-            config.fjall_persist_policy,
-            config.realm_id,
-        ) {
-            Ok(document_sync) => document_sync,
+        // A failed open drops the temporary folder after the database it held.
+        let opened = match sync_storage(config.sync_storage_path.clone()) {
+            Ok((path, fallback)) => {
+                let service = DocumentSyncService::open_with_policy(
+                    runtime.endpoint.clone(),
+                    storage.clone(),
+                    path,
+                    &document_sync_peers,
+                    runtime.app_alpns.clone(),
+                    config.document_sync_runtime.unwrap_or_default(),
+                    config.fjall_persist_policy,
+                    config.realm_id,
+                );
+                service.map(|service| (service, fallback))
+            }
+            Err(error) => Err(error),
+        };
+        let (mut document_sync, fallback_dir) = match opened {
+            Ok(opened) => opened,
             Err(error) => {
                 runtime.shutdown.cancel();
                 let mut tasks = dht_resources.tasks;
@@ -391,6 +401,7 @@ impl NetworkServices {
         };
         // Dial-side half of the ALPN x kind matrix: sync never targets a device.
         document_sync.set_peer_kinds(peers.inbound_admission.peer_kinds());
+        document_sync.keep_fallback(fallback_dir);
         let document_sync = Arc::new(document_sync);
 
         let streams = Arc::new(StreamsService::new(connection_pool.clone()));
@@ -405,6 +416,21 @@ impl NetworkServices {
             dht_resources,
         ))
     }
+}
+
+/// Where the document sync database lives: the configured folder, or a temporary one whose
+/// guard the caller keeps for the database's lifetime, so it is removed with it.
+fn sync_storage(
+    configured: Option<std::path::PathBuf>,
+) -> Result<(std::path::PathBuf, Option<tempfile::TempDir>)> {
+    if let Some(path) = configured {
+        return Ok((path, None));
+    }
+    let dir = tempfile::Builder::new()
+        .prefix("aruna-document-sync-")
+        .tempdir()
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+    Ok((dir.path().to_path_buf(), Some(dir)))
 }
 
 /// Background loops started last, owned together for shutdown.
@@ -444,6 +470,7 @@ impl BackgroundRuntime {
         let inbound_tasks = TaskTracker::new();
         let effect_context = Arc::new(NetEffectContext {
             dht: services.dht.clone(),
+            secret_key: runtime.endpoint.secret_key().clone(),
             document_sync: services.document_sync.clone(),
             presence: effect_handlers::RealmPresenceCache::default(),
             tasks: inbound_tasks.clone(),
@@ -540,5 +567,26 @@ impl BackgroundRuntime {
             accept_shutdown,
             tasks,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A database without a configured folder lives in a temporary one that goes with its guard,
+    // which the service keeps last; a configured folder is used as it is and stays.
+    #[test]
+    fn fallback_dir_removed() {
+        let (path, guard) = sync_storage(None).unwrap();
+        assert!(path.is_dir());
+        drop(guard);
+        assert!(!path.exists());
+
+        let kept = tempfile::tempdir().unwrap();
+        let (path, guard) = sync_storage(Some(kept.path().to_path_buf())).unwrap();
+        assert_eq!(path, kept.path());
+        assert!(guard.is_none());
+        assert!(kept.path().is_dir());
     }
 }

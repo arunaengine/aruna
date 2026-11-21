@@ -160,7 +160,9 @@ pub(super) fn record_effect_fields(span: &Span, effect: &StorageEffect) {
                 span.record("txn_id", field::display(txn_id));
             }
         }
-        StorageEffect::SyncAll => {}
+        StorageEffect::SyncAll
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => {}
         StorageEffect::BeginUsageRebuild { key_space }
         | StorageEffect::FinishUsageRebuild { key_space } => {
             span.record("key_space", field::display(key_space));
@@ -190,6 +192,8 @@ pub(super) fn storage_effect_kind(effect: &StorageEffect) -> &'static str {
         StorageEffect::VaultDelete { .. } => "vault_delete",
         StorageEffect::BeginUsageRebuild { .. } => "begin_usage_rebuild",
         StorageEffect::FinishUsageRebuild { .. } => "finish_usage_rebuild",
+        StorageEffect::RealmOpen(_) => "realm_open",
+        StorageEffect::CompilePolicies(_) => "compile_policies",
     }
 }
 
@@ -202,9 +206,19 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(_) => "net",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
+        Effect::Background(_) => "background",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
+        Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
+        Effect::Git(_) => "git",
+        Effect::Outbound(_) => "outbound",
+        Effect::Plugin(_) => "plugin",
+        Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 
@@ -223,5 +237,7 @@ pub(super) fn storage_event_kind(event: &StorageEvent) -> &'static str {
         StorageEvent::IterResult { .. } => "iter_result",
         StorageEvent::VaultResult { .. } => "vault_result",
         StorageEvent::Error { .. } => "error",
+        StorageEvent::RealmOpened { .. } => "realm_opened",
+        StorageEvent::PoliciesCompiled(_) => "policies_compiled",
     }
 }

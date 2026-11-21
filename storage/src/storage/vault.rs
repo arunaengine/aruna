@@ -6,7 +6,9 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
 use aruna_core::keyspaces::NODE_VAULT_KEYSPACE;
-use aruna_core::node_vault::{NodeVaultKey, VaultEntry};
+use aruna_core::node::vault::{NodeVaultKey, VaultEntry};
+
+use super::sealing::fresh_nonce;
 
 fn not_open() -> StorageError {
     StorageError::KeyspaceError("node vault is not open".to_string())
@@ -26,7 +28,7 @@ pub(super) fn vault_effect(
         } => {
             let value = vault_key
                 .ok_or_else(not_open)?
-                .seal(entry, secret.bytes())
+                .seal(entry, secret.bytes(), fresh_nonce()?)
                 .map_err(|error| StorageError::WriteError(error.to_string()))?;
             let write = StorageEffect::Write {
                 key_space,
@@ -81,10 +83,11 @@ pub(super) fn vault_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FjallStorage, StorageHandle};
+    use crate::storage::handle::StorageHandle;
+    use crate::storage::worker::FjallStorage;
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::events::Event;
-    use aruna_core::node_vault::VaultPurpose;
+    use aruna_core::node::vault::VaultPurpose;
     use aruna_core::types::{TxnId, Value};
     use ulid::Ulid;
 
@@ -265,5 +268,32 @@ mod tests {
             read(&handle, backend).await,
             StorageEvent::Error { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn realm_needs_keys() {
+        // A handle that was never given the realm keys answers NoKey and opens nothing.
+        use aruna_core::realm_vault::{
+            RealmSealed, RealmVaultEntry, RealmVaultError, RealmVaultPurpose, RealmVaultRecord,
+        };
+        use aruna_core::structs::identity::realm::RealmId;
+        let entry = RealmVaultEntry::new(RealmVaultPurpose::NamedSecret, Ulid::from_bytes([5; 16]));
+        let realm_id = RealmId::from_bytes([3u8; 32]);
+        let record = RealmVaultRecord {
+            entry,
+            revision: Ulid::from_bytes([6; 16]),
+            sealed: vec![0; 40],
+            changed_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([7; 16]), realm_id),
+            changed_at_ms: 1,
+        };
+        let effect = StorageEffect::RealmOpen(Box::new(RealmSealed::Record { realm_id, record }));
+        let directory = tempfile::tempdir().unwrap();
+        let handle = open(directory.path().to_str().unwrap(), Some(1));
+        assert_eq!(
+            handle.send_storage_effect(effect).await,
+            Event::Storage(StorageEvent::RealmOpened {
+                result: Err(RealmVaultError::NoKey)
+            })
+        );
     }
 }

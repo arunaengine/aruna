@@ -1,102 +1,19 @@
-//! Shared retry math, page draining and timer arming for the two device queues.
-//! The stored state enums stay distinct; only their control flow lives here.
+//! Drains the two device queues page by page, forwarding the due entries side by side.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::future::Future;
-use std::time::Duration;
+use aruna_core::rows::{outside_answer, outside_call};
+use std::fmt::Debug;
 
-use aruna_core::task::{TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
-use aruna_tasks::TaskHandle;
-use futures_util::StreamExt;
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::types::{Key, Value};
 use tracing::warn;
 
-use crate::tasks::queue_backoff::retry_delay_ms;
-
-use super::drain::DrainOutcome;
-use super::publish_queue::{PublishEntry, PublishState};
-use super::sync::repository::{SyncUpload, UploadState};
-
-/// The retry view both device queue states expose.
-pub(crate) trait RetryView {
-    /// When the entry may be forwarded again; `None` while it is terminal.
-    fn due_at_ms(&self) -> Option<u64>;
-    /// Forwards already spent; zero while the entry is terminal.
-    fn attempts(&self) -> u32;
-
-    /// Whether the drain may pick the entry up now.
-    fn is_due(&self, now_ms: u64) -> bool {
-        self.due_at_ms()
-            .is_some_and(|due_at_ms| due_at_ms <= now_ms)
-    }
-}
-
-impl RetryView for PublishState {
-    fn due_at_ms(&self) -> Option<u64> {
-        match self {
-            Self::Pending { due_at_ms, .. } | Self::Publishing { due_at_ms, .. } => {
-                Some(*due_at_ms)
-            }
-            Self::Published { .. } | Self::Failed { .. } => None,
-        }
-    }
-
-    fn attempts(&self) -> u32 {
-        match self {
-            Self::Pending { attempts, .. } | Self::Publishing { attempts, .. } => *attempts,
-            Self::Published { .. } | Self::Failed { .. } => 0,
-        }
-    }
-}
-
-impl RetryView for UploadState {
-    fn due_at_ms(&self) -> Option<u64> {
-        match self {
-            Self::Pending { due_at_ms, .. } => Some(*due_at_ms),
-            Self::Transferring { .. } => Some(0),
-            Self::Failed { .. } => None,
-        }
-    }
-
-    fn attempts(&self) -> u32 {
-        match self {
-            Self::Pending { attempts, .. } | Self::Transferring { attempts, .. } => *attempts,
-            Self::Failed { .. } => 0,
-        }
-    }
-}
-
-impl RetryView for PublishEntry {
-    fn due_at_ms(&self) -> Option<u64> {
-        self.state.due_at_ms()
-    }
-
-    fn attempts(&self) -> u32 {
-        self.state.attempts()
-    }
-}
-
-impl RetryView for SyncUpload {
-    fn due_at_ms(&self) -> Option<u64> {
-        self.state.due_at_ms()
-    }
-
-    fn attempts(&self) -> u32 {
-        self.state.attempts()
-    }
-}
-
-/// Due time for the next attempt after `attempts` failures.
-pub(crate) fn retry_due_ms(attempts: u32) -> u64 {
-    unix_timestamp_millis().saturating_add(retry_delay_ms(attempts))
-}
-
-/// Whether `attempts` spent exhausts `max_attempts` and parks the row.
-pub(crate) fn exhausted(attempts: u32, max_attempts: u32) -> bool {
-    attempts >= max_attempts
-}
+use super::retry::RetryView;
+use crate::device::publish_queue::DrainOutcome;
 
 /// What forwarding one due queue entry asks of the drain.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,217 +24,151 @@ pub(crate) enum ForwardOutcome {
     Settled,
 }
 
-/// One device queue as the page drain drives it.
-pub(crate) trait QueueDrain {
+/// One forward as a member of the drain's window.
+pub(crate) fn forward_member<O>(forward: O) -> Effect
+where
+    O: Operation<Output = ForwardOutcome> + 'static,
+    O::Error: PartialEq + 'static,
+{
+    Effect::SubOperation(boxed_suboperation(forward, |result| {
+        Event::Child(ChildOutcome::new(result))
+    }))
+}
+
+/// One device queue as the page drain runs it.
+pub(crate) trait DrainQueue: Send + Debug + PartialEq {
     type Entry: RetryView;
 
-    fn read(
-        &mut self,
-        cursor: Option<Key>,
-    ) -> impl Future<Output = Option<(Vec<Self::Entry>, Option<Key>)>> + Send;
-
-    fn forward(&self, entry: Self::Entry) -> impl Future<Output = ForwardOutcome> + Send;
+    /// The keyspace of the queue and how many rows one page reads.
+    fn page(&self) -> (&'static str, usize);
+    /// The entry a row holds; a row that does not decode is skipped.
+    fn entry(&self, value: &Value) -> Option<Self::Entry>;
+    /// The forward of one due entry, which reports a [`ForwardOutcome`] or an error of `E`.
+    fn forward(&self, entry: Self::Entry) -> Effect;
+    /// Whether a finished forward asks for another pass.
+    fn rechecks(&self, outcome: ChildOutcome) -> bool;
 }
 
-/// Drains one queue page by page: entries that are not due are skipped, the
-/// rest go to `forward`, at most `in_flight` at once. `forward` reports whether
-/// the entry asks for another pass, so each queue keeps its own claim ordering.
-pub(crate) async fn drain_queue<Q: QueueDrain>(
+/// Reads whether a forward's outcome asks for another pass; a failed forward does.
+pub(crate) fn outcome_rechecks<E: 'static>(outcome: ChildOutcome) -> bool {
+    !matches!(
+        outcome.take::<ForwardOutcome, E>(),
+        Some(Ok(ForwardOutcome::Settled))
+    )
+}
+
+/// Drains one queue page by page: entries that are not due are skipped, the rest are forwarded,
+/// at most `in_flight` at once. Each forward reports whether it asks for another pass, so each
+/// queue keeps its own claim ordering.
+#[derive(Debug, PartialEq)]
+pub(crate) struct DrainOperation<Q> {
+    queue: Q,
     now_ms: u64,
-    mut queue: Q,
     in_flight: usize,
-) -> DrainOutcome {
-    let mut cursor: Option<Key> = None;
-    let mut needs_recheck = false;
-    loop {
-        let Some((entries, next)) = queue.read(cursor).await else {
-            return DrainOutcome::Deferred;
-        };
-        let due = entries.into_iter().filter(|entry| entry.is_due(now_ms));
-        let mut outcomes = futures_util::stream::iter(due)
-            .map(|entry| queue.forward(entry))
-            .buffer_unordered(in_flight.max(1));
-        while let Some(outcome) = outcomes.next().await {
-            needs_recheck |= outcome == ForwardOutcome::Recheck;
-        }
-        match next {
-            Some(next) => cursor = Some(next),
-            None => break,
+    cursor: Option<Key>,
+    next: Option<Key>,
+    recheck: bool,
+    forwarding: bool,
+}
+
+type Draining = Result<Next<DrainOutcome>, IoError>;
+
+impl<Q: DrainQueue> DrainOperation<Q> {
+    pub(crate) fn new(queue: Q, now_ms: u64, in_flight: usize) -> Self {
+        Self {
+            queue,
+            now_ms,
+            in_flight,
+            cursor: None,
+            next: None,
+            recheck: false,
+            forwarding: false,
         }
     }
-    match needs_recheck {
-        true => DrainOutcome::Recheck,
-        false => DrainOutcome::Idle,
+
+    fn read_page(&mut self) -> Draining {
+        let (space, limit) = self.queue.page();
+        let page = IoCall::Page {
+            space: space.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: self.cursor.take(),
+            limit,
+        };
+        self.forwarding = false;
+        Ok(Next::Call(outside_call(page)))
+    }
+
+    fn page_done(&mut self) -> Draining {
+        match self.next.take() {
+            Some(next) => {
+                self.cursor = Some(next);
+                self.read_page()
+            }
+            None => Ok(Next::Done(match self.recheck {
+                true => DrainOutcome::Recheck,
+                false => DrainOutcome::Idle,
+            })),
+        }
+    }
+
+    fn page_read(&mut self, result: IoResult) -> Draining {
+        let (rows, next) = match outside_answer(result).and_then(IoResult::page) {
+            Ok(page) => page,
+            Err(error) => {
+                warn!(%error, "Failed to scan a device queue");
+                return Ok(Next::Done(DrainOutcome::Deferred));
+            }
+        };
+        self.next = next;
+        let members: Vec<Effect> = (rows.iter())
+            .filter_map(|(_, value)| self.queue.entry(value))
+            .filter(|entry| entry.is_due(self.now_ms))
+            .map(|entry| self.queue.forward(entry))
+            .collect();
+        if members.is_empty() {
+            return self.page_done();
+        }
+        self.forwarding = true;
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: self.in_flight.max(1),
+            form: GroupForm::Window,
+        })))
     }
 }
 
-/// Arms `task_key` now, reporting a scheduling failure under `failure`.
-pub(crate) async fn arm_timer(task_handle: &TaskHandle, task_key: TaskKey, failure: &str) {
-    if let TaskEvent::Error { message, .. } = task_handle
-        .schedule_idle_timer(task_key, Duration::ZERO)
-        .await
-    {
-        warn!(message = %message, "{}", failure);
+impl<Q: DrainQueue> Operation for DrainOperation<Q> {
+    type Output = DrainOutcome;
+    type Error = IoError;
+
+    fn first(&mut self) -> Draining {
+        self.read_page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Draining {
+        if !self.forwarding {
+            return self.page_read(result);
+        }
+        match result {
+            IoResult::Group(GroupEvent::Member { result, .. }) => {
+                self.recheck |= match result {
+                    GroupResult::Done(event) => match *event {
+                        Event::Child(outcome) => self.queue.rechecks(outcome),
+                        _ => true,
+                    },
+                    _ => true,
+                };
+                Ok(Next::Wait)
+            }
+            IoResult::Group(GroupEvent::Closed) => self.page_done(),
+            other => Err(IoError::Unexpected {
+                expected: "IoResult::Group",
+                got: other.label(),
+            }),
+        }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    use aruna_core::types::Key;
-    use tokio::sync::Barrier;
-
-    use super::{ForwardOutcome, QueueDrain, RetryView, drain_queue};
-    use crate::device::drain::DrainOutcome;
-
-    #[derive(Clone, Debug)]
-    struct Entry {
-        due_at_ms: u64,
-        recheck: bool,
-    }
-
-    impl RetryView for Entry {
-        fn due_at_ms(&self) -> Option<u64> {
-            Some(self.due_at_ms)
-        }
-
-        fn attempts(&self) -> u32 {
-            0
-        }
-    }
-
-    /// A queue whose each `read` takes the next scripted page.
-    struct FakeQueue {
-        pages: Vec<Option<Vec<Entry>>>,
-        forwarded: Arc<AtomicUsize>,
-    }
-
-    impl FakeQueue {
-        fn new(pages: Vec<Option<Vec<Entry>>>, forwarded: Arc<AtomicUsize>) -> Self {
-            Self { pages, forwarded }
-        }
-    }
-
-    impl QueueDrain for FakeQueue {
-        type Entry = Entry;
-
-        async fn read(&mut self, _cursor: Option<Key>) -> Option<(Vec<Entry>, Option<Key>)> {
-            match self.pages.remove(0) {
-                Some(entries) => {
-                    let next = (!self.pages.is_empty()).then(|| Key::from(vec![1]));
-                    Some((entries, next))
-                }
-                None => None,
-            }
-        }
-
-        async fn forward(&self, entry: Entry) -> ForwardOutcome {
-            self.forwarded.fetch_add(1, Ordering::SeqCst);
-            match entry.recheck {
-                true => ForwardOutcome::Recheck,
-                false => ForwardOutcome::Settled,
-            }
-        }
-    }
-
-    fn entry(due_at_ms: u64, recheck: bool) -> Entry {
-        Entry { due_at_ms, recheck }
-    }
-
-    #[tokio::test]
-    async fn rechecks_last_entry() {
-        // Processing the last entry may still ask for another pass, so the
-        // outcome must not claim that entries remain or that none do.
-        let queue = FakeQueue::new(vec![Some(vec![entry(0, true)])], Arc::default());
-        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Recheck);
-    }
-
-    #[tokio::test]
-    async fn rechecks_failed_claim() {
-        // A failed claim also asks for another pass: the entry may have
-        // advanced rather than the queue being empty.
-        let queue = FakeQueue::new(vec![Some(vec![entry(0, true)])], Arc::default());
-        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Recheck);
-    }
-
-    #[tokio::test]
-    async fn skips_future_entries() {
-        let queue = FakeQueue::new(vec![Some(vec![entry(1_000, true)])], Arc::default());
-        assert_eq!(drain_queue(999, queue, 1).await, DrainOutcome::Idle);
-    }
-
-    #[tokio::test]
-    async fn defers_partial_pass() {
-        // A later page that cannot be read must not hide work already
-        // forwarded from an earlier one.
-        let forwarded = Arc::default();
-        let queue = FakeQueue::new(
-            vec![Some(vec![entry(0, true)]), None],
-            Arc::clone(&forwarded),
-        );
-        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Deferred);
-        assert_eq!(forwarded.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn settles_without_recheck() {
-        let queue = FakeQueue::new(vec![Some(vec![entry(0, false)])], Arc::default());
-        assert_eq!(drain_queue(0, queue, 1).await, DrainOutcome::Idle);
-    }
-
-    /// Entries wait at a barrier as wide as the limit, so the limit is reached and never passed.
-    struct GateQueue {
-        pages: Vec<Vec<Entry>>,
-        gate: Arc<Barrier>,
-        running: Arc<AtomicUsize>,
-        peak: Arc<AtomicUsize>,
-        seen: Arc<Mutex<Vec<u64>>>,
-    }
-
-    impl QueueDrain for GateQueue {
-        type Entry = Entry;
-
-        async fn read(&mut self, _cursor: Option<Key>) -> Option<(Vec<Entry>, Option<Key>)> {
-            let entries = self.pages.remove(0);
-            let next = (!self.pages.is_empty()).then(|| Key::from(vec![1]));
-            Some((entries, next))
-        }
-
-        async fn forward(&self, entry: Entry) -> ForwardOutcome {
-            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
-            self.peak.fetch_max(now, Ordering::SeqCst);
-            self.seen.lock().unwrap().push(entry.due_at_ms);
-            self.gate.wait().await;
-            // The last to arrive must still count as running when the next forward starts.
-            tokio::task::yield_now().await;
-            self.running.fetch_sub(1, Ordering::SeqCst);
-            ForwardOutcome::Settled
-        }
-    }
-
-    #[tokio::test]
-    async fn bounds_in_flight() {
-        let (running, peak, seen) = (Arc::default(), Arc::default(), Arc::default());
-        let queue = GateQueue {
-            pages: vec![
-                (0..6)
-                    .map(|id| entry(id, false))
-                    .chain([entry(5_000, false)])
-                    .collect(),
-                (6..9).map(|id| entry(id, false)).collect(),
-            ],
-            gate: Arc::new(Barrier::new(3)),
-            running: Arc::clone(&running),
-            peak: Arc::clone(&peak),
-            seen: Arc::clone(&seen),
-        };
-        assert_eq!(drain_queue(1_000, queue, 3).await, DrainOutcome::Idle);
-        assert_eq!(peak.load(Ordering::SeqCst), 3);
-        assert_eq!(running.load(Ordering::SeqCst), 0);
-        let mut seen = seen.lock().unwrap().clone();
-        seen.sort_unstable();
-        assert_eq!(seen, (0..9).collect::<Vec<_>>());
-    }
-}
+#[path = "backlog_tests.rs"]
+mod tests;

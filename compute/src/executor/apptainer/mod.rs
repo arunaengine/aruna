@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
+use aruna_core::compute::backend::RuntimeDestination;
 use aruna_core::compute::runtimes::SESSION_SOCKET_PATH;
 use aruna_core::compute::{
     AdoptableEvidence, ArtifactEvidence, AttemptPhase, AttemptStatus, BackendError, CancelEvidence,
@@ -29,7 +30,10 @@ use super::channel::ChannelStream;
 use super::config::ApptainerConfig;
 use super::logs::BoundedTail;
 use super::staging::{StageLayout, StagePlan};
-use super::{BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, now_ms};
+use super::{
+    BackendCaps, ExecutorBackend, SessionChannel, digest_pinned, enforced_limit, host_capabilities,
+};
+use aruna_clock::unix_timestamp_millis;
 
 mod runtime;
 #[cfg(feature = "slurm")]
@@ -289,15 +293,14 @@ impl ExecutorBackend for ApptainerBackend {
         ExecutorKind::Apptainer
     }
 
+    fn destination(&self) -> Option<RuntimeDestination> {
+        Some(RuntimeDestination::Apptainer {
+            state_root: self.config.state_root.display().to_string(),
+        })
+    }
+
     fn capabilities(&self) -> BackendCaps {
-        BackendCaps {
-            file_staging: true,
-            direct_s3: true,
-            local_site: true,
-            session: true,
-            limits: self.config.envelope,
-            ..BackendCaps::default()
-        }
+        host_capabilities(self.config.envelope)
     }
 
     fn granted(&self, spec: &TaskSpec) -> Result<GrantedResources, BackendError> {
@@ -470,18 +473,7 @@ impl ExecutorBackend for ApptainerBackend {
         context: &FenceContext,
         limits: &LogLimits,
     ) -> Result<LogTails, BackendError> {
-        validate_control(self.state.read(context)?, context)?;
-        let logs = self.state.attempt_dir(context).join("logs");
-        let stdout = read_log(&logs.join("stdout"), limits).await?;
-        let stderr = read_log(&logs.join("stderr"), limits).await?;
-        Ok(LogTails {
-            stdout: stdout.0,
-            stderr: stderr.0,
-            stdout_total: stdout.1,
-            stderr_total: stderr.1,
-            stdout_truncated: stdout.2,
-            stderr_truncated: stderr.2,
-        })
+        attempt_logs(&self.state, context, limits).await
     }
 
     async fn fetch_output(
@@ -997,6 +989,26 @@ fn repository_name(image: &str) -> &str {
     }
 }
 
+/// The log tails of a fenced attempt, read from its state directory.
+async fn attempt_logs(
+    state: &StateRoot,
+    context: &FenceContext,
+    limits: &LogLimits,
+) -> Result<LogTails, BackendError> {
+    validate_control(state.read(context)?, context)?;
+    let logs = state.attempt_dir(context).join("logs");
+    let stdout = read_log(&logs.join("stdout"), limits).await?;
+    let stderr = read_log(&logs.join("stderr"), limits).await?;
+    Ok(LogTails {
+        stdout: stdout.0,
+        stderr: stderr.0,
+        stdout_total: stdout.1,
+        stderr_total: stderr.1,
+        stdout_truncated: stdout.2,
+        stderr_truncated: stderr.2,
+    })
+}
+
 async fn read_log(path: &Path, limits: &LogLimits) -> Result<(Vec<u8>, u64, bool), BackendError> {
     let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
@@ -1094,7 +1106,7 @@ fn lost_status(directory: &Path) -> AttemptStatus {
         },
         backend_ref: directory.display().to_string(),
         started_at_ms: None,
-        finished_at_ms: Some(now_ms()),
+        finished_at_ms: Some(unix_timestamp_millis()),
         detail: None,
     }
 }

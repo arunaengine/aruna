@@ -3,24 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::credential_job_id;
+use aruna_core::structs::execution::job::local::credential_job_id;
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::link::LinkTarget;
-use aruna_operations::driver::drive;
-use aruna_operations::jobs::source_read::READ_OPERATION;
-use aruna_operations::jobs::store::read_job_record;
-use aruna_operations::s3::object::get::GetObjectError;
+use aruna_core::structs::storage::listing::{ListVersionsItem, ListVersionsResult};
+use aruna_core::structs::storage::read_grant::READ_OPERATION;
+use aruna_drivers::driver::drive;
+use aruna_drivers::position::seal_cursor;
 use aruna_operations::s3::object::link::{
-    LinkCaller, LinkError, LinkSource, authorize_target, create_link, head_target, read_target,
-    target_visible,
+    AuthorizeTargetOperation, CreateLinkOperation, HeadTargetOperation, LinkCaller, LinkError,
+    LinkNode, LinkSource, ReadTargetOperation, TargetVisibleOperation,
 };
-use aruna_operations::s3::object::versions::{
-    ListVersionsInput, ListVersionsItem, ListVersionsOperation, ListVersionsResult,
-};
-use aruna_operations::s3::object::visible::{SCAN_BUDGET, seal_cursor};
+use aruna_operations::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
+use aruna_operations::s3::object::visible::SCAN_BUDGET;
 use s3s::dto::{ETag, ETagCondition, GetObjectOutput, StreamingBlob};
 use s3s::{S3Response, S3Result, s3_error};
 
@@ -28,7 +26,7 @@ use super::ArunaS3Service;
 use super::object::object_range_request;
 use crate::s3::error::IntoS3Error;
 
-fn link_error(error: LinkError) -> s3s::S3Error {
+pub(in crate::s3::service) fn link_error(error: LinkError) -> s3s::S3Error {
     match error {
         LinkError::Denied => s3_error!(AccessDenied, "The link target may not be read"),
         LinkError::NotFound => s3_error!(NoSuchKey, "The link target does not exist."),
@@ -50,14 +48,21 @@ impl ArunaS3Service {
             session: None,
         };
         if let Some(job_id) = credential_job_id(&access.access_key)
-            && let Ok(Some(record)) =
-                read_job_record(&self.state.storage_handle, job_id, None).await
+            && let Ok(Some(record)) = crate::job_service::read_job_record(&self.state, job_id).await
             && record.created_by == access.user_identity
             && record.workspace_bucket.as_deref() == Some(bucket)
         {
             auth.path_restrictions = None;
         }
         LinkCaller::of_access(auth, access)
+    }
+
+    /// This node as a link read needs it.
+    pub(in crate::s3::service) fn link_node(&self) -> LinkNode {
+        LinkNode {
+            local: self.node_id,
+            ids: self.state.node_and_realm(),
+        }
     }
 
     /// Refuses a link the caller may not read the target of; other versions pass.
@@ -71,9 +76,12 @@ impl ArunaS3Service {
             return Ok(());
         };
         let caller = self.link_caller(access, bucket).await;
-        head_target(&self.state, &caller, &target, self.node_id)
-            .await
-            .map_err(link_error)
+        drive(
+            HeadTargetOperation::new(&caller, &target, self.link_node()),
+            &self.state,
+        )
+        .await
+        .map_err(link_error)
     }
 
     /// A GetObject of a link: the target's bytes, or the asked range of them. `If-Match` holds
@@ -98,10 +106,16 @@ impl ArunaS3Service {
             // Only a caller the target's GET admits learns that its ETag differs, before any
             // range is weighed: here the local check decides; elsewhere the target opens a read.
             match target.arn.node_id == self.node_id {
-                true => authorize_target(&self.state, &caller.auth, &target, READ_OPERATION).await,
-                false => read_target(&self.state, &caller, &target, (self.node_id, None))
-                    .await
-                    .map(drop),
+                true => {
+                    let check =
+                        AuthorizeTargetOperation::new(&caller.auth, &target, READ_OPERATION);
+                    drive(check, &self.state).await
+                }
+                false => {
+                    let node = self.link_node();
+                    let read = ReadTargetOperation::new(&caller, &target, node, None);
+                    drive(read, &self.state).await.map(drop)
+                }
             }
             .map_err(link_error)?;
             return Err(s3_error!(PreconditionFailed, "The ETag does not match"));
@@ -110,16 +124,10 @@ impl ArunaS3Service {
             .map(object_range_request)
             .map(|range| range.resolve(recorded.content_length))
             .transpose()
-            .map_err(|error| match error {
-                GetObjectError::InvalidRange => {
-                    s3_error!(InvalidRange, "The requested range is not satisfiable")
-                }
-                _ => s3_error!(InvalidArgument, "The range is invalid"),
-            })?;
+            .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
         let asked = resolved.as_ref().map(|resolved| resolved.range.clone());
-        let blob = read_target(&self.state, &caller, &target, (self.node_id, asked))
-            .await
-            .map_err(link_error)?;
+        let read = ReadTargetOperation::new(&caller, &target, self.link_node(), asked);
+        let blob = drive(read, &self.state).await.map_err(link_error)?;
         let length = match &resolved {
             Some(resolved) => resolved.content_length,
             None => i64::try_from(recorded.content_length).unwrap_or(i64::MAX),
@@ -186,9 +194,8 @@ impl ArunaS3Service {
             req.input.key.as_str(),
             dest.group_id,
         );
-        let version = create_link(&self.state, &caller, destination, (self.node_id, source))
-            .await
-            .map_err(link_error)?;
+        let create = CreateLinkOperation::new(&caller, destination, self.link_node(), source);
+        let version = drive(create, &self.state).await.map_err(link_error)?;
         Ok(S3Response::new(s3s::dto::CopyObjectOutput {
             copy_object_result: Some(s3s::dto::CopyObjectResult {
                 e_tag: Some(ETag::Strong(version.to_string())),
@@ -201,31 +208,20 @@ impl ArunaS3Service {
 }
 
 impl ArunaS3Service {
-    /// Whether a listed entry may show: every entry but a link whose target the reader may not
-    /// read. A request without a credential reads as the Everyone principal.
-    pub(super) async fn link_listable(
+    /// Whom a listing follows links for. A request without a credential reads as the Everyone
+    /// principal, and as no credential expires, only the delegation's lifetime bounds a HEAD.
+    pub(in crate::s3::service) async fn listing_caller(
         &self,
         reader: Option<&UserAccess>,
         bucket: &str,
-        object: &aruna_operations::s3::object::list::ListedObject,
-    ) -> S3Result<bool> {
-        let Some(binding) = object.link.as_ref() else {
-            return Ok(true);
-        };
-        let Some(target) = LinkTarget::of(binding, self.realm_id) else {
-            return Ok(false);
-        };
-        let caller = match reader {
+    ) -> LinkCaller {
+        match reader {
             Some(access) => self.link_caller(access, bucket).await,
-            // No credential expires, so only the delegation's own lifetime bounds a remote HEAD.
             None => LinkCaller {
                 auth: AuthContext::anonymous(self.realm_id),
                 credential: (String::new(), ulid::Ulid::nil(), u64::MAX),
             },
-        };
-        target_visible(&self.state, &caller, &target, self.node_id)
-            .await
-            .map_err(link_error)
+        }
     }
 }
 
@@ -267,9 +263,10 @@ impl ArunaS3Service {
             return Ok(true);
         };
         match LinkTarget::of(binding, self.realm_id) {
-            Some(target) => target_visible(&self.state, caller, &target, self.node_id)
-                .await
-                .map_err(link_error),
+            Some(target) => {
+                let visible = TargetVisibleOperation::new(caller, &target, self.link_node());
+                drive(visible, &self.state).await.map_err(link_error)
+            }
             None => Ok(false),
         }
     }

@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::on_use::CACHE_CAPACITY_BYTES;
-use super::{DataStrategy, DistributionSnapshot, KeyRange};
+use super::{DataStrategy, KeyRange};
 use crate::errors::ConversionError;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 /// Estimated metadata bytes per object on a member: head and version rows, inventory, version,
 /// content and search index entries and queue rows. An estimate until measured in the testbed.
@@ -194,10 +195,9 @@ mod tests {
     fn unopened_ranges_empty() {
         use crate::structs::identity::realm::RealmId;
         use crate::structs::storage::distribution::presets::shard_layout;
-        use crate::structs::storage::distribution::{
-            DistributionConfig, DistributionRequest, DistributionSettings, SetRoot, Statement,
-            next_snapshot,
-        };
+        use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+        use crate::structs::storage::distribution::statement::{SetRoot, Statement};
+        use crate::structs::storage::distribution::{DistributionConfig, DistributionSettings};
 
         let secret = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]);
         let (realm, member) = (RealmId::from_bytes([9; 32]), Ulid::from_bytes([1; 16]));

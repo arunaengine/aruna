@@ -3,26 +3,36 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::compute;
 use super::jobs::LegacyInput;
+use super::prune_index::family_of;
+use super::session_refs;
+use super::tombstones::{Remains, Stated};
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
-use aruna_core::compute::ExecutionTargetId;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
     JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{
-    EffectiveResources, ExecutionSpec, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobId,
-    JobPayload, JobRecord, JobRecordEnvelope, JobRetryPolicy, RunCrateStatus, SubmissionClaim,
-    SubmissionId, WitnessBudgetRecord, cleanup_job_id, job_entry_prefix,
+use aruna_core::structs::execution::job::family::{
+    EffectiveResources, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
+    JobRetryPolicy, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    JobRecord, RunCrateStatus, cleanup_job_id, job_entry_prefix,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
+};
+use aruna_core::structs::execution::job::rows::prune_delete_entries;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
-use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
-use aruna_operations::jobs::store::prune_delete_entries;
+use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -31,9 +41,10 @@ use ulid::Ulid;
 
 /// Where a stored envelope names its record variant: after the 32 bytes of the realm id.
 const VARIANT_AT: usize = 32;
-/// Variant indexes of `JobFamilyRecord::Spec` and `JobFamilyRecord::Launch`.
+/// Variant indexes of `JobFamilyRecord::Spec`, `JobFamilyRecord::Launch` and the receipt.
 const SPEC: u8 = 0;
 const LAUNCH: u8 = 3;
+const RECEIPT: u8 = 4;
 
 /// A row of a family keyspace: an envelope first, then fields alpha.134 stored the same way.
 pub(super) trait Held: Serialize + DeserializeOwned {
@@ -70,12 +81,13 @@ pub(super) struct Evidence {
     receipts: BTreeSet<(Ulid, [u8; 32], [u8; 32])>,
 }
 
-/// A spec or launch row: its envelope when it reads back unchanged in the current layout, and
-/// its envelope when it reads back unchanged in the alpha.134 layout.
+/// A spec, launch or receipt row: its envelope when it reads back unchanged in the current
+/// layout or in the alpha.134 layout, and its ids when it reads as alpha.206 stored it.
 pub(super) struct Candidate {
     key: Vec<u8>,
     current: Option<JobRecordEnvelope>,
     historical: Option<OldEnvelope>,
+    unnamed: Option<(SubmissionId, [u8; 32], JobId)>,
 }
 
 /// What the migration deletes: the families of old specs and launches, with their local runs.
@@ -84,6 +96,8 @@ pub(super) struct Removal {
     families: BTreeSet<[u8; 64]>,
     jobs: BTreeSet<JobId>,
     executions: BTreeSet<Ulid>,
+    /// What each removed family with records leaves, as a finished prune leaves it.
+    remains: BTreeMap<[u8; 64], Remains>,
     /// Stored keys to delete, by keyspace.
     pub(super) rows: BTreeMap<String, BTreeSet<Vec<u8>>>,
     /// Run crate documents of deleted jobs, which stay.
@@ -103,12 +117,13 @@ pub(super) fn scan<T: Held>(
         if let Some(envelope) = &current {
             evidence.add(envelope);
         }
-        if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH)) {
-            let historical = exact::<(OldEnvelope, T::Tail)>(&value).map(|(old, _)| old);
+        if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH | &RECEIPT)) {
+            let historical = old_envelope::<(OldEnvelope, T::Tail)>(&value).map(|(old, _)| old);
             candidates.push(Candidate {
                 key: key.to_vec(),
                 current,
                 historical,
+                unnamed: compute::family_ids::<T::Tail>(&value),
             });
         }
     }
@@ -153,13 +168,16 @@ pub(super) fn old_families(
     )))
 }
 
+/// The tombstone and the two prune index rows of one removed family, as keyspace, key and value.
+pub(super) type TombstoneRows = [(String, Key, Value); 3];
+
 impl Removal {
     pub(super) fn is_empty(&self) -> bool {
         self.families.is_empty()
     }
 
     /// Rows whose key names a removed family at `offset`. Records and aliases also name the
-    /// family's jobs and executions.
+    /// family's jobs and executions; records must go first, so aliases find their tombstone.
     pub(super) fn family_rows(
         &mut self,
         db: &OptimisticTxDatabase,
@@ -173,12 +191,16 @@ impl Removal {
         for entry in db.read_tx().iter(&keyspace) {
             let (key, value) = entry.into_inner()?;
             let family = key.get(offset..offset + 64);
-            if !family.is_some_and(|family| self.families.contains(family)) {
+            let family = family.and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+            let Some(family) = family.filter(|family| self.families.contains(family)) else {
                 continue;
-            }
+            };
             match name {
-                FAMILY_ALIAS_KEYSPACE => self.alias_job(&key),
-                FAMILY_RECORD_KEYSPACE => self.record_jobs(&value),
+                FAMILY_ALIAS_KEYSPACE if self.alias_job(&key, &family) => continue,
+                FAMILY_RECORD_KEYSPACE => {
+                    self.record_jobs(&value);
+                    self.remains.entry(family).or_default().record(&value);
+                }
                 _ => {}
             }
             self.add(name, &key);
@@ -194,7 +216,8 @@ impl Removal {
         keyspace: &OptimisticTxKeyspace,
         rewrites: &[(Vec<u8>, Vec<u8>)],
     ) -> Result<(), ExplorerError> {
-        if self.is_empty() {
+        // An alpha.206 job record is always among the rewrites.
+        if self.is_empty() && rewrites.is_empty() {
             return Ok(());
         }
         let rewrites: BTreeMap<&[u8], &[u8]> = rewrites
@@ -212,7 +235,15 @@ impl Removal {
                 JobPayload::WriteRunCrate { for_job } => self.jobs.contains(for_job),
                 _ => false,
             };
-            if parent || self.jobs.contains(&record.job_id) || cleanups.contains(&record.job_id) {
+            // An execution of that release goes with its family, which cannot be re-signed;
+            // any other job only gains the fields it lacks and stays.
+            let execution = matches!(record.payload, JobPayload::Execution(_));
+            let unnamed = execution && compute::old_job(&stored).is_some();
+            if unnamed
+                || parent
+                || self.jobs.contains(&record.job_id)
+                || cleanups.contains(&record.job_id)
+            {
                 records.push(record);
             }
         }
@@ -305,15 +336,35 @@ impl Removal {
         Ok(())
     }
 
-    /// An alias key starts with the job id it binds.
-    fn alias_job(&mut self, key: &[u8]) {
-        if let Some(Ok(id)) = key.get(..16).map(<[u8; 16]>::try_from) {
-            self.jobs.insert(JobId::from_bytes(id));
-        }
+    /// The rows a finished prune at `now_ms` leaves of each removed family with records.
+    pub(super) fn tombstones(&self, now_ms: u64) -> Result<Vec<TombstoneRows>, ExplorerError> {
+        (self.remains.iter())
+            .map(|(family, remains)| remains.rows(&family_of(*family), now_ms))
+            .collect()
+    }
+
+    /// An alias key starts with the job id it binds. Answers whether the alias stays, as the
+    /// tombstone of a family with records keeps answering it until both expire.
+    fn alias_job(&mut self, key: &[u8], family: &[u8; 64]) -> bool {
+        let Some(Ok(id)) = key.get(..16).map(<[u8; 16]>::try_from) else {
+            return false;
+        };
+        let job_id = JobId::from_bytes(id);
+        self.jobs.insert(job_id);
+        let Some(remains) = self.remains.get_mut(family) else {
+            return false;
+        };
+        remains.alias(job_id);
+        true
     }
 
     /// Claims name a logical job; receipts name the physical job and execution on this node.
     fn record_jobs(&mut self, value: &[u8]) {
+        if let Some((physical_job_id, execution_id)) = compute::receipt_jobs(value) {
+            self.jobs.insert(physical_job_id);
+            self.executions.insert(execution_id);
+            return;
+        }
         let Ok(envelope) = postcard::from_bytes::<JobRecordEnvelope>(value) else {
             return;
         };
@@ -409,7 +460,7 @@ impl Candidate {
                     _ => None,
                 })
         };
-        let (submission_id, request_digest, job_id) = old.or_else(current)?;
+        let (submission_id, request_digest, job_id) = old.or(self.unnamed).or_else(current)?;
         let family = JobFamilyId {
             submission_id,
             request_digest,
@@ -419,7 +470,7 @@ impl Candidate {
 }
 
 /// `T` read from `value` when it encodes back to the same bytes.
-fn exact<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
+pub(super) fn exact<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
     let decoded = postcard::from_bytes::<T>(value).ok()?;
     let bytes = postcard::to_allocvec(&decoded).ok()?;
     (bytes == value).then_some(decoded)
@@ -449,7 +500,7 @@ struct OldLaunch {
     scheduler_seq: u32,
     witness_placement: PlacementRef,
     holder_generation: u64,
-    target: ExecutionTargetId,
+    target: compute::Target,
     inputs: Vec<OldPlanned>,
     output_policies: Vec<PlacementPolicyRef>,
     plan_digest: [u8; 32],
@@ -497,34 +548,53 @@ struct OldEnvelope {
     signature: iroh::Signature,
 }
 
+/// The time an alpha.134 spec, claim or launch states, and a spec's submitter.
+pub(super) fn old_stated(value: &[u8]) -> Option<Stated> {
+    Some(match old_envelope::<OldEnvelope>(value)?.record {
+        OldRecord::Spec(spec) => (Some(spec.created_at_ms), Some(spec.created_by)),
+        OldRecord::Claim(claim) => (Some(claim.accepted_at_ms), None),
+        OldRecord::Budget(_) => (None, None),
+        OldRecord::Launch(launch) => (Some(launch.created_at_ms), None),
+    })
+}
+
+/// An alpha.134 envelope: its job payload has no backend name yet, so `ExecutionSpec` is read
+/// with the fields alpha.134 stored.
+fn old_envelope<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
+    exact::<T>(value).or_else(|| session_refs::decode::<T>(value, compute::UNNAMED).ok())
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use crate::explorer::ExplorerError;
     use crate::migrate::tests::{read, write};
     use crate::migrate::{MigrateOutput, migrate_output};
-    use aruna_core::NodeId;
-    use aruna_core::UserId;
+    use aruna::tasks::runner::recover_stale_jobs;
     use aruna_core::compute::ExecutionTargetId;
+    use aruna_core::id::NodeId;
     use aruna_core::keyspaces::{
         ACTIVE_USER_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
-        FAMILY_PENDING_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE,
-        JOB_RESERVATION_KEYSPACE, RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE,
-        WITNESS_DEADLINE_KEYSPACE,
+        FAMILY_RECORD_KEYSPACE, JOB_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+        RUN_CRATE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
     };
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, ExecutionReceipt, ExecutionSpec, JobAdmissionRecord, JobFamilyId,
-        JobFamilyRecord, JobId, JobPayload, JobRecord, JobRecordEnvelope, JobRecordKey,
-        JobRecordKind, JobRetryPolicy, LaunchIntent, RunCrateStatus, SubmissionClaim, SubmissionId,
-        WitnessBudgetRecord,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, ExecutionReceipt, JobAdmissionRecord, JobFamilyId, JobFamilyRecord,
+        JobRecordEnvelope, JobRecordKey, JobRecordKind, JobRetryPolicy, LaunchIntent,
+        SubmissionClaim, SubmissionId,
     };
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
+    use aruna_core::structs::execution::job::rows::job_insert_entries;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementPolicyRef;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::types::GroupId;
-    use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord};
-    use aruna_operations::jobs::runtime::JobsRuntime;
-    use aruna_operations::jobs::store::{job_insert_entries, list_user_jobs};
-    use aruna_storage::FjallStorage;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::jobs::runtime::JobsRuntime;
+    use aruna_operations::jobs::store::list_jobs::ListJobsOperation;
+    use aruna_storage::storage::worker::FjallStorage;
     use serde::Serialize;
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -567,12 +637,47 @@ mod tests {
         scheduler_seq: u32,
         witness_placement: PlacementRef,
         holder_generation: u64,
-        target: ExecutionTargetId,
+        target: OldTarget,
         inputs: Vec<OldPlanned>,
         output_policies: Vec<PlacementPolicyRef>,
         plan_digest: [u8; 32],
         spec_digest: [u8; 32],
         created_at_ms: u64,
+    }
+
+    /// `ExecutionTargetId` as alpha.134 stored it, before the backend name.
+    #[derive(Serialize)]
+    struct OldTarget {
+        node_id: NodeId,
+        executor_kind: String,
+    }
+
+    /// `ExecutionSpec` as alpha.134 stored it: the current fields up to `collision_policy`.
+    struct OldExecution(ExecutionSpec);
+
+    impl Serialize for OldExecution {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeStruct;
+            let spec = &self.0;
+            let mut state = serializer.serialize_struct("ExecutionSpec", 16)?;
+            state.serialize_field("group_id", &spec.group_id)?;
+            state.serialize_field("name", &spec.name)?;
+            state.serialize_field("description", &spec.description)?;
+            state.serialize_field("tags", &spec.tags)?;
+            state.serialize_field("image", &spec.image)?;
+            state.serialize_field("entrypoint", &spec.entrypoint)?;
+            state.serialize_field("command", &spec.command)?;
+            state.serialize_field("workdir", &spec.workdir)?;
+            state.serialize_field("env", &spec.env)?;
+            state.serialize_field("resources", &spec.resources)?;
+            state.serialize_field("executor_constraint", &spec.executor_constraint)?;
+            state.serialize_field("inputs", &spec.inputs)?;
+            state.serialize_field("file_outputs", &spec.file_outputs)?;
+            state.serialize_field("workspace_outputs", &spec.workspace_outputs)?;
+            state.serialize_field("output_prefixes", &spec.output_prefixes)?;
+            state.serialize_field("collision_policy", &spec.collision_policy)?;
+            state.end()
+        }
     }
 
     /// `CapturedInput` as alpha.134 stored it.
@@ -597,7 +702,7 @@ mod tests {
         group_id: GroupId,
         created_by: UserId,
         created_at_ms: u64,
-        payload: ExecutionSpec,
+        payload: OldExecution,
         request_digest: [u8; 32],
         spec_digest: [u8; 32],
         resources: EffectiveResources,
@@ -627,14 +732,6 @@ mod tests {
         signature: iroh::Signature,
     }
 
-    #[derive(Serialize)]
-    struct OldPending {
-        envelope: OldEnvelope,
-        need: PendingNeed,
-        first_seen_ms: u64,
-        attempts: u32,
-    }
-
     fn secret() -> iroh::SecretKey {
         iroh::SecretKey::from_bytes(&[7u8; 32])
     }
@@ -646,6 +743,7 @@ mod tests {
     fn target() -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: secret().public(),
+            backend: "kubernetes".to_string(),
             executor_kind: "kubernetes".to_string(),
         }
     }
@@ -668,6 +766,7 @@ mod tests {
             workspace_outputs: Vec::new(),
             output_prefixes: Vec::new(),
             collision_policy: Default::default(),
+            backend: None,
         }
     }
 
@@ -681,7 +780,10 @@ mod tests {
             scheduler_seq: 1,
             witness_placement: PlacementRef::NIL,
             holder_generation: 1,
-            target: target(),
+            target: OldTarget {
+                node_id: secret().public(),
+                executor_kind: "kubernetes".to_string(),
+            },
             inputs: vec![OldPlanned {
                 destination_key: "inputs/table.csv".to_string(),
                 version_id: Ulid::from_bytes([6u8; 16]),
@@ -718,7 +820,7 @@ mod tests {
             group_id,
             created_by: user(),
             created_at_ms: 1_000,
-            payload: execution(),
+            payload: OldExecution(execution()),
             request_digest: OLD.request_digest,
             spec_digest: [9u8; 32],
             resources,
@@ -780,6 +882,7 @@ mod tests {
             plan_digest: [8u8; 32],
             spec_digest,
             created_at_ms,
+            config_clock: Default::default(),
         };
         signed(JobFamilyRecord::Launch(Box::new(launch)))
     }
@@ -816,12 +919,15 @@ mod tests {
             subject_generation: 1,
             subject_digest: [12u8; 32],
             accepted_at_ms: 3_000,
+            config_clock: Default::default(),
+            config_generation: 0,
+            config_digest: [0u8; 32],
         };
         signed(JobFamilyRecord::Receipt(Box::new(receipt)))
     }
 
     /// The storage key of a record of `kind` in `family`.
-    fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
+    pub(crate) fn key(family: JobFamilyId, kind: JobRecordKind, seed: u8) -> Vec<u8> {
         let key = JobRecordKey {
             family,
             kind,
@@ -873,9 +979,9 @@ mod tests {
 
     #[tokio::test]
     async fn deletes_old_families() {
-        // An alpha.134 spec and launch take their whole family, its local jobs and execution
-        // with them. A current family and its job stay, the run crate stays, and the node lists
-        // and recovers jobs from what is left. A second run changes nothing.
+        // An alpha.134 spec and launch take their family, local jobs and execution; the alias
+        // stays with the tombstone. A current family, its job and the run crate stay, the node
+        // lists and recovers jobs from what is left, and a second run changes nothing.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let kept_job = JobId::from_bytes([21u8; 16]);
@@ -888,9 +994,11 @@ mod tests {
         let alias = [kept_job.to_bytes().as_slice(), &KEPT.to_bytes()].concat();
         write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
         store_job(&path, kept_job);
+        let (logical, physical) = (JobId::from_bytes([5u8; 16]), JobId::from_bytes([22u8; 16]));
+        let alias = [logical.to_bytes().as_slice(), &OLD.to_bytes()].concat();
+        write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
         let kept = snapshot(&path);
 
-        let (logical, physical) = (JobId::from_bytes([5u8; 16]), JobId::from_bytes([22u8; 16]));
         let execution = Ulid::from_bytes([23u8; 16]);
         let rows = [
             (
@@ -911,8 +1019,6 @@ mod tests {
             .iter()
             .map(|(key, value)| (key.as_slice(), value.clone()));
         write(&path, FAMILY_RECORD_KEYSPACE, rows.collect());
-        let alias = [logical.to_bytes().as_slice(), &OLD.to_bytes()].concat();
-        write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
         let outbox = key(OLD, JobRecordKind::Claim, 5);
         write(&path, FAMILY_OUTBOX_KEYSPACE, vec![(&outbox, vec![1])]);
         let deadline = [7u64.to_be_bytes().as_slice(), &OLD.to_bytes()].concat();
@@ -937,114 +1043,53 @@ mod tests {
             (output.old_families_deleted, output.run_crates_kept),
             (1, 1)
         );
+        assert_eq!(output.families_tombstoned, 1);
         assert_eq!(deleted(&output, FAMILY_RECORD_KEYSPACE), 4);
-        assert_eq!(deleted(&output, FAMILY_ALIAS_KEYSPACE), 1);
+        assert_eq!(deleted(&output, FAMILY_ALIAS_KEYSPACE), 0);
         assert_eq!(deleted(&output, JOB_KEYSPACE), 2);
         assert_eq!(deleted(&output, JOB_RESERVATION_KEYSPACE), 1);
         assert_eq!(snapshot(&path), kept);
         assert_eq!(read(&path, RUN_CRATE_KEYSPACE), run_crate);
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(again.old_families_deleted, 0);
+        assert_eq!(
+            (again.old_families_deleted, again.families_tombstoned),
+            (0, 0)
+        );
         assert!(again.old_runs_deleted.is_empty());
         assert_eq!(snapshot(&path), kept);
 
-        let storage = FjallStorage::open(path.to_str().unwrap()).unwrap();
-        let (jobs, _) = list_user_jobs(&storage, user(), None, 10, |_| true)
+        let context = DriverContext {
+            storage_handle: FjallStorage::open(path.to_str().unwrap()).unwrap(),
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
+        let (jobs, _) = drive(ListJobsOperation::new(user(), None, 10, |_| true), &context)
             .await
             .unwrap();
         let listed: Vec<JobId> = jobs.iter().map(|job| job.job_id).collect();
         assert_eq!(listed, [kept_job]);
-        let recovered = JobsRuntime::new().recover_stale_jobs(&storage).await;
+        let recovered = recover_stale_jobs(&JobsRuntime::new(), &context).await;
         assert_eq!(recovered, Ok(0), "startup recovery reads what is left");
     }
 
     #[test]
-    fn deletes_receipted_aliases() {
-        // An alpha.134 launch without inputs and a plan digest starting with zero reads back
-        // unchanged as a current launch, with shifted digests. A receipt binding its aliased
-        // digest but its true spec digest is no evidence, so the family goes, receipt included.
-        let temp = tempdir().unwrap();
-        let path = temp.path().join("db");
+    fn launches_never_alias() {
+        // Launches cite their scheduler's realm config clock, so an alpha.134 launch no longer
+        // reads as a current one, and a current launch no longer reads as alpha.134.
         let mut launch = old_launch(1);
         launch.inputs.clear();
         launch.plan_digest[0] = 0;
-        launch.created_at_ms = 1_730_000_000_000;
-        let pending = |envelope| OldPending {
-            envelope,
-            need: PendingNeed::Evidence(JobRecordKind::Spec),
-            first_seen_ms: 2_000,
-            attempts: 1,
-        };
-        let launch = OldRecord::Launch(Box::new(launch));
-        let bytes = postcard::to_allocvec(&pending(old_envelope(launch))).unwrap();
-        let aliased = super::exact::<PendingRecord>(&bytes).expect("aliases a current row");
-        let digest = aliased.envelope.record.digest().unwrap();
-        let receipt = PendingRecord {
-            envelope: postcard::from_bytes(&receipt(
-                JobId::from_bytes([22u8; 16]),
-                Ulid::nil(),
-                digest,
-            ))
-            .unwrap(),
-            need: PendingNeed::Evidence(JobRecordKind::Spec),
-            first_seen_ms: 3_000,
-            attempts: 1,
-        };
-        let rows = [
-            (key(OLD, JobRecordKind::Launch, 1), bytes),
-            (
-                key(OLD, JobRecordKind::Receipt, 2),
-                postcard::to_allocvec(&receipt).unwrap(),
-            ),
-        ];
-        let rows = rows
-            .iter()
-            .map(|(key, value)| (key.as_slice(), value.clone()));
-        write(&path, FAMILY_PENDING_KEYSPACE, rows.collect());
+        let old = OldRecord::Launch(Box::new(launch));
+        let bytes = postcard::to_allocvec(&old_envelope(old)).unwrap();
+        assert!(super::exact::<JobRecordEnvelope>(&bytes).is_none());
 
-        let output = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(deleted(&output, FAMILY_PENDING_KEYSPACE), 2);
-        assert!(read(&path, FAMILY_PENDING_KEYSPACE).is_empty());
-    }
-
-    #[test]
-    fn keeps_bound_launches() {
-        // A current launch whose bytes also read as alpha.134 counts as old until a budget binds
-        // its spec digest; then it stays unchanged, also on a second run.
         let launch = current_launch([0x99u8; 32], 1_730_000_000_000);
-        let historical = super::exact::<(super::OldEnvelope, ())>(&launch);
-        assert!(historical.is_some(), "also reads as alpha.134");
-        let budget = signed(JobFamilyRecord::Budget(WitnessBudgetRecord {
-            submission_id: OLD.submission_id,
-            request_digest: OLD.request_digest,
-            scheduler_node_id: secret().public(),
-            source_spec_digest: [0x99u8; 32],
-            max_launches: 1,
-        }));
-        let launch_key = key(OLD, JobRecordKind::Launch, 1);
-        let budget_key = key(OLD, JobRecordKind::Budget, 1);
-
-        let temp = tempdir().unwrap();
-        let alone = temp.path().join("alone");
-        write(
-            &alone,
-            FAMILY_RECORD_KEYSPACE,
-            vec![(&launch_key, launch.clone())],
-        );
-        let output = migrate_output(alone.to_str().unwrap()).unwrap();
-        assert_eq!(output.old_families_deleted, 1);
-
-        let bound = temp.path().join("bound");
-        let rows = vec![(&launch_key[..], launch), (&budget_key[..], budget)];
-        write(&bound, FAMILY_RECORD_KEYSPACE, rows);
-        let rows = read(&bound, FAMILY_RECORD_KEYSPACE);
-        for _ in 0..2 {
-            let output = migrate_output(bound.to_str().unwrap()).unwrap();
-            assert_eq!((output.records_scanned, output.records_rewritten), (2, 0));
-            assert_eq!(output.old_families_deleted, 0);
-            assert_eq!(read(&bound, FAMILY_RECORD_KEYSPACE), rows);
-        }
+        assert!(super::exact::<(super::OldEnvelope, ())>(&launch).is_none());
     }
 
     #[test]

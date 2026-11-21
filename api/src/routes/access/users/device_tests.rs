@@ -6,19 +6,21 @@ use super::{
     UserDeviceResponse, evict_device, list_user_devices, preferences_from_attributes,
     revoke_user_device,
 };
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use crate::error::ServerError;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -35,7 +37,7 @@ struct Fixture {
     _dir: TempDir,
 }
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
@@ -49,9 +51,10 @@ async fn setup_devices() -> Fixture {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -137,7 +140,7 @@ async fn setup_devices() -> Fixture {
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -151,16 +154,11 @@ async fn setup_devices() -> Fixture {
 }
 
 fn auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: user_id.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, user_id.realm_id)
 }
 
 async fn devices(state: &Arc<ServerState>, owner: UserId) -> Vec<UserDeviceResponse> {
-    let (_, Json(listed)) = list_user_devices(State(state.clone()), Extension(Some(auth(owner))))
+    let (_, Json(listed)) = list_user_devices(State(state.clone()), UnrestrictedAuth(auth(owner)))
         .await
         .unwrap();
     listed.devices
@@ -207,7 +205,7 @@ async fn revokes_pending_device() {
 
     let status = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(pending.id.clone()),
     )
     .await
@@ -218,7 +216,7 @@ async fn revokes_pending_device() {
 
     let repeated = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(pending.id),
     )
     .await;
@@ -239,14 +237,15 @@ async fn rejects_stranger_device() {
 
     let foreign = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(node(3).to_string()),
     )
     .await;
     assert!(matches!(foreign, Err(ServerError::NotFound)));
 
-    let anonymous = list_user_devices(State(fixture.state), Extension(None)).await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    // `list_user_devices` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let anonymous = extract::<UnrestrictedAuth>(&fixture.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -257,7 +256,7 @@ async fn evicts_enrolled_device() {
 
     let status = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(node(2).to_string()),
     )
     .await
@@ -269,7 +268,7 @@ async fn evicts_enrolled_device() {
 
     let repeated = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.owner))),
+        UnrestrictedAuth(auth(fixture.owner)),
         Path(node(2).to_string()),
     )
     .await;
@@ -307,7 +306,7 @@ async fn admin_evicts_device() {
 
     let status = revoke_user_device(
         State(fixture.state.clone()),
-        Extension(Some(auth(fixture.other))),
+        UnrestrictedAuth(auth(fixture.other)),
         Path(node(3).to_string()),
     )
     .await

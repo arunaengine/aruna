@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::extract;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
 };
+use aruna_core::structs::identity::auth::AuthContext;
 use axum::http::StatusCode;
 
 fn request(key: &str) -> TextObjectRequest {
@@ -24,7 +27,7 @@ async fn write(
 ) -> ServerResult<Json<WriteObjectOutput>> {
     write_text_object(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path(bucket.to_string()),
@@ -59,16 +62,9 @@ async fn refuses_bad_writes() {
         write(&node, &node.stranger, BUCKET, request("a.md")).await,
         Err(ServerError::Forbidden)
     ));
-    let anonymous = write_text_object(
-        State(node.state.clone()),
-        Extension(None),
-        Extension(None),
-        HeaderMap::new(),
-        Path(BUCKET.to_string()),
-        Json(request("a.md")),
-    )
-    .await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    // `write_text_object` takes `RealmAuth`, so the refusal is the extractor's.
+    let anonymous = extract::<RealmAuth>(&node.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -148,7 +144,7 @@ async fn relay_failures_answer() {
     // A relay needs the caller's token to pass on.
     let tokenless = write_text_object(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(None),
         HeaderMap::new(),
         Path(BUCKET.to_string()),

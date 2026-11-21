@@ -16,7 +16,10 @@ impl DocumentSyncService {
     /// Decodes a genesis tie-break eviction into outbox events to re-emit with
     /// `allow_genesis: false`, preserving ids where the format can. Control ops
     /// and whole-document admin payloads carry nothing a peer can accept.
-    pub fn decode_eviction(&self, eviction: TopicEviction) -> Vec<DocumentEvictedDocument> {
+    pub(in crate::document_sync) fn decode_eviction(
+        &self,
+        eviction: TopicEviction,
+    ) -> Vec<DocumentEvictedDocument> {
         self.clear_cursor(eviction.topic_id);
         if let Err(error) = self.flush_database() {
             warn!(%error, topic_id = %eviction.topic_id, "Failed to persist document sync fan-out cursor reset");

@@ -3,18 +3,38 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::NodeId;
 use crate::compute::quota::{ComputeDemandSnapshot, ComputeReservationSnapshot, SnapshotError};
 use crate::compute::{ExecutorAvailability, MAX_ADVERTISED_EXECUTORS};
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::MAX_KIND_LEN;
-use crate::structs::storage::node_info::{AdvertisementEpoch, NodeUtilization};
+use crate::structs::storage::node_info::{AdvertisementEpoch, NodeInfoDocument, NodeUtilization};
+
+/// How recently a peer must have reached this node to count as seen. A device beats every 60
+/// seconds and shuffles which node it asks, so three beats keep one skipped turn from reading as gone.
+pub const PEER_CONTACT_WINDOW: Duration = Duration::from_secs(180);
+
+/// Whether a peer last seen at `seen_ms` still counts as seen at `now_ms`.
+pub fn seen_recently(seen_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(seen_ms) <= PEER_CONTACT_WINDOW.as_millis() as u64
+}
 
 /// Largest encoded heartbeat a peer accepts.
 pub const MAX_HEARTBEAT_BYTES: usize = 32 * 1024;
+/// Interval between two heartbeats. Peers treat a heartbeat older than three intervals as stale
+/// telemetry.
+pub const INFO_PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// Oldest heartbeat that still counts as current telemetry: three missed intervals.
+pub const MAX_HEARTBEAT_AGE: std::time::Duration =
+    std::time::Duration::from_secs(3 * INFO_PUBLISH_INTERVAL.as_secs());
+/// Deadline for reading or sending one heartbeat.
+pub const HEARTBEAT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// One heartbeat. `epoch` names the committed advertisement it belongs to, with the send time as
 /// `observed_at_ms`; `sequence` grows by one per heartbeat of one process.
@@ -24,7 +44,7 @@ pub struct NodeHeartbeat {
     pub epoch: AdvertisementEpoch,
     pub sequence: u64,
     pub utilization: NodeUtilization,
-    /// Availability per advertised executor kind, ordered by kind.
+    /// Availability per advertised backend name, ordered by name.
     pub availability: Vec<(String, ExecutorAvailability)>,
     pub reservation: ComputeReservationSnapshot,
     pub demand: ComputeDemandSnapshot,
@@ -45,8 +65,8 @@ pub struct RunningJobs {
 pub enum HeartbeatError {
     #[error("a heartbeat names at most {MAX_ADVERTISED_EXECUTORS} executors")]
     ExecutorCount,
-    #[error("executor kinds must be 1..={MAX_KIND_LEN} bytes, unique and ordered")]
-    ExecutorKind,
+    #[error("backend names must be 1..={MAX_KIND_LEN} bytes, unique and ordered")]
+    BackendName,
     #[error("snapshot epochs must name the heartbeat's advertisement")]
     EpochMismatch,
     #[error("a heartbeat is at most {MAX_HEARTBEAT_BYTES} bytes")]
@@ -66,14 +86,14 @@ impl NodeHeartbeat {
         let malformed = self
             .availability
             .iter()
-            .any(|(kind, _)| kind.is_empty() || kind.len() > MAX_KIND_LEN || kind.trim() != kind);
+            .any(|(name, _)| name.is_empty() || name.len() > MAX_KIND_LEN || name.trim() != name);
         if malformed
             || self
                 .availability
                 .windows(2)
                 .any(|pair| pair[0].0 >= pair[1].0)
         {
-            return Err(HeartbeatError::ExecutorKind);
+            return Err(HeartbeatError::BackendName);
         }
         self.demand.validate()?;
         let current = revision(&self.epoch);
@@ -127,6 +147,87 @@ pub struct HeldHeartbeat {
     pub heartbeat: NodeHeartbeat,
     pub age_ms: u64,
     pub received_at_ms: u64,
+}
+
+/// A heartbeat action the runner carries out with the node's net handle.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HeartbeatEffect {
+    /// Keeps this node's own heartbeat and answers the sync peers of the realm.
+    Record(Box<NodeHeartbeat>),
+    /// Sends one length-prefixed heartbeat frame to `peer`; no answer is read.
+    Push {
+        peer: NodeId,
+        frame: crate::types::Value,
+    },
+    /// Keeps a heartbeat `peer` sent when it is newer and `peer` is a sync peer.
+    Store {
+        peer: NodeId,
+        heartbeat: Box<NodeHeartbeat>,
+    },
+    /// Skips `holder` in holder choices for a while after it failed to serve.
+    Avoid { holder: NodeId, now_ms: u64 },
+    /// Answers this node, its realm, and the held heartbeats and avoided state of `holders`.
+    Holders { holders: Vec<NodeId>, now_ms: u64 },
+}
+
+/// What this node knows about candidate holders, from its heartbeat state.
+#[derive(Debug, PartialEq)]
+pub struct HolderFacts {
+    pub local: NodeId,
+    pub realm_id: RealmId,
+    /// Held heartbeats of the asked holders, fresh or stale.
+    pub held: Vec<HeldHeartbeat>,
+    /// The asked holders this node avoids for now after a failure.
+    pub avoided: Vec<NodeId>,
+}
+
+/// The answer to a [`HeartbeatEffect`].
+#[derive(Debug, PartialEq)]
+pub enum HeartbeatEvent {
+    Peers(Vec<NodeId>),
+    Pushed,
+    PushFailed(String),
+    Stored(bool),
+    Avoided,
+    Holders(Box<HolderFacts>),
+}
+
+/// Takes the load, download slots and executor availability of each document from the node's
+/// fresh heartbeat when that names the document's advertisement, and clears them otherwise:
+/// unknown ranks worst.
+pub fn live_telemetry(
+    fresh: &BTreeMap<NodeId, HeldHeartbeat>,
+    documents: &mut BTreeMap<NodeId, NodeInfoDocument>,
+    now_ms: u64,
+) {
+    for (node_id, document) in documents.iter_mut() {
+        let held = fresh.get(node_id).filter(|held| {
+            let epoch = &held.heartbeat.epoch;
+            (epoch.membership_generation, epoch.publisher_generation)
+                == (
+                    document.epoch.membership_generation,
+                    document.epoch.publisher_generation,
+                )
+        });
+        let observed_at_ms = held.map_or(0, |held| now_ms.saturating_sub(held.age_ms));
+        document.utilization.load_permille =
+            held.and_then(|held| held.heartbeat.utilization.load_permille);
+        document.utilization.download_slots =
+            held.and_then(|held| held.heartbeat.utilization.download_slots);
+        for executor in &mut document.executors {
+            executor.availability = held
+                .and_then(|held| {
+                    held.heartbeat
+                        .availability
+                        .iter()
+                        .find(|(name, _)| *name == executor.backend)
+                })
+                .map(|(_, availability)| ExecutorAvailability {
+                    observed_at_ms,
+                    ..*availability
+                });
+        }
+    }
 }
 
 fn revision(epoch: &AdvertisementEpoch) -> (u64, u64) {
@@ -247,18 +348,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unordered_kinds() {
+    fn rejects_unordered_names() {
         let mut beat = heartbeat(1);
         beat.availability = vec![
-            ("kubernetes".into(), availability()),
-            ("docker".into(), availability()),
+            ("lab".into(), availability()),
+            ("edge".into(), availability()),
         ];
-        assert_eq!(beat.validate(), Err(HeartbeatError::ExecutorKind));
+        assert_eq!(beat.validate(), Err(HeartbeatError::BackendName));
         beat.availability = vec![
-            ("docker".into(), availability()),
-            ("docker".into(), availability()),
+            ("lab".into(), availability()),
+            ("lab".into(), availability()),
         ];
-        assert_eq!(beat.validate(), Err(HeartbeatError::ExecutorKind));
+        assert_eq!(beat.validate(), Err(HeartbeatError::BackendName));
+        // Two backends of one kind are two names.
+        beat.availability = vec![
+            ("edge".into(), availability()),
+            ("lab".into(), availability()),
+        ];
+        assert_eq!(beat.validate(), Ok(()));
     }
 
     #[test]
@@ -275,4 +382,33 @@ mod tests {
             Err(HeartbeatError::TooLarge)
         );
     }
+}
+
+/// Who this node hears from: itself, and each node's heartbeat age and wall receive time.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Heard {
+    pub local: Option<NodeId>,
+    pub nodes: std::collections::BTreeMap<NodeId, (u64, u64)>,
+}
+
+impl Heard {
+    /// What the held heartbeats say, seen from `local`.
+    pub fn of<'a>(
+        local: Option<NodeId>,
+        held: impl IntoIterator<Item = (NodeId, &'a HeldHeartbeat)>,
+    ) -> Self {
+        let nodes = (held.into_iter())
+            .map(|(node_id, held)| (node_id, (held.age_ms, held.received_at_ms)))
+            .collect();
+        Self { local, nodes }
+    }
+}
+
+/// The node an operation runs on, read once by the input that starts it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Here {
+    pub ids: crate::structs::identity::realm::NodeRealm,
+    /// The bytes this node's backends can hold, when all of them state a quota.
+    pub capacity: Option<u64>,
+    pub heard: Heard,
 }

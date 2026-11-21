@@ -3,23 +3,25 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::VecDeque;
+
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::keyspaces::PLUGIN_WORK_KEYSPACE;
-use aruna_core::structs::execution::job::JobId;
-use aruna_plugins::broker::{ErrorKind, HostError};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::execution::job::identity::JobId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::check::unavailable;
-use super::store::{StoreError, Txn, decode, encode, transact};
-use super::work::{WorkKind, WorkState, read_in};
-use crate::driver::{DriverContext, drive};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use super::objects::absent;
+use super::rows::{
+    Row, StoreError, decode, delete_call, done, encode, mapped_child, page_call, page_of,
+    read_call, row, values,
+};
+use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_core::install_work::{Found, WorkKind, WorkLookup, WorkState};
 
 /// Row kind of the marks in the work keyspace, apart from the rows an install's removal deletes.
 pub const MARK_ROW: u8 = b'm';
-
-/// Marks one sweep pass reads at a time.
-const PAGE: usize = 100;
 
 /// What every refusal of a marked version says.
 pub const MARKED: &str = "this object was written by a job with a secret; plugins cannot read it";
@@ -41,99 +43,218 @@ fn mark_key((bucket, key, version_id): Version<'_>) -> Result<Vec<u8>, StoreErro
     Ok([&[MARK_ROW][..], &encode(&(bucket, key, version_id))?].concat())
 }
 
-/// Marks `version` in `txn`, the transaction that reserves it, before any byte is written.
-pub async fn mark_in(txn: &Txn<'_>, version: Version<'_>, mark: &Mark) -> Result<(), StoreError> {
-    let row = vec![(mark_key(version)?, encode(mark)?)];
-    txn.write(PLUGIN_WORK_KEYSPACE, row).await
+/// The row that marks `version`, written in the transaction that reserves it, before any byte
+/// is written.
+pub fn mark_row(version: Version<'_>, mark: &Mark) -> Result<Row, StoreError> {
+    Ok(row(PLUGIN_WORK_KEYSPACE, mark_key(version)?, encode(mark)?))
 }
 
-pub async fn is_marked(ctx: &DriverContext, version: Version<'_>) -> Result<bool, StoreError> {
-    let row = Txn::direct(ctx)
-        .read(PLUGIN_WORK_KEYSPACE, &mark_key(version)?)
-        .await?;
-    Ok(row.is_some())
+pub fn is_marked(version: Version<'_>) -> Result<IsMarked, StoreError> {
+    Ok(IsMarked(mark_key(version)?))
 }
 
-/// The version of `bucket/key` a read or copy reads (`version`, else the current one), refused
-/// when it is marked; `None` when there is no such object, so nothing is read either.
-pub async fn unmarked(
-    ctx: &DriverContext,
-    (bucket, key): (&str, &str),
-    version: Option<Ulid>,
-) -> Result<Option<Ulid>, HostError> {
-    let head = HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: version,
-    };
-    let resolved = match drive(HeadObjectOperation::new(head), ctx).await {
-        Ok(head) => head.resolved_version_id.or(version),
-        Err(error) if absent(&error) => return Ok(None),
-        Err(error) => return Err(unavailable(error.to_string())),
-    };
-    let Some(resolved) = resolved else {
-        return Ok(None);
-    };
-    match is_marked(ctx, (bucket, key, resolved)).await {
-        Ok(false) => Ok(Some(resolved)),
-        Ok(true) => Err(HostError::new(ErrorKind::Denied, MARKED)),
-        Err(error) => Err(unavailable(error.0)),
+#[derive(Debug, PartialEq)]
+pub struct IsMarked(Vec<u8>);
+
+impl Operation for IsMarked {
+    type Output = bool;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
+        let read = vec![(PLUGIN_WORK_KEYSPACE, self.0.clone())];
+        Ok(Next::Call(read_call(read)))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
+        let [row] = values::<1>(answer)?;
+        Ok(Next::Done(row.is_some()))
     }
 }
 
-/// Drops the marks nothing can need any more, a page at a time: the work that minted the
-/// version can write no more, as its row is settled or gone, and only then the version is
-/// absent. The delete reads the row again, so it conflicts with a settlement or reservation.
-pub async fn sweep_marks(ctx: &DriverContext) -> Result<usize, StoreError> {
-    let (mut dropped, mut after) = (0, None);
-    loop {
-        let txn = Txn::direct(ctx);
-        let (rows, next) = txn
-            .page(PLUGIN_WORK_KEYSPACE, &[MARK_ROW], after, PAGE)
-            .await?;
-        for (key, value) in &rows {
-            let mark: Mark = decode(value)?;
-            let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
-            if !ended(&Txn::direct(ctx), &mark).await? {
-                continue;
+/// Whether the mark's work can write no more: its row is settled or gone. With the mark's key,
+/// the mark is deleted in the same transaction, so the delete conflicts with a settlement or
+/// reservation.
+#[derive(Debug, PartialEq)]
+pub struct MarkEnded {
+    lookup: WorkLookup,
+    key: Option<Vec<u8>>,
+    deleted: bool,
+}
+
+impl MarkEnded {
+    pub fn check(mark: &Mark, key: Option<Vec<u8>>) -> MarkEnded {
+        let lookup = WorkLookup::new(mark.install_id, mark.work_id);
+        MarkEnded {
+            lookup,
+            deleted: false,
+            key,
+        }
+    }
+}
+
+impl Operation for MarkEnded {
+    type Output = bool;
+    type Error = StoreError;
+
+    /// With the mark's key the delete runs in one transaction with the lookup.
+    fn transaction(&self) -> TransactionMode {
+        match self.key.is_some() {
+            true => TransactionMode::Write,
+            false => TransactionMode::None,
+        }
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, StoreError> {
+        Ok(Next::Call(self.lookup.ask()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<bool>, StoreError> {
+        if self.deleted {
+            done(answer)?;
+            return Ok(Next::Done(true));
+        }
+        let ended = match self.lookup.take(answer)? {
+            Found::Ask(ask) => return Ok(Next::Call(ask)),
+            Found::Row(row) => row.is_none_or(|(_, row)| row.state == WorkState::Settled),
+        };
+        match (ended, self.key.take()) {
+            (true, Some(key)) => {
+                self.deleted = true;
+                Ok(Next::Call(delete_call(vec![(PLUGIN_WORK_KEYSPACE, key)])))
             }
-            let head = HeadObjectInput {
-                bucket,
-                key: object,
-                version_id: Some(version_id),
-            };
-            match drive(HeadObjectOperation::new(head), ctx).await {
-                Err(error) if absent(&error) => {}
-                // Present, or not known now: the mark stays.
-                _ => continue,
-            }
-            let gone = transact(ctx, async |txn: &Txn<'_>| {
-                if !ended(txn, &mark).await? {
-                    return Ok::<_, StoreError>(false);
-                }
-                txn.delete(PLUGIN_WORK_KEYSPACE, vec![key.clone()]).await?;
-                Ok(true)
+            (ended, _) => Ok(Next::Done(ended)),
+        }
+    }
+}
+
+/// Marks one sweep pass reads at a time.
+const MARK_PAGE: usize = 100;
+
+#[derive(Debug, PartialEq)]
+enum SweepStep {
+    Paging,
+    /// Asks whether the work that minted the version can write no more.
+    Ended,
+    /// Asks whether the version is gone.
+    Head,
+    /// Deletes the mark, reading the work row again.
+    Dropping,
+}
+
+/// One mark a sweep looks at.
+#[derive(Debug, PartialEq)]
+struct SweptMark {
+    key: Vec<u8>,
+    mark: Mark,
+    head: Option<HeadObjectInput>,
+}
+
+/// Drops the marks nothing can need any more, a page at a time: the work that minted the version
+/// can write no more, as its row is settled or gone, and only then the version is absent. The
+/// delete reads the row again, so it conflicts with a settlement or reservation.
+#[derive(Debug, PartialEq)]
+pub struct SweepMarks {
+    after: Option<Vec<u8>>,
+    more: bool,
+    rows: VecDeque<(Vec<u8>, Vec<u8>)>,
+    current: Option<SweptMark>,
+    dropped: usize,
+    step: SweepStep,
+}
+
+impl SweepMarks {
+    pub fn new() -> Self {
+        Self {
+            after: None,
+            more: false,
+            rows: VecDeque::new(),
+            current: None,
+            dropped: 0,
+            step: SweepStep::Paging,
+        }
+    }
+
+    fn page(&mut self) -> IoCall {
+        self.step = SweepStep::Paging;
+        let after = self.after.clone();
+        page_call(PLUGIN_WORK_KEYSPACE, vec![MARK_ROW], after, MARK_PAGE)
+    }
+
+    /// The call for the next mark, the next page, or the end.
+    fn advance(&mut self) -> Result<Next<usize>, StoreError> {
+        let Some((key, value)) = self.rows.pop_front() else {
+            return Ok(match self.more {
+                true => Next::Call(self.page()),
+                false => Next::Done(self.dropped),
             });
-            dropped += usize::from(gone.await?);
-        }
-        match next {
-            Some(key) => after = Some(key),
-            None => return Ok(dropped),
-        }
+        };
+        let mark: Mark = decode(&value)?;
+        let (bucket, object, version_id) = decode::<(String, String, Ulid)>(&key[1..])?;
+        let head = HeadObjectInput {
+            bucket,
+            key: object,
+            version_id: Some(version_id),
+        };
+        let ended = MarkEnded::check(&mark, None);
+        self.current = Some(SweptMark {
+            key,
+            mark,
+            head: Some(head),
+        });
+        self.step = SweepStep::Ended;
+        Ok(Next::Call(IoCall::child(ended)))
     }
 }
 
-/// Whether the mark's work can write no more: its row is settled or gone.
-async fn ended(txn: &Txn<'_>, mark: &Mark) -> Result<bool, StoreError> {
-    let row = read_in(txn, mark.install_id, mark.work_id).await?;
-    Ok(row.is_none_or(|(_, row)| row.state == WorkState::Settled))
+impl Default for SweepMarks {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-fn absent(error: &HeadObjectError) -> bool {
-    matches!(
-        error,
-        HeadObjectError::NoSuchKey | HeadObjectError::NoSuchVersion | HeadObjectError::DeleteMarker
-    )
+impl Operation for SweepMarks {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        match self.step {
+            SweepStep::Paging => {
+                let (rows, next) = page_of(answer)?;
+                self.rows = rows.into();
+                self.more = next.is_some();
+                self.after = next;
+            }
+            SweepStep::Ended => {
+                if answer.child::<bool, StoreError>()?? {
+                    let head = (self.current.as_mut()).and_then(|mark| mark.head.take());
+                    let head = head.ok_or(IoError::Unfinished)?;
+                    self.step = SweepStep::Head;
+                    let head = HeadObjectOperation::new(head);
+                    // Present, or not known now: the mark stays.
+                    return Ok(Next::Call(mapped_child(head, |head| {
+                        Ok::<bool, ()>(head.is_err_and(|error| absent(&error)))
+                    })));
+                }
+            }
+            SweepStep::Head => {
+                if answer.child::<bool, ()>()?.unwrap_or(false) {
+                    let swept = self.current.take().ok_or(IoError::Unfinished)?;
+                    self.step = SweepStep::Dropping;
+                    let drop = MarkEnded::check(&swept.mark, Some(swept.key));
+                    return Ok(Next::Call(IoCall::child(drop)));
+                }
+            }
+            SweepStep::Dropping => {
+                let dropped = answer.child::<bool, StoreError>()??;
+                self.dropped += usize::from(dropped);
+            }
+        }
+        self.advance()
+    }
 }
 
 #[cfg(test)]

@@ -11,10 +11,8 @@ use super::group::GROUP_WRITE_CHUNK;
 use super::pithos::{ArchiveEncoder, Share, working_set};
 use super::plain::Held;
 use crate::codec::{FrameEncoder, Guard};
-use crate::hash::Hasher;
 use crate::opendal::{UnsupportedAbort, abort_partial_writer, abort_writer};
 use crate::s3::NativeMultipart;
-use aruna_core::UserId;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -25,6 +23,7 @@ use aruna_core::keyspaces::{
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, Backend, BackendLocation, BackendRef, BlobLocationKey, CopyOwner,
     HIDDEN_BLOB_PREFIX, HiddenBlobEntry, HiddenBlobKey, ResolvedBackend,
@@ -33,6 +32,7 @@ use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
 use aruna_core::structs::storage::format::{Compression, FrameLayout, StoredFormat, StoredLayout};
 use aruna_core::structs::storage::group_backend::GroupBackendKind;
 use aruna_core::structs::storage::multipart::MultipartPartKey;
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -516,8 +516,8 @@ impl BlobHandler {
         let encoder = match (seal, compression) {
             (Some(plan), _) => {
                 // One supported size for every sealed copy, so any of them can be re-encoded later.
-                if size.is_some_and(|size| size > super::pithos::MAX_SIZE) {
-                    let limit = super::pithos::MAX_SIZE;
+                if size.is_some_and(|size| size > aruna_core::structs::storage::pithos::MAX_SIZE) {
+                    let limit = aruna_core::structs::storage::pithos::MAX_SIZE;
                     return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
                 }
                 let covered = size.unwrap_or(super::pithos::GROWTH);

@@ -2,30 +2,28 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
-use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TURN_KEYSPACE};
-use aruna_core::structs::AssistantChatHead;
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::keyspaces::{CHAT_HEAD_KEYSPACE, CHAT_TOTAL_KEYSPACE, CHAT_TURN_KEYSPACE};
+use aruna_core::structs::assistant_chat::{AssistantChatHead, AssistantChatTotals};
+use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 pub mod central;
-mod heads;
+pub mod heads;
 pub mod provider;
 #[cfg(test)]
 mod tests;
-mod turns;
-
-pub use heads::{DeleteChatOperation, ListChatOperation, WriteChatOperation};
-pub use turns::{ReadChatOperation, WriteTurnOperation};
+pub mod turns;
 
 pub const CHAT_CAP: &str = "a user may keep at most 20 chats";
 pub const TURN_CAP: &str = "a turn payload may hold at most 256 KiB";
 pub const BUDGET_CAP: &str = "the chats of a user may hold at most 8 MiB together";
+
+/// Heads one page of a totals rebuild reads at most.
+const TOTALS_PAGE: usize = 64;
 
 fn head_prefix(user_id: UserId) -> Vec<u8> {
     let mut key = user_id.to_storage_key();
@@ -52,38 +50,30 @@ fn turn_key(user_id: UserId, chat_id: &str, seq: u32) -> Key {
     ByteView::from(key)
 }
 
-fn read_head(user_id: UserId, chat_id: &str, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: CHAT_HEAD_KEYSPACE.to_string(),
-        key: head_key(user_id, chat_id),
-        txn_id,
-    })
+fn read_head(user_id: UserId, chat_id: &str) -> IoCall {
+    IoCall::Read(vec![(
+        CHAT_HEAD_KEYSPACE.to_string(),
+        head_key(user_id, chat_id),
+    )])
 }
 
-fn iter_heads(user_id: UserId, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: CHAT_HEAD_KEYSPACE.to_string(),
-        prefix: Some(ByteView::from(head_prefix(user_id))),
-        start: None,
+fn heads_page(user_id: UserId) -> IoCall {
+    IoCall::Page {
+        space: CHAT_HEAD_KEYSPACE.to_string(),
+        prefix: ByteView::from(head_prefix(user_id)),
+        after: None,
         limit: usize::MAX,
-        txn_id,
-    })
+    }
 }
 
-fn iter_turns(
-    user_id: UserId,
-    chat_id: &str,
-    seq: u32,
-    limit: usize,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: CHAT_TURN_KEYSPACE.to_string(),
-        prefix: Some(ByteView::from(turn_prefix(user_id, chat_id))),
-        start: Some(IterStart::At(turn_key(user_id, chat_id, seq))),
+/// At most `limit` turns of one chat from `seq` on.
+fn turns_page(user_id: UserId, chat_id: &str, seq: u32, limit: usize) -> IoCall {
+    IoCall::Page {
+        space: CHAT_TURN_KEYSPACE.to_string(),
+        prefix: ByteView::from(turn_prefix(user_id, chat_id)),
+        after: (seq.checked_sub(1)).map(|before| turn_key(user_id, chat_id, before)),
         limit,
-        txn_id,
-    })
+    }
 }
 
 fn decode_head(value: Option<Value>) -> Result<Option<AssistantChatHead>, ChatStoreError> {
@@ -102,23 +92,88 @@ fn live_head(value: Option<Value>) -> Result<AssistantChatHead, ChatStoreError> 
     }
 }
 
+/// The row of one user's chat totals, written in the transaction of each change it counts.
+fn totals_entry(
+    user_id: UserId,
+    totals: AssistantChatTotals,
+) -> Result<(String, Key, Value), ChatStoreError> {
+    let key = ByteView::from(user_id.to_storage_key());
+    Ok((
+        CHAT_TOTAL_KEYSPACE.to_string(),
+        key,
+        totals.to_bytes()?.into(),
+    ))
+}
+
+/// What reading a user's chat totals needs next.
+#[derive(Debug, PartialEq)]
+enum TotalsStep {
+    Call(IoCall),
+    Done(AssistantChatTotals),
+}
+
+/// Reads one user's chat totals; a missing row is summed from the live heads in bounded pages,
+/// and the change that read it writes the row, so later changes read it directly.
+#[derive(Debug, PartialEq)]
+struct TotalsRead {
+    user_id: UserId,
+    paging: bool,
+    after: Option<Key>,
+    summed: AssistantChatTotals,
+}
+
+impl TotalsRead {
+    fn new(user_id: UserId) -> Self {
+        Self {
+            user_id,
+            paging: false,
+            after: None,
+            summed: AssistantChatTotals::default(),
+        }
+    }
+
+    fn call(&self) -> IoCall {
+        let key = ByteView::from(self.user_id.to_storage_key());
+        IoCall::Read(vec![(CHAT_TOTAL_KEYSPACE.to_string(), key)])
+    }
+
+    fn page(&self) -> IoCall {
+        IoCall::Page {
+            space: CHAT_HEAD_KEYSPACE.to_string(),
+            prefix: ByteView::from(head_prefix(self.user_id)),
+            after: self.after.clone(),
+            limit: TOTALS_PAGE,
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<TotalsStep, ChatStoreError> {
+        if !self.paging {
+            if let Some(value) = result.value()? {
+                return Ok(TotalsStep::Done(AssistantChatTotals::from_bytes(&value)?));
+            }
+            self.paging = true;
+            return Ok(TotalsStep::Call(self.page()));
+        }
+        let (rows, next) = result.page()?;
+        for head in decode_heads(rows)?.iter().filter(|head| head.is_live()) {
+            self.summed.chats = self.summed.chats.saturating_add(1);
+            self.summed.bytes = self.summed.bytes.saturating_add(head.bytes);
+        }
+        match next {
+            Some(after) => {
+                self.after = Some(after);
+                Ok(TotalsStep::Call(self.page()))
+            }
+            None => Ok(TotalsStep::Done(self.summed)),
+        }
+    }
+}
+
 fn decode_heads(values: Vec<(Key, Value)>) -> Result<Vec<AssistantChatHead>, ChatStoreError> {
     Ok(values
         .into_iter()
         .map(|(_, value)| AssistantChatHead::from_bytes(value.as_ref()))
         .collect::<Result<Vec<_>, _>>()?)
-}
-
-fn commit(txn_id: TxnId) -> Effects {
-    smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-}
-
-fn abort_effects(txn_id: &mut Option<TxnId>) -> Effects {
-    txn_id
-        .take()
-        .map_or_else(smallvec::SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -137,24 +192,10 @@ pub enum ChatStoreError {
     Stale,
     #[error("the next turn seq is {next_seq}")]
     StaleTurn { next_seq: u32 },
-    #[error("chat operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
 }
 
-fn unexpected(
-    state: &impl std::fmt::Debug,
-    expected: &'static str,
-    event: &Event,
-) -> ChatStoreError {
-    ChatStoreError::UnexpectedEvent {
-        state: format!("{state:?}"),
-        expected,
-        got: format!("{event:?}"),
+impl From<IoError> for ChatStoreError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
     }
 }

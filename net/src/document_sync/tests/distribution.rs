@@ -7,10 +7,13 @@ use super::*;
 use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, DISTRIBUTION_KEYSPACE, PARKED_INDEX_KEYSPACE};
 use aruna_core::structs::storage::distribution::presets::replica_layout;
 use aruna_core::structs::storage::distribution::publisher_key;
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement, StatementKind};
 use aruna_core::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, DistributionSnapshot,
-    DistributionView, MemberState, PublisherCutoff, SetRoot, SignedSnapshot, Statement,
-    StatementKind, next_snapshot,
+    DistributionConfig, DistributionSettings, MemberState, PublisherCutoff,
 };
 
 const PUBLISHER: u8 = 41;
@@ -256,8 +259,12 @@ async fn membership_gaps_defer() {
             revision: created().revision(),
         }],
     };
-    state.apply_operation(&actor(OTHER), ensure).unwrap();
-    state.apply_operation(&actor(OTHER), removed).unwrap();
+    state
+        .apply_operation(&actor(OTHER), ensure, ulid::Ulid::generate())
+        .unwrap();
+    state
+        .apply_operation(&actor(OTHER), removed, ulid::Ulid::generate())
+        .unwrap();
     batch_write_to(&storage, vec![reducer_state_entry(&state).unwrap()])
         .await
         .unwrap();
@@ -473,7 +480,9 @@ async fn cutoff_is_exact() {
             revision: cutoff.revision(),
         }],
     };
-    state.apply_operation(&actor(OTHER), removed).unwrap();
+    state
+        .apply_operation(&actor(OTHER), removed, ulid::Ulid::generate())
+        .unwrap();
     batch_write_to(&storage, vec![reducer_state_entry(&state).unwrap()])
         .await
         .unwrap();

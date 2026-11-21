@@ -2,36 +2,34 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::USER_KEYSPACE;
-use aruna_core::UserId;
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::rows::values;
 use aruna_core::storage_entries::{reducer_state_entry, sync_revision_entry};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, GroupId, TxnId};
+use aruna_core::types::GroupId;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{INSTALL_ATTRIBUTE, SERVICE_GROUP_ATTRIBUTE};
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::collections::HashMap;
 use thiserror::Error;
 
 use super::check::{ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation};
-use crate::placement::target_placement_ref;
-use crate::sync::document_outbox::{
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use crate::users::oidc_user::initial_sync_change;
+use aruna_core::placement::target_placement_ref;
 
 const MAX_NAME_LEN: usize = 256;
 
@@ -70,41 +68,42 @@ pub enum CreateServiceError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
-enum CreateServiceState {
-    Init,
-    Authorize,
-    StartTransaction,
-    ReadConfig { txn_id: TxnId },
-    WriteUser { txn_id: TxnId, user: User },
-    ReadFence { txn_id: TxnId, user: User },
-    Commit { user: User },
-    ScheduleDrain { user: User },
-    Finish,
-    Error,
+impl From<IoError> for CreateServiceError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "CreateService".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
 }
 
+type ServiceTurn = Result<Next<User>, CreateServiceError>;
+
+/// Checks that the caller administers the group's service accounts, then writes the account in
+/// one write transaction.
 #[derive(Debug, PartialEq)]
 pub struct CreateServiceOperation {
     config: CreateServiceConfig,
-    fence: crate::placement::fence::WriteFence,
-    state: CreateServiceState,
-    output: Option<Result<User, CreateServiceError>>,
     guard: Option<aruna_core::plugin_installs::InstallGuard>,
+    authorized: bool,
 }
 
 impl CreateServiceOperation {
     pub fn new(config: CreateServiceConfig) -> Self {
         Self {
             config,
-            fence: Default::default(),
-            state: CreateServiceState::Init,
-            output: None,
             guard: None,
+            authorized: false,
         }
     }
 
@@ -113,81 +112,90 @@ impl CreateServiceOperation {
         self.guard = Some(guard);
         self
     }
+}
 
-    fn fail(&mut self, error: CreateServiceError) -> Effects {
-        let cleanup = self.abort();
-        self.state = CreateServiceState::Error;
-        self.output = Some(Err(error));
-        cleanup
+impl Operation for CreateServiceOperation {
+    type Output = User;
+    type Error = CreateServiceError;
+
+    fn first(&mut self) -> ServiceTurn {
+        let name = self.config.name.trim();
+        if name.is_empty() || name.len() > MAX_NAME_LEN {
+            return Err(CreateServiceError::InvalidName);
+        }
+        Ok(Next::Call(IoCall::child(ServiceCheckOperation::new(
+            ServiceCheckConfig {
+                auth_context: self.config.auth_context.clone(),
+                group_id: self.config.group_id,
+                target: None,
+            },
+        ))))
     }
 
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.fail(CreateServiceError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: format!("{event:?}"),
-        })
+    fn next(&mut self, result: IoResult) -> ServiceTurn {
+        if self.authorized {
+            return result.child::<User, CreateServiceError>()?.map(Next::Done);
+        }
+        let checked = result.child::<Option<User>, ServiceCheckError>()?;
+        if !ServiceCheckError::allowed(checked)? {
+            return Err(CreateServiceError::Unauthorized);
+        }
+        self.authorized = true;
+        let write = ServiceWrite::new(self.config.clone(), self.guard);
+        Ok(Next::Call(IoCall::child(write)))
     }
+}
 
-    fn handle_authorized(&mut self, event: Event) -> Effects {
-        match event {
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(true) }) => {
-                self.state = CreateServiceState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
-            }
-            Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: Ok(false) }) => {
-                self.fail(CreateServiceError::Unauthorized)
-            }
-            Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: Err(error),
-            }) => self.fail(error.into()),
-            other => self.unexpected("authorization result", other),
+/// What the account write transaction waits for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stage {
+    Config,
+    Write,
+    Fence,
+}
+
+/// Reads the realm config, writes the account, its sync revision and admin events, and checks
+/// the bucket fence, all in one write transaction.
+#[derive(Debug, PartialEq)]
+struct ServiceWrite {
+    config: CreateServiceConfig,
+    guard: Option<aruna_core::plugin_installs::InstallGuard>,
+    fence: aruna_core::placement::fence::WriteFence,
+    stage: Stage,
+    user: Option<User>,
+    now_ms: u64,
+    ids: IdMint,
+}
+
+impl ServiceWrite {
+    fn new(
+        config: CreateServiceConfig,
+        guard: Option<aruna_core::plugin_installs::InstallGuard>,
+    ) -> Self {
+        Self {
+            config,
+            guard,
+            fence: Default::default(),
+            stage: Stage::Config,
+            user: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
-    fn handle_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected("transaction started", event);
-        };
-        self.state = CreateServiceState::ReadConfig { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(*self.config.actor.realm_id.as_bytes()),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_config(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let value = match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            Event::Storage(StorageEvent::Error { error }) => return self.fail(error.into()),
-            other => return self.unexpected("realm config read result", other),
-        };
-        let config = match value
+    fn handle_config(&mut self, value: Option<aruna_core::types::Value>) -> ServiceTurn {
+        let config = value
             .as_deref()
             .map(RealmConfigDocument::from_bytes)
-            .transpose()
-        {
-            Ok(config) => config,
-            Err(error) => return self.fail(error.into()),
-        };
+            .transpose()?;
         if (self.guard).is_some_and(|guard| !guard.admits(config.as_ref())) {
-            return self.fail(CreateServiceError::Superseded);
+            return Err(CreateServiceError::Superseded);
         }
-        match self.write_user(txn_id, config.as_ref()) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
+        self.write_user(config.as_ref())
     }
 
     /// Writes the record, its sync revision and the admin events other nodes replay.
-    fn write_user(
-        &mut self,
-        txn_id: TxnId,
-        config: Option<&RealmConfigDocument>,
-    ) -> Result<Effects, CreateServiceError> {
+    fn write_user(&mut self, config: Option<&RealmConfigDocument>) -> ServiceTurn {
         let group = self.config.group_id.to_string();
         let mut user = User {
             user_id: self.config.user_id,
@@ -213,13 +221,15 @@ impl CreateServiceOperation {
         let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::User {
             user_id: user.user_id,
         });
+        let revision =
+            initial_sync_change(actor, placement, self.now_ms, self.ids.mint(self.now_ms));
         let mut writes = vec![
             (
                 USER_KEYSPACE.to_string(),
                 ByteView::from(user.user_id.to_bytes()),
                 ByteView::from(user.to_bytes(actor)?),
             ),
-            sync_revision_entry(&document_target, &initial_sync_change(actor, placement))?,
+            sync_revision_entry(&document_target, &revision)?,
         ];
         // Ownership first, so receivers admit the name change as the owning group's administrator.
         let marker = marker.map(|(key, value)| AdminDocumentOperation::UserAttributeSet {
@@ -237,7 +247,8 @@ impl CreateServiceOperation {
             }),
         ];
         for operation in operations.into_iter().flatten() {
-            let event = reducer_state.apply_operation(actor, operation)?;
+            let event =
+                reducer_state.apply_operation(actor, operation, self.ids.mint(self.now_ms))?;
             let record = new_identified_record(
                 event.event_id,
                 actor.node_id,
@@ -252,133 +263,75 @@ impl CreateServiceOperation {
         }
         writes.push(reducer_state_entry(&reducer_state)?);
         let mut audit = AdminAuditRecord::new(
+            self.ids.mint(self.now_ms),
             AdminAuditAction::ServiceAccountCreated,
             actor.user_id,
             user.user_id,
         );
         audit.group_id = Some(self.config.group_id);
         writes.extend(audit.entries()?);
-        self.state = CreateServiceState::WriteUser { txn_id, user };
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.user = Some(user);
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn handle_written(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        if !matches!(event, Event::Storage(StorageEvent::BatchWriteResult { .. })) {
-            return self.unexpected("batch write result", event);
-        }
-        if self.fence.is_empty() {
-            return self.commit(txn_id, user);
-        }
-        self.state = CreateServiceState::ReadFence { txn_id, user };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: self.fence.reads(),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_fence(&mut self, event: Event, txn_id: TxnId, user: User) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected("fence read result", event);
-        };
-        if !self.fence.admits(&values) {
-            return self.fail(CreateServiceError::PlacementFenced);
-        }
-        self.commit(txn_id, user)
-    }
-
-    fn commit(&mut self, txn_id: TxnId, user: User) -> Effects {
-        self.state = CreateServiceState::Commit { user };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_committed(&mut self, event: Event, user: User) -> Effects {
-        if !matches!(
-            event,
-            Event::Storage(StorageEvent::TransactionCommitted { .. })
-        ) {
-            return self.unexpected("transaction committed", event);
-        }
-        self.state = CreateServiceState::ScheduleDrain { user };
-        smallvec![schedule_drain_effect()]
-    }
-
-    fn handle_drain(&mut self, event: Event, user: User) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. } | TaskEvent::Error { .. }) => {
-                self.state = CreateServiceState::Finish;
-                self.output = Some(Ok(user));
-                smallvec![]
-            }
-            other => self.unexpected("admin document outbox drain timer schedule", other),
-        }
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn committed(&mut self) -> ServiceTurn {
+        let output = self.user.take().ok_or(CreateServiceError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl Operation for CreateServiceOperation {
+impl Operation for ServiceWrite {
     type Output = User;
     type Error = CreateServiceError;
 
-    fn start(&mut self) -> Effects {
-        let name = self.config.name.trim();
-        if name.is_empty() || name.len() > MAX_NAME_LEN {
-            return self.fail(CreateServiceError::InvalidName);
-        }
-        self.state = CreateServiceState::Authorize;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            ServiceCheckOperation::new(ServiceCheckConfig {
-                auth_context: self.config.auth_context.clone(),
-                group_id: self.config.group_id,
-                target: None,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: ServiceCheckError::allowed(result),
-            }),
-        ))]
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.fail(error.into());
-        }
-        match self.state.clone() {
-            CreateServiceState::Authorize => self.handle_authorized(event),
-            CreateServiceState::StartTransaction => self.handle_started(event),
-            CreateServiceState::ReadConfig { txn_id } => self.handle_config(event, txn_id),
-            CreateServiceState::WriteUser { txn_id, user } => {
-                self.handle_written(event, txn_id, user)
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> ServiceTurn {
+        let key = ByteView::from(*self.config.actor.realm_id.as_bytes());
+        Ok(Next::Call(IoCall::Read(vec![(
+            REALM_CONFIG_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> ServiceTurn {
+        match self.stage {
+            Stage::Config => {
+                let [value] = values::<1>(result)?;
+                self.handle_config(value)
             }
-            CreateServiceState::ReadFence { txn_id, user } => {
-                self.handle_fence(event, txn_id, user)
+            Stage::Write => {
+                result.done()?;
+                if self.fence.is_empty() {
+                    return self.committed();
+                }
+                self.stage = Stage::Fence;
+                Ok(Next::Call(IoCall::Read(self.fence.reads())))
             }
-            CreateServiceState::Commit { user } => self.handle_committed(event, user),
-            CreateServiceState::ScheduleDrain { user } => self.handle_drain(event, user),
-            CreateServiceState::Init => self.unexpected("no event before start", event),
-            CreateServiceState::Finish | CreateServiceState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateServiceState::Finish | CreateServiceState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateServiceError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            CreateServiceState::ReadConfig { txn_id }
-            | CreateServiceState::WriteUser { txn_id, .. }
-            | CreateServiceState::ReadFence { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+            Stage::Fence => {
+                let IoResult::Values(values) = result else {
+                    return Err(CreateServiceError::NotFinished);
+                };
+                let keys = self.fence.reads().into_iter().map(|(_, key)| key);
+                let rows: Vec<_> = keys.zip(values).collect();
+                if !self.fence.admits(&rows) {
+                    return Err(CreateServiceError::PlacementFenced);
+                }
+                self.committed()
             }
-            _ => smallvec![],
         }
     }
 }

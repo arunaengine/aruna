@@ -3,8 +3,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
 use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::dto::{GetObjectInput, PutObjectInput, StreamingBlob};
 use s3s::{S3, S3Request};
@@ -13,6 +13,16 @@ use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
 
 use super::reads::STALE_HEADER;
 use crate::tests::members::{BUCKET, Members, members};
+
+/// The distribution record a member holds for `binding`.
+async fn snapshot_of(
+    service: &crate::s3::service::ArunaS3Service,
+    binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+) -> aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot {
+    let view = aruna_operations::distribution::routing::bound_view(binding);
+    let view = aruna_drivers::driver::drive(view, service.state.as_ref());
+    view.await.unwrap().head.snapshot
+}
 
 /// A request the access hook admitted for `user` on `bucket`.
 fn request<T>(input: T, method: Method, user: UserAccess, bucket: BucketInfo) -> S3Request<T> {
@@ -365,10 +375,12 @@ async fn origin_of(
 ) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
     let node = &members.nodes[on];
     let local = (members.realm_id, node.node_id());
-    let view =
-        aruna_operations::s3::object::origin::read_origin(&node.context, local, BUCKET, key, None)
-            .await
-            .unwrap();
+    let view = aruna_drivers::driver::drive(
+        aruna_operations::transfer::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
+        &node.context,
+    )
+    .await
+    .unwrap();
     view.origin
 }
 
@@ -414,7 +426,8 @@ async fn copy_streams_source() {
 // A copy signed with a run's workspace credential records the run, on every copy path.
 #[tokio::test]
 async fn copy_records_run() {
-    use aruna_core::structs::execution::job::{JobId, workspace_credential_id};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::local::workspace_credential_id;
     use aruna_core::structs::storage::origin::VersionOrigin;
     let members = members(3, &["h", "p"], 0).await;
     let job_id = JobId::from_bytes([7; 16]);
@@ -755,7 +768,7 @@ async fn listing_merges_ranges() {
 async fn hidden_link(members: &Members, on: usize, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let node = &members.nodes[on];
     let target = LinkTarget {
         arn: VersionedObjectArn {
@@ -791,7 +804,12 @@ async fn hidden_link(members: &Members, on: usize, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.context, write).await.unwrap();
+    aruna_drivers::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.context,
+    )
+    .await
+    .unwrap();
 }
 
 // A range that starts with more hidden entries than one request examines goes on from the
@@ -1235,7 +1253,7 @@ async fn uploads_merge_ranges() {
 // across its key ranges, as the S3 listing does, and every name is checked for Everyone.
 #[tokio::test]
 async fn folder_spans_ranges() {
-    use aruna_core::UserId;
+    use aruna_core::user::id::UserId;
     let members = members(3, &["f/m", "p"], 0).await;
     for key in ["f/a.txt", "f/z.txt", "g/other"] {
         put(&members, 0, key, b"public").await;
@@ -1352,7 +1370,7 @@ async fn upload_markers_tagged() {
     let mut plain = node.bucket().await;
     plain.distribution = None;
     let create = CreateBucketOperation::new("plain".to_string(), plain.clone());
-    aruna_operations::driver::drive(create, &node.context)
+    aruna_drivers::driver::drive(create, &node.context)
         .await
         .unwrap();
     let input = s3s::dto::CreateMultipartUploadInput {
@@ -1445,7 +1463,7 @@ async fn copies_answer_stale() {
     copy_rows(&members, 1, 2).await;
     members.nodes[1].stop().await;
     let binding = members.nodes[2].bucket().await.distribution.unwrap();
-    let snapshot = members.nodes[2].service.snapshot(&binding).await.unwrap();
+    let snapshot = snapshot_of(&members.nodes[2].service, &binding).await;
     let range_id = snapshot.config.ranges[1].range_id;
     let stale = format!("range={range_id}");
     for on in [0, 2] {
@@ -1511,21 +1529,20 @@ async fn copy_read_marked() {
     put(&members, 0, "k/1", b"k/1").await;
     copy_rows(&members, 1, 2).await;
     let binding = members.nodes[0].bucket().await.distribution.unwrap();
-    let snapshot = members.nodes[0].service.snapshot(&binding).await.unwrap();
-    let copy = super::Forward {
+    let snapshot = snapshot_of(&members.nodes[0].service, &binding).await;
+    let copy = aruna_operations::s3::object::member::read::MemberTarget {
         set_id: binding.set_id,
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || {
-        super::reads::read_request(
-            Method::GET,
-            "GetObject",
-            BUCKET,
-            "k/1",
-            None,
-            &HeaderMap::new(),
-        )
+    let read = || aruna_operations::s3::object::member::read::MemberRequest {
+        method: aruna_core::member_read::MemberMethod::Get,
+        operation: "GetObject",
+        bucket: BUCKET.to_string(),
+        key: "k/1".to_string(),
+        query: None,
+        headers: Vec::new(),
+        body: aruna_operations::s3::object::member::read::MemberPayload::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service
@@ -1538,5 +1555,6 @@ async fn copy_read_marked() {
     let answer = service
         .forward_read(&members.user_on(0), &copy, marked)
         .await;
-    assert_eq!(answer.unwrap().bytes().await.unwrap().as_ref(), b"k/1");
+    let text = service.answer_text(answer.unwrap()).await.unwrap();
+    assert_eq!(text, "k/1");
 }

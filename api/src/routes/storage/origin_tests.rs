@@ -4,12 +4,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::relay::RELAY_SET_HEADER;
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
     replicate, write,
 };
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE};
 use aruna_core::structs::checksum::ChecksumAlgorithm;
 use aruna_core::structs::execution::source_access::SourceDigest;
@@ -17,8 +19,10 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::backend_import::BackendImport;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key};
-use aruna_core::{NodeId, UserId};
+use aruna_core::structs::sync_relationship::{
+    SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key,
+};
+use aruna_core::user::id::UserId;
 use axum::http::StatusCode;
 use std::time::SystemTime;
 
@@ -50,7 +54,7 @@ async fn origin(
     };
     get_origin(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Path(bucket.to_string()),
@@ -302,7 +306,7 @@ fn view_keeps_fields() {
             relationship_id: Ulid::from_bytes([47; 16]),
             from: OriginVersion::Global(global.clone()),
         }),
-        source: Some(aruna_operations::s3::object::origin::SourceView {
+        source: Some(aruna_operations::transfer::origin::SourceView {
             url: Some("https://s3.example.org/a".to_string()),
             path: "a".to_string(),
             version: None,
@@ -313,13 +317,13 @@ fn view_keeps_fields() {
                 (ChecksumAlgorithm::Sha1, listing),
             ],
             sources: vec![
-                aruna_operations::s3::object::origin::SourcePlace {
+                aruna_operations::transfer::origin::SourcePlace {
                     url: Some("https://s3.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: None,
                     connector_name: None,
                 },
-                aruna_operations::s3::object::origin::SourcePlace {
+                aruna_operations::transfer::origin::SourcePlace {
                     url: Some("https://mirror.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: Some(Ulid::from_bytes([48; 16])),
@@ -518,7 +522,7 @@ async fn sources(
 ) -> ServerResult<FileSourcesResponse> {
     get_sources(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(bucket.to_string()),
     )
     .await
@@ -580,11 +584,14 @@ async fn by_version(
     let mut headers = HeaderMap::new();
     if let Some(named) = named {
         let value = named.to_string().parse().unwrap();
-        headers.insert(crate::routes::storage::relay::RELAY_NODE_HEADER, value);
+        headers.insert(
+            aruna_operations::s3::object::member::rest::RELAY_NODE_HEADER,
+            value,
+        );
     }
     get_version_origin(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         headers,
         Query(VersionOriginParams {

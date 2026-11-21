@@ -4,18 +4,22 @@
 
 use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};
-use crate::metadata::{
+use crate::metadata::model::{
     MetadataQueryMode, MetadataQueryResponse, MetadataSearchParams, SearchResultsResponse,
-    SparqlQueryRequest, bearer_token_string, map_api_error, map_query_mode, map_query_results,
-    map_search_hit, parse_document_id,
+    SparqlQueryRequest,
+};
+use crate::metadata::{
+    bearer_token_string, map_api_error, map_query_mode, map_query_results, map_search_hit,
+    parse_document_id,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::metadata::api::{
-    DocumentQueryRequest, MetadataQueryRequest, MetadataSearchRequest,
-    query_metadata as run_query_metadata, query_metadata_document as run_query_metadata_document,
-    search_metadata as run_search_metadata,
-};
+use aruna_drivers::driver::drive;
+use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
+use aruna_operations::metadata::api::read::query_metadata as run_query_metadata;
+use aruna_operations::metadata::api::read_types::{DocumentQueryRequest, MetadataQueryRequest};
+use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -131,18 +135,20 @@ pub async fn query_metadata_document(
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let document_id = parse_document_id(&document_id)?;
     let ctx = state.get_ctx();
-    let result = run_query_metadata_document(
+    let result = drive(
+        DocumentQueryOperation::new(
+            state.get_realm_id(),
+            state.get_node_id(),
+            DocumentQueryRequest {
+                document_id,
+                auth,
+                bearer_token: bearer_token_string(bearer_token),
+                query: request.query,
+                mode: map_query_mode(request.mode),
+                allow_partial: request.allow_partial,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        DocumentQueryRequest {
-            document_id,
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            query: request.query,
-            mode: map_query_mode(request.mode),
-            allow_partial: request.allow_partial,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -263,19 +269,21 @@ pub async fn query_all_metadata(
     Json(request): Json<SparqlQueryRequest>,
 ) -> ServerResult<(StatusCode, Json<MetadataQueryResponse>)> {
     let ctx = state.get_ctx();
-    let result = run_query_metadata(
+    let result = drive(
+        run_query_metadata(
+            state.get_realm_id(),
+            state.get_node_id(),
+            MetadataQueryRequest {
+                auth,
+                bearer_token: bearer_token_string(bearer_token),
+                graph_iris: None,
+                query: request.query,
+                mode: map_query_mode(request.mode),
+                target_nodes: None,
+                allow_partial: request.allow_partial,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        MetadataQueryRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: request.query,
-            mode: map_query_mode(request.mode),
-            target_nodes: None,
-            allow_partial: request.allow_partial,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -405,22 +413,24 @@ pub async fn search_metadata(
 ) -> ServerResult<(StatusCode, Json<SearchResultsResponse>)> {
     let group_id = params.group_id.as_deref().map(parse_group_id).transpose()?;
     let ctx = state.get_ctx();
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            state.get_realm_id(),
+            state.get_node_id(),
+            MetadataSearchRequest {
+                auth,
+                bearer_token: bearer_token_string(bearer_token),
+                graph_iris: None,
+                query: params.q,
+                conforms_to: params.conforms_to,
+                group_id,
+                limit: params.limit,
+                cursor: params.cursor,
+                mode: map_query_mode(params.mode),
+                target_nodes: None,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        MetadataSearchRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: params.q,
-            conforms_to: params.conforms_to,
-            group_id,
-            limit: params.limit,
-            cursor: params.cursor,
-            mode: map_query_mode(params.mode),
-            target_nodes: None,
-        },
     )
     .await
     .map_err(map_api_error)?;

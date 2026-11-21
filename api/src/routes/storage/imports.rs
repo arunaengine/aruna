@@ -2,26 +2,32 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::storage::compression::MigrationProgress;
 use crate::routes::storage::moves::{BucketMoveStarted, move_refusal};
 use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::auth::bearer_token::token_grant;
-use aruna_operations::driver::{drive, now_ms};
-use aruna_operations::groups::imports::change::{ChangeImportOperation, ImportChange};
-use aruna_operations::groups::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_operations::groups::imports::discovery::{authorized_renames, rename_guards};
-use aruna_operations::groups::imports::remove::RemoveImportOperation;
-use aruna_operations::groups::imports::schedule::{next_due, start_run, wake_schedule};
-use aruna_operations::groups::imports::{ImportRuleError, last_run, list_imports, read_import};
+use aruna_drivers::driver::{drive, node_routing};
+use aruna_operations::auth::error::token_grant;
+use aruna_operations::jobs::backend_import::schedule::{
+    ImportRunInput, StartRunOperation, WakeScheduleOperation,
+};
 use aruna_operations::s3::bucket::compression::MigrationStatusOperation;
 use aruna_operations::s3::bucket::storage_move::StartMoveOperation;
+use aruna_operations::s3::imports::change::{ChangeImportOperation, ImportChange};
+use aruna_operations::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_operations::s3::imports::cron::next_due;
+use aruna_operations::s3::imports::remove::RemoveImportOperation;
+use aruna_operations::s3::imports::{
+    ImportRuleError, LastRunOperation, ListImportsOperation, ReadImportOperation,
+};
+use aruna_operations::transfer::discovery::{AuthorizedRenamesOperation, RenameGuardsOperation};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -30,16 +36,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct BackendImportsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(BackendImportsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_import, list_group_imports))
         .routes(routes!(get_import, update_import, delete_import))
         .routes(routes!(run_import))
@@ -166,16 +168,15 @@ pub(super) fn map_error(error: ImportRuleError) -> ServerError {
         ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
         ImportRuleError::NotFound => ServerError::NotFound,
         ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 pub(super) async fn admin_of_group(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     group_id: &str,
 ) -> ServerResult<(Ulid, AuthContext)> {
-    let auth = require_realm_auth(state, auth)?;
     let group_id = parse_group_id(group_id)?;
     ensure_group_admin(state, &auth, group_id).await?;
     Ok((group_id, auth))
@@ -187,14 +188,19 @@ pub(super) async fn existing_rule(
     import_id: &str,
 ) -> ServerResult<BackendImport> {
     let import_id = Ulid::from_str(import_id).map_err(|_| ServerError::BadRequest)?;
-    read_import(&state.get_ctx(), group_id, import_id)
-        .await
-        .map_err(map_error)?
-        .ok_or(ServerError::NotFound)
+    drive(
+        ReadImportOperation::new(group_id, import_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?
+    .ok_or(ServerError::NotFound)
 }
 
 async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<ImportResponse> {
-    let run = last_run(&state.get_ctx(), &rule).await.map_err(map_error)?;
+    let run = drive(LastRunOperation::new(&rule), &state.get_ctx())
+        .await
+        .map_err(map_error)?;
     let since = rule.last_started_ms.unwrap_or(millis(rule.created_at));
     let now = unix_timestamp_millis();
     let next_run_at = rule
@@ -324,7 +330,6 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
             })
         ),
         (status = 400, description = "Invalid ids, prefixes, schedule, bucket or backend, or a backend bucket that cannot be found, created or written", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or on the bucket", body = ErrorResponse),
         (status = 409, description = "A routing rule for the folder names another target, another rule imports into an overlapping folder or shares a backend folder it does not both read and write, a folder lies in the default rule's bucket, or the group is being deleted", body = ErrorResponse)
     ),
@@ -332,7 +337,7 @@ async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<Impo
 )]
 pub async fn create_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateImportRequest>,
 ) -> ServerResult<(StatusCode, Json<ImportResponse>)> {
@@ -373,7 +378,7 @@ pub async fn create_import(
     .await
     .map_err(map_error)?;
     if scheduled {
-        wake_schedule(&state.get_ctx()).await;
+        drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
     Ok((StatusCode::CREATED, Json(describe(&state, rule).await?)))
 }
@@ -416,18 +421,17 @@ pub async fn create_import(
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_group_imports(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<Json<ListImportsResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
-    let rules = list_imports(&state.get_ctx(), group_id)
+    let rules = drive(ListImportsOperation::new(group_id), &state.get_ctx())
         .await
         .map_err(map_error)?;
     let mut imports = Vec::with_capacity(rules.len());
@@ -478,7 +482,6 @@ pub async fn list_group_imports(
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -486,7 +489,7 @@ pub async fn list_group_imports(
 )]
 pub async fn get_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ImportResponse>> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -549,7 +552,6 @@ pub async fn get_import(
             })
         ),
         (status = 400, description = "Invalid ids, schedule or pattern", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The group is being deleted, a run or move has not finished, or a compressed or encrypted bucket would become a 1:1 link", body = ErrorResponse)
@@ -558,7 +560,7 @@ pub async fn get_import(
 )]
 pub async fn update_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     Json(request): Json<UpdateImportRequest>,
 ) -> ServerResult<Json<ImportResponse>> {
@@ -574,7 +576,7 @@ pub async fn update_import(
         .await
         .map_err(map_error)?;
     if scheduled {
-        wake_schedule(&state.get_ctx()).await;
+        drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
     Ok(Json(describe(&state, rule).await?))
 }
@@ -603,7 +605,6 @@ pub async fn update_import(
     responses(
         (status = 204, description = "The rule was removed"),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The bucket still holds files or has no other storage, or the group is being deleted", body = ErrorResponse)
@@ -612,7 +613,7 @@ pub async fn update_import(
 )]
 pub async fn delete_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
@@ -624,7 +625,7 @@ pub async fn delete_import(
     .await;
     if removed.is_err() {
         // A removal that stopped after deleting the rule is finished by the schedule.
-        wake_schedule(&state.get_ctx()).await;
+        drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
     removed.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
@@ -666,7 +667,6 @@ pub async fn delete_import(
             example = json!({"job_id": "01JJ0B0123456789ABCDEFGHJK"})
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "The last run of this rule has not finished", body = ErrorResponse)
@@ -675,22 +675,24 @@ pub async fn delete_import(
 )]
 pub async fn run_import(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<RunImportResponse>)> {
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let retention_ms = state.rocrate_limits().artifact_retention_ms;
-    let started = start_run(
-        &state.get_ctx(),
-        &rule,
-        auth,
-        state.get_node_id(),
-        None,
+    let context = state.get_ctx();
+    let input = ImportRunInput {
+        auth_context: auth,
+        node_id: state.get_node_id(),
+        dedup: None,
         retention_ms,
-    )
-    .await
-    .map_err(map_error)?;
+        serving: context.node_and_realm(),
+        now_ms: unix_timestamp_millis(),
+    };
+    let started = drive(StartRunOperation::new(&rule, input), &context)
+        .await
+        .map_err(map_error)?;
     let Some(job_id) = started else {
         return Err(ServerError::Conflict(
             "the last run of this import has not finished".to_string(),
@@ -819,7 +821,6 @@ key the caller may read are counted and listed.
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path or the bucket, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse)
     ),
@@ -827,19 +828,19 @@ key the caller may read are counted and listed.
 )]
 pub async fn get_renames(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, import_id)): Path<(String, String)>,
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
-    use aruna_operations::blob::migration::misplaced::{DEFAULT_PAGE, MAX_PAGE, rename_page};
-    use base64::Engine;
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use aruna_operations::blob::migration::misplaced::{
+        AccessRule, DEFAULT_PAGE, MAX_PAGE, RenamePageOperation, RenameQuery,
+    };
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let limit = page.limit.unwrap_or(DEFAULT_PAGE);
     let bad = || ServerError::BadRequestMessage("`after` is not a cursor".to_string());
     let after = match page.after.as_deref() {
-        Some(after) => Some(URL_SAFE_NO_PAD.decode(after).map_err(|_| bad())?),
+        Some(after) => Some(aruna_core::cursor::decode(after).map_err(|_| bad())?),
         None => None,
     };
     if !(1..=MAX_PAGE).contains(&limit) {
@@ -848,30 +849,36 @@ pub async fn get_renames(
         )));
     }
     let context = state.get_ctx();
-    let access = aruna_operations::groups::imports::discovery::bucket_access(
+    let access = drive(
+        aruna_operations::transfer::discovery::RuleAccessOperation::new(
+            &auth,
+            state.get_node_id(),
+            &rule,
+        ),
         &context,
-        &auth,
-        state.get_node_id(),
-        &rule,
     )
     .await
     .map_err(map_error)?;
-    let readable = |key: &str| access.allows(Some(key), &Permission::READ);
-    let writable = |key: &str| access.allows(Some(key), &Permission::WRITE);
-    let found = rename_page(
-        &context,
-        &rule,
-        (&readable, &writable),
-        (page.filter.as_deref(), after, limit),
-    )
-    .await
-    .map_err(ServerError::InternalError)?;
+    let access = Arc::new(access);
+    let rules = (
+        AccessRule::new(access.clone(), Permission::READ),
+        AccessRule::new(access, Permission::WRITE),
+    );
+    let query = RenameQuery {
+        filter: page.filter.clone(),
+        after,
+        limit,
+    };
+    let plan = RenamePageOperation::new(node_routing(&context), &rule, rules, query);
+    let found = drive(plan, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let status = drive(
         MigrationStatusOperation::new(rule.bucket.clone()),
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let last = status.filter(|record| record.moving && record.prefix == rule.key_prefix);
     let (files, plan) = (found.entries.into_iter(), found.plan);
     Ok(Json(ImportRenamesResponse {
@@ -889,7 +896,7 @@ pub async fn get_renames(
         files: files
             .map(|(from, to, writable)| RenameFileResponse { from, to, writable })
             .collect(),
-        next: found.next.map(|key| URL_SAFE_NO_PAD.encode(key)),
+        next: found.next.map(aruna_core::cursor::encode),
         progress: last.map(Into::into),
     }))
 }
@@ -957,7 +964,6 @@ restrictions are refused.
             })
         ),
         (status = 400, description = "The group id or the rule id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "No such rule in this group on this node", body = ErrorResponse),
         (status = 409, description = "`bucket_encrypted`, `move_running` or `rule_changed`", body = ErrorResponse)
@@ -966,7 +972,7 @@ restrictions are refused.
 )]
 pub async fn start_renames(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, import_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<BucketMoveStarted>)> {
@@ -977,20 +983,22 @@ pub async fn start_renames(
     let rule = existing_rule(&state, group_id, &import_id).await?;
     let caller = (&auth, state.get_node_id());
     // The move starts only while the rule and its patterns are as they were when checked.
-    let guards = rename_guards(&state.get_ctx(), &rule)
+    let guards = drive(RenameGuardsOperation::new(&rule), &state.get_ctx())
         .await
         .map_err(map_error)?;
-    let checked = authorized_renames(&state.get_ctx(), caller, &rule, Permission::WRITE)
-        .await
-        .map_err(map_error)?;
+    let context = state.get_ctx();
+    let plan =
+        AuthorizedRenamesOperation::new(node_routing(&context), caller, &rule, Permission::WRITE);
+    let checked = drive(plan, &context).await.map_err(map_error)?;
     if checked.withheld_files > 0 {
         return Err(ServerError::Forbidden);
     }
     // Files written after the check are authorized one by one when the rename reaches them.
     let (bucket, prefix) = (rule.bucket, rule.key_prefix);
-    let operation = StartMoveOperation::new(bucket.clone(), group_id, prefix, now_ms())
-        .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
-        .with_guards(guards);
+    let operation =
+        StartMoveOperation::new(bucket.clone(), group_id, prefix, unix_timestamp_millis())
+            .renaming((auth.clone(), state.get_node_id()), grant, checked.files)
+            .with_guards(guards);
     let record = drive(operation, &state.get_ctx())
         .await
         .map_err(move_refusal)?;

@@ -5,20 +5,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::TopicId;
+use aruna_clock::testing::poll_until;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::id::{DhtKeyId, NodeId};
+use aruna_core::id::{DhtKeyId, NodeId, TopicId};
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::structs::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
+use aruna_core::structs::info::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_net::error::NetError;
 use aruna_net::streams::BiStream;
-use aruna_net::{
-    DiscoveryMethod, InboundEventHandler, NetConfig, NetError, NetHandle, RelayMethod,
-};
-use aruna_storage::FjallStorage;
+use aruna_net::{InboundEventHandler, NetHandle};
+use aruna_storage::storage::worker::FjallStorage;
 use async_trait::async_trait;
 use byteview::ByteView;
 use iroh::endpoint::ReadToEndError;
@@ -45,39 +45,27 @@ async fn wait_for_connection(
     handle: &NetHandle,
     node_id: NodeId,
 ) -> Result<NetState, Box<dyn std::error::Error>> {
-    tokio::time::timeout(NETWORK_HANG_CAP, async {
-        let mut poll = Duration::from_millis(10);
-        loop {
-            let status = handle.get_status().await;
-            if peer_connected(&status, node_id) {
-                return Ok(status);
-            }
-            tokio::time::sleep(poll).await;
-            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
-        }
+    let connected = poll_until(NETWORK_HANG_CAP, async || {
+        let status = handle.get_status().await;
+        peer_connected(&status, node_id).then_some(status)
     })
-    .await
-    .map_err(|_| {
+    .await;
+    Ok(connected.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             format!("connection to {node_id} did not become active"),
         )
-    })?
+    })?)
 }
 
 async fn wait_for_dht(handle: &NetHandle) -> Result<(), Box<dyn std::error::Error>> {
-    tokio::time::timeout(NETWORK_HANG_CAP, async {
-        let mut poll = Duration::from_millis(10);
-        loop {
-            if handle.get_status().await.routing_table_size.unwrap_or(0) > 0 {
-                return;
-            }
-            tokio::time::sleep(poll).await;
-            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
-        }
+    let found = poll_until(NETWORK_HANG_CAP, async || {
+        (handle.get_status().await.routing_table_size.unwrap_or(0) > 0).then_some(())
     })
-    .await
-    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "DHT peer never appeared"))?;
+    .await;
+    found.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "DHT peer never appeared")
+    })?;
     Ok(())
 }
 
@@ -343,18 +331,11 @@ async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
     handle_b.add_peer_addr(handle_c.endpoint_addr()).await;
     handle_c.add_peer_addr(handle_b.endpoint_addr()).await;
 
-    let opened_stream = tokio::time::timeout(NETWORK_HANG_CAP, async {
-        let mut poll = Duration::from_millis(10);
-        loop {
-            if let Ok(stream) = handle_a.open_stream(node_b, Alpn::Bao).await {
-                break stream;
-            }
-            tokio::time::sleep(poll).await;
-            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
-        }
+    let opened_stream = poll_until(NETWORK_HANG_CAP, async || {
+        handle_a.open_stream(node_b, Alpn::Bao).await.ok()
     })
     .await
-    .map_err(|_| {
+    .ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "DHT-signed fallback did not resolve node_b",
@@ -691,20 +672,13 @@ async fn offline_peer_bounded() -> Result<(), Box<dyn std::error::Error>> {
 
     handle_b.shutdown().await;
     let before = handle_a.pool_counts();
-    let after = tokio::time::timeout(NETWORK_HANG_CAP, async {
-        let mut poll = Duration::from_millis(10);
-        loop {
-            assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
-            let counts = handle_a.pool_counts();
-            if counts.cooldown_hits > before.cooldown_hits {
-                break counts;
-            }
-            tokio::time::sleep(poll).await;
-            poll = poll.saturating_mul(2).min(Duration::from_millis(200));
-        }
+    let after = poll_until(NETWORK_HANG_CAP, async || {
+        assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
+        let counts = handle_a.pool_counts();
+        (counts.cooldown_hits > before.cooldown_hits).then_some(counts)
     })
     .await
-    .map_err(|_| {
+    .ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "offline peer never entered dial cooldown",
@@ -747,7 +721,7 @@ struct RealmFixture {
     a: NetHandle,
     b: NetHandle,
     c: NetHandle,
-    b_storage: aruna_storage::StorageHandle,
+    b_storage: aruna_storage::storage::handle::StorageHandle,
     b_secret: iroh::SecretKey,
     node_b: NodeId,
     node_c: NodeId,

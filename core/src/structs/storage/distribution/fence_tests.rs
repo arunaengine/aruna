@@ -7,9 +7,9 @@ use ulid::Ulid;
 use super::*;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::distribution::presets::shard_layout;
-use crate::structs::storage::distribution::{
-    DistributionConfig, DistributionRequest, DistributionSettings, SetRoot, next_snapshot,
-};
+use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use crate::structs::storage::distribution::statement::SetRoot;
+use crate::structs::storage::distribution::{DistributionConfig, DistributionSettings};
 
 fn pending() -> DistributionSnapshot {
     let secret = |seed: u8| iroh::SecretKey::from_bytes(&[seed; 32]);

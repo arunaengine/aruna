@@ -3,15 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::s3::bucket::key::rows::authority_rows;
+use crate::s3::bucket::key::test_rows::{authority_rows, keys};
 use aruna_core::keyspaces::NOTIFICATION_OUTBOX_KEYSPACE;
 use aruna_core::structs::execution::notification::NotificationOutboxRecord;
-use aruna_core::structs::identity::user::vault::UserKeyRecord;
-use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::vault_format::key_fingerprint;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -19,22 +16,6 @@ const BUCKET_ID: Ulid = Ulid::from_bytes([4; 16]);
 
 fn user(seed: u8) -> UserId {
     UserId::new(Ulid::from_bytes([seed; 16]), RealmId::from_bytes([1; 32]))
-}
-
-fn keys(user_id: UserId) -> KeyLookup {
-    KeyLookup::Keys(vec![UserKeyRecord {
-        realm_id: user_id.realm_id,
-        user_id,
-        record_id: Ulid::from_bytes([user_id.user_ulid.to_bytes()[0]; 16]),
-        key_id: "slot".to_string(),
-        public_key: [7; 32],
-        fingerprint: key_fingerprint(&[7; 32]),
-        has_recovery: false,
-        node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
-        placement: PlacementRef::NIL,
-        created_at_ms: 1,
-        signature: None,
-    }])
 }
 
 fn copy(user_id: UserId) -> (Key, Value) {
@@ -50,19 +31,16 @@ fn copy(user_id: UserId) -> (Key, Value) {
     (copy.key().into(), copy.to_bytes().unwrap().into())
 }
 
-fn rows(values: Vec<Vec<u8>>) -> Event {
-    Event::Storage(StorageEvent::IterResult {
-        values: values
-            .into_iter()
-            .map(|value| (Key::from(Vec::new()), value.into()))
-            .collect(),
-        next_start_after: None,
-    })
+fn rows(values: Vec<(Key, Value)>) -> IoResult {
+    IoResult::Page {
+        rows: values,
+        next: None,
+    }
 }
 
 /// Checks a bucket of creator user(1) where user(1) and user(2) hold copies, `admins` hold the
 /// admin role now and `marker` is what the holders were told before. Answers the decision.
-fn checked(admins: &[UserId], marker: Option<Vec<u8>>) -> (RecoveryNoticeOperation, Effects) {
+fn checked(admins: &[UserId], marker: Option<Vec<u8>>) -> (RecoveryNoticeOperation, Step) {
     let lookups = BTreeMap::from([(user(1), keys(user(1))), (user(2), keys(user(2)))]);
     let mut operation = RecoveryNoticeOperation::new(RecoveryInput {
         bucket: "bucket".to_string(),
@@ -72,9 +50,8 @@ fn checked(admins: &[UserId], marker: Option<Vec<u8>>) -> (RecoveryNoticeOperati
         lookups,
         now_ms: 9,
     });
-    operation.start();
-    let txn_id = Ulid::from_bytes([9; 16]);
-    operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let _ = operation.first();
     let info = BucketInfo {
         group_id: Ulid::from_bytes([3; 16]),
         created_at: SystemTime::UNIX_EPOCH,
@@ -93,23 +70,18 @@ fn checked(admins: &[UserId], marker: Option<Vec<u8>>) -> (RecoveryNoticeOperati
         ..Default::default()
     };
     let values = authority_rows(&info, Some(&settings), admins);
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    operation.step(rows(Vec::new()));
-    operation.step(Event::Storage(StorageEvent::IterResult {
-        values: vec![copy(user(1)), copy(user(2))],
-        next_start_after: None,
-    }));
-    let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Key::from(Vec::new()),
-        value: marker.map(Value::from),
-    }));
-    (operation, effects)
+    let values = values.into_iter().map(|(_, value)| value).collect();
+    let _ = operation.next(IoResult::Values(values));
+    let _ = operation.next(rows(Vec::new()));
+    let _ = operation.next(rows(vec![copy(user(1)), copy(user(2))]));
+    let turn = operation.next(IoResult::Values(vec![marker.map(Value::from)]));
+    (operation, turn)
 }
 
 /// The notices and marker of a decision batch.
-fn written(effects: &Effects) -> (Vec<UserId>, Vec<u8>) {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the notice batch, got {effects:?}");
+fn written(turn: &Step) -> (Vec<UserId>, Vec<u8>) {
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected the notice batch, got {turn:?}");
     };
     let recipients = writes
         .iter()
@@ -125,33 +97,26 @@ fn written(effects: &Effects) -> (Vec<UserId>, Vec<u8>) {
 #[test]
 fn revoked_admin_degrades() {
     // With both admins ready the rule is met and nobody is told.
-    let (_, effects) = checked(&[user(2)], None);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
+    let (_, turn) = checked(&[user(2)], None);
+    assert_eq!(turn, Ok(Next::Done(Vec::new())));
 
     // user(2) lost the admin role: one ready holder without a recovery code is left. Only the
     // current holder is told; the former admin is not.
-    let (mut operation, effects) = checked(&[], None);
-    let (recipients, marker) = written(&effects);
+    let (mut operation, turn) = checked(&[], None);
+    let (recipients, marker) = written(&turn);
     assert_eq!(recipients, [user(1)]);
-    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    let txn_id = Ulid::from_bytes([9; 16]);
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    assert_eq!(effects.as_slice(), [schedule_drain_effect()]);
-    let key = aruna_core::task::TaskKey::DrainNotificationOutbox;
-    let after = std::time::Duration::ZERO;
-    let scheduled = aruna_core::task::TaskEvent::TimerScheduled { key, after };
-    operation.step(Event::Task(scheduled));
-    assert_eq!(operation.finalize(), Ok(vec![user(1)]));
+    // The drain is woken only after the notices committed.
+    let drain = IoCall::Effect(Box::new(schedule_drain_effect()));
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Ok(Next::Then {
+            output: vec![user(1)],
+            calls: vec![drain],
+        })
+    );
 
     // The same weakened state checked again tells nobody a second time.
-    let (_, effects) = checked(&[], Some(marker));
-    let (recipients, _) = written(&effects);
+    let (_, turn) = checked(&[], Some(marker));
+    let (recipients, _) = written(&turn);
     assert!(recipients.is_empty());
 }

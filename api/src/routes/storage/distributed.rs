@@ -3,46 +3,41 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_drivers::driver::drive;
 use std::sync::Arc;
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::storage::distribution::request::{PublishRefusal, TransferRole};
 use aruna_core::structs::storage::distribution::{
-    DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, RouteError,
-    SetPhase, TransferRole,
+    DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, SetPhase,
 };
-use aruna_operations::distribution::create::{
+use aruna_operations::transfer::create::{
     CreateError, CreateInput, CreationReport, LayoutKind, admit_pending, create_set,
 };
-use aruna_operations::distribution::forward::PublishRefusal;
-use aruna_operations::distribution::guard::GuardError;
-use aruna_operations::distribution::status::{
-    DeletionStatus, DistributionStatus, Reach, add_progress, read_status,
-};
+use aruna_operations::transfer::status::{add_progress, read_status};
+use aruna_operations::transfer::status_view::{DeletionStatus, DistributionStatus, Reach};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::routing::ensure_group_admin;
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::routes::storage::bucket::usage::range_sizes;
-use crate::routes::storage::deletion::bucket_info;
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct DistributedDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(DistributedDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_distributed))
         .routes(routes!(get_distributed))
         .routes(routes!(retry_admission))
@@ -433,7 +428,7 @@ fn phase_name(phase: SetPhase, deletion: Option<&DeletionStatus>) -> &'static st
 }
 
 pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse {
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     let members = status
         .members
         .into_iter()
@@ -548,21 +543,6 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
     }
 }
 
-/// A write this member of a distributed bucket may not take now: 503 when a retry or the
-/// coordinator can take it, 409 when the bucket state refuses it.
-pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
-    match error {
-        GuardError::NotCoordinator { .. }
-        | GuardError::RecordMissing(_)
-        | GuardError::Unreadable(_)
-        | GuardError::Route(
-            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
-        ) => ServerError::ServiceUnavailableReason(error.to_string()),
-        GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
-        GuardError::Conversion(error) => ServerError::InternalError(error.to_string()),
-    }
-}
-
 pub(crate) fn map_create_error(error: CreateError) -> ServerError {
     match error {
         CreateError::Invalid(message) => ServerError::BadRequestMessage(message),
@@ -575,7 +555,7 @@ pub(crate) fn map_create_error(error: CreateError) -> ServerError {
         CreateError::Publish(refusal) => ServerError::Conflict(refusal.to_string()),
         CreateError::UnknownSet(_) => ServerError::NotFound,
         CreateError::Conflicted => ServerError::Conflict(error.to_string()),
-        CreateError::Status(error) => ServerError::InternalError(error.to_string()),
+        CreateError::Status(error) => ServerError::InternalError(error.into()),
         CreateError::Blocked(message) => ServerError::ServiceUnavailableReason(message),
     }
 }
@@ -701,7 +681,6 @@ pub(super) fn admission_example() -> serde_json::Value {
     responses(
         (status = 201, description = "The set and each member's admission", body = AdmissionResponse, example = admission_example),
         (status = 400, description = "Invalid layout, bucket name or node", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change", body = ErrorResponse),
         (status = 503, description = "Configuration changes unavailable", body = ErrorResponse)
@@ -710,18 +689,20 @@ pub(super) fn admission_example() -> serde_json::Value {
 )]
 pub async fn create_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(group_id): Path<Ulid>,
     Json(request): Json<CreateDistributedRequest>,
 ) -> ServerResult<(StatusCode, Json<AdmissionResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     let input = create_input(group_id, request)?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
-    let report = create_set(&state.get_ctx(), &auth, bearer, input)
-        .await
-        .map_err(map_create_error)?;
+    let report = drive(
+        create_set(state.get_ctx().here(), &auth, bearer, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok((StatusCode::CREATED, Json(admission_response(report))))
 }
 
@@ -745,7 +726,6 @@ pub async fn create_distributed(
     ),
     responses(
         (status = 200, description = "Each member's admission", body = AdmissionResponse, example = admission_example),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group's admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse),
         (status = 409, description = "The publisher refused the change or the record conflicts", body = ErrorResponse),
@@ -755,18 +735,26 @@ pub async fn create_distributed(
 )]
 pub async fn retry_admission(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Json<AdmissionResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     ensure_group_admin(&state, &auth, group_id).await?;
     owned_status(&state, group_id, set_id).await?;
     let sizes = range_sizes(&state, bearer.as_ref(), set_id).await?;
     let bearer = crate::metadata::forwarded_auth_token(bearer)?;
-    let report = admit_pending(&state.get_ctx(), &auth, bearer, (set_id, None), &sizes)
-        .await
-        .map_err(map_create_error)?;
+    let report = drive(
+        admit_pending(
+            state.get_ctx().here(),
+            &auth,
+            bearer,
+            (set_id, None),
+            &sizes,
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_create_error)?;
     Ok(Json(admission_response(report)))
 }
 
@@ -776,11 +764,14 @@ pub(crate) async fn owned_status(
     group_id: Ulid,
     set_id: Ulid,
 ) -> ServerResult<DistributionStatus> {
-    let status = read_status(&state.get_ctx(), state.get_realm_id(), set_id)
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .filter(|status| status.owner_group == group_id)
-        .ok_or(ServerError::NotFound)?;
+    let status = drive(
+        read_status(state.get_ctx().heard(), state.get_realm_id(), set_id),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?
+    .filter(|status| status.owner_group == group_id)
+    .ok_or(ServerError::NotFound)?;
     Ok(status)
 }
 
@@ -815,7 +806,6 @@ pub(crate) async fn owned_status(
     ),
     responses(
         (status = 200, description = "The set's status", body = DistributedResponse, example = status_example),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket path", body = ErrorResponse),
         (status = 404, description = "This node holds no record of the set", body = ErrorResponse)
     ),
@@ -823,10 +813,9 @@ pub(crate) async fn owned_status(
 )]
 pub async fn get_distributed(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, set_id)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Json<DistributedResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let mut status = owned_status(&state, group_id, set_id).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),
@@ -835,7 +824,19 @@ pub async fn get_distributed(
         &status.bucket,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    add_progress(&state.get_ctx(), &mut status).await;
+    let context = state.get_ctx();
+    if let Ok(progress) = drive(
+        add_progress(
+            context.node_id(),
+            context.storage_handle.range_indexes().is_some(),
+            &status,
+        ),
+        &context,
+    )
+    .await
+    {
+        status = progress;
+    }
     Ok(Json(status_response(status)))
 }
 
@@ -886,7 +887,19 @@ pub async fn get_bucket_distribution(
         .map_err(hidden)?;
     let binding = info.distribution.ok_or(ServerError::NotFound)?;
     let mut status = owned_status(&state, info.group_id, binding.set_id).await?;
-    add_progress(&state.get_ctx(), &mut status).await;
+    let context = state.get_ctx();
+    if let Ok(progress) = drive(
+        add_progress(
+            context.node_id(),
+            context.storage_handle.range_indexes().is_some(),
+            &status,
+        ),
+        &context,
+    )
+    .await
+    {
+        status = progress;
+    }
     Ok(Json(status_response(status)))
 }
 

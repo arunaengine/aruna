@@ -1,0 +1,263 @@
+//! Tests that a paged distributed search keeps its cursor valid when another node answers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::topology;
+
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use std::time::UNIX_EPOCH;
+
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_core::search::ObjectKeyMatch;
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
+};
+use aruna_drivers::driver::drive;
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_operations::metadata::api::object_search::search_objects;
+use aruna_operations::metadata::api::search_types::{
+    BucketSearchRequest, ObjectQueryMode, SearchQueryRequest,
+};
+use ulid::Ulid;
+
+use topology::{TestNode, TestResult, Topology};
+
+async fn write_value(
+    node: &TestNode,
+    key_space: &str,
+    key: Vec<u8>,
+    value: Vec<u8>,
+) -> TestResult<()> {
+    match node
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key: key.into(),
+            value: value.into(),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
+        event => Err(format!("unexpected fixture write: {event:?}").into()),
+    }
+}
+
+async fn seed_bucket(node: &TestNode, realm: &Topology, group_id: Ulid) -> TestResult<()> {
+    write_value(
+        node,
+        S3_BUCKET_KEYSPACE,
+        b"data".to_vec(),
+        BucketInfo {
+            group_id,
+            created_at: UNIX_EPOCH,
+            created_by: realm.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        }
+        .to_bytes()?,
+    )
+    .await
+}
+
+async fn seed_object(node: &TestNode, realm: &Topology, key: &str, tag: u8) -> TestResult<()> {
+    let version_id = Ulid::generate();
+    write_value(
+        node,
+        BLOB_HEAD_KEYSPACE,
+        BlobHeadKey::new("data", key).to_bytes()?,
+        CurrentVersionPointer::new(version_id).to_bytes()?,
+    )
+    .await?;
+    write_value(
+        node,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new("data", key, version_id).to_bytes()?,
+        BlobVersion::materialized(
+            [tag; 32],
+            BackendRef::node_default(),
+            EncodingClass::Raw,
+            UNIX_EPOCH,
+            realm.user_id,
+            None,
+        )
+        .to_bytes()?,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn distributed_search_routes() -> TestResult<()> {
+    // A distributed cursor remains valid when a load balancer selects another realm node.
+    let realm = Topology::spawn_sharded(2, 0, 1, 1).await?;
+    let origin = realm.node(0);
+    let responder = realm.node(1);
+    let group_id = realm.seed_group().await?;
+    seed_bucket(origin, &realm, group_id).await?;
+    seed_object(origin, &realm, "reads/a.fastq", 1).await?;
+    seed_object(origin, &realm, "reads/b.fastq", 2).await?;
+
+    let first = drive(
+        search_objects(
+            realm.realm_id,
+            origin.node_id(),
+            SearchQueryRequest {
+                auth: realm.auth_context(),
+                bearer_token: Some(realm.bearer_string()),
+                query: "reads/".to_string(),
+                key_match: ObjectKeyMatch::Prefix,
+                bucket: Some("data".to_string()),
+                limit: 1,
+                cursor: None,
+                mode: ObjectQueryMode::DistributedBestEffort,
+                target_nodes: Some(vec![origin.node_id()]),
+            },
+            origin
+                .context
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
+        origin.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(first.hits.len(), 1);
+    assert_eq!(first.hits[0].key, "reads/a.fastq");
+    let cursor = first.next_cursor.expect("the first page is truncated");
+
+    let second = drive(
+        search_objects(
+            realm.realm_id,
+            responder.node_id(),
+            SearchQueryRequest {
+                auth: realm.auth_context(),
+                bearer_token: Some(realm.bearer_string()),
+                query: "reads/".to_string(),
+                key_match: ObjectKeyMatch::Prefix,
+                bucket: Some("data".to_string()),
+                limit: 1,
+                cursor: Some(cursor),
+                mode: ObjectQueryMode::DistributedBestEffort,
+                target_nodes: None,
+            },
+            responder
+                .context
+                .as_ref()
+                .storage_handle
+                .range_indexes()
+                .is_some(),
+        ),
+        responder.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(second.hits.len(), 1);
+    assert_eq!(second.hits[0].key, "reads/b.fastq");
+    assert!(second.next_cursor.is_none());
+    assert!(second.complete);
+
+    let buckets = drive(
+        search_buckets_distributed(
+            realm.realm_id,
+            responder.node_id(),
+            BucketSearchRequest {
+                auth: realm.auth_context(),
+                bearer_token: Some(realm.bearer_string()),
+                query: "data".to_string(),
+                key: None,
+                extras: None,
+                limit: 10,
+                group_id: None,
+                cursor: None,
+                target_nodes: Some(vec![origin.node_id()]),
+                database: false,
+            },
+        ),
+        responder.context.as_ref(),
+    )
+    .await?;
+    assert_eq!(buckets.hits.len(), 1);
+    assert_eq!(buckets.hits[0].bucket, "data");
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_keeps_member() -> TestResult<()> {
+    // An extra operation's deny on the member a merged page would show leaves the bucket listed
+    // through another member, because each node applies it before the members merge.
+    use aruna_core::request_policy::{PolicyKind, RequestPolicy};
+    use aruna_core::structs::storage::distribution::{DistributionBinding, DistributionRevision};
+    let mut realm = Topology::spawn_sharded(2, 0, 1, 1).await?;
+    let group_id = realm.seed_group().await?;
+    let set_id = Ulid::from_parts(4, 4);
+    for (index, member) in [(0, 1u16), (1, 2u16)] {
+        let binding = DistributionBinding {
+            set_id,
+            member_id: Ulid::from_parts(5, member.into()),
+            incarnation: 0,
+            revision: DistributionRevision::default(),
+        };
+        let info = BucketInfo {
+            group_id,
+            created_at: UNIX_EPOCH,
+            created_by: realm.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: Some(binding),
+        };
+        let node = realm.node(index);
+        write_value(node, S3_BUCKET_KEYSPACE, b"data".to_vec(), info.to_bytes()?).await?;
+    }
+    let mut members = realm.node_ids();
+    members.sort_by_key(|node_id| *node_id.as_bytes());
+    let (first, second) = (members[0], members[1]);
+    let mut config = realm.config.clone();
+    config.request_policies = vec![RequestPolicy {
+        policy_id: Ulid::from_parts(6, 6),
+        name: "hide-first-member".to_string(),
+        kind: PolicyKind::Deny,
+        when: None,
+        expression: format!("operation == 'mcp:list_buckets' && path.contains('{first}')"),
+        enabled: true,
+    }];
+    realm.apply_config(config).await?;
+    let search = |operation: Option<&str>| BucketSearchRequest {
+        auth: realm.auth_context(),
+        bearer_token: Some(realm.bearer_string()),
+        query: "data".to_string(),
+        key: None,
+        extras: operation.map(PolicyRequestExtras::operation),
+        limit: 10,
+        group_id: None,
+        cursor: None,
+        target_nodes: Some(realm.node_ids()),
+        database: false,
+    };
+    let origin = realm.node(0);
+    let shown = |request| {
+        let search = search_buckets_distributed(realm.realm_id, origin.node_id(), request);
+        drive(search, origin.context.as_ref())
+    };
+    let plain = shown(search(None)).await?;
+    let nodes: Vec<_> = plain.hits.iter().map(|hit| hit.node_id).collect();
+    assert_eq!(nodes, [first]);
+    let filtered = shown(search(Some("mcp:list_buckets"))).await?;
+    let nodes: Vec<_> = filtered.hits.iter().map(|hit| hit.node_id).collect();
+    assert_eq!(nodes, [second]);
+    realm.shutdown().await;
+    Ok(())
+}

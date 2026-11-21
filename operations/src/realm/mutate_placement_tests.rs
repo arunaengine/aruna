@@ -4,9 +4,10 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::UserId;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentTarget;
-use aruna_core::events::StorageEvent;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metadata::{MetadataEventPayload, MetadataEventRecord};
 use aruna_core::storage_entries::{create_projection_entries, registry_write_entries};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
@@ -18,28 +19,31 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use tempfile::tempdir;
 
 use super::*;
-use crate::driver::{DriverContext, drive};
-use crate::placement::transition::{TransitionRequest, plan_transition};
-use crate::realm::get_config::GetConfigOperation;
+use crate::document_repository::GetConfigOperation;
+use aruna_core::placement::transition::{TransitionRequest, plan_transition};
 use aruna_core::structs::placement::transition::{
     PlacementTransition, ProofClaim, TransitionLimits,
 };
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::path_context;
 
-fn node(seed: u8) -> aruna_core::NodeId {
+fn node(seed: u8) -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
 }
 
-fn node_secret(node_id: &aruna_core::NodeId) -> iroh::SecretKey {
+fn node_secret(node_id: &aruna_core::id::NodeId) -> iroh::SecretKey {
     (1..=8u8)
         .map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]))
         .find(|secret| secret.public() == *node_id)
         .expect("fixture node keys are seeded")
 }
 
-fn actor(realm_id: RealmId) -> Actor {
+pub(crate) fn actor(realm_id: RealmId) -> Actor {
     Actor {
         node_id: node(1),
         user_id: UserId::local(Ulid::from_bytes([1; 16]), realm_id),
@@ -47,18 +51,7 @@ fn actor(realm_id: RealmId) -> Actor {
     }
 }
 
-fn context(root: &str) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
-}
-
-async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
+pub(crate) async fn seed_config(context: &DriverContext, actor: &Actor) -> RealmConfigDocument {
     let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     document.seed_default_placement();
     document.ensure_node(actor.node_id, RealmNodeKind::Management);
@@ -112,43 +105,7 @@ fn conflict_is_expected() {
     ));
 }
 
-#[tokio::test]
-async fn concurrent_mutations_land() {
-    // Writers racing on one document conflict at commit; each re-drives
-    // its own mutation, so all of them land instead of one failing.
-    let root = tempdir().unwrap();
-    let context = context(root.path().to_str().unwrap());
-    let actor = actor(RealmId::from_bytes([21; 32]));
-    seed_config(&context, &actor).await;
-    let ids: Vec<Ulid> = (1..=6u8).map(|seed| Ulid::from_bytes([seed; 16])).collect();
-    let mut tasks = Vec::new();
-    for strategy_id in ids.clone() {
-        let context = context.clone();
-        let actor = actor.clone();
-        tasks.push(tokio::spawn(async move {
-            drive_placement_mutation(
-                MutatePlacementConfig {
-                    actor,
-                    mutation: RealmPlacementMutation::UpsertStrategy(strategy(strategy_id)),
-                },
-                None,
-                &context,
-            )
-            .await
-        }));
-    }
-    for task in tasks {
-        task.await.unwrap().expect("every mutation lands");
-    }
-    let config = drive(GetConfigOperation::new(actor.realm_id), &context)
-        .await
-        .unwrap();
-    for strategy_id in ids {
-        assert!(config.strategy(&strategy_id).is_some());
-    }
-}
-
-fn strategy(strategy_id: Ulid) -> PlacementStrategy {
+pub(crate) fn strategy(strategy_id: Ulid) -> PlacementStrategy {
     PlacementStrategy {
         strategy_id,
         name: "hot".to_string(),
@@ -195,23 +152,13 @@ fn create_event(actor: &Actor, strategy_id: Ulid, document_seed: u8) -> Metadata
 }
 
 async fn write_entries(context: &DriverContext, writes: Vec<(String, Key, Value)>) {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchWrite {
-            writes,
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::BatchWriteResult { .. })
-    ));
+    aruna_drivers::testing::write_entries(&context.storage_handle, writes).await;
 }
 
 #[tokio::test]
 async fn strategy_binding_lifecycle() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([3; 32]);
     let actor = actor(realm_id);
     let initial = seed_config(&context, &actor).await;
@@ -353,7 +300,7 @@ async fn strategy_binding_lifecycle() {
 #[tokio::test]
 async fn node_placement_lifecycle() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([12; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -388,7 +335,7 @@ async fn node_placement_lifecycle() {
 #[tokio::test]
 async fn rejects_reserved_label() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([13; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -415,7 +362,7 @@ async fn rejects_reserved_label() {
 #[tokio::test]
 async fn rejects_dangling_refs() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([4; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -524,7 +471,7 @@ fn group_reuses_realm() {
 #[tokio::test]
 async fn referenced_strategy_conflicts() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([5; 32]);
     let actor = actor(realm_id);
     let document = seed_config(&context, &actor).await;
@@ -544,7 +491,7 @@ async fn referenced_strategy_conflicts() {
 #[tokio::test]
 async fn materialized_reference_blocks() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([14; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -573,7 +520,7 @@ async fn materialized_reference_blocks() {
 #[tokio::test]
 async fn pending_reference_blocks() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([15; 32]);
     let actor = actor(realm_id);
     seed_config(&context, &actor).await;
@@ -602,7 +549,7 @@ async fn pending_reference_blocks() {
 #[tokio::test]
 async fn missing_config_absent() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([11; 32]);
     let actor = actor(realm_id);
 
@@ -619,35 +566,50 @@ async fn missing_config_absent() {
 
 #[test]
 fn mutation_schedules_revalidation() {
+    // After the commit the outbox drain and the placement revalidation are woken.
     let realm_id = RealmId::from_bytes([6; 32]);
     let actor = actor(realm_id);
-    let mut operation = MutatePlacementOperation::new(MutatePlacementConfig {
+    let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    document.seed_default_placement();
+    document.ensure_node(actor.node_id, RealmNodeKind::Management);
+    let operation = MutatePlacementOperation::new(MutatePlacementConfig {
         actor: actor.clone(),
         mutation: RealmPlacementMutation::RemoveOverride(Vec::new()),
     });
-    operation.state = MutatePlacementState::ScheduleSyncDrain;
-
-    let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: TaskKey::DrainSyncOutbox,
-        after: std::time::Duration::ZERO,
-    }));
-
+    let mut write = operation.write();
+    assert_eq!(write.transaction(), TransactionMode::Write);
+    write.first().unwrap();
+    let read = IoResult::Values(vec![Some(document.to_bytes(&actor).unwrap().into()), None]);
+    assert!(matches!(write.next(read), Ok(Next::Call(IoCall::Write(_)))));
+    let Ok(Next::Then { calls, .. }) = write.next(IoResult::Done) else {
+        panic!("expected the config with the timers");
+    };
+    let [IoCall::Effect(drain), IoCall::Effect(revalidate)] = calls.as_slice() else {
+        panic!("expected the drain and the revalidation");
+    };
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Task(TaskEffect::ResetTimer {
+        drain.as_ref(),
+        Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainSyncOutbox,
+            ..
+        })
+    ));
+    assert!(matches!(
+        revalidate.as_ref(),
+        Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::SyncPlacements {
                 realm_id: scheduled_realm,
                 node_id,
             },
             after,
-        })] if *scheduled_realm == realm_id && *node_id == actor.node_id && after.is_zero()
+        }) if *scheduled_realm == realm_id && *node_id == actor.node_id && after.is_zero()
     ));
 }
 
 async fn seed_placement_config(
     context: &DriverContext,
     actor: &Actor,
-    nodes: &[aruna_core::NodeId],
+    nodes: &[aruna_core::id::NodeId],
     replica: Option<u32>,
 ) -> RealmConfigDocument {
     let mut document = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
@@ -682,7 +644,7 @@ async fn seed_placement_config(
     document
 }
 
-fn draining_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+fn draining_entry(node_id: aruna_core::id::NodeId) -> NodePlacementEntry {
     NodePlacementEntry {
         node_id,
         location: String::new(),
@@ -713,7 +675,7 @@ fn draining_change_rejected() {
     }
 }
 
-fn placed_entry(node_id: aruna_core::NodeId) -> NodePlacementEntry {
+fn placed_entry(node_id: aruna_core::id::NodeId) -> NodePlacementEntry {
     NodePlacementEntry {
         node_id,
         location: "eu-west".to_string(),
@@ -731,7 +693,7 @@ fn placed_document(entry: NodePlacementEntry) -> RealmConfigDocument {
 }
 
 fn set_attributes(
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     location: Option<&str>,
     labels: Option<BTreeMap<String, String>>,
 ) -> RealmPlacementMutation {
@@ -929,7 +891,7 @@ fn unmapped_drain_allowed() {
 #[tokio::test]
 async fn overlapping_transition_allowed() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([22; 32]);
     let actor = actor(realm_id);
     // Replica two with two nodes: every shard holds both, so draining one
@@ -951,7 +913,7 @@ async fn overlapping_transition_allowed() {
 #[tokio::test]
 async fn rejects_empty_holders() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([23; 32]);
     let actor = actor(realm_id);
     let document = seed_placement_config(&context, &actor, &[node(1), node(2)], Some(2)).await;
@@ -1187,7 +1149,7 @@ fn rejects_plan_mismatch() {
     ));
 }
 
-fn issuer(realm_id: RealmId, node_id: aruna_core::NodeId) -> Actor {
+fn issuer(realm_id: RealmId, node_id: aruna_core::id::NodeId) -> Actor {
     Actor {
         node_id,
         user_id: UserId::nil(realm_id),
@@ -1365,7 +1327,7 @@ fn reports_require_roles() {
 #[tokio::test]
 async fn unauthorized_writes_nothing() {
     let directory = tempdir().unwrap();
-    let context = context(directory.path().to_str().unwrap());
+    let context = path_context(directory.path().to_str().unwrap());
     let realm_id = RealmId::from_bytes([46; 32]);
     let management = actor(realm_id);
     let seeded = seed_placement_config(&context, &management, &[node(2)], Some(2)).await;
@@ -1386,7 +1348,7 @@ async fn unauthorized_writes_nothing() {
         .expect("the realm config survives a rejected mutation");
     assert!(stored.candidate_maps.is_empty());
     assert!(
-        crate::sync::document_outbox::read_outbox_tails(&context.storage_handle)
+        aruna_test_support::documents::read_outbox_tails(&context.storage_handle)
             .await
             .expect("outbox scan")
             .is_empty()
@@ -1483,12 +1445,7 @@ fn completion_must_verify() {
 }
 
 fn auth(actor: &Actor) -> AuthContext {
-    AuthContext {
-        user_id: actor.user_id,
-        realm_id: actor.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(actor.user_id, actor.realm_id)
 }
 
 fn placement_config(actor: &Actor) -> MutatePlacementConfig {
@@ -1498,33 +1455,33 @@ fn placement_config(actor: &Actor) -> MutatePlacementConfig {
     }
 }
 
-#[test]
-fn authorized_checks_permission() {
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
+fn checked(
+    allowed: Result<bool, AuthorizationError>,
+) -> Result<Next<RealmConfigDocument>, MutatePlacementError> {
+    let actor = actor(RealmId::from_bytes([1; 32]));
     let mut operation =
         MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    let effects = operation.start();
-    assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-    let emitted = format!("{effects:?}");
-    assert!(emitted.contains(&policy_admin_path(realm_id)));
-    assert!(emitted.contains("WRITE"));
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    operation.next(IoResult::Child(ChildOutcome::new(allowed)))
+}
+
+#[test]
+fn authorized_checks_permission() {
+    // The caller's check runs first; an allowed one hands over to the write child.
+    assert!(matches!(
+        checked(Ok(true)),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
 }
 
 #[test]
 fn denied_is_terminal() {
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
-    let mut operation =
-        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    operation.start();
-    let effects = operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-    ));
-    assert!(effects.is_empty());
-    assert!(operation.is_complete());
+    let actor = actor(RealmId::from_bytes([1; 32]));
     assert_eq!(
-        operation.finalize(),
+        checked(Ok(false)),
         Err(MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         })
@@ -1534,21 +1491,9 @@ fn denied_is_terminal() {
 #[test]
 fn capacity_not_denied() {
     // Storage exhaustion inside the check is infrastructure, not a verdict.
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
-    let mut operation =
-        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    operation.start();
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult {
-            allowed: Err(AuthorizationError::StorageError(
-                StorageError::CleanupCapacity,
-            )),
-        },
-    ));
-    assert!(operation.is_complete());
+    let capacity = AuthorizationError::StorageError(StorageError::CleanupCapacity);
     assert_eq!(
-        operation.finalize(),
+        checked(Err(capacity)),
         Err(MutatePlacementError::StorageError(
             StorageError::CleanupCapacity
         ))
@@ -1557,15 +1502,13 @@ fn capacity_not_denied() {
 
 #[test]
 fn internal_skips_authorization() {
-    let realm_id = RealmId::from_bytes([1; 32]);
-    let actor = actor(realm_id);
+    let actor = actor(RealmId::from_bytes([1; 32]));
     let mut operation = MutatePlacementOperation::new(placement_config(&actor));
-    assert_eq!(
-        operation.start().as_slice(),
-        &[Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    );
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert!(operation.checked);
 }
 
 #[test]
@@ -1575,26 +1518,12 @@ fn refuses_server_node() {
     let actor = actor(realm_id);
     let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
     document.ensure_node(actor.node_id, RealmNodeKind::Server);
-    let mut operation =
-        MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
-    operation.start();
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([7; 16]),
-    }));
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                Key::from(vec![0u8]),
-                Some(document.to_bytes(&actor).unwrap().into()),
-            ),
-            (Key::from(vec![1u8]), None),
-        ],
-    }));
+    let operation = MutatePlacementOperation::authorized(placement_config(&actor), auth(&actor));
+    let mut write = operation.write();
+    write.first().unwrap();
+    let read = IoResult::Values(vec![Some(document.to_bytes(&actor).unwrap().into()), None]);
     assert_eq!(
-        operation.finalize(),
+        write.next(read),
         Err(MutatePlacementError::Unauthorized {
             node_id: actor.node_id,
         })

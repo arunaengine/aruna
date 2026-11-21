@@ -29,6 +29,7 @@ pub mod link_routes;
 pub mod management_relay;
 pub mod metadata;
 pub mod node_names;
+pub(crate) mod notification_calls;
 pub mod notifications;
 pub mod oai;
 pub mod oidc_providers;
@@ -55,10 +56,6 @@ pub mod webhooks;
 
 // Temporary aliases for the pre-family module paths; the access, execution
 // and storage families own these modules now. Remove once consumers migrate.
-pub use access::{credentials, group_join, groups, sessions, tokens, users};
-pub use execution::{compute, device_compute, jobs, tes};
-pub use storage::bucket::usage as bucket_usage;
-pub use storage::{blobs, connectors, group_backends};
 
 /// The single REST source: every route is registered from a `#[utoipa::path]`
 /// handler, so the runtime router and the generated document cannot diverge.
@@ -351,6 +348,7 @@ pub(crate) mod tests {
         ("POST", "/system/realm/nodes/{node_id}/promote"),
         ("GET", "/data/buckets/{bucket}/placement"),
         ("GET", "/data/buckets/{bucket}/placement/coverage"),
+        ("GET", "/data/buckets/{bucket}/placement/coverage/count"),
         ("GET", "/data/buckets/{bucket}/placement/objects"),
         ("GET", "/data/buckets/{bucket}/storage/check"),
         ("GET", "/data/buckets/{bucket}/storage/compression"),
@@ -582,6 +580,7 @@ pub(crate) mod tests {
         ("POST", "/data/placement/quarantine"),
         ("POST", "/data/sync/quarantine/{record_id}/acknowledge"),
         ("POST", "/data/blobs/replicate"),
+        ("POST", "/data/buckets/{bucket}/placement/coverage/count"),
         ("POST", "/data/buckets/{bucket}/placement/objects"),
         ("POST", "/data/buckets/{bucket}/objects/text"),
         ("POST", "/data/buckets/{bucket}/placement/runs"),

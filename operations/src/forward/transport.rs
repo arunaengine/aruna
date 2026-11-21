@@ -1,192 +1,28 @@
-//! Forwards a metadata write to holder nodes in rank order and maps their replies to errors.
+//! Sends encoded metadata requests to peers and builds the refusals forwarded requests answer.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::routing::distinct_holders;
-use crate::driver::DriverContext;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::create_document::CreateDocumentError;
-use crate::metadata::delete_document::DeleteDocumentError;
-use crate::metadata::handle::MetadataRequestDelivery;
-use crate::metadata::protocol::MetadataReadError;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::metadata::protocol::WriteAuthError;
-use crate::metadata::update_document::UpdateDocumentError;
-use aruna_core::NodeId;
-use std::sync::Arc;
+use aruna_core::calls::IoError;
+use aruna_core::metadata::protocol::{
+    MetadataReadError, MetadataTransportMessage, decode_message, encode_message, metadata_request,
+};
 use thiserror::Error;
-use tracing::error;
-use tracing::warn;
 
-#[derive(Debug, Error)]
-pub enum MetadataWriteError {
-    #[error("metadata write requires authentication")]
+/// Why a request forwarded to peers ended without being accepted.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ForwardError {
+    #[error("the forwarded request needs authentication")]
     Unauthorized,
-    #[error("metadata write is forbidden")]
+    #[error("the forwarded request is forbidden")]
     Forbidden,
-    #[error("metadata document not found")]
-    NotFound,
-    #[error(transparent)]
-    Create(#[from] CreateDocumentError),
-    #[error(transparent)]
-    Update(#[from] UpdateDocumentError),
-    #[error(transparent)]
-    Delete(#[from] DeleteDocumentError),
-    /// The write reached a node that cannot publish it and no holder accepted
-    /// the forward. Loud by construction: never accepted, never deferred into an
-    /// outbox that can only drain to a topic this node may not join.
-    #[error("metadata write is undeliverable: {0}")]
-    Undeliverable(String),
+    #[error("no peer accepted the forwarded request")]
+    Unavailable,
 }
 
-pub(crate) fn write_error(error: MetadataWriteError) -> MetadataApiError {
-    match error {
-        MetadataWriteError::Unauthorized => MetadataApiError::Unauthorized,
-        MetadataWriteError::Forbidden => MetadataApiError::Forbidden,
-        MetadataWriteError::NotFound => MetadataApiError::NotFound,
-        _ => MetadataApiError::ServiceUnavailable,
+impl From<IoError> for ForwardError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
     }
-}
-
-pub(crate) fn read_error(error: MetadataApiError) -> MetadataReadError {
-    match error {
-        MetadataApiError::Unauthorized => MetadataReadError::Unauthorized,
-        MetadataApiError::Forbidden => MetadataReadError::Forbidden,
-        MetadataApiError::NotFound => MetadataReadError::NotFound,
-        MetadataApiError::TooLarge => MetadataReadError::TooLarge,
-        MetadataApiError::BadRequest
-        | MetadataApiError::ServiceUnavailable
-        | MetadataApiError::SearchIncomplete(_)
-        | MetadataApiError::PlacementUnavailable(_)
-        | MetadataApiError::InvalidCursor(_)
-        | MetadataApiError::InvalidQuery(_)
-        | MetadataApiError::Internal(_) => MetadataReadError::Unavailable,
-    }
-}
-
-pub(crate) async fn forward_to_holders(
-    context: &Arc<DriverContext>,
-    holders: &[NodeId],
-    message: MetadataTransportMessage,
-    local_miss: Option<NodeId>,
-    local_capacity: bool,
-) -> Result<MetadataTransportMessage, MetadataWriteError> {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
-        return Err(MetadataWriteError::Undeliverable(
-            "no metadata handle to forward with".to_string(),
-        ));
-    };
-    let holders = distinct_holders(holders);
-    let local_node_id = local_miss.or_else(|| context.net_handle.as_ref().map(|net| net.node_id()));
-    let tracks_not_found = matches!(
-        &message,
-        MetadataTransportMessage::ForwardUpdateDocument { .. }
-            | MetadataTransportMessage::ForwardDeleteDocument { .. }
-            | MetadataTransportMessage::ForwardPersistentId { .. }
-    );
-
-    let mut failures: Vec<String> = Vec::new();
-    let mut not_found = usize::from(local_miss.is_some_and(|local| holders.contains(&local)));
-    let mut capacity =
-        usize::from(local_capacity && local_miss.is_some_and(|local| holders.contains(&local)));
-    for holder in holders
-        .iter()
-        .filter(|holder| Some(**holder) != local_node_id)
-    {
-        match metadata_handle
-            .request_forwarded_write(*holder, message.clone())
-            .await
-        {
-            Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: WriteAuthError::Unauthorized,
-            }) => return Err(MetadataWriteError::Unauthorized),
-            Ok(MetadataTransportMessage::ForwardedWriteDenied {
-                error: WriteAuthError::Forbidden,
-            }) => return Err(MetadataWriteError::Forbidden),
-            Ok(MetadataTransportMessage::WriteNotFound) if tracks_not_found => {
-                not_found += 1;
-            }
-            Ok(MetadataTransportMessage::WriteNotFound) => {
-                failures.push(format!(
-                    "{holder}: holder returned not found for a forwarded create"
-                ));
-            }
-            Ok(MetadataTransportMessage::ForwardedWriteUnavailable) => {
-                failures.push(format!("{holder}: holder placement view is unavailable"));
-            }
-            Ok(MetadataTransportMessage::MetadataHistoryCapacity)
-                if matches!(
-                    &message,
-                    MetadataTransportMessage::ForwardUpdateDocument { .. }
-                ) =>
-            {
-                capacity += 1;
-            }
-            Ok(MetadataTransportMessage::MetadataHistoryCapacity) => {
-                failures.push(format!(
-                    "{holder}: holder returned metadata history capacity for a non-update"
-                ));
-            }
-            Ok(MetadataTransportMessage::Reject(error)) => {
-                warn!(holder = %holder, error = %error, "Holder rejected a forwarded metadata write");
-                return Err(MetadataWriteError::Undeliverable(format!(
-                    "holder `{holder}` rejected the forwarded metadata write; refusing to replay it: {error}"
-                )));
-            }
-            Ok(response) => return Ok(response),
-            Err(error) => {
-                warn!(holder = %holder, error = %error, "Failed to forward a metadata write to holder");
-                if retry_disposition(error.delivery()) == RetryDisposition::Stop {
-                    return Err(MetadataWriteError::Undeliverable(format!(
-                        "forward to holder `{holder}` may have applied the metadata write before failing; refusing to replay it: {error}"
-                    )));
-                }
-                failures.push(format!("{holder}: {error}"));
-            }
-        }
-    }
-
-    if !holders.is_empty() && capacity == holders.len() {
-        return Err(MetadataWriteError::Undeliverable(
-            "metadata history capacity reached on every holder".to_string(),
-        ));
-    }
-
-    if tracks_not_found && !holders.is_empty() && not_found == holders.len() {
-        return Err(MetadataWriteError::NotFound);
-    }
-
-    let detail = if failures.is_empty() {
-        "the document's bucket has no reachable holder".to_string()
-    } else {
-        failures.join("; ")
-    };
-    error!(
-        holders = holders.len(),
-        detail = %detail,
-        "Metadata write reached a non-holder and no holder accepted the forward"
-    );
-    Err(MetadataWriteError::Undeliverable(detail))
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RetryDisposition {
-    TryNext,
-    Stop,
-}
-
-pub(crate) fn retry_disposition(delivery: MetadataRequestDelivery) -> RetryDisposition {
-    match delivery {
-        MetadataRequestDelivery::DefinitelyNotSent => RetryDisposition::TryNext,
-        MetadataRequestDelivery::PossiblySent => RetryDisposition::Stop,
-    }
-}
-
-pub(crate) fn unexpected_response(response: MetadataTransportMessage) -> MetadataWriteError {
-    MetadataWriteError::Undeliverable(format!(
-        "unexpected forwarded metadata response: {}",
-        crate::metadata::handle::transport_message_kind(&response)
-    ))
 }
 
 pub(crate) fn reject(error: impl Into<String>) -> MetadataTransportMessage {
@@ -216,3 +52,83 @@ pub(crate) fn forwarded_unavailable(
         _ => reject("unexpected forwarded metadata message"),
     }
 }
+
+/// Upper bound of one request; the transport's own step limits end it earlier.
+const PEER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The call that sends `message` to `peer`, or why it does not encode.
+pub(crate) fn peer_call(
+    peer: aruna_core::id::NodeId,
+    message: &MetadataTransportMessage,
+) -> Result<aruna_core::calls::IoCall, String> {
+    peer_call_within(peer, message, PEER_DEADLINE)
+}
+
+/// [`peer_call`] with an answer due within `timeout`.
+pub(crate) fn peer_call_within(
+    peer: aruna_core::id::NodeId,
+    message: &MetadataTransportMessage,
+    timeout: std::time::Duration,
+) -> Result<aruna_core::calls::IoCall, String> {
+    let frame = encode_message(message).map_err(|error| error.to_string())?;
+    let request = metadata_request(peer, frame, timeout);
+    let effect = aruna_core::effects::Effect::Net(aruna_core::effects::NetEffect::MetadataRequest(
+        Box::new(request),
+    ));
+    Ok(aruna_core::calls::IoCall::from(effect))
+}
+
+/// The peer's decoded answer, or why there is none.
+pub(crate) fn peer_answer(
+    result: aruna_core::calls::IoResult,
+) -> Result<Result<MetadataTransportMessage, String>, aruna_core::calls::IoError> {
+    Ok(timed_answer(result)?.0)
+}
+
+/// Whether a peer request failed because this node has no metadata handle to send it with.
+pub(crate) fn no_peer_transport(result: &aruna_core::calls::IoResult) -> bool {
+    use aruna_core::events::{Event, NetEvent, PeerRequestError};
+    use aruna_core::metadata::MetadataError;
+    let aruna_core::calls::IoResult::Event(event) = result else {
+        return false;
+    };
+    let Event::Net(NetEvent::MetadataAnswer(answer)) = &**event else {
+        return false;
+    };
+    matches!(
+        answer.result,
+        Err(PeerRequestError::Failed(MetadataError::HandleMissing))
+    )
+}
+
+/// The peer's decoded answer and how long the request took.
+pub(crate) fn timed_answer(
+    result: aruna_core::calls::IoResult,
+) -> Result<
+    (
+        Result<MetadataTransportMessage, String>,
+        std::time::Duration,
+    ),
+    aruna_core::calls::IoError,
+> {
+    let answer = match result.event()? {
+        aruna_core::events::Event::Net(aruna_core::events::NetEvent::MetadataAnswer(answer)) => {
+            answer
+        }
+        other => {
+            return Err(aruna_core::calls::IoError::Unexpected {
+                expected: "Event::Net(NetEvent::MetadataAnswer)",
+                got: other.label(),
+            });
+        }
+    };
+    let decoded = match answer.result {
+        Ok(bytes) => decode_message(&bytes).map_err(|error| error.to_string()),
+        Err(error) => Err(format!("{error:?}")),
+    };
+    Ok((decoded, answer.elapsed))
+}
+
+#[cfg(test)]
+#[path = "peer_call_tests.rs"]
+mod peer_call_tests;

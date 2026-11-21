@@ -4,17 +4,17 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::jobs::repository::Action;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
+use crate::metadata::model::{RepositoryExportRequest, SubmitExportRequest, SubmitExportResponse};
 use crate::server::state::ServerState;
 
 use super::rocrate_import::{
@@ -95,11 +95,10 @@ Invalid queries return 400, with code not_supported for a repository kind withou
 )]
 pub async fn search_records(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Query(query): Query<RepositorySearch>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let query = aruna_core::repository::RepositoryQuery {
         group_id: ulid::Ulid::from_string(&group_id).map_err(|_| ServerError::BadRequest)?,
         connector_id: ulid::Ulid::from_string(&connector_id)
@@ -118,24 +117,26 @@ pub async fn search_records(
     .await?;
     let kind = links::connector_kind(&state, query.group_id, query.connector_id).await?;
     links::ensure_capable(kind, Action::Search)?;
-    aruna_operations::jobs::repository::search(
+    let context = state.get_ctx();
+    let search = aruna_operations::jobs::repository::invenio::query::SearchRecordsOperation::new(
         kind,
-        &state.get_ctx(),
-        &auth,
-        &query,
+        context.node_scope(),
+        auth.clone(),
+        query,
         state.rocrate_limits().metadata_bytes,
-    )
-    .await
-    .map(Json)
-    .map_err(|error| match error {
-        aruna_operations::jobs::repository::TransferError::Permanent(message) => {
-            ServerError::BadRequestReason(message)
-        }
-        error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
-            ServerError::BadRequestReason(error.to_string())
-        }
-        _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
-    })
+    );
+    aruna_drivers::driver::drive(search, context.as_ref())
+        .await
+        .map(Json)
+        .map_err(|error| match error {
+            aruna_operations::jobs::repository::TransferError::Permanent(message) => {
+                ServerError::BadRequestReason(message)
+            }
+            error @ aruna_operations::jobs::repository::TransferError::Refused(_) => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            _ => ServerError::ServiceUnavailableReason("repository search unavailable".into()),
+        })
 }
 
 /// Names the record by exactly one of record_id, doi or url.
@@ -268,10 +269,13 @@ A kind without imports, a doi or url on a kind without search, or keep_updated o
 )]
 pub async fn import_record(
     state: State<Arc<ServerState>>,
-    auth: Extension<Option<AuthContext>>,
+    auth: UnrestrictedAuth,
     Json(request): Json<RepositoryImportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitImportResponse>)> {
-    use aruna_operations::jobs::repository::{RecordReference, TransferError, resolve};
+    use aruna_operations::jobs::repository::TransferError;
+    use aruna_operations::jobs::repository::invenio::query::{
+        RecordReference, ResolveRecordOperation,
+    };
     let reference = match (request.record_id, request.doi, request.url) {
         (Some(id), None, None) => RecordReference::Id(id),
         (None, Some(doi), None) => RecordReference::Doi(doi),
@@ -285,7 +289,7 @@ pub async fn import_record(
     let record_id = match reference {
         RecordReference::Id(id) => id,
         reference => {
-            let caller = crate::auth::require_unrestricted_auth(&state, auth.0.clone())?;
+            let caller = auth.0.clone();
             let group_id =
                 ulid::Ulid::from_string(&request.group_id).map_err(|_| ServerError::BadRequest)?;
             let connector_id = ulid::Ulid::from_string(&request.connector_id)
@@ -300,23 +304,25 @@ pub async fn import_record(
             let kind = links::connector_kind(&state, group_id, connector_id).await?;
             links::ensure_capable(kind, Action::Import)?;
             links::ensure_capable(kind, Action::Search)?;
-            resolve(
+            let context = state.get_ctx();
+            let resolve = ResolveRecordOperation::new(
                 kind,
-                &state.get_ctx(),
-                &caller,
+                context.node_scope(),
+                caller,
                 group_id,
                 connector_id,
-                &reference,
+                reference,
                 state.rocrate_limits().metadata_bytes,
-            )
-            .await
-            .map_err(|error| match error {
-                TransferError::Permanent(message) => ServerError::BadRequestReason(message),
-                error @ TransferError::Refused(_) => {
-                    ServerError::BadRequestReason(error.to_string())
-                }
-                _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
-            })?
+            );
+            aruna_drivers::driver::drive(resolve, context.as_ref())
+                .await
+                .map_err(|error| match error {
+                    TransferError::Permanent(message) => ServerError::BadRequestReason(message),
+                    error @ TransferError::Refused(_) => {
+                        ServerError::BadRequestReason(error.to_string())
+                    }
+                    _ => ServerError::ServiceUnavailableReason("repository unavailable".into()),
+                })?
         }
     };
     super::rocrate_import::submit_import(
@@ -392,7 +398,7 @@ Incomplete files, conflicting revisions or rejected metadata fail the job. An am
 )]
 pub async fn export_record(
     state: State<Arc<ServerState>>,
-    auth: Extension<Option<AuthContext>>,
+    auth: UnrestrictedAuth,
     path: Path<String>,
     Json(request): Json<SubmitRepositoryExport>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {

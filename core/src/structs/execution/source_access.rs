@@ -289,7 +289,7 @@ fn same_second(left: SystemTime, right: SystemTime) -> bool {
 
 /// Length-prefixed canonical encoding of an optional string field so distinct
 /// fields cannot collide across boundaries.
-fn write_fingerprint_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+pub(crate) fn write_fingerprint_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
     match value {
         Some(value) => {
             hasher.update(&[1]);
@@ -315,8 +315,8 @@ pub enum ListCursor {
     After(String),
     /// Provider key: the next page starts at it, so a key a full page deferred is read first.
     At(String),
-    /// Entries to skip, for a source whose provider cannot start after a key.
-    Offset(u64),
+    /// The last path a walked source listed: the next page continues after it in walk order.
+    Walk(String),
 }
 
 /// One bounded page of a source listing. Key bounds need a flat recursive listing.

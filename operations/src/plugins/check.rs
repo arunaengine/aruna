@@ -5,25 +5,56 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::PluginRun;
-use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
+use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
-use aruna_plugins::broker::{ErrorKind, HostError};
-use aruna_plugins::permission::Permission;
+use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::account::read_user;
-use super::grants::{InstallScope, accesses, parse_grants, patterns_for};
-use super::install::read_config;
-use crate::auth::request_authorization::{AuthorizeError, authorize};
-use crate::auth::request_policy::PolicyRequestExtras;
-use crate::driver::DriverContext;
+use super::rows::{StoreError, mapped_child};
+use super::unavailable;
+use crate::auth::error::AuthorizeError;
+use crate::auth::install_access::{Authorize, granted};
+use crate::document_repository::{GetConfigError, GetConfigOperation};
+use crate::users::install_account::{owns_install, read_user_call, read_user_result};
+
+/// A host call's refusal or fault, as the operations behind the call report it.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}", .0.message)]
+pub struct CallError(pub HostError);
+
+impl From<HostError> for CallError {
+    fn from(error: HostError) -> Self {
+        Self(error)
+    }
+}
+
+impl From<CallError> for HostError {
+    fn from(error: CallError) -> Self {
+        error.0
+    }
+}
+
+impl From<IoError> for CallError {
+    fn from(error: IoError) -> Self {
+        Self(unavailable(error.to_string()))
+    }
+}
+
+impl From<StoreError> for CallError {
+    fn from(error: StoreError) -> Self {
+        Self(unavailable(error.0))
+    }
+}
 
 /// What one run's calls are checked against: the run and the node that runs it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunScope {
     pub realm_id: RealmId,
     pub local: NodeId,
@@ -32,7 +63,7 @@ pub struct RunScope {
 
 /// Steps 0 to 2: this node runs the install, the account is the active account the record
 /// names, and the record is active with the run's artifact.
-pub fn check_run<'a>(
+pub(crate) fn check_run<'a>(
     scope: &RunScope,
     config: &'a RealmConfigDocument,
     account: Option<&User>,
@@ -42,7 +73,7 @@ pub fn check_run<'a>(
 }
 
 /// Steps 0 to 2 for install `install_id` pinned at `digest`, run by `local`.
-pub fn check_install<'a>(
+pub(crate) fn check_install<'a>(
     place: (&'a RealmConfigDocument, RealmId, NodeId),
     binding: (Ulid, &str),
     account: Option<&User>,
@@ -59,8 +90,8 @@ pub fn check_install<'a>(
 
 /// The install whatever its state: this node runs it, its account is active and marked with
 /// it, and it still pins `digest`.
-pub fn check_identity<'a>(
-    (config, realm_id, local): (&'a RealmConfigDocument, RealmId, NodeId),
+pub(crate) fn check_identity<'a>(
+    (config, _, local): (&'a RealmConfigDocument, RealmId, NodeId),
     (install_id, digest): (Ulid, &str),
     account: Option<&User>,
 ) -> Result<&'a PluginInstall, HostError> {
@@ -70,14 +101,9 @@ pub fn check_identity<'a>(
     if install.receiver != local {
         return Err(denied("this node does not run the install"));
     }
-    let install_scope = InstallScope {
-        realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    };
     let active = account.is_some_and(|user| {
         user.user_id == install.account
-            && super::account::owned(user, &install_scope)
+            && owns_install(user, install.group_id, install.install_id)
             && !user.is_deactivated()
     });
     if !active {
@@ -95,10 +121,7 @@ pub fn matching(
     permission: Permission,
     target: &str,
 ) -> Result<BTreeSet<String>, HostError> {
-    let grants = parse_grants(&install.grants);
-    let patterns: BTreeSet<String> = (patterns_for(&grants, permission).into_iter())
-        .filter(|pattern| covers(pattern, target))
-        .collect();
+    let patterns = granted(install, permission, target);
     match patterns.is_empty() {
         true => Err(HostError::new(
             ErrorKind::NotGranted,
@@ -108,110 +131,160 @@ pub fn matching(
     }
 }
 
-/// Whether a granted pattern, an exact path or a `<base>/**` subtree, covers `target`.
-pub fn covers(pattern: &str, target: &str) -> bool {
-    match pattern.strip_suffix("/**") {
-        Some(base) => {
-            target == base
-                || target
-                    .strip_prefix(base)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        }
-        None => pattern == target,
-    }
+/// The child that runs `check` and answers as a call: a fault of the check stays retryable.
+pub(crate) fn authorize_call(check: Authorize) -> IoCall {
+    mapped_child(check, |result| result.map_err(refusal))
 }
 
-/// Step 4: each access of `permission` on `target`, as the account restricted to `patterns`,
-/// against roles, denies and policies with the operation `plugin.<permission>`.
-pub async fn authorize_call(
-    ctx: &DriverContext,
-    install: &PluginInstall,
-    permission: Permission,
-    target: &str,
-    patterns: &BTreeSet<String>,
-) -> Result<(), HostError> {
-    for access in accesses(permission) {
-        authorize_access(ctx, install, (permission, access.clone()), target, patterns).await?;
-    }
-    Ok(())
+/// Refuses one authorization result: a fault of the check stays retryable.
+fn refusal(error: AuthorizeError) -> CallError {
+    CallError(match error {
+        AuthorizeError::Storage(error) => unavailable(error.to_string()),
+        AuthorizeError::CheckFailed(error) => unavailable(error),
+        error => HostError::new(ErrorKind::Denied, error.to_string()),
+    })
 }
 
-/// One access on `target` under the operation `plugin.<permission>`, such as READ on the source
-/// of a copy, whose target needs WRITE.
-pub async fn authorize_access(
-    ctx: &DriverContext,
-    install: &PluginInstall,
-    (permission, access): (Permission, Access),
-    target: &str,
-    patterns: &BTreeSet<String>,
-) -> Result<(), HostError> {
-    let realm_id = install.account.realm_id;
-    let restrictions = (patterns.iter())
-        .map(|pattern| PathRestriction {
-            pattern: pattern.clone(),
-            permission: access.clone(),
-        })
-        .collect();
-    let auth = AuthContext {
-        user_id: install.account,
-        realm_id,
-        path_restrictions: Some(restrictions),
-        session: None,
-    };
-    let extras = PolicyRequestExtras::operation(format!("plugin.{permission}"));
-    match authorize(ctx, realm_id, &auth, target, &access, extras).await {
-        Ok(()) => Ok(()),
-        Err(AuthorizeError::Storage(error)) => Err(unavailable(error.to_string())),
-        Err(AuthorizeError::CheckFailed(error)) => Err(unavailable(error)),
-        Err(error) => Err(HostError::new(ErrorKind::Denied, error.to_string())),
-    }
+fn authorized(result: IoResult) -> Result<(), CallError> {
+    result.child::<(), CallError>()?
 }
 
 /// The patterns a copy reads `source` and writes `target` under: read on the source and write
 /// on the target, each authorized with the operation `plugin.objects.copy`.
-pub async fn copy_grants(
-    ctx: &DriverContext,
-    install: &PluginInstall,
-    (source, target): (&str, &str),
-) -> Result<BTreeSet<String>, HostError> {
-    let copy = Permission::ObjectsCopy;
-    let read = matching(install, Permission::ObjectsRead, source)?;
-    authorize_access(ctx, install, (copy, Access::READ), source, &read).await?;
-    let write = matching(install, copy, target)?;
-    authorize_access(ctx, install, (copy, Access::WRITE), target, &write).await?;
-    Ok(read.into_iter().chain(write).collect())
+#[derive(Debug, PartialEq)]
+pub(crate) struct CopyGrants {
+    install: PluginInstall,
+    target: String,
+    read: BTreeSet<String>,
+    write: Option<BTreeSet<String>>,
+    source: String,
+}
+
+impl CopyGrants {
+    pub(crate) fn new(install: &PluginInstall, (source, target): (&str, &str)) -> Self {
+        Self {
+            install: install.clone(),
+            target: target.to_string(),
+            read: BTreeSet::new(),
+            write: None,
+            source: source.to_string(),
+        }
+    }
+}
+
+impl Operation for CopyGrants {
+    type Output = BTreeSet<String>;
+    type Error = CallError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, CallError> {
+        self.read = matching(&self.install, Permission::ObjectsRead, &self.source)?;
+        let access = (Permission::ObjectsCopy, Access::READ);
+        let check = Authorize::access(&self.install, access, &self.source, &self.read);
+        Ok(Next::Call(authorize_call(check)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CallError> {
+        authorized(result)?;
+        if let Some(write) = self.write.take() {
+            let read = std::mem::take(&mut self.read);
+            return Ok(Next::Done(read.into_iter().chain(write).collect()));
+        }
+        let copy = Permission::ObjectsCopy;
+        let write = matching(&self.install, copy, &self.target)?;
+        let check = Authorize::access(&self.install, (copy, Access::WRITE), &self.target, &write);
+        self.write = Some(write);
+        Ok(Next::Call(authorize_call(check)))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum CheckPhase {
+    Config,
+    Account(Box<RealmConfigDocument>),
+    Authorizing(Box<PluginInstall>),
 }
 
 /// Steps 0 to 4 for one call; `target` is the permission and resource a guarded call names.
 /// State and log calls name none and pass steps 0 to 2 only.
-pub async fn check_call(
-    ctx: &DriverContext,
-    scope: &RunScope,
-    target: Option<(Permission, &str)>,
-) -> Result<PluginInstall, HostError> {
-    let config =
-        (read_config(ctx, scope.realm_id).await).map_err(|error| unavailable(error.to_string()))?;
-    let account = (config.installs.iter())
-        .find(|install| install.install_id == scope.run.install_id)
-        .map(|install| install.account);
-    let user = match account {
-        Some(account) => read_user(ctx, account).await.map_err(unavailable)?,
-        None => None,
-    };
-    let install = check_run(scope, &config, user.as_ref())?.clone();
-    if let Some((permission, resource)) = target {
-        let patterns = matching(&install, permission, resource)?;
-        authorize_call(ctx, &install, permission, resource, &patterns).await?;
+#[derive(Debug, PartialEq)]
+pub(crate) struct CheckCall {
+    scope: RunScope,
+    target: Option<(Permission, String)>,
+    phase: CheckPhase,
+}
+
+impl CheckCall {
+    pub(crate) fn new(scope: &RunScope, target: Option<(Permission, &str)>) -> Self {
+        Self {
+            scope: scope.clone(),
+            target: target.map(|(permission, resource)| (permission, resource.to_string())),
+            phase: CheckPhase::Config,
+        }
     }
-    Ok(install)
+
+    /// Steps 0 to 2 with the account read, then step 3 and the authorization of step 4.
+    fn decide(
+        &mut self,
+        config: &RealmConfigDocument,
+        user: Option<User>,
+    ) -> Result<Next<PluginInstall>, CallError> {
+        let install = check_run(&self.scope, config, user.as_ref())?.clone();
+        let Some((permission, resource)) = &self.target else {
+            return Ok(Next::Done(install));
+        };
+        let patterns = matching(&install, *permission, resource)?;
+        let check = Authorize::call(&install, *permission, resource, &patterns);
+        self.phase = CheckPhase::Authorizing(Box::new(install));
+        Ok(Next::Call(authorize_call(check)))
+    }
+}
+
+impl Operation for CheckCall {
+    type Output = PluginInstall;
+    type Error = CallError;
+
+    fn first(&mut self) -> Result<Next<PluginInstall>, CallError> {
+        let read = GetConfigOperation::new(self.scope.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PluginInstall>, CallError> {
+        match std::mem::replace(&mut self.phase, CheckPhase::Config) {
+            CheckPhase::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let config = config.map_err(config_unavailable)?;
+                let install_id = self.scope.run.install_id;
+                let account = (config.installs.iter())
+                    .find(|install| install.install_id == install_id)
+                    .map(|install| install.account);
+                match account {
+                    Some(account) => {
+                        self.phase = CheckPhase::Account(Box::new(config));
+                        Ok(Next::Call(read_user_call(account)))
+                    }
+                    None => self.decide(&config, None),
+                }
+            }
+            CheckPhase::Account(config) => {
+                let user =
+                    read_user_result(result).map_err(|error| unavailable(error.to_string()))?;
+                self.decide(&config, user)
+            }
+            CheckPhase::Authorizing(install) => {
+                authorized(result)?;
+                Ok(Next::Done(*install))
+            }
+        }
+    }
+}
+
+/// A realm config that cannot be read, as a call sees it.
+pub(crate) fn config_unavailable(error: GetConfigError) -> CallError {
+    CallError(unavailable(format!("realm config: {error:?}")))
 }
 
 fn denied(message: &str) -> HostError {
     HostError::new(ErrorKind::Denied, message)
-}
-
-pub(crate) fn unavailable(message: impl Into<String>) -> HostError {
-    HostError::new(ErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]

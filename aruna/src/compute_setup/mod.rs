@@ -20,14 +20,14 @@ mod kubernetes;
 #[cfg(all(feature = "slurm", unix))]
 mod slurm;
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::ExecutorRegistry;
 use aruna_core::compute::ResourceEnvelope;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::warn;
 
-use crate::config::Config;
+use aruna_config::Config;
 
 /// Why a selected compute backend could not be built. The categories stay
 /// distinct so an invalid configuration is never silently treated as
@@ -66,6 +66,12 @@ pub(super) fn optional_tolerates(error: &ComputeBuildError) -> bool {
     matches!(error, ComputeBuildError::Unavailable(_))
 }
 
+/// One built backend with the endpoint its tasks reach this node's S3 at; the caller names it.
+pub(super) type BuiltBackend = (
+    Arc<dyn aruna_compute::executor::ExecutorBackend>,
+    aruna_compute::registry::WorkspaceEndpoint,
+);
+
 /// One selected compute backend with its already-parsed settings.
 pub(super) enum BackendSettings {
     None,
@@ -95,6 +101,8 @@ pub(super) struct DockerSettings {
     pub(super) pull_deadline: Duration,
     pub(super) keep_failed: bool,
     pub(super) state_root: Option<PathBuf>,
+    /// `DOCKER_HOST`; unset leaves the platform's default socket.
+    pub(super) docker_host: Option<String>,
 }
 
 /// Read only by the Apptainer builder, which is compiled on Unix.
@@ -119,7 +127,7 @@ pub(super) struct KubernetesSettings {
     /// KubeDAL driver for run input views and session data, which mount through this node's gateway.
     pub(super) kubedal_driver: Option<String>,
     /// KubeDAL worker cache for cached run inputs, set by its scope.
-    pub(super) kubedal_cache: Option<aruna_compute::KubedalCache>,
+    pub(super) kubedal_cache: Option<aruna_compute::executor::config::KubedalCache>,
     /// The node's S3 endpoint as task pods reach it, used for their S3 env instead of the
     /// public one.
     pub(super) session_endpoint: Option<String>,
@@ -165,7 +173,9 @@ impl ComputeSettings {
 /// Collects the typed compute settings once from one explicit operator-input
 /// source. Production passes the process environment at the resource boundary;
 /// tests pass a map.
-pub(crate) fn collect(env: &dyn crate::settings::SettingsEnv) -> Result<ComputeSettings, String> {
+pub(crate) fn collect(
+    env: &dyn aruna_config::settings::SettingsEnv,
+) -> Result<ComputeSettings, String> {
     settings::collect(env).map_err(compute_error_message)
 }
 
@@ -192,7 +202,11 @@ pub(crate) async fn build_registry(
         BackendSettings::Slurm(slurm) => build_slurm(settings, slurm, config).await,
     };
     let registry = match result {
-        Ok(registry) => Some(Arc::new(registry)),
+        Ok((backend, workspace)) => Some(Arc::new(ExecutorRegistry::new().with_workspace(
+            aruna_core::compute::backend::DEFAULT_BACKEND,
+            backend,
+            workspace,
+        ))),
         Err(error) if settings.optional && optional_tolerates(&error) => {
             warn!(reason = %compute_error_message(error), "Compute executor unavailable; running without compute");
             None
@@ -220,7 +234,7 @@ async fn build_docker(
     _settings: &ComputeSettings,
     _docker: &DockerSettings,
     _config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<BuiltBackend, ComputeBuildError> {
     Err(ComputeBuildError::Unsupported(
         "Docker executor feature is not compiled".to_string(),
     ))
@@ -233,7 +247,7 @@ async fn build_apptainer(
     _settings: &ComputeSettings,
     _apptainer: &ApptainerSettings,
     _config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<BuiltBackend, ComputeBuildError> {
     Err(ComputeBuildError::Unsupported(
         "Apptainer executor feature is not compiled".to_string(),
     ))
@@ -246,7 +260,7 @@ async fn build_kubernetes(
     _settings: &ComputeSettings,
     _kubernetes: &KubernetesSettings,
     _config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<BuiltBackend, ComputeBuildError> {
     Err(ComputeBuildError::Unsupported(
         "Kubernetes executor feature is not compiled".to_string(),
     ))
@@ -259,7 +273,7 @@ async fn build_slurm(
     _settings: &ComputeSettings,
     _slurm: &SlurmSettings,
     _config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<BuiltBackend, ComputeBuildError> {
     Err(ComputeBuildError::Unsupported(
         "Slurm executor feature is not compiled".to_string(),
     ))

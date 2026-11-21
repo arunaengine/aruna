@@ -5,6 +5,8 @@
 use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
 use crate::server::state::ServerState;
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
@@ -133,10 +135,8 @@ pub(crate) fn request_auth(
         .ok_or_else(|| server_error(crate::error::ServerError::Unauthorized))
 }
 
-pub(crate) fn empty_extras(
-    tool: &str,
-) -> aruna_operations::auth::request_policy::PolicyRequestExtras {
-    aruna_operations::auth::request_policy::PolicyRequestExtras {
+pub(crate) fn empty_extras(tool: &str) -> aruna_core::request_policy::PolicyRequestExtras {
+    aruna_core::request_policy::PolicyRequestExtras {
         operation: format!("mcp:{tool}"),
         params: BTreeMap::new(),
         headers: BTreeMap::new(),
@@ -147,7 +147,7 @@ pub(crate) fn empty_extras(
 pub(crate) fn tool_extras<T: serde::Serialize>(
     tool: &str,
     arguments: &T,
-) -> Result<aruna_operations::auth::request_policy::PolicyRequestExtras, CallToolResult> {
+) -> Result<aruna_core::request_policy::PolicyRequestExtras, CallToolResult> {
     let value = serde_json::to_value(arguments)
         .map_err(|error| internal_error(format!("failed to encode tool arguments: {error}")))?;
     let object = value
@@ -163,14 +163,12 @@ pub(crate) fn tool_extras<T: serde::Serialize>(
             (key.clone(), value)
         })
         .collect();
-    Ok(
-        aruna_operations::auth::request_policy::PolicyRequestExtras {
-            operation: format!("mcp:{tool}"),
-            params,
-            headers: BTreeMap::new(),
-            body: None,
-        },
-    )
+    Ok(aruna_core::request_policy::PolicyRequestExtras {
+        operation: format!("mcp:{tool}"),
+        params,
+        headers: BTreeMap::new(),
+        body: None,
+    })
 }
 
 pub(crate) fn server_error(error: crate::error::ServerError) -> CallToolResult {
@@ -179,7 +177,7 @@ pub(crate) fn server_error(error: crate::error::ServerError) -> CallToolResult {
 
 pub(crate) fn internal_error(message: impl std::fmt::Display) -> CallToolResult {
     server_error(crate::error::ServerError::InternalError(
-        message.to_string(),
+        message.to_string().into(),
     ))
 }
 
@@ -219,7 +217,7 @@ pub(crate) async fn authorize_tool(
     auth: &aruna_core::structs::identity::auth::AuthContext,
     path: String,
     permission: aruna_core::structs::identity::auth::Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     crate::auth::ensure_permission_with(state, auth, path, permission, extras).await
 }
@@ -230,18 +228,21 @@ pub(crate) async fn authorize_self(
     state: &ServerState,
     auth: &aruna_core::structs::identity::auth::AuthContext,
     permission: aruna_core::structs::identity::auth::Permission,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let realm_id = state.get_realm_id();
-    let request = aruna_operations::auth::request_policy::policy_request_with(
+    let request = aruna_core::request_policy::policy_request_with(
         &format!("/{realm_id}/u/{}", auth.user_id),
         &permission,
         Some(auth),
         extras,
     );
-    aruna_operations::auth::request_policy::enforce_policies(&state.get_ctx(), realm_id, &request)
-        .await
-        .map_err(|_| crate::error::ServerError::Forbidden)
+    drive(
+        EnforcePolicyOperation::new(realm_id, request.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|_| crate::error::ServerError::Forbidden)
 }
 
 fn error_result(body: crate::error::ErrorResponse) -> CallToolResult {

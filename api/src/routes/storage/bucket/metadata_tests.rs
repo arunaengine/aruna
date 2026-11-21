@@ -6,6 +6,7 @@ use axum::extract::FromRequest;
 use serde_json::json;
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::tests::distributed::{BUCKET, Node, node_state};
 
 async fn put(node: &Node, body: serde_json::Value) -> ServerResult<BucketMetadataResponse> {
@@ -17,7 +18,7 @@ async fn put(node: &Node, body: serde_json::Value) -> ServerResult<BucketMetadat
     let parsed = Json::<PutMetadataRequest>::from_request(request, &()).await;
     put_bucket_metadata(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         Path(BUCKET.to_string()),
         parsed,
@@ -29,7 +30,7 @@ async fn put(node: &Node, body: serde_json::Value) -> ServerResult<BucketMetadat
 async fn stored(node: &Node) -> Option<BucketMetadataBody> {
     let Json(read) = get_bucket_metadata(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(None),
         Path(BUCKET.to_string()),
     )

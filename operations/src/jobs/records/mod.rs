@@ -5,7 +5,7 @@
 
 use aruna_core::effects::FrameBoundsError;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::structs::execution::job::JobRecordError;
+use aruna_core::structs::execution::job::family::JobRecordError;
 use aruna_core::structs::identity::realm::JobFamilyError;
 use thiserror::Error;
 
@@ -13,21 +13,12 @@ pub mod admit;
 pub mod append;
 pub mod audit;
 pub mod family;
-pub mod keys;
 pub mod pages;
 pub mod project;
+pub mod prune;
 pub mod reduce;
-pub mod rows;
 pub mod transport;
 pub mod verify;
-
-pub use admit::Admission;
-pub use append::{AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-pub use audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
-pub use family::{FamilyReadError, load_family_complete, load_kind_complete};
-pub use project::{FamilyRef, ProjectFamilyConfig, ProjectFamilyOperation, ProjectedFamily};
-pub use transport::{dispatch_offer, dispatch_record, serve_job_record, serve_launch_offer};
-pub use verify::FamilyView;
 
 /// Rows one append may read while completing its evidence scans. Reaching it
 /// with pages left is a corrupt or pathological family, never proof of absence.
@@ -50,6 +41,8 @@ pub enum RecordStoreError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
     #[error(transparent)]
     Record(#[from] JobRecordError),
     #[error(transparent)]
@@ -74,11 +67,26 @@ pub enum RecordStoreError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
+crate::jobs::io_failure!(RecordStoreError);
+
 impl RecordStoreError {
+    /// An event the operation's current state does not accept.
+    pub(crate) fn unexpected(
+        state: &impl std::fmt::Debug,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Self {
+        Self::UnexpectedEvent {
+            state: format!("{state:?}"),
+            expected,
+            got,
+        }
+    }
+
     /// Whether the work lost its optimistic transaction and may be retried
     /// unchanged. Every other failure needs a different answer.
     pub fn is_conflict(&self) -> bool {

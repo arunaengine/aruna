@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::listener::HostRoute;
 use axum::extract::ConnectInfo;
 use axum::serve::{IncomingStream, Listener};
 use axum::{Extension, Router};
@@ -24,8 +25,8 @@ use tokio_util::task::TaskTracker;
 use tower::{Layer, service_fn};
 use tracing::{debug, info};
 
+use super::HostCheck;
 use super::certificate::CertificateStore;
-use super::{HostCheck, HostRoute};
 
 /// Finished handshakes one route may queue before a sender has to wait.
 const ROUTE_QUEUE: usize = 64;

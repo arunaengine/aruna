@@ -6,14 +6,21 @@
 use std::sync::{Arc, Mutex};
 
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::SourceEvent;
+use aruna_core::plugin_runs::{SourceEvent, SourceKind};
 use aruna_core::time::unix_timestamp_millis;
 
 use super::*;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::match_pending;
-use crate::plugins::matcher::tests::{config, forwarded, gap, journal};
-use crate::plugins::worker::tests::{created, installed};
+use crate::plugins::calls::*;
+use crate::plugins::matcher::tests::gap;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
+use aruna_core::plugin_runs::EVENTS_QUEUED;
+use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::created;
+use aruna_test_support::plugins::flows::matcher::{config, forwarded, journal};
+use aruna_test_support::plugins::rows::Txn;
 
 /// The batches a fake receiver got; it answers each event with `decide` and acknowledges gaps
 /// when `ack` is set.
@@ -60,7 +67,7 @@ async fn queued(fixture: &Fixture, install: &PluginInstall, names: &[&str], at_m
     }
     let local = fixture.actor.node_id;
     let config = config(fixture).await;
-    match_pending(&fixture.ctx, &config, local, at_ms)
+    match_journal(&fixture.ctx, &config, local, (at_ms, EVENTS_QUEUED))
         .await
         .unwrap();
 }
@@ -91,7 +98,7 @@ async fn decided_rows() {
         .unwrap();
     assert_eq!(receiver.batches(), 1);
     let failing = |_, _| std::future::ready(Err::<Decisions, _>("down".to_string()));
-    let later = now + MAX_BACKOFF_MS;
+    let later = now + u64::try_from(MAX_BACKOFF.as_millis()).unwrap();
     send_outbox(&fixture.ctx, &config, later, &mut backoff, failing)
         .await
         .unwrap();
@@ -147,7 +154,7 @@ async fn creation(fixture: &Fixture, install: &PluginInstall, now: u64) -> (Ulid
     };
     journal(fixture, &event).await;
     let (local, config) = (fixture.actor.node_id, config(fixture).await);
-    match_pending(&fixture.ctx, &config, local, now)
+    match_journal(&fixture.ctx, &config, local, (now, EVENTS_QUEUED))
         .await
         .unwrap();
     (document, event_id)
@@ -300,7 +307,8 @@ async fn update_waits() {
         event,
         queued_ms: 1,
     };
-    let waits = async || unreadable(&fixture.ctx, &Txn::direct(&fixture.ctx), &row).await;
+    let metadata = fixture.ctx.graph_handle.is_some();
+    let waits = async || drive(Unreadable::new(&row, metadata), &fixture.ctx).await;
     let newer = (document, Ulid::from_parts(20, 1));
     materialization(&fixture, newer, State::Materialized).await;
     assert_eq!(waits().await, Ok(true));
@@ -353,4 +361,364 @@ async fn update_waits() {
         .await
         .unwrap();
     assert_eq!(waits().await, Ok(false));
+}
+
+#[test]
+fn apply_decisions() {
+    let install = Ulid::from_parts(1, 1);
+    let keys = BTreeMap::from([
+        ((install, "s1".to_string()), b"k1".to_vec()),
+        ((install, "s2".to_string()), b"k2".to_vec()),
+    ]);
+    let decisions = Decisions {
+        events: vec![
+            (install, "s1".into(), Outcome::Queued),
+            (install, "s2".into(), Outcome::Busy),
+        ],
+        gaps: vec![(install, SourceKind::DatasetCreated, GapReason::Full, 4)],
+    };
+    let mut plan = Apply {
+        count: 1,
+        busy: true,
+        decided: Some(vec![(PLUGIN_OUTBOX_KEYSPACE, b"k1".to_vec())]),
+        acked: vec![(
+            gap_key(install, SourceKind::DatasetCreated, GapReason::Full),
+            4,
+        )],
+        phase: ApplyPhase::Deleting,
+    };
+    let first = apply(&keys, decisions).first().unwrap();
+    assert!(matches!(first, Next::Call(IoCall::Delete(_))));
+    // A busy event keeps its row; the acknowledged sequence stops at the counted one.
+    let decided = vec![(PLUGIN_OUTBOX_KEYSPACE, b"k1".to_vec())];
+    assert_eq!(plan.first().unwrap(), Next::Call(delete_call(decided)));
+    assert!(matches!(
+        plan.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
+    let mut row = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
+    row.sequence = 3;
+    let read = values_result(vec![Some(encode(&row).unwrap())]);
+    let Next::Call(IoCall::Write(rows)) = plan.next(read).unwrap() else {
+        panic!("the acknowledgement is written");
+    };
+    let written: GapRow = decode(&rows[0].2).unwrap();
+    assert_eq!(written.acked, 3);
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done((1, true)));
+}
+
+#[test]
+fn expired_rows_counted() {
+    let install = Ulid::from_parts(1, 1);
+    let row = |queued_ms| ForwardRow {
+        install_id: install,
+        revision: 1,
+        event: SourceEvent {
+            kind: SourceKind::DatasetCreated,
+            group_id: Ulid::from_parts(1, 9),
+            path: "/r/g/x/meta/a@d".into(),
+            resource: "d".into(),
+            revision: "e".into(),
+            source: format!("s{queued_ms}"),
+            actor: None,
+            anchor_ms: queued_ms,
+            journaled_ms: queued_ms,
+        },
+        queued_ms,
+    };
+    let now = SEND_EXPIRY_MS + 10;
+    let mut plan = ExpireRows {
+        install_id: install,
+        now_ms: now,
+        phase: ExpirePhase::Reading,
+    };
+    assert!(matches!(
+        plan.first().unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
+    let (old, kept) = (encode(&row(1)).unwrap(), encode(&row(now)).unwrap());
+    let page = vec![(b"o".to_vec(), old), (b"k".to_vec(), kept.clone())];
+    let Next::Call(IoCall::Read(reads)) = plan.next(page_result(page, None)).unwrap() else {
+        panic!("the expired row's gap is read");
+    };
+    assert_eq!(reads.len(), 1);
+    let Next::Call(IoCall::Write(rows)) = plan.next(values_result(vec![None])).unwrap() else {
+        panic!("the gap is written");
+    };
+    assert_eq!(rows.len(), 1);
+    let deleted = delete_call(vec![(PLUGIN_OUTBOX_KEYSPACE, b"o".to_vec())]);
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Call(deleted));
+    let rest = vec![(b"k".to_vec(), kept)];
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(rest));
+}
+
+#[test]
+fn next_after_install() {
+    let id = Ulid::from_parts(3, 3);
+    let start = [&id.to_bytes()[..], &[0xff; 24]].concat();
+    let mut plan = NextInstall(Some(start.clone()));
+    let Next::Call(IoCall::Page { after, limit, .. }) = plan.first().unwrap() else {
+        panic!("the next install reads one row");
+    };
+    assert_eq!((after.map(|key| key.to_vec()), limit), (Some(start), 1));
+    let key = [&id.to_bytes()[..], &[0; 24]].concat();
+    let found = plan.next(page_result(vec![(key, Vec::new())], None));
+    assert_eq!(found.unwrap(), Next::Done(Some(id)));
+    let mut empty = NextInstall(None);
+    let none = empty.next(page_result(Vec::new(), None)).unwrap();
+    assert_eq!(none, Next::Done(None));
+    assert!(empty.next(IoResult::Done).is_err());
+}
+
+#[test]
+fn drops_every_page() {
+    let space = PLUGIN_OUTBOX_KEYSPACE;
+    let mut plan = DropRows {
+        space,
+        prefix: b"p".to_vec(),
+        deleting: false,
+    };
+    let first = plan.first().unwrap();
+    assert!(matches!(
+        first,
+        Next::Call(IoCall::Page { limit: 1_000, .. })
+    ));
+    let rows = vec![(b"p1".to_vec(), b"x".to_vec())];
+    let asked = plan.next(page_result(rows, None)).unwrap();
+    assert_eq!(
+        asked,
+        Next::Call(delete_call(vec![(space, b"p1".to_vec())]))
+    );
+    let again = plan.next(IoResult::Done).unwrap();
+    assert!(matches!(again, Next::Call(IoCall::Page { .. })));
+    let last = plan.next(page_result(Vec::new(), None)).unwrap();
+    assert_eq!(last, Next::Done(()));
+}
+
+fn forward_row(kind: SourceKind, resource: String, revision: String) -> ForwardRow {
+    ForwardRow {
+        install_id: Ulid::from_parts(1, 1),
+        revision: 1,
+        event: SourceEvent {
+            kind,
+            group_id: Ulid::from_parts(1, 9),
+            path: "/r/g/x/meta/a@d".into(),
+            resource,
+            revision,
+            source: "s".into(),
+            actor: None,
+            anchor_ms: 5,
+            journaled_ms: 5,
+        },
+        queued_ms: 5,
+    }
+}
+
+fn dataset_row(kind: SourceKind) -> ForwardRow {
+    let (document, event) = (Ulid::from_parts(5, 5), Ulid::from_parts(6, 6));
+    forward_row(kind, document.to_string(), event.to_string())
+}
+
+#[test]
+fn other_events_readable() {
+    let upload = dataset_row(SourceKind::DataUploaded);
+    assert_eq!(
+        Unreadable::new(&upload, true).first(),
+        Ok(Next::Done(false))
+    );
+    let named = forward_row(SourceKind::DatasetCreated, "d".into(), "e".into());
+    assert_eq!(Unreadable::new(&named, true).first(), Ok(Next::Done(false)));
+}
+
+#[test]
+fn unmaterialized_update_unreadable() {
+    let row = dataset_row(SourceKind::DatasetUpdated);
+    let mut check = Unreadable::new(&row, true);
+    assert!(matches!(check.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let facts = child_result(Ok::<_, StoreError>(Facts::default()));
+    assert_eq!(check.next(facts), Ok(Next::Done(true)));
+    let mut deleted = Unreadable::new(&row, true);
+    let gone = Facts {
+        deleted: true,
+        ..Facts::default()
+    };
+    let answer = deleted.next(child_result(Ok::<_, StoreError>(gone)));
+    assert_eq!(answer, Ok(Next::Done(false)));
+}
+
+fn collecting(config: RealmConfigDocument) -> CollectOutbox {
+    let open = BTreeSet::from([iroh::SecretKey::from_bytes(&[3u8; 32]).public()]);
+    CollectOutbox::new(Arc::new(config), open, (9, 1 << 20), true)
+}
+
+fn bare_config() -> RealmConfigDocument {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    RealmConfigDocument::new(realm, Vec::new(), 3)
+}
+
+#[test]
+fn collects_nothing_empty() {
+    let mut collect = collecting(bare_config());
+    assert!(matches!(collect.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let none = child_result(Ok::<Option<Ulid>, StoreError>(None));
+    let scan = collect.next(none);
+    assert!(matches!(scan, Ok(Next::Call(IoCall::Page { .. }))));
+    assert_eq!(
+        collect.next(page_result(Vec::new(), None)),
+        Ok(Next::Done(BTreeMap::new()))
+    );
+}
+
+#[test]
+fn drops_removed_install() {
+    let mut collect = collecting(bare_config());
+    let found = child_result(Ok::<_, StoreError>(Some(Ulid::from_parts(7, 7))));
+    assert!(matches!(
+        collect.next(found),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(collect.phase, CollectPhase::Dropping);
+    let dropped = child_result(Ok::<(), StoreError>(()));
+    assert!(matches!(
+        collect.next(dropped),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    assert_eq!(collect.phase, CollectPhase::NextInstall);
+}
+
+#[test]
+fn readable_row_joins() {
+    let mut config = bare_config();
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let receiver = install.receiver;
+    config.installs.push(install.clone());
+    let mut collect = collecting(config);
+    let found = child_result(Ok::<_, StoreError>(Some(install.install_id)));
+    assert!(matches!(
+        collect.next(found),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let row = forward_row(SourceKind::DataUploaded, "d".into(), "e".into());
+    let kept: Rows = vec![(b"k".to_vec(), encode(&row).unwrap())];
+    let check = collect.next(child_result(Ok::<_, StoreError>(kept)));
+    assert!(matches!(check, Ok(Next::Call(IoCall::Child(_)))));
+    let next = collect.next(child_result(Ok::<bool, StoreError>(false)));
+    assert!(matches!(next, Ok(Next::Call(IoCall::Child(_)))));
+    let none = child_result(Ok::<Option<Ulid>, StoreError>(None));
+    collect.next(none).unwrap();
+    let Next::Done(batches) = collect.next(page_result(Vec::new(), None)).unwrap() else {
+        panic!("the gap scan ends the pass");
+    };
+    assert_eq!(batches[&receiver].open[0].0.0.events, [row]);
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{is_effect, node, peer_says, peer_silent};
+
+    #[test]
+    fn events_reach_receiver() {
+        let mut send = SendEvents::new(node(1), EventBatch::default());
+        assert!(is_effect(&send.first()));
+        let result = Ok(Decisions::default());
+        let said = peer_says(node(1), &MetadataTransportMessage::EventsDecided { result });
+        assert_eq!(send.next(said), Ok(Next::Done(Decisions::default())));
+        let silent = send.next(peer_silent(node(1)));
+        assert_eq!(silent, Err(MetadataReadError::Unavailable));
+    }
+}
+
+mod outbox_pass {
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::fixtures::{self, is_child, is_effect, node};
+
+    fn pass(route: OutboxRoute) -> SendOutbox {
+        let config = Arc::new(fixtures::config(&fixtures::install(), json!({})));
+        SendOutbox::new(config, (route, node(3)), (50, true), Backoff::default())
+    }
+
+    fn collected(peer: NodeId, count: usize) -> IoResult {
+        let pending = || ((EventBatch::default(), BTreeMap::new()), 0);
+        let requests = Requests {
+            bound: REQUEST_BYTES,
+            open: (0..count).map(|_| pending()).collect(),
+        };
+        child_result(Ok::<_, StoreError>(BTreeMap::from([(peer, requests)])))
+    }
+
+    fn decided() -> IoResult {
+        child_result(Ok::<_, MetadataReadError>(Decisions::default()))
+    }
+
+    fn done(next: Result<Next<OutboxPass>, StoreError>) -> OutboxPass {
+        let Ok(Next::Done(pass)) = next else {
+            panic!("the pass should be over");
+        };
+        pass
+    }
+
+    #[test]
+    fn only_local_holds() {
+        let local = pass(OutboxRoute::Local).hold_scope();
+        assert_eq!(local, Some(HoldScope::PluginAdmissions));
+        assert_eq!(pass(OutboxRoute::Remote).hold_scope(), None);
+    }
+
+    #[test]
+    fn remote_applies_decisions() {
+        let mut send = pass(OutboxRoute::Remote);
+        assert!(is_child(&send.first()));
+        assert!(is_child(&send.next(collected(node(1), 1))));
+        assert!(is_child(&send.next(decided())));
+        let applied = child_result(Ok::<_, StoreError>((2usize, false)));
+        let over = done(send.next(applied));
+        assert_eq!((over.decided, over.failure), (2, None));
+        assert!(over.backoff.ready(node(1), 50));
+    }
+
+    #[test]
+    fn failed_receiver_waits() {
+        let mut send = pass(OutboxRoute::Remote);
+        send.first().unwrap();
+        send.next(collected(node(1), 2)).unwrap();
+        let failed = Err::<Decisions, _>(MetadataReadError::Unavailable);
+        let over = done(send.next(child_result(failed)));
+        assert!(!over.backoff.ready(node(1), 50));
+    }
+
+    #[test]
+    fn busy_receiver_waits() {
+        let mut send = pass(OutboxRoute::Remote);
+        send.first().unwrap();
+        send.next(collected(node(1), 1)).unwrap();
+        send.next(decided()).unwrap();
+        let busy = child_result(Ok::<_, StoreError>((1usize, true)));
+        let over = done(send.next(busy));
+        assert_eq!(over.decided, 1);
+        assert!(!over.backoff.ready(node(1), 50));
+    }
+
+    #[test]
+    fn local_decides_here() {
+        let mut send = pass(OutboxRoute::Local);
+        send.first().unwrap();
+        let asked = send.next(collected(node(3), 1));
+        assert!(is_child(&asked) && !is_effect(&asked));
+        let answer = child_result(Ok::<_, StoreError>(Decisions::default()));
+        assert!(is_child(&send.next(answer)));
+    }
+
+    #[test]
+    fn failure_keeps_backoff() {
+        let mut send = pass(OutboxRoute::Remote);
+        send.backoff.failed(node(2), 50);
+        send.first().unwrap();
+        let failed = StoreError("no".to_string());
+        let answer = child_result(Err::<BTreeMap<NodeId, Requests>, _>(failed.clone()));
+        let over = done(send.next(answer));
+        assert_eq!(over.failure, Some(failed));
+        assert!(!over.backoff.ready(node(2), 50));
+    }
 }

@@ -20,10 +20,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{Instrument, warn};
 
-use crate::DhtHandle;
 use crate::EffectHandle;
 use crate::InboundEventHandler;
 use crate::dht::driver::InboundSender;
+use crate::dht::handle::DhtHandle;
 use crate::document_sync::DocumentSyncService;
 use crate::effect_handlers::{self, NetEffectContext};
 use crate::streams;

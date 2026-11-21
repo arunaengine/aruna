@@ -9,11 +9,12 @@ use std::time::Duration;
 
 use aruna::shutdown::NodeShutdown;
 use aruna_api::cors::CorsConfig;
+use aruna_api::https::HostCheck;
 use aruna_api::https::certificate::CertificateStore;
 use aruna_api::https::listener::{CombinedListener, HttpsHandle, RoutedListener};
-use aruna_api::https::{HostCheck, HostRoute, HostRoutes};
 use aruna_api::s3::server::{S3Server, S3ServerHandle};
-use aruna_core::shutdown::Shutdown;
+use aruna_core::listener::{HostRoute, HostRoutes};
+use aruna_tasks::shutdown::Shutdown;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::primitives::ByteStream;
@@ -81,7 +82,7 @@ impl TlsFiles {
 }
 
 /// Native settings parsed like a real node, so `S3_HOST` gets the settings normalization.
-fn native_settings(s3_host: &str) -> aruna::settings::Settings {
+fn native_settings(s3_host: &str) -> aruna_config::settings::Settings {
     let map: BTreeMap<String, String> = [
         ("DATABASE_DIR", "/tmp/aruna-https-settings"),
         ("SOCKET_ADDRESS", "127.0.0.1:0"),
@@ -98,7 +99,7 @@ fn native_settings(s3_host: &str) -> aruna::settings::Settings {
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
     .collect();
-    aruna::settings::read_settings_from(&map).expect("native settings parse")
+    aruna_config::settings::read_settings_from(&map).expect("native settings parse")
 }
 
 /// One S3 server on the seed's storage, serving plain and TLS from one loop.
@@ -113,7 +114,7 @@ struct TlsS3 {
 }
 
 async fn tls_s3(
-    context: Arc<aruna_operations::driver::DriverContext>,
+    context: Arc<aruna_drivers::driver::DriverContext>,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     node_id: iroh::PublicKey,
     s3_host: &str,
@@ -380,7 +381,7 @@ async fn rest_bearer_tls() -> TestResult<()> {
                 seed.capabilities.clone(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -393,7 +394,7 @@ async fn rest_bearer_tls() -> TestResult<()> {
             state,
             aruna_api::server::ServerConfig {
                 http_addr: plain.local_addr()?,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: CorsConfig::default(),
             },
         );
@@ -492,7 +493,7 @@ async fn released(mut stream: tokio_rustls::client::TlsStream<TcpStream>) {
 
 fn shutdown_sequence(
     shutdown: Shutdown,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     grace: Duration,
 ) -> NodeShutdown {
     NodeShutdown {
@@ -505,9 +506,12 @@ fn shutdown_sequence(
         https: None,
         monitoring: None,
         task_handle: aruna_tasks::TaskHandle::new(),
-        jobs_runtime: aruna_operations::jobs::runtime::JobsRuntime::new(),
+        jobs_runtime: aruna_drivers::jobs::runtime::JobsRuntime::new(),
+        driver_ctx: Arc::new(aruna_drivers::driver::DriverContext::storage_only(
+            storage_handle.clone(),
+        )),
         net_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         blob_handle: None,
         storage_handle,
         ops: None,
@@ -518,17 +522,23 @@ fn shutdown_sequence(
 /// A TLS S3 stack on fresh storage with one connection permit, stopped by `shutdown`.
 async fn drained_stack(
     shutdown: &Shutdown,
-) -> (TlsS3, aruna_storage::StorageHandle, tempfile::TempDir) {
+) -> (
+    TlsS3,
+    aruna_storage::storage::handle::StorageHandle,
+    tempfile::TempDir,
+) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
-        .expect("storage opens");
-    let context = Arc::new(aruna_operations::driver::DriverContext {
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+            .expect("storage opens");
+    let context = Arc::new(aruna_drivers::driver::DriverContext {
         storage_handle: storage.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let secret = iroh::SecretKey::from_bytes(&[0x61; 32]);
     let stack = tls_s3(

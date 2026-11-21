@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::document::DocumentOutboxRecord;
 use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
@@ -36,37 +37,27 @@ fn config(target: UserId, admin: bool) -> SetAdminConfig {
 }
 
 #[test]
-fn retry_rereads_config() {
-    // A commit lost to a background config write reads again and keeps an admin granted elsewhere.
-    let mut operation = SetAdminOperation::new(config(user(5), true));
-    let actor = operation.config.actor.clone();
-    let mut realm_config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
-    realm_config.ensure_node(actor.node_id, RealmNodeKind::Management);
-    let realm_config = realm_config.to_bytes(&actor).unwrap();
-    let admins = |users: &[UserId]| {
-        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
-        for role in document.roles.values_mut() {
-            role.assigned_users.extend(users.iter().copied());
-        }
-        Some(document.to_bytes(&actor).unwrap())
-    };
-    let writes = crate::realm::commit_retry::conflict_then_write(
-        &mut operation,
-        vec![Some(realm_config.clone()), admins(&[user(1)]), None],
-        vec![Some(realm_config), admins(&[user(1), user(9)]), None],
+fn conflict_reruns_change() {
+    // A commit lost to a background config write reruns the whole change, reading again.
+    let conflict = SetAdminError::from(IoError::Conflict);
+    assert!(SetAdminWrite::is_conflict(&conflict));
+    assert_eq!(
+        SetAdminWrite::conflict_retries(),
+        COMMIT_ATTEMPTS as u32 - 1
     );
-    let (_, _, value) = writes
-        .iter()
-        .find(|(space, _, _)| space == AUTH_KEYSPACE)
-        .expect("the retry rewrites the realm authorization");
-    let written = RealmAuthorizationDocument::from_bytes(value).unwrap();
-    let stored = written.roles.into_values().next().unwrap().assigned_users;
-    assert_eq!(stored, HashSet::from([user(1), user(9), user(5)]));
-    assert_eq!(operation.finalize(), Ok(stored));
+    assert_eq!(
+        SetAdminWrite::new(config(user(5), true)).transaction(),
+        TransactionMode::Write
+    );
 }
 
-/// Steps an allowed caller to the read result of a realm with these admins.
-fn step_to_write(operation: &mut SetAdminOperation, admins: &[UserId]) -> Effects {
+/// Feeds the read of a realm with these admins to a fresh change transaction.
+fn change(
+    target: UserId,
+    admin: bool,
+    admins: &[UserId],
+) -> (SetAdminWrite, Result<Next<HashSet<UserId>>, SetAdminError>) {
+    let mut operation = SetAdminWrite::new(config(target, admin));
     let actor = operation.config.actor.clone();
     let mut realm_config = RealmConfigDocument::new(actor.realm_id, Vec::new(), 3);
     realm_config.ensure_node(actor.node_id, RealmNodeKind::Management);
@@ -74,36 +65,23 @@ fn step_to_write(operation: &mut SetAdminOperation, admins: &[UserId]) -> Effect
     for role in auth_doc.roles.values_mut() {
         role.assigned_users.extend(admins.iter().copied());
     }
-    assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::SubOperation(_)]
-    ));
-    operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([7u8; 16]),
-    }));
+    assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(reads))) if reads.len() == 3));
     let value = |bytes: Vec<u8>| Some(Value::from(bytes));
-    operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: vec![
-            (
-                Key::from(b"config".as_slice()),
-                value(realm_config.to_bytes(&actor).unwrap()),
-            ),
-            (
-                Key::from(b"auth".as_slice()),
-                value(auth_doc.to_bytes(&actor).unwrap()),
-            ),
-            (Key::from(b"state".as_slice()), None),
-        ],
-    }))
+    let rows = vec![
+        value(realm_config.to_bytes(&actor).unwrap()),
+        value(auth_doc.to_bytes(&actor).unwrap()),
+        None,
+    ];
+    let turn = operation.next(IoResult::Values(rows));
+    (operation, turn)
 }
 
-/// The stored admins and the replicated admin operations of one batch write.
-fn written(effects: &Effects) -> (HashSet<UserId>, Vec<AdminDocumentOperation>) {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected one batch write, got {effects:?}");
+/// The stored admins and the replicated admin operations of one write call.
+fn written(
+    turn: Result<Next<HashSet<UserId>>, SetAdminError>,
+) -> (HashSet<UserId>, Vec<AdminDocumentOperation>) {
+    let Ok(Next::Call(IoCall::Write(writes))) = turn else {
+        panic!("expected one write, got {turn:?}");
     };
     let auth_doc = RealmAuthorizationDocument::from_bytes(&writes[0].2).unwrap();
     let admins = auth_doc.roles.into_values().next().unwrap().assigned_users;
@@ -123,9 +101,8 @@ fn written(effects: &Effects) -> (HashSet<UserId>, Vec<AdminDocumentOperation>) 
 
 #[test]
 fn grants_admin_role() {
-    let mut operation = SetAdminOperation::new(config(user(2), true));
-    let effects = step_to_write(&mut operation, &[user(1)]);
-    let (admins, ops) = written(&effects);
+    let (mut operation, turn) = change(user(2), true, &[user(1)]);
+    let (admins, ops) = written(turn);
     assert_eq!(admins, HashSet::from([user(1), user(2)]));
     assert!(matches!(
         ops.as_slice(),
@@ -134,70 +111,52 @@ fn grants_admin_role() {
             AdminDocumentOperation::RealmAssignmentAdded { user_id, .. },
         ] if *user_id == user(2)
     ));
-
-    operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    let txn_id = Ulid::from_bytes([7u8; 16]);
-    let commit = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id,
-    }));
-    assert!(matches!(commit.as_slice(), [Effect::Task(_)]));
-    operation.step(Event::Task(TaskEvent::TimerScheduled {
-        key: aruna_core::task::TaskKey::DrainSyncOutbox,
-        after: std::time::Duration::ZERO,
-    }));
-    assert!(operation.is_complete());
-    assert_eq!(operation.finalize(), Ok(HashSet::from([user(1), user(2)])));
+    // The drain timer runs after the commit; the admins are the outcome.
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("expected the outcome with the drain timer");
+    };
+    assert_eq!(output, HashSet::from([user(1), user(2)]));
+    assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
 }
 
 #[test]
 fn removes_with_epochs() {
     // A removal narrows access, so key epochs are marked due before the commit.
-    let mut operation = SetAdminOperation::new(config(user(2), false));
-    let effects = step_to_write(&mut operation, &[user(1), user(2)]);
-    let (admins, ops) = written(&effects);
+    let (mut operation, turn) = change(user(2), false, &[user(1), user(2)]);
+    let (admins, ops) = written(turn);
     assert_eq!(admins, HashSet::from([user(1)]));
     assert!(matches!(
         ops.last(),
         Some(AdminDocumentOperation::RealmAssignmentRemoved { user_id, .. }) if *user_id == user(2)
     ));
-
-    let marking = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    assert!(matches!(marking.as_slice(), [Effect::SubOperation(_)]));
-    let commit = operation.step(Event::SubOperation(SubOperationEvent::EpochsMarked {
-        result: Ok(()),
-    }));
-    assert!(matches!(
-        commit.as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
+    let marking = operation.next(IoResult::Done);
+    assert!(matches!(marking, Ok(Next::Call(IoCall::Page { .. }))));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert!(matches!(operation.next(empty), Ok(Next::Then { .. })));
 }
 
 #[test]
 fn keeps_last_admin() {
-    let mut operation = SetAdminOperation::new(config(user(1), false));
-    let effects = step_to_write(&mut operation, &[user(1)]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(operation.finalize(), Err(SetAdminError::LastAdmin));
+    let (_, turn) = change(user(1), false, &[user(1)]);
+    assert_eq!(turn, Err(SetAdminError::LastAdmin));
 }
 
 #[test]
 fn refuses_non_admin() {
     let mut operation = SetAdminOperation::new(config(user(2), true));
-    operation.start();
-    let effects = operation.step(Event::SubOperation(
-        SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
+    assert!(matches!(
+        operation.first(),
+        Ok(Next::Call(IoCall::Child(_)))
     ));
-    assert!(effects.is_empty());
-    assert_eq!(operation.finalize(), Err(SetAdminError::Unauthorized));
+    let denied = ChildOutcome::new(Ok::<bool, AuthorizationError>(false));
+    assert_eq!(
+        operation.next(IoResult::Child(denied)),
+        Err(SetAdminError::Unauthorized)
+    );
 
     let mut operation = SetAdminOperation::new(config(UserId::nil(realm_id()), true));
-    assert!(operation.start().is_empty());
-    assert_eq!(operation.finalize(), Err(SetAdminError::InvalidUser));
+    assert_eq!(operation.first(), Err(SetAdminError::InvalidUser));
 }

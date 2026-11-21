@@ -3,36 +3,44 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod model;
+pub mod model;
 
-pub use model::*;
+use model::*;
 
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::origin_holds;
 use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
+use aruna_core::metadata::api::{
+    CreateDocumentPayload, ExportMetadataResult,
+    RoCrateExportView as OperationMetadataRoCrateExportView,
+};
 use aruna_core::metadata::{
     MetadataError, MetadataQueryResults, MetadataRoCratePage, MetadataSearchHit,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::{MetaResourceId, StructuredId};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
-use aruna_operations::forward::routing::origin_holds_document as run_origin_holds_document;
-use aruna_operations::forward::transport::MetadataWriteError;
-use aruna_operations::git::snapshot::unreadable_file;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, ExportMetadataResult, ListVisibleRequest, MetadataApiError, MetadataFanoutStats,
-    MetadataListOrder, MetadataReferenceEntry, MetadataReferencesExecution,
-    RoCrateExportView as OperationMetadataRoCrateExportView, forwarded_bearer,
-    list_visible_documents as run_list_visible_metadata_documents,
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::git::linked::unreadable_file;
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
+use aruna_operations::metadata::api::list::ListVisibleOperation;
+use aruna_operations::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
+use aruna_operations::metadata::api::read_types::{
+    ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
 };
-use aruna_operations::metadata::create_document::{CreateDocumentError, CreateDocumentPayload};
-use aruna_operations::metadata::forward::{CreateAuthorizedError, create_metadata_authorized};
-use aruna_operations::metadata::get_document::load_document_record as load_metadata_record_by_document_from_operations;
+use aruna_operations::metadata::create_document::CreateDocumentError;
+use aruna_operations::metadata::forward::authorized_create::CreateAuthorizedError;
+use aruna_operations::metadata::forward::authorized_create::{
+    AuthorizedCreateOperation, DocumentCreate,
+};
+use aruna_operations::metadata::forward::write::MetadataWriteError;
+use aruna_operations::metadata::record_reads::DocumentRecordOperation;
 use aruna_operations::metadata::update_document::UpdateDocumentError;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -81,28 +89,30 @@ pub(crate) async fn run_create_metadata(
     message: Option<String>,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
-    create_metadata_authorized(
-        &ctx,
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth,
-        extras,
-        forwarded_auth_token(bearer_token)?,
+    let create = DocumentCreate {
         group_id,
         path,
         public,
         payload,
-        message,
-    )
-    .await
-    .map_err(|error| match error {
-        CreateAuthorizedError::EmptyPath => ServerError::BadRequest,
-        CreateAuthorizedError::Forbidden => ServerError::Forbidden,
-        CreateAuthorizedError::Api(error) => map_api_error(error),
-        CreateAuthorizedError::Create(error) => map_create_error(error),
-        CreateAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
-        CreateAuthorizedError::Write(error) => map_write_error(error),
-    })
+        commit_message: message,
+    };
+    let node = (
+        state.get_realm_id(),
+        state.get_node_id(),
+        ctx.net_handle.is_some(),
+    );
+    let caller = (auth.clone(), extras, forwarded_auth_token(bearer_token)?);
+    let create = AuthorizedCreateOperation::new(node, caller, create);
+    drive(create, ctx.as_ref())
+        .await
+        .map_err(|error| match error {
+            CreateAuthorizedError::EmptyPath => ServerError::BadRequest,
+            CreateAuthorizedError::Forbidden => ServerError::Forbidden,
+            CreateAuthorizedError::Api(error) => map_api_error(error),
+            CreateAuthorizedError::Create(error) => map_create_error(error),
+            CreateAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
+            CreateAuthorizedError::Write(error) => map_write_error(error),
+        })
 }
 
 pub(crate) fn map_references_response(
@@ -145,21 +155,17 @@ pub(crate) async fn run_document_list(
     let include = parse_include_flags(query.include.as_deref())?;
     let order = parse_metadata_order(query.order.as_deref())?;
     let ctx = state.get_ctx();
-    let result = run_list_visible_metadata_documents(
-        ctx.as_ref(),
-        state.get_realm_id(),
-        ListVisibleRequest {
-            group_id,
-            path_prefix: query.path_prefix,
-            include_summary: include.summary,
-            limit: query.limit,
-            offset: query.offset,
-            order,
-            auth,
-        },
-    )
-    .await
-    .map_err(map_api_error)?;
+    let request = ListVisibleRequest {
+        group_id,
+        path_prefix: query.path_prefix,
+        include_summary: include.summary,
+        limit: query.limit,
+        offset: query.offset,
+        order,
+        auth,
+    };
+    let list = ListVisibleOperation::new(state.get_realm_id(), request);
+    let result = drive(list, ctx.as_ref()).await.map_err(map_api_error)?;
 
     let mut documents = Vec::with_capacity(result.documents.len());
     for document in result.documents {
@@ -218,15 +224,12 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
 
 /// The crate or entity with objects of local distributed member buckets named by global id.
 pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> ServerResult<Value> {
-    let mut value = value.clone();
-    aruna_operations::metadata::global_entries::normalize_entries(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        &mut value,
-    )
-    .await
-    .map_err(ServerError::InternalError)?;
+    use aruna_operations::metadata::global_entries::NormalizeEntriesOperation;
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    let normalize = NormalizeEntriesOperation::new(realm_id, node_id, value.clone());
+    let (value, _) = drive(normalize, state.get_ctx().as_ref())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     Ok(value)
 }
 
@@ -246,7 +249,7 @@ pub(crate) fn map_write_error(error: MetadataWriteError) -> ServerError {
         MetadataWriteError::NotFound => ServerError::NotFound,
         MetadataWriteError::Create(error) => map_create_error(error),
         MetadataWriteError::Update(error) => map_update_error(error),
-        MetadataWriteError::Delete(error) => ServerError::InternalError(error.to_string()),
+        MetadataWriteError::Delete(error) => ServerError::InternalError(error.into()),
         MetadataWriteError::Undeliverable(error) => ServerError::ServiceUnavailableReason(format!(
             "metadata write is undeliverable: {error}"
         )),
@@ -270,7 +273,7 @@ pub(crate) fn map_create_error(error: CreateDocumentError) -> ServerError {
             ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
         }
         CreateDocumentError::RawLimit => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -285,14 +288,14 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
         UpdateDocumentError::GraphPending { .. } => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 /// The caller's own bearer token, carried to the holder a write is forwarded to
 /// so it re-runs the same permission checks under the same authority.
 pub(crate) fn forwarded_auth_token(
     bearer_token: Option<ValidatedBearer>,
-) -> ServerResult<Option<aruna_operations::metadata::AuthToken>> {
+) -> ServerResult<Option<aruna_core::metadata::AuthToken>> {
     forwarded_bearer(bearer_token_string(bearer_token).as_deref()).map_err(map_api_error)
 }
 
@@ -304,7 +307,7 @@ pub(crate) fn map_metadata_error(error: MetadataError) -> ServerError {
             ServerError::MetadataProfileValidation(findings)
         }
         MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -319,7 +322,7 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         }
         MetadataApiError::SearchIncomplete(reason) => ServerError::ServiceUnavailableReason(reason),
         MetadataApiError::PlacementUnavailable(
-            aruna_operations::placement::PlacementResolveError::ActivationConflicted(_),
+            aruna_core::placement::PlacementResolveError::ActivationConflicted(_),
         ) => ServerError::ServiceUnavailableReason("placement_activation_conflict".to_string()),
         MetadataApiError::PlacementUnavailable(_) => {
             ServerError::ServiceUnavailableReason("placement_activation_unavailable".to_string())
@@ -327,7 +330,7 @@ pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
         MetadataApiError::InvalidCursor(message) | MetadataApiError::InvalidQuery(message) => {
             ServerError::BadRequestMessage(message)
         }
-        MetadataApiError::Internal(message) => ServerError::InternalError(message),
+        MetadataApiError::Internal(message) => ServerError::InternalError(message.into()),
     }
 }
 
@@ -338,7 +341,7 @@ pub(crate) fn map_query_mode(mode: Option<MetadataQueryMode>) -> Option<ApiQuery
     })
 }
 
-pub(crate) fn bearer_token_string(bearer_token: Option<ValidatedBearer>) -> Option<String> {
+pub fn bearer_token_string(bearer_token: Option<ValidatedBearer>) -> Option<String> {
     bearer_token.map(|carrier| carrier.as_str().to_string())
 }
 
@@ -377,9 +380,10 @@ pub(crate) async fn ensure_readable_files(
     if auth.path_restrictions.is_none() {
         return Ok(());
     }
-    match unreadable_file(&state.get_ctx(), auth, entities).await {
-        Some(_) => Err(ServerError::Forbidden),
-        None => Ok(()),
+    let context = state.get_ctx();
+    match drive(unreadable_file(context.node_id(), auth, entities), &context).await {
+        Ok(None) => Ok(()),
+        _ => Err(ServerError::Forbidden),
     }
 }
 
@@ -426,29 +430,22 @@ pub(crate) async fn local_write_record(
 ) -> ServerResult<Option<MetadataRegistryRecord>> {
     ensure_device_owner(state, auth).await?;
     let context = state.get_ctx();
-    if !run_origin_holds_document(
-        &context,
-        state.get_realm_id(),
-        state.get_node_id(),
-        document_id,
-    )
-    .await
-    .map_err(map_api_error)?
+    if !origin_holds(state, document_id)
+        .await
+        .ok_or(ServerError::ServiceUnavailable)?
     {
         return Ok(None);
     }
-    let record =
-        match load_metadata_record_by_document_from_operations(context.as_ref(), document_id).await
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => return Ok(None),
-            Err(ReadError::Storage(error)) => {
-                return Err(ServerError::InternalError(error.to_string()));
-            }
-            Err(ReadError::Conversion(error)) => {
-                return Err(ServerError::InternalError(error.to_string()));
-            }
-        };
+    let record = match drive(DocumentRecordOperation::new(document_id), context.as_ref()).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return Ok(None),
+        Err(ReadError::Storage(error)) => {
+            return Err(ServerError::InternalError(error.into()));
+        }
+        Err(ReadError::Conversion(error)) => {
+            return Err(ServerError::InternalError(error.into()));
+        }
+    };
     ensure_record_writable(state, auth, &record, extras).await?;
     Ok(Some(record))
 }
@@ -471,14 +468,14 @@ pub(crate) async fn load_document_record(
     document_id: Ulid,
 ) -> ServerResult<MetadataRegistryRecord> {
     let ctx = state.get_ctx();
-    match load_metadata_record_by_document_from_operations(ctx.as_ref(), document_id).await {
+    match drive(DocumentRecordOperation::new(document_id), ctx.as_ref()).await {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(ServerError::NotFound),
-        Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.to_string())),
-        Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.to_string())),
+        Err(ReadError::Storage(error)) => Err(ServerError::InternalError(error.into())),
+        Err(ReadError::Conversion(error)) => Err(ServerError::InternalError(error.into())),
     }
 }
-type ReadError = aruna_operations::metadata::repository::StorageReadError;
+type ReadError = aruna_core::errors::StorageReadError;
 
 pub(crate) fn map_export_view(view: &MetadataRoCrateView) -> OperationMetadataRoCrateExportView {
     match view {
@@ -603,7 +600,7 @@ fn build_view_id(
 
 fn parse_jsonld(jsonld: String) -> ServerResult<Value> {
     serde_json::from_str(&jsonld)
-        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string()))
+        .map_err(|_| ServerError::InternalError("invalid jsonld export".to_string().into()))
 }
 
 fn rewrite_view_jsonld(mut value: Value, graph_iri: &str, view_id: &str) -> ServerResult<Value> {

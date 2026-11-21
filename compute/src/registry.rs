@@ -5,11 +5,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use aruna_core::compute::backend::{DeclaredCapabilities, WorkloadSuitability};
+use aruna_core::compute::identity::home_digest;
+use aruna_core::compute::offer::{
+    BackendCaps, BackendLimit, BackendLimits, ExecutorOffer, config_digest,
+};
 use aruna_core::compute::{BackendError, ExecutorCapability, ExecutorKind};
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementSubject};
-use aruna_core::structs::storage::node_info::NODE_LABEL_KEY;
 
-use crate::executor::{BackendCaps, ExecutorBackend};
+use crate::executor::ExecutorBackend;
 use crate::session::SessionRegistry;
 
 /// Container-facing S3 endpoint the workspace credential targets. Injected into
@@ -33,12 +37,45 @@ impl Default for WorkspaceEndpoint {
     }
 }
 
-/// Enabled executor backends keyed by their wire kind. The driver selects a
-/// backend per execution job; advertisement (Stage 3) reads `kinds()`.
+/// What the operator wrote for one backend in the backends file. These values replace the
+/// adapter's defaults wherever the registry reads the backend's capabilities.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OperatorSettings {
+    pub max_walltime_ms: Option<u64>,
+    pub declared: DeclaredCapabilities,
+    pub suitability: Option<WorkloadSuitability>,
+    pub groups: Vec<aruna_core::types::GroupId>,
+}
+
+/// One enabled backend with the S3 endpoints its containers reach.
+struct Registered {
+    backend: Arc<dyn ExecutorBackend>,
+    workspace: WorkspaceEndpoint,
+    settings: Option<OperatorSettings>,
+}
+
+impl Registered {
+    /// The adapter's capabilities with the operator's settings, when written, in place.
+    fn caps(&self) -> BackendCaps {
+        let caps = self.backend.capabilities();
+        match &self.settings {
+            Some(settings) => BackendCaps {
+                max_walltime_ms: settings.max_walltime_ms,
+                declared: settings.declared.clone(),
+                suitability: settings.suitability,
+                groups: settings.groups.clone(),
+                ..caps
+            },
+            None => caps,
+        }
+    }
+}
+
+/// Enabled executor backends keyed by their node-local name. The driver selects
+/// a backend per execution job; advertisement reads `capabilities()`.
 #[derive(Default)]
 pub struct ExecutorRegistry {
-    backends: BTreeMap<String, Arc<dyn ExecutorBackend>>,
-    workspace: WorkspaceEndpoint,
+    backends: BTreeMap<String, Registered>,
     sessions: Arc<SessionRegistry>,
 }
 
@@ -46,35 +83,35 @@ impl ExecutorRegistry {
     pub fn new() -> Self {
         Self {
             backends: BTreeMap::new(),
-            workspace: WorkspaceEndpoint::default(),
             sessions: Arc::new(SessionRegistry::new()),
         }
     }
 
-    pub fn with_backend(mut self, backend: Arc<dyn ExecutorBackend>) -> Self {
-        self.register(backend);
+    /// Adds `backend` under `name` without a container-facing S3 endpoint.
+    pub fn with_backend(self, name: impl Into<String>, backend: Arc<dyn ExecutorBackend>) -> Self {
+        self.with_workspace(name, backend, WorkspaceEndpoint::default())
+    }
+
+    /// Adds `backend` under `name`, whose containers reach S3 at `workspace`.
+    pub fn with_workspace(
+        mut self,
+        name: impl Into<String>,
+        backend: Arc<dyn ExecutorBackend>,
+        workspace: WorkspaceEndpoint,
+    ) -> Self {
+        self.register(name, backend, workspace);
         self
     }
 
-    pub fn with_workspace_endpoint(mut self, endpoint: Option<String>, region: String) -> Self {
-        self.workspace = WorkspaceEndpoint {
-            endpoint,
-            region,
-            session_endpoint: self.workspace.session_endpoint,
-        };
-        self
-    }
-
-    pub fn with_session_endpoint(mut self, endpoint: Option<String>) -> Self {
-        self.workspace.session_endpoint = endpoint;
-        self
-    }
-
-    /// The endpoint a Direct-S3 attempt binding would hand its container. No
-    /// attempt path builds one yet, so nothing reads this today; it stays
-    /// because the operator configuration that fills it is documented.
-    pub fn workspace_endpoint(&self) -> &WorkspaceEndpoint {
-        &self.workspace
+    /// The S3 endpoints of the backend `placed` finds, which sessions and workspace
+    /// access hand to its containers.
+    pub fn workspace(
+        &self,
+        name: Option<&str>,
+        constraint: Option<&ExecutorKind>,
+    ) -> Option<&WorkspaceEndpoint> {
+        self.placement(name, constraint)
+            .map(|(_, entry)| &entry.workspace)
     }
 
     /// The interactive sessions this node runs. In memory only: a restart ends
@@ -83,26 +120,126 @@ impl ExecutorRegistry {
         &self.sessions
     }
 
-    pub fn register(&mut self, backend: Arc<dyn ExecutorBackend>) {
-        self.backends.insert(backend.kind().as_wire(), backend);
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        backend: Arc<dyn ExecutorBackend>,
+        workspace: WorkspaceEndpoint,
+    ) {
+        let settings = None;
+        self.backends.insert(
+            name.into(),
+            Registered {
+                backend,
+                workspace,
+                settings,
+            },
+        );
     }
 
+    /// Gives the backend under `name` the operator's settings from the backends file.
+    pub fn with_settings(mut self, name: &str, settings: OperatorSettings) -> Self {
+        if let Some(entry) = self.backends.get_mut(name) {
+            entry.settings = Some(settings);
+        }
+        self
+    }
+
+    /// The capabilities backend `name` is filtered and advertised by, operator settings included.
+    pub fn caps(&self, name: &str) -> Option<BackendCaps> {
+        self.backends.get(name).map(Registered::caps)
+    }
+
+    /// The backend registered under `name`.
+    pub fn named(&self, name: &str) -> Option<&Arc<dyn ExecutorBackend>> {
+        self.backends.get(name).map(|entry| &entry.backend)
+    }
+
+    /// The first backend of `kind` in name order.
     pub fn get(&self, kind: &ExecutorKind) -> Option<&Arc<dyn ExecutorBackend>> {
-        self.backends.get(&kind.as_wire())
+        self.selected(Some(kind)).map(|entry| &entry.backend)
     }
 
     /// Pick a backend satisfying the constraint, or the first enabled one when
     /// unconstrained. `None` means no enabled backend can run the job.
     pub fn select(&self, constraint: Option<&ExecutorKind>) -> Option<&Arc<dyn ExecutorBackend>> {
-        match constraint {
-            Some(kind) => self.get(kind),
-            None => self.backends.values().next(),
+        self.selected(constraint).map(|entry| &entry.backend)
+    }
+
+    /// The backend a run is placed on with its name: the stored name, which must
+    /// also match the kind constraint, else the first backend `select` picks.
+    pub fn placed(
+        &self,
+        name: Option<&str>,
+        constraint: Option<&ExecutorKind>,
+    ) -> Option<(&str, &Arc<dyn ExecutorBackend>)> {
+        self.placement(name, constraint)
+            .map(|(name, entry)| (name.as_str(), &entry.backend))
+    }
+
+    fn placement(
+        &self,
+        name: Option<&str>,
+        constraint: Option<&ExecutorKind>,
+    ) -> Option<(&String, &Registered)> {
+        let kind_matches =
+            |entry: &Registered| constraint.is_none_or(|kind| &entry.backend.kind() == kind);
+        match name {
+            Some(name) => self
+                .backends
+                .get_key_value(name)
+                .filter(|(_, entry)| kind_matches(entry)),
+            None => self.backends.iter().find(|(_, entry)| kind_matches(entry)),
         }
+    }
+
+    fn selected(&self, constraint: Option<&ExecutorKind>) -> Option<&Registered> {
+        self.backends
+            .values()
+            .find(|entry| constraint.is_none_or(|kind| &entry.backend.kind() == kind))
+    }
+
+    /// Where the attempts of backend `name` live: its kind and runtime destination.
+    pub fn home_digest(&self, name: &str) -> Option<[u8; 32]> {
+        let backend = self.named(name)?;
+        Some(home_digest(
+            &backend.kind().as_wire(),
+            backend.destination().as_ref(),
+        ))
+    }
+
+    /// The home digest and everything placement and admission read of backend `name`.
+    pub fn config_digest(&self, name: &str) -> Option<[u8; 32]> {
+        let home = self.home_digest(name)?;
+        let backend = self.named(name)?;
+        let caps = self.caps(name)?;
+        Some(config_digest(
+            &home,
+            &caps,
+            suitability(backend.as_ref(), &caps),
+        ))
     }
 
     /// Advertised wire kinds for the Node Descriptor.
     pub fn kinds(&self) -> BTreeSet<String> {
-        self.backends.keys().cloned().collect()
+        self.backends
+            .values()
+            .map(|entry| entry.backend.kind().as_wire())
+            .collect()
+    }
+
+    /// What each registered backend advertises, by its name, with its wire kind and config.
+    pub fn limits(&self) -> BackendLimits {
+        (self.backends.iter())
+            .map(|(name, entry)| {
+                let limit = BackendLimit {
+                    kind: entry.backend.kind().as_wire(),
+                    limits: entry.caps().limits,
+                    config_digest: self.config_digest(name).unwrap_or_default(),
+                };
+                (name.clone(), limit)
+            })
+            .collect()
     }
 
     /// Advertisement of every enabled backend at the site it actually runs on.
@@ -113,20 +250,21 @@ impl ExecutorRegistry {
         subject: &PlacementSubject,
         policy_draining: bool,
     ) -> Result<Vec<ExecutorCapability>, PlacementPolicyError> {
-        self.backends
-            .values()
-            .map(|backend| {
-                let caps = backend.capabilities();
-                let mut capability =
-                    ExecutorCapability::new(backend.kind().as_wire(), site(subject, &caps))?;
-                capability.file_staging = caps.file_staging;
-                capability.direct_s3 = caps.direct_s3;
-                capability.s3_mount = caps.s3_mount;
-                capability.network_policy = caps.network_policy;
-                capability.session = caps.session;
-                capability.limits = caps.limits;
-                capability.policy_draining = policy_draining;
-                Ok(capability)
+        (self.offers().iter())
+            .map(|offer| offer.capability(subject, policy_draining))
+            .collect()
+    }
+
+    /// What every enabled backend offers, before a placement subject is known.
+    pub fn offers(&self) -> Vec<ExecutorOffer> {
+        (self.backends.iter())
+            .map(|(name, entry)| {
+                let backend = &entry.backend;
+                let mut caps = entry.caps();
+                caps.suitability = Some(suitability(backend.as_ref(), &caps));
+                let kind = backend.kind().as_wire();
+                let home = home_digest(&kind, backend.destination().as_ref());
+                ExecutorOffer::new((name.clone(), kind), home, caps)
             })
             .collect()
     }
@@ -136,17 +274,17 @@ impl ExecutorRegistry {
     /// start instead of running accepted work at a site nobody authorized.
     pub fn fenced(
         &self,
-        kind: &ExecutorKind,
+        name: &str,
         subject: &PlacementSubject,
         stored_generation: u64,
         stored_digest: &[u8; 32],
     ) -> Result<&Arc<dyn ExecutorBackend>, BackendError> {
         let backend = self
-            .get(kind)
-            .ok_or_else(|| BackendError::Unavailable(format!("no {} backend", kind.as_wire())))?;
-        let current =
-            ExecutorCapability::new(kind.as_wire(), site(subject, &backend.capabilities()))
-                .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
+            .named(name)
+            .ok_or_else(|| BackendError::Unavailable(format!("no backend named {name}")))?;
+        let site = backend.capabilities().site(subject);
+        let current = ExecutorCapability::new(name.to_string(), backend.kind().as_wire(), site)
+            .map_err(|error| BackendError::InvalidSpec(error.to_string()))?;
         match current.subject.generation == stored_generation
             && &current.subject_digest == stored_digest
         {
@@ -160,48 +298,22 @@ impl ExecutorRegistry {
     }
 }
 
-/// The execution site one backend advertises. A backend whose workers are
-/// neither the controller nor a declared worker site cannot prove placement, so
-/// it advertises no location and no site labels rather than the controller's.
-fn site(subject: &PlacementSubject, caps: &BackendCaps) -> PlacementSubject {
-    let mut site = match (caps.local_site, &caps.worker_site) {
-        (true, _) => PlacementSubject {
-            local_to_controller: true,
-            ..subject.clone()
-        },
-        (false, Some(site)) => {
-            let mut labels = site.labels.clone();
-            aruna_core::structs::storage::node_info::stamp_location(&mut labels, &site.location);
-            PlacementSubject {
-                local_to_controller: false,
-                location: site.location.clone(),
-                labels,
-                ..subject.clone()
-            }
-        }
-        (false, None) => PlacementSubject {
-            local_to_controller: false,
-            location: String::new(),
-            labels: BTreeMap::new(),
-            ..subject.clone()
-        },
-    };
-    // The node runs every backend it offers, so a submission can pin it by its id.
-    site.labels
-        .insert(NODE_LABEL_KEY.to_string(), subject.node_id.to_string());
-    site
+/// The written suitability of a backend, else the defaults of its kind.
+fn suitability(backend: &dyn ExecutorBackend, caps: &BackendCaps) -> WorkloadSuitability {
+    caps.suitability
+        .unwrap_or_else(|| WorkloadSuitability::of_kind(&backend.kind()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::{BackendCaps, ExecutorBackend, WorkerSite};
+    use aruna_core::compute::offer::WorkerSite;
     use aruna_core::compute::{
         AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
         LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence,
         TombstoneSpec, UserSpec,
     };
-    use aruna_core::structs::storage::node_info::LOCATION_LABEL_KEY;
+    use aruna_core::structs::storage::node_info::{LOCATION_LABEL_KEY, NODE_LABEL_KEY};
     use async_trait::async_trait;
     use tokio_util::sync::CancellationToken;
 
@@ -314,9 +426,65 @@ mod tests {
     }
 
     #[test]
-    fn select_by_kind() {
+    fn names_two_backends() {
+        // Two backends of one kind stay apart under their names.
         let registry = ExecutorRegistry::new()
-            .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
+            .with_backend("lab", Arc::new(StubBackend::local(ExecutorKind::Docker)))
+            .with_workspace(
+                "edge",
+                Arc::new(remote(ExecutorKind::Docker, None)),
+                WorkspaceEndpoint {
+                    endpoint: Some("http://edge.test".to_string()),
+                    ..WorkspaceEndpoint::default()
+                },
+            );
+
+        assert!(
+            registry
+                .named("lab")
+                .is_some_and(|b| b.capabilities().local_site)
+        );
+        assert!(
+            registry
+                .named("edge")
+                .is_some_and(|b| !b.capabilities().local_site)
+        );
+        assert!(registry.named("default").is_none());
+        // Unnamed selection takes the first name in order.
+        assert!(!registry.select(None).unwrap().capabilities().local_site);
+        assert_eq!(
+            registry
+                .workspace(None, None)
+                .and_then(|w| w.endpoint.as_deref()),
+            Some("http://edge.test")
+        );
+        // A stored name pins its backend, and only while the kind still matches.
+        let docker = Some(&ExecutorKind::Docker);
+        assert_eq!(
+            registry.placed(Some("lab"), docker).map(|(name, _)| name),
+            Some("lab")
+        );
+        assert!(
+            registry
+                .placed(Some("lab"), Some(&ExecutorKind::Slurm))
+                .is_none()
+        );
+        assert!(registry.placed(Some("gone"), None).is_none());
+        let advertised = registry.capabilities(&subject(), false).unwrap();
+        assert_eq!(advertised.len(), 2);
+        assert!(
+            advertised
+                .iter()
+                .all(|capability| capability.kind == "docker")
+        );
+    }
+
+    #[test]
+    fn select_by_kind() {
+        let registry = ExecutorRegistry::new().with_backend(
+            "default",
+            Arc::new(StubBackend::local(ExecutorKind::Docker)),
+        );
         assert!(registry.get(&ExecutorKind::Docker).is_some());
         assert!(registry.get(&ExecutorKind::Slurm).is_none());
         // Unconstrained selects the only enabled backend.
@@ -346,10 +514,10 @@ mod tests {
             location: "dc-b".to_string(),
             labels: BTreeMap::from([("gpu".to_string(), "a100".to_string())]),
         };
-        let registry = ExecutorRegistry::new().with_backend(Arc::new(remote(
-            ExecutorKind::Kubernetes,
-            Some(site.clone()),
-        )));
+        let registry = ExecutorRegistry::new().with_backend(
+            "default",
+            Arc::new(remote(ExecutorKind::Kubernetes, Some(site.clone()))),
+        );
         let subject = subject();
 
         let capability = registry
@@ -375,8 +543,8 @@ mod tests {
         subject
             .labels
             .insert("tier".to_string(), "secure".to_string());
-        let registry =
-            ExecutorRegistry::new().with_backend(Arc::new(remote(ExecutorKind::Kubernetes, None)));
+        let registry = ExecutorRegistry::new()
+            .with_backend("default", Arc::new(remote(ExecutorKind::Kubernetes, None)));
 
         let capability = registry
             .capabilities(&subject, false)
@@ -392,8 +560,10 @@ mod tests {
     #[test]
     fn fence_refuses_drift() {
         // Work receipted under one site may not start after the site changed.
-        let registry = ExecutorRegistry::new()
-            .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
+        let registry = ExecutorRegistry::new().with_backend(
+            "default",
+            Arc::new(StubBackend::local(ExecutorKind::Docker)),
+        );
         let subject = subject();
         let stored = registry
             .capabilities(&subject, false)
@@ -403,7 +573,7 @@ mod tests {
         assert!(
             registry
                 .fenced(
-                    &ExecutorKind::Docker,
+                    "default",
                     &subject,
                     stored.subject.generation,
                     &stored.subject_digest
@@ -416,7 +586,7 @@ mod tests {
         assert_eq!(
             registry
                 .fenced(
-                    &ExecutorKind::Docker,
+                    "default",
                     &moved,
                     stored.subject.generation,
                     &stored.subject_digest
@@ -430,7 +600,7 @@ mod tests {
         assert_eq!(
             registry
                 .fenced(
-                    &ExecutorKind::Docker,
+                    "default",
                     &aged,
                     stored.subject.generation,
                     &stored.subject_digest
@@ -441,7 +611,7 @@ mod tests {
         assert!(
             registry
                 .fenced(
-                    &ExecutorKind::Slurm,
+                    "missing",
                     &subject,
                     stored.subject.generation,
                     &stored.subject_digest
@@ -451,10 +621,83 @@ mod tests {
     }
 
     #[test]
+    fn advertises_kind_defaults() {
+        // Without written suitability a backend advertises its kind's defaults; written values
+        // and the walltime maximum are advertised as they are, and both move the config digest.
+        use aruna_core::compute::backend::{Suitability, WorkloadSuitability};
+        let registry = ExecutorRegistry::new()
+            .with_backend("a", Arc::new(StubBackend::local(ExecutorKind::Apptainer)))
+            .with_backend("d", Arc::new(StubBackend::local(ExecutorKind::Docker)));
+        let advertised = registry.capabilities(&subject(), false).unwrap();
+        assert_eq!(advertised[0].suitability.sessions, Suitability::Refused);
+        assert_eq!(advertised[1].suitability.sessions, Suitability::Good);
+        assert_eq!(advertised[1].max_walltime_ms, None);
+
+        let mut caps = StubBackend::local(ExecutorKind::Docker).1;
+        caps.max_walltime_ms = Some(3_600_000);
+        let (first, second) = (
+            aruna_core::types::GroupId::from(1u128),
+            aruna_core::types::GroupId::from(2u128),
+        );
+        caps.groups = vec![second, first, second];
+        caps.suitability = Some(WorkloadSuitability {
+            sessions: Suitability::Refused,
+            ..WorkloadSuitability::of_kind(&ExecutorKind::Docker)
+        });
+        let written = ExecutorRegistry::new()
+            .with_backend("d", Arc::new(StubBackend(ExecutorKind::Docker, caps)));
+        let capability = &written.capabilities(&subject(), false).unwrap()[0];
+        assert_eq!(capability.suitability.sessions, Suitability::Refused);
+        assert_eq!(capability.max_walltime_ms, Some(3_600_000));
+        assert_eq!(capability.groups, [first, second]);
+        assert_ne!(capability.config_digest, advertised[1].config_digest);
+    }
+
+    #[test]
+    fn applies_operator_settings() {
+        // A backend's file entry replaces the adapter defaults it is advertised, digested and
+        // filtered by; a backend without one keeps them.
+        use aruna_core::compute::backend::{Suitability, WorkloadSuitability};
+        let plain = ExecutorRegistry::new()
+            .with_backend("lab", Arc::new(StubBackend::local(ExecutorKind::Docker)));
+        let group = aruna_core::types::GroupId::from(5u128);
+        let settings = OperatorSettings {
+            max_walltime_ms: Some(60_000),
+            suitability: Some(WorkloadSuitability {
+                sessions: Suitability::Refused,
+                ..WorkloadSuitability::of_kind(&ExecutorKind::Docker)
+            }),
+            groups: vec![group],
+            ..OperatorSettings::default()
+        };
+        let written = ExecutorRegistry::new()
+            .with_backend("lab", Arc::new(StubBackend::local(ExecutorKind::Docker)))
+            .with_settings("lab", settings);
+
+        let caps = written.caps("lab").unwrap();
+        assert_eq!(
+            (caps.max_walltime_ms, caps.groups.clone()),
+            (Some(60_000), vec![group])
+        );
+        assert!(caps.file_staging, "adapter capabilities stay");
+        assert_eq!(
+            written.offers()[0].suitability().sessions,
+            Suitability::Refused
+        );
+        let advertised = &written.capabilities(&subject(), false).unwrap()[0];
+        assert_eq!(advertised.groups, [group]);
+        assert_eq!(advertised.max_walltime_ms, Some(60_000));
+        assert_ne!(written.config_digest("lab"), plain.config_digest("lab"));
+        assert_eq!(plain.caps("lab").unwrap().max_walltime_ms, None);
+    }
+
+    #[test]
     fn advertises_backend_site() {
         // Each backend advertises its own kind, site locality, and stored digest.
-        let registry = ExecutorRegistry::new()
-            .with_backend(Arc::new(StubBackend::local(ExecutorKind::Docker)));
+        let registry = ExecutorRegistry::new().with_backend(
+            "default",
+            Arc::new(StubBackend::local(ExecutorKind::Docker)),
+        );
         let subject = subject();
         let capabilities = registry
             .capabilities(&subject, true)

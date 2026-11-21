@@ -3,50 +3,37 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod create;
-mod get;
-mod list;
-mod purge;
-mod refresh;
-mod revoke;
-mod touch;
+pub mod create;
+pub mod get;
+pub mod list;
+pub mod purge;
+pub mod refresh;
+pub mod revoke;
+pub mod touch;
 
-pub use create::{CreateS3Config, CreateS3Operation};
-pub use get::GetS3Operation;
-pub use list::ListSessionsOperation;
-pub use purge::{PurgeSessionsOperation, PurgeSessionsResult};
-pub use refresh::{RefreshS3Config, RefreshS3Operation};
-pub use revoke::{RevokeS3Config, RevokeS3Operation};
-pub use touch::{TouchS3Config, TouchS3Operation};
-
-use crate::driver::{DriverContext, drive};
-use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError,
 };
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::permission_path::{RestrictionLimitError, validate_restriction_limits};
-use aruna_core::shutdown::Shutdown;
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::types::{GroupId, Key, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
-use rand::distr::Alphanumeric;
-use rand::{RngExt, rng};
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use tracing::warn;
 use ulid::Ulid;
 
 pub const MAX_GROUP_SESSIONS: usize = 4;
 pub const PURGE_BATCH: usize = 256;
-const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 const SIGNING_SECRET_LEN: usize = 30;
 const SESSION_TOKEN_LEN: usize = 64;
+/// The letters and digits one session draws: its signing secret, then its token.
+const SESSION_SECRETS_LEN: usize = SIGNING_SECRET_LEN + SESSION_TOKEN_LEN;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum S3SessionError {
@@ -88,12 +75,23 @@ pub enum S3SessionError {
     NotFinished,
     #[error("session operation failed")]
     Failed,
-    #[error("state {state} expected {expected}, received {received:?}")]
+    #[error("state {state} expected {expected}, received {received}")]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
+    #[error(transparent)]
+    Io(IoError),
+}
+
+impl From<IoError> for S3SessionError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl S3SessionError {
@@ -196,16 +194,6 @@ fn session_age(session: &S3Session) -> (u128, SystemTime) {
     (issued, session.expiry)
 }
 
-fn generate_secret(length: usize) -> Secret {
-    Secret::new(
-        rng()
-            .sample_iter(&Alphanumeric)
-            .take(length)
-            .map(char::from)
-            .collect::<String>(),
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_session(
     access_key: String,
@@ -215,6 +203,8 @@ fn build_session(
     path_restrictions: Option<Vec<PathRestriction>>,
     issued_by: [u8; 32],
     encryption_key: &CredentialEncryptionKey,
+    drawn: Secret,
+    nonce: [u8; 24],
 ) -> Result<S3SessionCredentials, S3SessionError> {
     if let Some(restrictions) = path_restrictions.as_deref() {
         validate_restriction_limits(restrictions)?;
@@ -222,8 +212,9 @@ fn build_session(
     if !S3Session::valid_access_key(&access_key) {
         return Err(S3SessionError::InvalidAccessKey);
     }
-    let secret_access_key = generate_secret(SIGNING_SECRET_LEN);
-    let session_token = generate_secret(SESSION_TOKEN_LEN);
+    let split = drawn.expose().split_at_checked(SIGNING_SECRET_LEN);
+    let (signing, token) = split.ok_or(S3SessionError::Failed)?;
+    let (secret_access_key, session_token) = (Secret::new(signing), Secret::new(token));
     let mut session = S3Session {
         access_key: access_key.clone(),
         user_identity,
@@ -236,7 +227,7 @@ fn build_session(
         last_used_at: None,
         previous: None,
     };
-    session.encrypt_secret(encryption_key, secret_access_key.expose())?;
+    session.encrypt_secret(encryption_key, secret_access_key.expose(), nonce)?;
     Ok(S3SessionCredentials {
         access_key_id: access_key,
         secret_access_key,
@@ -245,37 +236,13 @@ fn build_session(
     })
 }
 
-pub fn spawn_session_sweep(context: Arc<DriverContext>, shutdown: &Shutdown) {
-    let token = shutdown.token();
-    shutdown.spawn(async move {
-        loop {
-            tokio::select! {
-                _ = token.cancelled() => return,
-                _ = tokio::time::sleep(SWEEP_INTERVAL) => {}
-            }
-            loop {
-                match drive(
-                    PurgeSessionsOperation::new(SystemTime::now()),
-                    context.as_ref(),
-                )
-                .await
-                {
-                    Ok(result) if result.scanned == PURGE_BATCH && result.removed > 0 => {
-                        tokio::task::yield_now().await
-                    }
-                    Ok(_) => break,
-                    Err(error) => {
-                        warn!(error = ?error, "S3 session expiry sweep failed");
-                        break;
-                    }
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
+    use super::create::{CreateS3Config, CreateS3Operation};
+    use super::get::GetS3Operation;
+    use super::purge::PurgeSessionsOperation;
+    use super::refresh::{RefreshS3Config, RefreshS3Operation};
+    use super::touch::{TouchS3Config, TouchS3Operation};
     use super::*;
     use crate::s3::access::create::{CreateUserConfig, CreateUserOperation};
     use crate::s3::access::list::{ListUserInput, ListUserOperation};
@@ -284,7 +251,9 @@ mod tests {
     use aruna_core::keyspaces::{SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::s3_session::SESSION_MAX_TTL;
-    use aruna_storage::FjallStorage;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::storage::worker::FjallStorage;
+    use std::time::Duration;
     use tempfile::TempDir;
     use ulid::Ulid;
 
@@ -297,9 +266,10 @@ mod tests {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             },
         )
     }

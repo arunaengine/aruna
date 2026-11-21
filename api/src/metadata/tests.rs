@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::routes::{seed_realm_auth, test_context, test_state, test_storage};
+use crate::tests::routes::{seed_realm_auth, test_state, test_storage};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::testing::test_context;
 use ed25519_dalek::SigningKey;
 use std::sync::Arc;
 use ulid::Ulid;
@@ -20,7 +21,7 @@ fn test_realm_id() -> RealmId {
 
 #[tokio::test]
 async fn storage_failure_internal() {
-    let (storage_handle, receivers) = aruna_storage::storage::StorageHandle::new();
+    let (storage_handle, receivers) = aruna_storage::storage::handle::StorageHandle::new();
     drop(receivers);
 
     let realm_id = test_realm_id();
@@ -37,7 +38,7 @@ async fn storage_failure_internal() {
 
     assert!(matches!(
         result,
-        Err(ServerError::InternalError(message)) if message == "Channel closed"
+        Err(ServerError::InternalError(message)) if message.to_string() == "Channel closed"
     ));
 }
 
@@ -46,7 +47,7 @@ async fn missing_group_forbidden() {
     let (_storage_dir, storage_handle) = test_storage();
     let realm_id = test_realm_id();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
@@ -91,7 +92,7 @@ async fn device_edit_owner() {
     let (_storage_dir, storage_handle) = test_storage();
     let realm_id = test_realm_id();
     let node_id = iroh::SecretKey::from_bytes(&[12u8; 32]).public();
-    let owner = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let owner = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id: owner,
@@ -139,7 +140,7 @@ async fn device_edit_owner() {
     let refused = local_write_record(&state, &restricted, document_id, extras()).await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         ..auth
     };
     let refused = local_write_record(&state, &stranger, document_id, extras()).await;
@@ -178,7 +179,7 @@ async fn restricted_names_readable() {
     });
     let plain = serde_json::json!({"@id": "notes.txt", "@type": "File"});
     let auth = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,

@@ -3,8 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::IoCall;
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE,
@@ -19,7 +18,8 @@ use aruna_core::structs::storage::encryption::{
 };
 use aruna_core::structs::storage::holders::{HolderReport, HolderState, KeyLookup, admin_users};
 use aruna_core::structs::storage::multipart::MultipartUpload;
-use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -64,33 +64,37 @@ pub struct BucketState {
     pub admins: BTreeSet<UserId>,
 }
 
-/// Reads a bucket, its settings and the realm and group authorization documents together, so
-/// implicit authority comes from the snapshot the change commits against (D30).
-pub fn authority_read(
+/// A bucket, its settings and the realm and group authorization documents, read together so
+/// implicit authority comes from the snapshot the change commits against (D30), in the order
+/// `parse_authority` expects.
+pub(crate) fn authority_keys(
     bucket: &str,
     realm_id: RealmId,
     group_id: GroupId,
-    txn_id: Option<TxnId>,
-) -> Effect {
+) -> Vec<(KeySpace, Key)> {
     let key: Key = bucket.as_bytes().to_vec().into();
-    Effect::Storage(StorageEffect::BatchRead {
-        reads: vec![
-            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
-            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
-            (
-                AUTH_KEYSPACE.to_string(),
-                realm_id.as_bytes().to_vec().into(),
-            ),
-            (
-                AUTH_KEYSPACE.to_string(),
-                group_id.to_bytes().to_vec().into(),
-            ),
-        ],
-        txn_id,
-    })
+    vec![
+        (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
+        (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
+        (
+            AUTH_KEYSPACE.to_string(),
+            realm_id.as_bytes().to_vec().into(),
+        ),
+        (
+            AUTH_KEYSPACE.to_string(),
+            group_id.to_bytes().to_vec().into(),
+        ),
+    ]
 }
 
-/// The state an `authority_read` returned; admins hold WRITE on the group admin path now.
+/// The values of an `IoCall::Read` as the keyed rows `parse_authority` and `parse_settings` take.
+pub(crate) fn keyless(values: Vec<Option<Value>>) -> Vec<(Key, Option<Value>)> {
+    (values.into_iter())
+        .map(|value| (Key::from(Vec::new()), value))
+        .collect()
+}
+
+/// The state the rows of [`authority_keys`] hold; admins hold WRITE on the group admin path now.
 pub fn parse_authority(
     mut values: Vec<(Key, Option<Value>)>,
     realm_id: RealmId,
@@ -117,59 +121,7 @@ pub fn parse_authority(
     })
 }
 
-/// Rows an `authority_read` answers with, where `admins` hold the group admin role.
-#[cfg(test)]
-pub(crate) fn authority_rows(
-    info: &BucketInfo,
-    settings: Option<&BucketEncryption>,
-    admins: &[UserId],
-) -> Vec<(Key, Option<Value>)> {
-    use aruna_core::structs::identity::auth::{Actor, Permission, Role};
-    let realm_id = info.created_by.realm_id;
-    let actor = Actor {
-        node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
-        user_id: info.created_by,
-        realm_id,
-    };
-    let realm = RealmAuthorizationDocument {
-        realm_id,
-        roles: Default::default(),
-        operation_restrictions: Default::default(),
-    };
-    let admin = Role {
-        role_id: ulid::Ulid::from_bytes([1; 16]),
-        name: "keepers".to_string(),
-        permissions: [(group_admin_path(realm_id, info.group_id), Permission::WRITE)].into(),
-        assigned_users: admins.iter().copied().collect(),
-    };
-    let group = GroupAuthorizationDocument {
-        group_id: info.group_id,
-        roles: [(admin.role_id, admin)].into(),
-        policies: Vec::new(),
-    };
-    let row = |value: Vec<u8>| (Key::from(Vec::new()), Some(Value::from(value)));
-    let settings = settings.map(|settings| Value::from(settings.to_bytes().unwrap()));
-    vec![
-        row(info.to_bytes().unwrap()),
-        (Key::from(Vec::new()), settings),
-        row(realm.to_bytes(&actor).unwrap()),
-        row(group.to_bytes(&actor).unwrap()),
-    ]
-}
-
-/// Reads a bucket record and its encryption settings in one transaction.
-pub fn settings_read(bucket: &str, txn_id: Option<TxnId>) -> Effect {
-    let key: Key = bucket.as_bytes().to_vec().into();
-    Effect::Storage(StorageEffect::BatchRead {
-        reads: vec![
-            (S3_BUCKET_KEYSPACE.to_string(), key.clone()),
-            (BUCKET_ENCRYPTION_KEYSPACE.to_string(), key),
-        ],
-        txn_id,
-    })
-}
-
-/// The bucket record and settings a `settings_read` returned; the bucket must belong to `group_id`.
+/// The bucket record and settings read together; the bucket must belong to `group_id`.
 pub fn parse_settings(
     values: Vec<(Key, Option<Value>)>,
     group_id: GroupId,
@@ -185,6 +137,26 @@ pub fn parse_settings(
         return Err(SettingsError::GroupMismatch);
     }
     Ok((info, BucketEncryption::from_row(settings.as_deref())?))
+}
+
+/// Reads every row of `key_space` under `prefix` in one page, inside `txn_id`.
+/// Every row below `prefix` in one page, as a call.
+pub(crate) fn scan_call(key_space: &str, prefix: Key) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix,
+        after: None,
+        limit: u64::MAX as usize,
+    }
+}
+
+pub(crate) fn full_scan(key_space: &str, prefix: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: prefix.unwrap_or_else(|| Key::from(Vec::new())),
+        after: None,
+        limit: u64::MAX as usize,
+    }
 }
 
 /// Whether a multipart upload of `bucket` is open; it captured the stored format of its start.
@@ -260,6 +232,7 @@ pub fn generation_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3::bucket::key::test_rows::authority_rows;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::user::vault::UserKeyRecord;
     use aruna_core::structs::placement::record::PlacementRef;

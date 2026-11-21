@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::UserId;
+use aruna_core::calls::IoError;
 use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
 
 #[test]
 fn server_rejects_private() {
@@ -50,6 +51,7 @@ fn response_hides_secrets() {
                 account_id: Some(Secret::new("secret-account")),
                 ..AssistantProviderSecret::empty()
             },
+            [3; 24],
         )
         .unwrap();
     let body = serde_json::to_string(&provider_summary(&provider)).unwrap();
@@ -183,7 +185,7 @@ fn store_error_mapping() {
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_store_error(ProviderStoreError::NotFinished),
+        map_store_error(IoError::Unfinished.into()),
         ServerError::InternalError(_)
     ));
 }

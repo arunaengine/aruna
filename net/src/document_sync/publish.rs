@@ -3,6 +3,40 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::shard_manifest::lineage_root;
+
+/// The lineage an appended event may be reported on: the one read after the append, `None` when
+/// the event left it, the read failed, or it differs from the lineage the event was `bound` to.
+pub(in crate::document_sync) fn confirmed_lineage(
+    read: Result<Option<[u8; 32]>>,
+    bound: Option<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    match read {
+        Ok(Some(lineage)) if bound.is_none_or(|bound| bound == lineage) => Some(lineage),
+        Ok(Some(_)) => {
+            warn!("A received history moved a bound publish off its lineage");
+            None
+        }
+        Ok(None) => {
+            warn!("A published event left its lineage before the read");
+            None
+        }
+        Err(error) => {
+            warn!(%error, "Cannot read the lineage of a publish");
+            None
+        }
+    }
+}
+
+/// The lineage an entry's topic must keep while it appends: the one the caller bound it to, else
+/// the one an earlier entry of the batch was confirmed on, so a batch never spans two histories.
+pub(in crate::document_sync) fn bound_lineage(
+    expected: Option<[u8; 32]>,
+    confirmed: &BTreeMap<::irokle::TopicId, [u8; 32]>,
+    topic_id: ::irokle::TopicId,
+) -> Option<[u8; 32]> {
+    expected.or_else(|| confirmed.get(&topic_id).copied())
+}
 
 impl DocumentSyncService {
     pub async fn publish_documents(
@@ -10,13 +44,25 @@ impl DocumentSyncService {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
     ) -> DocumentNetEvent {
+        self.publish_expecting(documents, peers, Vec::new()).await
+    }
+
+    /// Publishes `documents`; one whose topic no longer has the lineage `expected` names at its
+    /// position retries, and holds its topic and origin for the later ones.
+    pub async fn publish_expecting(
+        &self,
+        documents: Vec<DocumentSyncPublish>,
+        peers: Vec<NodeId>,
+        expected: Vec<Option<[u8; 32]>>,
+    ) -> DocumentNetEvent {
         let targets = documents
             .iter()
             .map(|document| document.target().clone())
             .collect::<Vec<_>>();
-        match self.publish_events(documents, peers).await {
+        match self.publish_events(documents, peers, expected).await {
             Ok(outcome) if outcome.retry_indices.is_empty() => {
-                DocumentNetEvent::DocumentsPublished { targets }
+                let lineages = outcome.lineage_list(targets.len());
+                DocumentNetEvent::DocumentsPublished { targets, lineages }
             }
             Ok(outcome) if outcome.published_indices.is_empty() => DocumentNetEvent::Error {
                 target: outcome
@@ -28,26 +74,12 @@ impl DocumentSyncService {
                     .unwrap_or_else(|| "Document sync topic not ready".to_string()),
             },
             Ok(outcome) => DocumentNetEvent::DocumentsPartiallyPublished {
+                lineages: outcome.lineage_list(targets.len()),
                 published_indices: outcome.published_indices,
                 retry_indices: outcome.retry_indices,
                 error: outcome
                     .retry_error
                     .unwrap_or_else(|| "Document sync topic not ready".to_string()),
-            },
-            Err(error) => DocumentNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            },
-        }
-    }
-
-    pub async fn reconcile_documents_event(&self) -> DocumentNetEvent {
-        match self.reconcile_documents().await {
-            Ok(result) => DocumentNetEvent::DocumentsReconciled {
-                applied: result.applied(),
-                targets: result.targets,
-                metadata_create_events: result.metadata_create_events,
-                metadata_graph_tombstones: result.metadata_graph_tombstones,
             },
             Err(error) => DocumentNetEvent::Error {
                 target: None,
@@ -124,17 +156,8 @@ impl DocumentSyncService {
                 error: error.to_string(),
             };
         }
-        match self.reconcile_document_topics([topic_id]).await {
-            Ok(result) => DocumentNetEvent::DocumentsReconciled {
-                applied: result.applied(),
-                targets: result.targets,
-                metadata_create_events: result.metadata_create_events,
-                metadata_graph_tombstones: result.metadata_graph_tombstones,
-            },
-            Err(error) => DocumentNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            },
+        DocumentNetEvent::DocumentsSynced {
+            topics: vec![topic_id],
         }
     }
 
@@ -201,38 +224,23 @@ impl DocumentSyncService {
             };
         }
         let flush_elapsed = flush_started.elapsed();
-        let reconcile_started = Instant::now();
-        match self.reconcile_document_topics(topic_ids).await {
-            Ok(result) => {
-                info!(
-                    event = "pipeline.sync.summary",
-                    targets = target_count,
-                    applied = result.applied(),
-                    bootstrap_ms = duration_ms(bootstrap_elapsed),
-                    peer_sync_ms = duration_ms(peer_sync_elapsed),
-                    flush_ms = duration_ms(flush_elapsed),
-                    reconcile_ms = duration_ms(reconcile_started.elapsed()),
-                    total_ms = duration_ms(sync_started.elapsed()),
-                    "Document sync batch summary"
-                );
-                DocumentNetEvent::DocumentsReconciled {
-                    applied: result.applied(),
-                    targets: result.targets,
-                    metadata_create_events: result.metadata_create_events,
-                    metadata_graph_tombstones: result.metadata_graph_tombstones,
-                }
-            }
-            Err(error) => DocumentNetEvent::Error {
-                target: None,
-                error: error.to_string(),
-            },
-        }
+        info!(
+            event = "pipeline.sync.summary",
+            targets = target_count,
+            bootstrap_ms = duration_ms(bootstrap_elapsed),
+            peer_sync_ms = duration_ms(peer_sync_elapsed),
+            flush_ms = duration_ms(flush_elapsed),
+            total_ms = duration_ms(sync_started.elapsed()),
+            "Document sync batch summary"
+        );
+        DocumentNetEvent::DocumentsSynced { topics: topic_ids }
     }
 
     async fn publish_events(
         &self,
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
+        expected: Vec<Option<[u8; 32]>>,
     ) -> Result<PublishEventsOutcome> {
         if documents.is_empty() {
             return Ok(PublishEventsOutcome::default());
@@ -241,7 +249,7 @@ impl DocumentSyncService {
         self.allow_sync_peers(&sync_peers)?;
         let service = self.clone();
         let mut outcome = tokio::task::spawn_blocking(move || {
-            service.publish_events_blocking(documents, &sync_peers)
+            service.publish_events_blocking(documents, &sync_peers, &expected)
         })
         .await
         .map_err(|error| NetError::Bootstrap(error.to_string()))??;
@@ -255,6 +263,7 @@ impl DocumentSyncService {
         &self,
         documents: Vec<DocumentSyncPublish>,
         sync_peers: &BTreeSet<PeerId>,
+        expected: &[Option<[u8; 32]>],
     ) -> Result<PublishEventsOutcome> {
         let publish_started = Instant::now();
         let document_count = documents.len();
@@ -264,8 +273,17 @@ impl DocumentSyncService {
         // instead of voiding that batch's commit.
         let oplog = self.node.oplog();
         let mut outcome = PublishEventsOutcome::default();
+        // A retryable failure holds back the later events of its topic and admin origin, so none
+        // lands in the oplog ahead of it.
+        let mut held = HeldDomains::default();
+        // The lineage each topic's first confirmed entry of this batch stands on.
+        let mut confirmed = BTreeMap::new();
         for (index, document) in documents.into_iter().enumerate() {
             let allow_genesis = document.allow_genesis();
+            let origin = match &document {
+                DocumentSyncPublish::AdminOperation { event, .. } => Some(event.origin_node_id),
+                _ => None,
+            };
             let event = match document {
                 DocumentSyncPublish::Upsert {
                     event_id,
@@ -311,6 +329,8 @@ impl DocumentSyncService {
                                 );
                                 outcome.retry_indices.push(index);
                                 outcome.retry_error.get_or_insert_with(|| error.to_string());
+                                let topic_id = target.sync_topic_id(self.realm_id, &placement);
+                                held.hold(topic_id, Some(event.origin_node_id));
                                 continue;
                             }
                         },
@@ -328,36 +348,49 @@ impl DocumentSyncService {
             // Shard topics are join-only: only rank-0 creates the genesis, so a
             // publish onto a genesis-less shard defers the outbox record.
             let may_create_topic = !target.uses_shard_topic();
+            if held.waits(topic_id, origin) {
+                outcome.retry_indices.push(index);
+                continue;
+            }
             let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
+            let key = event_key(topic_id, &event)?;
             let envelope = EventEnvelope::encode_event(&event)
                 .map_err(|error| NetError::Bootstrap(error.to_string()))?;
-            let op = match self.publish_event_op(
-                oplog,
-                topic_id,
-                actor_id,
-                envelope,
-                sync_peers,
-                allow_genesis,
-                may_create_topic,
-                &mut fast_path,
-                &mut fallback,
-            ) {
-                Ok(op) => op,
-                Err(NetError::TopicNotReady(topic)) => {
+            // Held from the check to the record, so no other publish appends the event between.
+            let _lock = self.publish_lock(topic_id);
+            // A successor bound to a lineage appends only while its topic still has it.
+            let bound = bound_lineage(expected.get(index).copied().flatten(), &confirmed, topic_id);
+            // A publish repeated after a restart finds the op it became on the current lineage; a
+            // new one appends only on the bound lineage, which Irokle checks inside its turn.
+            let published = match self.published_op(topic_id, actor_id, &key)? {
+                Some(op) => self.found_lineage(op, bound, &key),
+                None => self
+                    .publish_event_op(
+                        oplog,
+                        (topic_id, actor_id, envelope),
+                        sync_peers,
+                        (allow_genesis, may_create_topic, bound),
+                        (&mut fast_path, &mut fallback),
+                    )
+                    .and_then(|(op, lineage)| {
+                        self.keep_published(&key, &op).map(|()| (op, lineage))
+                    }),
+            };
+            let (op, lineage) = match published {
+                Ok(published) => published,
+                Err(error @ (NetError::TopicNotReady(_) | NetError::LineageMoved(_))) => {
                     outcome.retry_indices.push(index);
-                    outcome
-                        .retry_error
-                        .get_or_insert_with(|| NetError::TopicNotReady(topic).to_string());
+                    outcome.retry_error.get_or_insert_with(|| error.to_string());
+                    held.hold(topic_id, origin);
                     continue;
                 }
                 Err(error) => return Err(error),
             };
+            confirmed.entry(topic_id).or_insert(lineage);
+            outcome.lineages.insert(index, lineage);
             outcome.published_indices.push(index);
-            outcome
-                .published
-                .entry(topic_id)
-                .or_default()
-                .observe(op.signed.body.actor_id, op.signed.body.actor_seq);
+            let published = outcome.published.entry(topic_id).or_default();
+            published.observe(&op, lineage);
         }
         // Member fan-out for admin publishes without explicit peers: the drain
         // sync stage pushes only to record peers, so publishing fans out itself.
@@ -403,19 +436,16 @@ impl DocumentSyncService {
         Ok(iroh::Signature::from_bytes(&signature.to_bytes()))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn publish_event_op(
+    /// Appends the event and answers its op with the lineage it was appended on. With a `bound`
+    /// lineage it appends only while the topic keeps it, else it fails with `LineageMoved`.
+    pub(in crate::document_sync) fn publish_event_op(
         &self,
         oplog: &Oplog<::irokle::FjallStorage>,
-        topic_id: ::irokle::TopicId,
-        actor_id: ::irokle::ActorId,
-        envelope: EventEnvelope,
+        (topic_id, actor_id, envelope): (::irokle::TopicId, ::irokle::ActorId, EventEnvelope),
         sync_peers: &BTreeSet<PeerId>,
-        allow_genesis: bool,
-        may_create_topic: bool,
-        fast_path: &mut usize,
-        fallback: &mut usize,
-    ) -> Result<::irokle::Op> {
+        (allow_genesis, may_create_topic, bound): (bool, bool, Option<[u8; 32]>),
+        (fast_path, fallback): (&mut usize, &mut usize),
+    ) -> Result<(::irokle::Op, [u8; 32])> {
         let topic_missing = self
             .node
             .storage()
@@ -433,6 +463,9 @@ impl DocumentSyncService {
             if !allow_genesis {
                 return Err(NetError::TopicNotReady(topic_id.to_string()));
             }
+            if bound.is_some() {
+                return Err(NetError::LineageMoved(topic_id.to_string()));
+            }
             // Fast path for brand-new topics: genesis and first event in one
             // transaction; a lost genesis race falls back to the two-step flow.
             let genesis = TopicGenesis {
@@ -447,10 +480,10 @@ impl DocumentSyncService {
                 envelope.clone(),
                 self.node.signer(),
             ) {
-                Ok((_, event_op)) => {
+                Ok((genesis_op, event_op)) => {
                     *fast_path += 1;
                     self.net.schedule_topic_recheck(topic_id)?;
-                    return Ok(event_op);
+                    return Ok((event_op, lineage_root(&genesis_op.id)));
                 }
                 Err(error) => {
                     *fallback += 1;
@@ -461,75 +494,112 @@ impl DocumentSyncService {
         if may_create_topic {
             self.ensure_topic(topic_id, sync_peers, allow_genesis)?;
         }
-        oplog
-            .create_event_op(topic_id, actor_id, envelope, self.node.signer())
-            .map_err(|error| NetError::Bootstrap(error.to_string()))
+        let state = (self.node.storage().topic_state(&topic_id))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let Some(genesis) = state.map(|state| state.genesis) else {
+            return Err(NetError::TopicNotReady(topic_id.to_string()));
+        };
+        let lineage = lineage_root(&genesis);
+        let moved = || NetError::LineageMoved(topic_id.to_string());
+        if bound.is_some_and(|bound| bound != lineage) {
+            return Err(moved());
+        }
+        // Irokle checks the genesis inside the topic's admission turn, against the state the
+        // append commits on, so a history received meanwhile refuses the append.
+        let op = oplog
+            .create_event_on(topic_id, actor_id, envelope, self.node.signer(), genesis)
+            .map_err(|error| match error {
+                ::irokle::Error::GenesisMoved => moved(),
+                error => NetError::Bootstrap(error.to_string()),
+            })?;
+        Ok((op, lineage))
     }
 
-    /// Signs one op carrying `payload` under the document-sync event type
-    /// without encoding an event, so tests can deliver a payload no peer can
-    /// decode. Returns the op's transport identity.
-    #[cfg(test)]
-    pub(crate) fn publish_raw_event(
+    /// The lineage of an op an earlier publish became, read with its actor index entry; one off
+    /// its `bound` lineage or the current one is forgotten, so the event appends again in order.
+    fn found_lineage(
         &self,
-        topic_id: ::irokle::TopicId,
-        payload: Vec<u8>,
-    ) -> Result<SyncQuarantineIdentity> {
-        let oplog = Oplog::with_storage(self.node.storage().clone());
-        let actor_id = ::irokle::actor_id_for(topic_id, self.node.peer_id());
-        let envelope = EventEnvelope {
-            type_id: DocumentEvent::TYPE_ID.to_string(),
-            payload: payload.into(),
-        };
-        let op = self.publish_event_op(
-            &oplog,
-            topic_id,
-            actor_id,
-            envelope,
-            &BTreeSet::new(),
-            true,
-            true,
-            &mut 0,
-            &mut 0,
-        )?;
-        self.flush_database()?;
-        Ok(SyncQuarantineIdentity {
-            topic: topic_id,
-            actor: op.signed.body.actor_id,
-            actor_seq: op.signed.body.actor_seq,
-        })
+        op: ::irokle::Op,
+        bound: Option<[u8; 32]>,
+        key: &[u8],
+    ) -> Result<(::irokle::Op, [u8; 32])> {
+        let topic_id = op.signed.body.topic_id;
+        if let Some(lineage) = confirmed_lineage(self.appended_lineage(&op), bound) {
+            return Ok((op, lineage));
+        }
+        if let Err(error) = self.forget_published(key) {
+            warn!(%topic_id, %error, "Cannot forget a moved publish");
+        }
+        Err(NetError::LineageMoved(topic_id.to_string()))
     }
 
     /// Marks locally published ops as applied by advancing the per-topic
     /// cursor, so the origin's own reconcile does not re-emit them. Their
     /// effects are always applied locally before the outbox publish runs.
-    async fn advance_topic_cursors(
+    pub(in crate::document_sync) async fn advance_topic_cursors(
         &self,
-        published: BTreeMap<::irokle::TopicId, ::irokle::ActorClock>,
+        published: BTreeMap<::irokle::TopicId, PublishedOps>,
     ) -> Result<()> {
         if published.is_empty() {
             return Ok(());
         }
+        // The cursor read and write must not interleave with a reconcile or an eviction.
+        let _reconcile_guard = self.reconcile_lock.lock().await;
         let mut writes = Vec::with_capacity(published.len());
-        for (topic_id, clock) in published {
-            // A tie-break between the publish and this write leaves the ops on a
-            // chain that no longer exists; the next reconcile replays the winner.
-            let Some(genesis) = self.topic_genesis(topic_id)? else {
-                continue;
-            };
+        for (topic_id, ops) in published {
             let cursor_key = topic_cursor_key(topic_id);
-            let mut cursor = applied_cursor_clock(
-                self.node.storage(),
-                topic_id,
-                genesis,
-                self.storage_read(APPLIED_OPS_KEYSPACE.to_string(), cursor_key.clone())
-                    .await?,
-            )?;
-            cursor.merge(&clock);
-            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
-            writes.push((APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value));
+            let key_space = APPLIED_OPS_KEYSPACE.to_string();
+            let stored = self
+                .storage_read(key_space.clone(), cursor_key.clone())
+                .await?;
+            if let Some(cursor) = self.advanced_cursor(topic_id, &ops, stored)? {
+                writes.push((key_space, cursor_key, cursor_bytes(&cursor)?));
+            }
         }
         self.storage_batch_write(writes).await
+    }
+
+    /// The stored cursor advanced over `ops`, with the genesis and every position read from one
+    /// snapshot. After a tie-break since the publish, `ops` stand on a chain that no longer
+    /// exists: the winning cursor stays as it is (`None`) and the next reconcile replays it.
+    fn advanced_cursor(
+        &self,
+        topic_id: ::irokle::TopicId,
+        ops: &PublishedOps,
+        stored: Option<Value>,
+    ) -> Result<Option<AppliedCursor>> {
+        let (peer, actors) = (self.node.peer_id(), BTreeSet::new());
+        let read = |snapshot: &dyn ::irokle::storage::SnapshotRead| -> ::irokle::Result<_> {
+            let held = |actor_id: &::irokle::ActorId,
+                        actor_seq: u64|
+             -> ::irokle::Result<Option<::irokle::OpId>> {
+                let after = actor_seq.saturating_sub(1);
+                let indexed = snapshot.actor_range(&topic_id, actor_id, after, 1)?;
+                let found = indexed.first().filter(|(seq, _)| *seq == actor_seq);
+                Ok(found.map(|(_, op_id)| *op_id))
+            };
+            let Some(view) = snapshot.request_view(&topic_id, &peer, &actors)? else {
+                return Ok(None);
+            };
+            let mut moved = lineage_root(&view.genesis) != ops.lineage;
+            for (actor_id, (actor_seq, op_id)) in &ops.tips {
+                moved = moved || held(actor_id, *actor_seq)? != Some(*op_id);
+            }
+            if moved {
+                debug!(%topic_id, "Leaving a cursor whose published ops left its lineage");
+                return Ok(None);
+            }
+            let mut clock = match AppliedCursor::decode(stored.as_deref(), view.genesis) {
+                Some(cursor) if cursor.stands(held)? => cursor.clock,
+                _ => ::irokle::ActorClock::default(),
+            };
+            for (actor_id, (actor_seq, _)) in &ops.tips {
+                clock.observe(*actor_id, *actor_seq);
+            }
+            AppliedCursor::marked(view.genesis, clock, held).map(Some)
+        };
+        (self.node.storage().read_snapshot(read))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
     pub(in crate::document_sync) fn flush_database(&self) -> Result<()> {

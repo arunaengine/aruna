@@ -39,16 +39,6 @@ fn system_lookup() -> Lookup {
     })
 }
 
-/// Screens a literal host. A name returns `Ok` here and is screened again
-/// against its resolved addresses when the connection is opened.
-fn screen_host(policy: &EgressPolicy, host: &str) -> Result<(), EgressError> {
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    match host.parse::<IpAddr>() {
-        Ok(address) => policy.check(address),
-        Err(_) => Ok(()),
-    }
-}
-
 struct ScreenedResolver {
     policy: EgressPolicy,
     lookup: Lookup,
@@ -152,7 +142,7 @@ impl HttpTransport for ScreenedFetch {
         else {
             return Err(denied(EgressError::MissingHost(uri)));
         };
-        screen_host(&self.policy, &host).map_err(denied)?;
+        self.policy.check_host(&host).map_err(denied)?;
         // Each request opendal sends, its own retries included, takes a token of a paced task.
         crate::pace::turn().await.map_err(unpaced)?;
         let response = self.client.fetch(request).await?;
@@ -213,7 +203,7 @@ impl EgressGuard {
             .ok()
             .and_then(|url| url.host_str().map(str::to_string))
             .ok_or_else(|| EgressError::MissingHost(endpoint.to_string()))?;
-        screen_host(&self.policy, &host)?;
+        self.policy.check_host(&host)?;
         Ok(aws_smithy_http_client::Builder::new()
             .tls_provider(Provider::Rustls(CryptoMode::AwsLc))
             .build_with_resolver(ScreenedDns {
@@ -243,7 +233,7 @@ impl EgressGuard {
         let host = url
             .host_str()
             .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
-        screen_host(&self.policy, host)?;
+        self.policy.check_host(host)?;
         Ok(self.plain.get(url))
     }
 
@@ -258,11 +248,17 @@ impl EgressGuard {
         let host = url
             .host_str()
             .ok_or_else(|| EgressError::MissingHost(format!("{}:", url.scheme())))?;
-        screen_host(&self.policy, host)?;
+        self.policy.check_host(host)?;
         if scheme_downgraded(visited, &url) {
             return Err(EgressError::SchemeDowngrade(host.to_string()));
         }
         Ok(self.opendal.get(url))
+    }
+
+    /// The client of repository requests with its policy, which screens a literal host before
+    /// a request; the client screens resolved addresses and follows no redirect.
+    pub fn repository_client(&self) -> (reqwest::Client, EgressPolicy) {
+        (self.opendal.clone(), self.policy.clone())
     }
 
     /// Screens repository requests and refuses redirects for authenticated writes.
@@ -274,7 +270,7 @@ impl EgressGuard {
         let host = url
             .host_str()
             .ok_or_else(|| EgressError::MissingHost(url.to_string()))?;
-        screen_host(&self.policy, host)?;
+        self.policy.check_host(host)?;
         Ok(self.opendal.request(method, url))
     }
 }
@@ -304,7 +300,7 @@ fn guarded_client(
                 return attempt.error(EgressError::SchemeDowngrade(target));
             }
             let verdict = match attempt.url().host_str() {
-                Some(host) => screen_host(&screen_policy, host),
+                Some(host) => screen_policy.check_host(host),
                 None => Err(EgressError::MissingHost(attempt.url().to_string())),
             };
             match verdict {

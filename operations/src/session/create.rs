@@ -4,14 +4,14 @@
 
 use super::index::{MAX_USER_SESSIONS, decode_index, encode_index, owner_key};
 use crate::auth::create_token::{CreateTokenConfig, CreateTokenError, mint_login_token};
-use aruna_core::UserId;
 use aruna_core::auth::bearer_token_hash;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::Secret;
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{USER_KEYSPACE, USER_OWNER_KEYSPACE, USER_SESSION_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AdminAuditRecord};
 use aruna_core::structs::identity::auth::{
     NodeCapabilities, PathRestriction, SessionKind, SessionRef,
@@ -19,8 +19,8 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::identity::user::session::UserSession;
-use aruna_core::types::{Effects, GroupId, TxnId};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Value};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use thiserror::Error;
 use ulid::Ulid;
@@ -53,18 +53,16 @@ pub struct CreatedSession {
     pub session: UserSession,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CreateSessionState {
-    Init,
-    StartTransaction,
-    ReadOwnerIndex,
-    ReadSessions { index: BTreeSet<String> },
-    DeleteStale { index: BTreeSet<String> },
-    WriteSession,
-    CommitTransaction,
-    Finish,
-    Error,
+/// What the session transaction waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stage {
+    Index,
+    Sessions,
+    DeleteStale,
+    Write,
 }
+
+type SessionTurn = Result<Next<CreatedSession>, CreateSessionError>;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum CreateSessionError {
@@ -91,21 +89,40 @@ pub enum CreateSessionError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
+impl From<IoError> for CreateSessionError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "CreateSession".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+/// Mints the session's token, then reads the owner's sessions, drops the stale ones and writes
+/// the new session with its index in one write transaction.
 #[derive(Debug, PartialEq)]
 pub struct CreateSessionOperation {
     config: CreateSessionConfig,
     sid: String,
     session: Option<UserSession>,
     token: Option<Secret>,
-    txn_id: Option<TxnId>,
-    state: CreateSessionState,
+    /// The owner's session ids: the stored ones, then the ones the new index keeps.
+    index: BTreeSet<String>,
+    state: Stage,
     /// Who issued a restricted session for another account, and the group owning that account.
     issuer: Option<(UserId, Option<GroupId>)>,
-    output: Option<Result<CreatedSession, CreateSessionError>>,
+    now_ms: u64,
+    ids: IdMint,
 }
 
 pub fn bound_session_expiry(
@@ -126,19 +143,21 @@ pub fn bound_session_expiry(
 
 impl CreateSessionOperation {
     pub fn new(config: CreateSessionConfig) -> Self {
-        Self::new_with_sid(config, Ulid::generate().to_string())
+        Self::new_with_sid(config, String::new())
     }
 
+    /// An empty `sid` takes a fresh session id from the run.
     pub fn new_with_sid(config: CreateSessionConfig, sid: String) -> Self {
         Self {
             config,
             sid,
             session: None,
             token: None,
-            txn_id: None,
-            state: CreateSessionState::Init,
+            index: BTreeSet::new(),
+            state: Stage::Index,
             issuer: None,
-            output: None,
+            now_ms: 0,
+            ids: IdMint::default(),
         }
     }
 
@@ -148,22 +167,10 @@ impl CreateSessionOperation {
         self
     }
 
-    fn emit_error(&mut self, error: CreateSessionError) -> Effects {
-        let cleanup = self.abort();
-        self.state = CreateSessionState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected(&mut self, expected: &'static str, event: Event) -> Effects {
-        self.emit_error(CreateSessionError::UnexpectedEvent {
-            state: format!("{:?}", self.state),
-            expected,
-            got: format!("{event:?}"),
-        })
-    }
-
     fn prepare_session(&mut self) -> Result<(), CreateSessionError> {
+        if self.sid.is_empty() {
+            self.sid = self.ids.mint(self.now_ms).to_string();
+        }
         Ulid::from_string(&self.sid).map_err(ConversionError::from)?;
         if self.config.expiry <= self.config.time {
             return Err(CreateSessionError::InvalidExpiry);
@@ -174,6 +181,7 @@ impl CreateSessionOperation {
             name: self.config.name.clone(),
             via: self.config.via,
         };
+        let jti = self.ids.mint(self.now_ms);
         let token = mint_login_token(
             &CreateTokenConfig {
                 time: self.config.time,
@@ -185,6 +193,7 @@ impl CreateSessionOperation {
                 restrictions: self.config.restrictions.clone(),
             },
             self.config.auth_time,
+            jti,
         )?;
         self.session = Some(UserSession {
             sid: self.sid.clone(),
@@ -206,33 +215,11 @@ impl CreateSessionOperation {
         self.config.restrictions.is_some() && !matches!(self.issuer, Some((_, Some(_))))
     }
 
-    fn handle_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected("transaction started", event);
-        };
-        self.txn_id = Some(txn_id);
-        self.state = CreateSessionState::ReadOwnerIndex;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: USER_OWNER_KEYSPACE.to_string(),
-            key: owner_key(self.config.user_id),
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_index(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.unexpected("owner index read", event);
-        };
-        let index = match decode_index(value.as_ref()) {
-            Ok(index) => index,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn handle_index(&mut self, value: Option<Value>) -> SessionTurn {
+        let index = decode_index(value.as_ref())?;
         if index.contains(&self.sid) {
-            return self.emit_error(CreateSessionError::IdCollision);
+            return Err(CreateSessionError::IdCollision);
         }
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(StorageError::TransactionNotFound.into());
-        };
         let mut reads = index
             .iter()
             .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.as_bytes().into()))
@@ -245,55 +232,34 @@ impl CreateSessionOperation {
             let key = self.config.user_id.to_bytes().into();
             reads.push((USER_KEYSPACE.to_string(), key));
         }
-        self.state = CreateSessionState::ReadSessions {
-            index: index.clone(),
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        self.index = index;
+        self.state = Stage::Sessions;
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn handle_sessions(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { mut values }) = event else {
-            return self.unexpected("session records read", event);
-        };
+    /// Answers in read order: the indexed sessions, the new id, then the owner when it is read.
+    fn handle_sessions(&mut self, mut values: Vec<Option<Value>>) -> SessionTurn {
         if self.reads_owner() {
-            let owner = values.pop().and_then(|(_, value)| value);
-            let group_id = match owner.as_deref().map(User::from_bytes).transpose() {
-                Ok(owner) => owner.as_ref().and_then(User::service_group),
-                Err(error) => return self.emit_error(error.into()),
-            };
+            let owner = values.pop().flatten();
+            let owner = owner.as_deref().map(User::from_bytes).transpose()?;
+            let group_id = owner.as_ref().and_then(User::service_group);
             let actor = self.issuer.map_or(self.config.user_id, |(actor, _)| actor);
             self.issuer = Some((actor, group_id));
         }
-        if values.len() != index.len() + 1 {
-            return self.emit_error(CreateSessionError::IndexInconsistent);
+        if values.len() != self.index.len() + 1 {
+            return Err(CreateSessionError::IndexInconsistent);
+        }
+        if values.pop().flatten().is_some() {
+            return Err(CreateSessionError::IdCollision);
         }
         let mut active = BTreeSet::new();
         let mut stale = BTreeSet::new();
         let mut oldest = u64::MAX;
-        let mut pending_seen = false;
-        for (key, value) in values {
-            if key.as_ref() == self.sid.as_bytes() {
-                if pending_seen || value.is_some() {
-                    return self.emit_error(CreateSessionError::IdCollision);
-                }
-                pending_seen = true;
-                continue;
-            }
-            let Some(value) = value else {
-                return self.emit_error(CreateSessionError::IndexInconsistent);
-            };
-            let session = match UserSession::from_bytes(value.as_ref()) {
-                Ok(session) => session,
-                Err(error) => return self.emit_error(error.into()),
-            };
-            if session.user_id != self.config.user_id
-                || session.sid.as_bytes() != key.as_ref()
-                || !index.contains(&session.sid)
-            {
-                return self.emit_error(CreateSessionError::IndexInconsistent);
+        for (sid, value) in self.index.iter().zip(values) {
+            let value = value.ok_or(CreateSessionError::IndexInconsistent)?;
+            let session = UserSession::from_bytes(value.as_ref())?;
+            if session.user_id != self.config.user_id || session.sid != *sid {
+                return Err(CreateSessionError::IndexInconsistent);
             }
             let cut = self
                 .config
@@ -306,51 +272,30 @@ impl CreateSessionOperation {
                 active.insert(session.sid);
             }
         }
-        if !pending_seen || active.len() + stale.len() != index.len() {
-            return self.emit_error(CreateSessionError::IndexInconsistent);
-        }
         if active.len() >= MAX_USER_SESSIONS {
-            return self.emit_error(CreateSessionError::LimitReached { oldest });
+            return Err(CreateSessionError::LimitReached { oldest });
         }
         active.insert(self.sid.clone());
+        self.index = active;
         if stale.is_empty() {
-            return self.write_session(active);
+            return self.write_session();
         }
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(StorageError::TransactionNotFound.into());
-        };
-        self.state = CreateSessionState::DeleteStale { index: active };
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes: stale
+        self.state = Stage::DeleteStale;
+        Ok(Next::Call(IoCall::Delete(
+            stale
                 .into_iter()
                 .map(|sid| (USER_SESSION_KEYSPACE.to_string(), sid.as_bytes().into()))
                 .collect(),
-            txn_id: Some(txn_id),
-        })]
+        )))
     }
 
-    fn handle_deleted(&mut self, event: Event, index: BTreeSet<String>) -> Effects {
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.unexpected("stale sessions deleted", event);
-        };
-        self.write_session(index)
-    }
-
-    fn write_session(&mut self, index: BTreeSet<String>) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(StorageError::TransactionNotFound.into());
-        };
-        let Some(session) = self.session.as_ref() else {
-            return self.emit_error(CreateSessionError::NotFinished);
-        };
-        let session_bytes = match session.to_bytes() {
-            Ok(bytes) => bytes,
-            Err(error) => return self.emit_error(error.into()),
-        };
-        let index_bytes = match encode_index(&index) {
-            Ok(bytes) => bytes,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn write_session(&mut self) -> SessionTurn {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or(CreateSessionError::NotFinished)?;
+        let session_bytes = session.to_bytes()?;
+        let index_bytes = encode_index(&self.index)?;
         let mut writes = vec![
             (
                 USER_SESSION_KEYSPACE.to_string(),
@@ -366,48 +311,16 @@ impl CreateSessionOperation {
         if self.config.restrictions.is_some() {
             let (actor, group_id) = self.issuer.unwrap_or((self.config.user_id, None));
             let mut audit = AdminAuditRecord::new(
+                self.ids.mint(self.now_ms),
                 AdminAuditAction::RestrictedTokenIssued,
                 actor,
                 self.config.user_id,
             );
             (audit.group_id, audit.session_id) = (group_id, Some(self.sid.clone()));
-            match audit.entries() {
-                Ok(entries) => writes.extend(entries),
-                Err(error) => return self.emit_error(error.into()),
-            }
+            writes.extend(audit.entries()?);
         }
-        self.state = CreateSessionState::WriteSession;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
-    }
-
-    fn handle_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected("session write", event);
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(StorageError::TransactionNotFound.into());
-        };
-        let Some(session) = self.session.clone() else {
-            return self.emit_error(CreateSessionError::NotFinished);
-        };
-        let Some(token) = self.token.take() else {
-            return self.emit_error(CreateSessionError::NotFinished);
-        };
-        self.output = Some(Ok(CreatedSession { token, session }));
-        self.state = CreateSessionState::CommitTransaction;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_committed(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected("transaction committed", event);
-        };
-        self.txn_id = None;
-        self.state = CreateSessionState::Finish;
-        smallvec![]
+        self.state = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 }
 
@@ -415,123 +328,65 @@ impl Operation for CreateSessionOperation {
     type Output = CreatedSession;
     type Error = CreateSessionError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = self.prepare_session() {
-            return self.emit_error(error);
-        }
-        self.state = CreateSessionState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return self.emit_error(error.into());
-        }
-        match self.state.clone() {
-            CreateSessionState::Init => self.start(),
-            CreateSessionState::StartTransaction => self.handle_started(event),
-            CreateSessionState::ReadOwnerIndex => self.handle_index(event),
-            CreateSessionState::ReadSessions { index } => self.handle_sessions(event, index),
-            CreateSessionState::DeleteStale { index } => self.handle_deleted(event, index),
-            CreateSessionState::WriteSession => self.handle_written(event),
-            CreateSessionState::CommitTransaction => self.handle_committed(event),
-            CreateSessionState::Finish | CreateSessionState::Error => smallvec![],
-        }
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateSessionState::Finish | CreateSessionState::Error
-        )
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateSessionError::NotFinished)?
+    fn first(&mut self) -> SessionTurn {
+        self.prepare_session()?;
+        self.state = Stage::Index;
+        Ok(Next::Call(IoCall::Read(vec![(
+            USER_OWNER_KEYSPACE.to_string(),
+            owner_key(self.config.user_id),
+        )])))
     }
 
-    fn abort(&mut self) -> Effects {
-        self.txn_id
-            .take()
-            .map_or_else(smallvec::SmallVec::new, |txn_id| {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            })
-    }
-}
-
-/// Creates a session for the user. At the session limit the user's cutoff moves past the
-/// oldest active sessions, which signs them out, and creation runs again. A service account
-/// keeps the plain limit, so renewing never ends the sessions its automation uses.
-pub async fn create_making_room(
-    context: &crate::driver::DriverContext,
-    node_id: aruna_core::id::NodeId,
-    mut config: CreateSessionConfig,
-) -> Result<CreatedSession, CreateSessionError> {
-    let read_cutoff = |realm_id, user_id| async move {
-        crate::auth::bearer_token::realm_user_cutoff(&context.storage_handle, realm_id, &user_id)
-            .await
-            .map_err(|error| CreateSessionError::Retire(error.to_string()))
-    };
-    let now = config.time;
-    config.cutoff = read_cutoff(config.realm_id, config.user_id).await?;
-    // A token issued before the cutoff would be refused at once, so it is issued at it.
-    let at_cutoff = |config: &mut CreateSessionConfig| {
-        config.time = config.time.max(config.cutoff.unwrap_or(0));
-    };
-    at_cutoff(&mut config);
-    loop {
-        let oldest = match crate::driver::drive(
-            CreateSessionOperation::new(config.clone()),
-            context,
-        )
-        .await
-        {
-            Err(CreateSessionError::LimitReached { oldest }) => oldest,
-            other => return other,
-        };
-        let read = crate::users::read_document::ReadUserOperation::new(config.user_id);
-        let service = match crate::driver::drive(read, context).await {
-            Ok(user) => user.service_group().is_some(),
-            // An unknown account may be a service account not yet replicated here.
-            Err(crate::users::read_document::ReadUserError::NotFound) => true,
-            Err(error) => return Err(CreateSessionError::Retire(error.to_string())),
-        };
-        if service {
-            return Err(CreateSessionError::LimitReached { oldest });
+    fn next(&mut self, result: IoResult) -> SessionTurn {
+        match self.state {
+            Stage::Index => {
+                let [value] = values::<1>(result)?;
+                self.handle_index(value)
+            }
+            Stage::Sessions => {
+                let IoResult::Values(values) = result else {
+                    return Err(CreateSessionError::NotFinished);
+                };
+                self.handle_sessions(values)
+            }
+            Stage::DeleteStale => {
+                result.done()?;
+                self.write_session()
+            }
+            Stage::Write => {
+                result.done()?;
+                let session = self
+                    .session
+                    .clone()
+                    .ok_or(CreateSessionError::NotFinished)?;
+                let token = self.token.take().ok_or(CreateSessionError::NotFinished)?;
+                Ok(Next::Done(CreatedSession { token, session }))
+            }
         }
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id,
-            user_id: config.user_id,
-            realm_id: config.realm_id,
-        };
-        let retire = super::revoke::cutoff_revocation(actor, oldest, now);
-        crate::driver::drive(
-            crate::auth::revoke_token::RevokeTokenOperation::new(retire),
-            context,
-        )
-        .await
-        .map_err(|error| CreateSessionError::Retire(error.to_string()))?;
-        let cutoff = read_cutoff(config.realm_id, config.user_id).await?;
-        // Without progress the limit stands rather than looping.
-        if cutoff.is_none_or(|cutoff| cutoff <= oldest) {
-            return Err(CreateSessionError::LimitReached { oldest });
-        }
-        config.cutoff = cutoff;
-        at_cutoff(&mut config);
     }
 }
 
 #[cfg(test)]
-mod pure_tests {
+pub(super) mod pure_tests {
     use super::*;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
     use aruna_core::structs::identity::auth::Permission;
-    use aruna_core::types::{Key, Value};
+    use aruna_core::types::Key;
 
-    fn session_config() -> CreateSessionConfig {
+    pub(crate) fn session_config() -> CreateSessionConfig {
         let signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
         CreateSessionConfig {
@@ -569,13 +424,15 @@ mod pure_tests {
         }
     }
 
-    fn begin_read(operation: &mut CreateSessionOperation, index: &BTreeSet<String>, txn_id: TxnId) {
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: owner_key(operation.config.user_id),
-            value: Some(encode_index(index).unwrap()),
-        }));
+    fn begin_read(operation: &mut CreateSessionOperation, index: &BTreeSet<String>) {
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
+        let stored = IoResult::Values(vec![Some(encode_index(index).unwrap())]);
+        operation.next(stored).unwrap();
+    }
+
+    fn rows(values: Vec<Option<Value>>) -> IoResult {
+        IoResult::Values(values)
     }
 
     #[test]
@@ -597,34 +454,24 @@ mod pure_tests {
         let index = BTreeSet::from([expired_sid.clone(), revoked_sid.clone()]);
         let mut operation =
             CreateSessionOperation::new_with_sid(config.clone(), pending_sid.clone());
-        let txn_id = Ulid::from_bytes([6; 16]);
-        begin_read(&mut operation, &index, txn_id);
+        begin_read(&mut operation, &index);
 
-        let deleted = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    expired_sid.as_bytes().into(),
-                    Some(
-                        session_record(&config, expired_sid.clone(), 99, false)
-                            .to_bytes()
-                            .unwrap()
-                            .into(),
-                    ),
-                ),
-                (
-                    revoked_sid.as_bytes().into(),
-                    Some(
-                        session_record(&config, revoked_sid.clone(), 200, true)
-                            .to_bytes()
-                            .unwrap()
-                            .into(),
-                    ),
-                ),
-                (pending_sid.as_bytes().into(), None),
-            ],
-        }));
-        let [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })] = deleted.as_slice()
-        else {
+        let deleted = operation.next(rows(vec![
+            Some(
+                session_record(&config, expired_sid.clone(), 99, false)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+            Some(
+                session_record(&config, revoked_sid.clone(), 200, true)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
+            ),
+            None,
+        ]));
+        let Ok(Next::Call(IoCall::Delete(deletes))) = deleted else {
             panic!("stale session records must be deleted");
         };
         assert_eq!(
@@ -635,10 +482,7 @@ mod pure_tests {
             BTreeSet::from([expired_sid.as_bytes().into(), revoked_sid.as_bytes().into()])
         );
 
-        let written = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice() else {
+        let Ok(Next::Call(IoCall::Write(writes))) = operation.next(IoResult::Done) else {
             panic!("the new session and bounded index must be written together");
         };
         let stored_index = writes
@@ -650,18 +494,18 @@ mod pure_tests {
             decode_index(Some(stored_index)).unwrap(),
             BTreeSet::from([pending_sid])
         );
+        assert!(matches!(
+            operation.next(IoResult::Done),
+            Ok(Next::Done(created)) if created.session.sid == operation.sid
+        ));
     }
 
     fn written_rows(mut operation: CreateSessionOperation) -> Vec<(String, Key, Value)> {
-        begin_read(&mut operation, &BTreeSet::new(), Ulid::from_parts(9, 9));
-        let sid = operation.sid.clone();
-        let written = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(sid.as_bytes().into(), None)],
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice() else {
+        begin_read(&mut operation, &BTreeSet::new());
+        let Ok(Next::Call(IoCall::Write(writes))) = operation.next(rows(vec![None])) else {
             panic!("the session must be written");
         };
-        writes.clone()
+        writes
     }
 
     #[test]
@@ -676,8 +520,11 @@ mod pure_tests {
         }]);
         let admin = UserId::local(Ulid::from_bytes([5; 16]), config.realm_id);
         let group = Ulid::from_bytes([6; 16]);
-        let operation = CreateSessionOperation::new(config.clone()).issued_by(admin, Some(group));
-        let sid = operation.sid.clone();
+        let mut operation =
+            CreateSessionOperation::new(config.clone()).issued_by(admin, Some(group));
+        operation.stamp(1_000);
+        operation.seed(7);
+        let sid = Ulid::from_parts(1_000, 7).to_string();
         let rows = written_rows(operation);
         let audit: Vec<_> = rows
             .iter()
@@ -712,18 +559,9 @@ mod pure_tests {
             realm_id: config.realm_id,
         };
         let mut operation = CreateSessionOperation::new(config.clone());
-        begin_read(&mut operation, &BTreeSet::new(), Ulid::from_parts(9, 9));
-        let sid = operation.sid.clone();
-        let written = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (sid.as_bytes().into(), None),
-                (
-                    Key::from(Vec::new()),
-                    Some(owner.to_bytes(&actor).unwrap().into()),
-                ),
-            ],
-        }));
-        let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = written.as_slice() else {
+        begin_read(&mut operation, &BTreeSet::new());
+        let owner = Some(owner.to_bytes(&actor).unwrap().into());
+        let Ok(Next::Call(IoCall::Write(writes))) = operation.next(rows(vec![None, owner])) else {
             panic!("the session must be written");
         };
         let audit = writes
@@ -748,27 +586,20 @@ mod pure_tests {
         for value in 0..MAX_USER_SESSIONS {
             let sid = Ulid::from_parts(value as u64, value as u128).to_string();
             index.insert(sid.clone());
-            values.push((
-                sid.as_bytes().into(),
-                Some(
-                    session_record(&config, sid, 200, false)
-                        .to_bytes()
-                        .unwrap()
-                        .into(),
-                ),
+            values.push(Some(
+                session_record(&config, sid, 200, false)
+                    .to_bytes()
+                    .unwrap()
+                    .into(),
             ));
         }
-        values.push((pending_sid.as_bytes().into(), None));
+        values.push(None);
         let mut operation =
             CreateSessionOperation::new_with_sid(config.clone(), pending_sid.clone());
-        begin_read(&mut operation, &index, Ulid::from_bytes([6; 16]));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: values.clone(),
-        }));
-
+        begin_read(&mut operation, &index);
         assert_eq!(
-            operation.finalize(),
-            Err(CreateSessionError::LimitReached { oldest: 1 })
+            operation.next(rows(values.clone())).err(),
+            Some(CreateSessionError::LimitReached { oldest: 1 })
         );
 
         let cut = CreateSessionConfig {
@@ -776,253 +607,10 @@ mod pure_tests {
             ..config
         };
         let mut operation = CreateSessionOperation::new_with_sid(cut, pending_sid);
-        begin_read(&mut operation, &index, Ulid::from_bytes([6; 16]));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        begin_read(&mut operation, &index);
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::BatchDelete { deletes, .. })]
-                if deletes.len() == MAX_USER_SESSIONS
+            operation.next(rows(values)),
+            Ok(Next::Call(IoCall::Delete(deletes))) if deletes.len() == MAX_USER_SESSIONS
         ));
-    }
-
-    /// A realm whose user `session_config` creates sessions for, on real storage.
-    async fn session_realm() -> (
-        tempfile::TempDir,
-        crate::driver::DriverContext,
-        CreateSessionConfig,
-        aruna_core::id::NodeId,
-    ) {
-        use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = crate::driver::DriverContext {
-            storage_handle: storage,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: Some(aruna_tasks::TaskHandle::new()),
-            compute_handle: None,
-        };
-        let config = session_config();
-        let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id,
-            user_id: config.user_id,
-            realm_id: config.realm_id,
-        };
-        let realm = CreateRealmConfig {
-            actor,
-            realm_description: "session realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        };
-        crate::driver::drive(CreateRealmOperation::new(realm), &context)
-            .await
-            .unwrap();
-        (dir, context, config, node_id)
-    }
-
-    /// Stores the user document of `config`'s user with the given attributes.
-    async fn store_user(
-        context: &crate::driver::DriverContext,
-        config: &CreateSessionConfig,
-        node_id: aruna_core::id::NodeId,
-        attributes: std::collections::HashMap<String, String>,
-    ) {
-        use aruna_core::document::DocumentTarget;
-        let user = aruna_core::structs::identity::user::User {
-            user_id: config.user_id,
-            name: "user".to_string(),
-            subject_ids: Vec::new(),
-            alias_user_ids: Default::default(),
-            attributes,
-        };
-        let target = DocumentTarget::User {
-            user_id: config.user_id,
-        };
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id,
-            user_id: config.user_id,
-            realm_id: config.realm_id,
-        };
-        let write = StorageEffect::Write {
-            key_space: target.storage_keyspace().to_string(),
-            key: target.storage_key(),
-            value: user.to_bytes(&actor).unwrap().into(),
-            txn_id: None,
-        };
-        context.storage_handle.send_storage_effect(write).await;
-    }
-
-    // Signing out works past the 64 self-service revocations a user may hold: the rest move
-    // the user's cutoff, and the next sign-in still works.
-    #[tokio::test]
-    async fn revokes_past_capacity() {
-        use crate::driver::drive;
-        use crate::session::revoke::RevokeSessionOperation;
-        let (_dir, context, config, node_id) = session_realm().await;
-        let now = aruna_core::time::unix_timestamp_secs();
-        let base = now - 1_000;
-        let mut sessions = Vec::new();
-        for offset in 0..100 {
-            let session = CreateSessionConfig {
-                time: base + offset,
-                expiry: now + 3_600,
-                ..config.clone()
-            };
-            let created = drive(CreateSessionOperation::new(session), &context)
-                .await
-                .unwrap();
-            sessions.push(created.session);
-        }
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id,
-            user_id: config.user_id,
-            realm_id: config.realm_id,
-        };
-        for session in &sessions {
-            let revoke = RevokeSessionOperation::new(actor.clone(), session.sid.clone(), now);
-            let revoked = drive(revoke, &context).await.unwrap();
-            assert!(revoked.is_some_and(|revoked| revoked.revoked));
-        }
-        let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-            &context.storage_handle,
-            config.realm_id,
-            &config.user_id,
-        )
-        .await
-        .unwrap();
-        // The last revoked session and every older one are cut off.
-        assert_eq!(cutoff, Some(base + 100));
-        let next = CreateSessionConfig {
-            time: now,
-            expiry: now + 3_600,
-            ..config
-        };
-        create_making_room(&context, node_id, next).await.unwrap();
-    }
-
-    // A service account, or one whose document is not here yet, at the limit is refused as
-    // before; none of its sessions are ended.
-    #[tokio::test]
-    async fn service_keeps_limit() {
-        use crate::driver::drive;
-        for known in [true, false] {
-            let (_dir, context, config, node_id) = session_realm().await;
-            if known {
-                let service = std::collections::HashMap::from([(
-                    aruna_core::user::validation::SERVICE_GROUP_ATTRIBUTE.to_string(),
-                    Ulid::from_bytes([8; 16]).to_string(),
-                )]);
-                store_user(&context, &config, node_id, service).await;
-            }
-            let now = aruna_core::time::unix_timestamp_secs();
-            let base = now - 1_000;
-            for offset in 0..MAX_USER_SESSIONS as u64 {
-                let session = CreateSessionConfig {
-                    time: base + offset,
-                    expiry: now + 3_600,
-                    ..config.clone()
-                };
-                drive(CreateSessionOperation::new(session), &context)
-                    .await
-                    .unwrap();
-            }
-            let next = CreateSessionConfig {
-                time: now,
-                expiry: now + 3_600,
-                ..config.clone()
-            };
-            let refused = create_making_room(&context, node_id, next).await;
-            assert_eq!(
-                refused,
-                Err(CreateSessionError::LimitReached { oldest: base })
-            );
-            let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-                &context.storage_handle,
-                config.realm_id,
-                &config.user_id,
-            )
-            .await
-            .unwrap();
-            assert_eq!(cutoff, None);
-        }
-    }
-
-    // A sign-in right after a sign-out moved the cutoff into the next second is issued at the
-    // cutoff, so its token is not refused at once.
-    #[tokio::test]
-    async fn issues_at_cutoff() {
-        use crate::driver::drive;
-        let (_dir, context, config, node_id) = session_realm().await;
-        let now = aruna_core::time::unix_timestamp_secs();
-        let actor = aruna_core::structs::identity::auth::Actor {
-            node_id,
-            user_id: config.user_id,
-            realm_id: config.realm_id,
-        };
-        let raise = super::super::revoke::cutoff_revocation(actor, now, now);
-        drive(
-            crate::auth::revoke_token::RevokeTokenOperation::new(raise),
-            &context,
-        )
-        .await
-        .unwrap();
-        let next = CreateSessionConfig {
-            time: now,
-            expiry: now + 3_600,
-            ..config
-        };
-        let created = create_making_room(&context, node_id, next).await.unwrap();
-        assert_eq!(created.session.created_at, now + 1);
-        assert_eq!(created.session.expires_at, now + 3_600);
-    }
-
-    // A user at the session limit still signs in: the oldest session is signed out instead.
-    #[tokio::test]
-    async fn full_user_login() {
-        use crate::driver::drive;
-        let (_dir, context, config, node_id) = session_realm().await;
-        store_user(&context, &config, node_id, Default::default()).await;
-        // The cutoff is read against the wall clock, so the sessions are recent.
-        let now = aruna_core::time::unix_timestamp_secs();
-        let base = now - 1_000;
-        let mut first = None;
-        for offset in 0..MAX_USER_SESSIONS as u64 {
-            let session = CreateSessionConfig {
-                time: base + offset,
-                expiry: now + 3_600,
-                ..config.clone()
-            };
-            let created = drive(CreateSessionOperation::new(session), &context)
-                .await
-                .unwrap();
-            first.get_or_insert(created.session);
-        }
-        let next = CreateSessionConfig {
-            time: now,
-            expiry: now + 3_600,
-            ..config.clone()
-        };
-        let refused = drive(CreateSessionOperation::new(next.clone()), &context).await;
-        assert_eq!(
-            refused,
-            Err(CreateSessionError::LimitReached { oldest: base })
-        );
-
-        create_making_room(&context, node_id, next).await.unwrap();
-
-        let cutoff = crate::auth::bearer_token::realm_user_cutoff(
-            &context.storage_handle,
-            config.realm_id,
-            &config.user_id,
-        )
-        .await
-        .unwrap();
-        assert_eq!(cutoff, Some(base + 1));
-        assert!(first.unwrap().created_at < base + 1);
     }
 }

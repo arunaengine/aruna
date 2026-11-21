@@ -2,19 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
+use aruna_core::placement::resolver::{build_view, resolve_holders};
 use aruna_core::structs::execution::notification_watch::WatchSubscription;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::placement::record::{DEFAULT_SHARD_COUNT, PlacementStrategy};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use crate::placement::{build_view, resolve_holders};
+pub(crate) const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
 
-pub const INBOX_TOPIC_DOMAIN: &[u8] = b"aruna-notification-inbox-v1";
-
-pub fn inbox_topic_id(user_id: &UserId) -> [u8; 32] {
+pub(crate) fn inbox_topic_id(user_id: &UserId) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(INBOX_TOPIC_DOMAIN);
     hasher.update(&user_id.to_storage_key());
@@ -45,7 +44,7 @@ pub fn resolve_inbox_holder(
         .next())
 }
 
-pub fn filter_local_subscriptions(
+pub(crate) fn filter_local_subscriptions(
     subscriptions: Vec<WatchSubscription>,
     realm_config: &RealmConfigDocument,
     local_node_id: NodeId,

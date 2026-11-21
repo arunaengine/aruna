@@ -1,5 +1,5 @@
 //! Tests the Docker backend against a real daemon, ignored unless run with --ignored.
-//! Without a daemon they skip, unless ARUNA_COMPUTE_REQUIRE_DOCKER=1 makes that a failure.
+//! A run on purpose without a daemon fails.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -8,7 +8,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aruna_compute::DockerConfig;
+use aruna_clock::testing::poll_until;
+use aruna_compute::executor::config::DockerConfig;
 use aruna_compute::executor::docker::DockerBackend;
 use aruna_core::compute::{
     AttemptPhase, AttemptRef, AttemptStatus, BackendError, CancelEvidence, FenceContext, LogLimits,
@@ -67,7 +68,8 @@ impl DockerTestExt for DockerBackend {
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
         let image =
-            aruna_compute::ExecutorBackend::resolve_image(self, &spec.image, cancel).await?;
+            aruna_compute::executor::ExecutorBackend::resolve_image(self, &spec.image, cancel)
+                .await?;
         let inputs = spec
             .inputs
             .iter()
@@ -97,6 +99,7 @@ impl DockerTestExt for DockerBackend {
             output_paths: spec.output_paths.clone(),
             env: spec.env.clone(),
             secret_env: spec.secret_env.clone(),
+            vault_env: spec.vault_env.clone(),
             resources: spec.resources.clone(),
             workspace: spec.workspace.clone(),
             security: spec.security.clone(),
@@ -104,11 +107,17 @@ impl DockerTestExt for DockerBackend {
             session: spec.session,
             session_mount: spec.session_mount.clone(),
         };
-        aruna_compute::ExecutorBackend::submit(self, &fence(&spec.attempt), &pinned, cancel).await
+        aruna_compute::executor::ExecutorBackend::submit(
+            self,
+            &fence(&spec.attempt),
+            &pinned,
+            cancel,
+        )
+        .await
     }
 
     async fn status(&self, attempt: &AttemptRef) -> Result<AttemptStatus, BackendError> {
-        aruna_compute::ExecutorBackend::status(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::status(self, &fence(attempt)).await
     }
 
     async fn wait(
@@ -116,11 +125,11 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         cancel: &CancellationToken,
     ) -> Result<AttemptStatus, BackendError> {
-        aruna_compute::ExecutorBackend::wait(self, &fence(attempt), cancel).await
+        aruna_compute::executor::ExecutorBackend::wait(self, &fence(attempt), cancel).await
     }
 
     async fn cancel(&self, attempt: &AttemptRef) -> Result<CancelEvidence, BackendError> {
-        aruna_compute::ExecutorBackend::cancel(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::cancel(self, &fence(attempt)).await
     }
 
     async fn fetch_logs(
@@ -128,7 +137,7 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         limits: &LogLimits,
     ) -> Result<LogTails, BackendError> {
-        aruna_compute::ExecutorBackend::fetch_logs(self, &fence(attempt), limits).await
+        aruna_compute::executor::ExecutorBackend::fetch_logs(self, &fence(attempt), limits).await
     }
 
     async fn fetch_output(
@@ -136,7 +145,7 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         path: &str,
     ) -> Result<TaskOutput, BackendError> {
-        aruna_compute::ExecutorBackend::fetch_output(self, &fence(attempt), path).await
+        aruna_compute::executor::ExecutorBackend::fetch_output(self, &fence(attempt), path).await
     }
 
     async fn list_outputs(
@@ -144,15 +153,15 @@ impl DockerTestExt for DockerBackend {
         attempt: &AttemptRef,
         pattern: &str,
     ) -> Result<Vec<String>, BackendError> {
-        aruna_compute::ExecutorBackend::list_outputs(self, &fence(attempt), pattern).await
+        aruna_compute::executor::ExecutorBackend::list_outputs(self, &fence(attempt), pattern).await
     }
 
     async fn reconcile(&self, attempt: &AttemptRef) -> ReconcileEvidence {
-        aruna_compute::ExecutorBackend::reconcile(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::reconcile(self, &fence(attempt)).await
     }
 
     async fn cleanup(&self, attempt: &AttemptRef) -> Result<(), BackendError> {
-        aruna_compute::ExecutorBackend::cleanup(self, &fence(attempt)).await
+        aruna_compute::executor::ExecutorBackend::cleanup(self, &fence(attempt)).await
     }
 }
 
@@ -170,23 +179,9 @@ async fn read_output(backend: &DockerBackend, attempt: &AttemptRef, path: &str) 
 
 const IMAGE: &str = "alpine:3.24";
 
-/// Required-mode flag for daemon-backed jobs: `1` makes setup failures fatal.
-fn docker_required() -> bool {
-    std::env::var("ARUNA_COMPUTE_REQUIRE_DOCKER").as_deref() == Ok("1")
-}
-
-/// Report a missing daemon: panic in required mode, otherwise skip.
-fn daemon_missing(reason: String) -> Option<DockerBackend> {
-    if docker_required() {
-        panic!("docker backend required but unavailable: {reason}");
-    }
-    eprintln!("skipping docker test: {reason}");
-    None
-}
-
-/// Connect + health-check, or `None` when no daemon is available. Uses network
-/// mode `none`: these containers need no egress and it keeps the tests hermetic.
-async fn daemon() -> Option<DockerBackend> {
+/// Connect + health-check; a missing daemon fails the test. Uses network mode `none`: these
+/// containers need no egress and it keeps the tests hermetic.
+async fn daemon() -> DockerBackend {
     let config = DockerConfig {
         state_root: std::env::temp_dir()
             .join("aruna-compute-tests")
@@ -195,24 +190,12 @@ async fn daemon() -> Option<DockerBackend> {
     };
     let backend = match DockerBackend::with_config(config) {
         Ok(backend) => backend,
-        Err(error) => return daemon_missing(format!("daemon setup failed: {error}")),
+        Err(error) => panic!("docker backend unavailable: daemon setup failed: {error}"),
     };
-    match aruna_compute::ExecutorBackend::health(&backend).await {
-        Ok(()) => Some(backend),
-        Err(error) => daemon_missing(format!("daemon unhealthy: {error}")),
+    match aruna_compute::executor::ExecutorBackend::health(&backend).await {
+        Ok(()) => backend,
+        Err(error) => panic!("docker backend unavailable: daemon unhealthy: {error}"),
     }
-}
-
-macro_rules! backend_or_skip {
-    () => {
-        match daemon().await {
-            Some(b) => b,
-            None => {
-                eprintln!("skipping docker test: no reachable docker daemon");
-                return;
-            }
-        }
-    };
 }
 
 fn unique(prefix: &str) -> String {
@@ -232,21 +215,22 @@ fn sh(job: &str, script: &str) -> TaskSpec {
 }
 
 async fn wait_running(backend: &DockerBackend, attempt: &AttemptRef) {
-    for _ in 0..200 {
+    let reached = poll_until(Duration::from_secs(60), async || {
         let status = backend.status(attempt).await.unwrap();
-        if matches!(status.phase, AttemptPhase::Running) || status.is_terminal() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("container never reached running/terminal");
+        (matches!(status.phase, AttemptPhase::Running) || status.is_terminal()).then_some(())
+    })
+    .await;
+    assert!(
+        reached.is_some(),
+        "container never reached running/terminal"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires a running Docker daemon"]
 async fn idempotent_submit() {
     // Submitting the same external name twice adopts the one container.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let job = unique("idem");
     let spec = sh(&job, "sleep 60");
     let attempt = spec.attempt.clone();
@@ -276,7 +260,7 @@ async fn idempotent_submit() {
 #[ignore = "requires a running Docker daemon"]
 async fn resubmit_after_removal() {
     // A removed container must not license a second run of the same attempt.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let cancel = CancellationToken::new();
     let spec = sh(&unique("lost"), "exit 0");
     let attempt = spec.attempt.clone();
@@ -301,7 +285,7 @@ async fn resubmit_after_removal() {
 #[ignore = "requires a running Docker daemon"]
 async fn exit_code_capture() {
     // Distinct exit codes surface as distinct terminal evidence.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let cancel = CancellationToken::new();
 
     let ok = sh(&unique("exit0"), "exit 0");
@@ -323,7 +307,7 @@ async fn exit_code_capture() {
 #[tokio::test]
 #[ignore = "requires a running Docker daemon"]
 async fn file_transfer() {
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let cancel = CancellationToken::new();
     let mut spec = sh(
         &unique("files"),
@@ -351,7 +335,7 @@ async fn file_transfer() {
 #[ignore = "requires a running Docker daemon"]
 async fn wildcard_outputs() {
     // A pattern selects the matching files of the terminal container only.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let cancel = CancellationToken::new();
     let mut spec = sh(
         &unique("wildcard"),
@@ -387,7 +371,7 @@ async fn wildcard_outputs() {
 async fn chunked_transfer() {
     // A multi-chunk input stream round-trips through the container and comes
     // back as a multi-chunk output stream, byte for byte.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let cancel = CancellationToken::new();
     let mut spec = sh(
         &unique("chunks"),
@@ -425,7 +409,7 @@ async fn chunked_transfer() {
 #[tokio::test]
 #[ignore = "requires a running Docker daemon"]
 async fn cancelled_submit() {
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let spec = sh(&unique("cancelled-submit"), "sleep 300");
     let cancel = CancellationToken::new();
     cancel.cancel();
@@ -444,7 +428,7 @@ async fn cancelled_submit() {
 #[ignore = "requires a running Docker daemon"]
 async fn cancel_stops() {
     // A long-running container is stopped with definitive evidence.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let spec = sh(&unique("cancel"), "sleep 300");
     let attempt = spec.attempt.clone();
 
@@ -471,7 +455,7 @@ async fn cancel_stops() {
 #[tokio::test]
 #[ignore = "requires a running Docker daemon"]
 async fn created_cancel_removes() {
-    let warm_backend = backend_or_skip!();
+    let warm_backend = daemon().await;
     let warmup = sh(&unique("created-warmup"), "true");
     warm_backend
         .submit(&warmup, &CancellationToken::new())
@@ -546,7 +530,7 @@ async fn created_cancel_removes() {
 #[ignore = "requires a running Docker daemon"]
 async fn reconcile_adopts() {
     // A fresh backend (simulating restart) re-adopts a running container by name.
-    let submitter = backend_or_skip!();
+    let submitter = daemon().await;
     let spec = sh(&unique("adopt"), "sleep 120");
     let attempt = spec.attempt.clone();
     submitter
@@ -557,7 +541,7 @@ async fn reconcile_adopts() {
 
     // Drop the submitting handle; a brand-new backend has no in-memory state.
     drop(submitter);
-    let recovered = backend_or_skip!();
+    let recovered = daemon().await;
     match recovered.reconcile(&attempt).await {
         ReconcileEvidence::Adoptable(evidence) => {
             let status = evidence.status;
@@ -580,7 +564,7 @@ async fn reconcile_adopts() {
 #[ignore = "requires a running Docker daemon"]
 async fn log_bounds() {
     // A chatty container's captured tail is bounded; totals show truncation.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let cancel = CancellationToken::new();
     let spec = sh(
         &unique("logs"),
@@ -622,7 +606,7 @@ async fn log_bounds() {
 #[ignore = "requires a running Docker daemon"]
 async fn resource_limits() {
     // Memory / CPU / pids ceilings are actually applied to the container config.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let mut spec = sh(&unique("limits"), "sleep 30");
     spec.resources.ram_bytes = Some(64 * 1024 * 1024);
     spec.resources.cpu_cores = Some(1);
@@ -647,7 +631,7 @@ async fn resource_limits() {
 async fn foreign_not_adopted() {
     // A same-named container created outside Aruna (no aruna-engine.org/* labels) is
     // neither adopted as evidence nor removed by cleanup.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     // Warm the image so the bare create below cannot 404.
     let warmup = sh(&unique("warmup"), "true");
     backend
@@ -710,7 +694,7 @@ async fn foreign_not_adopted() {
 #[ignore = "requires a running Docker daemon"]
 async fn wait_is_observational() {
     // Operations owns walltime cancellation; backend wait only observes.
-    let backend = backend_or_skip!();
+    let backend = daemon().await;
     let spec = sh(&unique("wait"), "sleep 300");
     let attempt = spec.attempt.clone();
 

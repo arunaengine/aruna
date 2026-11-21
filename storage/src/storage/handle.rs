@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::key_index::RangeIndexes;
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -14,7 +15,8 @@ use aruna_core::effects::{Effect, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
+use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
 use aruna_core::telemetry::record_stage;
 use async_trait::async_trait;
 use crossfire::{TrySendError, mpsc};
@@ -24,6 +26,7 @@ use ulid::Ulid;
 
 use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
 use super::owner::TransactionOwner;
+use super::policies::PolicyPrograms;
 use super::sealing::{open_event, seal_effect};
 use super::telemetry::{effect_kind, storage_effect_kind, storage_effect_span, storage_event_kind};
 use super::vault::{vault_effect, vault_event};
@@ -47,7 +50,8 @@ pub(super) enum CleanupKind {
     Aborted,
     CommitQueued,
     CommitUnknown,
-    Committed,
+    /// Holds the commit's sequence, so a repeated commit answers it again.
+    Committed(u64),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +96,12 @@ pub struct StorageHandle {
     pub(super) worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
     pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
     pub(super) vault_key: Arc<OnceLock<NodeVaultKey>>,
+    pub(super) realm_keys: Arc<OnceLock<RealmKeys>>,
     pub(super) database: Arc<OnceLock<OpenDatabase>>,
+    /// The key indexes of distributed bucket ranges, on a node that keeps them.
+    pub(super) range_indexes: Arc<OnceLock<Arc<RangeIndexes>>>,
+    /// Compiled request policy sets by content, shared by every clone of the handle.
+    pub(super) policies: Arc<PolicyPrograms>,
 }
 
 /// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
@@ -160,10 +169,30 @@ impl StorageHandle {
                 worker: Arc::new(Mutex::new(None)),
                 secret_key: Arc::new(OnceLock::new()),
                 vault_key: Arc::new(OnceLock::new()),
+                realm_keys: Arc::new(OnceLock::new()),
                 database: Arc::new(OnceLock::new()),
+                range_indexes: Arc::new(OnceLock::new()),
+                policies: Arc::new(PolicyPrograms::default()),
             },
             StorageReceivers { foreground, bulk },
         )
+    }
+
+    /// Installs the range key indexes on first call; later calls get the installed ones.
+    pub fn install_range_indexes(&self, indexes: RangeIndexes) -> Arc<RangeIndexes> {
+        self.range_indexes.get_or_init(|| Arc::new(indexes)).clone()
+    }
+
+    /// Installs the range indexes below the metadata storage `path`; only a metadata node keeps
+    /// them.
+    pub fn install_metadata_indexes(&self, path: impl AsRef<std::path::Path>) {
+        let root = path.as_ref().join(crate::key_index::RANGE_INDEX_DIR);
+        self.install_range_indexes(RangeIndexes::new(root));
+    }
+
+    /// The range key indexes; `None` on a node that keeps none.
+    pub fn range_indexes(&self) -> Option<Arc<RangeIndexes>> {
+        self.range_indexes.get().cloned()
     }
 
     /// The opened node database, for consistent read snapshots such as live backups. `None`
@@ -202,6 +231,18 @@ impl StorageHandle {
     /// at startup; vault effects fail until then, and a later key is ignored.
     pub fn open_vault(&self, key: NodeVaultKey) {
         let _ = self.vault_key.set(key);
+    }
+
+    /// Gives this handle and its clones the realm keys; only management nodes hold them. Set
+    /// once at startup; a later key is ignored.
+    pub fn open_realm(&self, keys: RealmKeys) {
+        let _ = self.realm_keys.set(keys);
+    }
+
+    /// The realm keys this handle was given, for plugin releases that still open secrets in the
+    /// operation; `None` on nodes without them.
+    pub fn realm_keys(&self) -> Option<&RealmKeys> {
+        self.realm_keys.get()
     }
 
     /// A handle whose effects dispatch on the bulk lane, served only when the
@@ -286,7 +327,7 @@ impl StorageHandle {
             .lock()
             .expect("transaction cleanup mutex poisoned");
         if pending.get(&txn_id).is_some_and(|entry| {
-            matches!(entry.kind, CleanupKind::Committed | CleanupKind::Aborted)
+            matches!(entry.kind, CleanupKind::Committed(_) | CleanupKind::Aborted)
         }) {
             pending.remove(&txn_id);
             return true;
@@ -335,10 +376,22 @@ impl StorageHandle {
                     entry.kind,
                     CleanupKind::CommitQueued
                         | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed
+                        | CleanupKind::Committed(_)
                         | CleanupKind::Aborted
                 )
             })
+    }
+
+    /// Starts a write transaction and returns its id; panics on any other answer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn begin_write(&self) -> Ulid {
+        match self
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
     }
 
     #[tracing::instrument(
@@ -373,6 +426,16 @@ impl StorageHandle {
     pub(super) async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
         self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
+        if let StorageEffect::CompilePolicies(sets) = &effect {
+            return StorageEvent::PoliciesCompiled(self.policies.compile(sets));
+        }
+        #[cfg(debug_assertions)]
+        super::ledger::record_outbox(&effect);
+        if let StorageEffect::RealmOpen(sealed) = &effect {
+            let keys = self.realm_keys.get();
+            let result = keys.map_or(Err(RealmVaultError::NoKey), |keys| sealed.open(keys));
+            return StorageEvent::RealmOpened { result };
+        }
         let (effect, vault_entry) = match vault_effect(self.vault_key.get(), effect) {
             Ok(translated) => translated,
             Err(error) => return self.observe_storage_event(StorageEvent::Error { error }),
@@ -404,15 +467,18 @@ impl StorageHandle {
         let cleanup = cleanup_effect(&effect);
         let cleanup_write = is_cleanup_write(&effect);
         if let StorageEffect::CommitTransaction { txn_id } = &effect
-            && self
+            && let Some(CleanupKind::Committed(sequence)) = self
                 .transaction_cleanup
                 .lock()
                 .expect("transaction cleanup mutex poisoned")
                 .get(txn_id)
-                .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed))
+                .map(|entry| entry.kind)
         {
-            return self
-                .observe_storage_event(StorageEvent::TransactionCommitted { txn_id: *txn_id });
+            let committed = StorageEvent::TransactionCommitted {
+                txn_id: *txn_id,
+                sequence,
+            };
+            return self.observe_storage_event(committed);
         }
         let mut deferred = None;
         let send_result: Result<(), StorageError> = {
@@ -694,7 +760,9 @@ pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
         | StorageEffect::Last { .. }
         | StorageEffect::VaultRead { .. }
         | StorageEffect::AbortTransaction { .. }
-        | StorageEffect::SyncAll => false,
+        | StorageEffect::SyncAll
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => false,
     }
 }
 
@@ -767,7 +835,9 @@ pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
         | StorageEffect::VaultRead { txn_id: None, .. }
         | StorageEffect::VaultDelete { txn_id: None, .. }
         | StorageEffect::BeginUsageRebuild { .. }
-        | StorageEffect::FinishUsageRebuild { .. } => None,
+        | StorageEffect::FinishUsageRebuild { .. }
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => None,
     }
 }
 
@@ -795,7 +865,9 @@ pub(super) fn reserve_cleanup(
     match (kind, previous) {
         (
             CleanupKind::Abort,
-            Some(CleanupKind::CommitQueued | CleanupKind::CommitUnknown | CleanupKind::Committed),
+            Some(
+                CleanupKind::CommitQueued | CleanupKind::CommitUnknown | CleanupKind::Committed(_),
+            ),
         )
         | (CleanupKind::CommitQueued, Some(CleanupKind::Abort | CleanupKind::Aborted))
         | (CleanupKind::CommitUnknown, Some(CleanupKind::Abort | CleanupKind::Aborted)) => {
@@ -877,7 +949,7 @@ pub(super) fn observe_cleanup(
     }
     if pending
         .get(&txn_id)
-        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed | CleanupKind::Aborted))
+        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed(_) | CleanupKind::Aborted))
     {
         return true;
     }
@@ -895,12 +967,18 @@ pub(super) fn observe_cleanup(
         ) => Some(CleanupKind::Aborted),
         (
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
-            StorageEvent::TransactionCommitted { txn_id: committed },
-        ) if txn_id == *committed => Some(CleanupKind::Committed),
+            StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                sequence,
+            },
+        ) if txn_id == *committed => Some(CleanupKind::Committed(*sequence)),
         (
             CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
             StorageEvent::Error {
-                error: StorageError::TransactionConflict | StorageError::TransactionNotFound,
+                error:
+                    StorageError::TransactionConflict
+                    | StorageError::TransactionNotFound
+                    | StorageError::RolledBack(_),
             },
         ) => Some(CleanupKind::Aborted),
         _ => None,
@@ -1028,13 +1106,16 @@ impl ResponseToken {
             ResponseCleanup::Commit(txn_id) => {
                 if matches!(
                     event,
-                    StorageEvent::TransactionCommitted { txn_id: committed }
-                        if txn_id == *committed
+                    StorageEvent::TransactionCommitted {
+                        txn_id: committed,
+                        ..
+                    } if txn_id == *committed
                 ) || matches!(
                     event,
                     StorageEvent::Error {
                         error: StorageError::TransactionConflict
                             | StorageError::TransactionNotFound
+                            | StorageError::RolledBack(_)
                     }
                 ) {
                     ResponseCleanup::Terminal(txn_id)

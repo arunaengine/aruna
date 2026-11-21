@@ -37,13 +37,29 @@ fn id(byte: u8) -> Ulid {
 }
 
 fn created() -> SecretRecord {
-    let applied = apply_change(SecretScope::Node, None, create(), actor(), 10, id(10)).unwrap();
+    let applied = apply_change(
+        SecretScope::Node,
+        None,
+        create(),
+        actor(),
+        10,
+        (id(10), Ulid::from_parts(9, 9)),
+    )
+    .unwrap();
     applied.info.unwrap()
 }
 
 #[test]
 fn create_once() {
-    let applied = apply_change(SecretScope::Node, None, create(), actor(), 10, id(10)).unwrap();
+    let applied = apply_change(
+        SecretScope::Node,
+        None,
+        create(),
+        actor(),
+        10,
+        (id(10), Ulid::from_parts(9, 9)),
+    )
+    .unwrap();
     let info = applied.info.unwrap();
     assert_eq!((info.revision, info.value_id), (id(10), id(10)));
     assert_eq!(info.fields, ["token"]);
@@ -55,7 +71,7 @@ fn create_once() {
         create(),
         actor(),
         11,
-        id(11),
+        (id(11), Ulid::from_parts(9, 9)),
     );
     assert_eq!(again.unwrap_err(), ChangeError::Exists);
 }
@@ -76,7 +92,7 @@ fn replace_keeps_value() {
         change,
         actor(),
         11,
-        id(11),
+        (id(11), Ulid::from_parts(9, 9)),
     );
     let applied = applied.unwrap();
     let info = applied.info.unwrap();
@@ -100,7 +116,7 @@ fn rotate_retires_value() {
         change,
         actor(),
         12,
-        id(12),
+        (id(12), Ulid::from_parts(9, 9)),
     );
     let applied = applied.unwrap();
     assert_eq!(applied.info.unwrap().value_id, id(12));
@@ -116,7 +132,7 @@ fn rotate_retires_value() {
         wrong,
         actor(),
         12,
-        id(12),
+        (id(12), Ulid::from_parts(9, 9)),
     );
     assert_eq!(
         refused.unwrap_err(),
@@ -137,7 +153,7 @@ fn stale_token_refused() {
         delete("x"),
         actor(),
         13,
-        id(13),
+        (id(13), Ulid::from_parts(9, 9)),
     );
     assert_eq!(stale.unwrap_err(), ChangeError::Stale);
     let token = current.revision_token();
@@ -147,11 +163,18 @@ fn stale_token_refused() {
         delete(&token),
         actor(),
         13,
-        id(13),
+        (id(13), Ulid::from_parts(9, 9)),
     );
     let applied = applied.unwrap();
     assert_eq!((applied.info, applied.retired), (None, Some(id(10))));
-    let missing = apply_change(SecretScope::Node, None, delete(&token), actor(), 13, id(13));
+    let missing = apply_change(
+        SecretScope::Node,
+        None,
+        delete(&token),
+        actor(),
+        13,
+        (id(13), Ulid::from_parts(9, 9)),
+    );
     assert_eq!(missing.unwrap_err(), ChangeError::NotFound);
 }
 
@@ -189,7 +212,14 @@ fn scope_checks_rules() {
         fields,
     };
     // A node secret names the groups whose installs may use it.
-    let refused = apply_change(SecretScope::Node, None, change, actor(), 10, id(10));
+    let refused = apply_change(
+        SecretScope::Node,
+        None,
+        change,
+        actor(),
+        10,
+        (id(10), Ulid::from_parts(9, 9)),
+    );
     assert_eq!(
         refused.unwrap_err(),
         ChangeError::Invalid(SecretError::Rule)
@@ -198,7 +228,15 @@ fn scope_checks_rules() {
 
 #[test]
 fn audit_hides_value() {
-    let applied = apply_change(SecretScope::Node, None, create(), actor(), 10, id(10)).unwrap();
+    let applied = apply_change(
+        SecretScope::Node,
+        None,
+        create(),
+        actor(),
+        10,
+        (id(10), Ulid::from_parts(9, 9)),
+    )
+    .unwrap();
     let shown = format!("{applied:?}{:?}", applied.audit.to_bytes().unwrap());
     assert!(!shown.contains(CANARY));
     assert!(

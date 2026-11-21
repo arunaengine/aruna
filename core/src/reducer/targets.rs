@@ -2,6 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::paths::{
+    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_DISCOVERY_PATH, CONFIG_EMAIL_PATH,
+    CONFIG_FEDERATION_PATH, CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH,
+    CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH, GROUP_LOCATION_PATH,
+    GROUP_OWNER_PATH, GROUP_POLICIES_PATH, METADATA_REPLICATION_PATH, NODE_HISTORY_PREFIX,
+    PLUGIN_ENTRY_PREFIX, PLUGIN_INSTALL_PREFIX, REALM_ID_PATH, SECRET_INFO_PREFIX,
+    USER_ALIAS_PREFIX, USER_NAME_PATH, VAULT_ENTRY_PREFIX, compute_from_value, config_node_path,
+    config_oidc_path, decode_metadata_replication, decode_oidc_provider, decode_realm_discovery,
+    group_assignment_role, group_role_path, group_user_path, metadata_replication_value,
+    node_history_path, parse_config_oidc, parse_group_role, parse_realm_role, policies_from_value,
+    publisher_cutoffs_path, quota_from_value, realm_assignment_role, realm_discovery_value,
+    realm_role_path, realm_user_path, secret_info_path, user_alias_path, user_attribute_path,
+    user_subject_path,
+};
 use super::*;
 
 impl AdminDocumentState {
@@ -438,6 +452,29 @@ impl AdminDocumentState {
         entries.into_values().collect()
     }
 
+    /// What the realm config holds at one install's path, deletions and conflicts included,
+    /// which [`Self::materialized_installs`] leaves out.
+    pub fn install_entry(&self, install_id: &ulid::Ulid) -> InstallEntry {
+        let path = crate::reducer::paths::plugin_install_path(install_id);
+        let parse = |value: &Option<String>| {
+            (value.as_deref()).and_then(|value| serde_json::from_str(value).ok())
+        };
+        if let Some(conflict) = self.conflicts.get(&path) {
+            return InstallEntry::Conflict {
+                deletion: conflict.values.iter().any(|value| value.value.is_none()),
+                installs: conflict
+                    .values
+                    .iter()
+                    .filter_map(|value| parse(&value.value))
+                    .collect(),
+            };
+        }
+        match self.user_subject_ids.get(&path) {
+            None => InstallEntry::Absent,
+            Some(version) => InstallEntry::Settled(parse(&version.value).map(Box::new)),
+        }
+    }
+
     /// Plugin install records sorted by install id. A deleted or conflicting one is absent.
     pub fn materialized_installs(&self) -> Vec<crate::plugin_installs::PluginInstall> {
         if !matches!(&self.target, AdminDocumentTarget::RealmConfig { .. }) {
@@ -688,7 +725,7 @@ impl AdminDocumentState {
         }
     }
 
-    pub(super) fn apply_node_value(
+    pub(super) fn apply_value(
         &mut self,
         event: &AdminDocumentEvent,
         path: String,
@@ -790,7 +827,7 @@ impl AdminDocumentState {
             },
         };
         let value = serde_json::to_string(&record).ok();
-        self.apply_node_value(event, node_history_path(node_id, event.event_id), value);
+        self.apply_value(event, node_history_path(node_id, event.event_id), value);
     }
 
     /// Every infrastructure membership interval the realm config has seen, also of removed
@@ -839,4 +876,18 @@ impl AdminDocumentState {
             })
             .collect()
     }
+}
+
+/// An install's path in the realm config: never written, settled (`None` is the deletion
+/// `remove_install` writes), or in conflict between candidates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallEntry {
+    Absent,
+    Settled(Option<Box<crate::plugin_installs::PluginInstall>>),
+    Conflict {
+        /// One candidate is the deletion.
+        deletion: bool,
+        /// The candidates that hold a record.
+        installs: Vec<crate::plugin_installs::PluginInstall>,
+    },
 }

@@ -2,15 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::SystemTime;
+use aruna_core::id_mint::IdMint;
+use std::time::{Duration, SystemTime};
 
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::placement::policy::PlacementPolicyError;
 use aruna_core::structs::storage::blob::{
@@ -18,9 +18,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::connectors::repository::connector_reference_write;
@@ -28,20 +27,18 @@ use crate::distribution::guard::{GuardError, authority_read, record_epoch};
 use crate::distribution::inventory::{
     AddedVersion, entry_of, stamp_head, stamp_version, version_written,
 };
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
-use crate::replication::protocol::ReferenceAdvance;
-use crate::replication::queue::{LiveObligationRecord, live_obligation_entry};
-use crate::s3::object::get::MAX_AUTO_ADVANCES;
 use crate::s3::object::metadata::ReferenceRefresh;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
 use aruna_core::structs::storage::distribution::hint::mint_version;
 use aruna_core::structs::storage::distribution::{DistributionBinding, OriginalEpoch};
+use aruna_core::structs::storage::replication_queue::{
+    LiveObligationRecord, live_obligation_entry,
+};
+use aruna_core::structs::storage::replication_queue::{MAX_AUTO_ADVANCES, ReferenceAdvance};
 
 /// One storage row a successor writes.
 type Row = (KeySpace, Key, Value);
-
-/// The rows read for a successor, in read order.
-type ReadRows = Vec<(Key, Option<Value>)>;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum MintError {
@@ -57,88 +54,71 @@ pub enum MintError {
     Purge(#[from] PurgeFenceError),
     #[error(transparent)]
     Distribution(#[from] GuardError),
-    #[error("unexpected event in state {state:?}: {received}")]
-    UnexpectedEvent { state: MintState, received: String },
 }
 
+impl From<IoError> for MintError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type MintTurn = Result<Next<bool>, MintError>;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MintState {
-    Init,
+enum MintState {
     ReadRows,
     /// Reads a distributed bucket's record: only the key's coordinator advances it.
     ReadRecord,
     WriteRows,
     UpdateUsage,
-    Finish,
-    Error,
 }
 
-/// Writes, in the caller's transaction, the successor carrying the refresh's observation while
-/// the refreshed version is the head. Outputs whether a successor was written.
+/// Writes the successor carrying the refresh's observation while the refreshed version is the
+/// head, and outputs whether it did. A caller folds these calls into its own transaction.
 #[derive(Debug, PartialEq)]
 pub(crate) struct MintSuccessorOperation {
-    txn_id: TxnId,
+    ids: IdMint,
+    now_ms: u64,
     refresh: ReferenceRefresh,
     observation: SourceMetadata,
     predecessor: BlobVersion,
     state: MintState,
     /// The rows read and the binding whose record decides the successor's epoch.
-    pending: Option<(ReadRows, DistributionBinding)>,
+    pending: Option<(Vec<Option<Value>>, DistributionBinding)>,
     usage: Option<UsageCounterUpdate>,
-    output: Option<Result<bool, MintError>>,
 }
 
 impl MintSuccessorOperation {
     pub(crate) fn new(
-        txn_id: TxnId,
         refresh: ReferenceRefresh,
         observation: SourceMetadata,
         predecessor: BlobVersion,
     ) -> Self {
         Self {
-            txn_id,
+            ids: IdMint::default(),
+            now_ms: 0,
             refresh,
             observation,
             predecessor,
-            state: MintState::Init,
+            state: MintState::ReadRows,
             pending: None,
             usage: None,
-            output: None,
         }
     }
 
-    fn finish(&mut self, written: bool) -> Effects {
-        self.state = MintState::Finish;
-        self.output = Some(Ok(written));
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: MintError) -> Effects {
-        self.state = MintState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn write_successor(
-        &mut self,
-        values: Vec<(Key, Option<Value>)>,
-        epoch: OriginalEpoch,
-    ) -> Result<Effects, MintError> {
+    fn write_successor(&mut self, values: Vec<Option<Value>>, epoch: OriginalEpoch) -> MintTurn {
         let Some(writes) = self.successor_rows(values, epoch)? else {
-            return Ok(self.finish(false));
+            return Ok(Next::Done(false));
         };
         self.state = MintState::WriteRows;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(self.txn_id),
-        })])
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn head_key(&self) -> Result<Vec<u8>, ConversionError> {
         BlobHeadKey::new(&self.refresh.bucket, &self.refresh.key).to_bytes()
     }
 
-    fn read_rows(&mut self) -> Result<Effects, MintError> {
+    fn read_rows(&mut self) -> MintTurn {
         let bucket = ByteView::from(self.refresh.bucket.as_bytes().to_vec());
         let reads = vec![
             (BLOB_HEAD_KEYSPACE.to_string(), self.head_key()?.into()),
@@ -149,19 +129,16 @@ impl MintSuccessorOperation {
             ),
         ];
         self.state = MintState::ReadRows;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(self.txn_id),
-        })])
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
     /// The successor's rows once the head is still the refreshed version; `None` otherwise.
     fn successor_rows(
         &mut self,
-        values: Vec<(Key, Option<Value>)>,
+        values: Vec<Option<Value>>,
         epoch: OriginalEpoch,
     ) -> Result<Option<Vec<Row>>, MintError> {
-        let mut values = values.into_iter().map(|(_, value)| value);
+        let mut values = values.into_iter();
         let pointer = values
             .next()
             .flatten()
@@ -195,9 +172,9 @@ impl MintSuccessorOperation {
             return Ok(None);
         }
         let refresh = &self.refresh;
-        let now = SystemTime::now();
+        let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms);
         let hint = bucket.distribution.as_ref().map(DistributionBinding::hint);
-        let version_id = mint_version(hint);
+        let version_id = mint_version(self.ids.mint(self.now_ms), hint);
         let successor = BlobVersion::reference(
             source.clone(),
             self.observation.clone(),
@@ -265,55 +242,28 @@ impl MintSuccessorOperation {
         Ok(Some(writes))
     }
 
-    fn step_inner(&mut self, event: Event) -> Result<Effects, MintError> {
-        match (self.state, event) {
-            (MintState::ReadRows, Event::Storage(StorageEvent::BatchReadResult { values })) => {
-                let bucket = values
-                    .get(1)
-                    .and_then(|(_, value)| value.as_ref())
-                    .map(|value| BucketInfo::from_bytes(value.as_ref()))
-                    .transpose()?;
-                match bucket.and_then(|bucket| bucket.distribution) {
-                    Some(binding) => {
-                        // Read in the mint transaction, so a fence set meanwhile conflicts it.
-                        self.state = MintState::ReadRecord;
-                        let read = authority_read(binding.set_id, Some(self.txn_id));
-                        self.pending = Some((values, binding));
-                        Ok(smallvec![read])
-                    }
-                    None => self.write_successor(values, OriginalEpoch::default()),
-                }
+    fn rows_read(&mut self, values: Vec<Option<Value>>) -> MintTurn {
+        let bucket = (values.get(1).and_then(Option::as_ref))
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?;
+        let Some(binding) = bucket.and_then(|bucket| bucket.distribution) else {
+            return self.write_successor(values, OriginalEpoch::default());
+        };
+        // Read in the mint transaction, so a fence set meanwhile conflicts it.
+        self.state = MintState::ReadRecord;
+        let read = authority_read(binding.set_id, None);
+        self.pending = Some((values, binding));
+        Ok(Next::Call(read.into()))
+    }
+
+    fn rows_written(&mut self) -> MintTurn {
+        match self.usage.as_mut().filter(|usage| !usage.is_noop()) {
+            Some(usage) => {
+                let call = usage.start_calls(self.ids.mint(self.now_ms)).into_call();
+                self.state = MintState::UpdateUsage;
+                Ok(Next::Call(call))
             }
-            (
-                MintState::ReadRecord,
-                event @ Event::Storage(StorageEvent::BatchReadResult { .. }),
-            ) => {
-                let (values, binding) = self.pending.take().ok_or(StorageError::InvalidEffect)?;
-                let epoch = record_epoch(&binding, &self.refresh.key, event)?;
-                self.write_successor(values, epoch)
-            }
-            (MintState::WriteRows, Event::Storage(StorageEvent::BatchWriteResult { .. })) => {
-                match self.usage.as_mut().filter(|usage| !usage.is_noop()) {
-                    Some(usage) => {
-                        self.state = MintState::UpdateUsage;
-                        Ok(usage.start(self.txn_id))
-                    }
-                    None => Ok(self.finish(true)),
-                }
-            }
-            (MintState::UpdateUsage, event @ Event::Storage(_)) => {
-                let txn_id = self.txn_id;
-                let usage = self.usage.as_mut().ok_or(StorageError::InvalidEffect)?;
-                match usage.step(event, txn_id)? {
-                    Some(effects) => Ok(effects),
-                    None => Ok(self.finish(true)),
-                }
-            }
-            (_, Event::Storage(StorageEvent::Error { error })) => Err(error.into()),
-            (state, event) => Err(MintError::UnexpectedEvent {
-                state,
-                received: format!("{event:?}"),
-            }),
+            None => Ok(Next::Done(true)),
         }
     }
 }
@@ -322,7 +272,7 @@ impl Operation for MintSuccessorOperation {
     type Output = bool;
     type Error = MintError;
 
-    fn start(&mut self) -> Effects {
+    fn first(&mut self) -> MintTurn {
         let exhausted = match &self.predecessor.state {
             BlobVersionState::Reference { advance_count, .. } => {
                 *advance_count >= MAX_AUTO_ADVANCES
@@ -330,38 +280,44 @@ impl Operation for MintSuccessorOperation {
             _ => true,
         };
         if exhausted {
-            return self.finish(false);
+            return Ok(Next::Done(false));
         }
-        match self.read_rows() {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
+        self.read_rows()
+    }
+
+    fn next(&mut self, result: IoResult) -> MintTurn {
+        match self.state {
+            MintState::ReadRows => self.rows_read(result.values()?),
+            MintState::ReadRecord => {
+                let event = result.event()?;
+                let (values, binding) = self.pending.take().ok_or(IoError::Unfinished)?;
+                let epoch = record_epoch(&binding, &self.refresh.key, event)?;
+                self.write_successor(values, epoch)
+            }
+            MintState::WriteRows => {
+                result.done()?;
+                self.rows_written()
+            }
+            MintState::UpdateUsage => {
+                let usage = self.usage.as_mut().ok_or(IoError::Unfinished)?;
+                Ok(match usage.step_calls(result)? {
+                    Some(call) => Next::Call(call.into_call()),
+                    None => Next::Done(true),
+                })
+            }
         }
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if matches!(self.state, MintState::Finish | MintState::Error) {
-            return smallvec![];
-        }
-        match self.step_inner(event) {
-            Ok(effects) => effects,
-            Err(error) => self.fail(error),
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, MintState::Finish | MintState::Error)
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(MintError::UnexpectedEvent {
-            state: self.state,
-            received: "no output".to_string(),
-        }))
-    }
-
-    /// The transaction belongs to the caller, which aborts it.
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 }
 
@@ -379,14 +335,10 @@ mod tests {
     use ulid::Ulid;
 
     fn observation(content_length: u64) -> SourceMetadata {
-        SourceMetadata {
+        aruna_test_support::staging::sized_source(
             content_length,
-            content_type: None,
-            etag: Some(format!("etag-{content_length}")),
-            last_modified: None,
-            source_version: None,
-            digests: Default::default(),
-        }
+            Some(format!("etag-{content_length}")),
+        )
     }
 
     fn mint(version_id: Ulid) -> MintSuccessorOperation {
@@ -422,12 +374,7 @@ mod tests {
                 session: None,
             },
         };
-        MintSuccessorOperation::new(
-            Ulid::from_bytes([1; 16]),
-            refresh,
-            observation(2),
-            predecessor,
-        )
+        MintSuccessorOperation::new(refresh, observation(2), predecessor)
     }
 
     fn bucket() -> BucketInfo {
@@ -447,11 +394,11 @@ mod tests {
     // A key under a permanent purge gets no successor; the refresh fails and is retried.
     #[test]
     fn purge_fence_suspends() {
-        use aruna_core::structs::execution::job::JobId;
+        use aruna_core::structs::execution::job::identity::JobId;
         use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
         let version_id = Ulid::from_bytes([2; 16]);
         let mut operation = mint(version_id);
-        operation.start();
+        operation.first().unwrap();
         let fence = StoragePurgeFence {
             job_id: JobId::from_bytes([6; 16]),
             scope: StoragePurgeScope::Bucket {
@@ -459,25 +406,14 @@ mod tests {
             },
         };
         let head = CurrentVersionPointer::new(version_id);
-        let values = vec![
-            (
-                Key::from(b"head".to_vec()),
-                Some(head.to_bytes().unwrap().into()),
-            ),
-            (
-                Key::from(b"bucket".to_vec()),
-                Some(bucket().to_bytes().unwrap().into()),
-            ),
-            (
-                Key::from(b"fence".to_vec()),
-                Some(fence.to_bytes().unwrap().into()),
-            ),
-        ];
-
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let values = IoResult::Values(vec![
+            Some(head.to_bytes().unwrap().into()),
+            Some(bucket().to_bytes().unwrap().into()),
+            Some(fence.to_bytes().unwrap().into()),
+        ]);
 
         assert_eq!(
-            operation.finalize(),
+            operation.next(values),
             Err(MintError::Purge(PurgeFenceError::Suspended))
         );
     }
@@ -487,26 +423,20 @@ mod tests {
     fn successor_books_bucket() {
         let version_id = Ulid::from_bytes([2; 16]);
         let mut operation = mint(version_id);
-        operation.start();
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        operation.first().unwrap();
         let head = CurrentVersionPointer::new(version_id);
-        let values = vec![
-            (
-                Key::from(b"head".to_vec()),
-                Some(head.to_bytes().unwrap().into()),
-            ),
-            (
-                Key::from(b"bucket".to_vec()),
-                Some(bucket().to_bytes().unwrap().into()),
-            ),
-            (Key::from(b"fence".to_vec()), None),
-        ];
-        operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        let values = IoResult::Values(vec![
+            Some(head.to_bytes().unwrap().into()),
+            Some(bucket().to_bytes().unwrap().into()),
+            None,
+        ]);
+        let turn = operation.next(values);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
+        let turn = operation.next(IoResult::Done);
 
-        let [Effect::Storage(StorageEffect::AddUsage { buckets, .. })] = effects.as_slice() else {
-            panic!("expected the usage update, got {effects:?}");
+        let Ok(Next::Call(IoCall::AddUsage { buckets, .. })) = &turn else {
+            panic!("expected the usage update, got {turn:?}");
         };
         assert_eq!(buckets.len(), 1);
         assert_eq!(buckets[0].1.versions, 1);
@@ -516,25 +446,14 @@ mod tests {
     #[test]
     fn stale_head_skipped() {
         let mut operation = mint(Ulid::from_bytes([2; 16]));
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Storage(StorageEffect::BatchRead { .. })]
-        ));
+        assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
         let newer = CurrentVersionPointer::new(Ulid::from_bytes([3; 16]));
-        let values = vec![
-            (
-                Key::from(b"head".to_vec()),
-                Some(newer.to_bytes().unwrap().into()),
-            ),
-            (
-                Key::from(b"bucket".to_vec()),
-                Some(bucket().to_bytes().unwrap().into()),
-            ),
-        ];
+        let values = IoResult::Values(vec![
+            Some(newer.to_bytes().unwrap().into()),
+            Some(bucket().to_bytes().unwrap().into()),
+            None,
+        ]);
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-
-        assert!(effects.is_empty());
-        assert_eq!(operation.finalize(), Ok(false));
+        assert_eq!(operation.next(values), Ok(Next::Done(false)));
     }
 }

@@ -5,87 +5,32 @@
 use aruna_core::admin_documents::{
     AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
-use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission, Role};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId};
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::sync::document_outbox::{
+use crate::realm::write_stage::{WriteStage, WriteStep};
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::sync::replicate_documents::replicate_documents_effect;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RealmRoleConfig {
     pub actor: Actor,
     pub realm_id: RealmId,
     pub role: Role,
-}
-
-#[derive(PartialEq)]
-pub struct RealmRoleOperation {
-    input: RealmRoleConfig,
-    state: RealmRoleState,
-    output: Option<Result<RealmAuthorizationDocument, RealmRoleError>>,
-    narrowed: bool,
-}
-
-impl std::fmt::Debug for RealmRoleOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RealmRoleOperation")
-            .field("input", &self.input)
-            .field("state", &self.state)
-            .field("output", &self.output)
-            .finish()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum RealmRoleState {
-    Init,
-    Auth,
-    StartTransaction,
-    GetAdminState {
-        txn_id: TxnId,
-    },
-    WriteAuthState {
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
-    },
-    DeleteAdminConflicts {
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    CommitTransaction {
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    },
-    ScheduleDocumentDrain {
-        auth_doc: RealmAuthorizationDocument,
-    },
-    AnnounceAuthDoc {
-        auth_doc: RealmAuthorizationDocument,
-    },
-    Finish,
-    Error,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -98,8 +43,6 @@ pub enum RealmRoleError {
     AdminDocumentError(#[from] AdminDocumentError),
     #[error("topic announcement failed: {0}")]
     TopicAnnouncement(String),
-    #[error("No transaction found")]
-    NoTransactionFound,
     #[error("Unauthorized")]
     Unauthorized,
     #[error("No realm authorization document found")]
@@ -114,12 +57,29 @@ pub enum RealmRoleError {
     CheckPermissionsError(#[from] AuthorizationError),
     #[error("Adding role to realm did not finish")]
     NotFinished,
-    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    #[error("Unexpected event in state {state}: expected {expected}, got {got}")]
     UnexpectedEvent {
-        state: RealmRoleState,
+        state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
+}
+
+impl From<IoError> for RealmRoleError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "RealmRole".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 const REALM_ROLE_NAMES: &[&str] = &["realm_admin"];
@@ -128,58 +88,23 @@ fn reserved_role_name(name: &str) -> bool {
     REALM_ROLE_NAMES.contains(&name.trim())
 }
 
-impl RealmRoleOperation {
-    pub fn new(input: RealmRoleConfig) -> Self {
-        RealmRoleOperation {
-            input,
-            state: RealmRoleState::Init,
-            output: None,
-            narrowed: false,
-        }
-    }
-
-    fn handle_start_transaction(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.unexpected_event(
-                RealmRoleState::StartTransaction,
-                "Event::Storage(StorageEvent::TransactionStarted)",
-                got,
-            );
-        };
-        match self.emit_auth_read(txn_id) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
-        }
-    }
-
-    fn auth_context(&self) -> AuthContext {
-        AuthContext {
-            user_id: self.input.actor.user_id,
-            realm_id: self.input.actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
-    }
-
-    fn validate_role(&self) -> Result<(), RealmRoleError> {
-        if reserved_role_name(&self.input.role.name) {
+impl RealmRoleConfig {
+    fn validate(&self) -> Result<(), RealmRoleError> {
+        if reserved_role_name(&self.role.name) {
             return Err(RealmRoleError::ReservedRoleName);
         }
 
         if self
-            .input
             .role
             .assigned_users
             .iter()
-            .any(|user| user.is_nil() && !user.is_nil_in(self.input.realm_id))
+            .any(|user| user.is_nil() && !user.is_nil_in(self.realm_id))
         {
             return Err(RealmRoleError::InvalidAssignedUser);
         }
 
-        if self.input.role.is_public(self.input.realm_id)
+        if self.role.is_public(self.realm_id)
             && self
-                .input
                 .role
                 .permissions
                 .values()
@@ -190,84 +115,140 @@ impl RealmRoleOperation {
 
         Ok(())
     }
+}
 
-    fn handle_authorization(&mut self, event: Event) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
-            return self.unexpected_event(
-                RealmRoleState::Auth,
-                "Event::SubOperation(SubOperationEvent::AuthorizationResult)",
-                got,
-            );
-        };
+/// The written document, and whether admin events reached the outbox.
+type WrittenRole = (RealmAuthorizationDocument, bool);
 
-        match self.emit_start_transaction(allowed) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+/// What the role creation waits for after the caller check.
+#[derive(Debug, PartialEq)]
+enum Step {
+    Check,
+    Write,
+    Announce,
+}
+
+/// Checks the caller, writes the role in one write transaction, then wakes the outbox drain or,
+/// when nothing reached the outbox, announces the document and waits for the announcement.
+#[derive(Debug, PartialEq)]
+pub struct RealmRoleOperation {
+    input: RealmRoleConfig,
+    step: Step,
+    document: Option<RealmAuthorizationDocument>,
+}
+
+impl RealmRoleOperation {
+    pub fn new(input: RealmRoleConfig) -> Self {
+        RealmRoleOperation {
+            input,
+            step: Step::Check,
+            document: None,
         }
     }
 
-    fn emit_start_transaction(
+    fn written(
         &mut self,
-        auth_result: Result<bool, AuthorizationError>,
-    ) -> Result<Effects, RealmRoleError> {
-        if auth_result? {
-            self.state = RealmRoleState::StartTransaction;
-            Ok(smallvec![Effect::Storage(
-                StorageEffect::StartTransaction { read: false }
-            )])
-        } else {
-            Err(RealmRoleError::Unauthorized)
+        result: IoResult,
+    ) -> Result<Next<RealmAuthorizationDocument>, RealmRoleError> {
+        let (document, outbox) = result.child::<WrittenRole, RealmRoleError>()??;
+        if outbox {
+            // A failed drain timer leaves the durable outbox retryable.
+            let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+            return Ok(Next::Then {
+                output: document,
+                calls,
+            });
+        }
+        let announce = super::announce_call(
+            &self.input.actor,
+            DocumentTarget::RealmAuthorization {
+                realm_id: document.realm_id,
+            },
+        );
+        let announce = announce.ok_or(RealmRoleError::NotFinished)?;
+        self.document = Some(document);
+        self.step = Step::Announce;
+        Ok(Next::Call(announce))
+    }
+
+    fn announced(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<RealmAuthorizationDocument>, RealmRoleError> {
+        let outcome = super::announced(result).map_err(|got| RealmRoleError::UnexpectedEvent {
+            state: "Announce".to_string(),
+            expected: "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
+            got,
+        })?;
+        outcome.map_err(RealmRoleError::TopicAnnouncement)?;
+        self.document
+            .take()
+            .map(Next::Done)
+            .ok_or(RealmRoleError::NotFinished)
+    }
+}
+
+impl Operation for RealmRoleOperation {
+    type Output = RealmAuthorizationDocument;
+    type Error = RealmRoleError;
+
+    fn first(&mut self) -> Result<Next<RealmAuthorizationDocument>, RealmRoleError> {
+        self.input.validate()?;
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: AuthContext::from(&self.input.actor),
+                path: format!(
+                    "/{}/admin/roles/{}",
+                    self.input.realm_id, self.input.role.role_id
+                ),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<RealmAuthorizationDocument>, RealmRoleError> {
+        match self.step {
+            Step::Check => {
+                if !result.child::<bool, AuthorizationError>()?? {
+                    return Err(RealmRoleError::Unauthorized);
+                }
+                self.step = Step::Write;
+                Ok(Next::Call(IoCall::child(RoleWrite::new(
+                    self.input.clone(),
+                ))))
+            }
+            Step::Write => self.written(result),
+            Step::Announce => self.announced(result),
         }
     }
+}
 
-    fn emit_auth_read(&mut self, txn_id: TxnId) -> Result<Effects, RealmRoleError> {
-        self.state = RealmRoleState::GetAdminState { txn_id };
-        let target = AdminDocumentTarget::Realm {
-            realm_id: self.input.realm_id,
-        };
-        let auth_key = (*self.input.realm_id.as_bytes()).into();
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (AUTH_KEYSPACE.to_string(), auth_key),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })])
-    }
+/// Reads the realm authorization and its admin state, writes the role, and marks key epochs due
+/// when it narrowed access, in one write transaction.
+#[derive(Debug, PartialEq)]
+struct RoleWrite {
+    input: RealmRoleConfig,
+    write: WriteStage,
+    written: Option<WrittenRole>,
+}
 
-    fn handle_auth_read(&mut self, event: Event, txn_id: TxnId) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult)",
-                got,
-            );
-        };
-        let [(_, auth_doc_value), (_, reducer_state_value)] = values.as_slice() else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchReadResult) with auth doc and admin state values",
-                got,
-            );
-        };
-
-        match self.emit_auth_write(txn_id, auth_doc_value.clone(), reducer_state_value.clone()) {
-            Ok(effects) => effects,
-            Err(err) => self.fail(err),
+impl RoleWrite {
+    fn new(input: RealmRoleConfig) -> Self {
+        Self {
+            input,
+            write: WriteStage::default(),
+            written: None,
         }
     }
 
     fn emit_auth_write(
         &mut self,
-        txn_id: TxnId,
         auth_doc: Option<ByteView>,
         reducer_state_value: Option<ByteView>,
-    ) -> Result<Effects, RealmRoleError> {
+    ) -> Result<Next<WrittenRole>, RealmRoleError> {
         let mut auth_doc = RealmAuthorizationDocument::from_bytes(
             &auth_doc.ok_or_else(|| RealmRoleError::RealmDocMissing)?,
         )?;
@@ -291,16 +272,18 @@ impl RealmRoleOperation {
         let mut reducer_state = previous_reducer_state
             .clone()
             .unwrap_or_else(|| AdminDocumentState::new(target));
-        let admin_events = apply_reducer_updates(&mut reducer_state, &self.input)?;
+        let admin_events = apply_reducer_updates(
+            &mut reducer_state,
+            &self.input,
+            &mut self.write.ids,
+            self.write.now_ms,
+        )?;
         let roles_before = auth_doc.roles.clone();
         materialize_realm_role(&mut auth_doc, &self.input.role, &reducer_state);
-        self.narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
+        let narrowed = aruna_core::admin_documents::roles_narrowed(&roles_before, &auth_doc.roles);
 
-        let conflict_delete_keys: Vec<_> =
-            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state))
-                .into_iter()
-                .map(|(key_space, key)| (key_space, key.as_ref().to_vec()))
-                .collect();
+        let conflict_delete_keys =
+            stale_conflict_deletes(previous_reducer_state.as_ref(), Some(&reducer_state));
 
         let mut writes = vec![
             (
@@ -329,299 +312,46 @@ impl RealmRoleOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.state = RealmRoleState::WriteAuthState {
-            txn_id,
-            auth_doc,
-            admin_outbox_written: !admin_events.is_empty(),
-            conflict_delete_keys,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.written = Some((auth_doc, !admin_events.is_empty()));
+        self.write.written(conflict_delete_keys, narrowed);
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn handle_auth_write(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-        conflict_delete_keys: Vec<(KeySpace, Vec<u8>)>,
-    ) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchWriteResult)",
-                got,
-            );
-        };
-
-        if !conflict_delete_keys.is_empty() {
-            self.state = RealmRoleState::DeleteAdminConflicts {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-            };
-            let deletes = conflict_delete_keys
-                .into_iter()
-                .map(|(key_space, key)| (key_space, Key::from(key)))
-                .collect();
-            return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                deletes,
-                txn_id: Some(txn_id),
-            })];
-        }
-
-        self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
-    }
-
-    fn delete_stale_conflicts(
-        &mut self,
-        event: Event,
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::BatchDeleteResult { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::BatchDeleteResult)",
-                got,
-            );
-        };
-
-        self.emit_commit_transaction(txn_id, auth_doc, admin_outbox_written)
-    }
-
-    fn emit_commit_transaction(
-        &mut self,
-        txn_id: TxnId,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        self.state = RealmRoleState::CommitTransaction {
-            txn_id,
-            auth_doc,
-            admin_outbox_written,
-        };
-        if self.narrowed {
-            return smallvec![crate::abe::mark_due(None, txn_id)];
-        }
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn handle_commit_transaction(
-        &mut self,
-        event: Event,
-        auth_doc: RealmAuthorizationDocument,
-        admin_outbox_written: bool,
-    ) -> Effects {
-        let got = format!("{event:?}");
-        let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::Storage(StorageEvent::TransactionCommitted)",
-                got,
-            );
-        };
-        if admin_outbox_written {
-            self.state = RealmRoleState::ScheduleDocumentDrain { auth_doc };
-            return smallvec![schedule_drain_effect()];
-        }
-
-        self.emit_auth_announce(auth_doc)
-    }
-
-    fn schedule_outbox_drain(
-        &mut self,
-        event: Event,
-        auth_doc: RealmAuthorizationDocument,
-    ) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => {
-                self.state = RealmRoleState::Finish;
-                self.output = Some(Ok(auth_doc));
-                smallvec![]
-            }
-            other => self.unexpected_event(
-                self.state.clone(),
-                "admin document outbox drain timer schedule",
-                format!("{other:?}"),
-            ),
-        }
-    }
-
-    fn emit_auth_announce(&mut self, auth_doc: RealmAuthorizationDocument) -> Effects {
-        self.state = RealmRoleState::AnnounceAuthDoc {
-            auth_doc: auth_doc.clone(),
-        };
-        let document = DocumentTarget::RealmAuthorization {
-            realm_id: auth_doc.realm_id,
-        };
-        smallvec![replicate_documents_effect(
-            self.input.actor.realm_id,
-            self.input.actor.node_id,
-            vec![document],
-        )]
-    }
-
-    fn handle_auth_announce(
-        &mut self,
-        event: Event,
-        auth_doc: RealmAuthorizationDocument,
-    ) -> Effects {
-        let got = format!("{event:?}");
-        let Event::SubOperation(SubOperationEvent::DocumentSyncResult { result }) = event else {
-            return self.unexpected_event(
-                self.state.clone(),
-                "Event::SubOperation(SubOperationEvent::DocumentSyncResult)",
-                got,
-            );
-        };
-        if let Err(error) = result {
-            return self.fail(RealmRoleError::TopicAnnouncement(error));
-        }
-        self.state = RealmRoleState::Finish;
-        self.output = Some(Ok(auth_doc));
-        smallvec![]
-    }
-
-    fn fail(&mut self, err: RealmRoleError) -> Effects {
-        self.state = RealmRoleState::Error;
-        self.output = Some(Err(err));
-        self.abort()
-    }
-
-    fn fail_with_cleanup(&mut self, err: RealmRoleError, cleanup_effects: Effects) -> Effects {
-        self.state = RealmRoleState::Error;
-        self.output = Some(Err(err));
-        cleanup_effects
-    }
-
-    fn unexpected_event(
-        &mut self,
-        state: RealmRoleState,
-        expected: &'static str,
-        got: String,
-    ) -> Effects {
-        let cleanup_effects = self.abort();
-        self.fail_with_cleanup(
-            RealmRoleError::UnexpectedEvent {
-                state,
-                expected,
-                got,
-            },
-            cleanup_effects,
-        )
-    }
-
-    fn fail_storage_error(&mut self, event: Event) -> Result<Event, Effects> {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return Err(self.fail(error.into()));
-        }
-
-        Ok(event)
+    fn finish(&mut self) -> Result<Next<WrittenRole>, RealmRoleError> {
+        self.written
+            .take()
+            .map(Next::Done)
+            .ok_or(RealmRoleError::NotFinished)
     }
 }
 
-impl Operation for RealmRoleOperation {
-    type Output = RealmAuthorizationDocument;
-
+impl Operation for RoleWrite {
+    type Output = WrittenRole;
     type Error = RealmRoleError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = self.validate_role() {
-            return self.fail(error);
-        }
-
-        self.state = RealmRoleState::Auth;
-
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.auth_context(),
-                path: format!(
-                    "/{}/admin/roles/{}",
-                    self.input.realm_id, self.input.role.role_id
-                ),
-                required_permission: Permission::WRITE,
-            }),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+    fn seed(&mut self, entropy: u128) {
+        self.write.ids = IdMint::new(entropy);
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match self.fail_storage_error(event) {
-            Ok(event) => event,
-            Err(effects) => return effects,
-        };
-        if let RealmRoleState::CommitTransaction { txn_id, .. } = self.state
-            && let Some(next) = crate::abe::marked(&event, txn_id)
-        {
-            return next.unwrap_or_else(|error| self.fail(error.into()));
-        }
-
-        match self.state.clone() {
-            RealmRoleState::Auth => self.handle_authorization(event),
-            RealmRoleState::StartTransaction => self.handle_start_transaction(event),
-            RealmRoleState::GetAdminState { txn_id } => self.handle_auth_read(event, txn_id),
-            RealmRoleState::WriteAuthState {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-            } => self.handle_auth_write(
-                event,
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-                conflict_delete_keys,
-            ),
-            RealmRoleState::DeleteAdminConflicts {
-                txn_id,
-                auth_doc,
-                admin_outbox_written,
-            } => self.delete_stale_conflicts(event, txn_id, auth_doc, admin_outbox_written),
-            RealmRoleState::CommitTransaction {
-                auth_doc,
-                admin_outbox_written,
-                ..
-            } => self.handle_commit_transaction(event, auth_doc, admin_outbox_written),
-            RealmRoleState::ScheduleDocumentDrain { auth_doc } => {
-                self.schedule_outbox_drain(event, auth_doc)
-            }
-            RealmRoleState::AnnounceAuthDoc { auth_doc } => {
-                self.handle_auth_announce(event, auth_doc)
-            }
-            RealmRoleState::Init | RealmRoleState::Finish | RealmRoleState::Error => {
-                smallvec![]
-            }
-        }
+    fn stamp(&mut self, now_ms: u64) {
+        self.write.stamp(now_ms);
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, RealmRoleState::Finish | RealmRoleState::Error)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or_else(|| RealmRoleError::NotFinished)?
+    fn first(&mut self) -> Result<Next<WrittenRole>, RealmRoleError> {
+        Ok(Next::Call(crate::realm::authorization_reads(
+            self.input.realm_id,
+        )))
     }
 
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            RealmRoleState::GetAdminState { txn_id }
-            | RealmRoleState::WriteAuthState { txn_id, .. }
-            | RealmRoleState::DeleteAdminConflicts { txn_id, .. }
-            | RealmRoleState::CommitTransaction { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<WrittenRole>, RealmRoleError> {
+        match self.write.step(result)? {
+            WriteStep::Read([auth_doc, reducer]) => self.emit_auth_write(auth_doc, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }
@@ -629,6 +359,8 @@ impl Operation for RealmRoleOperation {
 fn apply_reducer_updates(
     state: &mut AdminDocumentState,
     input: &RealmRoleConfig,
+    ids: &mut IdMint,
+    now_ms: u64,
 ) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
     let mut admin_events = Vec::new();
     let event = state.apply_operation(
@@ -636,6 +368,7 @@ fn apply_reducer_updates(
         AdminDocumentOperation::RealmRoleCreated {
             role: AdminRoleDefinition::from(&input.role),
         },
+        ids.mint(now_ms),
     )?;
     admin_events.push(event);
 
@@ -646,6 +379,7 @@ fn apply_reducer_updates(
                 role_id: input.role.role_id,
                 user_id,
             },
+            ids.mint(now_ms),
         )?;
         admin_events.push(event);
     }
@@ -688,19 +422,16 @@ fn materialize_realm_role(
 pub mod test {
     use std::collections::{HashMap, HashSet};
 
-    use crate::driver::{DriverContext, drive};
     use crate::realm::add_role::{
-        RealmRoleConfig, RealmRoleError, RealmRoleOperation, RealmRoleState,
+        RealmRoleConfig, RealmRoleError, RealmRoleOperation, RoleWrite, Step,
     };
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentDot, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
     };
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{
         AUTH_KEYSPACE, DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
     };
@@ -709,9 +440,10 @@ pub mod test {
     use aruna_core::storage_entries::{reducer_conflict_key, reducer_state_key};
     use aruna_core::structs::identity::auth::{Actor, Permission, Role};
     use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
-    use aruna_core::task::{TaskEvent, TaskKey};
-    use aruna_core::types::TxnId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
@@ -742,8 +474,7 @@ pub mod test {
                 },
             });
 
-            assert!(operation.start().is_empty());
-            assert_eq!(operation.finalize(), Err(RealmRoleError::ReservedRoleName));
+            assert_eq!(operation.first(), Err(RealmRoleError::ReservedRoleName));
         }
     }
 
@@ -769,8 +500,7 @@ pub mod test {
                 },
             });
 
-            assert!(operation.start().is_empty());
-            assert_eq!(operation.finalize(), Err(RealmRoleError::InvalidPublicRole));
+            assert_eq!(operation.first(), Err(RealmRoleError::InvalidPublicRole));
         }
     }
 
@@ -795,11 +525,7 @@ pub mod test {
             },
         });
 
-        assert!(operation.start().is_empty());
-        assert_eq!(
-            operation.finalize(),
-            Err(RealmRoleError::InvalidAssignedUser)
-        );
+        assert_eq!(operation.first(), Err(RealmRoleError::InvalidAssignedUser));
     }
 
     #[test]
@@ -811,7 +537,7 @@ pub mod test {
             user_id: UserId::local(Ulid::from_bytes([2u8; 16]), realm_id),
             realm_id,
         };
-        let mut operation = RealmRoleOperation::new(RealmRoleConfig {
+        let operation = RealmRoleOperation::new(RealmRoleConfig {
             actor: actor.clone(),
             realm_id,
             role: Role {
@@ -824,35 +550,18 @@ pub mod test {
                 )]),
             },
         });
+        let mut operation = RoleWrite::new(operation.input.clone());
         let auth_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
-        let txn_id = TxnId::generate();
-        operation.start();
-        operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+        operation.first().unwrap();
+        let read = IoResult::Values(vec![Some(auth_doc.to_bytes(&actor).unwrap().into()), None]);
+        assert!(matches!(
+            operation.next(read),
+            Ok(Next::Call(IoCall::Write(_)))
         ));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    (*realm_id.as_bytes()).into(),
-                    Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                ),
-                (realm_id.as_bytes().to_vec().into(), None),
-            ],
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        let marking = operation.next(IoResult::Done);
         assert!(
-            matches!(effects.as_slice(), [Effect::SubOperation(_)]),
-            "got {effects:?}"
-        );
-        let effects = operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::EpochsMarked { result: Ok(()) },
-        ));
-        assert_eq!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
+            matches!(marking, Ok(Next::Call(IoCall::Page { .. }))),
+            "got {marking:?}"
         );
     }
 
@@ -940,53 +649,35 @@ pub mod test {
         let mut expected_auth_doc = auth_doc.clone();
         expected_auth_doc.roles.insert(role_id, input.role.clone());
 
-        let mut operation = RealmRoleOperation::new(input.clone());
+        let mut checked = RealmRoleOperation::new(input.clone());
+        assert!(matches!(checked.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let allowed = IoResult::Child(ChildOutcome::new(Ok::<
+            bool,
+            aruna_core::errors::AuthorizationError,
+        >(true)));
         assert!(matches!(
-            operation.start().first(),
-            Some(Effect::SubOperation(_))
+            checked.next(allowed),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        let effects = operation.step(Event::SubOperation(
-            aruna_core::events::SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
+
+        let mut operation = RoleWrite::new(input.clone());
         assert_eq!(
-            effects.first().unwrap(),
-            &Effect::Storage(StorageEffect::StartTransaction { read: false })
-        );
-        let txn_id = TxnId::generate();
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert_eq!(
-            effects.first().unwrap(),
-            &Effect::Storage(StorageEffect::BatchRead {
-                reads: vec![
-                    (AUTH_KEYSPACE.to_string(), (*realm_id.as_bytes()).into()),
-                    (
-                        DOCUMENT_STATE_KEYSPACE.to_string(),
-                        reducer_state_key(&target),
-                    ),
-                ],
-                txn_id: Some(txn_id),
-            })
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(vec![
+                (AUTH_KEYSPACE.to_string(), (*realm_id.as_bytes()).into()),
+                (
+                    DOCUMENT_STATE_KEYSPACE.to_string(),
+                    reducer_state_key(&target),
+                ),
+            ])))
         );
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    (*realm_id.as_bytes()).into(),
-                    Some(auth_doc.to_bytes(&actor).unwrap().into()),
-                ),
-                (
-                    reducer_state_key(&target),
-                    Some(postcard::to_allocvec(&previous_state).unwrap().into()),
-                ),
-            ],
-        }));
-        let write_effect = effects.first().unwrap();
-        match write_effect {
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: effect_txn_id,
-            }) => {
-                assert_eq!(effect_txn_id, &Some(txn_id));
+        let turn = operation.next(IoResult::Values(vec![
+            Some(auth_doc.to_bytes(&actor).unwrap().into()),
+            Some(postcard::to_allocvec(&previous_state).unwrap().into()),
+        ]));
+        match turn {
+            Ok(Next::Call(IoCall::Write(writes))) => {
                 let auth_write = writes
                     .iter()
                     .find(|(keyspace, _, _)| keyspace == AUTH_KEYSPACE)
@@ -1043,48 +734,24 @@ pub mod test {
                     keyspace == DOCUMENT_CONFLICT_KEYSPACE && key == &stale_conflict_key
                 }));
             }
-            other => panic!("unexpected realm role write effect: {other:?}"),
+            other => panic!("unexpected realm role write call: {other:?}"),
         }
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
+        let deletes = vec![(DOCUMENT_CONFLICT_KEYSPACE.to_string(), stale_conflict_key)];
         assert_eq!(
-            effects.first().unwrap(),
-            &Effect::Storage(StorageEffect::BatchDelete {
-                deletes: vec![(DOCUMENT_CONFLICT_KEYSPACE.to_string(), stale_conflict_key,)],
-                txn_id: Some(txn_id),
-            })
+            operation.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(deletes)))
         );
-        let effects = operation.step(Event::Storage(StorageEvent::BatchDeleteResult {
-            entries: Vec::new(),
-        }));
         assert_eq!(
-            effects.first().unwrap(),
-            &Effect::Storage(StorageEffect::CommitTransaction { txn_id })
+            operation.next(IoResult::Done),
+            Ok(Next::Done((expected_auth_doc, true)))
         );
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert!(matches!(effects.first(), Some(Effect::Task(_))));
-        assert_eq!(
-            operation.state,
-            RealmRoleState::ScheduleDocumentDrain {
-                auth_doc: expected_auth_doc.clone(),
-            }
-        );
-
-        let effects = operation.step(Event::Task(TaskEvent::TimerScheduled {
-            key: TaskKey::DrainSyncOutbox,
-            after: std::time::Duration::ZERO,
-        }));
-        assert!(effects.is_empty());
-        assert_eq!(operation.state, RealmRoleState::Finish);
-        assert_eq!(operation.finalize().unwrap(), expected_auth_doc);
     }
 
     #[test]
-    pub fn outbox_error_finishes() {
+    pub fn outbox_drain_after() {
+        // With admin events in the outbox the drain timer runs after the write; its failure is
+        // only logged, so the document is the outcome either way.
         let realm_id = aruna_core::structs::identity::realm::RealmId([6u8; 32]);
         let user_id = UserId::local(Ulid::from_bytes([7u8; 16]), realm_id);
         let actor = Actor {
@@ -1108,18 +775,13 @@ pub mod test {
             realm_id,
             role,
         });
-        operation.state = RealmRoleState::ScheduleDocumentDrain {
-            auth_doc: auth_doc.clone(),
+        operation.step = Step::Write;
+        let written = ChildOutcome::new(Ok::<_, RealmRoleError>((auth_doc.clone(), true)));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Child(written)) else {
+            panic!("expected the document with the drain timer");
         };
-
-        let effects = operation.step(Event::Task(TaskEvent::Error {
-            key: Some(TaskKey::DrainSyncOutbox),
-            message: "schedule failed".to_string(),
-        }));
-
-        assert!(effects.is_empty());
-        assert_eq!(operation.state, RealmRoleState::Finish);
-        assert_eq!(operation.finalize().unwrap(), auth_doc);
+        assert_eq!(output, auth_doc);
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
     }
 
     fn conflict_dot(seed: u8, origin_seq: u64) -> AdminDocumentDot {
@@ -1134,7 +796,7 @@ pub mod test {
     pub async fn test_add_role() {
         let random_path = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
         let net_handle = NetHandle::new(
             NetConfig {
                 bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -1151,9 +813,10 @@ pub mod test {
         let context = DriverContext {
             storage_handle,
             net_handle: Some(net_handle.clone()),
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle),
             compute_handle: None,
+            outbound_handle: None,
             blob_handle: None,
         };
 

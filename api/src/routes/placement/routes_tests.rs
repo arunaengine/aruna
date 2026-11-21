@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{ObjectPlacementQuery, get_object_placement};
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -29,9 +29,10 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::Extension;
 use axum::extract::{Path, Query, State};
 use byteview::ByteView;
@@ -43,7 +44,7 @@ use ulid::Ulid;
 const BUCKET: &str = "datasets";
 const KEY: &str = "raw/sample.fastq";
 
-fn node_id() -> aruna_core::NodeId {
+fn node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[3u8; 32]).public()
 }
 
@@ -100,9 +101,10 @@ async fn setup(owner: UserId) -> (TempDir, Arc<ServerState>, Ulid) {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id(),
@@ -250,7 +252,7 @@ async fn reads_object_refs() {
 
     let Ok(axum::Json(view)) = get_object_placement(
         State(state),
-        Extension(Some(auth(owner))),
+        RealmAuth(auth(owner)),
         Extension(None),
         axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -283,7 +285,7 @@ async fn unknown_key_missing() {
 
     let error = get_object_placement(
         State(state),
-        Extension(Some(auth(owner))),
+        RealmAuth(auth(owner)),
         Extension(None),
         axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -306,7 +308,7 @@ async fn refuses_foreign_reader() {
 
     let error = get_object_placement(
         State(state),
-        Extension(Some(auth(outsider))),
+        RealmAuth(auth(outsider)),
         Extension(None),
         axum::http::HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -335,19 +337,17 @@ fn openapi_lists_objects() {
 
 mod mint {
     use super::super::{ObjectPlacementRequest, mint_object_placement};
-    use crate::auth::ValidatedBearer;
+    use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
+    use crate::lookup::bucket_info;
     use crate::mcp::data::{WriteObjectInput, store_text};
-    use crate::routes::storage::deletion::bucket_info;
     use crate::tests::distributed::{
-        BUCKET, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api, write,
+        BUCKET, Node, PEER, advertise, distribute, mock_peer, node_id, node_state, publish_api,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, NODE_SUBJECT_KEYSPACE};
+    use aruna_core::keyspaces::BLOB_HEAD_KEYSPACE;
     use aruna_core::structs::identity::auth::AuthContext;
-    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::policy::PlacementSubject;
     use aruna_core::structs::storage::blob::{BlobHeadKey, CurrentVersionPointer};
     use axum::Extension;
     use axum::Json;
@@ -372,7 +372,7 @@ mod mint {
     ) -> Result<super::super::ObjectPlacementResponse, ServerError> {
         let minted = mint_object_placement(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             HeaderMap::new(),
             Path(BUCKET.to_string()),
@@ -380,21 +380,6 @@ mod mint {
         )
         .await?;
         Ok(minted.0)
-    }
-
-    /// Advertises this node's placement subject, so it admits governed data.
-    async fn advertise(node: &Node) {
-        let record = NodeSubjectRecord::seed(PlacementSubject {
-            node_id: node_id(LOCAL),
-            generation: 1,
-            location: "eu-west".to_string(),
-            labels: Default::default(),
-            executor_kind: None,
-            local_to_controller: true,
-        })
-        .unwrap();
-        let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
-        write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
     }
 
     #[tokio::test]
@@ -482,15 +467,12 @@ mod mint {
 
 mod runs {
     use super::super::{BulkRunRequest, BulkRunResponse, run_bucket_placement};
-    use crate::auth::ValidatedBearer;
+    use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
     use crate::tests::distributed::{
-        BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
-        publish_api, replicate, write,
+        BUCKET, CLOSED_API, Node, PEER, advertise, distribute, mock_peer, node_id, node_state,
+        publish_api, replicate,
     };
-    use aruna_core::keyspaces::NODE_SUBJECT_KEYSPACE;
-    use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
-    use aruna_core::structs::placement::policy::PlacementSubject;
     use axum::Extension;
     use axum::Json;
     use axum::extract::{Path, State};
@@ -508,7 +490,7 @@ mod runs {
     async fn run(node: &Node, request: BulkRunRequest) -> Result<BulkRunResponse, ServerError> {
         let answer = run_bucket_placement(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Path(BUCKET.to_string()),
             HeaderMap::new(),
@@ -516,20 +498,6 @@ mod runs {
         )
         .await?;
         Ok(answer.0)
-    }
-
-    async fn advertise(node: &Node) {
-        let record = NodeSubjectRecord::seed(PlacementSubject {
-            node_id: node_id(LOCAL),
-            generation: 1,
-            location: "eu-west".to_string(),
-            labels: Default::default(),
-            executor_kind: None,
-            local_to_controller: true,
-        })
-        .unwrap();
-        let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
-        write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
     }
 
     #[tokio::test]
@@ -579,7 +547,7 @@ mod runs {
 
 mod coverage {
     use super::super::{CoverageQuery, CoverageResponse, get_placement_coverage};
-    use crate::auth::ValidatedBearer;
+    use crate::auth::{RealmAuth, ValidatedBearer};
     use crate::error::ServerError;
     use crate::tests::distributed::{
         BUCKET, CLOSED_API, LOCAL, Node, PEER, distribute, mock_peer, node_id, node_state,
@@ -622,7 +590,7 @@ mod coverage {
         };
         let answer = get_placement_coverage(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Path(BUCKET.to_string()),
             HeaderMap::new(),
@@ -692,7 +660,7 @@ mod coverage {
         };
         let answer = get_placement_coverage(
             State(node.state.clone()),
-            Extension(Some(node.stranger.clone())),
+            RealmAuth(node.stranger.clone()),
             Extension(None),
             Path("no-such-bucket".to_string()),
             HeaderMap::new(),

@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::link::link_error;
 use super::{ArunaS3Service, URL_ENCODE_SET};
 use crate::s3::checksum::{ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
@@ -9,18 +10,22 @@ use crate::s3::scope::SubpathScope;
 use crate::s3::util::{map_checksum_algorithm, map_checksum_type};
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_core::structs::storage::blob::BlobHeadKey;
 use aruna_core::structs::storage::blob::UserAccess;
+use aruna_core::structs::storage::blob::{BlobHeadKey, common_prefix_of};
+use aruna_core::structs::storage::listing::{
+    ListUploadsResult, ListVersionsItem, ListVersionsResult,
+};
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::request_authorization::BucketAccess;
-use aruna_operations::s3::listing::common_prefix_of;
 use aruna_operations::s3::multipart::parts::ListPartsResult;
-use aruna_operations::s3::multipart::uploads::ListUploadsResult;
 use aruna_operations::s3::object::list::ListedObject;
-use aruna_operations::s3::object::list::{ListBucketInput as LOV2I, ListContinuationToken};
-use aruna_operations::s3::object::versions::{ListVersionsItem, ListVersionsResult};
-use aruna_operations::s3::object::visible::{HiddenCursor, NextPage, VisibleError, visible_page};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use aruna_operations::s3::object::list::{
+    ListBucketInput, ListContinuationToken, decode_list_token, encode_list_token,
+};
+use aruna_operations::s3::object::visible::{
+    HiddenCursor, LinkShows, ListingKeys, NextPage, RecordSource, VisibleError,
+    VisiblePageOperation,
+};
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
     ChecksumType, CommonPrefix, DeleteMarkerEntry, ETag, EncodingType, Initiator,
@@ -31,6 +36,46 @@ use s3s::dto::{
 };
 use s3s::{S3Response, S3Result, s3_error};
 use ulid::Ulid;
+
+/// The keys an S3 caller may list: inside its scope, and what its share session may read.
+#[derive(Debug, PartialEq)]
+struct ListedKeys {
+    scope: Option<SubpathScope>,
+    access: Option<BucketAccess>,
+}
+
+impl ListedKeys {
+    fn reads(&self, key: &str) -> bool {
+        (self.access.as_ref()).is_none_or(|access| access.allows(Some(key), &Permission::READ))
+    }
+}
+
+impl ListingKeys for ListedKeys {
+    fn allows(&self, key: &str) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|scope| scope.allows_key(key))
+            && self.reads(key)
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        (self.scope.as_ref()).is_none_or(|scope| scope.allows_prefix(prefix)) && self.reads(prefix)
+    }
+}
+
+/// The keys a merged listing shows: those inside the caller's scope, here and from any member.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ScopedKeys(pub(super) Option<SubpathScope>);
+
+impl ListingKeys for ScopedKeys {
+    fn allows(&self, key: &str) -> bool {
+        self.0.as_ref().is_none_or(|scope| scope.allows_key(key))
+    }
+
+    fn groups(&self, prefix: &str) -> bool {
+        (self.0.as_ref()).is_none_or(|scope| scope.allows_prefix(prefix))
+    }
+}
 
 /// One page of a shared object listing before protocol-specific mapping.
 pub(super) struct ObjectListingPage {
@@ -96,11 +141,8 @@ impl ArunaS3Service {
     ) -> S3Result<Option<ListContinuationToken>> {
         token
             .map(|token| {
-                let decoded = STANDARD
-                    .decode(token)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))?;
-                ListContinuationToken::from_bytes(&decoded)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))
+                decode_list_token(token)
+                    .ok_or_else(|| s3_error!(InvalidArgument, "Invalid continuation token"))
             })
             .transpose()
     }
@@ -110,12 +152,35 @@ impl ArunaS3Service {
     ) -> S3Result<Option<String>> {
         token
             .map(|token| {
-                token
-                    .to_bytes()
-                    .map(|bytes| STANDARD.encode(bytes))
+                encode_list_token(token)
                     .map_err(|err| s3_error!(InternalError, "{}", err.to_string()))
             })
             .transpose()
+    }
+
+    /// A listed object as an S3 listing shows it.
+    pub(super) fn listed_object(
+        &self,
+        object: ListedObject,
+        owner: &Option<Owner>,
+        url_encoded: bool,
+    ) -> Object {
+        let response_fields = self.build_response_fields(
+            object.location.as_ref(),
+            None,
+            None,
+            object.source_metadata.as_ref(),
+            object.last_refresh,
+            object.version_created_at,
+        );
+        Object {
+            e_tag: response_fields.e_tag,
+            key: Some(self.encoded(object.head.key, url_encoded)),
+            last_modified: response_fields.last_modified,
+            owner: owner.clone(),
+            size: response_fields.content_length,
+            ..Default::default()
+        }
     }
 
     /// Runs one listing page shared by ListObjects and ListObjectsV2. Only entries the reader
@@ -123,78 +188,45 @@ impl ArunaS3Service {
     /// share session may read; a page that stopped among hidden entries continues sealed.
     pub(super) async fn run_object_listing(
         &self,
-        input: LOV2I,
+        input: ListBucketInput,
         (owner, reader): (Option<Owner>, Option<&UserAccess>),
         url_encoded: bool,
-        (scope, access): (Option<&SubpathScope>, Option<&BucketAccess>),
+        (scope, access): (Option<&SubpathScope>, Option<BucketAccess>),
         (bounds, hidden): (Option<(String, Option<String>)>, Option<HiddenCursor>),
     ) -> S3Result<ObjectListingPage> {
-        let bucket = input.bucket.clone();
-        let reads =
-            |key: &str| access.is_none_or(|access| access.allows(Some(key), &Permission::READ));
-        let groups =
-            |prefix: &str| scope.is_none_or(|scope| scope.allows_prefix(prefix)) && reads(prefix);
-        let listed = visible_page(
-            self.state.as_ref(),
-            input,
-            (hidden, bounds),
-            |object: &ListedObject| {
-                let object = object.clone();
-                let bucket = &bucket;
-                Box::pin(async move {
-                    if !scope.is_none_or(|scope| scope.allows_key(&object.head.key))
-                        || !reads(&object.head.key)
-                    {
-                        return Ok(false);
-                    }
-                    self.link_listable(reader, bucket, &object).await
-                })
+        let rule = LinkShows {
+            keys: ListedKeys {
+                scope: scope.cloned(),
+                access,
             },
-            groups,
-        );
-        let page = listed.await.map_err(|error| match error {
-            VisibleError::List(error) => error.into_s3_error(),
-            VisibleError::Shows(error) => error,
-            VisibleError::Cursor => s3_error!(InternalError, "The listing cursor was not sealed"),
-        })?;
+            caller: self.listing_caller(reader, &input.bucket).await,
+            realm_id: self.realm_id,
+            node: self.link_node(),
+        };
+        let source = RecordSource { bounds };
+        let list = VisiblePageOperation::new(source, rule, input, hidden);
+        let page = drive(list, &self.state)
+            .await
+            .map_err(|error| match error {
+                VisibleError::List(error) => error.into_s3_error(),
+                VisibleError::Shows(error) => link_error(error),
+                VisibleError::Cursor => {
+                    s3_error!(InternalError, "The listing cursor was not sealed")
+                }
+                VisibleError::Unopened => s3_error!(InvalidArgument, "Invalid continuation token"),
+                VisibleError::Io(error) => s3_error!(InternalError, "{error}"),
+            })?;
         let (continuation_token, sealed) = match page.next {
             Some(NextPage::After(token)) => (Some(token), None),
             Some(NextPage::Sealed(sealed)) => (None, Some(sealed)),
             None => (None, None),
         };
-        let result = (page.objects, page.prefixes);
-
-        let encode_field = |value: String| -> String {
-            if url_encoded {
-                utf8_percent_encode(&value, URL_ENCODE_SET).to_string()
-            } else {
-                value
-            }
-        };
-
-        let contents: Vec<Object> = (result.0.into_iter())
-            .map(|object| {
-                let response_fields = self.build_response_fields(
-                    object.location.as_ref(),
-                    None,
-                    None,
-                    object.source_metadata.as_ref(),
-                    object.last_refresh,
-                    object.version_created_at,
-                );
-                Object {
-                    e_tag: response_fields.e_tag,
-                    key: Some(encode_field(object.head.key)),
-                    last_modified: response_fields.last_modified,
-                    owner: owner.clone(),
-                    size: response_fields.content_length,
-                    ..Default::default()
-                }
-            })
+        let contents: Vec<Object> = (page.objects.into_iter())
+            .map(|object| self.listed_object(object, &owner, url_encoded))
             .collect();
-        let common_prefixes: Vec<CommonPrefix> = (result.1.into_iter())
+        let common_prefixes: Vec<CommonPrefix> = (page.prefixes.into_iter())
             .map(|prefix| CommonPrefix {
-                prefix: Some(encode_field(prefix)),
+                prefix: Some(self.encoded(prefix, url_encoded)),
             })
             .collect();
 
@@ -205,23 +237,6 @@ impl ArunaS3Service {
             sealed,
         })
     }
-}
-
-pub(super) fn scoped_marker(
-    bucket: &str,
-    last_key: Option<&str>,
-    last_prefix: Option<&str>,
-) -> S3Result<Option<ListContinuationToken>> {
-    let group = last_prefix.filter(|prefix| last_key.is_none_or(|key| *prefix > key));
-    let Some(entry) = group.or(last_key) else {
-        return Ok(None);
-    };
-    let last_key = BlobHeadKey::object_prefix(bucket, entry)
-        .map_err(|_| s3_error!(InternalError, "Invalid listing marker"))?;
-    Ok(Some(ListContinuationToken {
-        last_key,
-        last_common_prefix: group.map(str::to_string),
-    }))
 }
 
 pub(super) fn list_parts_output(
@@ -477,8 +492,8 @@ impl ArunaS3Service {
 
 #[cfg(test)]
 mod tests {
-    use super::scoped_marker;
     use aruna_core::structs::storage::blob::BlobHeadKey;
+    use aruna_operations::s3::object::member::merge::merged_marker as scoped_marker;
 
     #[test]
     fn prefix_token_precedence() {

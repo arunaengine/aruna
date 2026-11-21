@@ -4,11 +4,8 @@
 
 use super::pure_tests::{make_manifest, make_reference_manifest};
 use super::*;
-use crate::placement::policy::PolicyCacheEntry;
 use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
-use aruna_core::structs::placement::policy::{
-    PlacementPolicy, PlacementSelector, PlacementSubject, VerifiedPolicy,
-};
+use aruna_core::structs::placement::policy::{PlacementSubject, VerifiedPolicy};
 use aruna_core::structs::storage::replication::ReplicationItemKind;
 use std::collections::BTreeMap;
 
@@ -17,18 +14,7 @@ fn realm() -> RealmId {
 }
 
 fn policy(location: &str) -> VerifiedPolicy {
-    let policy = PlacementPolicy::new(
-        Ulid::from_bytes([1u8; 16]),
-        "residency".to_string(),
-        vec![PlacementSelector {
-            node_id: None,
-            location: Some(location.to_string()),
-            labels: Vec::new(),
-            executor_kind: None,
-        }],
-    )
-    .expect("policy is valid");
-    VerifiedPolicy::verify(policy).expect("policy verifies")
+    crate::tests::policy::residency(1, location)
 }
 
 fn gate(location: &str) -> GateContext {
@@ -71,17 +57,21 @@ fn denies_incoming_replica() {
     // would invite bytes is refused instead.
     let rule = policy("us-east");
     let mut operation = governed(&rule).with_gate(gate("eu-west"));
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let turn = operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let Ok(Next::Call(IoCall::Child(mut gate))) = turn else {
+        panic!("expected the gate child")
+    };
 
-    let document = crate::tests::policy::signed_document(realm(), &rule, 9);
-    let cached = PolicyCacheEntry::verified(&document, 10)
-        .to_bytes()
-        .expect("entry encodes");
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: Some(cached.into()),
-    }));
-    operation.step(crate::tests::policy::authority(realm()));
+    gate.start();
+    assert!(
+        gate.step(crate::tests::policy::resolved_policy(&rule))
+            .is_empty()
+    );
+    assert!(gate.is_complete());
+    let Event::Child(outcome) = gate.finalize() else {
+        panic!("the gate finishes as a child")
+    };
+    operation.next(IoResult::Child(outcome)).unwrap();
 
     assert!(rejected(&operation));
 }
@@ -92,7 +82,9 @@ fn missing_subject_refuses() {
     // never invites the bytes.
     let rule = policy("eu-west");
     let mut operation = governed(&rule);
-    operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    operation
+        .send_negotiation(ReplicationNegotiationResult::NeedBlobVersion)
+        .unwrap();
     assert!(rejected(&operation));
 }
 
@@ -107,18 +99,11 @@ fn reference_registers_nothing() {
         realm(),
         manifest,
     );
-    operation.txn_id = Some(Ulid::from_parts(3, 3));
     operation.destination_group_id = Some(Ulid::from_parts(4, 4));
 
-    operation.write_version();
-    assert!(
-        operation
-            .pending_version_effects
-            .iter()
-            .all(|effect| !matches!(
-                effect,
-                Effect::Storage(StorageEffect::Write { key_space, .. })
-                    if key_space == MANAGED_COPY_KEYSPACE
-            ))
-    );
+    let turn = operation.write_version();
+    let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
+        panic!("expected the version rows, got {turn:?}")
+    };
+    assert!(rows.iter().all(|row| row.0 != MANAGED_COPY_KEYSPACE));
 }

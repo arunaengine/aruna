@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 use aruna_core::effects::StorageEffect;
@@ -20,7 +22,11 @@ use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 
 use super::rebuild::shadow_row;
 
-use super::{CleanupEntry, CleanupKind, FjallStorage, MAX_TRANSACTION_CLEANUP, Txn};
+use super::handle::{CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP};
+use super::worker::{FjallStorage, Txn};
+
+/// A transaction's pending counter changes, keyed by key space and key in sorted order.
+pub(super) type PendingChanges = BTreeMap<(String, ByteView), CounterChange>;
 
 /// A transaction's pending change of one counter row.
 #[derive(Clone, Copy, Debug)]
@@ -106,15 +112,14 @@ impl FjallStorage {
         let mut entries = Vec::with_capacity(changes.len());
         for (key, change) in changes {
             entries.push((key_space.clone(), key.clone()));
-            match pending
-                .iter_mut()
-                .find(|(space, existing, _)| *space == key_space && *existing == key)
-            {
-                Some((_, _, existing)) => match existing.merge(change) {
-                    Ok(merged) => *existing = merged,
+            match pending.entry((key_space.clone(), key)) {
+                Entry::Occupied(mut existing) => match existing.get().merge(change) {
+                    Ok(merged) => *existing.get_mut() = merged,
                     Err(error) => return StorageEvent::Error { error },
                 },
-                None => pending.push((key_space.clone(), key, change)),
+                Entry::Vacant(slot) => {
+                    slot.insert(change);
+                }
             }
         }
         StorageEvent::BatchWriteResult { entries }
@@ -133,7 +138,7 @@ impl FjallStorage {
         self.shadow_changes(&mut pending)?;
         let snapshot = self.store.db.read_tx();
         let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
-        for (key_space, key, change) in pending {
+        for ((key_space, key), change) in pending {
             let keyspace = self.store.resolve_keyspace(&key_space)?;
             let stored = snapshot
                 .get(&keyspace, &key)
@@ -238,7 +243,7 @@ impl FjallStorage {
                     entry.kind,
                     CleanupKind::CommitQueued
                         | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed
+                        | CleanupKind::Committed(_)
                         | CleanupKind::Aborted
                 )
             })
@@ -292,8 +297,8 @@ impl FjallStorage {
                     entry.kind = CleanupKind::CommitQueued;
                 }
             }
-            Some(CleanupKind::Committed) => {
-                return StorageEvent::TransactionCommitted { txn_id };
+            Some(CleanupKind::Committed(sequence)) => {
+                return StorageEvent::TransactionCommitted { txn_id, sequence };
             }
             None => {}
         }
@@ -302,7 +307,10 @@ impl FjallStorage {
         self.usage_views.remove(&txn_id);
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
-            Some(Txn::Read(_)) => StorageEvent::TransactionCommitted { txn_id },
+            Some(Txn::Read(_)) => StorageEvent::TransactionCommitted {
+                txn_id,
+                sequence: self.commits,
+            },
             Some(Txn::Write(txn)) => {
                 // A commit never waits for a read still running in the transaction.
                 let Ok(mut txn) = Arc::try_unwrap(txn) else {
@@ -317,6 +325,8 @@ impl FjallStorage {
                 if let Err(error) = staged.and_then(|()| self.stage_usage(txn_id, &mut txn)) {
                     self.take_txn_deletes(txn_id, false);
                     txn.rollback();
+                    // Unlike an unknown commit, a confirmed rollback lets the caller undo work.
+                    let error = StorageError::RolledBack(Box::new(error));
                     return StorageEvent::Error { error };
                 }
                 let committed = txn.commit();
@@ -326,7 +336,13 @@ impl FjallStorage {
                     self.note_config_change();
                 }
                 match committed {
-                    Ok(Ok(())) => StorageEvent::TransactionCommitted { txn_id },
+                    Ok(Ok(())) => {
+                        self.commits += 1;
+                        StorageEvent::TransactionCommitted {
+                            txn_id,
+                            sequence: self.commits,
+                        }
+                    }
                     Ok(Err(_)) => StorageEvent::Error {
                         error: StorageError::TransactionConflict,
                     },

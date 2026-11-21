@@ -6,3 +6,16 @@ pub mod bulk;
 pub mod coverage;
 pub mod mutation;
 pub mod successor;
+
+/// A child check that the caller may write `path`.
+pub(crate) fn write_check(
+    auth_context: aruna_core::structs::identity::auth::AuthContext,
+    path: String,
+) -> aruna_core::calls::IoCall {
+    use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
+    aruna_core::calls::IoCall::child(CheckPermissionsOperation::new(CheckPermissionsConfig {
+        auth_context,
+        path,
+        required_permission: aruna_core::structs::identity::auth::Permission::WRITE,
+    }))
+}

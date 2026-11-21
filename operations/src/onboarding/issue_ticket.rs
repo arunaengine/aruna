@@ -2,20 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
 use aruna_core::operation::Operation;
+use aruna_core::rows::PrefixPages;
 use aruna_core::structs::identity::group_delete::{GroupDeletePhase, GroupDeleteRecord};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::types::{Effects, Key};
+use aruna_core::user::id::UserId;
 use ed25519_dalek::SigningKey;
-use smallvec::smallvec;
 use thiserror::Error;
 
 pub const TICKET_TTL_SECS: u64 = 300;
@@ -33,24 +31,14 @@ pub struct IssueSyncInput {
     pub ttl_secs: u64,
 }
 
+/// Pages through the realm's users, then the deletion records, persists, and signs the ticket.
 #[derive(Debug, PartialEq)]
 pub struct IssueSyncOperation {
     input: IssueSyncInput,
-    state: IssueSyncState,
     documents: Vec<DocumentTarget>,
     deletions: Vec<GroupDeleteRecord>,
-    next_start_after: Option<Key>,
-    output: Option<Result<OnboardingTicket, IssueSyncError>>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum IssueSyncState {
-    Init,
-    ListUsers,
-    ListDeletions,
-    Persist,
-    Finish,
-    Error,
+    users: PrefixPages,
+    deleted: PrefixPages,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -67,8 +55,25 @@ pub enum IssueSyncError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
+}
+
+impl From<IoError> for IssueSyncError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "IssueSync".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 impl IssueSyncOperation {
@@ -94,63 +99,56 @@ impl IssueSyncOperation {
                 node_id: input.issuer_node_id,
             },
         ];
+        let users = UserId::storage_prefix(input.realm_id);
         Self {
             input,
-            state: IssueSyncState::Init,
             documents,
             deletions: Vec::new(),
-            next_start_after: None,
-            output: None,
+            users: PrefixPages::new(USER_KEYSPACE, users, TICKET_PAGE_SIZE),
+            deleted: PrefixPages::new(GROUP_DELETE_KEYSPACE, Vec::new(), TICKET_PAGE_SIZE),
         }
     }
 
-    fn emit_list_users(&mut self) -> Effects {
-        self.state = IssueSyncState::ListUsers;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: USER_KEYSPACE.to_string(),
-            prefix: Some(UserId::storage_prefix(self.input.realm_id)),
-            start: self.next_start_after.take().map(IterStart::After),
-            limit: TICKET_PAGE_SIZE,
-            txn_id: None,
-        })]
+    fn take_users(&mut self, result: IoResult) -> Result<IoCall, IssueSyncError> {
+        for (key, _) in self.users.take(result)? {
+            let user_id = UserId::from_storage_key(&key)?;
+            if user_id.realm_id == self.input.realm_id {
+                self.documents.push(DocumentTarget::User { user_id });
+            }
+        }
+        Ok(match self.users.done() {
+            true => self.deleted.call(),
+            false => self.users.call(),
+        })
     }
 
-    fn list_deletions(&mut self) -> Effects {
-        self.state = IssueSyncState::ListDeletions;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: GROUP_DELETE_KEYSPACE.to_string(),
-            prefix: None,
-            start: self.next_start_after.take().map(IterStart::After),
-            limit: TICKET_PAGE_SIZE,
-            txn_id: None,
-        })]
+    fn take_deletions(&mut self, result: IoResult) -> Result<IoCall, IssueSyncError> {
+        for (key, value) in self.deleted.take(result)? {
+            if key.len() != 16 {
+                continue;
+            }
+            let record = GroupDeleteRecord::from_bytes(&value)?;
+            if record.plan.realm_id == self.input.realm_id
+                && record.phase == GroupDeletePhase::Deleted
+            {
+                self.deletions.push(record);
+            }
+        }
+        Ok(match self.deleted.done() {
+            true => IoCall::Sync,
+            false => self.deleted.call(),
+        })
     }
 
-    fn finish(&mut self) -> Effects {
-        match OnboardingTicket::issue_with_deletions(
+    fn issue(&mut self) -> Result<OnboardingTicket, IssueSyncError> {
+        Ok(OnboardingTicket::issue_with_deletions(
             &self.input.realm_signing_key,
             &self.input.realm_id,
             self.input.node_id,
             self.input.now.saturating_add(self.input.ttl_secs),
             std::mem::take(&mut self.documents),
             std::mem::take(&mut self.deletions),
-        ) {
-            Ok(ticket) => {
-                self.state = IssueSyncState::Finish;
-                self.output = Some(Ok(ticket));
-            }
-            Err(error) => {
-                self.state = IssueSyncState::Error;
-                self.output = Some(Err(error.into()));
-            }
-        }
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: IssueSyncError) -> Effects {
-        self.state = IssueSyncState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+        )?)
     }
 }
 
@@ -158,111 +156,34 @@ impl Operation for IssueSyncOperation {
     type Output = OnboardingTicket;
     type Error = IssueSyncError;
 
-    fn start(&mut self) -> Effects {
-        self.emit_list_users()
+    fn first(&mut self) -> Result<Next<OnboardingTicket>, IssueSyncError> {
+        Ok(Next::Call(self.users.call()))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            IssueSyncState::ListUsers => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (key, _) in values {
-                        match UserId::from_storage_key(&key) {
-                            Ok(user_id) if user_id.realm_id == self.input.realm_id => {
-                                self.documents.push(DocumentTarget::User { user_id });
-                            }
-                            Ok(_) => {}
-                            Err(error) => return self.fail(error.into()),
-                        }
-                    }
-                    if let Some(next_start_after) = next_start_after {
-                        self.next_start_after = Some(next_start_after);
-                        self.emit_list_users()
-                    } else {
-                        self.list_deletions()
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(IssueSyncError::UnexpectedEvent {
-                    state: format!("{:?}", self.state),
-                    expected: "storage iter result",
-                    got: format!("{other:?}"),
-                }),
-            },
-            IssueSyncState::ListDeletions => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    for (key, value) in values {
-                        if key.len() != 16 {
-                            continue;
-                        }
-                        let record = match GroupDeleteRecord::from_bytes(&value) {
-                            Ok(record) => record,
-                            Err(error) => return self.fail(error.into()),
-                        };
-                        if record.plan.realm_id == self.input.realm_id
-                            && record.phase == GroupDeletePhase::Deleted
-                        {
-                            self.deletions.push(record);
-                        }
-                    }
-                    self.next_start_after = next_start_after;
-                    if self.next_start_after.is_some() {
-                        self.list_deletions()
-                    } else {
-                        self.state = IssueSyncState::Persist;
-                        smallvec![Effect::Storage(StorageEffect::SyncAll)]
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(IssueSyncError::UnexpectedEvent {
-                    state: format!("{:?}", self.state),
-                    expected: "deletion records",
-                    got: format!("{other:?}"),
-                }),
-            },
-            IssueSyncState::Persist => match event {
-                Event::Storage(StorageEvent::SyncAllFinished) => self.finish(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.fail(IssueSyncError::UnexpectedEvent {
-                    state: format!("{:?}", self.state),
-                    expected: "durable deletion records",
-                    got: format!("{other:?}"),
-                }),
-            },
-            IssueSyncState::Init | IssueSyncState::Finish | IssueSyncState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> Result<Next<OnboardingTicket>, IssueSyncError> {
+        if !self.users.done() {
+            return self.take_users(result).map(Next::Call);
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, IssueSyncState::Finish | IssueSyncState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(IssueSyncError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+        if !self.deleted.done() {
+            return self.take_deletions(result).map(Next::Call);
+        }
+        result.done()?;
+        self.issue().map(Next::Done)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS};
-    use crate::driver::{DriverContext, drive};
-    use aruna_core::UserId;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USER_KEYSPACE;
     use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
     use ed25519_dalek::SigningKey;
@@ -284,25 +205,22 @@ mod tests {
             ttl_secs: TICKET_TTL_SECS,
         });
 
-        assert_eq!(operation.start().len(), 1);
-        for _ in 0..2 {
-            assert_eq!(
-                operation
-                    .step(Event::Storage(StorageEvent::IterResult {
-                        values: Vec::new(),
-                        next_start_after: None,
-                    }))
-                    .len(),
-                1
-            );
-            assert!(!operation.is_complete());
-        }
-        assert!(
-            operation
-                .step(Event::Storage(StorageEvent::SyncAllFinished))
-                .is_empty()
-        );
-        let ticket = operation.finalize().unwrap();
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let empty = || IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert!(matches!(
+            operation.next(empty()),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        assert_eq!(operation.next(empty()), Ok(Next::Call(IoCall::Sync)));
+        let Ok(Next::Done(ticket)) = operation.next(IoResult::Done) else {
+            panic!("expected the ticket");
+        };
 
         assert_eq!(ticket.payload.node_id, joiner_node_id.to_string());
         assert_eq!(
@@ -340,14 +258,16 @@ mod tests {
     #[tokio::test]
     async fn ticket_discovery_paginates() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm_signing_key = SigningKey::from_bytes(&[3u8; 32]);
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());

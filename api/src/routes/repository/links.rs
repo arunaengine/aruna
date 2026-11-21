@@ -5,34 +5,38 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use aruna_core::repository::{
-    LinkFailure, LinkRemote, LinkStatus, RepositoryLink, capabilities, descriptor,
-};
+use aruna_core::repository::capabilities;
+use aruna_core::repository::kind::descriptor;
+use aruna_core::repository::link::{LinkFailure, LinkRemote, LinkStatus, RepositoryLink};
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
-use aruna_operations::jobs::repository::check::{RequirementCheck, check_requirements};
-use aruna_operations::jobs::repository::link_queue::owner_holds;
-use aruna_operations::jobs::repository::links::{
-    LinkChange, LinkError, change_link, list_links, read_link,
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
+use aruna_operations::jobs::repository::check::{CrateCheck, RequirementCheck, profile_failure};
+use aruna_operations::jobs::repository::link_queue::OwnerHoldsOperation;
+use aruna_operations::jobs::repository::link_store::{
+    ApplyChangeOperation, ListLinksOperation, ReadLinkOperation,
 };
+use aruna_operations::jobs::repository::links::{LinkChange, LinkError};
 use aruna_operations::jobs::repository::{Action, TransferError, seal_token, supports};
+use aruna_operations::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
 
-use crate::auth::{ensure_permission, ensure_permission_with, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, ensure_permission_with};
 use crate::error::{ErrorResponse, ProfileFindingResponse, ServerError, ServerResult};
+use crate::jobs::job_urls;
 use crate::metadata::{ensure_metadata_scope, load_document_record, parse_document_id};
-use crate::routes::execution::jobs::job_urls;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -305,7 +309,7 @@ pub(in crate::routes) fn link_error(error: LinkError) -> ServerError {
         LinkError::ForeignToken
         | LinkError::Storage(_)
         | LinkError::Conversion(_)
-        | LinkError::Unexpected(_) => ServerError::InternalError(error.to_string()),
+        | LinkError::Unexpected(_) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -365,15 +369,21 @@ pub(crate) async fn requirements(
     view: &ConnectorView,
 ) -> ServerResult<RequirementCheck> {
     ensure_capable(view.connector.kind, Action::Publish)?;
-    Box::pin(check_requirements(
-        &state.get_ctx(),
-        auth,
-        document_id,
-        view,
-        state.rocrate_limits().metadata_bytes,
-    ))
-    .await
-    .map_err(|error| match error {
+    let context = state.get_ctx();
+    let metadata_bytes = state.rocrate_limits().metadata_bytes;
+    let checked = async {
+        let local = context.net_handle.as_ref().map(|net| net.node_id());
+        let read = CrateJsonOperation::new(local, auth.clone(), document_id, metadata_bytes);
+        let (jsonld, _) = Box::pin(drive(read, &context)).await?;
+        let check = CrateCheck::new(view.connector.kind, &view.connector.endpoint, &jsonld)?;
+        let assess = ProfileAssessOperation::against(local, check.profile_iri, jsonld.clone());
+        let status = Box::pin(drive(assess, &context))
+            .await
+            .map(profile_verdict)
+            .map_err(profile_failure)?;
+        check.finish(status)
+    };
+    Box::pin(checked).await.map_err(|error| match error {
         TransferError::Permanent(message) => ServerError::BadRequestReason(message),
         _ => ServerError::ServiceUnavailableReason("the requirements could not be checked".into()),
     })
@@ -425,10 +435,9 @@ pub(in crate::routes) fn metadata_json(
 /// READ on the dataset gates every link route.
 pub(in crate::routes) async fn readable(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     document_id: &str,
 ) -> ServerResult<(AuthContext, Ulid)> {
-    let auth = require_unrestricted_auth(state, auth)?;
     let document_id = parse_document_id(document_id)?;
     let record = load_document_record(state, document_id).await?;
     ensure_permission_with(
@@ -446,16 +455,19 @@ pub(in crate::routes) async fn readable(
 /// on the link's owner node.
 pub(in crate::routes) async fn managed(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     document_id: &str,
     link_id: &str,
 ) -> ServerResult<(AuthContext, RepositoryLink)> {
     let (auth, document_id) = readable(state, auth, document_id).await?;
     let link_id = parse_ulid(link_id)?;
-    let link = read_link(&state.get_ctx().storage_handle, document_id, link_id)
-        .await
-        .map_err(link_error)?
-        .ok_or(ServerError::NotFound)?;
+    let link = drive(
+        ReadLinkOperation::new(document_id, link_id),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(link_error)?
+    .ok_or(ServerError::NotFound)?;
     ensure_metadata_scope(state, &auth, link.group_id, Permission::WRITE).await?;
     if link.created_by != auth.user_id {
         let admin = format!("/{}/g/{}/admin", state.get_realm_id(), link.group_id);
@@ -473,9 +485,9 @@ pub(in crate::routes) async fn change(
     link: &RepositoryLink,
     change: LinkChange,
 ) -> ServerResult<Option<RepositoryLink>> {
-    change_link(state.get_ctx().as_ref(), link, change)
-        .await
-        .map_err(link_error)
+    let context = state.get_ctx();
+    let operation = ApplyChangeOperation::new(context.node_scope(), link.clone(), change);
+    drive(operation, context.as_ref()).await.map_err(link_error)
 }
 
 /// The links a node keeps for the dataset. Holders keep replicas; only the owner queues checks.
@@ -485,11 +497,13 @@ async fn responses(
 ) -> ServerResult<Vec<RepositoryLinkResponse>> {
     let context = state.get_ctx();
     let mut views = Vec::new();
-    for (link, queued) in list_links(&context.storage_handle, document_id)
+    let scope = context.node_scope();
+    for (link, queued) in drive(ListLinksOperation::new(document_id), context.as_ref())
         .await
         .map_err(link_error)?
     {
-        let holds = owner_holds(&context, &link).await;
+        let holds = OwnerHoldsOperation::new(scope.clone(), &link);
+        let holds = drive(holds, context.as_ref()).await.unwrap_or(true);
         let queued = queued && link.owner_node == state.get_node_id();
         views.push(response(link, queued, holds));
     }
@@ -512,7 +526,7 @@ pub(in crate::routes) async fn view(
 
 pub(in crate::routes) async fn job_response(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<(StatusCode, Json<LinkJobResponse>)> {
     let urls = job_urls(state, job_id).await?;
     Ok((
@@ -569,7 +583,7 @@ An unknown dataset, or a connector that does not exist in the group, returns 404
 )]
 pub async fn create_link(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
     Json(request): Json<CreateLinkRequest>,
 ) -> ServerResult<(StatusCode, Json<RepositoryLinkResponse>)> {
@@ -596,14 +610,11 @@ pub async fn create_link(
     let metadata_json = metadata_json(&state, request.metadata)?;
     Box::pin(ensure_requirements(&state, &auth, document_id, &view)).await?;
     let context = state.get_ctx();
-    let holds = aruna_operations::forward::routing::origin_holds_document(
-        &context,
-        state.get_realm_id(),
-        state.get_node_id(),
-        document_id,
-    )
-    .await
-    .map_err(|_| ServerError::ServiceUnavailableReason("dataset placement unavailable".into()))?;
+    let holds = crate::lookup::origin_holds(&state, document_id)
+        .await
+        .ok_or_else(|| {
+            ServerError::ServiceUnavailableReason("dataset placement unavailable".into())
+        })?;
     if !holds {
         return Err(ServerError::Conflict(
             "create the link on a node that holds this dataset".into(),
@@ -611,11 +622,12 @@ pub async fn create_link(
     }
     let link_id = Ulid::generate();
     let secret = seal_token(
-        &context,
+        context.credential_key(),
         auth.user_id,
         &view,
         Some(link_id),
         &request.access_token,
+        rand::random::<[u8; 24]>(),
     )
     .map_err(seal_error)?;
     let owner_node_url = state
@@ -650,14 +662,15 @@ pub async fn create_link(
         updated_at: now,
         generation: 0,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind,
     };
     let change = LinkChange::Create {
         link: Box::new(link.clone()),
         secret: Some(secret),
     };
-    let created = change_link(context.as_ref(), &link, change)
+    let operation = ApplyChangeOperation::new(context.node_scope(), link, change);
+    let created = drive(operation, context.as_ref())
         .await
         .map_err(link_error)?
         .ok_or_else(|| ServerError::InternalError("created link missing".into()))?;
@@ -696,7 +709,7 @@ Every holder of the dataset lists its links. owner_node_url names the node that 
 )]
 pub async fn list_repository_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(document_id): Path<String>,
 ) -> ServerResult<Json<Vec<RepositoryLinkResponse>>> {
     let (_, document_id) = readable(&state, auth, &document_id).await?;

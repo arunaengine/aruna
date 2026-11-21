@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::download::{self, AdmissionError};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::LocalKey;
 use crate::routes::execution::jobs::range_request;
-use crate::routes::storage::relay::relay_stream;
-use aruna_operations::s3::object::get::{
-    GetObjectError, GetObjectInput, GetObjectOperation, read_object,
-};
+use crate::routes::storage::relay::{RestRead, holder_stream, missed_stream};
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use aruna_operations::transfer::read::ReadObjectOperation;
 use axum::response::Response;
 use http::{HeaderMap, header};
 
@@ -63,13 +63,12 @@ fn read_error(error: GetObjectError) -> ServerError {
         (status = 503, body = ErrorResponse, description = "Download or storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
 pub async fn content(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Extension(object): Extension<ObjectKey>,
     Query(query): Query<VersionQuery>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = crate::auth::require_realm_auth(&state, auth)?;
     let (version, info) = authorize_version(&state, &auth, &query).await?;
     let private = object.0.map_err(|_| ServerError::BadRequest)?;
     let mut sent = HeaderMap::new();
@@ -84,8 +83,15 @@ pub async fn content(
         sent.insert("x-aruna-object-key", value);
     }
     let path = version_path("/data/blobs/content", &query);
-    if let Some(holders) = read_holders(&state, &info, &query.key, &headers).await? {
-        return relay_stream(&state, &holders, &path, bearer.as_ref(), sent).await;
+    let relayed = RestRead {
+        info: &info,
+        key: &query.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_stream(&state, &relayed, &sent).await? {
+        return Ok(answer);
     }
     let keyed = private.is_some();
     let range = range_request(&headers).map_err(|_| ServerError::BadRequest)?;
@@ -112,7 +118,8 @@ pub async fn content(
     let result = match private {
         Some(private) => {
             let limits = state.rocrate_limits();
-            read_object(&state.get_ctx(), input, restrictions, private, limits).await
+            let read = ReadObjectOperation::new(input, restrictions, private, limits);
+            drive(read, &state.get_ctx()).await
         }
         None => {
             let operation = GetObjectOperation::new(input).with_restrictions(restrictions);
@@ -130,9 +137,9 @@ pub async fn content(
         result => result.map_err(read_error),
     };
     if matches!(result, Err(ServerError::NotFound))
-        && let Some(coordinator) = copy_miss(&state, &info, &query.key, &headers).await?
+        && let Some(answer) = missed_stream(&state, &relayed, &sent).await?
     {
-        return relay_stream(&state, &coordinator, &path, bearer.as_ref(), sent).await;
+        return Ok(answer);
     }
     let result = result?;
     let mut response = Response::new(download::body(result.blob, permit));

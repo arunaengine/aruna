@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::admin_documents::AdminDocumentTarget;
 use crate::reducer::AdminDocumentState;
 use crate::types::{GroupId, RoleId};
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ulid::Ulid;
@@ -149,6 +149,7 @@ mod tests {
                         permissions: BTreeMap::new(),
                     },
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let request = JoinRequest {
@@ -164,6 +165,7 @@ mod tests {
                 AdminDocumentOperation::GroupJoinRequested {
                     request: request.clone(),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         (state, request, role_id)
@@ -195,6 +197,7 @@ mod tests {
                         BTreeSet::from([role_id]),
                     ),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let rejection = denied
@@ -203,6 +206,7 @@ mod tests {
                 AdminDocumentOperation::GroupJoinDecided {
                     decision: decision(JoinDecisionKind::Denied, &other, BTreeSet::new()),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         approved.apply(&rejection).unwrap();
@@ -231,6 +235,7 @@ mod tests {
                     display_name: "Group".into(),
                     owner: admin.user_id,
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         (state, role_id)
@@ -258,6 +263,7 @@ mod tests {
             AdminDocumentOperation::GroupJoinRequested {
                 request: request.clone(),
             },
+            ulid::Ulid::generate(),
         )?;
         Ok(request)
     }
@@ -283,6 +289,7 @@ mod tests {
                         role_ids: BTreeSet::from([role_id]),
                     },
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let members = &state.materialized_group_assignments()[&role_id];
@@ -320,7 +327,8 @@ mod tests {
                             decided_at: 2,
                             role_ids: BTreeSet::new()
                         },
-                    }
+                    },
+                    ulid::Ulid::generate()
                 )
                 .is_err()
         );

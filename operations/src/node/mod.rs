@@ -1,13 +1,22 @@
-//! Groups node startup, status, info publishing, usage stats and dashboard signals.
+//! Groups node startup, heartbeats, the node info document and node usage publication.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub mod dashboard;
+pub mod api_state;
+pub mod applied_drain;
+pub mod catch_up;
+pub mod contacts;
+pub mod counter_check;
 pub mod heartbeat;
-pub mod holder_choice;
-pub mod node_info;
+pub mod info;
+pub mod info_timer;
+pub mod outbox;
+pub mod peer_metadata;
+pub mod placement_timer;
+pub mod presence_timer;
+pub mod range_timer;
 mod rebuild_counts;
-pub mod startup;
-pub mod status;
-mod usage_rebuild;
-pub mod usage_stats;
+pub mod recovery_run;
+pub mod summary_refresh;
+pub mod usage_publish;
+pub mod usage_rebuild;

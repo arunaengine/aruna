@@ -4,13 +4,14 @@
 
 use crate::auth::permission_granted;
 use crate::error::{ServerError, ServerResult};
-use crate::routes::execution::jobs::{JobProgressResponse, rfc3339};
+use crate::jobs::{JobProgressResponse, rfc3339};
 use crate::routes::info::{InfoAccess, info_access};
 use crate::server::state::ServerState;
 use aruna_core::jobs::{JobTarget, RunningJobView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_operations::auth::request_authorization::BucketAccess;
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -201,9 +202,12 @@ async fn may_read(
         return permission_granted(state, auth, path, Permission::READ).await;
     };
     let context = state.get_ctx();
-    let access = BucketAccess::load(&context, auth, (realm_id, group_id, node_id), bucket)
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let access = drive(
+        BucketAccessOperation::new(auth, (realm_id, group_id, node_id), bucket),
+        &context,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     // A prefix shows only when the caller may read every key the job may touch below it.
     let path = path.as_deref().unwrap_or_default();
     Ok(match exact {

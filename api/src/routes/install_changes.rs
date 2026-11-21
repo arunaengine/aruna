@@ -5,29 +5,25 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::plugins::lifecycle::{
-    pause_install, resume_install, set_grants, update_install,
-};
+use aruna_drivers::driver::drive;
+use aruna_operations::plugins::lifecycle::{SetGrants, SetPaused, UpdateInstall};
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::plugin_installs::{
-    InstallView, actor, admin_call, map_error, secret_session, view, view_example,
+    InstallView, admin_call, caller, local_node, map_error, secret_session, view, view_example,
 };
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-pub struct ChangesApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ChangesApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(put_grants))
         .routes(routes!(put_version))
         .routes(routes!(pause))
@@ -79,7 +75,6 @@ the call and every other node relays it to one.
     responses(
         (status = 200, description = "The changed install", body = InstallView, example = json!(view_example())),
         (status = 400, description = "A grant is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin or lacks a granted right", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile or is not settled", body = ErrorResponse)
@@ -88,21 +83,14 @@ the call and every other node relays it to one.
 )]
 pub async fn put_grants(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Json(body): Json<GrantsBody>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     secret_session(&state, &auth, (Some(install_id), None)).await?;
-    let changed = set_grants(
-        &state.get_ctx(),
-        &actor(&state, &auth),
-        &auth,
-        install_id,
-        &body.grants,
-    )
-    .await
-    .map_err(map_error)?;
+    let change = SetGrants::new(caller(&state, &auth), install_id, &body.grants);
+    let changed = drive(change, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(view(&state, changed).await?))
 }
 
@@ -126,7 +114,6 @@ the call and every other node relays it to one.
     responses(
         (status = 200, description = "The updated install", body = UpdateView, example = json!({"install": view_example(), "missing": []})),
         (status = 400, description = "The settings do not fit the new version, or it cannot be installed yet", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install or published version matches", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile or is not settled", body = ErrorResponse)
@@ -135,25 +122,18 @@ the call and every other node relays it to one.
 )]
 pub async fn put_version(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
     Json(body): Json<VersionBody>,
 ) -> ServerResult<Json<UpdateView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     let target = (Some(install_id), Some(body.version.as_str()));
     secret_session(&state, &auth, target).await?;
-    let actor = actor(&state, &auth);
+    let ctx = state.get_ctx();
+    let who = (caller(&state, &auth), local_node(&ctx));
     let settings = body.settings.as_ref();
-    let (updated, missing) = update_install(
-        &state.get_ctx(),
-        &actor,
-        &auth,
-        install_id,
-        &body.version,
-        settings,
-    )
-    .await
-    .map_err(map_error)?;
+    let update = UpdateInstall::new(who, install_id, &body.version, settings);
+    let (updated, missing) = drive(update, &ctx).await.map_err(map_error)?;
     let install = view(&state, updated).await?;
     Ok(Json(UpdateView { install, missing }))
 }
@@ -173,7 +153,6 @@ serves the call and every other node relays it to one.
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The paused install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install is not active", body = ErrorResponse)
@@ -182,13 +161,12 @@ serves the call and every other node relays it to one.
 )]
 pub async fn pause(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
-    let paused = pause_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
-        .await
-        .map_err(map_error)?;
+    let pause = SetPaused::new(caller(&state, &auth), install_id, true);
+    let paused = drive(pause, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(view(&state, paused).await?))
 }
 
@@ -207,7 +185,6 @@ serves the call and every other node relays it to one.
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The active install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install is not paused", body = ErrorResponse)
@@ -216,12 +193,11 @@ serves the call and every other node relays it to one.
 )]
 pub async fn resume(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
-    let resumed = resume_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
-        .await
-        .map_err(map_error)?;
+    let resume = SetPaused::new(caller(&state, &auth), install_id, false);
+    let resumed = drive(resume, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(view(&state, resumed).await?))
 }

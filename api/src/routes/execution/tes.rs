@@ -8,27 +8,30 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::job_service::{cancel_job_routed, list_owned_jobs, read_record_routed};
+use crate::jobs::{family_report, submit_external_job};
 use crate::routes::routes_at;
 use aruna_core::compute::{
     directory_pattern, has_wildcard, literal_prefix, output_glob, output_suffix, paths_overlap,
 };
-use aruna_core::structs::execution::job::{
-    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobId, JobPayload,
-    JobRecord, JobResultPayload, JobState, MAX_EXECUTION_OUTPUTS, OutputDestination,
-    OutputSelection, PhysicalExecutionResult, ResultMessage, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    MAX_EXECUTION_OUTPUTS, PhysicalExecutionResult, ResultMessage,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource, JobPayload,
+    OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{JobRecord, JobResultPayload, WorkspaceMode};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
-use aruna_operations::device::compute::{LocalExecutionConfig, submit_local_execution};
-use aruna_operations::driver::drive;
-use aruna_operations::jobs::JobRouteError;
-use aruna_operations::jobs::lifecycle::{FamilyReport, family_report, submit_external_job};
-use aruna_operations::jobs::service::{
-    RoutedCancelOutcome, cancel_job_routed, list_owned_jobs, read_record_routed,
-};
+use aruna_drivers::driver::drive;
+use aruna_operations::jobs::job::cancel::RoutedCancelOutcome;
+use aruna_operations::jobs::lifecycle::report::FamilyReport;
+use aruna_operations::jobs::local_run::LocalExecutionConfig;
+use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
@@ -36,7 +39,7 @@ use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{OpenApi, ToSchema};
@@ -49,6 +52,8 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, external_base_url};
 use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
 use crate::server::state::ServerState;
+use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
+use aruna_operations::auth::bearer_token::UserCutoffOperation;
 
 /// GA4GH TES version this facade implements.
 const TES_VERSION: &str = "1.1.0";
@@ -56,6 +61,8 @@ const TES_VERSION: &str = "1.1.0";
 const GROUP_TAG_KEY: &str = "aruna-engine.org/group";
 /// Optional tag pinning a backend executor kind.
 const EXECUTOR_TAG_KEY: &str = "aruna-engine.org/executor";
+/// Names the compute backend a task runs on, next to the executor kind.
+const BACKEND_TAG_KEY: &str = "aruna-engine.org/compute-backend";
 /// Optional tag carrying the submission idempotency key.
 const IDEMPOTENCY_TAG_KEY: &str = "aruna-engine.org/idempotency-key";
 /// Optional tag choosing where the task runs: `realm` or `local`.
@@ -73,27 +80,24 @@ const DEFAULT_PAGE_SIZE: usize = 256;
 const MAX_PAGE_SIZE: usize = 512;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags((name = "tes", description = "GA4GH TES v1.1 task execution facade")),
-    components(schemas(
-        TesServiceInfo,
-        TesServiceType,
-        TesServiceOrganization,
-        TesTask,
-        TesExecutor,
-        TesInput,
-        TesOutput,
-        TesResources,
-        TesFileType,
-        TesState,
-        TesExecutorLog,
-        TesFileLog,
-        TesTaskLog,
-        TesTaskResponse,
-        TesTasksResponse,
-        TesErrorPayload
-    ))
-)]
+#[openapi(components(schemas(
+    TesServiceInfo,
+    TesServiceType,
+    TesServiceOrganization,
+    TesTask,
+    TesExecutor,
+    TesInput,
+    TesOutput,
+    TesResources,
+    TesFileType,
+    TesState,
+    TesExecutorLog,
+    TesFileLog,
+    TesTaskLog,
+    TesTaskResponse,
+    TesTasksResponse,
+    TesErrorPayload
+)))]
 pub struct TesApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -582,8 +586,8 @@ naming a different one; a bearer token requires that tag.
 - Exactly one executor whose `command` is the full argv.
 - `id`, `state`, `logs` and `creation_time` are read only, as are the derived tags
   `aruna-engine.org/job-id`, `aruna-engine.org/logical-state`, `aruna-engine.org/executor-kind`
-  and `aruna-engine.org/estimated-transfer-bytes`; naming one is refused with error code
-  `reserved_tag`.
+  and `aruna-engine.org/estimated-transfer-bytes`; naming one, or any tag starting with
+  `aruna-engine.org/plugin-` (set only on plugin tasks), is refused with error code `reserved_tag`.
 - Input urls must be `s3://bucket/key` or a versioned object ARN, output urls `s3://bucket/key`;
   container paths must be absolute, canonical and
   may not overlap between inputs and outputs; at most 1024 outputs, the same bound the immutable
@@ -703,16 +707,21 @@ pub async fn create_task(
     let workspace_mode = target_modes(target).1;
 
     if target == ExecutionTarget::Local {
-        return match submit_local_execution(
-            &state.get_ctx(),
-            LocalExecutionConfig {
-                spec,
-                owner: caller.auth.user_id,
-                node_id: state.get_node_id(),
-                idempotency_key,
-                workspace_mode,
-                retention_ms: state.rocrate_limits().artifact_retention_ms,
-            },
+        let config = LocalExecutionConfig {
+            spec,
+            owner: caller.auth.user_id,
+            node_id: state.get_node_id(),
+            idempotency_key,
+            workspace_mode,
+            retention_ms: state.rocrate_limits().artifact_retention_ms,
+        };
+        let context = state.get_ctx();
+        return match drive(
+            aruna_operations::jobs::local_run::LocalRunOperation::new(
+                config,
+                context.node_and_realm(),
+            ),
+            context.as_ref(),
         )
         .await
         {
@@ -726,9 +735,9 @@ pub async fn create_task(
         };
     }
 
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::AuthToken::internal(
+            Some(aruna_core::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -903,9 +912,9 @@ pub async fn get_task(
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
 
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::AuthToken::internal(
+            Some(aruna_core::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -1127,7 +1136,7 @@ pub async fn list_tasks(
         StatusCode::OK,
         TesTasksResponse {
             tasks,
-            next_page_token: next_cursor.map(|cursor| URL_SAFE_NO_PAD.encode(cursor)),
+            next_page_token: next_cursor.map(aruna_core::cursor::encode),
         },
     )
 }
@@ -1187,9 +1196,9 @@ pub async fn cancel_task(
         Ok(job_id) => job_id,
         Err(_) => return TesError::not_found("TES task not found").into_response(),
     };
-    let forwarded = match super::jobs::forwarded_job_auth(bearer) {
+    let forwarded = match crate::jobs::forwarded_job_auth(bearer) {
         Ok(token) => token.or_else(|| {
-            Some(aruna_operations::metadata::AuthToken::internal(
+            Some(aruna_core::metadata::AuthToken::internal(
                 caller.auth.clone(),
             ))
         }),
@@ -1292,6 +1301,7 @@ fn map_execution_spec(
         env: executor.env.clone(),
         resources,
         executor_constraint: task.tags.get(EXECUTOR_TAG_KEY).cloned(),
+        backend: task.tags.get(BACKEND_TAG_KEY).cloned(),
         inputs,
         file_outputs,
         workspace_outputs: Vec::new(),
@@ -1317,6 +1327,13 @@ fn validate_task_shape(task: &TesTask) -> Result<&TesExecutor, TesError> {
         return Err(TesError::coded(
             StatusCode::BAD_REQUEST,
             format!("tag `{key}` is derived at read time and read-only"),
+            "reserved_tag",
+        ));
+    }
+    if let Some(key) = aruna_core::structs::execution::job::input::plugin_tag(&task.tags) {
+        return Err(TesError::coded(
+            StatusCode::BAD_REQUEST,
+            format!("tag `{key}` is reserved for plugin tasks"),
             "reserved_tag",
         ));
     }
@@ -1522,16 +1539,18 @@ fn map_input(input: &TesInput, mode: InputMode) -> Result<InputSelection, TesErr
     // A directory names a key prefix, which admission expands into its objects.
     let mut dest_key = input.path[1..].to_string();
     if input.kind == TesFileType::Directory {
-        let InputSource::S3 {
+        if let InputSource::S3 {
             key, version_id, ..
-        } = &mut source;
-        if version_id.is_some() {
-            return Err(TesError::bad_request(
-                "a directory input names an s3:// prefix, not one version",
-            ));
-        }
-        if !key.ends_with('/') {
-            key.push('/');
+        } = &mut source
+        {
+            if version_id.is_some() {
+                return Err(TesError::bad_request(
+                    "a directory input names an s3:// prefix, not one version",
+                ));
+            }
+            if !key.ends_with('/') {
+                key.push('/');
+            }
         }
         dest_key.push('/');
     }
@@ -1600,7 +1619,7 @@ fn output_prefix(output: &TesOutput) -> Result<Option<String>, TesError> {
 
 /// An input url is `s3://bucket/key` on this node, or a versioned object ARN naming the node
 /// that holds the exact version to read.
-fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::NodeId>), TesError> {
+fn parse_input_url(url: &str) -> Result<(InputSource, Option<aruna_core::id::NodeId>), TesError> {
     if !url.starts_with("arn:") {
         let (bucket, key) = parse_s3_url(url, "input")?;
         let source = InputSource::S3 {
@@ -1684,6 +1703,7 @@ fn tes_state(record: &JobRecord) -> TesState {
             _ => TesState::SystemError,
         },
         JobState::Cancelled => TesState::Canceled,
+        JobState::NotRun => TesState::SystemError,
     }
 }
 
@@ -1792,7 +1812,11 @@ fn input_url(record: &JobRecord, input: &InputSelection, realm_id: RealmId) -> S
         bucket,
         key,
         version_id,
-    } = &input.source;
+    } = &input.source
+    else {
+        // Only plugin tasks carry inline bytes; they have no url to show.
+        return String::new();
+    };
     let captured =
         (record.captured_inputs.iter()).find(|captured| captured.destination_key == input.dest_key);
     let pinned = match captured {
@@ -1971,6 +1995,10 @@ fn project_tags(spec: &ExecutionSpec) -> BTreeMap<String, String> {
         tags.entry(EXECUTOR_TAG_KEY.to_string())
             .or_insert_with(|| constraint.clone());
     }
+    if let Some(backend) = &spec.backend {
+        tags.entry(BACKEND_TAG_KEY.to_string())
+            .or_insert_with(|| backend.clone());
+    }
     tags
 }
 
@@ -2092,11 +2120,14 @@ async fn authenticate_tes(
         )
     };
     let context = state.get_ctx();
-    let (storage, owner) = (&context.storage_handle, &access.user_identity);
-    let cutoff = realm_user_cutoff(storage, state.get_realm_id(), owner)
-        .await
-        .map_err(unavailable)?;
-    let deactivated = account_deactivated(storage, owner)
+    let owner = &access.user_identity;
+    let cutoff = drive(
+        UserCutoffOperation::new(state.get_realm_id(), owner),
+        &context,
+    )
+    .await
+    .map_err(unavailable)?;
+    let deactivated = drive(AccountDeactivatedOperation::new(owner), &context)
         .await
         .map_err(unavailable)?;
     if deactivated || cutoff.is_some_and(|cutoff| issued < cutoff) {
@@ -2175,7 +2206,9 @@ async fn ensure_group_write(
     )
     .await
     .map_err(|error| match error {
-        crate::error::ServerError::InternalError(message) => TesError::internal(message),
+        crate::error::ServerError::InternalError(message) => {
+            TesError::internal(message.to_string())
+        }
         _ => TesError::forbidden("no write access to group"),
     })
 }
@@ -2183,8 +2216,7 @@ async fn ensure_group_write(
 fn decode_page_token(token: Option<&str>) -> Result<Option<Vec<u8>>, TesError> {
     match token {
         Some(token) => {
-            let bytes = URL_SAFE_NO_PAD
-                .decode(token)
+            let bytes = aruna_core::cursor::decode(token)
                 .map_err(|_| TesError::bad_request("invalid page_token"))?;
             if bytes.len() != 24 {
                 return Err(TesError::bad_request("invalid page_token"));
@@ -2288,7 +2320,7 @@ impl TesError {
 
     /// Task creation shares the REST submit mapping, so a refusal a TES client
     /// must not retry never reaches it as a retryable 500.
-    fn from_submit(error: aruna_operations::jobs::submit::SubmitJobError) -> Self {
+    fn from_submit(error: aruna_core::job_request::SubmitJobError) -> Self {
         Self::from_server(super::jobs::map_submit_error(error))
     }
 
@@ -2303,6 +2335,11 @@ impl TesError {
                 code: None,
             },
             JobRouteError::Internal(message) => Self::internal(message),
+            JobRouteError::Pruned => Self {
+                status: StatusCode::GONE,
+                message: "TES task was pruned after its retention".to_string(),
+                code: None,
+            },
         }
     }
 }

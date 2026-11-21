@@ -7,24 +7,24 @@ use super::query::*;
 use super::references::*;
 use super::rocrate::*;
 use super::validation::*;
-use crate::auth::ValidatedBearer;
+use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
+use crate::metadata::model::*;
 use crate::metadata::*;
 use crate::server::state::ServerState;
-use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, test_context, test_state, test_storage,
+use crate::tests::metadata_fixtures::{
+    create_test_document, drain_metadata_background, state_realm_nodes, test_realm_id, write_doc,
 };
-use aruna_core::keys::generate_signing_key;
-use aruna_core::metadata::MetadataQueryResults;
+use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, test_storage};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_core::{MetaResourceId, StructuredId};
-use aruna_operations::driver::drive;
-use aruna_operations::metadata::api::{
-    ApiQueryMode, MetadataApiError, MetadataQueryRequest, MetadataSearchRequest, load_realm_nodes,
-    query_metadata as run_query_metadata, search_metadata as run_search_metadata,
-};
+use aruna_drivers::driver::drive;
+use aruna_drivers::testing::installed_graph_handle;
+use aruna_drivers::testing::test_context;
+use aruna_operations::metadata::api::read_types::ApiQueryMode;
+use aruna_operations::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -45,46 +45,33 @@ use aruna_core::metadata::{
     MetadataLifecycleRecord,
 };
 use aruna_core::storage_entries::{materialization_status_entry, registry_delete_entries};
-use aruna_core::structs::identity::auth::{NodeCapabilities, TokenClaims};
+use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
 };
-use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, HashIndex,
     VersionKey,
 };
-use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::{
-    drain_projection_queue, replay_event_log, schedule_projection_drain,
-};
-use aruna_operations::metadata::prune_queue::{process_graph_tombstones, prune_jobs_exist};
-use aruna_operations::metadata::repository::{write_document_lifecycle, write_graph_lifecycle};
+use aruna_drivers::driver::DriverContext;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_operations::metadata::repository::write_document_lifecycle;
 use aruna_operations::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceOperation,
 };
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
-use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::EncodePrivateKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
-use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use aruna_test_support::metadata::process_materialization_batch;
+use aruna_test_support::metadata::{process_graph_tombstones, prune_jobs_exist};
+use aruna_test_support::projection::drain_projection_queue;
+use aruna_test_support::projection::schedule_projection_drain;
 use serde_json::json;
 use std::collections::HashSet;
 use std::time::SystemTime;
 use tempfile::TempDir;
-
-async fn state_realm_nodes(state: &ServerState) -> ServerResult<Vec<aruna_core::NodeId>> {
-    let ctx = state.get_ctx();
-    Ok(load_realm_nodes(ctx.as_ref(), state.get_realm_id(), state.get_node_id()).await)
-}
 
 pub(crate) struct TestState {
     _storage_dir: TempDir,
@@ -119,20 +106,13 @@ async fn write_status(state: &ServerState, status: &MaterializationStatusRecord)
     }
 }
 
-fn installed_metadata_handle(context: &DriverContext) -> &MetadataHandle {
-    let DriverContext {
-        metadata_handle, ..
-    } = context;
-    metadata_handle.as_ref().expect("metadata handle installed")
-}
-
 #[tokio::test]
 async fn public_routes_work() {
     let test = setup_network_state().await;
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -242,7 +222,7 @@ async fn public_routes_work() {
 
     let _ = replace_metadata_rocrate(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(ReplaceRoCrateRequest {
@@ -278,10 +258,12 @@ async fn public_routes_work() {
     assert_eq!(raw.context_digest.len(), 64);
     assert_eq!(raw.dataset_digest.as_deref().map(str::len), Some(64));
     assert!(raw.projected_event_id.is_none());
-    let projected_jsonld = installed_metadata_handle(test.state.get_ctx().as_ref())
-        .export_rocrate_jsonld(created.summary.graph_iri.clone())
-        .await
-        .unwrap();
+    let projected_jsonld = aruna_test_support::metadata::export_rocrate_jsonld(
+        test.state.get_ctx().as_ref(),
+        created.summary.graph_iri.clone(),
+    )
+    .await
+    .unwrap();
     assert!(!projected_jsonld.contains("file-2.txt"));
     let failed_event_id = Ulid::from_string(&raw.winning_event_id).unwrap();
     let mut failed_status = MaterializationStatusRecord {
@@ -440,7 +422,7 @@ async fn public_routes_work() {
     assert_eq!(result.nodes_failed, 0);
 
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -550,7 +532,7 @@ async fn portal_searches_description() {
     let test = setup_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),
@@ -626,7 +608,7 @@ async fn rocrate_routes_work() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),
@@ -666,7 +648,7 @@ async fn rocrate_routes_work() {
 
     let _ = add_contextual_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({
@@ -680,7 +662,7 @@ async fn rocrate_routes_work() {
 
     let _ = add_data_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({
@@ -723,7 +705,7 @@ async fn data_entity_removal() {
     drain_metadata_background(test.state.as_ref()).await;
     let (_, Json(added)) = add_data_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({"@id": "./data/run-42.raw", "@type": "File", "name": "run-42.raw"})),
@@ -740,7 +722,7 @@ async fn data_entity_removal() {
         let (state, auth) = (test.state.clone(), test.auth.clone());
         remove_data_entity(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(None),
             Path(document_id.clone()),
             Query(query),
@@ -789,7 +771,7 @@ async fn stale_removal_conflicts() {
     drain_metadata_background(test.state.as_ref()).await;
     let (_, Json(added)) = add_data_entity(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(json!({"@id": "./data/gone.raw", "@type": "File", "name": "gone.raw"})),
@@ -806,7 +788,7 @@ async fn stale_removal_conflicts() {
         let (state, auth) = (test.state.clone(), test.auth.clone());
         remove_data_entity(
             State(state),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(None),
             Path(document_id.clone()),
             Query(query),
@@ -862,11 +844,14 @@ async fn export_here_copy() {
 async fn list_uses_registry() {
     let test = setup_state().await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+    ctx.graph_handle
+        .as_ref()
+        .expect("graph store installed")
+        .expire_caches();
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -884,7 +869,10 @@ async fn list_uses_registry() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
 
-    installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+    ctx.graph_handle
+        .as_ref()
+        .expect("graph store installed")
+        .expire_caches();
 
     let (_, Json(listed)) = list_metadata_documents(
         State(test.state.clone()),
@@ -899,7 +887,7 @@ async fn list_uses_registry() {
 
     let status = delete_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(created.summary.document_id.clone()),
     )
@@ -922,11 +910,14 @@ async fn list_uses_registry() {
 async fn tombstone_hides_listing() {
     let test = setup_state().await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref()).expire_visibility_caches();
+    ctx.graph_handle
+        .as_ref()
+        .expect("graph store installed")
+        .expire_caches();
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -972,8 +963,16 @@ async fn tombstone_hides_listing() {
             deleted_after_id: record.last_event_id,
         },
     };
+    let (key_space, key, value) =
+        aruna_core::storage_entries::graph_lifecycle_entry(&tombstone).unwrap();
+    let graph_lifecycle = Effect::Storage(StorageEffect::Write {
+        key_space,
+        key,
+        value,
+        txn_id: None,
+    });
     for effect in [
-        write_graph_lifecycle(&tombstone, None).unwrap(),
+        graph_lifecycle,
         write_document_lifecycle(&lifecycle, None).unwrap(),
     ] {
         match ctx.storage_handle.send_effect(effect).await {
@@ -996,7 +995,7 @@ async fn tombstone_hides_listing() {
     let processed = process_graph_tombstones(ctx.as_ref(), vec![tombstone]).await;
 
     assert_eq!(processed.enqueued, 1);
-    assert!(prune_jobs_exist(&ctx.storage_handle).await.unwrap());
+    assert!(prune_jobs_exist(ctx.as_ref()).await.unwrap());
     let (_, Json(listed)) = list_metadata_documents(
         State(test.state.clone()),
         Extension(None),
@@ -1037,7 +1036,7 @@ async fn private_metadata_hidden() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1085,7 +1084,7 @@ async fn hides_document_existence() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1114,7 +1113,7 @@ async fn hides_document_existence() {
     assert!(owner.is_ok());
 
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
@@ -1176,46 +1175,6 @@ async fn realm_nodes_fallback() {
     assert_eq!(nodes, vec![state.get_node_id()]);
 }
 
-#[tokio::test]
-async fn presence_tracks_config() {
-    let realm_id = test_realm_id(31);
-    let coordinator = spawn_metadata_node(realm_id).await;
-    let remote = spawn_metadata_node(realm_id).await;
-
-    coordinator
-        .net
-        .add_peer_addr(remote.net.endpoint_addr())
-        .await;
-    remote
-        .net
-        .add_peer_addr(coordinator.net.endpoint_addr())
-        .await;
-    install_realm_config(&[&coordinator, &remote], realm_id, None).await;
-
-    let initial = state_realm_nodes(coordinator.state.as_ref()).await.unwrap();
-    assert_eq!(initial, vec![coordinator.net.node_id()]);
-
-    let remote_ctx = remote.state.get_ctx();
-    drive(
-        AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-            realm_id,
-            node_id: remote.net.node_id(),
-            schedule_refresh: false,
-        }),
-        remote_ctx.as_ref(),
-    )
-    .await
-    .unwrap();
-
-    let discovered = state_realm_nodes(coordinator.state.as_ref()).await.unwrap();
-
-    assert!(discovered.contains(&coordinator.net.node_id()));
-    assert!(discovered.contains(&remote.net.node_id()));
-
-    coordinator.net.shutdown().await;
-    remote.net.shutdown().await;
-}
-
 fn draft_crate() -> Value {
     json!({
         "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -1244,7 +1203,7 @@ async fn preview_refuses_stranger() {
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,
@@ -1252,7 +1211,7 @@ async fn preview_refuses_stranger() {
 
     let result = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Json(ProfilePreviewRequest {
             rocrate: draft_crate(),
             group_id: Some(test.group_id.to_string()),
@@ -1270,7 +1229,7 @@ async fn preview_admits_member() {
 
     let (status, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate: draft_crate(),
             group_id: Some(test.group_id.to_string()),
@@ -1362,7 +1321,7 @@ async fn grant_anonymous_read(test: &TestState) {
                 format!("/{realm_id}/g/{}/**", test.group_id),
                 Permission::READ,
             )]),
-            assigned_users: HashSet::from([aruna_core::UserId::nil(realm_id)]),
+            assigned_users: HashSet::from([aruna_core::user::id::UserId::nil(realm_id)]),
         },
     );
     write_doc(
@@ -1381,7 +1340,7 @@ async fn preview_lists_restricted() {
 
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
@@ -1420,7 +1379,7 @@ async fn preview_skips_readable() {
 
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
@@ -1441,7 +1400,7 @@ async fn preview_skips_private() {
 
     let (_, Json(preview)) = preview_profile_validation(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Json(ProfilePreviewRequest {
             rocrate,
             group_id: Some(test.group_id.to_string()),
@@ -1462,7 +1421,7 @@ async fn pending_export_unavailable() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1521,7 +1480,7 @@ async fn pending_summary_tolerated() {
 
     let (_, Json(_created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1575,7 +1534,7 @@ async fn replacement_summary_withheld() {
 
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1615,7 +1574,7 @@ async fn replacement_summary_withheld() {
     );
     let _ = replace_metadata_rocrate(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id),
         Json(ReplaceRoCrateRequest {
@@ -1795,7 +1754,7 @@ async fn local_partition_executes() {
 
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -1849,7 +1808,7 @@ async fn query_applies_visibility() {
     ] {
         let _ = create_metadata_document(
             State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Extension(None),
             Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
                 group_id: test.group_id.to_string(),
@@ -1898,322 +1857,6 @@ async fn query_applies_visibility() {
     assert!(authorized.iter().any(|name| name.contains("Lazy Private")));
 }
 
-#[tokio::test]
-async fn query_forwards_token() {
-    let test = setup_access_state().await;
-    let token_auth: AuthContext =
-        crate::auth::handle_token(test.coordinator.state.as_ref(), &test.valid_bearer_token)
-            .await
-            .unwrap()
-            .try_into()
-            .unwrap();
-    assert_eq!(token_auth, test.auth);
-
-    let authorized = query_remote_names(
-        &test,
-        Some(token_auth.clone()),
-        Some(ValidatedBearer::new_for_test(
-            test.valid_bearer_token.clone(),
-        )),
-    )
-    .await;
-    assert_eq!(authorized.nodes_queried, 1);
-    assert_eq!(authorized.nodes_failed, 0);
-    assert_contains_name(&authorized.names, "Remote Public Dataset");
-    assert_contains_name(&authorized.names, "Remote Private Dataset");
-
-    let anonymous = query_remote_names(&test, None, None).await;
-    assert_eq!(anonymous.nodes_failed, 0);
-    assert_contains_name(&anonymous.names, "Remote Public Dataset");
-    assert_excludes_name(&anonymous.names, "Remote Private Dataset");
-
-    let no_forwardable_token = query_remote_names(&test, Some(token_auth.clone()), None).await;
-    assert_eq!(no_forwardable_token.nodes_failed, 0);
-    assert_contains_name(&no_forwardable_token.names, "Remote Public Dataset");
-    assert_excludes_name(&no_forwardable_token.names, "Remote Private Dataset");
-
-    let oversized_token = query_remote_names(
-        &test,
-        Some(token_auth.clone()),
-        Some(ValidatedBearer::new_for_test("x".repeat(4097))),
-    )
-    .await;
-    assert_eq!(oversized_token.nodes_failed, 0);
-    assert_contains_name(&oversized_token.names, "Remote Public Dataset");
-    assert_excludes_name(&oversized_token.names, "Remote Private Dataset");
-
-    assert!(
-        crate::auth::handle_token(test.coordinator.state.as_ref(), "not-a-jwt")
-            .await
-            .is_err()
-    );
-    let invalid_forwarded_token = query_remote_names(
-        &test,
-        Some(token_auth),
-        Some(ValidatedBearer::new_for_test("not-a-jwt")),
-    )
-    .await;
-    assert_eq!(invalid_forwarded_token.nodes_queried, 1);
-    assert_eq!(invalid_forwarded_token.nodes_failed, 1);
-    assert_eq!(
-        invalid_forwarded_token.failed_partitions,
-        vec![test.remote.net.node_id()]
-    );
-    assert_excludes_name(&invalid_forwarded_token.names, "Remote Public Dataset");
-    assert_excludes_name(&invalid_forwarded_token.names, "Remote Private Dataset");
-
-    let ctx = test.coordinator.state.get_ctx();
-    let strict = run_query_metadata(
-        ctx.as_ref(),
-        test.coordinator.state.get_realm_id(),
-        test.coordinator.state.get_node_id(),
-        MetadataQueryRequest {
-            auth: None,
-            bearer_token: Some("not-a-jwt".to_string()),
-            graph_iris: None,
-            query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(vec![test.remote.net.node_id()]),
-            allow_partial: false,
-        },
-    )
-    .await;
-    assert!(matches!(strict, Err(MetadataApiError::ServiceUnavailable)));
-
-    test.shutdown().await;
-}
-
-#[tokio::test]
-async fn private_get_forwards() {
-    let test = setup_access_state().await;
-    let (_, Json(listed)) = list_metadata_documents(
-        State(test.remote.state.clone()),
-        Extension(Some(test.auth.clone())),
-        Path(test.group_id.to_string()),
-        Query(ListMetadataQuery::default()),
-    )
-    .await
-    .unwrap();
-    let private = listed
-        .documents
-        .into_iter()
-        .find(|document| document.document_path == "datasets/remote-private")
-        .expect("private document exists on its holder");
-    let (_, Json(path)) = get_metadata_path(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        Extension(Some(ValidatedBearer::new_for_test(
-            test.valid_bearer_token.clone(),
-        ))),
-        Path(test.group_id.to_string()),
-        Query(MetadataPathQuery {
-            path: "datasets/remote-private".to_string(),
-        }),
-    )
-    .await
-    .unwrap();
-    assert_eq!(path.winner.document_id, private.document_id);
-    assert!(path.conflicts.is_empty());
-
-    let (_, Json(fetched)) = get_metadata_document(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        Extension(Some(ValidatedBearer::new_for_test(
-            test.valid_bearer_token.clone(),
-        ))),
-        Path(private.document_id),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(fetched.document_path, "datasets/remote-private");
-    test.shutdown().await;
-}
-
-#[tokio::test]
-async fn user_writes_forward() {
-    let test = setup_access_state().await;
-    let denied = create_metadata_document(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.denied_auth.clone())),
-        Extension(Some(ValidatedBearer::new_for_test(
-            test.denied_bearer_token.clone(),
-        ))),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: test.group_id.to_string(),
-            path: "datasets/user-denied".to_string(),
-            name: "User Denied".to_string(),
-            description: "Forwarded write without group permission".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: None,
-            public: false,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await;
-    // A device forwards only for the owner its realm config names, so
-    // another user's token is refused before any group check.
-    assert!(matches!(denied, Err(ServerError::Forbidden)));
-
-    let bearer = || {
-        Extension(Some(ValidatedBearer::new_for_test(
-            test.valid_bearer_token.clone(),
-        )))
-    };
-
-    // The owner binding does not replace the group check: a group the owner
-    // holds no role in is still refused at the ingress.
-    let foreign_group = Ulid::generate();
-    install_group_documents(
-        &test.remote,
-        test.auth.realm_id,
-        test.denied_auth.user_id,
-        foreign_group,
-    )
-    .await;
-    let unpermitted = create_metadata_document(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        bearer(),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: foreign_group.to_string(),
-            path: "datasets/user-unpermitted".to_string(),
-            name: "User Unpermitted".to_string(),
-            description: "Forwarded write into a foreign group".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: None,
-            public: false,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await;
-    assert!(matches!(unpermitted, Err(ServerError::Forbidden)));
-    let missing = MetaResourceId::from_parts(
-        1,
-        PlacementHandle::new(METADATA_HANDLE).unwrap(),
-        BucketId::new(0).unwrap(),
-        1,
-    )
-    .unwrap();
-    let missing_result = delete_metadata_document(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        bearer(),
-        Path(missing.to_string()),
-    )
-    .await;
-    assert!(matches!(missing_result, Err(ServerError::NotFound)));
-
-    let (_, Json(created)) = create_metadata_document(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        bearer(),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: test.group_id.to_string(),
-            path: "datasets/user-forward".to_string(),
-            name: "User Forward".to_string(),
-            description: "Forwarded from a User node".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: None,
-            public: false,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await
-    .unwrap();
-    let document_id = created.summary.document_id;
-    drain_metadata_background(test.remote.state.as_ref()).await;
-
-    let _ = add_data_entity(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        bearer(),
-        Path(document_id.clone()),
-        Json(json!({
-            "@id": "./forwarded.txt",
-            "@type": "File",
-            "name": "forwarded.txt"
-        })),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        delete_metadata_document(
-            State(test.coordinator.state.clone()),
-            Extension(Some(test.auth.clone())),
-            bearer(),
-            Path(document_id),
-        )
-        .await
-        .unwrap(),
-        StatusCode::NO_CONTENT
-    );
-
-    test.shutdown().await;
-}
-
-#[tokio::test]
-async fn missing_config_fails() {
-    let test = setup_access_state().await;
-    let context = test.coordinator.state.get_ctx();
-    let deleted = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: (*test.coordinator.state.get_realm_id().as_bytes()).into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        deleted,
-        Event::Storage(StorageEvent::DeleteResult { .. })
-    ));
-
-    let result = create_metadata_document(
-        State(test.coordinator.state.clone()),
-        Extension(Some(test.auth.clone())),
-        Extension(Some(ValidatedBearer::new_for_test(
-            test.valid_bearer_token.clone(),
-        ))),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: test.group_id.to_string(),
-            path: "datasets/missing-config".to_string(),
-            name: "Missing Config".to_string(),
-            description: "Origin must fail closed".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: None,
-            public: false,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await;
-    assert!(matches!(result, Err(ServerError::ServiceUnavailable)));
-
-    test.shutdown().await;
-}
-
-#[tokio::test]
-async fn search_without_token() {
-    let test = setup_access_state().await;
-    let ctx = test.remote.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
-        .flush_search_updates()
-        .await
-        .unwrap();
-
-    let anonymous = search_remote_paths(&test, None, None).await;
-    assert_eq!(anonymous.nodes_queried, 1);
-    assert_eq!(anonymous.nodes_failed, 0);
-    assert_contains_path(&anonymous.paths, "datasets/remote-public");
-    assert_excludes_path(&anonymous.paths, "datasets/remote-private");
-
-    test.shutdown().await;
-}
-
 async fn run_search_route(
     state: &Arc<ServerState>,
     auth: &AuthContext,
@@ -2239,297 +1882,12 @@ async fn run_search_route(
     .map(|(_, Json(response))| response)
 }
 
-async fn flush_node_search(node: &DistributedMetadataNode) {
-    let ctx = node.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
-        .flush_search_updates()
-        .await
-        .unwrap();
-}
-
-struct SearchPaginationCluster {
-    auth: AuthContext,
-    group_id: Ulid,
-    nodes: Vec<DistributedMetadataNode>,
-}
-
-impl SearchPaginationCluster {
-    fn coordinator(&self) -> &DistributedMetadataNode {
-        &self.nodes[0]
-    }
-
-    async fn shutdown(self) {
-        for node in self.nodes {
-            node.net.shutdown().await;
-        }
-    }
-}
-
-async fn setup_search_cluster(node_count: usize) -> SearchPaginationCluster {
-    let realm_signing_key = test_signing_key();
-    let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
-    let group_id = Ulid::generate();
-
-    let mut nodes = Vec::new();
-    for _ in 0..node_count {
-        nodes.push(spawn_metadata_node(realm_id).await);
-    }
-    for i in 0..nodes.len() {
-        for j in 0..nodes.len() {
-            if i != j {
-                let addr = nodes[j].net.endpoint_addr();
-                nodes[i].net.add_peer_addr(addr).await;
-            }
-        }
-    }
-    let node_refs: Vec<&DistributedMetadataNode> = nodes.iter().collect();
-    install_realm_config(&node_refs, realm_id, None).await;
-    for node in &nodes {
-        install_auth_documents(node, realm_id, user_id, group_id).await;
-    }
-
-    let auth = AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    SearchPaginationCluster {
-        auth,
-        group_id,
-        nodes,
-    }
-}
-
-async fn seed_public_document(
-    node: &DistributedMetadataNode,
-    auth: &AuthContext,
-    group_id: Ulid,
-    path: &str,
-    name: &str,
-) {
-    create_test_document(node.state.clone(), auth.clone(), group_id, path, name, true).await;
-    drain_metadata_background(node.state.as_ref()).await;
-    flush_node_search(node).await;
-}
-
-// Drives the coordinator against an explicit node set, matching how the other
-// distributed metadata tests fan out (the REST route never sets target_nodes).
-async fn search_cluster_page(
-    cluster: &SearchPaginationCluster,
-    query: &str,
-    limit: usize,
-    cursor: Option<String>,
-) -> aruna_operations::metadata::api::MetadataSearchExecution {
-    let coordinator = cluster.coordinator();
-    let ctx = coordinator.state.get_ctx();
-    let target_nodes = cluster
-        .nodes
-        .iter()
-        .map(|node| node.net.node_id())
-        .collect();
-    run_search_metadata(
-        ctx.as_ref(),
-        coordinator.state.get_realm_id(),
-        coordinator.state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(cluster.auth.clone()),
-            bearer_token: None,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to: None,
-            group_id: None,
-            limit: Some(limit),
-            cursor,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(target_nodes),
-        },
-    )
-    .await
-    .unwrap()
-}
-
-#[tokio::test]
-async fn search_paginates_uniquely() {
-    let cluster = setup_search_cluster(3).await;
-    for index in 0..9 {
-        let node = &cluster.nodes[index % cluster.nodes.len()];
-        seed_public_document(
-            node,
-            &cluster.auth,
-            cluster.group_id,
-            &format!("datasets/corpus-{index}"),
-            &format!("Corpus Document {index}"),
-        )
-        .await;
-    }
-
-    let mut seen_keys: Vec<(String, String)> = Vec::new();
-    let mut seen_paths: HashSet<String> = HashSet::new();
-    let mut cursor = None;
-    let mut last_score = f32::INFINITY;
-    let mut pages = 0;
-    loop {
-        let response = search_cluster_page(&cluster, "Corpus", 3, cursor.clone()).await;
-        assert_eq!(response.fanout_stats.nodes_failed, 0);
-        assert!(response.hits.len() <= 3);
-        for hit in &response.hits {
-            assert!(
-                hit.score <= last_score,
-                "scores must be non-increasing across pages"
-            );
-            last_score = hit.score;
-            seen_keys.push((hit.graph_iri.clone(), hit.subject_iri.clone()));
-            seen_paths.insert(hit.document_path.clone());
-        }
-        pages += 1;
-        assert!(pages <= 20, "pagination failed to terminate");
-        match response.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-
-    let unique: HashSet<_> = seen_keys.iter().cloned().collect();
-    assert_eq!(
-        unique.len(),
-        seen_keys.len(),
-        "pages must not repeat a (graph_iri, subject_iri)"
-    );
-    for index in 0..9 {
-        assert!(
-            seen_paths.contains(&format!("datasets/corpus-{index}")),
-            "every seeded document must appear across the pages"
-        );
-    }
-
-    cluster.shutdown().await;
-}
-
-#[tokio::test]
-async fn pagination_survives_failure() {
-    let cluster = setup_search_cluster(3).await;
-    for index in 0..9 {
-        let node = &cluster.nodes[index % cluster.nodes.len()];
-        seed_public_document(
-            node,
-            &cluster.auth,
-            cluster.group_id,
-            &format!("datasets/corpus-{index}"),
-            &format!("Corpus Document {index}"),
-        )
-        .await;
-    }
-
-    let page1 = search_cluster_page(&cluster, "Corpus", 3, None).await;
-    assert_eq!(page1.fanout_stats.nodes_failed, 0);
-    let cursor = page1.next_cursor.clone().expect("more pages remain");
-
-    // Drop a non-coordinator holder mid-session; paging must continue.
-    cluster.nodes[2].net.shutdown().await;
-
-    let page2 = search_cluster_page(&cluster, "Corpus", 3, Some(cursor)).await;
-    assert!(
-        page2.fanout_stats.nodes_failed >= 1,
-        "the downed node must surface as a failed partition"
-    );
-
-    cluster.shutdown().await;
-}
-
-async fn search_cluster_group(
-    cluster: &SearchPaginationCluster,
-    query: &str,
-    group_id: Option<Ulid>,
-) -> aruna_operations::metadata::api::MetadataSearchExecution {
-    let coordinator = cluster.coordinator();
-    let ctx = coordinator.state.get_ctx();
-    let target_nodes = cluster
-        .nodes
-        .iter()
-        .map(|node| node.net.node_id())
-        .collect();
-    run_search_metadata(
-        ctx.as_ref(),
-        coordinator.state.get_realm_id(),
-        coordinator.state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(cluster.auth.clone()),
-            bearer_token: None,
-            graph_iris: None,
-            query: query.to_string(),
-            conforms_to: None,
-            group_id,
-            limit: Some(50),
-            cursor: None,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(target_nodes),
-        },
-    )
-    .await
-    .unwrap()
-}
-
-#[tokio::test]
-async fn group_filter_fanout() {
-    // Group filter must hold across every fanned-out node.
-    let cluster = setup_search_cluster(3).await;
-    let other_group = Ulid::generate();
-    for node in &cluster.nodes {
-        install_auth_documents(
-            node,
-            node.state.get_realm_id(),
-            cluster.auth.user_id,
-            other_group,
-        )
-        .await;
-    }
-    for index in 0..6 {
-        let node = &cluster.nodes[index % cluster.nodes.len()];
-        let (group_id, label) = if index % 2 == 0 {
-            (cluster.group_id, "primary")
-        } else {
-            (other_group, "other")
-        };
-        seed_public_document(
-            node,
-            &cluster.auth,
-            group_id,
-            &format!("datasets/fanout-{label}-{index}"),
-            &format!("Fanout Document {index}"),
-        )
-        .await;
-    }
-
-    let filtered = search_cluster_group(&cluster, "Fanout", Some(cluster.group_id)).await;
-    assert!(!filtered.hits.is_empty());
-    assert!(
-        filtered
-            .hits
-            .iter()
-            .all(|hit| hit.group_id == cluster.group_id.to_string()),
-        "the group filter must hold across every fanned-out node"
-    );
-
-    let unfiltered = search_cluster_group(&cluster, "Fanout", None).await;
-    let groups: HashSet<String> = unfiltered
-        .hits
-        .iter()
-        .map(|hit| hit.group_id.clone())
-        .collect();
-    assert!(groups.contains(&cluster.group_id.to_string()));
-    assert!(groups.contains(&other_group.to_string()));
-
-    cluster.shutdown().await;
-}
-
 #[tokio::test]
 async fn discovery_failure_partial() {
     let test = setup_state().await;
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2547,7 +1905,7 @@ async fn discovery_failure_partial() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2557,22 +1915,24 @@ async fn discovery_failure_partial() {
         ..ctx.as_ref().clone()
     };
 
-    let result = run_search_metadata(
+    let result = drive(
+        run_search_metadata(
+            test.state.get_realm_id(),
+            test.state.get_node_id(),
+            MetadataSearchRequest {
+                auth: Some(test.auth.clone()),
+                bearer_token: None,
+                graph_iris: None,
+                query: "Discovery".to_string(),
+                conforms_to: None,
+                group_id: None,
+                limit: Some(10),
+                cursor: None,
+                mode: Some(ApiQueryMode::Distributed),
+                target_nodes: None,
+            },
+        ),
         &no_net_ctx,
-        test.state.get_realm_id(),
-        test.state.get_node_id(),
-        MetadataSearchRequest {
-            auth: Some(test.auth.clone()),
-            bearer_token: None,
-            graph_iris: None,
-            query: "Discovery".to_string(),
-            conforms_to: None,
-            group_id: None,
-            limit: Some(10),
-            cursor: None,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: None,
-        },
     )
     .await
     .unwrap();
@@ -2587,7 +1947,7 @@ async fn invalid_cursor_rejected() {
     let test = setup_network_state().await;
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2605,7 +1965,7 @@ async fn invalid_cursor_rejected() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2680,7 +2040,7 @@ async fn cursor_suppresses_churn() {
     for index in 0..5 {
         let _ = create_metadata_document(
             State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Extension(None),
             Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
                 group_id: test.group_id.to_string(),
@@ -2699,7 +2059,7 @@ async fn cursor_suppresses_churn() {
     }
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2724,7 +2084,7 @@ async fn cursor_suppresses_churn() {
     // Introduce a matching document between pages (churn).
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2741,7 +2101,7 @@ async fn cursor_suppresses_churn() {
     .await
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2788,7 +2148,7 @@ async fn page_size_clamped() {
     let test = setup_network_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -2824,7 +2184,7 @@ async fn page_size_clamped() {
     );
     let _ = replace_metadata_rocrate(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Path(document_id.clone()),
         Json(ReplaceRoCrateRequest {
@@ -2838,7 +2198,7 @@ async fn page_size_clamped() {
     .unwrap();
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -2961,7 +2321,7 @@ async fn group_filter_scopes() {
     .await;
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -3009,7 +2369,7 @@ async fn cursor_binds_filter() {
     }
     drain_metadata_background(test.state.as_ref()).await;
     let ctx = test.state.get_ctx();
-    installed_metadata_handle(ctx.as_ref())
+    installed_graph_handle(ctx.as_ref())
         .flush_search_updates()
         .await
         .unwrap();
@@ -3035,7 +2395,7 @@ async fn search_tolerates_pending() {
     let test = setup_state().await;
     let _ = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -3069,264 +2429,6 @@ async fn search_tolerates_pending() {
     }
 }
 
-struct DistributedAccessState {
-    auth: AuthContext,
-    denied_auth: AuthContext,
-    group_id: Ulid,
-    valid_bearer_token: String,
-    denied_bearer_token: String,
-    coordinator: DistributedMetadataNode,
-    remote: DistributedMetadataNode,
-}
-
-impl DistributedAccessState {
-    async fn shutdown(self) {
-        self.coordinator.net.shutdown().await;
-        self.remote.net.shutdown().await;
-    }
-}
-
-struct DistributedMetadataNode {
-    _node_dir: TempDir,
-    net: NetHandle,
-    state: Arc<ServerState>,
-}
-
-struct QueryNamesResult {
-    names: Vec<String>,
-    nodes_queried: usize,
-    nodes_failed: usize,
-    failed_partitions: Vec<aruna_core::NodeId>,
-}
-
-struct SearchPathsResult {
-    paths: Vec<String>,
-    nodes_queried: usize,
-    nodes_failed: usize,
-}
-
-async fn setup_access_state() -> DistributedAccessState {
-    let realm_signing_key = test_signing_key();
-    let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
-    let denied_user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
-    let group_id = Ulid::generate();
-    let coordinator = spawn_metadata_node(realm_id).await;
-    let remote = spawn_metadata_node(realm_id).await;
-    let nodes = [&coordinator, &remote];
-
-    coordinator
-        .net
-        .add_peer_addr(remote.net.endpoint_addr())
-        .await;
-    remote
-        .net
-        .add_peer_addr(coordinator.net.endpoint_addr())
-        .await;
-    // The device forwards for the owner its realm config names, so the
-    // fixture binds it to the user whose token the writes carry.
-    install_realm_config(&nodes, realm_id, Some((coordinator.net.node_id(), user_id))).await;
-    install_auth_documents(&remote, realm_id, user_id, group_id).await;
-
-    let auth = AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    let denied_auth = AuthContext {
-        user_id: denied_user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    create_test_document(
-        remote.state.clone(),
-        auth.clone(),
-        group_id,
-        "datasets/remote-public",
-        "Remote Public Dataset",
-        true,
-    )
-    .await;
-    create_test_document(
-        remote.state.clone(),
-        auth.clone(),
-        group_id,
-        "datasets/remote-private",
-        "Remote Private Dataset",
-        false,
-    )
-    .await;
-    drain_metadata_background(remote.state.as_ref()).await;
-
-    let valid_bearer_token =
-        sign_test_token(&realm_signing_key, &test_token_claims(realm_id, user_id));
-    let denied_bearer_token = sign_test_token(
-        &realm_signing_key,
-        &test_token_claims(realm_id, denied_user_id),
-    );
-
-    DistributedAccessState {
-        auth,
-        denied_auth,
-        group_id,
-        valid_bearer_token,
-        denied_bearer_token,
-        coordinator,
-        remote,
-    }
-}
-
-async fn spawn_metadata_node(realm_id: RealmId) -> DistributedMetadataNode {
-    let node_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(node_dir.path().to_str().unwrap()).unwrap();
-    let net = NetHandle::new(
-        NetConfig {
-            bind_addr: "127.0.0.1:0".parse().unwrap(),
-            realm_id,
-            discovery_method: DiscoveryMethod::None,
-            relay_method: RelayMethod::None,
-            ..NetConfig::default()
-        },
-        storage_handle.clone(),
-    )
-    .await
-    .unwrap();
-    let metadata_handle = MetadataHandle::new(
-        node_dir.path().join("metadata"),
-        net.node_id(),
-        storage_handle.clone(),
-        Some(net.clone()),
-        Some(net.document_sync_node()),
-        Some(net.document_sync_database()),
-    )
-    .unwrap();
-    let context = Arc::new(DriverContext {
-        storage_handle,
-        net_handle: Some(net.clone()),
-        blob_handle: None,
-        metadata_handle: Some(metadata_handle),
-        task_handle: Some(TaskHandle::new()),
-        compute_handle: None,
-    });
-    initialize_incoming_fixture(context.clone());
-    let state = Arc::new(
-        ServerState::new(
-            context,
-            realm_id,
-            net.node_id(),
-            NodeCapabilities::user_node(realm_id).unwrap(),
-            false,
-            None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
-        )
-        .await,
-    );
-
-    DistributedMetadataNode {
-        _node_dir: node_dir,
-        net,
-        state,
-    }
-}
-
-async fn install_realm_config(
-    nodes: &[&DistributedMetadataNode],
-    realm_id: RealmId,
-    user_node: Option<(aruna_core::NodeId, aruna_core::UserId)>,
-) {
-    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
-    config.seed_default_placement();
-    for (band, node) in nodes.iter().enumerate() {
-        let kind = match user_node {
-            Some((node_id, owner)) if node_id == node.net.node_id() => {
-                RealmNodeKind::User { owner }
-            }
-            _ => RealmNodeKind::Server,
-        };
-        config.ensure_node(node.net.node_id(), kind);
-        config.seed_job_control(node.net.node_id(), band as u32);
-    }
-
-    for node in nodes {
-        let actor = Actor {
-            node_id: node.net.node_id(),
-            user_id: aruna_core::UserId::nil(realm_id),
-            realm_id,
-        };
-        write_doc(
-            &node.state.get_ctx(),
-            REALM_CONFIG_KEYSPACE,
-            (*realm_id.as_bytes()).into(),
-            config.to_bytes(&actor).unwrap().into(),
-        )
-        .await;
-        node.net.refresh_document_peers(&config).await.unwrap();
-    }
-}
-
-async fn install_auth_documents(
-    node: &DistributedMetadataNode,
-    realm_id: RealmId,
-    user_id: aruna_core::UserId,
-    group_id: Ulid,
-) {
-    let actor = Actor {
-        node_id: node.net.node_id(),
-        user_id,
-        realm_id,
-    };
-    let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
-    write_doc(
-        &node.state.get_ctx(),
-        AUTH_KEYSPACE,
-        (*realm_id.as_bytes()).into(),
-        realm_auth.to_bytes(&actor).unwrap().into(),
-    )
-    .await;
-    install_group_documents(node, realm_id, user_id, group_id).await;
-}
-
-/// A group owned by `owner`, with its authorization document, so a caller
-/// outside it is refused by the group check rather than by its absence.
-async fn install_group_documents(
-    node: &DistributedMetadataNode,
-    realm_id: RealmId,
-    owner: aruna_core::UserId,
-    group_id: Ulid,
-) {
-    let actor = Actor {
-        node_id: node.net.node_id(),
-        user_id: owner,
-        realm_id,
-    };
-    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
-    let group = Group {
-        display_name: "distributed-metadata-group".to_string(),
-        group_id,
-        realm_id,
-        roles: group_auth.roles.keys().copied().collect(),
-        owner,
-    };
-    let context = node.state.get_ctx();
-
-    write_doc(
-        &context,
-        AUTH_KEYSPACE,
-        group_id.to_bytes().into(),
-        group_auth.to_bytes(&actor).unwrap().into(),
-    )
-    .await;
-    write_doc(
-        &context,
-        GROUP_KEYSPACE,
-        group_id.to_bytes().into(),
-        group.to_bytes(&actor).unwrap().into(),
-    )
-    .await;
-}
-
 async fn references_route(
     test: &TestState,
     auth: Option<AuthContext>,
@@ -3337,7 +2439,7 @@ async fn references_route(
 ) -> ServerResult<MetadataReferencesResponse> {
     metadata_references(
         State(test.state.clone()),
-        Extension(auth),
+        RealmAuth(crate::auth::require_realm_auth(&test.state, auth)?),
         Query(MetadataReferencesParams {
             iri: iri.to_string(),
             predicate: predicate.map(str::to_string),
@@ -3361,7 +2463,7 @@ async fn preflight_route(
 ) -> ServerResult<PreflightResponse> {
     metadata_reference_preflight(
         State(test.state.clone()),
-        Extension(auth),
+        RealmAuth(crate::auth::require_realm_auth(&test.state, auth)?),
         Extension(None),
         Json(PreflightBody {
             target,
@@ -3415,7 +2517,7 @@ async fn create_linking_doc(
     });
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: group_id.to_string(),
@@ -3431,7 +2533,7 @@ async fn create_linking_doc(
     created.summary.document_id
 }
 
-async fn seed_owned_group(test: &TestState, group_id: Ulid, owner: aruna_core::UserId) {
+async fn seed_owned_group(test: &TestState, group_id: Ulid, owner: aruna_core::user::id::UserId) {
     let realm_id = test.state.get_realm_id();
     let actor = Actor {
         node_id: test.state.get_node_id(),
@@ -3570,7 +2672,7 @@ async fn references_omits_unauthorized() {
     // A private backlink from a group the caller cannot read is dropped.
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
-    let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let foreign_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let foreign_group = Ulid::generate();
     seed_owned_group(&test, foreign_group, foreign_user).await;
     let foreign_auth = AuthContext {
@@ -3846,7 +2948,7 @@ async fn preflight_distinguishes_states() {
 async fn hidden_references_concealed() {
     let test = setup_state().await;
     let realm_id = test.state.get_realm_id();
-    let foreign_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let foreign_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let foreign_group = Ulid::generate();
     seed_owned_group(&test, foreign_group, foreign_user).await;
     let foreign_auth = AuthContext {
@@ -4112,195 +3214,29 @@ async fn preflight_locates_unread() {
     );
 }
 
-async fn create_test_document(
-    state: Arc<ServerState>,
-    auth: AuthContext,
-    group_id: Ulid,
-    path: &str,
-    name: &str,
-    public: bool,
-) {
-    let _ = create_metadata_document(
-        State(state),
-        Extension(Some(auth)),
-        Extension(None),
-        Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
-            group_id: group_id.to_string(),
-            path: path.to_string(),
-            name: name.to_string(),
-            description: "Remote metadata access fixture".to_string(),
-            date_published: "2026-01-01".to_string(),
-            license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
-            public,
-            message: None,
-            storage_location: None,
-        })),
-    )
-    .await
-    .unwrap();
-}
-
-async fn query_remote_names(
-    test: &DistributedAccessState,
-    auth: Option<AuthContext>,
-    bearer_token: Option<ValidatedBearer>,
-) -> QueryNamesResult {
-    let ctx = test.coordinator.state.get_ctx();
-    let result = run_query_metadata(
-        ctx.as_ref(),
-        test.coordinator.state.get_realm_id(),
-        test.coordinator.state.get_node_id(),
-        MetadataQueryRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: "SELECT DISTINCT ?name WHERE { ?s <http://schema.org/name> ?name }".to_string(),
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(vec![test.remote.net.node_id()]),
-            allow_partial: true,
-        },
-    )
-    .await
-    .unwrap();
-    let MetadataQueryResults::Solutions(rows) = result.results else {
-        panic!("expected SELECT solutions");
-    };
-    QueryNamesResult {
-        names: rows.into_iter().flat_map(|row| row.into_values()).collect(),
-        nodes_queried: result.fanout_stats.nodes_queried,
-        nodes_failed: result.fanout_stats.nodes_failed,
-        failed_partitions: result.fanout_stats.failed_partitions,
-    }
-}
-
-async fn search_remote_paths(
-    test: &DistributedAccessState,
-    auth: Option<AuthContext>,
-    bearer_token: Option<ValidatedBearer>,
-) -> SearchPathsResult {
-    let ctx = test.coordinator.state.get_ctx();
-    let result = run_search_metadata(
-        ctx.as_ref(),
-        test.coordinator.state.get_realm_id(),
-        test.coordinator.state.get_node_id(),
-        MetadataSearchRequest {
-            auth,
-            bearer_token: bearer_token_string(bearer_token),
-            graph_iris: None,
-            query: "Remote".to_string(),
-            conforms_to: None,
-            group_id: None,
-            limit: Some(10),
-            cursor: None,
-            mode: Some(ApiQueryMode::Distributed),
-            target_nodes: Some(vec![test.remote.net.node_id()]),
-        },
-    )
-    .await
-    .unwrap();
-    SearchPathsResult {
-        paths: result
-            .hits
-            .into_iter()
-            .map(|hit| hit.document_path)
-            .collect(),
-        nodes_queried: result.fanout_stats.nodes_queried,
-        nodes_failed: result.fanout_stats.nodes_failed,
-    }
-}
-
-fn assert_contains_name(names: &[String], expected: &str) {
-    assert!(
-        names.iter().any(|name| name.contains(expected)),
-        "expected {names:?} to contain {expected:?}"
-    );
-}
-
-fn assert_excludes_name(names: &[String], unexpected: &str) {
-    assert!(
-        !names.iter().any(|name| name.contains(unexpected)),
-        "expected {names:?} not to contain {unexpected:?}"
-    );
-}
-
-fn assert_contains_path(paths: &[String], expected: &str) {
-    assert!(
-        paths.iter().any(|path| path == expected),
-        "expected {paths:?} to contain {expected:?}"
-    );
-}
-
-fn assert_excludes_path(paths: &[String], unexpected: &str) {
-    assert!(
-        !paths.iter().any(|path| path == unexpected),
-        "expected {paths:?} not to contain {unexpected:?}"
-    );
-}
-
-fn test_signing_key() -> SigningKey {
-    generate_signing_key()
-}
-
-fn test_realm_id(seed: u8) -> RealmId {
-    RealmId::from_bytes(
-        SigningKey::from_bytes(&[seed; 32])
-            .verifying_key()
-            .to_bytes(),
-    )
-}
-
-fn test_token_claims(realm_id: RealmId, user_id: aruna_core::UserId) -> TokenClaims {
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
-    TokenClaims {
-        sub: user_id.to_string(),
-        iss: realm_id.to_string(),
-        iat: now,
-        exp: now + 600,
-        jti: Ulid::generate().to_string(),
-        sid: None,
-        session_kind: None,
-        restrictions: None,
-        issuer_pubkey: None,
-        delegation_signature: None,
-        name: None,
-        via: None,
-        auth_time: None,
-    }
-}
-
-fn sign_test_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
-    let key_pem = signing_key.to_pkcs8_pem(LineEnding::LF).unwrap();
-    encode(
-        &Header::new(Algorithm::EdDSA),
-        claims,
-        &EncodingKey::from_ed_pem(key_pem.as_bytes()).unwrap(),
-    )
-    .unwrap()
-}
-
 pub(crate) async fn setup_state() -> TestState {
     let (storage_dir, storage_handle) = test_storage();
     let metadata_dir = tempfile::tempdir().unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let realm_id = test_realm_id(3);
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
         realm_id,
     };
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         node_id,
-        storage_handle.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
-    context.metadata_handle = Some(metadata_handle);
+    context.graph_handle = Some(graph_handle);
     context.task_handle = Some(task_handle);
     let driver_ctx = Arc::new(context);
     let group_id = Ulid::generate();
@@ -4370,25 +3306,25 @@ pub(crate) async fn setup_network_state() -> TestState {
     .await
     .unwrap();
     let node_id = net.node_id();
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
         node_id,
         user_id,
         realm_id,
     };
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         node_id,
-        storage_handle.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let task_handle = TaskHandle::new();
     let mut context = test_context(storage_handle);
     context.net_handle = Some(net.clone());
-    context.metadata_handle = Some(metadata_handle);
+    context.graph_handle = Some(graph_handle);
     context.task_handle = Some(task_handle);
     let driver_ctx = Arc::new(context);
     // Single-node realm config so the holder proxy serves mutations locally.
@@ -4403,7 +3339,7 @@ pub(crate) async fn setup_network_state() -> TestState {
         config
             .to_bytes(&Actor {
                 node_id,
-                user_id: aruna_core::UserId::nil(realm_id),
+                user_id: aruna_core::user::id::UserId::nil(realm_id),
                 realm_id,
             })
             .unwrap()
@@ -4456,17 +3392,8 @@ pub(crate) async fn setup_network_state() -> TestState {
     }
 }
 
-pub(crate) async fn drain_metadata_background(state: &ServerState) {
-    let ctx = state.get_ctx();
-    let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
-    if drained.markers_examined == 0 {
-        replay_event_log(ctx.as_ref()).await.unwrap();
-    }
-    process_materialization_batch(ctx.as_ref()).await.unwrap();
-}
-
 async fn setup_closed_storage() -> Arc<ServerState> {
-    let (storage_handle, receivers) = storage::StorageHandle::new();
+    let (storage_handle, receivers) = storage::handle::StorageHandle::new();
     drop(receivers);
 
     let realm_id = test_realm_id(3);
@@ -4477,40 +3404,20 @@ async fn setup_closed_storage() -> Arc<ServerState> {
                 storage_handle,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     )
-}
-
-async fn write_doc(
-    driver_ctx: &Arc<DriverContext>,
-    key_space: &str,
-    key: byteview::ByteView,
-    value: byteview::ByteView,
-) {
-    let event = driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        }))
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 async fn read_task_timer(ctx: &DriverContext, key: &TaskKey) -> Option<PersistedTaskTimer> {
@@ -4543,7 +3450,7 @@ mod authorization {
                 .to_bytes(),
         );
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -4553,7 +3460,7 @@ mod authorization {
     fn stranger_auth(state: &ServerState) -> AuthContext {
         let realm_id = state.get_realm_id();
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
             realm_id,
             path_restrictions: None,
             session: None,
@@ -4582,7 +3489,7 @@ mod authorization {
     ) -> ServerResult<(StatusCode, Json<CreateMetadataResponse>)> {
         create_metadata_document(
             State(test.state.clone()),
-            Extension(auth),
+            RealmAuth(crate::auth::require_realm_auth(&test.state, auth)?),
             Extension(None),
             Json(scaffold(test.group_id, path, public)),
         )
@@ -4656,7 +3563,7 @@ mod authorization {
 
         let denied = delete_metadata_document(
             State(test.state.clone()),
-            Extension(Some(stranger_auth(&test.state))),
+            RealmAuth(stranger_auth(&test.state)),
             Extension(None),
             Path(document_id.clone()),
         )
@@ -4722,7 +3629,7 @@ async fn lookup_hides_private() {
     let test = setup_network_state().await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -4756,16 +3663,22 @@ async fn lookup_hides_private() {
         )
         .unwrap(),
     ];
-    let (_, changed) = aruna_operations::metadata::persistent_id::forward::add_identifiers_routed(
-        &test.state.get_ctx(),
-        test.state.get_realm_id(),
-        document_id,
+    use aruna_operations::metadata::persistent_id::forward::{PidRouteOperation, outcome_mapping};
+    let ctx = test.state.get_ctx();
+    let request = aruna_core::metadata::protocol::PersistentIdRequest::AddIdentifiers {
         identifiers,
-        aruna_core::time::unix_timestamp_millis(),
-        test.auth.clone(),
-    )
-    .await
-    .unwrap();
+        occurred_at_ms: aruna_clock::unix_timestamp_millis(),
+    };
+    let node = (
+        test.state.get_realm_id(),
+        ctx.node_and_realm().map(|(node, _)| node),
+    );
+    let caller = (None, Some(test.auth.clone()));
+    let add = PidRouteOperation::new(node, document_id, request, caller);
+    let (_, changed) = aruna_drivers::driver::drive(add, ctx.as_ref())
+        .await
+        .and_then(outcome_mapping)
+        .unwrap();
     assert!(changed);
 
     let lookup = |auth: Option<AuthContext>, value: &str| {
@@ -4789,7 +3702,7 @@ async fn lookup_hides_private() {
         serde_json::json!({"matches": [{"document_id": document_id.to_string(), "origin": "imported"}]})
     );
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), test.auth.realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), test.auth.realm_id),
         ..test.auth.clone()
     };
     for auth in [None, Some(stranger)] {

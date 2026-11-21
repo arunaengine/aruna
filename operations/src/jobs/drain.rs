@@ -2,36 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
 use std::time::Duration;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
-use aruna_core::events::Event;
-use aruna_core::handle::Handle;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SCHEDULE_INDEX_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    DUE_INDEX_PREFIX, JobError, JobExecutionClass, JobId, JobRecord, LEASE_INDEX_PREFIX,
-    lease_index_key, parse_schedule_key,
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::identity::{
+    DUE_INDEX_PREFIX, JobExecutionClass, JobId, LEASE_INDEX_PREFIX,
 };
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::Key;
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
-use byteview::ByteView;
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, lease_index_key, parse_schedule_key,
+};
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{Key, Value};
+use thiserror::Error;
 use tracing::warn;
 
-use super::reconcile::ExternalReconciler;
-use super::store::{
-    ClaimOutcome, JobMutationError, RequeueOutcome, batch_delete, claim_job, first_schedule_entry,
-    iter_prefix_page, read_job_record, requeue_job,
-};
+use super::store::job_calls::{ClaimOutcome, RequeueOutcome, claim_job, requeue_job};
+use super::store::mutation_error::JobMutationError;
+use super::store::row_calls::{SchedulePage, first_schedule_entry, read_job_record, schedule_page};
+use super::store::store_call::RowBatch;
 use super::{DRAIN_BATCH_SIZE, JOB_RECONCILE_REARM};
 
 /// Per-class claim budget. Both classes share one due index, so a saturated class
 /// must be skipped during the scan rather than claimed and released again.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct JobClassBudget {
     pub in_process: usize,
     pub external: usize,
@@ -57,14 +54,18 @@ impl JobClassBudget {
     }
 }
 
-#[derive(Debug, Default)]
+/// What one drain pass did.
+#[derive(Debug, Default, PartialEq)]
 pub struct JobDrainResult {
     pub claimed: Vec<JobRecord>,
     pub terminal: Vec<JobRecord>,
     pub cancelled_fresh: usize,
     pub swept: usize,
-    /// Expired external attempts routed to the reconcile hook instead of a requeue.
+    /// Expired external attempts left to reconcile instead of a requeue.
     pub reconciled: usize,
+    /// The records of those attempts, which the node reconciles. A node without an executor
+    /// must not charge the attempt: it cannot even observe the container.
+    pub lost_attempts: Vec<JobRecord>,
     pub next_due_after: Option<Duration>,
     /// A per-job error stopped the batch early; the caller should re-drive after a
     /// backoff. Set so `claimed` is never discarded by a later failure.
@@ -74,264 +75,71 @@ pub struct JobDrainResult {
     pub deferred_saturated: bool,
 }
 
-/// Claim due jobs within each class's `budget` and re-queue expired leases. An
-/// expired external attempt routes to `reconciler`. Only records owned by
-/// `owner_node_id` are claimed: a JobId executes on its immutable owner.
-pub async fn drain_job_batch(
-    storage: &StorageHandle,
+/// The first due page could not be read, so nothing was handed off yet.
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct DrainError(pub String);
+
+impl From<IoError> for DrainError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DrainStep {
+    DuePage,
+    DueDrop(&'static str),
+    DueRecord { key: Key, job_id: JobId },
+    DueClaim { key: Key, job_id: JobId },
+    LeasePage,
+    LeaseDrop,
+    Requeue { ts: u64, job_id: JobId },
+    LeaseOrphan,
+    DueHead,
+    LeaseHead(Option<Duration>),
+}
+
+/// Claims due jobs within each class's budget and re-queues expired leases. Only records owned
+/// by `owner_node_id` are claimed: a JobId executes on its immutable owner. A job whose class is
+/// saturated is skipped without a write, since claiming it would only release it again.
+#[derive(Debug, PartialEq)]
+pub struct DrainJobsOperation {
     owner_node_id: NodeId,
     budget: JobClassBudget,
-    reconciler: Option<&Arc<dyn ExternalReconciler>>,
-) -> Result<JobDrainResult, String> {
-    let now_ms = unix_timestamp_millis();
-    let mut result = JobDrainResult::default();
-
-    claim_due_jobs(storage, owner_node_id, now_ms, budget, &mut result).await?;
-
-    if !result.retry_after_error {
-        let mut start_after = None;
-        for _ in 0..2 {
-            match scan_ready(
-                storage,
-                LEASE_INDEX_PREFIX,
-                now_ms,
-                DRAIN_BATCH_SIZE,
-                start_after.take(),
-            )
-            .await
-            {
-                Ok((expired_leases, _, next)) => {
-                    let expired_count = expired_leases.len();
-                    let reconciled_before = result.reconciled;
-                    for (ts, job_id) in expired_leases {
-                        match requeue_job(
-                            storage,
-                            job_id,
-                            None,
-                            now_ms,
-                            Some(now_ms),
-                            Some(JobError::retryable("lease expired")),
-                        )
-                        .await
-                        {
-                            // A node without a reconciler must not charge the attempt: that would
-                            // terminalize a healthy container this node cannot even observe.
-                            Ok(RequeueOutcome::NeedsReconcile(record)) => {
-                                if let Some(reconciler) = reconciler {
-                                    reconciler.reconcile_lost_attempt(storage, record).await;
-                                }
-                                result.reconciled = result.reconciled.saturating_add(1);
-                            }
-                            Ok(RequeueOutcome::Exhausted(record)) => {
-                                result.swept = result.swept.saturating_add(1);
-                                result.terminal.push(record);
-                            }
-                            Ok(_) => result.swept = result.swept.saturating_add(1),
-                            Err(JobMutationError::NotFound) => {
-                                if let Err(error) =
-                                    delete_schedule_row(storage, lease_index_key(ts, job_id)).await
-                                {
-                                    warn!(error = %error, "Failed to drop orphaned job lease index row");
-                                    result.retry_after_error = true;
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                warn!(job_id = %job_id, error = %error, "Failed to requeue expired lease");
-                                result.retry_after_error = true;
-                                break;
-                            }
-                        }
-                    }
-                    if result.retry_after_error
-                        || expired_count != DRAIN_BATCH_SIZE
-                        || result.reconciled.saturating_sub(reconciled_before) != expired_count
-                    {
-                        break;
-                    }
-                    let Some(next) = next else {
-                        break;
-                    };
-                    start_after = Some(next);
-                }
-                Err(error) => {
-                    warn!(error = %error, "Failed to scan expired job leases");
-                    result.retry_after_error = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    match next_drain_delays(storage).await {
-        Ok((due, lease)) => {
-            result.next_due_after = min_delay(due, lease);
-        }
-        Err(error) => {
-            warn!(error = %error, "Failed to compute next job drain timer");
-            result.retry_after_error = true;
-        }
-    }
-    Ok(result)
-}
-
-/// Walk the due head, claiming each job against its own class budget. A job whose
-/// class is saturated is skipped without a write: claiming it would only release it
-/// again, churning storage while the drain re-arms at zero.
-async fn claim_due_jobs(
-    storage: &StorageHandle,
-    owner_node_id: NodeId,
     now_ms: u64,
-    mut budget: JobClassBudget,
-    result: &mut JobDrainResult,
-) -> Result<(), String> {
-    if budget.is_empty() {
-        result.deferred_saturated = true;
-        return Ok(());
-    }
-    let mut start_after = None;
-    'pages: loop {
-        let (values, next) = match iter_prefix_page(
-            storage,
-            SCHEDULE_INDEX_KEYSPACE,
-            Some(ByteView::from(DUE_INDEX_PREFIX.to_vec())),
-            start_after.take(),
-            DRAIN_BATCH_SIZE,
-            None,
-        )
-        .await
-        {
-            Ok(page) => page,
-            // Nothing to hand off yet, so a plain failure is enough.
-            Err(error) if result.claimed.is_empty() => return Err(error),
-            Err(error) => {
-                warn!(error = %error, "Failed to page due jobs");
-                result.retry_after_error = true;
-                break 'pages;
-            }
-        };
-        if values.is_empty() {
-            break 'pages;
-        }
-        for (key, _) in values {
-            let (ts, job_id) = match parse_schedule_key(key.as_ref()) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    warn!(error = %error, "Deleting malformed job due index row");
-                    if let Err(error) = delete_schedule_row(storage, key).await {
-                        warn!(error = %error, "Failed to drop malformed job due index row");
-                        result.retry_after_error = true;
-                        break 'pages;
-                    }
-                    continue;
-                }
-            };
-            // The index is timestamp-ordered, so the first future row ends the scan.
-            if ts > now_ms {
-                break 'pages;
-            }
-            let record = match read_job_record(storage, job_id, None).await {
-                Ok(Some(record)) => record,
-                // Orphaned index row (record gone/quarantined): drop it so it cannot
-                // pin the drain timer at zero forever.
-                Ok(None) => {
-                    if let Err(error) = delete_schedule_row(storage, key).await {
-                        warn!(error = %error, "Failed to drop orphaned job due index row");
-                        result.retry_after_error = true;
-                        break 'pages;
-                    }
-                    continue;
-                }
-                Err(error) => {
-                    warn!(job_id = %job_id, error = %error, "Failed to read due job");
-                    result.retry_after_error = true;
-                    break 'pages;
-                }
-            };
-            // A foreign-owned due row is an index inconsistency: only the immutable
-            // owner may run the job, so drop it rather than claim it or pin the timer.
-            if record.owner_node_id != owner_node_id {
-                warn!(job_id = %job_id, owner = %record.owner_node_id, "Dropping due row for a foreign-owned job");
-                if let Err(error) = delete_schedule_row(storage, key).await {
-                    warn!(error = %error, "Failed to drop foreign-owned job due row");
-                    result.retry_after_error = true;
-                    break 'pages;
-                }
-                continue;
-            }
-            let class = record.execution_class;
-            if budget.remaining(class) == 0 {
-                result.deferred_saturated = true;
-                continue;
-            }
-            match claim_job(storage, job_id, owner_node_id, now_ms).await {
-                Ok(ClaimOutcome::Claimed(record)) => {
-                    budget.take(record.execution_class);
-                    result.claimed.push(record);
-                    if budget.is_empty() {
-                        break 'pages;
-                    }
-                }
-                Ok(ClaimOutcome::CancelledFresh(record)) => {
-                    result.cancelled_fresh = result.cancelled_fresh.saturating_add(1);
-                    result.terminal.push(record);
-                }
-                Ok(ClaimOutcome::NotEligible) => {}
-                Err(JobMutationError::NotFound) => {
-                    if let Err(error) = delete_schedule_row(storage, key).await {
-                        warn!(error = %error, "Failed to drop orphaned job due index row");
-                        result.retry_after_error = true;
-                        break 'pages;
-                    }
-                }
-                // Never discard jobs already claimed in this batch: stop here, hand them off,
-                // and let the caller re-drive the remainder after a backoff.
-                Err(error) => {
-                    warn!(job_id = %job_id, error = %error, "Failed to claim due job");
-                    result.retry_after_error = true;
-                    break 'pages;
-                }
-            }
-        }
-        match next {
-            Some(next) => start_after = Some(next),
-            None => break 'pages,
-        }
-    }
-    Ok(())
+    result: JobDrainResult,
+    step: DrainStep,
+    /// Rows of the current page still to judge, the next one last.
+    rows: Vec<(Key, Value)>,
+    next_page: Option<Key>,
+    /// Expired leases of the current page still to requeue, the next one last.
+    expired: Vec<(u64, JobId)>,
+    expired_count: usize,
+    reconciled_before: usize,
+    lease_pages: u8,
 }
 
-async fn delete_schedule_row(storage: &StorageHandle, key: Key) -> Result<(), String> {
-    batch_delete(
-        storage,
-        vec![(SCHEDULE_INDEX_KEYSPACE.to_string(), key)],
-        None,
-    )
-    .await
+type DrainNext = Result<Next<JobDrainResult>, DrainError>;
+
+fn drop_row(key: Key) -> IoCall {
+    let row = (SCHEDULE_INDEX_KEYSPACE.to_string(), key);
+    IoCall::child(RowBatch::delete(vec![row]))
 }
 
-/// Earliest `due/` and `lease/` heads as delays from now; lease delays observe the
-/// reconcile re-arm floor.
-async fn next_drain_delays(
-    storage: &StorageHandle,
-) -> Result<(Option<Duration>, Option<Duration>), String> {
-    let now_ms = unix_timestamp_millis();
-    let delay = |ts: u64| Duration::from_millis(ts.saturating_sub(now_ms));
-    let due = first_schedule_entry(storage, DUE_INDEX_PREFIX).await?;
-    let lease = first_schedule_entry(storage, LEASE_INDEX_PREFIX).await?;
-    // A reconciled attempt keeps its expired lease row, which would pin the lease
-    // head at zero; floor only an already-due head, a future one fires on time.
-    Ok((
-        due.map(|(ts, _)| delay(ts)),
-        lease.map(|(ts, _)| {
-            let raw = delay(ts);
-            if raw.is_zero() {
-                JOB_RECONCILE_REARM
-            } else {
-                raw
-            }
-        }),
-    ))
+fn delay(ts: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(ts.saturating_sub(now_ms))
+}
+
+/// A reconciled attempt keeps its expired lease row, which would pin the lease head at zero;
+/// floor only an already-due head, a future one fires on time.
+fn lease_delay(ts: u64, now_ms: u64) -> Duration {
+    let raw = delay(ts, now_ms);
+    if raw.is_zero() {
+        JOB_RECONCILE_REARM
+    } else {
+        raw
+    }
 }
 
 fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration> {
@@ -342,101 +150,563 @@ fn min_delay(due: Option<Duration>, lease: Option<Duration>) -> Option<Duration>
     }
 }
 
-/// Earliest `due/`/`lease/` head as a delay from now, with the lease re-arm floor.
-pub async fn next_drain_delay(storage: &StorageHandle) -> Result<Option<Duration>, String> {
-    let (due, lease) = next_drain_delays(storage).await?;
-    Ok(min_delay(due, lease))
+type ScheduleHead = Result<Option<(u64, JobId)>, JobMutationError>;
+
+fn schedule_head(result: IoResult) -> Result<ScheduleHead, IoError> {
+    result.child::<Option<(u64, JobId)>, JobMutationError>()
 }
 
-/// ShortenTimer restore (startup + re-arm loop); never pushes a deadline later.
-pub async fn restore_drain_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let after = match next_drain_delay(storage).await {
-        Ok(Some(after)) => after,
-        Ok(None) => return,
-        Err(error) => {
-            warn!(error = %error, "Failed to scan job schedule index");
-            return;
+impl DrainJobsOperation {
+    pub fn new(owner_node_id: NodeId, budget: JobClassBudget, now_ms: u64) -> Self {
+        Self {
+            owner_node_id,
+            budget,
+            now_ms,
+            result: JobDrainResult::default(),
+            step: DrainStep::DuePage,
+            rows: Vec::new(),
+            next_page: None,
+            expired: Vec::new(),
+            expired_count: 0,
+            reconciled_before: 0,
+            lease_pages: 0,
         }
-    };
-    let event = task_handle
-        .send_effect(Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::DrainJobQueue,
-            after,
-        }))
-        .await;
-    if let Event::Task(TaskEvent::Error { message, .. }) = event {
-        warn!(message = %message, "Failed to restore job drain timer");
     }
-}
 
-async fn scan_ready(
-    storage: &StorageHandle,
-    prefix: &[u8],
-    now_ms: u64,
-    limit: usize,
-    start_after: Option<Key>,
-) -> Result<(Vec<(u64, JobId)>, Option<u64>, Option<Key>), String> {
-    if limit == 0 {
-        return Ok((Vec::new(), None, None));
+    fn call(&mut self, step: DrainStep, call: IoCall) -> DrainNext {
+        self.step = step;
+        Ok(Next::Call(call))
     }
-    let (values, next) = iter_prefix_page(
-        storage,
-        SCHEDULE_INDEX_KEYSPACE,
-        Some(ByteView::from(prefix.to_vec())),
-        start_after,
-        limit,
-        None,
-    )
-    .await?;
 
-    let mut ready = Vec::new();
-    let mut next_at = None;
-    for (key, _) in values {
-        match parse_schedule_key(key.as_ref()) {
-            Ok((ts, job_id)) => {
-                if ts <= now_ms {
-                    ready.push((ts, job_id));
-                } else {
-                    next_at = Some(ts);
+    /// Stops the batch for a later retry; what was claimed is still handed off.
+    fn stop(&mut self, message: &str, error: impl std::fmt::Display) -> DrainNext {
+        warn!(error = %error, "{message}");
+        self.result.retry_after_error = true;
+        self.read_heads()
+    }
+
+    fn due_page(&mut self, after: Option<Key>) -> DrainNext {
+        let page = schedule_page(DUE_INDEX_PREFIX, after, DRAIN_BATCH_SIZE);
+        self.call(DrainStep::DuePage, IoCall::child(page))
+    }
+
+    fn due_paged(&mut self, page: Result<SchedulePage, JobMutationError>) -> DrainNext {
+        let (mut rows, next) = match page {
+            Ok(page) => page,
+            // Nothing to hand off yet, so a plain failure is enough.
+            Err(error) if self.result.claimed.is_empty() => {
+                return Err(DrainError(error.to_string()));
+            }
+            Err(error) => return self.stop("Failed to page due jobs", error),
+        };
+        if rows.is_empty() {
+            return self.sweep();
+        }
+        rows.reverse();
+        self.rows = rows;
+        self.next_page = next;
+        self.next_due()
+    }
+
+    fn drop_due(&mut self, key: Key, failure: &'static str) -> DrainNext {
+        self.call(DrainStep::DueDrop(failure), drop_row(key))
+    }
+
+    fn next_due(&mut self) -> DrainNext {
+        let Some((key, _)) = self.rows.pop() else {
+            return match self.next_page.take() {
+                Some(next) => self.due_page(Some(next)),
+                None => self.sweep(),
+            };
+        };
+        let (ts, job_id) = match parse_schedule_key(key.as_ref()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                warn!(error = %error, "Deleting malformed job due index row");
+                return self.drop_due(key, "Failed to drop malformed job due index row");
+            }
+        };
+        // The index is timestamp-ordered, so the first future row ends the scan.
+        if ts > self.now_ms {
+            return self.sweep();
+        }
+        let read = IoCall::child(read_job_record(job_id));
+        self.call(DrainStep::DueRecord { key, job_id }, read)
+    }
+
+    fn due_record(&mut self, key: Key, job_id: JobId, record: JobRecord) -> DrainNext {
+        // A foreign-owned due row is an index inconsistency: only the immutable owner may
+        // run the job, so drop it rather than claim it or pin the timer.
+        if record.owner_node_id != self.owner_node_id {
+            let owner = record.owner_node_id;
+            warn!(job_id = %job_id, owner = %owner, "Dropping due row for a foreign-owned job");
+            return self.drop_due(key, "Failed to drop foreign-owned job due row");
+        }
+        if self.budget.remaining(record.execution_class) == 0 {
+            self.result.deferred_saturated = true;
+            return self.next_due();
+        }
+        let claim = claim_job(job_id, self.owner_node_id, self.now_ms);
+        self.call(DrainStep::DueClaim { key, job_id }, IoCall::child(claim))
+    }
+
+    fn claimed(
+        &mut self,
+        key: Key,
+        job_id: JobId,
+        outcome: Result<ClaimOutcome, JobMutationError>,
+    ) -> DrainNext {
+        match outcome {
+            Ok(ClaimOutcome::Claimed(record)) => {
+                self.budget.take(record.execution_class);
+                self.result.claimed.push(record);
+                if self.budget.is_empty() {
+                    return self.sweep();
+                }
+                self.next_due()
+            }
+            Ok(ClaimOutcome::CancelledFresh(record)) => {
+                self.result.cancelled_fresh = self.result.cancelled_fresh.saturating_add(1);
+                self.result.terminal.push(record);
+                self.next_due()
+            }
+            Ok(ClaimOutcome::NotEligible) => self.next_due(),
+            Err(JobMutationError::NotFound) => {
+                self.drop_due(key, "Failed to drop orphaned job due index row")
+            }
+            // Never discard jobs already claimed in this batch: stop here, hand them off,
+            // and let the caller re-drive the remainder after a backoff.
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Failed to claim due job");
+                self.result.retry_after_error = true;
+                self.read_heads()
+            }
+        }
+    }
+
+    fn sweep(&mut self) -> DrainNext {
+        self.rows.clear();
+        self.next_page = None;
+        self.lease_page(None)
+    }
+
+    fn lease_page(&mut self, after: Option<Key>) -> DrainNext {
+        self.lease_pages += 1;
+        let page = schedule_page(LEASE_INDEX_PREFIX, after, DRAIN_BATCH_SIZE);
+        self.call(DrainStep::LeasePage, IoCall::child(page))
+    }
+
+    fn scan_leases(&mut self) -> DrainNext {
+        while let Some((key, _)) = self.rows.pop() {
+            match parse_schedule_key(key.as_ref()) {
+                Ok((ts, job_id)) if ts <= self.now_ms => self.expired.push((ts, job_id)),
+                Ok(_) => {
+                    self.rows.clear();
                     break;
                 }
-            }
-            Err(error) => {
-                warn!(error = %error, "Deleting malformed job schedule index row during scan");
-                delete_schedule_row(storage, key).await?;
+                Err(error) => {
+                    warn!(error = %error, "Deleting malformed job schedule index row during scan");
+                    return self.call(DrainStep::LeaseDrop, drop_row(key));
+                }
             }
         }
+        self.expired_count = self.expired.len();
+        self.reconciled_before = self.result.reconciled;
+        self.expired.reverse();
+        self.next_requeue()
     }
-    Ok((ready, next_at, next))
+
+    fn next_requeue(&mut self) -> DrainNext {
+        let Some((ts, job_id)) = self.expired.pop() else {
+            return self.lease_round_done();
+        };
+        let error = JobError::retryable("lease expired");
+        let requeue = requeue_job(job_id, None, self.now_ms, Some(self.now_ms), Some(error));
+        self.call(DrainStep::Requeue { ts, job_id }, IoCall::child(requeue))
+    }
+
+    /// Only a full page of reconciled attempts hides later rows, so only then look further.
+    fn lease_round_done(&mut self) -> DrainNext {
+        let reconciled = self
+            .result
+            .reconciled
+            .saturating_sub(self.reconciled_before);
+        let full = self.expired_count == DRAIN_BATCH_SIZE && reconciled == self.expired_count;
+        match self.next_page.take() {
+            Some(next) if full && self.lease_pages < 2 => self.lease_page(Some(next)),
+            _ => self.read_heads(),
+        }
+    }
+
+    fn requeued(
+        &mut self,
+        ts: u64,
+        job_id: JobId,
+        outcome: Result<RequeueOutcome, JobMutationError>,
+    ) -> DrainNext {
+        match outcome {
+            Ok(RequeueOutcome::NeedsReconcile(record)) => {
+                self.result.lost_attempts.push(record);
+                self.result.reconciled = self.result.reconciled.saturating_add(1);
+            }
+            Ok(RequeueOutcome::Exhausted(record)) => {
+                self.result.swept = self.result.swept.saturating_add(1);
+                self.result.terminal.push(record);
+            }
+            Ok(_) => self.result.swept = self.result.swept.saturating_add(1),
+            Err(JobMutationError::NotFound) => {
+                let orphan = drop_row(lease_index_key(ts, job_id));
+                return self.call(DrainStep::LeaseOrphan, orphan);
+            }
+            Err(error) => {
+                warn!(job_id = %job_id, error = %error, "Failed to requeue expired lease");
+                self.result.retry_after_error = true;
+                return self.read_heads();
+            }
+        }
+        self.next_requeue()
+    }
+
+    fn read_heads(&mut self) -> DrainNext {
+        let head = first_schedule_entry(DUE_INDEX_PREFIX);
+        self.call(DrainStep::DueHead, IoCall::child(head))
+    }
+
+    fn finish(mut self_result: JobDrainResult, next: Option<Duration>) -> DrainNext {
+        self_result.next_due_after = next;
+        Ok(Next::Done(self_result))
+    }
+
+    fn take_result(&mut self) -> JobDrainResult {
+        std::mem::take(&mut self.result)
+    }
+
+    fn heads_failed(&mut self, error: JobMutationError) -> DrainNext {
+        warn!(error = %error, "Failed to compute next job drain timer");
+        self.result.retry_after_error = true;
+        Ok(Next::Done(self.take_result()))
+    }
+}
+
+impl Operation for DrainJobsOperation {
+    type Output = JobDrainResult;
+    type Error = DrainError;
+
+    fn first(&mut self) -> DrainNext {
+        if self.budget.is_empty() {
+            self.result.deferred_saturated = true;
+            return self.sweep();
+        }
+        self.due_page(None)
+    }
+
+    fn next(&mut self, result: IoResult) -> DrainNext {
+        match std::mem::replace(&mut self.step, DrainStep::DuePage) {
+            DrainStep::DuePage => {
+                let page = result.child::<SchedulePage, JobMutationError>()?;
+                self.due_paged(page)
+            }
+            DrainStep::DueDrop(failure) => match result.child::<(), JobMutationError>()? {
+                Ok(()) => self.next_due(),
+                Err(error) => self.stop(failure, error),
+            },
+            DrainStep::DueRecord { key, job_id } => {
+                match result.child::<Option<JobRecord>, JobMutationError>()? {
+                    Ok(Some(record)) => self.due_record(key, job_id, record),
+                    // Orphaned index row (record gone or quarantined): drop it so it cannot
+                    // pin the drain timer at zero forever.
+                    Ok(None) => self.drop_due(key, "Failed to drop orphaned job due index row"),
+                    Err(error) => {
+                        warn!(job_id = %job_id, error = %error, "Failed to read due job");
+                        self.result.retry_after_error = true;
+                        self.read_heads()
+                    }
+                }
+            }
+            DrainStep::DueClaim { key, job_id } => {
+                let outcome = result.child::<ClaimOutcome, JobMutationError>()?;
+                self.claimed(key, job_id, outcome)
+            }
+            DrainStep::LeasePage => match result.child::<SchedulePage, JobMutationError>()? {
+                Ok((mut rows, next)) => {
+                    rows.reverse();
+                    self.rows = rows;
+                    self.next_page = next;
+                    self.scan_leases()
+                }
+                Err(error) => self.stop("Failed to scan expired job leases", error),
+            },
+            DrainStep::LeaseDrop => match result.child::<(), JobMutationError>()? {
+                Ok(()) => self.scan_leases(),
+                Err(error) => self.stop("Failed to scan expired job leases", error),
+            },
+            DrainStep::Requeue { ts, job_id } => {
+                let outcome = result.child::<RequeueOutcome, JobMutationError>()?;
+                self.requeued(ts, job_id, outcome)
+            }
+            DrainStep::LeaseOrphan => match result.child::<(), JobMutationError>()? {
+                Ok(()) => self.next_requeue(),
+                Err(error) => self.stop("Failed to drop orphaned job lease index row", error),
+            },
+            DrainStep::DueHead => match schedule_head(result)? {
+                Ok(head) => {
+                    let due = head.map(|(ts, _)| delay(ts, self.now_ms));
+                    let lease = first_schedule_entry(LEASE_INDEX_PREFIX);
+                    self.call(DrainStep::LeaseHead(due), IoCall::child(lease))
+                }
+                Err(error) => self.heads_failed(error),
+            },
+            DrainStep::LeaseHead(due) => match schedule_head(result)? {
+                Ok(head) => {
+                    let lease = head.map(|(ts, _)| lease_delay(ts, self.now_ms));
+                    Self::finish(self.take_result(), min_delay(due, lease))
+                }
+                Err(error) => self.heads_failed(error),
+            },
+        }
+    }
+}
+
+/// Moves the drain timer up to the earliest `due/` or `lease/` head; never later.
+#[derive(Debug, PartialEq)]
+pub struct DrainTimerOperation {
+    now_ms: u64,
+    due: Option<Option<Duration>>,
+}
+
+impl DrainTimerOperation {
+    pub fn new(now_ms: u64) -> Self {
+        Self { now_ms, due: None }
+    }
+}
+
+impl Operation for DrainTimerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let head = first_schedule_entry(DUE_INDEX_PREFIX);
+        Ok(Next::Call(IoCall::child(head)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        let head = match schedule_head(result)? {
+            Ok(head) => head,
+            Err(error) => {
+                warn!(error = %error, "Failed to scan job schedule index");
+                return Ok(Next::Done(()));
+            }
+        };
+        let Some(due) = self.due else {
+            self.due = Some(head.map(|(ts, _)| delay(ts, self.now_ms)));
+            let lease = first_schedule_entry(LEASE_INDEX_PREFIX);
+            return Ok(Next::Call(IoCall::child(lease)));
+        };
+        let lease = head.map(|(ts, _)| lease_delay(ts, self.now_ms));
+        let Some(after) = min_delay(due, lease) else {
+            return Ok(Next::Done(()));
+        };
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::DrainJobQueue,
+            after,
+        });
+        Ok(Next::Then {
+            output: (),
+            calls: vec![IoCall::Effect(Box::new(timer))],
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::jobs::JOB_LEASE_MS;
-    use crate::jobs::store::insert_job;
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, JobClaim, JobPayload, JobState, due_index_key,
-    };
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::events::Event;
+    use aruna_core::handle::Handle;
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{AttemptIntent, JobClaim, due_index_key};
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_storage::FjallStorage;
-    use std::sync::Mutex;
+    use aruna_core::task::TaskEvent;
+    use aruna_core::time::unix_timestamp_millis;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::scan::iter_prefix_page;
+    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_tasks::TaskHandle;
+    use aruna_test_support::jobs::insert_job;
+    use aruna_test_support::jobs::read_job_record;
+    use byteview::ByteView;
     use tempfile::tempdir;
     use ulid::Ulid;
 
-    #[derive(Default)]
-    struct RecordingReconciler {
-        seen: Mutex<Vec<JobId>>,
+    async fn drain_job_batch(
+        context: &DriverContext,
+        owner: NodeId,
+        budget: JobClassBudget,
+    ) -> Result<JobDrainResult, DrainError> {
+        let drain = DrainJobsOperation::new(owner, budget, unix_timestamp_millis());
+        drive(drain, context).await
     }
 
-    #[async_trait::async_trait]
-    impl ExternalReconciler for RecordingReconciler {
-        async fn reconcile_lost_attempt(&self, _storage: &StorageHandle, record: JobRecord) {
-            self.seen.lock().unwrap().push(record.job_id);
-        }
+    async fn next_drain_delay(context: &DriverContext) -> Result<Option<Duration>, IoError> {
+        let now_ms = unix_timestamp_millis();
+        let due = drive(first_schedule_entry(DUE_INDEX_PREFIX), context)
+            .await
+            .map_err(|error| IoError::Codec(error.to_string()))?;
+        let lease = drive(first_schedule_entry(LEASE_INDEX_PREFIX), context)
+            .await
+            .map_err(|error| IoError::Codec(error.to_string()))?;
+        Ok(min_delay(
+            due.map(|(ts, _)| delay(ts, now_ms)),
+            lease.map(|(ts, _)| lease_delay(ts, now_ms)),
+        ))
+    }
+
+    async fn restore_drain_timer(context: &DriverContext) {
+        let timer = DrainTimerOperation::new(unix_timestamp_millis());
+        drive(timer, context).await.expect("timer scan");
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn page_of(rows: Vec<Key>, next: Option<Key>) -> IoResult {
+        let rows = rows
+            .into_iter()
+            .map(|key| (key, Value::from(Vec::new())))
+            .collect::<Vec<_>>();
+        child(Ok::<SchedulePage, JobMutationError>((rows, next)))
+    }
+
+    fn is_child(next: &DrainNext) -> bool {
+        matches!(next, Ok(Next::Call(IoCall::Child(_))))
+    }
+
+    fn drain() -> DrainJobsOperation {
+        DrainJobsOperation::new(node_id(3), budget_of(1), 100)
+    }
+
+    // A first due page that cannot be read fails, since nothing was claimed yet.
+    #[test]
+    fn first_page_fails() {
+        let mut pass = drain();
+        assert!(is_child(&pass.first()));
+        let failed = child(Err::<SchedulePage, _>(JobMutationError::NotFound));
+        assert!(pass.next(failed).is_err());
+    }
+
+    // An empty budget leaves due jobs alone and still sweeps the leases.
+    #[test]
+    fn empty_budget_sweeps() {
+        let mut pass = DrainJobsOperation::new(node_id(3), JobClassBudget::default(), 100);
+        assert!(is_child(&pass.first()));
+        assert_eq!(pass.step, DrainStep::LeasePage);
+        assert!(pass.result.deferred_saturated);
+    }
+
+    // A future due row ends the claim pass, and a malformed one is dropped first.
+    #[test]
+    fn due_rows_judged() {
+        let job = job_id(1);
+        let mut pass = drain();
+        let future = due_index_key(200, job);
+        assert!(is_child(&pass.next(page_of(vec![future], None))));
+        assert_eq!(pass.step, DrainStep::LeasePage);
+
+        let mut pass = drain();
+        let bad = Key::from(vec![1u8]);
+        assert!(is_child(&pass.next(page_of(vec![bad], None))));
+        assert!(matches!(pass.step, DrainStep::DueDrop(_)));
+    }
+
+    // A claim failure stops the batch but keeps what it already claimed.
+    #[test]
+    fn claim_failure_stops() {
+        let job = job_id(1);
+        let mut pass = drain();
+        pass.result.claimed.push(queued_record(job, 1));
+        pass.step = DrainStep::DueClaim {
+            key: due_index_key(1, job),
+            job_id: job,
+        };
+        let failed = child(Err::<ClaimOutcome, _>(JobMutationError::TokenMismatch));
+        assert!(is_child(&pass.next(failed)));
+        assert_eq!(pass.step, DrainStep::DueHead);
+        assert!(pass.result.retry_after_error);
+        assert_eq!(pass.result.claimed.len(), 1);
+    }
+
+    // A lost external attempt goes to the caller's hook and is not charged here.
+    #[test]
+    fn lost_attempt_reported() {
+        let job = job_id(1);
+        let mut pass = drain();
+        pass.step = DrainStep::Requeue { ts: 1, job_id: job };
+        let lost = RequeueOutcome::NeedsReconcile(queued_record(job, 1));
+        assert!(is_child(&pass.next(child(Ok::<_, JobMutationError>(lost)))));
+        assert_eq!(pass.result.reconciled, 1);
+        assert_eq!(pass.result.lost_attempts.len(), 1);
+        assert_eq!(pass.result.swept, 0);
+    }
+
+    // Only a page made up entirely of reconciled attempts looks at the next page.
+    #[test]
+    fn lease_paging_bounded() {
+        let mut pass = drain();
+        pass.lease_pages = 1;
+        pass.expired_count = DRAIN_BATCH_SIZE;
+        pass.result.reconciled = DRAIN_BATCH_SIZE;
+        pass.next_page = Some(Key::from(vec![1u8]));
+        assert!(is_child(&pass.lease_round_done()));
+        assert_eq!(pass.step, DrainStep::LeasePage);
+        assert_eq!(pass.lease_pages, 2);
+
+        pass.expired_count = DRAIN_BATCH_SIZE;
+        pass.next_page = Some(Key::from(vec![1u8]));
+        assert!(is_child(&pass.lease_round_done()));
+        assert_eq!(pass.step, DrainStep::DueHead);
+    }
+
+    // The next delay is the nearer head, and an already-due lease waits for the floor.
+    #[test]
+    fn heads_set_delay() {
+        let mut pass = drain();
+        pass.step = DrainStep::DueHead;
+        let due = child(Ok::<_, JobMutationError>(Some((150u64, job_id(1)))));
+        assert!(is_child(&pass.next(due)));
+        let lease = child(Ok::<_, JobMutationError>(Some((50u64, job_id(2)))));
+        let Next::Done(result) = pass.next(lease).unwrap() else {
+            panic!("expected the result");
+        };
+        assert_eq!(
+            result.next_due_after,
+            Some(Duration::from_millis(50).min(JOB_RECONCILE_REARM))
+        );
+    }
+
+    // The timer moves only when a head exists.
+    #[test]
+    fn timer_follows_heads() {
+        let mut timer = DrainTimerOperation::new(100);
+        assert!(matches!(timer.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let none = || child(Ok::<Option<(u64, JobId)>, JobMutationError>(None));
+        assert!(matches!(
+            timer.next(none()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert!(matches!(timer.next(none()), Ok(Next::Done(()))));
+
+        let mut timer = DrainTimerOperation::new(100);
+        let due = child(Ok::<_, JobMutationError>(Some((150u64, job_id(1)))));
+        timer.next(due).unwrap();
+        assert!(matches!(timer.next(none()), Ok(Next::Then { .. })));
     }
 
     fn node_id(seed: u8) -> NodeId {
@@ -446,13 +716,7 @@ mod tests {
     }
 
     fn job_id(timestamp_ms: u64) -> JobId {
-        JobId::from_parts(
-            timestamp_ms,
-            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-            BucketId::new(0).unwrap(),
-            0,
-        )
-        .unwrap()
+        aruna_core::testing::job_at(timestamp_ms, 0)
     }
 
     fn budget_of(slots: usize) -> JobClassBudget {
@@ -484,8 +748,9 @@ mod tests {
     async fn claims_within_capacity() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         for seq in 1..=3u128 {
-            insert_job(&storage, &queued_record(job_id(seq as u64), 1))
+            insert_job(&context, &queued_record(job_id(seq as u64), 1))
                 .await
                 .unwrap();
         }
@@ -494,9 +759,7 @@ mod tests {
             in_process: 2,
             external: 0,
         };
-        let result = drain_job_batch(&storage, node_id(7), budget, None)
-            .await
-            .unwrap();
+        let result = drain_job_batch(&context, node_id(7), budget).await.unwrap();
         assert_eq!(result.claimed.len(), 2, "capacity caps claims");
         // A due job remains, so the re-arm is immediate.
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
@@ -508,12 +771,13 @@ mod tests {
         // index must not claim and release the external row it cannot run.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let external = job_id(1);
         let mut record = queued_record(external, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
         let internal = job_id(2);
-        insert_job(&storage, &queued_record(internal, 1))
+        insert_job(&context, &queued_record(internal, 1))
             .await
             .unwrap();
 
@@ -521,9 +785,7 @@ mod tests {
             in_process: 4,
             external: 0,
         };
-        let result = drain_job_batch(&storage, node_id(7), budget, None)
-            .await
-            .unwrap();
+        let result = drain_job_batch(&context, node_id(7), budget).await.unwrap();
 
         assert_eq!(
             result
@@ -539,7 +801,7 @@ mod tests {
             "the skipped row must be reported"
         );
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
-        let stored = read_job_record(&storage, external, None)
+        let stored = read_job_record(&context, external, None)
             .await
             .unwrap()
             .unwrap();
@@ -555,19 +817,20 @@ mod tests {
         // back off instead of re-arming the drain at zero.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = job_id(1);
-        insert_job(&storage, &queued_record(job_id, 1))
+        insert_job(&context, &queued_record(job_id, 1))
             .await
             .unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), JobClassBudget::default(), None)
+        let result = drain_job_batch(&context, node_id(3), JobClassBudget::default())
             .await
             .unwrap();
 
         assert!(result.claimed.is_empty());
         assert!(result.deferred_saturated);
         assert_eq!(result.next_due_after, Some(Duration::ZERO));
-        let stored = read_job_record(&storage, job_id, None)
+        let stored = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -581,29 +844,31 @@ mod tests {
         // immutable owner may run a JobId, and the dead row must not pin the timer.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let foreign = job_id(1);
-        insert_job(&storage, &queued_record(foreign, 1))
+        insert_job(&context, &queued_record(foreign, 1))
             .await
             .unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
 
         assert!(result.claimed.is_empty(), "no claim on a foreign owner");
-        let stored = read_job_record(&storage, foreign, None)
+        let stored = read_job_record(&context, foreign, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Queued, "the record is untouched");
         assert!(stored.claim.is_none());
-        assert_eq!(next_drain_delay(&storage).await.unwrap(), None);
+        assert_eq!(next_drain_delay(&context).await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn expired_lease_requeued() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([4u8; 16]);
         let mut record = queued_record(job_id, 1);
         record.state = JobState::Running;
@@ -612,13 +877,13 @@ mod tests {
             claim_token: Ulid::generate(),
             lease_expires_ms: 1,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert_eq!(result.swept, 1);
-        let requeued = read_job_record(&storage, job_id, None)
+        let requeued = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
@@ -633,6 +898,7 @@ mod tests {
     async fn external_lease_reconciled() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([0xE1; 16]);
         let mut record = queued_record(job_id, 1);
         record.execution_class = JobExecutionClass::ExternalAttempt;
@@ -643,17 +909,18 @@ mod tests {
             executor_kind: "docker".to_string(),
             pinned_image: "alpine@sha256:digest".to_string(),
             attempt_epoch: 1,
+            backend: "docker".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("docker", None),
         });
         record.claim = Some(JobClaim {
             holder_node_id: node_id(3),
             claim_token: Ulid::generate(),
             lease_expires_ms: 1,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
-        let recorder = Arc::new(RecordingReconciler::default());
-        let reconciler: Arc<dyn ExternalReconciler> = recorder.clone();
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), Some(&reconciler))
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert_eq!(result.swept, 0, "external attempt is not swept");
@@ -664,21 +931,23 @@ mod tests {
             "reconciled row must not re-arm the drain at zero, got {after:?}"
         );
 
-        let stored = read_job_record(&storage, job_id, None)
+        let stored = read_job_record(&context, job_id, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, JobState::Running, "not requeued");
         assert_eq!(stored.attempts, 0, "the sweep charges nothing");
         assert!(stored.claim.is_some());
-        // The hook saw exactly this job, proving no blind re-run path was taken.
-        assert_eq!(recorder.seen.lock().unwrap().as_slice(), &[job_id]);
+        // The caller gets exactly this job to reconcile, proving no blind re-run path was taken.
+        assert_eq!(result.lost_attempts.len(), 1);
+        assert_eq!(result.lost_attempts[0].job_id, job_id);
     }
 
     #[tokio::test]
     async fn future_lease_kept() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let job_id = JobId::from_bytes([5u8; 16]);
         let mut record = queued_record(job_id, 1);
         record.state = JobState::Running;
@@ -687,9 +956,9 @@ mod tests {
             claim_token: Ulid::generate(),
             lease_expires_ms: unix_timestamp_millis() + JOB_LEASE_MS,
         });
-        insert_job(&storage, &record).await.unwrap();
+        insert_job(&context, &record).await.unwrap();
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert_eq!(result.swept, 0);
@@ -700,14 +969,16 @@ mod tests {
     async fn restore_shortens_timer() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let mut context = aruna_drivers::testing::test_context(storage.clone());
+        let task_handle = TaskHandle::new();
+        context.task_handle = Some(task_handle.clone());
         let due_far_out = unix_timestamp_millis() + 7_200_000;
         insert_job(
-            &storage,
+            &context,
             &queued_record(JobId::from_bytes([1u8; 16]), due_far_out),
         )
         .await
         .unwrap();
-        let task_handle = TaskHandle::new();
 
         let Event::Task(TaskEvent::TimerScheduled { .. }) = task_handle
             .send_effect(Effect::Task(TaskEffect::ResetTimer {
@@ -719,7 +990,7 @@ mod tests {
             panic!("expected timer scheduled");
         };
 
-        restore_drain_timer(&storage, &task_handle).await;
+        restore_drain_timer(&context).await;
 
         let Event::Task(TaskEvent::TimerScheduled { after, .. }) = task_handle
             .send_effect(Effect::Task(TaskEffect::ShortenTimer {
@@ -743,6 +1014,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let orphan = JobId::from_bytes([9u8; 16]);
         match storage
             .send_storage_effect(StorageEffect::Write {
@@ -757,12 +1029,12 @@ mod tests {
             other => panic!("unexpected write event: {other:?}"),
         }
 
-        let result = drain_job_batch(&storage, node_id(3), budget_of(8), None)
+        let result = drain_job_batch(&context, node_id(3), budget_of(8))
             .await
             .unwrap();
         assert!(result.claimed.is_empty());
         // Self-healed: the orphan is gone and the drain timer stops returning zero.
-        assert_eq!(next_drain_delay(&storage).await.unwrap(), None);
+        assert_eq!(next_drain_delay(&context).await.unwrap(), None);
         let (rows, _) = iter_prefix_page(&storage, SCHEDULE_INDEX_KEYSPACE, None, None, 8, None)
             .await
             .unwrap();

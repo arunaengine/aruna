@@ -3,13 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::extract;
 use crate::error::ServerError;
-use crate::metadata::{
+use crate::metadata::model::{
     CreateMetadataRequest, CreateScaffoldRequest, MetadataQueryMode, ReplaceRoCrateRequest,
 };
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::rocrate::replace_metadata_rocrate;
-use aruna_core::UserId;
+use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
@@ -25,13 +27,12 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::metadata::materialization_queue::process_materialization_batch;
-use aruna_operations::metadata::projector::{drain_projection_queue, replay_event_log};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
 use aruna_storage::storage;
 use aruna_tasks::TaskHandle;
 use axum::extract::Path;
+use axum::http::StatusCode;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use std::time::SystemTime;
@@ -179,7 +180,8 @@ async fn seed_user(state: &ServerState, actor: &Actor, user_id: UserId, name: &s
 async fn setup() -> Fixture {
     let storage_dir = tempfile::tempdir().unwrap();
     let metadata_dir = tempfile::tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::from_bytes(&[11u8; 32]).public();
     let realm = realm_id(5);
     let user_id = UserId::local(Ulid::from_bytes([200u8; 16]), realm);
@@ -188,22 +190,23 @@ async fn setup() -> Fixture {
         user_id,
         realm_id: realm,
     };
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         node_id,
-        storage_handle.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(
@@ -213,7 +216,7 @@ async fn setup() -> Fixture {
             NodeCapabilities::user_node(realm).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -266,7 +269,7 @@ async fn setup() -> Fixture {
 async fn create_doc(fx: &Fixture, group_id: Ulid, path: &str, name: &str) -> String {
     let (_, Json(response)) = create_metadata_document(
         State(fx.state.clone()),
-        Extension(Some(fx.auth.clone())),
+        RealmAuth(fx.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: group_id.to_string(),
@@ -315,7 +318,7 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
     });
     let _ = replace_metadata_rocrate(
         State(fx.state.clone()),
-        Extension(Some(fx.auth.clone())),
+        RealmAuth(fx.auth.clone()),
         Extension(None),
         Path(document_id.to_string()),
         Json(ReplaceRoCrateRequest {
@@ -329,18 +332,9 @@ async fn attach_file(fx: &Fixture, document_id: &str, name: &str) {
     .unwrap();
 }
 
-async fn drain_projection(state: &ServerState) {
-    let ctx = state.get_ctx();
-    let drained = drain_projection_queue(ctx.as_ref()).await.unwrap();
-    if drained.markers_examined == 0 {
-        replay_event_log(ctx.as_ref()).await.unwrap();
-    }
-    process_materialization_batch(ctx.as_ref()).await.unwrap();
-}
-
 async fn flush_search(state: &ServerState) {
     let ctx = state.get_ctx();
-    ctx.metadata_handle
+    ctx.graph_handle
         .as_ref()
         .unwrap()
         .flush_search_updates()
@@ -358,7 +352,7 @@ fn params(q: &str) -> SearchParams {
 async fn search(fx: &Fixture, params: SearchParams) -> ServerResult<SearchResponse> {
     unified_search(
         State(fx.state.clone()),
-        Extension(Some(fx.auth.clone())),
+        RealmAuth(fx.auth.clone()),
         Extension(None),
         Query(params),
     )
@@ -552,7 +546,7 @@ async fn filters_group_hits() {
     };
     let (_, Json(resp)) = unified_search(
         State(fx.state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         Extension(None),
         Query(SearchParams {
             types: Some("groups".to_string()),
@@ -817,9 +811,9 @@ async fn documents_include_types() {
     let fx = setup().await;
     let document_id = create_doc(&fx, fx.groups[0], "datasets/reef", "epsilon-reef").await;
     // The crate can only be replaced once its graph is materialized.
-    drain_projection(&fx.state).await;
+    drain_metadata_background(&fx.state).await;
     attach_file(&fx, &document_id, "epsilon-reef").await;
-    drain_projection(&fx.state).await;
+    drain_metadata_background(&fx.state).await;
     flush_search(&fx.state).await;
 
     let documents = search(
@@ -861,7 +855,7 @@ async fn filters_documents_group() {
     let fx = setup().await;
     create_doc(&fx, fx.groups[0], "datasets/one", "gamma-one").await;
     create_doc(&fx, fx.groups[1], "datasets/two", "gamma-two").await;
-    drain_projection(&fx.state).await;
+    drain_metadata_background(&fx.state).await;
     flush_search(&fx.state).await;
 
     let documents = search(
@@ -889,14 +883,9 @@ async fn filters_documents_group() {
 #[tokio::test]
 async fn requires_auth() {
     let fx = setup().await;
-    let unauthenticated = unified_search(
-        State(fx.state.clone()),
-        Extension(None),
-        Extension(None),
-        Query(params("alpha")),
-    )
-    .await;
-    assert!(matches!(unauthenticated, Err(ServerError::Unauthorized)));
+    // `unified_search` takes `RealmAuth`, so these refusals are the extractor's.
+    let unauthenticated = extract::<RealmAuth>(&fx.state, None).await;
+    assert_eq!(unauthenticated.err(), Some(StatusCode::UNAUTHORIZED));
 
     let foreign = AuthContext {
         user_id: UserId::local(Ulid::from_bytes([9u8; 16]), realm_id(9)),
@@ -905,32 +894,16 @@ async fn requires_auth() {
         session: None,
     };
     assert_ne!(foreign.realm_id, fx.realm_id);
-    let wrong_realm = unified_search(
-        State(fx.state.clone()),
-        Extension(Some(foreign)),
-        Extension(None),
-        Query(params("alpha")),
-    )
-    .await;
-    assert!(matches!(wrong_realm, Err(ServerError::Forbidden)));
+    let wrong_realm = extract::<RealmAuth>(&fx.state, Some(foreign)).await;
+    assert_eq!(wrong_realm.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[tokio::test]
 async fn search_requires_auth() {
     let fx = setup().await;
-    let result = object_search(
-        State(fx.state.clone()),
-        Extension(None),
-        Extension(None),
-        Query(ObjectParams {
-            q: "reads".to_string(),
-            mode: Some(ObjectMode::Local),
-            ..Default::default()
-        }),
-    )
-    .await;
-
-    assert!(matches!(result, Err(ServerError::Unauthorized)));
+    // `object_search` takes `RealmAuth`, so the refusal is the extractor's.
+    let result = extract::<RealmAuth>(&fx.state, None).await;
+    assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[test]
@@ -938,7 +911,7 @@ fn search_maps_partiality() {
     let healthy = iroh::SecretKey::from_bytes(&[21u8; 32]).public();
     let failed = iroh::SecretKey::from_bytes(&[22u8; 32]).public();
     let result = ObjectExecution {
-        hits: vec![aruna_operations::s3::object::search::ObjectInventoryHit {
+        hits: vec![aruna_core::search::ObjectInventoryHit {
             node_id: healthy,
             group_id: Ulid::from_bytes([23u8; 16]),
             bucket: "data".to_string(),
@@ -951,12 +924,14 @@ fn search_maps_partiality() {
         }],
         next_cursor: Some("opaque".to_string()),
         as_of: SystemTime::UNIX_EPOCH,
-        partitions: vec![aruna_operations::metadata::api::ObjectPartitionCoverage {
-            node_id: healthy,
-            observed_at: SystemTime::UNIX_EPOCH,
-            truncated: true,
-        }],
-        fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
+        partitions: vec![
+            aruna_operations::metadata::api::search_types::ObjectPartitionCoverage {
+                node_id: healthy,
+                observed_at: SystemTime::UNIX_EPOCH,
+                truncated: true,
+            },
+        ],
+        fanout_stats: aruna_operations::metadata::api::fanout_types::MetadataFanoutStats {
             nodes_queried: 2,
             nodes_failed: 1,
             failed_partitions: vec![failed],
@@ -996,7 +971,7 @@ fn passes_documents_truncated() {
         hits: Vec::new(),
         next_cursor: None,
         truncated: true,
-        fanout_stats: aruna_operations::metadata::api::MetadataFanoutStats {
+        fanout_stats: aruna_operations::metadata::api::fanout_types::MetadataFanoutStats {
             nodes_queried: 1,
             nodes_failed: 0,
             failed_partitions: Vec::new(),

@@ -4,125 +4,60 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ::irokle::Event as _;
-use ::irokle::Storage as _;
-use ::irokle::TopicControl;
 use ::irokle::net::{decode_sync_message, encode_frame, encode_sync_message};
 use ::irokle::oplog::Oplog;
 use ::irokle::sync::SyncMessage;
 use ::irokle::{
-    EventEnvelope, PeerId, ReplicationPolicy, TopicEviction, TopicGenesis, TopicPayload,
+    Event as _, EventEnvelope, PeerId, ReplicationPolicy, Storage as _, TopicControl,
+    TopicEviction, TopicGenesis, TopicPayload,
 };
-use aruna_core::DhtKeyId;
-use aruna_core::MetaResourceId;
-use aruna_core::NodeId;
-use aruna_core::UserId;
-use aruna_core::admin_documents::{
-    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
-};
-use aruna_core::auth::valid_revocation_expiry;
+use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::document::{
-    DocumentChange, DocumentChangeKind, DocumentEvent, DocumentEvictedDocument, DocumentNetEvent,
-    DocumentOutboxEvent, DocumentReconcileResult, DocumentSyncPublish, DocumentTarget,
+    DocumentEvent, DocumentEvictedDocument, DocumentNetEvent, DocumentOutboxEvent,
+    DocumentSyncPublish, HeldDomains,
 };
+use aruna_core::document_apply::cursor::AppliedCursor;
+use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::id::short_display_id;
-use aruna_core::keyspaces::{
-    APPLIED_OPS_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,
-    DOCUMENT_STATE_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE, ID_MAPPING_KEYSPACE,
-    OWNER_INDEX_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE,
-    SUBJECT_CLAIMS_KEYSPACE, SUBJECT_INDEX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
-    SYNC_REVISION_KEYSPACE, WATCH_INTEREST_KEYSPACE,
-};
-use aruna_core::metadata::{
-    GraphLifecycleRecord, GraphPruneRecord, MetadataDeleteRecord, MetadataEventRecord,
-    MetadataLifecycleRecord,
-};
-use aruna_core::reducer::{
-    AdminApplyStatus, AdminDocumentState, CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH,
-    CONFIG_DISCOVERY_PATH, CONFIG_FEDERATION_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH,
-    CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH, DISPLAY_NAME_PATH, GROUP_OWNER_PATH,
-    METADATA_REPLICATION_PATH, REALM_ID_PATH, REVOCATIONS_PER_ORIGIN, RevocationIndex,
-    USER_NAME_PATH, config_node_path, decode_reducer_state, group_role_path, group_user_path,
-    overlay_placement, parse_config_node, parse_config_oidc, parse_group_assignment,
-    parse_group_role, parse_realm_assignment, realm_role_path, realm_user_path,
-    user_attribute_path, user_subject_path,
-};
-use aruna_core::storage_entries::{
-    conflict_write_entries, create_acceptance_entry, create_acceptance_key,
-    create_projection_entries, document_lifecycle_entry, document_lifecycle_key,
-    graph_lifecycle_entry, graph_lifecycle_key, graph_prune_entry, reducer_state_entry,
-    reducer_state_key, registry_delete_entries, registry_write_entries, shard_manifest_entry,
-    stale_conflict_deletes, subject_index_key, subject_index_value, sync_revision_entry,
-    sync_revision_key,
-};
-use aruna_core::structs::execution::notification_watch::{
-    INTEREST_BYTES_CAP, INTEREST_ENTRY_CAP, MAX_PREFIX_LEN, WatchEventMask, WatchInterestDigest,
-    WatchSubscription, interest_dirty_key, interest_node_id, interest_realm_id,
-};
-use aruna_core::structs::identity::auth::Role;
-use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument, owner_group_key};
-use aruna_core::structs::identity::realm::{
-    RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
-};
-use aruna_core::structs::identity::user::User;
-use aruna_core::structs::placement::binding_directory::BindingError;
-use aruna_core::structs::placement::policy::document::{
-    PlacementPolicyDocument, placement_policy_change, placement_policy_target,
-    verify_policy_authority,
-};
-use aruna_core::structs::placement::record::{
-    DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_RANGE_SIZE, PlacementRef, PlacementScope,
-    PoolAdmission, admit_band_pool, coordinator_spans,
-};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structs::storage::node_info::{NodeInfoDocument, reserved_label};
-use aruna_core::structs::storage::usage::{NodeUsageSnapshot, usage_node_id};
-use aruna_core::structs::{
-    PersistentIdKind, PersistentIdMapping, PersistentIdProvider, PersistentIdStatus,
-    QUARANTINE_USAGE_KEY, SyncQuarantineCapacity, SyncQuarantineError, SyncQuarantineEvidence,
-    SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage, build_quarantine_entries,
-    persistent_id_change, persistent_id_key, persistent_id_target, quarantine_usage_entry,
-    secondary_index_deletes, secondary_index_entries,
-};
+use aruna_core::id::{DhtKeyId, NodeId, short_display_id};
+use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
+use aruna_core::reducer::overlay::reduced_admin_target;
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 use aruna_core::telemetry::duration_ms;
-use aruna_core::time::{unix_timestamp_millis, unix_timestamp_secs};
-use aruna_core::types::{GroupId, RoleId, TxnId, Value};
-use aruna_storage::{FjallPersistPolicy, StorageHandle};
+use aruna_core::types::Value;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
-use ulid::Ulid;
 
 use crate::error::{NetError, Result};
 use crate::streams::{BiStream, PeerKinds};
 
+pub(crate) mod cursor;
 mod eviction;
 mod inbound;
 mod peers;
 mod publish;
+mod published;
 pub(crate) mod reconcile;
 pub(crate) mod storage;
 mod sync;
 mod topics;
 
-use self::reconcile::*;
-use self::storage::*;
+use self::cursor::*;
+use self::published::*;
 
 const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
-// Matches irokle's 1024-topic wire batches; the worst-case data stream sends
-// three messages per topic, staying under the peer's 4096-message stream cap.
-pub const BATCH_TOPIC_LIMIT: usize = 1_024;
 const OUTBOUND_PEER_LIMIT: usize = 8;
 const SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
 const SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
@@ -143,61 +78,9 @@ const INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
 const INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
 const REPLAY_BATCH_LIMIT: usize = 1_024;
-const MAX_DEFERRED_TOPICS: usize = 1_024;
-const TOPICS_PER_DEPENDENCY: usize = 256;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
 /// an unbounded number of simultaneous sync streams.
 const SHARD_PROBE_CONCURRENCY: usize = 8;
-
-#[derive(Debug)]
-struct PendingCreateApply {
-    identity: SyncQuarantineIdentity,
-    /// The event exactly as received, so a reject in the create batch keeps the
-    /// genuine envelope instead of the payload the batch reconstructed.
-    event: DocumentEvent,
-    target: DocumentTarget,
-    record: MetadataEventRecord,
-    bytes: Vec<u8>,
-    lifecycle_revision: Option<DocumentChange>,
-    /// The author's commit message for the event's ARC snapshot.
-    message: Option<String>,
-}
-
-/// A permanently rejected sync operation awaiting durable evidence. Evidence is
-/// materialized only as the cursor advances past it, so both land in one
-/// transaction; the identity is transport-derived, so undecodable payloads stay keyed.
-struct SyncRejection {
-    identity: SyncQuarantineIdentity,
-    evidence: SyncQuarantineEvidence,
-    reason: String,
-}
-
-impl SyncRejection {
-    fn new(
-        identity: SyncQuarantineIdentity,
-        event: DocumentEvent,
-        reason: impl Into<String>,
-    ) -> Self {
-        Self {
-            identity,
-            evidence: SyncQuarantineEvidence::from_event(&event),
-            reason: reason.into(),
-        }
-    }
-
-    /// Evidence for a payload that could not be decoded into an event at all.
-    fn raw(identity: SyncQuarantineIdentity, bytes: Vec<u8>, reason: impl Into<String>) -> Self {
-        Self {
-            identity,
-            evidence: SyncQuarantineEvidence::raw(bytes),
-            reason: reason.into(),
-        }
-    }
-
-    fn topic_id(&self) -> ::irokle::TopicId {
-        self.identity.topic
-    }
-}
 
 struct DocumentEventBatch {
     cursor: ::irokle::ActorClock,
@@ -215,23 +98,49 @@ pub struct PendingEviction {
     pub documents: Vec<DocumentEvictedDocument>,
 }
 
-/// Placement fence outcome. The transactional read of the realm config is the
-/// whole fence: a concurrent config mutation conflicts the commit. The config
-/// row is never written back, which would only conflict its readers.
-struct MetadataPlacementFence;
-
-enum MetadataPlacementOutcome<T> {
-    Accepted(T),
-    Deferred(DocumentSyncDependency),
-    Rejected,
-}
-
 #[derive(Default)]
 struct PublishEventsOutcome {
-    published: BTreeMap<::irokle::TopicId, ::irokle::ActorClock>,
+    published: BTreeMap<::irokle::TopicId, PublishedOps>,
     published_indices: Vec<usize>,
     retry_indices: Vec<usize>,
     retry_error: Option<String>,
+    /// The lineage root each published event was found or appended on, by document position.
+    lineages: BTreeMap<usize, [u8; 32]>,
+}
+
+impl PublishEventsOutcome {
+    /// The lineage of each of `count` documents, `None` where it is unknown.
+    fn lineage_list(&self, count: usize) -> Vec<Option<[u8; 32]>> {
+        (0..count)
+            .map(|index| self.lineages.get(&index).copied())
+            .collect()
+    }
+}
+
+/// The ops one publish batch left on a topic: the lineage they were confirmed on and the last op
+/// of each actor, which the cursor advance checks still stand before it covers them.
+#[derive(Debug, Default)]
+struct PublishedOps {
+    lineage: [u8; 32],
+    tips: BTreeMap<::irokle::ActorId, (u64, ::irokle::OpId)>,
+}
+
+impl PublishedOps {
+    /// Takes in `op`, confirmed on `lineage`; the ops of an earlier lineage no longer stand.
+    fn observe(&mut self, op: &::irokle::Op, lineage: [u8; 32]) {
+        if self.lineage != lineage {
+            self.lineage = lineage;
+            self.tips.clear();
+        }
+        let body = &op.signed.body;
+        let tip = self
+            .tips
+            .entry(body.actor_id)
+            .or_insert((body.actor_seq, op.id));
+        if body.actor_seq > tip.0 {
+            *tip = (body.actor_seq, op.id);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -394,6 +303,9 @@ pub struct DocumentSyncService {
     net: Arc<::irokle::net::IrohNet<::irokle::FjallStorage>>,
     db: fjall::OptimisticTxDatabase,
     fanout_cursors: fjall::OptimisticTxKeyspace,
+    /// The oplog op each local publish became, so a repeated publish appends nothing.
+    published: fjall::OptimisticTxKeyspace,
+    publish_locks: Arc<Vec<Mutex<()>>>,
     persist_policy: FjallPersistPolicy,
     pub(crate) storage: StorageHandle,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
@@ -417,6 +329,16 @@ pub struct DocumentSyncService {
     // Realm-config kind table shared with the accept loop, so the dial side
     // applies the same node-kind boundary. Empty until the embedder attaches it.
     peer_kinds: PeerKinds,
+    // The temporary folder of a database opened without a configured path. Declared last and shared
+    // by clones, so the last clone removes it after its database handles above are closed.
+    fallback_dir: Option<Arc<tempfile::TempDir>>,
+}
+
+impl DocumentSyncService {
+    /// Keeps the temporary folder the database was opened in until the service is dropped.
+    pub(crate) fn keep_fallback(&mut self, dir: Option<tempfile::TempDir>) {
+        self.fallback_dir = dir.map(Arc::new);
+    }
 }
 
 impl std::fmt::Debug for DocumentSyncService {
@@ -472,6 +394,9 @@ impl DocumentSyncService {
         let fanout_cursors = db
             .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let published = db
+            .keyspace(PUBLISHED_KEYSPACE, fjall::KeyspaceCreateOptions::default)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let node = ::irokle::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
@@ -506,6 +431,8 @@ impl DocumentSyncService {
             net,
             db,
             fanout_cursors,
+            published,
+            publish_locks: Arc::new((0..PUBLISH_LOCKS).map(|_| Mutex::new(())).collect()),
             persist_policy,
             storage,
             default_peers: Arc::new(RwLock::new(default_peers.clone())),
@@ -519,6 +446,7 @@ impl DocumentSyncService {
             configured_peers: default_peers,
             realm_config_materialized: Arc::new(AtomicBool::new(false)),
             peer_kinds: PeerKinds::default(),
+            fallback_dir: None,
         })
     }
 
@@ -526,14 +454,13 @@ impl DocumentSyncService {
         self.node.clone()
     }
 
-    #[cfg(test)]
-    fn local_node_id(&self) -> Result<NodeId> {
-        NodeId::from_bytes(self.node.peer_id().as_bytes())
-            .map_err(|error| NetError::Bootstrap(error.to_string()))
-    }
-
     pub fn database(&self) -> fjall::OptimisticTxDatabase {
         self.db.clone()
+    }
+
+    /// Waits for the reconcile lock and keeps it while the guard lives.
+    pub(crate) async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.reconcile_lock).lock_owned().await
     }
 
     pub async fn shutdown(&self) {
@@ -546,29 +473,6 @@ impl DocumentSyncService {
 
 pub(crate) fn node_to_peer(node_id: &NodeId) -> PeerId {
     PeerId::from_bytes(*node_id.as_bytes())
-}
-
-#[cfg(test)]
-fn group_sync_topics<F>(
-    topic_ids: &[::irokle::TopicId],
-    mut select: F,
-) -> BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<::irokle::TopicId>)>
-where
-    F: FnMut(::irokle::TopicId) -> PeerSelection,
-{
-    let mut groups: BTreeMap<BTreeSet<PeerId>, (PeerSelection, Vec<::irokle::TopicId>)> =
-        BTreeMap::new();
-    for topic_id in topic_ids.iter().copied() {
-        let selection = select(topic_id);
-        let selected = selection.peers.clone();
-        if let Some((group, topics)) = groups.get_mut(&selected) {
-            group.truncated |= selection.truncated;
-            topics.push(topic_id);
-        } else {
-            groups.insert(selected, (selection, vec![topic_id]));
-        }
-    }
-    groups
 }
 
 fn select_sync_peers(
@@ -614,34 +518,5 @@ fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
     *DhtKeyId::from_data(&input).as_bytes()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AdminOperationFamily {
-    Group,
-    RealmAuthorization,
-    User,
-    RealmConfig,
-    Distribution,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-enum DocumentSyncDependency {
-    RealmConfig(RealmId),
-    RealmAuthorization(RealmId),
-    PlacementStrategy {
-        realm_id: RealmId,
-        strategy_id: Ulid,
-    },
-    /// Roles of the group that owns a placement policy; without them its
-    /// publication authority cannot be decided here.
-    GroupAuthorization(GroupId),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeferredRegistrationOutcome {
-    Inserted,
-    AlreadyRegistered,
-    CapacityExceeded,
-}
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

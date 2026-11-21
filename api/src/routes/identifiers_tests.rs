@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::routes::metadata::tests::setup_state;
 
 #[tokio::test]
@@ -18,8 +19,7 @@ async fn rules_tried_unstored() {
     };
     let tried = |parser| {
         test_rules(
-            State(test.state.clone()),
-            Extension(Some(test.auth.clone())),
+            RealmAuth(test.auth.clone()),
             Json(ParserTestRequest {
                 parser,
                 key: "SAMN02138552/contigs.fna.gz".to_string(),

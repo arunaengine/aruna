@@ -6,18 +6,26 @@
 members = [
     "api",
     "aruna",
+    "config",
     "blob",
     "compute",
     "core",
+    "clock",
+    "graph",
+    "wire",
     "kpabe",
     "kpabe/wasm",
     "storage",
     "net",
     "tasks",
     "operations",
+    "drivers",
+    "outbound",
+    "test-support",
     "aruna-doctor",
     "cli",
     "plugins",
+    "plugin-types",
     "plugins/examples/elabftw",
     "plugins/examples/announcer/rust",
     "plugins/fixture",
@@ -30,7 +38,7 @@ resolver = "3"
 
 [workspace.package]
 description = "A federated data orchestration network"
-version = "3.0.0-alpha.207"
+version = "3.0.0-alpha.208"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/arunaengine/aruna"
@@ -45,13 +53,21 @@ aruna-api = { path = "api" }
 aruna-blob = { path = "blob" }
 aruna-cli = { path = "cli" }
 aruna-compute = { path = "compute", default-features = false }
+aruna-clock = { path = "clock" }
+aruna-config = { path = "config" }
 aruna-core = { path = "core" }
+aruna-graph = { path = "graph" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
+aruna-drivers = { path = "drivers" }
+aruna-outbound = { path = "outbound" }
 aruna-plugin = { path = "plugins/sdk" }
+aruna-plugin-types = { path = "plugin-types" }
 aruna-plugins = { path = "plugins", default-features = false }
 aruna-storage = { path = "storage" }
 aruna-tasks = { path = "tasks" }
+aruna-test-support = { path = "test-support" }
+aruna-wire = { path = "wire" }
 
 # Third-party crates
 aes-gcm = "0.11.1"
@@ -81,7 +97,7 @@ aws-smithy-http-client = { version = "1.5.0", default-features = false, features
 ] }
 aws-smithy-runtime-api = { version = "1.19.0", features = ["client"] }
 axum = "0.8.9"
-bao-tree = "0.16.1"
+bao-tree = "0.17.0"
 base64 = "0.23.1"
 blake3 = { version = "=1.8.7", features = ["serde"] }
 bls12_381_plus = { version = "=0.9.0", default-features = false, features = ["groups", "pairings", "alloc"] }
@@ -95,7 +111,7 @@ chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # Pinned to craqle 0.3.2 main (data entity removal) and Irokle 0.3.2; resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "d4ac035851529b017418aae01aab29c7246b7c87", features = [
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "a002de3335dbcca23160164e3eb868f2da4a0358", features = [
     "iroh",
     "shacl-core",
 ] }
@@ -123,7 +139,7 @@ globset = "0.4.20"
 hex = "0.4.3"
 hmac = "0.13.0"
 hostname = "0.4.2"
-hpke = { version = "0.14.1", default-features = false, features = [
+hpke = { version = "0.15.1", default-features = false, features = [
     "alloc",
     "aes",
     "getrandom",
@@ -145,12 +161,12 @@ hyper-util = { version = "0.1.21", features = [
 ipnet = "2.12.2"
 iroh = "1.3.0"
 # Pinned to the exact revision craqle uses so one irokle crate is resolved.
-irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "209f881af3fa4b8ed16e2ca0a0315d663029329e", features = [
+irokle = { git = "https://github.com/arunaengine/irokle.git", rev = "063d8be559f6f181257b22cca2d4cbde7d046969", features = [
     "fjall",
     "iroh",
 ] }
 iroh-io = "0.6.2"
-jsonwebtoken = { version = "11.1.0", features = ["rust_crypto"] }
+jsonwebtoken = { version = "12.0.0", features = ["rust_crypto"] }
 json-patch = "4.2.0"
 keyring-core = "1.0.1"
 lettre = { version = "0.11.23", default-features = false, features = [
@@ -160,10 +176,10 @@ lettre = { version = "0.11.23", default-features = false, features = [
     "tokio1-rustls",
     "webpki-roots",
 ] }
-lru = "0.18.5"
+lru = "0.19.1"
 md5 = "0.8.1"
 mime = "0.3.17"
-nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
+nix = { version = "0.32.0", features = ["time", "fs", "process", "signal"] }
 opendal = { version = "0.59.4", features = [
     "services-azblob",
     "services-azdls",
@@ -188,12 +204,12 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 ] }
 oxrdf = "0.3.4"
 oxttl = "0.2.4"
-parking_lot = { version = "0.12.5", features = ["deadlock_detection"] }
+parking_lot = { version = "0.13.0", features = ["deadlock_detection"] }
 pbkdf2 = "0.13.0"
 percent-encoding = "2.3.2"
 pithos_lib = { git = "https://github.com/arunaengine/pithos", rev = "2996df4269dd93fff3421e516fdd11f1a47c3be7", default-features = false, features = ["async"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
-prometheus-client = "0.25"
+prometheus-client = "0.26.0"
 proptest = "1.12.0"
 quick-xml = "0.42.0"
 rand = "0.10.3"
@@ -214,19 +230,19 @@ rustix = { version = "1.1.5", features = ["fs", "process"] }
 rustls = { version = "0.23.46", features = ["ring"] }
 rustls-webpki = { version = "0.103.16", default-features = false, features = ["std"] }
 rcgen = "0.14.10"
-kube = { version = "4.2.0", default-features = false, features = [
+kube = { version = "5.1.0", default-features = false, features = [
     "client",
     "jsonpatch",
     "runtime",
     "rustls-tls",
     "ws",
 ] }
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+k8s-openapi = { version = "0.29.0", features = ["v1_33"] }
 s3s = "0.17.0"
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.152", features = ["raw_value"] }
-serde-saphyr = "1.3.0"
+serde-saphyr = "2.2.0"
 sha1 = "0.11.0"
 sha2 = "0.11.0"
 sha2_010 = { package = "sha2", version = "0.10.9", default-features = false }
@@ -234,7 +250,7 @@ smallvec = "1.15.2"
 spareval = "0.2.7"
 spargebra = { version = "0.4.7", features = ["sparql-12"] }
 subtle = "2.6.1"
-sysinfo = { version = "0.39.6", default-features = false, features = [
+sysinfo = { version = "0.40.4", default-features = false, features = [
     "system",
 ] }
 tar = "0.4.46"
@@ -273,16 +289,16 @@ utoipa-axum = "0.3.0"
 utoipa-swagger-ui = { version = "10.0.1", features = ["axum"] }
 # Exact: the portal's wasm-bindgen-cli must match this version.
 wasm-bindgen = "=0.2.127"
-# Plugin runtime: wit-bindgen 0.61 and wasm-tools 0.258 match the component async ABI of wasmtime 49.
-wasm-encoder = "0.258.3"
-wasmparser = { version = "0.258.3", default-features = false, features = [
+# Plugin runtime: wit-bindgen 0.63 and wasm-tools 0.263 match the component async ABI of wasmtime 51.
+wasm-encoder = "0.263.0"
+wasmparser = { version = "0.263.0", default-features = false, features = [
     "component-model",
     "features",
     "simd",
     "std",
     "validate",
 ] }
-wasmtime = { version = "49.0.5", default-features = false, features = [
+wasmtime = { version = "51.0.0", default-features = false, features = [
     "async",
     "call-hook",
     "component-model",
@@ -290,12 +306,12 @@ wasmtime = { version = "49.0.5", default-features = false, features = [
     "runtime",
     "std",
 ] }
-wasmtime-wasi = { version = "49.0.5", default-features = false, features = ["p2"] }
-wasmtime-wasi-io = "49.0.5"
+wasmtime-wasi = { version = "51.0.0", default-features = false, features = ["p2"] }
+wasmtime-wasi-io = "51.0.0"
 webpki-roots = "1.0.10"
-wit-bindgen = "0.61.1"
-wit-component = "0.258.3"
-wit-parser = "0.258.3"
+wit-bindgen = "0.63.0"
+wit-component = "0.263.0"
+wit-parser = "0.263.0"
 windows-native-keyring-store = "1.1.0"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets", "zeroize"] }

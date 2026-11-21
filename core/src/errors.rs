@@ -132,6 +132,12 @@ impl BlobError {
     }
 }
 
+impl From<crate::calls::IoError> for BlobError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum StagingSourceError {
     #[error("Channel closed")]
@@ -188,6 +194,20 @@ pub enum SourceResolutionError {
     ResolveFailed,
 }
 
+/// A runner failure as a read error of the source.
+impl From<crate::calls::IoError> for StagingSourceError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for SourceResolutionError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::StorageError(StorageError::from(error))
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum StorageError {
     #[error("Key not found")]
@@ -224,6 +244,9 @@ pub enum StorageError {
     InvalidEffect,
     #[error("Storage is closed for shutdown")]
     Closed,
+    /// A commit storage refused before applying it, for the cause given: its writes are gone.
+    #[error("Transaction rolled back: {0}")]
+    RolledBack(Box<StorageError>),
 }
 
 impl StorageError {
@@ -233,8 +256,16 @@ impl StorageError {
     pub fn proves_no_commit(&self) -> bool {
         matches!(
             self,
-            Self::TransactionConflict | Self::QueueFull | Self::CleanupCapacity
+            Self::TransactionConflict
+                | Self::QueueFull
+                | Self::CleanupCapacity
+                | Self::RolledBack(_)
         )
+    }
+
+    /// Whether the same work may succeed later: a missing key or a malformed effect never does.
+    pub fn is_transient(&self) -> bool {
+        !matches!(self, Self::KeyNotFound | Self::InvalidEffect)
     }
 }
 
@@ -258,6 +289,31 @@ pub enum StreamError {
     StreamClosed,
     #[error("Other: {0}")]
     Other(String),
+}
+
+/// Why a stored row could not be read or decoded.
+#[derive(Debug, Error, PartialEq)]
+pub enum StorageReadError {
+    #[error(transparent)]
+    Storage(StorageError),
+    #[error(transparent)]
+    Conversion(ConversionError),
+}
+
+impl From<StorageReadError> for SourceResolutionError {
+    fn from(value: StorageReadError) -> Self {
+        match value {
+            StorageReadError::Storage(error) => Self::StorageError(error),
+            StorageReadError::Conversion(error) => Self::ConversionError(error),
+        }
+    }
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for StorageReadError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::Storage(StorageError::from(error))
+    }
 }
 
 #[derive(Debug, Error)]

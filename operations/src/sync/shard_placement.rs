@@ -5,14 +5,13 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
-use aruna_core::NodeId;
 use aruna_core::document::PendingShardPlacement;
 use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::SYNC_PLACEMENT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::time::unix_timestamp_secs;
 use aruna_core::types::Key;
 use byteview::ByteView;
 
@@ -48,11 +47,13 @@ pub fn placement_key(realm_id: RealmId, placement: &PlacementRef) -> Key {
     ByteView::from(bytes)
 }
 
+/// A pending placement of `placement` as of `updated_at`, in Unix seconds.
 pub fn new_placement(
     realm_id: RealmId,
     placement: PlacementRef,
     authoritative_node_id: NodeId,
     mut selected_peers: Vec<NodeId>,
+    updated_at: u64,
 ) -> PendingShardPlacement {
     selected_peers.retain(|node_id| *node_id != authoritative_node_id);
     sort_node_ids(&mut selected_peers);
@@ -60,7 +61,7 @@ pub fn new_placement(
         realm_id,
         placement,
         selected_peers,
-        updated_at: unix_timestamp_secs(),
+        updated_at,
         authoritative_node_id,
     }
 }
@@ -85,14 +86,6 @@ pub fn write_placement_effect(record: &PendingShardPlacement) -> Result<Effect, 
         value: ByteView::from(postcard::to_allocvec(record)?),
         txn_id: None,
     }))
-}
-
-pub fn delete_placement_effect(realm_id: RealmId, placement: &PlacementRef) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: SYNC_PLACEMENT_KEYSPACE.to_string(),
-        key: placement_key(realm_id, placement),
-        txn_id: None,
-    })
 }
 
 pub fn schedule_retry_effect(realm_id: RealmId, local_node_id: NodeId) -> Effect {
@@ -186,7 +179,7 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([3u8; 32]);
         let authoritative = node(1);
         let peer = node(5);
-        let record = new_placement(realm_id, placement(2), authoritative, vec![peer, peer]);
+        let record = new_placement(realm_id, placement(2), authoritative, vec![peer, peer], 1);
 
         assert_eq!(record.realm_id, realm_id);
         assert_eq!(record.authoritative_node_id, authoritative);
@@ -197,7 +190,7 @@ mod pure_tests {
     #[test]
     fn authority_counts_target() {
         let realm_id = RealmId::from_bytes([4u8; 32]);
-        let record = new_placement(realm_id, placement(2), node(1), vec![node(5), node(6)]);
+        let record = new_placement(realm_id, placement(2), node(1), vec![node(5), node(6)], 1);
 
         assert_eq!(missing_peer_count(&record, 3), 0);
         assert!(placement_satisfied(record.selected_peers.len(), 3));
@@ -208,7 +201,7 @@ mod pure_tests {
         let realm_id = RealmId::from_bytes([5u8; 32]);
         let authoritative = node(7);
 
-        let record = new_placement(realm_id, placement(2), authoritative, vec![node(8)]);
+        let record = new_placement(realm_id, placement(2), authoritative, vec![node(8)], 1);
 
         assert_eq!(record.authoritative_node_id, authoritative);
     }
@@ -223,6 +216,7 @@ mod pure_tests {
             placement(2),
             authoritative,
             vec![node(8), authoritative, node(8), node(9)],
+            1,
         );
 
         assert_eq!(record.selected_peers, vec![node(9), node(8)]);

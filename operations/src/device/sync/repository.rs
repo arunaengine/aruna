@@ -1,22 +1,22 @@
-//! Holds the storage shape and row helpers for the device-local synced folder state.
+//! Holds the storage shape and row encodings of the device-local synced folder state.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     SYNC_BASE_KEYSPACE, SYNC_LOG_KEYSPACE, SYNC_UPLOAD_KEYSPACE, SYNCED_FOLDER_KEYSPACE,
 };
-use aruna_core::structs::{SyncActionRecord, SyncBase, SyncedFolder};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::synced_folder::{SyncActionRecord, SyncBase, SyncedFolder};
 use aruna_core::types::{Key, TxnId, Value};
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use ulid::Ulid;
 
-use crate::device::backlog::RetryView;
+use crate::device::retry::RetryView;
 
 /// Folders one device may bind. A device serves one person's machine, so this
 /// is a human-sized list rather than an inventory.
@@ -108,7 +108,7 @@ pub fn base_key(folder_id: Ulid, relative: &str) -> Key {
     ByteView::from(key)
 }
 
-pub fn folder_prefix(folder_id: Ulid) -> Key {
+pub(crate) fn folder_prefix(folder_id: Ulid) -> Key {
     ByteView::from(folder_id.to_bytes().to_vec())
 }
 
@@ -178,117 +178,189 @@ pub fn scan_folder(
     })
 }
 
-/// Reads one row, answering `None` for both an absent row and a failed read:
-/// every caller here treats an unreadable row as work for the next pass.
-pub(crate) async fn read_value(
-    context: &Arc<crate::driver::DriverContext>,
-    key_space: &str,
-    key: Key,
-    txn_id: Option<TxnId>,
-) -> Option<Value> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key,
-            txn_id,
+/// Whether two rows publish the same local version of one file.
+pub(crate) fn same_version(stored: &SyncUpload, upload: &SyncUpload) -> bool {
+    stored.local_version == upload.local_version && stored.deleted == upload.deleted
+}
+
+/// The state an explicit sync gives one upload: a backed-off one is due now with its
+/// attempts kept, a retryable failure starts over, and anything else stays.
+pub(crate) fn requeued(state: &UploadState, now_ms: u64) -> Option<UploadState> {
+    match state {
+        UploadState::Pending {
+            due_at_ms,
+            attempts,
+            last_error,
+        } if *due_at_ms > now_ms => Some(UploadState::Pending {
+            due_at_ms: now_ms,
+            attempts: *attempts,
+            last_error: last_error.clone(),
+        }),
+        UploadState::Failed {
+            reason,
+            retryable: true,
+        } => Some(UploadState::Pending {
+            due_at_ms: now_ms,
+            attempts: 0,
+            last_error: Some(reason.clone()),
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum StoreUploadError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
+/// Writes one upload row under a new state in one transaction and outputs whether it was
+/// written. `guarded` refuses the write when the stored row no longer carries the state and
+/// version this pass read.
+#[derive(Debug, PartialEq)]
+pub struct StoreUploadOperation {
+    upload: SyncUpload,
+    next: UploadState,
+    guarded: bool,
+    written: bool,
+}
+
+impl StoreUploadOperation {
+    pub fn new(upload: SyncUpload, next: UploadState, guarded: bool) -> Self {
+        Self {
+            upload,
+            next,
+            guarded,
+            written: false,
+        }
+    }
+
+    fn write(&mut self) -> Next<bool> {
+        let updated = SyncUpload {
+            state: self.next.clone(),
+            ..self.upload.clone()
+        };
+        let Ok(row) = upload_entry(&updated) else {
+            return Next::Done(false);
+        };
+        self.written = true;
+        Next::Call(IoCall::Write(vec![row]))
+    }
+}
+
+impl Operation for StoreUploadOperation {
+    type Output = bool;
+    type Error = StoreUploadError;
+
+    fn first(&mut self) -> Result<Next<bool>, StoreUploadError> {
+        if !self.guarded {
+            return Ok(self.write());
+        }
+        let key = base_key(self.upload.folder_id, &self.upload.relative);
+        let row = (SYNC_UPLOAD_KEYSPACE.to_string(), key);
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, StoreUploadError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(true));
+        }
+        let stored = result.values()?.into_iter().next().flatten();
+        let stored = stored.and_then(|bytes| SyncUpload::from_bytes(&bytes).ok());
+        let holds = stored.is_some_and(|stored| {
+            stored.state == self.upload.state && same_version(&stored, &self.upload)
+        });
+        Ok(match holds {
+            true => self.write(),
+            false => Next::Done(false),
         })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        _ => None,
     }
-}
 
-pub(crate) async fn write_rows(
-    context: &Arc<crate::driver::DriverContext>,
-    writes: Vec<(String, Key, Value)>,
-    txn_id: Option<TxnId>,
-) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchWrite { writes, txn_id })
-            .await,
-        Event::Storage(StorageEvent::BatchWriteResult { .. })
-    )
-}
-
-pub(crate) async fn delete_rows(
-    context: &Arc<crate::driver::DriverContext>,
-    deletes: Vec<(String, Key)>,
-    txn_id: Option<TxnId>,
-) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::BatchDelete { deletes, txn_id })
-            .await,
-        Event::Storage(StorageEvent::BatchDeleteResult { .. })
-    )
-}
-
-/// One page of a keyspace, with the cursor of the next page. `None` means the
-/// scan itself failed.
-pub(crate) async fn scan_page(
-    context: &Arc<crate::driver::DriverContext>,
-    effect: Effect,
-) -> Option<(Vec<(Key, Value)>, Option<Key>)> {
-    let Effect::Storage(effect) = effect else {
-        return None;
-    };
-    match context.storage_handle.send_storage_effect(effect).await {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Some((values, next_start_after)),
-        _ => None,
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
-}
-
-pub(crate) async fn start_txn(context: &Arc<crate::driver::DriverContext>) -> Option<TxnId> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Some(txn_id),
-        _ => None,
-    }
-}
-
-pub(crate) async fn commit_txn(context: &Arc<crate::driver::DriverContext>, txn_id: TxnId) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-            .await,
-        Event::Storage(StorageEvent::TransactionCommitted { .. })
-    )
-}
-
-/// Whether storage confirmed that every committed transaction is on disk.
-pub(crate) async fn sync_all(context: &Arc<crate::driver::DriverContext>) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::SyncAll)
-            .await,
-        Event::Storage(StorageEvent::SyncAllFinished)
-    )
-}
-
-pub(crate) async fn abort_txn(context: &Arc<crate::driver::DriverContext>, txn_id: TxnId) {
-    context
-        .storage_handle
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{base_key, key_path};
+    use super::{
+        StoreUploadOperation, SyncUpload, UploadState, base_key, key_path, requeued, upload_entry,
+    };
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::keyspaces::SYNC_UPLOAD_KEYSPACE;
+    use aruna_core::operation::Operation;
     use ulid::Ulid;
+
+    fn upload(state: UploadState) -> SyncUpload {
+        SyncUpload {
+            folder_id: Ulid::from_bytes([4; 16]),
+            relative: "a.txt".to_string(),
+            deleted: false,
+            fingerprint: "1-1".to_string(),
+            blake3: None,
+            size: 1,
+            local_version: Some(Ulid::from_bytes([5; 16])),
+            queued_at_ms: 1,
+            state,
+        }
+    }
+
+    fn failed() -> UploadState {
+        UploadState::Failed {
+            reason: "down".to_string(),
+            retryable: true,
+        }
+    }
+
+    fn due() -> UploadState {
+        UploadState::Pending {
+            due_at_ms: 7,
+            attempts: 0,
+            last_error: Some("down".to_string()),
+        }
+    }
+
+    fn stored(upload: &SyncUpload) -> IoResult {
+        IoResult::Values(vec![Some(upload.to_bytes().unwrap().into())])
+    }
+
+    // A row still in the read state is written under the new one in the transaction.
+    #[test]
+    fn stores_unchanged_row() {
+        let row = upload(failed());
+        let mut store = StoreUploadOperation::new(row.clone(), due(), true);
+        assert_eq!(
+            store.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
+        let read = (
+            SYNC_UPLOAD_KEYSPACE.to_string(),
+            base_key(row.folder_id, &row.relative),
+        );
+        assert_eq!(store.first(), Ok(Next::Call(IoCall::Read(vec![read]))));
+        let written = upload_entry(&upload(due())).unwrap();
+        let write = Next::Call(IoCall::Write(vec![written.clone()]));
+        assert_eq!(store.next(stored(&row)), Ok(write));
+        assert_eq!(store.next(IoResult::Done), Ok(Next::Done(true)));
+        let mut unguarded = StoreUploadOperation::new(row, due(), false);
+        assert_eq!(
+            unguarded.first(),
+            Ok(Next::Call(IoCall::Write(vec![written])))
+        );
+    }
+
+    // A row that moved on is left alone; a result that answers no call fails.
+    #[test]
+    fn moved_row_kept() {
+        let mut store = StoreUploadOperation::new(upload(failed()), due(), true);
+        store.first().unwrap();
+        assert_eq!(store.next(stored(&upload(due()))), Ok(Next::Done(false)));
+        let mut store = StoreUploadOperation::new(upload(failed()), due(), true);
+        store.first().unwrap();
+        assert!(store.next(IoResult::Woke).is_err());
+        assert_eq!(requeued(&failed(), 7), Some(due()));
+    }
 
     #[test]
     fn keys_folder_paths() {

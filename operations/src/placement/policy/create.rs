@@ -2,12 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, NetEvent, PolicySignEvent, StorageEvent, SubOperationEvent};
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::effects::{Effect, NetEffect};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::events::{Event, NetEvent, PolicySignEvent};
+use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::storage_entries::{shard_manifest_entry, sync_revision_entry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -19,16 +21,16 @@ use aruna_core::structs::placement::policy::{
     PlacementPolicy, PlacementPolicyError, VerifiedPolicy,
 };
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
-use crate::sync::document_outbox::{new_outbox_record, outbox_write_entry, schedule_drain_effect};
+use crate::sync::outbox::record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
+use aruna_core::placement::{PlacementResolveError, fence, holds_placement, plan_target_placement};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreatePolicyConfig {
@@ -46,24 +48,7 @@ pub struct CreatePolicyConfig {
 #[derive(Debug, PartialEq)]
 pub struct CreatePolicyOperation {
     config: CreatePolicyConfig,
-    txn_id: Option<TxnId>,
-    state: CreatePolicyState,
-    output: Option<Result<PlacementPolicyDocument, CreatePolicyError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum CreatePolicyState {
-    Init,
-    Authorize,
-    StartTransaction,
-    ReadConfig,
-    ReadFence { pending: Box<PendingPublication> },
-    Sign { pending: Box<PendingPublication> },
-    Write,
-    Commit,
-    ScheduleDrain,
-    Finish,
-    Error,
+    authorized: bool,
 }
 
 /// Everything the write needs once this node's key has signed the publication.
@@ -108,25 +93,120 @@ pub enum CreatePolicyError {
     NotHolder { holders: Vec<NodeId> },
     #[error("policy bucket cut over mid-write; retry the create")]
     PlacementFenced,
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
+
+impl From<IoError> for CreatePolicyError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "CreatePolicy".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
+type PolicyTurn = Result<Next<PlacementPolicyDocument>, CreatePolicyError>;
 
 impl CreatePolicyOperation {
     pub fn new(config: CreatePolicyConfig) -> Self {
         Self {
             config,
-            txn_id: None,
-            state: CreatePolicyState::Init,
-            output: None,
+            authorized: false,
+        }
+    }
+}
+
+impl Operation for CreatePolicyOperation {
+    type Output = PlacementPolicyDocument;
+    type Error = CreatePolicyError;
+
+    fn first(&mut self) -> PolicyTurn {
+        VerifiedPolicy::verify(self.config.policy.clone())?;
+        let auth_config = CheckPermissionsConfig {
+            auth_context: self.config.auth_context.clone(),
+            path: policy_authority_path(
+                self.config.actor.realm_id,
+                self.config.policy.owner_group_id,
+            ),
+            required_permission: Permission::WRITE,
+        };
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            auth_config,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> PolicyTurn {
+        if self.authorized {
+            return result
+                .child::<PlacementPolicyDocument, CreatePolicyError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                let write = PolicyWrite::new(self.config.clone());
+                Ok(Next::Call(IoCall::child(write)))
+            }
+            Ok(false) => Err(CreatePolicyError::Unauthorized),
+            Err(error) => {
+                warn!(error = %error, "Placement policy authorization check failed");
+                Err(CreatePolicyError::Unauthorized)
+            }
+        }
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            CreatePolicyError::Unauthorized
+                | CreatePolicyError::NotHolder { .. }
+                | CreatePolicyError::Policy(_)
+        )
+    }
+}
+
+/// What the policy write transaction waits for.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stage {
+    Read,
+    Fence,
+    Sign,
+    Write,
+}
+
+/// Plans, fences, signs and writes the policy document in one write transaction.
+#[derive(Debug, PartialEq)]
+struct PolicyWrite {
+    config: CreatePolicyConfig,
+    stage: Stage,
+    pending: Option<Box<PendingPublication>>,
+    document: Option<PlacementPolicyDocument>,
+    ids: IdMint,
+}
+
+impl PolicyWrite {
+    fn new(config: CreatePolicyConfig) -> Self {
+        Self {
+            config,
+            stage: Stage::Read,
+            pending: None,
+            document: None,
+            ids: IdMint::default(),
         }
     }
 
@@ -138,36 +218,13 @@ impl CreatePolicyOperation {
         placement_policy_target(self.policy_id())
     }
 
-    fn emit_read_config(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = CreatePolicyState::ReadConfig;
-        let config_target = DocumentTarget::RealmConfig {
-            realm_id: self.config.actor.realm_id,
-        };
-        let target = self.target();
-        let mut reads = vec![
-            (
-                config_target.storage_keyspace().to_string(),
-                config_target.storage_key(),
-            ),
-            (target.storage_keyspace().to_string(), target.storage_key()),
-        ];
-        if let Some(group_id) = self.config.policy.owner_group_id {
-            reads.push(crate::groups::fence::group_fence_key(group_id));
-        }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
-    }
-
     /// Plans the document's bucket and either finishes an idempotent replay or
     /// moves on to the write fence.
     fn plan_write(
         &mut self,
         config_value: Option<Value>,
         policy_value: Option<Value>,
-    ) -> Result<Effects, CreatePolicyError> {
+    ) -> PolicyTurn {
         let Some(config_value) = config_value else {
             return Err(CreatePolicyError::RealmConfigMissing);
         };
@@ -182,8 +239,7 @@ impl CreatePolicyOperation {
                 }
                 .into());
             }
-            self.output = Some(Ok(existing));
-            return Ok(self.emit_commit());
+            return Ok(Self::committed(existing));
         }
 
         let target = self.target();
@@ -201,7 +257,7 @@ impl CreatePolicyOperation {
             &verified,
             self.config.actor.node_id,
             self.config.auth_context.user_id,
-            Ulid::generate(),
+            self.ids.mint(self.config.created_at_ms),
             self.config.created_at_ms,
             config.digest()?,
         );
@@ -214,22 +270,24 @@ impl CreatePolicyOperation {
             generation,
         });
         if generation == 0 {
-            return Ok(self.emit_sign(pending));
+            return Ok(self.sign(pending));
         }
         let (key_space, key) = fence::fence_read(&self.config.actor.realm_id, &plan.placement);
-        let txn_id = self.txn_id.ok_or(CreatePolicyError::MissingTransaction)?;
-        self.state = CreatePolicyState::ReadFence { pending };
-        Ok(smallvec![Effect::Storage(StorageEffect::Read {
-            key_space,
-            key,
-            txn_id: Some(txn_id),
-        })])
+        self.stage = Stage::Fence;
+        self.pending = Some(pending);
+        Ok(Next::Call(IoCall::Read(vec![(key_space, key)])))
     }
 
-    fn emit_sign(&mut self, pending: Box<PendingPublication>) -> Effects {
-        let claim = pending.claim;
-        self.state = CreatePolicyState::Sign { pending };
-        smallvec![Effect::Net(NetEffect::PolicySign(Box::new(claim)))]
+    fn sign(&mut self, pending: Box<PendingPublication>) -> Next<PlacementPolicyDocument> {
+        let claim = Box::new(pending.claim);
+        self.stage = Stage::Sign;
+        self.pending = Some(pending);
+        let sign = Effect::Net(NetEffect::PolicySign(claim));
+        Next::Call(IoCall::Effect(Box::new(sign)))
+    }
+
+    fn pending(&mut self) -> Result<Box<PendingPublication>, CreatePolicyError> {
+        self.pending.take().ok_or(CreatePolicyError::NotFinished)
     }
 
     /// Binds the signed publication to the planned definition before it is
@@ -238,7 +296,7 @@ impl CreatePolicyOperation {
         &mut self,
         pending: PendingPublication,
         publication: PolicyPublication,
-    ) -> Result<Effects, CreatePolicyError> {
+    ) -> PolicyTurn {
         let document =
             PlacementPolicyDocument::new(self.config.actor.realm_id, &pending.policy, publication);
         document.verify_publication()?;
@@ -259,8 +317,7 @@ impl CreatePolicyOperation {
         placement: PlacementRef,
         holders: Vec<NodeId>,
         generation: u64,
-    ) -> Result<Effects, CreatePolicyError> {
-        let txn_id = self.txn_id.ok_or(CreatePolicyError::MissingTransaction)?;
+    ) -> PolicyTurn {
         let target = self.target();
         let change = placement_policy_change(&document, placement);
         let bytes = document.to_bytes()?;
@@ -273,7 +330,8 @@ impl CreatePolicyOperation {
         if let Some(entry) = shard_manifest_entry(&target, &change)? {
             writes.push(entry);
         }
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            self.ids.mint(self.config.created_at_ms),
             self.config.actor.node_id,
             target,
             holders,
@@ -286,225 +344,145 @@ impl CreatePolicyOperation {
         .fenced_at(generation);
         writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
 
-        self.output = Some(Ok(document));
-        self.state = CreatePolicyState::Write;
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document);
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn emit_commit(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(CreatePolicyError::MissingTransaction);
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn committed(document: PlacementPolicyDocument) -> Next<PlacementPolicyDocument> {
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Next::Then {
+            output: document,
+            calls,
+        }
+    }
+
+    /// Checks the group deletion fence an owned rule reads, then plans the write.
+    fn read(&mut self, values: Vec<Option<Value>>) -> PolicyTurn {
+        let [config_value, policy_value, tail @ ..] = values.as_slice() else {
+            return Err(CreatePolicyError::UnexpectedEvent {
+                state: "Read".to_string(),
+                expected: "realm config and policy row",
+                got: "a batch read with other rows",
+            });
         };
-        self.state = CreatePolicyState::Commit;
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: CreatePolicyError) -> Effects {
-        let cleanup = self.abort();
-        self.state = CreatePolicyState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(CreatePolicyError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        match (self.config.policy.owner_group_id, tail) {
+            (Some(_), [value]) => {
+                aruna_core::structs::identity::group_delete::check_group_write(value.as_deref())?;
+            }
+            (None, []) => {}
+            _ => {
+                return Err(CreatePolicyError::UnexpectedEvent {
+                    state: "Read".to_string(),
+                    expected: "group deletion fence",
+                    got: "a batch read with other rows",
+                });
+            }
+        }
+        self.plan_write(config_value.clone(), policy_value.clone())
     }
 }
 
-impl Operation for CreatePolicyOperation {
+impl Operation for PolicyWrite {
     type Output = PlacementPolicyDocument;
     type Error = CreatePolicyError;
 
-    fn start(&mut self) -> Effects {
-        if let Err(error) = VerifiedPolicy::verify(self.config.policy.clone()) {
-            return self.fail(error.into());
-        }
-        self.state = CreatePolicyState::Authorize;
-        let auth_config = CheckPermissionsConfig {
-            auth_context: self.config.auth_context.clone(),
-            path: policy_authority_path(
-                self.config.actor.realm_id,
-                self.config.policy.owner_group_id,
-            ),
-            required_permission: Permission::WRITE,
-        };
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(auth_config),
-            |result| Event::SubOperation(SubOperationEvent::AuthorizationResult {
-                allowed: result
-            }),
-        ))]
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
-            CreatePolicyState::Authorize => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => {
-                            self.state = CreatePolicyState::StartTransaction;
-                            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                                read: false
-                            })]
-                        }
-                        Ok(false) => self.fail(CreatePolicyError::Unauthorized),
-                        Err(error) => {
-                            warn!(error = %error, "Placement policy authorization check failed");
-                            self.fail(CreatePolicyError::Unauthorized)
-                        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> PolicyTurn {
+        let config_target = DocumentTarget::RealmConfig {
+            realm_id: self.config.actor.realm_id,
+        };
+        let target = self.target();
+        let mut reads = vec![
+            (
+                config_target.storage_keyspace().to_string(),
+                config_target.storage_key(),
+            ),
+            (target.storage_keyspace().to_string(), target.storage_key()),
+        ];
+        if let Some(group_id) = self.config.policy.owner_group_id {
+            reads.push(crate::groups::fence::group_fence_key(group_id));
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PolicyTurn {
+        match self.stage {
+            Stage::Read => {
+                let IoResult::Values(values) = result else {
+                    return Err(IoError::Unexpected {
+                        expected: "IoResult::Values",
+                        got: result.label(),
                     }
+                    .into());
+                };
+                self.read(values)
+            }
+            Stage::Fence => {
+                let [value] = aruna_core::rows::values::<1>(result)?;
+                let pending = self.pending()?;
+                if !fence::admits(value.as_ref(), pending.generation) {
+                    return Err(CreatePolicyError::PlacementFenced);
                 }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
-            },
-            CreatePolicyState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_config(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            CreatePolicyState::ReadConfig => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, config_value), (_, policy_value), tail @ ..] = values.as_slice()
-                    else {
-                        return self.unexpected_event(
-                            "realm config and policy row",
-                            format!("{values:?}"),
-                        );
-                    };
-                    match (self.config.policy.owner_group_id, tail) {
-                        (Some(_), [(_, value)]) => {
-                            if let Err(error) =
-                                aruna_core::structs::identity::group_delete::check_group_write(
-                                    value.as_deref(),
-                                )
-                            {
-                                return self.fail(error.into());
-                            }
-                        }
-                        (None, []) => {}
-                        _ => {
-                            return self
-                                .unexpected_event("group deletion fence", format!("{values:?}"));
-                        }
+                Ok(self.sign(pending))
+            }
+            Stage::Sign => {
+                let pending = self.pending()?;
+                let IoResult::Event(event) = result else {
+                    return Err(IoError::Unexpected {
+                        expected: "the policy publication signature",
+                        got: result.label(),
                     }
-                    match self.plan_write(config_value.clone(), policy_value.clone()) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
+                    .into());
+                };
+                match *event {
+                    Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
+                        self.bind_publication(*pending, *publication)
                     }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
-            },
-            CreatePolicyState::ReadFence { pending } => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if !fence::admits(value.as_ref(), pending.generation) {
-                        return self.fail(CreatePolicyError::PlacementFenced);
+                    Event::Net(NetEvent::PolicySign(PolicySignEvent::Unavailable(reason))) => {
+                        Err(CreatePolicyError::PublicationUnavailable(reason))
                     }
-                    self.emit_sign(pending)
+                    other => Err(CreatePolicyError::UnexpectedEvent {
+                        state: "Sign".to_string(),
+                        expected: "policy publication signature",
+                        got: other.label(),
+                    }),
                 }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("placement fence read", format!("{other:?}")),
-            },
-            CreatePolicyState::Sign { pending } => match event {
-                Event::Net(NetEvent::PolicySign(PolicySignEvent::Signed(publication))) => {
-                    match self.bind_publication(*pending, *publication) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Net(NetEvent::PolicySign(PolicySignEvent::Unavailable(reason))) => {
-                    self.fail(CreatePolicyError::PublicationUnavailable(reason))
-                }
-                other => {
-                    self.unexpected_event("policy publication signature", format!("{other:?}"))
-                }
-            },
-            CreatePolicyState::Write => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.emit_commit(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            CreatePolicyState::Commit => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = CreatePolicyState::ScheduleDrain;
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            CreatePolicyState::ScheduleDrain => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = CreatePolicyState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule policy outbox drain; durable outbox remains retryable");
-                    self.state = CreatePolicyState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected_event("outbox drain schedule", format!("{other:?}")),
-            },
-            CreatePolicyState::Init | CreatePolicyState::Finish | CreatePolicyState::Error => {
-                smallvec![]
+            }
+            Stage::Write => {
+                result.done()?;
+                let document = self.document.take().ok_or(CreatePolicyError::NotFinished)?;
+                Ok(Self::committed(document))
             }
         }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreatePolicyState::Finish | CreatePolicyState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(CreatePolicyError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
-        }
-    }
-
-    fn expected_error(error: &Self::Error) -> bool {
-        matches!(
-            error,
-            CreatePolicyError::Unauthorized
-                | CreatePolicyError::NotHolder { .. }
-                | CreatePolicyError::Policy(_)
-        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
     use crate::placement::policy::read::{PolicySource, ReadPolicyConfig, ReadPolicyOperation};
     use crate::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
     use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::policy::PlacementSelector;
     use aruna_core::structs::placement::policy::document::verify_policy_authority;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_storage::storage::FjallStorage;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use tempfile::tempdir;
 
@@ -564,9 +542,10 @@ mod tests {
             storage_handle: storage,
             net_handle: Some(net_handle),
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         };
         let actor = Actor {
             node_id: secret.public(),

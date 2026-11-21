@@ -11,13 +11,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
 use crate::admin_documents::{
     AdminDocumentClock, AdminDocumentDot, AdminDocumentEvent, AdminDocumentOperation,
     AdminDocumentTarget, AdminRoleDefinition,
 };
 use crate::auth::{REVOCATION_GRACE_SECS, revocation_live, revocation_retained, valid_token_hash};
+use crate::id::NodeId;
 use crate::structs::identity::auth::Actor;
 use crate::structs::identity::realm::{
     MetadataReplicationConfig, NodePlace, OidcProviderConfig, QuotaConfig, RealmConfigDocument,
@@ -37,22 +36,23 @@ use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
 use crate::structs::storage::node_info::reserved_label;
 use crate::structured_id::PlacementHandle;
 use crate::types::RoleId;
+use crate::user::id::UserId;
 use crate::user::validation::{
     UserAttributeError, validate_attribute_key, validate_attribute_value,
 };
 
 mod apply;
-mod paths;
-mod placement;
-mod revocation;
+pub mod overlay;
+pub mod paths;
+pub mod placement;
+pub mod revocation;
 mod snapshot;
-mod targets;
+pub mod targets;
 
-pub use paths::*;
-use paths::{event_observes_dot, operation_paths, role_definition_value};
-pub use placement::*;
+use paths::{
+    GROUP_DELETED_PATH, USER_NAME_PATH, event_observes_dot, operation_paths, role_definition_value,
+};
 use placement::{candidate_map_value, transition_plan_value, transition_proof_value};
-pub use revocation::{REVOCATIONS_PER_ORIGIN, revoked_token_entry, revoked_token_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminApplyStatus {
@@ -108,7 +108,7 @@ pub enum AdminDocumentError {
     #[error("job family placement strategy cannot be removed")]
     JobFamilyRemoved,
     #[error(transparent)]
-    Distribution(#[from] crate::structs::storage::distribution::DistributionError),
+    Distribution(#[from] crate::structs::storage::distribution::validate::DistributionError),
     #[error("publisher cutoffs repeat a set or exceed their bound")]
     InvalidCutoffs,
     #[error("node place is empty, or its name or coordinates are invalid")]
@@ -230,14 +230,16 @@ impl AdminDocumentState {
         }
     }
 
+    /// Applies `op` by `actor` as a new event with the id `event_id`, which the caller's run mints.
     pub fn apply_operation(
         &mut self,
         actor: &Actor,
         op: AdminDocumentOperation,
+        event_id: Ulid,
     ) -> Result<AdminDocumentEvent, AdminDocumentError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
-            event_id: Ulid::generate(),
+            event_id,
             target: self.target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: observed.sequence_for(&actor.node_id) + 1,
@@ -254,10 +256,11 @@ impl AdminDocumentState {
         actor: &Actor,
         op: AdminDocumentOperation,
         index: &mut RevocationIndex,
+        event_id: Ulid,
     ) -> Result<AdminDocumentEvent, AdminDocumentError> {
         let observed = self.clock.clone();
         let event = AdminDocumentEvent {
-            event_id: Ulid::generate(),
+            event_id,
             target: self.target.clone(),
             origin_node_id: actor.node_id,
             origin_seq: observed.sequence_for(&actor.node_id) + 1,

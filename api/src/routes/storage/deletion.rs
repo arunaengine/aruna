@@ -5,40 +5,44 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use aruna_core::structs::execution::job::JobPayload;
+use crate::job_service::submit_purge_job;
+use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, bucket_permission_path, object_permission_path,
 };
+use aruna_core::structs::storage::listing::ListVersionsItem;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_operations::blob::migration::misplaced::AccessRule;
+use aruna_operations::blob::purge::ScopeTotalsOperation;
 use aruna_operations::jobs::JOB_RETENTION_MS;
-use aruna_operations::jobs::service::submit_purge_job;
-use aruna_operations::metadata::api::set_preview_distributed;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::bucket::release::BucketScope;
+use aruna_operations::metadata::api::links::set_preview_distributed;
+use aruna_operations::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_operations::replication::sync_relationship::list::ListRelationshipsOperation;
 use aruna_operations::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_scope};
 use aruna_operations::s3::object::versions::{
-    ListVersionsError, ListVersionsInput, ListVersionsItem, ListVersionsOperation,
+    ListVersionsError, ListVersionsInput, ListVersionsOperation,
 };
-use aruna_operations::sync::sync_relationship::{
-    ListRelationshipsOperation, SyncRelationshipDirection,
-};
+use aruna_operations::transfer::pinned::{PinnedError, RefuseScopeOperation};
+use aruna_operations::transfer::release::BucketScope;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, permission_granted, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
 
 const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
@@ -49,12 +53,8 @@ const PAGE_VERSIONS: usize = 10_000;
 /// Datasets a distributed bucket's deletion preflight names at most.
 const PREVIEW_DATASETS: usize = 25;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageDeletionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageDeletionDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(deletion_preflight))
         .routes(routes!(submit_purge))
         .routes(routes!(delete_preview))
@@ -279,7 +279,6 @@ separately whether the same caller may run the purge.
             })
         ),
         (status = 400, description = "Invalid scope, marker, or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the selected scope", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse)
     ),
@@ -287,11 +286,10 @@ separately whether the same caller may run the purge.
 )]
 pub async fn deletion_preflight(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<DeletionPreflightRequest>,
 ) -> ServerResult<(StatusCode, Json<DeletionPreflightResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let scope = request.scope.to_core()?;
     let info = bucket_info(&state, scope.bucket()).await?;
     let path = scope_permission_path(&state, info.group_id, &scope);
@@ -332,7 +330,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let uploads = drive(
         ListUploadsOperation::new(ListUploadsInput {
             bucket: scope.bucket().to_string(),
@@ -346,7 +344,7 @@ pub async fn deletion_preflight(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     let (items, versions_truncated, next_version_key, next_version_marker) =
         scoped_version_page(&scope, versions);
@@ -430,14 +428,14 @@ async fn set_coverage(
     set_id: Ulid,
 ) -> ServerResult<(ReferenceCoverageResponse, Vec<DataLinkDocument>)> {
     let preview = set_preview_distributed(
-        state.get_ctx().as_ref(),
         (state.get_realm_id(), state.get_node_id()),
         Some(auth),
         bearer_token_string(bearer),
         (set_id, PREVIEW_DATASETS),
-    )
-    .await
-    .map_err(map_api_error)?;
+    );
+    let preview = drive(preview, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     let freshness = match (
         preview.pending_materializations,
         preview.failed_materializations,
@@ -517,7 +515,6 @@ async fn set_coverage(
             })
         ),
         (status = 400, description = "Invalid scope or idempotency key, or `confirm` does not name the bucket", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not delete the selected scope permanently, or a restricted token asks to delete storage files", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 409, description = "The idempotency key is retained for a purge of a different scope, or a release pins a version in the file, folder or bucket", body = ErrorResponse),
@@ -527,10 +524,9 @@ async fn set_coverage(
 )]
 pub async fn submit_purge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<SubmitPurgeRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitPurgeResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     if request
         .idempotency_key
         .as_ref()
@@ -569,7 +565,7 @@ pub async fn submit_purge(
     )
     .await
     .map_err(crate::routes::execution::jobs::map_submit_error)?;
-    let urls = crate::routes::execution::jobs::job_urls(&state, result.job_id).await?;
+    let urls = crate::jobs::job_urls(&state, result.job_id).await?;
     Ok((
         if result.created {
             StatusCode::CREATED
@@ -598,7 +594,12 @@ async fn refuse_released(
         bucket: scope.bucket(),
         info,
     };
-    match refuse_scope(state.get_ctx().as_ref(), place, auth, scope).await {
+    match drive(
+        RefuseScopeOperation::new(place, auth, scope),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(error @ PinnedError::Unchecked(_)) => {
             Err(ServerError::ServiceUnavailableReason(error.to_string()))
@@ -701,7 +702,6 @@ pub struct DeleteImpact {
         })),
         (status = 400, description = "Invalid kind, key, limit or cursor", body = ErrorResponse),
         (status = 409, description = "Too many versions in a row are hidden from the caller", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the scope", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse)
     ),
@@ -709,11 +709,10 @@ pub struct DeleteImpact {
 )]
 pub async fn delete_preview(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     axum::extract::Path(bucket): axum::extract::Path<String>,
     Json(request): Json<DeleteImpactRequest>,
 ) -> ServerResult<Json<DeleteImpact>> {
-    let auth = require_realm_auth(&state, auth)?;
     let scope = match request.kind.as_str() {
         "file" => PurgeScopeRequest::File {
             bucket: bucket.clone(),
@@ -745,15 +744,19 @@ pub async fn delete_preview(
     let context = state.get_ctx();
     // Only keys the caller may read are counted, listed or named by a cursor.
     let scope_of = (auth.realm_id, info.group_id, state.get_node_id());
-    let access = aruna_operations::auth::request_authorization::BucketAccess::load(
-        &context, &auth, scope_of, &bucket,
+    let access = drive(
+        BucketAccessOperation::new(&auth, scope_of, &bucket),
+        &context,
     )
     .await
     .map_err(|_| ServerError::Forbidden)?;
+    let access = Arc::new(access);
     let readable = |key: &str| access.allows(Some(key), &Permission::READ);
-    let totals = aruna_operations::blob::purge::scope_totals(&context, &scope, &readable)
+    let rule = AccessRule::new(access.clone(), Permission::READ);
+    let routing = aruna_drivers::driver::node_routing(&context);
+    let totals = drive(ScopeTotalsOperation::new(routing, &scope, rule), &context)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let (mut items, mut marker) = (Vec::new(), (key_marker, version_marker));
     let (mut next, mut more, mut passed, mut cut) = (None, false, 0, false);
     for _ in 0..HIDDEN_PAGES {
@@ -777,7 +780,7 @@ pub async fn delete_preview(
                 (cut, more) = (true, false);
                 break;
             }
-            Err(error) => return Err(ServerError::InternalError(error.to_string())),
+            Err(error) => return Err(ServerError::InternalError(error.into())),
         };
         let (page, truncated, next_key, next_version) = scoped_version_page(&scope, page);
         passed += page.len();
@@ -828,14 +831,17 @@ pub async fn delete_preview(
             } => (key.clone(), *version_id),
         })
         .collect();
-    let files = aruna_operations::blob::purge::storage_files(
-        &context,
-        (&bucket, info.group_id),
+    let routing = aruna_drivers::driver::node_routing(&context);
+    let place = (bucket.as_str(), info.group_id);
+    let lookup = aruna_operations::blob::purge::StorageFilesOperation::new(
+        routing,
+        place,
         &versions,
         Some(&scope),
-    )
-    .await
-    .map_err(ServerError::InternalError)?;
+    );
+    let files = drive(lookup, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
     let unchecked = aruna_operations::blob::purge::UNCHECKED_READERS;
     let unchecked = files
@@ -890,16 +896,11 @@ pub async fn delete_preview(
 
 /// A page cursor: the key and version id the next page starts after.
 fn encode_marker(key: &str, version_id: Ulid) -> String {
-    use base64::Engine;
-    let raw = format!("{version_id}{key}");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    aruna_core::cursor::encode(format!("{version_id}{key}"))
 }
 
 fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
-    use base64::Engine;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor)
-        .map_err(|_| ServerError::BadRequest)?;
+    let bytes = aruna_core::cursor::decode(cursor).map_err(|_| ServerError::BadRequest)?;
     let raw = String::from_utf8(bytes).map_err(|_| ServerError::BadRequest)?;
     let (id, key) = raw.split_at_checked(26).ok_or(ServerError::BadRequest)?;
     let id = Ulid::from_string(id).map_err(|_| ServerError::BadRequest)?;
@@ -931,7 +932,6 @@ fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
             "delete_storage_files": true
         })),
         (status = 400, description = "Invalid job id or unknown action", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller may not delete the purge's scope permanently", body = ErrorResponse),
         (status = 404, description = "No purge job with this id on this node", body = ErrorResponse),
         (status = 409, description = "The purge already ended", body = ErrorResponse)
@@ -940,18 +940,17 @@ fn decode_marker(cursor: &str) -> ServerResult<(String, Ulid)> {
 )]
 pub async fn control_purge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     axum::extract::Path((job_id, action)): axum::extract::Path<(String, String)>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
-    use aruna_operations::jobs::service::{CancelJobOutcome, cancel_owned_job};
-    let auth = require_realm_auth(&state, auth)?;
+    use crate::job_service::cancel_owned_job;
+    use aruna_operations::jobs::job::cancel::CancelJobOutcome;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
     let context = state.get_ctx();
-    let record =
-        aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
-            .await
-            .map_err(ServerError::InternalError)?
-            .ok_or(ServerError::NotFound)?;
+    let record = crate::job_service::read_job_record(&context, job_id)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
     };
@@ -966,14 +965,15 @@ pub async fn control_purge(
     if record.state.is_terminal() {
         return Err(ServerError::Conflict("the purge already ended".to_string()));
     }
-    let failed = |error: String| ServerError::InternalError(error);
+    let failed = |error: String| ServerError::InternalError(error.into());
     let id = job_id.as_ulid();
     match action.as_str() {
         "pause" | "resume" => {
             let paused = action == "pause";
-            aruna_operations::blob::purge::set_paused(&context, id, paused)
+            let pause = aruna_operations::blob::pause::PausePurgeOperation::new(id, paused);
+            drive(pause, &context)
                 .await
-                .map_err(failed)?;
+                .map_err(|error| failed(error.to_string()))?;
         }
         "abort" => {
             let runtime = state.jobs_runtime();
@@ -984,9 +984,10 @@ pub async fn control_purge(
             if let CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_) = outcome
                 && purge_ended(&state, job_id).await?
             {
-                aruna_operations::blob::purge::set_paused(&context, id, false)
+                let resume = aruna_operations::blob::pause::PausePurgeOperation::new(id, false);
+                drive(resume, &context)
                     .await
-                    .map_err(failed)?;
+                    .map_err(|error| failed(error.to_string()))?;
             }
         }
         _ => return Err(ServerError::BadRequest),
@@ -1008,17 +1009,17 @@ pub struct PurgeJobResponse {
 
 async fn purge_job(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<Json<PurgeJobResponse>> {
     let context = state.get_ctx();
-    let record =
-        aruna_operations::jobs::store::read_job_record(&context.storage_handle, job_id, None)
-            .await
-            .map_err(ServerError::InternalError)?
-            .ok_or(ServerError::NotFound)?;
-    let paused = aruna_operations::blob::purge::is_paused(&context, job_id.as_ulid())
+    let record = crate::job_service::read_job_record(&context, job_id)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?
+        .ok_or(ServerError::NotFound)?;
+    let paused = aruna_operations::blob::pause::PausedOperation::new(job_id.as_ulid());
+    let paused = drive(paused, &context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let paused = paused && !record.state.is_terminal();
     Ok(Json(PurgeJobResponse {
         job_id: job_id.to_string(),
@@ -1046,7 +1047,6 @@ async fn purge_job(
             "delete_storage_files": true
         })),
         (status = 400, description = "Invalid job id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller cannot read the purge's scope", body = ErrorResponse),
         (status = 404, description = "No purge job with this id on this node", body = ErrorResponse)
     ),
@@ -1054,15 +1054,13 @@ async fn purge_job(
 )]
 pub async fn get_purge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     axum::extract::Path(job_id): axum::extract::Path<String>,
 ) -> ServerResult<Json<PurgeJobResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(|_| ServerError::BadRequest)?;
-    let storage = &state.get_ctx().storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let record = crate::job_service::read_job_record(&state.get_ctx(), job_id)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
     let Some(spec) = record.payload.purge_spec() else {
         return Err(ServerError::NotFound);
@@ -1076,29 +1074,12 @@ pub async fn get_purge(
 
 async fn purge_ended(
     state: &ServerState,
-    job_id: aruna_core::structs::execution::job::JobId,
+    job_id: aruna_core::structs::execution::job::identity::JobId,
 ) -> ServerResult<bool> {
-    let storage = &state.get_ctx().storage_handle;
-    let record = aruna_operations::jobs::store::read_job_record(storage, job_id, None)
+    let record = crate::job_service::read_job_record(&state.get_ctx(), job_id)
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(record.is_some_and(|record| record.state.is_terminal()))
-}
-
-pub(crate) async fn bucket_info(
-    state: &ServerState,
-    bucket: &str,
-) -> ServerResult<aruna_core::structs::storage::blob::BucketInfo> {
-    match drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    {
-        Ok(info) => Ok(info),
-        Err(GetBucketError::NotFound) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
-    }
 }
 
 fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePurgeScope) -> String {
@@ -1118,7 +1099,7 @@ fn scope_permission_path(state: &ServerState, group_id: Ulid, scope: &StoragePur
 
 fn scoped_version_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::object::versions::ListVersionsResult,
+    result: aruna_core::structs::storage::listing::ListVersionsResult,
 ) -> (Vec<ListVersionsItem>, bool, Option<String>, Option<Ulid>) {
     let mut items = result.items;
     let mut truncated = result.is_truncated;
@@ -1140,7 +1121,7 @@ fn scoped_version_page(
 
 fn scoped_multipart_page(
     scope: &StoragePurgeScope,
-    result: aruna_operations::s3::multipart::uploads::ListUploadsResult,
+    result: aruna_core::structs::storage::listing::ListUploadsResult,
 ) -> (
     Vec<aruna_core::structs::storage::multipart::MultipartUpload>,
     bool,
@@ -1177,7 +1158,7 @@ async fn list_sync_effects(
             &state.get_ctx(),
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
         for relationship in relationships {
             if !seen.insert((relationship.id, label)) {
                 continue;

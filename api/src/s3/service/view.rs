@@ -3,14 +3,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::execution::job::{JobId, JobRecord};
-use aruna_operations::jobs::store::read_job_record;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_drivers::driver::drive;
+use aruna_drivers::position::{open_cursor, seal_cursor};
 use aruna_operations::jobs::workflow::input_view::{
-    MAX_VIEW_KEYS, ViewEntry, ViewError, ViewFrom, decode_token, encode_token, head_entry,
-    list_shown, names_manifest, read_entry, read_manifest, view_bucket, view_entries,
+    MAX_VIEW_KEYS, ReadManifestOperation, ViewEntry, ViewEntryOperation, ViewError, ViewFrom,
+    ViewLister, creator, decode_token, encode_token, names_manifest, view_bucket, view_entries,
 };
-use aruna_operations::s3::object::get::GetObjectError;
-use aruna_operations::s3::object::visible::{is_sealed, open_cursor, seal_cursor};
+use aruna_operations::s3::object::visible::is_sealed;
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
     CommonPrefix, ETag, ETagCondition, EncodingType, GetObjectInput, GetObjectOutput,
@@ -48,7 +50,7 @@ fn matches(condition: Option<&ETagCondition>, entry: &ViewEntry) -> bool {
 
 impl ArunaS3Service {
     async fn view_record(&self, view: InputView) -> S3Result<(JobRecord, Vec<ViewEntry>)> {
-        let record = read_job_record(&self.state.storage_handle, view.job_id, None)
+        let record = crate::job_service::read_job_record(&self.state, view.job_id)
             .await
             .map_err(|_| s3_error!(ServiceUnavailable, "The run could not be read"))?
             .ok_or_else(|| s3_error!(NoSuchBucket, "The specified bucket does not exist."))?;
@@ -75,13 +77,26 @@ impl ArunaS3Service {
         }
     }
 
+    /// The run's creator as this node's realm knows it.
+    fn view_creator(&self, record: &JobRecord) -> AuthContext {
+        creator(record, self.state.serving_realm(record.created_by.realm_id))
+    }
+
+    /// Checks the creator may still read one entry, at its source.
+    async fn head_entry(&self, record: &JobRecord, entry: &ViewEntry) -> Result<(), ViewError> {
+        let head = ViewEntryOperation::head(self.view_creator(record), entry.clone(), self.node_id);
+        drive(head, &self.state).await.map(|_| ())
+    }
+
     /// The run's cache manifest and its ETag.
     async fn view_manifest(
         &self,
         record: &JobRecord,
         entries: &[ViewEntry],
     ) -> S3Result<(bytes::Bytes, String)> {
-        let body = read_manifest(&self.state, record, entries, self.node_id)
+        let auth = self.view_creator(record);
+        let manifest = ReadManifestOperation::new(auth, entries.to_vec(), self.node_id);
+        let body = drive(manifest, &self.state)
             .await
             .map_err(view_error)?
             .ok_or_else(|| s3_error!(NoSuchKey, "The specified key does not exist."))?;
@@ -131,19 +146,16 @@ impl ArunaS3Service {
         };
         // Each candidate is authorized in key order from the position, as a HEAD of it would be.
         let scope = (prefix.as_str(), input.delimiter.as_deref());
-        let (state, record_ref, node_id) = (&self.state, &record, self.node_id);
-        let page = list_shown(&entries, scope, from, max_keys, |entry: &ViewEntry| {
-            let entry = entry.clone();
-            Box::pin(async move {
-                match head_entry(state, record_ref, &entry, node_id).await {
-                    Ok(()) => Ok(true),
-                    Err(ViewError::Denied | ViewError::NotFound) => Ok(false),
-                    Err(error) => Err(error),
-                }
-            })
-        })
-        .await
-        .map_err(view_error)?;
+        let mut lister = ViewLister::new(&entries, scope, from, max_keys);
+        while let Some(entry) = lister.candidate() {
+            let shown = match self.head_entry(&record, entry).await {
+                Ok(()) => true,
+                Err(ViewError::Denied | ViewError::NotFound) => false,
+                Err(error) => return Err(view_error(error)),
+            };
+            lister.answer(shown);
+        }
+        let page = lister.finish();
         let next_continuation_token = match &page.next {
             Some(ViewFrom::After(marker)) => Some(encode_token(&bucket, marker)),
             Some(from) => Some(
@@ -218,9 +230,7 @@ impl ArunaS3Service {
         if !matches(input.if_match.as_ref(), entry) {
             return Err(s3_error!(PreconditionFailed, "The ETag does not match"));
         }
-        head_entry(&self.state, &record, entry, self.node_id)
-            .await
-            .map_err(view_error)?;
+        self.head_entry(&record, entry).await.map_err(view_error)?;
         Ok(S3Response::new(HeadObjectOutput {
             accept_ranges: Some("bytes".to_string()),
             content_length: i64::try_from(entry.captured.bytes).ok(),
@@ -260,16 +270,18 @@ impl ArunaS3Service {
             .map(object_range_request)
             .map(|range| range.resolve(entry.captured.bytes))
             .transpose()
-            .map_err(|error| match error {
-                GetObjectError::InvalidRange => {
-                    s3_error!(InvalidRange, "The requested range is not satisfiable")
-                }
-                _ => s3_error!(InvalidArgument, "The range is invalid"),
-            })?;
+            .map_err(|_| s3_error!(InvalidRange, "The requested range is not satisfiable"))?;
         let range = resolved.as_ref().map(|resolved| resolved.range.clone());
-        let blob = read_entry(&self.state, &record, entry, self.node_id, range)
+        let read = ViewEntryOperation::read(
+            self.view_creator(&record),
+            entry.clone(),
+            self.node_id,
+            range,
+        );
+        let blob = drive(read, &self.state)
             .await
-            .map_err(view_error)?;
+            .map_err(view_error)?
+            .ok_or_else(|| s3_error!(ServiceUnavailable, "The input source is unavailable"))?;
         let length = match &resolved {
             Some(resolved) => resolved.content_length,
             None => i64::try_from(entry.captured.bytes).unwrap_or(i64::MAX),

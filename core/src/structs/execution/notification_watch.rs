@@ -4,18 +4,22 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
+use std::time::Duration;
 
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::NodeId;
-use crate::UserId;
+use crate::effects::Effect;
 use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::keyspaces::{WATCH_INTEREST_KEYSPACE, WATCH_OUTBOX_KEYSPACE};
 use crate::structs::execution::notification::NotificationKind;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
-use crate::types::{GroupId, Key};
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 pub const WATCH_USER_CAP: usize = 50;
 pub const MAX_PREFIX_LEN: usize = 1024;
@@ -239,6 +243,30 @@ impl WatchEvent {
         Ok(postcard::from_bytes(bytes)?)
     }
 
+    /// The event of every dataset creation path, so an import or a job notifies exactly like
+    /// `POST /metadata`. `event_id` dates it, keeping a retried create's inbox key stable.
+    pub fn metadata_created(
+        realm_id: RealmId,
+        actor: UserId,
+        group_id: GroupId,
+        document_id: Ulid,
+        document_path: &str,
+        event_id: Ulid,
+    ) -> Self {
+        Self {
+            event_id,
+            realm_id,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/{document_path}"),
+            actor,
+            occurred_at_ms: event_id.timestamp_ms(),
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        }
+    }
+
     /// Maps this event to the recipient-facing notification kind. The event's
     /// `kind` selects matching; the `detail` supplies the deep-link fields.
     pub fn notification_kind(&self) -> NotificationKind {
@@ -365,12 +393,14 @@ pub struct WatchSubscription {
 
 impl WatchSubscription {
     pub fn new(
+        watch_id: Ulid,
         owner: UserId,
         path_prefix: String,
         event_mask: WatchEventMask,
         created_at_ms: u64,
     ) -> Self {
         Self::new_with_authorization(
+            watch_id,
             owner,
             path_prefix,
             event_mask,
@@ -380,6 +410,7 @@ impl WatchSubscription {
     }
 
     pub fn new_with_authorization(
+        watch_id: Ulid,
         owner: UserId,
         path_prefix: String,
         event_mask: WatchEventMask,
@@ -388,7 +419,7 @@ impl WatchSubscription {
     ) -> Self {
         authorization.watch_path_prefix = path_prefix.clone();
         Self {
-            watch_id: Ulid::generate(),
+            watch_id,
             owner,
             path_prefix,
             event_mask,
@@ -623,6 +654,11 @@ impl WatchInterestTable {
             .insert(node_id, entries);
     }
 
+    /// Takes one realm's node map out of the table; empty when the realm holds no interest.
+    pub fn take_realm(&mut self, realm_id: RealmId) -> HashMap<NodeId, Vec<WatchInterestEntry>> {
+        self.realms.remove(&realm_id).unwrap_or_default()
+    }
+
     /// Replaces the entire node map for a realm, dropping empty digests and the
     /// realm entry itself when nothing remains.
     pub fn set_realm(
@@ -676,6 +712,81 @@ impl WatchInterestTable {
     }
 }
 
+/// A watch event the drain still has to deliver, with what an earlier delivery left open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedWatchEvent {
+    pub event: WatchEvent,
+    /// `None` until a delivery did not settle.
+    pub retry: Option<WatchRetry>,
+}
+
+/// When an unsettled watch event is delivered again, and to which holders.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchRetry {
+    pub due_at_ms: u64,
+    pub attempts: u32,
+    /// The holders still waiting, this node for its own open expansion; `None` asks the current
+    /// holders again, as after a delivery that did not report them.
+    pub holders: Option<Vec<NodeId>>,
+}
+
+impl QueuedWatchEvent {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// The row the drain reads; its key is the event id, so a retry rewrites the same row.
+    pub fn entry(&self) -> Result<(KeySpace, Key, Value), ConversionError> {
+        Ok((
+            WATCH_OUTBOX_KEYSPACE.to_string(),
+            Key::from(self.event.event_id.to_bytes().to_vec()),
+            Value::from(postcard::to_allocvec(self)?),
+        ))
+    }
+}
+
+/// The row that asks the notification drain to emit `event`; a retried event keeps its row.
+pub fn watch_event_entry(event: &WatchEvent) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let queued = QueuedWatchEvent {
+        event: event.clone(),
+        retry: None,
+    };
+    queued.entry()
+}
+
+/// Arms the watch event drain now, so a queued event leaves right after its commit.
+pub fn schedule_watch_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainWatchEvents,
+        after: Duration::ZERO,
+    })
+}
+
+/// Debounce window for the coalesced watch-interest publisher: `ShortenTimer`
+/// fires this long after the first dirty write, collapsing a run of watch CRUD
+/// into one publish with bounded latency.
+pub const WATCH_PUBLISH_DEBOUNCE: Duration = Duration::from_secs(2);
+
+/// Schedules (or shortens toward) the debounced watch-interest publish task.
+pub fn schedule_publish_effect() -> Effect {
+    Effect::Task(TaskEffect::ShortenTimer {
+        key: TaskKey::PublishWatchInterest,
+        after: WATCH_PUBLISH_DEBOUNCE,
+    })
+}
+
+/// Dirty marker written in the same transaction as a subscription row change,
+/// so the debounced publisher knows which realm's digest to rebuild. The value
+/// is a generation id; a marker is only cleared if its generation still matches.
+pub fn dirty_marker_write(realm_id: RealmId, generation: Ulid) -> (KeySpace, Key, Value) {
+    let generation = ByteView::from(generation.to_bytes().to_vec());
+    (
+        WATCH_INTEREST_KEYSPACE.to_string(),
+        ByteView::from(interest_dirty_key(realm_id)),
+        generation,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,6 +800,7 @@ mod tests {
 
     fn subscription(owner: UserId) -> WatchSubscription {
         WatchSubscription::new(
+            ulid::Ulid::generate(),
             owner,
             "/bucket/prefix".to_string(),
             WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
@@ -708,7 +820,13 @@ mod tests {
             ]),
             WatchEventMask::from_kinds([WatchEventKind::SyncCompleted, WatchEventKind::SyncFailed]),
         ] {
-            let record = WatchSubscription::new(owner, "/data".to_string(), mask, 42);
+            let record = WatchSubscription::new(
+                ulid::Ulid::generate(),
+                owner,
+                "/data".to_string(),
+                mask,
+                42,
+            );
             let bytes = record.to_bytes().unwrap();
             assert_eq!(WatchSubscription::from_bytes(&bytes).unwrap(), record);
         }

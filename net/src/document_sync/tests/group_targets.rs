@@ -76,7 +76,7 @@ async fn group_tombstone_replays() {
     .await
     .unwrap();
     assert!(matches!(
-        validate_group_authority(&storage, &deleted, None)
+        check_group_authority(&storage, &deleted, None)
             .await
             .unwrap(),
         AdminEventValidation::Deferred { .. }
@@ -105,7 +105,7 @@ async fn group_tombstone_replays() {
     .await
     .unwrap();
     assert_eq!(
-        validate_group_authority(&storage, &deleted, None)
+        check_group_authority(&storage, &deleted, None)
             .await
             .unwrap(),
         AdminEventValidation::Accepted
@@ -845,7 +845,7 @@ async fn user_operation_materializes() {
             name: "Alice Updated".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("admin operation applies");
 
@@ -914,7 +914,7 @@ async fn stale_user_recorded() {
     };
 
     for event in [newer, older.clone(), older.clone()] {
-        apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+        apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
             .await
             .expect("out-of-order admin operation applies");
     }
@@ -960,7 +960,7 @@ async fn subject_add_indexes() {
         },
     };
 
-    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("subject add applies");
 
@@ -1037,7 +1037,7 @@ async fn subject_remove_cleans() {
             subject_id: "subject-removed".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id }, event)
         .await
         .expect("subject remove applies");
 
@@ -1137,7 +1137,7 @@ async fn merge_needs_role() {
                 user_id: survivor,
             },
         );
-        let validation = validate_group_authority(&storage, &grant, None)
+        let validation = check_group_authority(&storage, &grant, None)
             .await
             .expect("validation runs");
         assert_eq!(
@@ -1228,7 +1228,7 @@ async fn hand_over_subject(
             subject_id: "subject-moved".to_string(),
         },
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id: merged }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id: merged }, event)
         .await
         .expect("subject remove applies");
     let owner = read_storage_value(
@@ -1296,7 +1296,7 @@ async fn pointer_needs_management() {
             1,
             op.clone(),
         );
-        let validation = validate_user_authority(&storage, &event, None)
+        let validation = check_user_authority(&storage, &event, None)
             .await
             .expect("validation runs");
         assert_eq!(
@@ -1378,7 +1378,7 @@ async fn apply_with_claims(
         actor,
         op,
     };
-    apply_user_operation(&storage, DocumentTarget::User { user_id: target }, event)
+    apply_admin_operation(&storage, DocumentTarget::User { user_id: target }, event)
         .await
         .expect("event applies");
     read_storage_value(
@@ -1449,6 +1449,7 @@ fn handoff_needs_coordinator() {
             .apply_operation(
                 &old,
                 AdminDocumentOperation::MergeCoordinatorSet { node_id },
+                ulid::Ulid::generate(),
             )
             .expect("pin applies");
         state
@@ -1466,7 +1467,6 @@ fn handoff_needs_coordinator() {
     };
     let judge = |config: RealmConfigDocument, state: Option<AdminDocumentState>, origin: &Actor| {
         validate_config_authority(Some(&config), &handoff(origin), state.as_ref())
-            .expect("validation runs")
     };
     let management = Some(RealmNodeKind::Management);
     assert!(matches!(

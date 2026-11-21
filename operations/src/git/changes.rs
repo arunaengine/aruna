@@ -1,8 +1,6 @@
 //! Compares RO-Crate documents by entity and property and finds conflicting changes.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
-
-use super::PropertyConflict;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -185,6 +183,15 @@ fn shortened(text: &str) -> String {
         Some((end, _)) => format!("{}...", &text[..end]),
         None => text.to_string(),
     }
+}
+
+/// A metadata property both sides changed from their common version to different values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropertyConflict {
+    pub entity: String,
+    pub property: String,
+    pub source: Vec<serde_json::Value>,
+    pub target: Vec<serde_json::Value>,
 }
 
 #[cfg(test)]

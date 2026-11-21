@@ -2,19 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{
-    ensure_permission, permission_granted, require_realm_auth, require_unrestricted_auth,
-};
+use crate::auth::RealmAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{ensure_permission, permission_granted};
 use crate::error::{ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::routes::federation::AcceptedRealmsSetting;
 use crate::routes::node_names::CoordinatesBody;
-pub use crate::server::state::PortalStatus;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::alpn::Alpn;
 use aruna_core::errors::StorageError;
 use aruna_core::heartbeat::HeldHeartbeat;
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::heartbeat::MAX_HEARTBEAT_AGE;
+use aruna_core::heartbeat::seen_recently;
+use aruna_core::node::state::ReadInfoOperation;
+use aruna_core::placement::transition::transition_health;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -22,29 +26,36 @@ use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
-use aruna_core::structs::{ConnectionAddressStatus, PeerConnectionStatus, RequestSummaryState};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::device::realm_documents::{installed_displays, installed_management_urls};
-use aruna_operations::driver::{backend_used_bytes, drive};
-use aruna_operations::federation::totals::data_totals;
-use aruna_operations::metadata::PeerContacts;
-use aruna_operations::metadata::stats::{count_realm_documents, count_realm_groups};
-use aruna_operations::node::heartbeat::{MAX_HEARTBEAT_AGE, held_heartbeats};
-use aruna_operations::node::status::load_status;
-use aruna_operations::node::usage_stats::{LoadCountersOperation, RealmUsage, RealmUsageScope};
-use aruna_operations::placement::allocate_handle::{
-    HandleAllocationError, provision_metadata_binding,
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::drive;
+use aruna_operations::device_node::realm_documents::{
+    installed_displays, installed_management_urls,
 };
-use aruna_operations::placement::transition::transition_health;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::federation::totals::DataTotalsOperation;
+use aruna_operations::groups::routing::UsageOperation;
+use aruna_operations::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
+use aruna_operations::node::contacts::PeerContactsOperation;
+use aruna_operations::placement::allocate_handle::HandleAllocationError;
+use aruna_operations::placement::mutation::PlacementMutationOperation;
+use aruna_operations::placement::provision::ProvisionBindingOperation;
 use aruna_operations::realm::get_nodes::{
     GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
 };
 use aruna_operations::realm::mutate_placement::{
-    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation, drive_placement_mutation,
+    MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation,
 };
 use aruna_operations::realm::node_name::{NodeDisplays, ReadNamesOperation};
 use aruna_operations::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
+use aruna_operations::relay::targets::management_node_urls;
+use aruna_operations::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
+use aruna_operations::s3::usage::LoadCountersOperation;
+use aruna_wire::info::{
+    AddressStatus, BackendStatus, BlobServiceStatus, ConnectionAddressInfo, DatabaseServiceStatus,
+    InfoResponse, InterfaceServicesStatus, InterfaceStatus, NetworkServiceStatus,
+    NodeCapabilityKind, NodeStatus, PeerConnectionInfo, PeerStatus, ProtocolConnectionInfo,
+    ProtocolConnectionStatus, RequestSummary, ServiceStatus, ServicesStatus, TimeoutConfigSecs,
+};
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
@@ -55,241 +66,17 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "system/info", description = "Node information and usage"),
-        (name = "system/realm", description = "Realm configuration, placement and quota")
-    )
-)]
-pub struct InfoApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(InfoApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_info))
         .routes(routes!(get_realm_info))
         .routes(routes!(get_realm_placement, mutate_realm_placement))
         .routes(routes!(set_realm_quota))
         .routes(routes!(get_usage))
-}
-
-/// Node information. `node.status`, `node.realm_id`, `node.peer_id` and `api_version` are
-/// public; capabilities, addresses, peer topology, backend detail and warnings need a realm
-/// token or config admin, and gated values are absent, never restructured.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct InfoResponse {
-    pub node: NodeStatus,
-    pub api_version: String,
-    /// Portal deployment detail. Realm config admins only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub portal: Option<PortalStatus>,
-    /// Node listen addresses. Realm-authenticated callers only, else empty.
-    pub my_addresses: Vec<String>,
-    /// Peer topology. Realm-authenticated callers only, else empty.
-    pub connections: Vec<PeerConnectionInfo>,
-    pub services: ServicesStatus,
-    /// Operational warnings. Realm config admins only, else empty.
-    pub warnings: Vec<String>,
-}
-
-/// Node health and identity. `status`, `realm_id` and `peer_id` are public, as the
-/// realm node list is; `capabilities`, `started_at` and `uptime_secs` need a token of this realm.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct NodeStatus {
-    pub status: ServiceStatus,
-    pub realm_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peer_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<NodeCapabilityKind>,
-    /// RFC 3339 time at which this node process started serving.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = "2026-04-09T14:23:11Z")]
-    pub started_at: Option<String>,
-    /// Whole seconds since `started_at`, from a monotonic clock.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(example = 86400)]
-    pub uptime_secs: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeCapabilityKind {
-    Management,
-    Server,
-    User,
-}
-
-impl From<&aruna_core::structs::identity::auth::NodeCapabilities> for NodeCapabilityKind {
-    fn from(capabilities: &aruna_core::structs::identity::auth::NodeCapabilities) -> Self {
-        match capabilities {
-            aruna_core::structs::identity::auth::NodeCapabilities::Management { .. } => {
-                Self::Management
-            }
-            aruna_core::structs::identity::auth::NodeCapabilities::Server { .. } => Self::Server,
-            aruna_core::structs::identity::auth::NodeCapabilities::User { .. } => Self::User,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ServiceStatus {
-    Available,
-    NotConfigured,
-    Unavailable,
-}
-
-impl From<aruna_core::structs::Status> for ServiceStatus {
-    fn from(status: aruna_core::structs::Status) -> Self {
-        match status {
-            aruna_core::structs::Status::Available => Self::Available,
-            aruna_core::structs::Status::NotConfigured => Self::NotConfigured,
-            aruna_core::structs::Status::Unavailable => Self::Unavailable,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PeerConnectionInfo {
-    pub peer_id: String,
-    pub status: PeerStatus,
-    pub active_addresses: Vec<ConnectionAddressInfo>,
-    /// Populated for realm config admins only.
-    pub last_error: Option<String>,
-    pub next_retry_secs: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PeerStatus {
-    Connected,
-    Known,
-    Unreachable,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ConnectionAddressInfo {
-    pub status: AddressStatus,
-    pub address: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rtt_ms: Option<u64>,
-    pub protocol_connections: Vec<ProtocolConnectionInfo>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum AddressStatus {
-    Active,
-    NotAssigned,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ProtocolConnectionInfo {
-    pub connection_id: u64,
-    pub protocol: Option<String>,
-    pub side: String,
-    pub status: ProtocolConnectionStatus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtocolConnectionStatus {
-    Open,
-}
-
-/// Node backend services. `interfaces` is always present; `network` needs a
-/// token of this realm, `blob` and `database` a realm config admin.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct ServicesStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network: Option<NetworkServiceStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blob: Option<BlobServiceStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub database: Option<DatabaseServiceStatus>,
-    pub interfaces: InterfaceServicesStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct NetworkServiceStatus {
-    pub status: ServiceStatus,
-    pub discovery: Vec<String>,
-    pub relay: Option<String>,
-    pub relay_urls: Vec<String>,
-    pub routing_table_size: Option<usize>,
-    /// Request metrics and last error. Realm config admins only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requests: Option<RequestSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct RequestSummary {
-    pub total: u64,
-    pub failure_rate: f64,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BlobServiceStatus {
-    pub status: ServiceStatus,
-    pub backend: Option<String>,
-    pub max_bucket_size: Option<u64>,
-    pub multipart_bucket: Option<String>,
-    pub timeouts_secs: Option<TimeoutConfigSecs>,
-    /// Every registered backend. The aggregate `status` above is the default
-    /// backend's, so single-backend consumers keep one headline signal.
-    pub backends: Vec<BackendStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BackendStatus {
-    pub name: String,
-    pub backend: String,
-    pub class: Option<String>,
-    /// Whether tenant routing rules may target this backend's class.
-    pub allow_tenants: bool,
-    /// Operator allowance for user data on this backend. A write routed here is
-    /// refused once `used_bytes` reaches it.
-    pub quota_bytes: Option<u64>,
-    /// Stored user-data bytes on this backend, from the maintained counters.
-    /// Absent when those counters could not be read.
-    pub used_bytes: Option<u64>,
-    pub default: bool,
-    pub status: ServiceStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct TimeoutConfigSecs {
-    pub connect: u64,
-    pub io: u64,
-    pub transfer_idle: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-pub struct DatabaseServiceStatus {
-    pub status: ServiceStatus,
-    pub requests: RequestSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct InterfaceServicesStatus {
-    pub rest: InterfaceStatus,
-    pub s3: InterfaceStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mcp: Option<InterfaceStatus>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct InterfaceStatus {
-    pub status: ServiceStatus,
-    /// Local listen address. Realm-authenticated callers only.
-    pub bind: Option<String>,
-    pub url: Option<String>,
 }
 
 /// Realm information. Identity, description, oidc providers, public urls and the
@@ -916,17 +703,17 @@ fn parse_subject(value: &str) -> ServerResult<Vec<u8>> {
         .map_err(|_| ServerError::BadRequestReason("subject must be valid hex".to_string()))
 }
 
-fn parse_node_id(value: &str) -> ServerResult<aruna_core::NodeId> {
+fn parse_node_id(value: &str) -> ServerResult<aruna_core::id::NodeId> {
     value
-        .parse::<aruna_core::NodeId>()
+        .parse::<aruna_core::id::NodeId>()
         .map_err(|_| ServerError::BadRequestReason(format!("invalid node_id: {value}")))
 }
 
-fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::NodeId>> {
+fn parse_node_ids(values: Vec<String>, field: &str) -> ServerResult<Vec<aruna_core::id::NodeId>> {
     values
         .into_iter()
         .map(|value| {
-            value.parse::<aruna_core::NodeId>().map_err(|_| {
+            value.parse::<aruna_core::id::NodeId>().map_err(|_| {
                 ServerError::BadRequestReason(format!("invalid node id in {field}: {value}"))
             })
         })
@@ -1026,11 +813,106 @@ impl TelemetryState {
     }
 }
 
+/// One compute backend the node offers. Read-only: only node or realm admins configure backends,
+/// at node start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ExecutorCapabilityResponse {
+    /// The backend's node-local name; `default` is the one built from the environment.
+    pub backend: String,
     pub kind: String,
     pub file_staging: bool,
     pub direct_s3: bool,
+    /// Where the backend's workers run; empty when the backend cannot prove it.
+    pub location: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    #[schema(inline)]
+    pub limits: BackendLimits,
+    /// The longest run the operator allows here; absent is unbounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_walltime_ms: Option<u64>,
+    /// What the operator declared the backend offers.
+    #[schema(inline)]
+    pub capabilities: BackendCapabilities,
+    /// How well the backend fits each workload kind: `refused`, `possible`, `good` or `best`.
+    #[schema(inline)]
+    pub suitability: BackendSuitability,
+    /// How many groups the backend is limited to; 0 means open to every group.
+    pub group_count: u32,
+    /// Advances whenever the backend's settings change on its node.
+    pub config_generation: u64,
+}
+
+/// The backend's resource ceilings. An absent dimension is unmeasured and bounds nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendLimits {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpu_cores: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_ram_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_disk_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendCapabilities {
+    pub gpus: u32,
+    pub architectures: Vec<String>,
+    pub stdin: bool,
+    pub multi_container: bool,
+    pub services: bool,
+    pub ingress: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BackendSuitability {
+    pub batch: String,
+    pub sessions: String,
+    pub services: String,
+}
+
+/// One advertised backend as the node document shows it; group ids are never shown.
+fn executor_response(
+    executor: &aruna_core::compute::ExecutorCapability,
+) -> ExecutorCapabilityResponse {
+    let name = |value: aruna_core::compute::backend::Suitability| {
+        serde_json::to_value(value)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default()
+    };
+    let declared = &executor.declared;
+    ExecutorCapabilityResponse {
+        backend: executor.backend.clone(),
+        kind: executor.kind.clone(),
+        file_staging: executor.file_staging,
+        direct_s3: executor.direct_s3,
+        location: executor.subject.location.clone(),
+        labels: executor.subject.labels.clone(),
+        limits: BackendLimits {
+            max_cpu_cores: executor.limits.max_cpu_cores,
+            max_ram_bytes: executor.limits.max_ram_bytes,
+            max_disk_bytes: executor.limits.max_disk_bytes,
+            max_concurrent: executor.limits.max_concurrent,
+        },
+        max_walltime_ms: executor.max_walltime_ms,
+        capabilities: BackendCapabilities {
+            gpus: declared.gpus,
+            architectures: declared.architectures.clone(),
+            stdin: declared.stdin,
+            multi_container: declared.multi_container,
+            services: declared.services,
+            ingress: declared.ingress,
+        },
+        suitability: BackendSuitability {
+            batch: name(executor.suitability.batch),
+            sessions: name(executor.suitability.sessions),
+            services: name(executor.suitability.services),
+        },
+        group_count: executor.groups.len() as u32,
+        config_generation: executor.config_generation,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1225,7 +1107,26 @@ token of another realm or one this node cannot validate, the response is the pub
                                 "connection_status": "connected",
                                 "placement": {"location": "dc-a", "weight": 100, "full": false, "draining": false},
                                 "info": {
-                                    "executors": [{"kind": "docker", "file_staging": true, "direct_s3": false}],
+                                    "executors": [{
+                                        "backend": "default",
+                                        "kind": "docker",
+                                        "file_staging": true,
+                                        "direct_s3": false,
+                                        "location": "eu-west",
+                                        "labels": {"aruna-engine.org/location": "eu-west"},
+                                        "limits": {"max_cpu_cores": 8, "max_concurrent": 4},
+                                        "capabilities": {
+                                            "gpus": 0,
+                                            "architectures": ["x86_64"],
+                                            "stdin": false,
+                                            "multi_container": false,
+                                            "services": false,
+                                            "ingress": false
+                                        },
+                                        "suitability": {"batch": "good", "sessions": "good", "services": "possible"},
+                                        "group_count": 0,
+                                        "config_generation": 1
+                                    }],
                                     "labels": {"zone": "dc-a"},
                                     "urls": {"api": "https://node.example.test/api/v1"},
                                     "utilization": {
@@ -1292,10 +1193,10 @@ pub(crate) async fn run_realm_info(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let realm_authenticated = auth.is_some_and(|auth| auth.realm_id == state.get_realm_id());
 
@@ -1311,14 +1212,19 @@ pub(crate) async fn run_realm_info(
     let metadata_replication = RealmReplicationResponse {
         default_replication_factor: config.effective_replication_factor(),
     };
-    let live_datasets = match count_realm_documents(&state.get_ctx(), config.realm_id).await {
+    let live_datasets = match drive(
+        RealmDocumentsOperation::new(config.realm_id),
+        &state.get_ctx(),
+    )
+    .await
+    {
         Ok(count) => count,
         Err(error) => {
             warn!(error = %error, "metadata document count unavailable for public realm overview");
             None
         }
     };
-    let groups = match count_realm_groups(&state.get_ctx(), config.realm_id).await {
+    let groups = match drive(RealmGroupsOperation::new(config.realm_id), &state.get_ctx()).await {
         Ok(count) => Some(count),
         Err(error) => {
             warn!(error = %error, "group count unavailable for public realm overview");
@@ -1344,7 +1250,9 @@ pub(crate) async fn run_realm_info(
     // A device holds no peer node-info document, so the list a realm node
     // installed on it is what the portal is offered there.
     if management_urls.is_empty() {
-        management_urls = installed_management_urls(&state.get_ctx(), config.realm_id).await;
+        management_urls = drive(installed_management_urls(config.realm_id), &state.get_ctx())
+            .await
+            .unwrap_or_default();
     }
 
     let public_nodes = public_nodes(
@@ -1357,8 +1265,8 @@ pub(crate) async fn run_realm_info(
     let (discovery, nodes, quota) = if realm_authenticated {
         let present_nodes = load_realm_presence(state).await;
         let discovery = serde_json::to_value(&config.discovery)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
-        let contacts = state.peer_contacts();
+            .map_err(|error| ServerError::InternalError(error.into()))?;
+        let contacts = peer_contacts(state, &config).await;
         let names = node_names(state, config.realm_id).await;
         let nodes = map_realm_nodes(
             state,
@@ -1410,12 +1318,25 @@ pub(crate) async fn run_realm_info(
     })
 }
 
+/// When this node last saw each node of the realm config; empty when it cannot tell.
+async fn peer_contacts(
+    state: &ServerState,
+    config: &RealmConfigDocument,
+) -> BTreeMap<aruna_core::id::NodeId, u64> {
+    let peers = (config.nodes.iter())
+        .filter_map(|node| node.node_id.parse::<aruna_core::id::NodeId>().ok())
+        .collect();
+    drive(PeerContactsOperation::new(peers), &state.get_ctx())
+        .await
+        .unwrap_or_default()
+}
+
 /// The realm's infrastructure nodes as a visitor sees them: name, place and whether they are
 /// online, without owners, placement, utilization or devices.
 async fn visitor_nodes(state: &ServerState, config: &RealmConfigDocument) -> Vec<NodeInfoResponse> {
     let present_nodes = load_realm_presence(state).await;
     let names = node_names(state, config.realm_id).await;
-    let contacts = state.peer_contacts();
+    let contacts = peer_contacts(state, config).await;
     let documents = BTreeMap::new();
     let nodes = map_realm_nodes(
         state,
@@ -1450,7 +1371,9 @@ async fn node_names(
         state.node_capabilities(),
         aruna_core::structs::identity::auth::NodeCapabilities::User { .. }
     ) {
-        return installed_displays(&state.get_ctx(), realm_id).await;
+        return drive(installed_displays(realm_id), &state.get_ctx())
+            .await
+            .unwrap_or_default();
     }
     drive(ReadNamesOperation::new(realm_id), &state.get_ctx())
         .await
@@ -1460,36 +1383,13 @@ async fn node_names(
         })
 }
 
-/// Every management node of the realm with the api url it published, in
-/// realm-config order. The caller decides where its own node belongs.
-pub(crate) fn management_node_urls(
-    config: &RealmConfigDocument,
-    node_info_docs: &BTreeMap<
-        aruna_core::NodeId,
-        aruna_core::structs::storage::node_info::NodeInfoDocument,
-    >,
-) -> Vec<(aruna_core::NodeId, Option<String>)> {
-    config
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.kind, RealmNodeKind::Management))
-        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
-        .map(|node_id| {
-            let url = node_info_docs
-                .get(&node_id)
-                .and_then(|doc| doc.urls.api.clone());
-            (node_id, url)
-        })
-        .collect()
-}
-
 /// Server and management nodes with a published api url, in realm-config order; this node
 /// names its own interface while its document has not landed yet.
 fn public_nodes(
     state: &ServerState,
     config: &RealmConfigDocument,
     node_info_docs: &BTreeMap<
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
     own_url: Option<&str>,
@@ -1499,7 +1399,7 @@ fn public_nodes(
         .nodes
         .iter()
         .filter(|node| !matches!(node.kind, RealmNodeKind::User { .. }))
-        .filter_map(|node| node.node_id.parse::<aruna_core::NodeId>().ok())
+        .filter_map(|node| node.node_id.parse::<aruna_core::id::NodeId>().ok())
         .filter_map(|node_id| {
             let published = node_info_docs
                 .get(&node_id)
@@ -1521,14 +1421,16 @@ fn management_urls(
     state: &ServerState,
     config: &RealmConfigDocument,
     node_info_docs: &BTreeMap<
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
     own_url: Option<&str>,
 ) -> Vec<String> {
     let current = state.get_node_id();
     let mut urls: Vec<String> = Vec::new();
-    for (node_id, published) in management_node_urls(config, node_info_docs) {
+    for (node_id, published) in management_node_urls(config, |node| {
+        (node_info_docs.get(node)).and_then(|doc| doc.urls.api.clone())
+    }) {
         let is_current = node_id == current;
         let url = published.or_else(|| is_current.then(|| own_url.map(str::to_string)).flatten());
         let Some(url) = url else {
@@ -1549,14 +1451,13 @@ fn management_urls(
 pub(crate) async fn load_node_documents(
     state: &ServerState,
     config: &RealmConfigDocument,
-) -> BTreeMap<aruna_core::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument> {
-    let node_ids: Vec<aruna_core::NodeId> = config
+) -> BTreeMap<aruna_core::id::NodeId, aruna_core::structs::storage::node_info::NodeInfoDocument> {
+    let node_ids: Vec<aruna_core::id::NodeId> = config
         .nodes
         .iter()
         .filter_map(|node| node.node_id.parse().ok())
         .collect();
-    match aruna_operations::node::node_info::read_info_documents(&state.get_ctx(), &node_ids).await
-    {
+    match drive(ReadInfoOperation::new(node_ids), state.get_ctx().as_ref()).await {
         Ok(documents) => documents,
         Err(error) => {
             warn!(error = %error, "Failed to load node info documents for realm info");
@@ -1575,15 +1476,7 @@ fn map_node_document(
     });
     let jobs = held.and_then(|held| held.heartbeat.jobs);
     NodeDocumentResponse {
-        executors: document
-            .executors
-            .iter()
-            .map(|executor| ExecutorCapabilityResponse {
-                kind: executor.kind.clone(),
-                file_staging: executor.file_staging,
-                direct_s3: executor.direct_s3,
-            })
-            .collect(),
+        executors: document.executors.iter().map(executor_response).collect(),
         labels: document.labels.clone(),
         urls: RealmUrlsResponse {
             api: document.urls.api.clone(),
@@ -1722,7 +1615,6 @@ management node serves the call and every other node relays it to one.
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 500, description = "The stored realm configuration could not be read or decoded here", body = crate::error::ErrorResponse),
@@ -1741,10 +1633,10 @@ pub async fn get_realm_placement(
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok((
         StatusCode::OK,
@@ -1864,30 +1756,23 @@ management node serves the call and every other node relays it to one.
             })
         ),
         (status = 400, description = "Malformed body, an id that is not a ULID, a node id or subject that does not decode, an unknown strategy, a node the realm does not place, a location or label the placement map refuses, or a change the realm configuration rejects as invalid", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "The strategy is still referenced by a binding or override (`StrategyReferenced`), so removing it would leave a dangling reference, the placement handle space is exhausted, or another update of the realm configuration won the race; the caller may retry", body = crate::error::ErrorResponse),
         (status = 500, description = "The realm configuration could not be read or written here", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn mutate_realm_placement(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     request: Result<Json<RealmPlacementRequest>, JsonRejection>,
 ) -> ServerResult<(StatusCode, Json<RealmPlacementResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let Json(request) =
         request.map_err(|error| ServerError::BadRequestReason(error.body_text()))?;
     let action = request.into_core()?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let context = state.get_ctx();
     let document = match action {
         RealmPlacementAction::Mutation(mutation) => {
@@ -1899,9 +1784,12 @@ pub async fn mutate_realm_placement(
                 Permission::WRITE,
             )
             .await?;
-            drive_placement_mutation(
-                MutatePlacementConfig { actor, mutation },
-                Some(auth),
+            drive(
+                PlacementMutationOperation::new(
+                    MutatePlacementConfig { actor, mutation },
+                    Some(auth),
+                    context.node_and_realm().map(|(node_id, _)| node_id),
+                ),
                 &context,
             )
             .await
@@ -1916,16 +1804,19 @@ pub async fn mutate_realm_placement(
             let scope = group_id
                 .map(PlacementScope::Group)
                 .unwrap_or(PlacementScope::Realm(actor.realm_id));
-            provision_metadata_binding(context.as_ref(), actor.clone(), scope, strategy_id)
-                .await
-                .map_err(map_handle_error)?;
+            drive(
+                ProvisionBindingOperation::new(actor.clone(), scope, strategy_id),
+                context.as_ref(),
+            )
+            .await
+            .map_err(map_handle_error)?;
             drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
-                    aruna_operations::realm::get_config::GetConfigError::DocumentNotFound => {
+                    aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
-                    other => ServerError::InternalError(other.to_string()),
+                    other => ServerError::InternalError(other.into()),
                 })?
         }
     };
@@ -1945,17 +1836,13 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         }
         HandleAllocationError::Append(error) => map_placement_error(error),
         HandleAllocationError::ReadConfig(
-            aruna_operations::realm::get_config::GetConfigError::DocumentNotFound,
+            aruna_operations::document_repository::GetConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
         }
-        HandleAllocationError::Storage(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        HandleAllocationError::Storage(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1982,12 +1869,8 @@ fn map_placement_error(error: MutatePlacementError) -> ServerError {
         MutatePlacementError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm placement update conflict; retry".to_string())
         }
-        MutatePlacementError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        MutatePlacementError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -2072,21 +1955,18 @@ management node serves the call and every other node relays it to one.
             })
         ),
         (status = 400, description = "A percentage outside its allowed range, a duplicate or malformed override, an id that is not a ULID or user identifier, or a zero device cap or device limit", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = crate::error::ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = crate::error::ErrorResponse),
         (status = 409, description = "Another update of the realm configuration won the race; the caller may retry with the same body", body = crate::error::ErrorResponse),
-        (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
-        (status = 503, description = "Storage cleanup capacity exhausted, or no management node was reachable to serve the relayed call; code `no_management_node`", body = crate::error::ErrorResponse)
+        crate::openapi::RelayErrors
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn set_realm_quota(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<RealmQuotaConfig>,
 ) -> ServerResult<(StatusCode, Json<RealmQuotaConfig>)> {
-    let auth = require_realm_auth(&state, auth)?;
     // Request policies live at this boundary; the operation only checks roles.
     ensure_permission(
         &state,
@@ -2096,11 +1976,7 @@ pub async fn set_realm_quota(
     )
     .await?;
     let (quota, replicas) = request.into_quota_config()?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
+    let actor = actor(&state, &auth);
     let stored = drive(
         SetQuotaOperation::new(SetQuotaConfig {
             actor,
@@ -2124,12 +2000,8 @@ fn map_quota_error(error: SetQuotaError) -> ServerError {
         SetQuotaError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent realm quota update conflict; retry".to_string())
         }
-        SetQuotaError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        SetQuotaError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -2288,7 +2160,7 @@ impl UsageResponse {
 pub async fn load_usage_counters(state: &ServerState, key: Vec<u8>) -> ServerResult<UsageCounters> {
     drive(LoadCountersOperation::new(key), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// The realm or group bucket total with each distributed bucket once; `None` when this node cannot
@@ -2298,7 +2170,8 @@ pub(crate) async fn distinct_buckets(
     group: Option<ulid::Ulid>,
     buckets: u64,
 ) -> Option<u64> {
-    match aruna_operations::distribution::counts::set_counts(&state.get_ctx(), group).await {
+    let count = aruna_operations::distribution::counts::SetCountsOperation::new(group);
+    match aruna_drivers::driver::drive(count, &state.get_ctx()).await {
         Ok(counts) => counts.distinct(buckets),
         Err(error) => {
             warn!(error = %error, "distributed bucket counts unavailable for usage response");
@@ -2310,23 +2183,30 @@ pub(crate) async fn distinct_buckets(
 /// The realm's current objects and data bytes, stored and referenced alike, private data
 /// included; aggregates only, so no bucket or dataset is named. `None` when unknown here.
 pub(crate) async fn realm_totals(state: &ServerState) -> Option<(u64, u64)> {
-    data_totals(&state.get_ctx(), state.get_node_id())
-        .await
-        .inspect_err(|error| warn!(error = %error, "realm usage unavailable for the realm totals"))
-        .ok()
+    let context = state.get_ctx();
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    drive(
+        DataTotalsOperation::new(state.get_node_id(), realm_id),
+        context.as_ref(),
+    )
+    .await
+    .inspect_err(|error| warn!(error = %error, "realm usage unavailable for the realm totals"))
+    .ok()
 }
 
 pub async fn load_realm_usage(
     state: &ServerState,
     scope: RealmUsageScope,
 ) -> ServerResult<RealmUsage> {
-    aruna_operations::node::usage_stats::load_realm_usage(
-        &state.get_ctx(),
-        state.get_node_id(),
-        scope,
-    )
-    .await
-    .map_err(ServerError::InternalError)
+    let context = state.get_ctx();
+    let realm_id = context.node_and_realm().map(|(_, realm_id)| realm_id);
+    let operation = RealmUsageOperation::new(state.get_node_id(), realm_id, scope);
+    let mut totals = drive(operation, context.as_ref())
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+    totals
+        .pop()
+        .ok_or_else(|| ServerError::InternalError("no realm usage total".into()))
 }
 
 #[utoipa::path(
@@ -2382,52 +2262,54 @@ checked, because the figures are realm-wide totals and not per-caller views.
                 "metadata_documents": 4096
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token is path-restricted, or the caller is not a member of this realm", body = crate::error::ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_usage(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<UsageResponse>)> {
-    require_unrestricted_auth(&state, auth)?;
     let local = load_usage_counters(&state, USAGE_GLOBAL_KEY.to_vec()).await?;
     let realm = load_realm_usage(&state, RealmUsageScope::Global).await?;
     let mut response = UsageResponse::new(local, realm.counters);
     response.realm.distinct_buckets = distinct_buckets(&state, None, response.realm.buckets).await;
     // Best effort: storage counters stay reportable when the metadata
     // subsystem cannot answer, and the omitted field never reads as zero.
-    response.metadata_documents =
-        match count_realm_documents(&state.get_ctx(), state.get_realm_id()).await {
-            Ok(count) => count,
-            Err(error) => {
-                warn!(error = %error, "metadata document count unavailable for usage response");
-                None
-            }
-        };
+    response.metadata_documents = match drive(
+        RealmDocumentsOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        Ok(count) => count,
+        Err(error) => {
+            warn!(error = %error, "metadata document count unavailable for usage response");
+            None
+        }
+    };
     Ok((StatusCode::OK, Json(response)))
 }
 
 fn map_realm_nodes(
     state: &ServerState,
     config: &RealmConfigDocument,
-    present_nodes: HashSet<aruna_core::NodeId>,
+    present_nodes: HashSet<aruna_core::id::NodeId>,
     node_info_docs: BTreeMap<
-        aruna_core::NodeId,
+        aruna_core::id::NodeId,
         aruna_core::structs::storage::node_info::NodeInfoDocument,
     >,
-    contacts: &PeerContacts,
+    contacts: &BTreeMap<aruna_core::id::NodeId, u64>,
     names: &NodeDisplays,
     now_ms: u64,
 ) -> Vec<NodeInfoResponse> {
     let current_node = state.get_node_id();
-    let heartbeats = held_heartbeats(state.get_ctx().net_handle.as_ref());
+    let heartbeats = state.get_ctx().held_heartbeats();
     config
         .nodes
         .iter()
         .map(|node| {
-            let parsed = node.node_id.parse::<aruna_core::NodeId>().ok();
+            let parsed = node.node_id.parse::<aruna_core::id::NodeId>().ok();
             let is_current = node.node_id == current_node.to_string();
             let kind = NodeKindInfo::from(&node.kind);
             // A device publishes no realm presence, so presence carries no
@@ -2451,12 +2333,14 @@ fn map_realm_nodes(
             // A device answering for itself is in contact by definition.
             let last_seen_ms = match (is_device, is_current) {
                 (true, true) => Some(now_ms),
-                (true, false) => parsed.and_then(|node_id| contacts.last_seen(&node_id)),
+                (true, false) => parsed.and_then(|node_id| contacts.get(&node_id).copied()),
                 (false, _) => None,
             };
             let seen_recently = is_device
                 && (is_current
-                    || parsed.is_some_and(|node_id| contacts.seen_recently(&node_id, now_ms)));
+                    || parsed
+                        .and_then(|node_id| contacts.get(&node_id))
+                        .is_some_and(|seen_ms| seen_recently(*seen_ms, now_ms)));
             let shown = parsed.map(|node_id| names.of(&node_id)).unwrap_or_default();
             let place = shown.place.unwrap_or_default();
             NodeInfoResponse {
@@ -2486,8 +2370,8 @@ fn map_realm_nodes(
 /// only the local node stays present until a fresh lookup confirms the rest.
 fn presence_nodes(
     presence: RealmPresence,
-    local: aruna_core::NodeId,
-) -> HashSet<aruna_core::NodeId> {
+    local: aruna_core::id::NodeId,
+) -> HashSet<aruna_core::id::NodeId> {
     if presence.is_stale() {
         return HashSet::from([local]);
     }
@@ -2496,7 +2380,7 @@ fn presence_nodes(
     nodes
 }
 
-async fn load_realm_presence(state: &ServerState) -> HashSet<aruna_core::NodeId> {
+async fn load_realm_presence(state: &ServerState) -> HashSet<aruna_core::id::NodeId> {
     // A realm with offline nodes must degrade to local-only presence rather
     // than stall the dashboard.
     let discovery = tokio::time::timeout(
@@ -2559,17 +2443,20 @@ async fn interface_services_status(state: &ServerState) -> InterfaceServicesStat
 /// request from the maintained counters, not from the store itself.
 async fn backend_statuses(
     state: &ServerState,
-    backends: Vec<aruna_core::structs::BackendState>,
+    backends: Vec<aruna_core::structs::info::BackendState>,
 ) -> Vec<BackendStatus> {
     let context = state.get_ctx();
     let mut statuses = Vec::with_capacity(backends.len());
     for backend in backends {
-        let used_bytes = backend_used_bytes(&context, &BackendRef::Node(backend.name.clone()))
-            .await
-            .inspect_err(
-                |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
-            )
-            .ok();
+        let used_bytes = drive(
+            UsageOperation::new(BackendRef::Node(backend.name.clone())),
+            &context,
+        )
+        .await
+        .inspect_err(
+            |error| warn!(backend = %backend.name, error = %error, "Backend usage unavailable"),
+        )
+        .ok();
         statuses.push(BackendStatus {
             name: backend.name,
             backend: backend.backend_type.to_string(),
@@ -2733,7 +2620,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
     }
 
     let ctx = state.get_ctx();
-    let snapshot = load_status(ctx.as_ref()).await;
+    let snapshot = ctx.status().await;
 
     let (network, warnings) = match snapshot.network {
         Some(info) => {
@@ -2812,7 +2699,7 @@ pub(crate) async fn run_node_info(state: &ServerState, auth: Option<AuthContext>
 /// Maps a live peer connection to its wire form. `last_error` leaks internal
 /// diagnostics, so it is populated for realm config admins only.
 fn map_peer_connection(
-    peer: &aruna_core::structs::PeerConnectionState,
+    peer: &aruna_core::structs::info::PeerConnectionState,
     admin: bool,
 ) -> PeerConnectionInfo {
     PeerConnectionInfo {
@@ -2839,47 +2726,6 @@ fn map_peer_connection(
             .collect(),
         last_error: admin.then(|| peer.last_error.clone()).flatten(),
         next_retry_secs: peer.retry_in_secs,
-    }
-}
-
-impl RequestSummary {
-    fn default() -> Self {
-        Self::from_counts(0, 0, None)
-    }
-
-    fn from_state(state: &RequestSummaryState) -> Self {
-        Self::from_counts(state.total, state.failures, state.last_error.clone())
-    }
-
-    fn from_counts(total: u64, failures: u64, last_error: Option<String>) -> Self {
-        Self {
-            total,
-            failure_rate: if total == 0 {
-                0.0
-            } else {
-                failures as f64 / total as f64
-            },
-            last_error,
-        }
-    }
-}
-
-impl From<PeerConnectionStatus> for PeerStatus {
-    fn from(status: PeerConnectionStatus) -> Self {
-        match status {
-            PeerConnectionStatus::Connected => Self::Connected,
-            PeerConnectionStatus::Known => Self::Known,
-            PeerConnectionStatus::Unreachable => Self::Unreachable,
-        }
-    }
-}
-
-impl From<ConnectionAddressStatus> for AddressStatus {
-    fn from(status: ConnectionAddressStatus) -> Self {
-        match status {
-            ConnectionAddressStatus::Active => Self::Active,
-            ConnectionAddressStatus::NotAssigned => Self::NotAssigned,
-        }
     }
 }
 

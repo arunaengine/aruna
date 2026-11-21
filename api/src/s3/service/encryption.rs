@@ -7,17 +7,18 @@ use super::ArunaS3Service;
 use crate::routes::storage::encryption::{EncryptionRequest, enable_bucket, too_large};
 use crate::s3::auth::map_authorize_error;
 use crate::s3::error::IntoS3Error;
+use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::errors::BlobError;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketKeyError, EncryptionMode};
-use aruna_operations::auth::request_authorization::authorize;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::replication::plaintext::EncryptionCheckOperation;
 use aruna_operations::s3::bucket::encryption::EnableError;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::s3::key_status::{KeyStatusOperation, bucket_settings};
+use aruna_operations::transfer::key_status::KeyStatusOperation;
 use s3s::dto::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
     ServerSideEncryptionRule,
@@ -26,9 +27,8 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 
 impl ArunaS3Service {
     pub(super) async fn bucket_encrypted(&self, bucket: &str) -> S3Result<bool> {
-        bucket_settings(&self.state, bucket)
+        drive(EncryptionCheckOperation::new(bucket, false), &self.state)
             .await
-            .map(|settings| settings.is_encrypted())
             .map_err(|error| s3_error!(InternalError, "{}", error))
     }
 
@@ -64,13 +64,9 @@ impl ArunaS3Service {
             session: None,
         };
         let path = group_admin_path(self.realm_id, info.group_id);
-        authorize(
+        drive(
+            AuthorizeOperation::new(self.realm_id, &auth, &path, &Permission::WRITE, extras),
             &self.state,
-            self.realm_id,
-            &auth,
-            &path,
-            &Permission::WRITE,
-            extras,
         )
         .await
         .map_err(map_authorize_error)?;
@@ -172,7 +168,7 @@ fn enable_error(error: EnableError) -> S3Error {
         EnableError::Mapped => s3_error!(
             InvalidRequest,
             "{}",
-            aruna_operations::groups::imports::MAPPED_REASON
+            aruna_operations::s3::imports::MAPPED_REASON
         ),
         EnableError::Blob(BlobError::SizeLimitExceeded { limit }) => {
             s3_error!(InvalidRequest, "{}", too_large(limit))

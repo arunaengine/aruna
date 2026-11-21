@@ -2,29 +2,68 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::git::{DocumentLocks, GitEffect, GitEvent, MAX_GIT_BYTES};
+use crate::git_cache::GitCaches;
+use aruna_core::git::{GitEffect, GitEvent, MAX_GIT_BYTES};
 use aruna_core::repo_layout::Layout;
-use aruna_core::telemetry::{record_stage, time_stage};
+use aruna_core::telemetry::record_stage;
 use bytes::Bytes;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
+use ulid::Ulid;
 
 #[derive(Debug)]
 pub struct GitStore {
     root: PathBuf,
     helper: PathBuf,
+    /// Held while one effect runs on a repository.
     locks: DocumentLocks,
+    /// Held across a projection, snapshot or push of one document, which runs several effects.
+    documents: DocumentLocks,
     slots: Semaphore,
     /// The layout of each seen commit; a commit never changes, so the answer stays valid.
     layouts: std::sync::Mutex<lru::LruCache<(ulid::Ulid, String), Layout>>,
+    caches: GitCaches,
 }
 
 /// Commits whose layout is kept; older answers are read from the repository again.
 const LAYOUTS: std::num::NonZeroUsize = std::num::NonZeroUsize::new(4096).unwrap();
+
+/// One async lock per document, created on first use and dropped once nobody holds it.
+#[derive(Debug, Default)]
+struct DocumentLocks(
+    std::sync::Mutex<std::collections::HashMap<Ulid, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
+
+impl DocumentLocks {
+    async fn lock(&self, document_id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.mutex(document_id).lock_owned().await
+    }
+
+    /// The lock when no one holds it, without waiting.
+    fn try_lock(&self, document_id: Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.mutex(document_id).try_lock_owned().ok()
+    }
+
+    fn mutex(&self, document_id: Ulid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&document_id).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(document_id, std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+}
 
 impl GitStore {
     pub fn new(root: PathBuf, helper: PathBuf) -> Self {
@@ -32,9 +71,16 @@ impl GitStore {
             root,
             helper,
             locks: DocumentLocks::default(),
+            documents: DocumentLocks::default(),
             slots: Semaphore::new(2),
             layouts: std::sync::Mutex::new(lru::LruCache::new(LAYOUTS)),
+            caches: GitCaches::default(),
         }
+    }
+
+    /// What this node remembers about its repositories between operations.
+    pub fn caches(&self) -> &GitCaches {
+        &self.caches
     }
 
     /// The stored layout when `revision` is a full commit id seen before.
@@ -47,6 +93,21 @@ impl GitStore {
         layouts.get(&(document_id, revision.to_string())).copied()
     }
 
+    /// Serializes projection, snapshots and pushes of one document on this node.
+    pub async fn lock(&self, document_id: ulid::Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        time_stage("git_document_lock", self.documents.lock(document_id)).await
+    }
+
+    /// Waits from blocking code for the lock every effect on repository `id` runs under.
+    pub fn hold_repository(&self, id: Ulid) -> tokio::sync::OwnedMutexGuard<()> {
+        self.locks.mutex(id).blocking_lock_owned()
+    }
+
+    /// The document lock when it is free; reads use it to avoid waiting for a running snapshot.
+    pub fn try_lock(&self, document_id: ulid::Ulid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        self.documents.try_lock(document_id)
+    }
+
     /// Whether the local repository still has the required files and settings.
     pub async fn configured(&self, id: ulid::Ulid) -> bool {
         configured(&self.root.join(format!("{id}.git")), &self.helper).await
@@ -55,7 +116,7 @@ impl GitStore {
     pub async fn execute(
         &self,
         effect: GitEffect,
-        actor: aruna_core::UserId,
+        actor: aruna_core::user::id::UserId,
     ) -> std::io::Result<GitEvent> {
         if let GitEffect::Layout {
             document_id,
@@ -327,7 +388,7 @@ impl GitStore {
 /// Records the settings last applied, so a configured repository needs no Git process.
 const SETTINGS: &str = "aruna-settings";
 
-fn settings(hooks: &str) -> [(&'static str, &str); 7] {
+fn settings(hooks: &str) -> [(&'static str, &str); 8] {
     [
         ("core.hooksPath", hooks),
         ("http.receivepack", "true"),
@@ -337,6 +398,8 @@ fn settings(hooks: &str) -> [(&'static str, &str); 7] {
         ("core.logAllRefUpdates", "true"),
         // The repository is a cache rebuilt from the replicated records, so it skips disk syncs.
         ("core.fsync", "none"),
+        // An automatic repack after a push runs inside the push, under the repository lock.
+        ("gc.autoDetach", "false"),
     ]
 }
 
@@ -509,6 +572,14 @@ pub(crate) async fn exchange(
     .map_err(std::io::Error::other)?
 }
 
+/// Awaits `future` and attributes its wall time to the named request stage.
+async fn time_stage<F: Future>(name: &'static str, future: F) -> F::Output {
+    let started = Instant::now();
+    let output = future.await;
+    record_stage(name, started.elapsed());
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +604,9 @@ mod tests {
             directory.path().to_path_buf(),
             "helper".into(),
         ));
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let busy = ulid::Ulid::from(1);
         let held = store.locks.lock(busy).await;
         let waiting = (0..2)
@@ -561,7 +634,9 @@ mod tests {
     async fn layouts_stay_known() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = GitStore::new(directory.path().to_path_buf(), "helper".into());
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let id = ulid::Ulid::from(3);
         let repository = directory.path().join(format!("{id}.git"));
         let run = |args: &[&str]| {
@@ -618,7 +693,9 @@ mod tests {
         let helper = directory.path().join("helper");
         let store = GitStore::new(directory.path().join("git"), helper);
         let id = ulid::Ulid::from(7);
-        let actor = aruna_core::UserId::nil(aruna_core::structs::identity::realm::RealmId([1; 32]));
+        let actor = aruna_core::user::id::UserId::nil(
+            aruna_core::structs::identity::realm::RealmId([1; 32]),
+        );
         let repository = directory.path().join("git").join(format!("{id}.git"));
         let config = || async {
             tokio::fs::metadata(repository.join("config"))
@@ -661,5 +738,22 @@ mod tests {
             .expect("broken repository is repaired");
         assert!(repository.join("HEAD").exists());
         assert!(store.configured(id).await);
+    }
+
+    #[tokio::test]
+    async fn reads_skip_busy() {
+        let locks = DocumentLocks::default();
+        let id = ulid::Ulid::from(1);
+        let held = locks.lock(id).await;
+        assert!(
+            locks.try_lock(id).is_none(),
+            "a held lock is not handed out"
+        );
+        assert!(
+            locks.try_lock(ulid::Ulid::from(2)).is_some(),
+            "other documents stay free"
+        );
+        drop(held);
+        assert!(locks.try_lock(id).is_some());
     }
 }

@@ -1,0 +1,26 @@
+# Manifest of aruna-clock, the host clock and random source of the runner, backends and inputs.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-clock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# The bounded poll for tests; only dev-dependencies enable it.
+test-hooks = ["dep:tokio"]
+
+[dependencies]
+aruna-core = { workspace = true }
+tokio = { workspace = true, optional = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+nix = { workspace = true }

@@ -7,20 +7,11 @@ use super::info_topics::cursor_key;
 use super::{git_record, session_refs};
 use crate::explorer::ExplorerError;
 use aruna_core::document::{DocumentEvent, DocumentTarget};
+use aruna_core::document_apply::cursor::AppliedCursor;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
-use irokle::{ActorClock, ActorId, Event, FjallStorage, Op, OpId, Storage, TopicId, TopicPayload};
-use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use irokle::{ActorClock, Event, FjallStorage, Op, OpId, Storage, TopicId, TopicPayload};
+use std::collections::BTreeSet;
 use std::path::Path;
-
-/// The applied cursor the node keeps per document topic.
-#[derive(Deserialize)]
-#[cfg_attr(test, derive(serde::Serialize))]
-struct AppliedCursor {
-    lineage: OpId,
-    clock: ActorClock,
-    marks: BTreeMap<ActorId, OpId>,
-}
 
 /// Ops of the pending pool one page reads.
 const PENDING_PAGE: usize = 256;
@@ -133,17 +124,11 @@ fn applied_clock(
     genesis: OpId,
     stored: Option<&[u8]>,
 ) -> Result<ActorClock, ExplorerError> {
-    let Some(cursor) = stored
-        .and_then(|value| postcard::from_bytes::<AppliedCursor>(value).ok())
-        .filter(|cursor| cursor.lineage == genesis)
-    else {
+    let Some(cursor) = AppliedCursor::decode(stored, genesis) else {
         return Ok(ActorClock::default());
     };
-    for (actor_id, actor_seq) in cursor.clock.iter().filter(|(_, seq)| **seq > 0) {
-        let current = storage.actor_index(topic_id, actor_id, *actor_seq)?;
-        if current.is_none() || current.as_ref() != cursor.marks.get(actor_id) {
-            return Ok(ActorClock::default());
-        }
+    if !cursor.stands(|actor_id, actor_seq| storage.actor_index(topic_id, actor_id, actor_seq))? {
+        return Ok(ActorClock::default());
     }
     Ok(cursor.clock)
 }
@@ -166,7 +151,6 @@ mod tests {
     use super::super::migrate_output;
     use super::super::tests::{strip, write};
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
@@ -175,8 +159,10 @@ mod tests {
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
+    use aruna_core::user::id::UserId;
     use irokle::oplog::Oplog;
     use irokle::{Ed25519Signer, EventEnvelope, ReplicationPolicy, Signer, TopicGenesis};
+    use std::collections::BTreeMap;
     use ulid::Ulid;
 
     /// A current delete of the realm config document, as the sync payload carries it.

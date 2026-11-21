@@ -7,29 +7,30 @@ use std::sync::Arc;
 
 use aruna_core::document::DocumentEvent;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::{SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage};
-use aruna_operations::sync::sync_quarantine::{
-    QuarantineAdminError, QuarantinePageRequest, acknowledge_quarantine_row,
-    list_quarantine_records, prune_quarantine_records, read_quarantine_record,
+use aruna_core::structs::sync_quarantine::{
+    SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
 };
+use aruna_drivers::driver::{drive, drive_retry};
+use aruna_operations::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_operations::sync::sync_quarantine::{QuarantineAdminError, QuarantinePageRequest};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct SyncQuarantineDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(SyncQuarantineDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_quarantine, prune_quarantine))
         .routes(routes!(inspect_quarantine))
         .routes(routes!(acknowledge_quarantine))
@@ -106,9 +107,8 @@ pub struct QuarantinePruneResponse {
 /// Realm admins only: retained evidence carries whole replicated documents.
 async fn authorize_quarantine_admin(
     state: &Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
 ) -> ServerResult<AuthContext> {
-    let auth = require_unrestricted_auth(state, auth)?;
     ensure_permission(
         state,
         &auth,
@@ -121,9 +121,9 @@ async fn authorize_quarantine_admin(
 
 fn map_admin_error(error: QuarantineAdminError) -> ServerError {
     match error {
-        QuarantineAdminError::Storage(error) => ServerError::InternalError(error.to_string()),
-        QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.to_string()),
-        QuarantineAdminError::Unexpected { .. } => ServerError::ServiceUnavailable,
+        QuarantineAdminError::Storage(error) => ServerError::InternalError(error.into()),
+        QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.into()),
+        QuarantineAdminError::Io(_) => ServerError::ServiceUnavailable,
     }
 }
 
@@ -231,18 +231,18 @@ because a retained row carries the whole rejected document; a path-restricted to
             })
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_quarantine(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<QuarantineQuery>,
 ) -> ServerResult<(StatusCode, Json<QuarantinePageResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
-    let page = list_quarantine_records(&state.get_ctx(), page_request(&query)?)
+    let operation = ListQuarantineOperation::new(page_request(&query)?);
+    let page = drive(operation, &state.get_ctx())
         .await
         .map_err(map_admin_error)?;
 
@@ -296,7 +296,6 @@ because the row carries the whole rejected document; a path-restricted token is 
             })
         ),
         (status = 400, description = "The row id is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no evidence under that row id; it may have been pruned, or retained by a different node", body = ErrorResponse)
     ),
@@ -304,12 +303,12 @@ because the row carries the whole rejected document; a path-restricted token is 
 )]
 pub async fn inspect_quarantine(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(record_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<QuarantineInspectResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
     let key = hex::decode(&record_id).map_err(|_| ServerError::BadRequest)?;
-    let record = read_quarantine_record(&state.get_ctx(), &key)
+    let record = drive(ReadQuarantineOperation::new(key), &state.get_ctx())
         .await
         .map_err(map_admin_error)?
         .ok_or(ServerError::NotFound)?;
@@ -360,7 +359,6 @@ path-restricted token is refused.
             })
         ),
         (status = 400, description = "The row id is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse),
         (status = 404, description = "This node holds no evidence under that row id; it may have been pruned, or retained by a different node", body = ErrorResponse)
     ),
@@ -368,12 +366,12 @@ path-restricted token is refused.
 )]
 pub async fn acknowledge_quarantine(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(record_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<QuarantineRecordResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
     let key = hex::decode(&record_id).map_err(|_| ServerError::BadRequest)?;
-    let record = acknowledge_quarantine_row(&state.get_ctx(), &key)
+    let record = drive(AcknowledgeQuarantineOperation::new(key), &state.get_ctx())
         .await
         .map_err(map_admin_error)?
         .ok_or(ServerError::NotFound)?;
@@ -426,18 +424,19 @@ path-restricted token is refused.
             })
         ),
         (status = 400, description = "The cursor or topic filter is not valid hex", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm or path-restricted, or no WRITE on the realm's sync-quarantine admin path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn prune_quarantine(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Query(query): Query<QuarantineQuery>,
 ) -> ServerResult<(StatusCode, Json<QuarantinePruneResponse>)> {
     authorize_quarantine_admin(&state, auth).await?;
-    let result = prune_quarantine_records(&state.get_ctx(), page_request(&query)?)
+    let request = page_request(&query)?;
+    let build = || PruneQuarantineOperation::new(request.clone());
+    let result = drive_retry(build, &state.get_ctx(), b"sync-quarantine-prune")
         .await
         .map_err(map_admin_error)?;
 

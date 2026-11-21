@@ -5,26 +5,48 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::inbound::initialize_net_holder;
+use crate::tasks::incoming::TaskQueues;
+use crate::tasks::incoming::restore::install_task_queues;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
-use aruna_blob::blob::{BackendRegistry, BlobHandle, BlobHandler};
+use aruna_blob::blob::registry::BackendRegistry;
+use aruna_blob::blob::{BlobHandle, BlobHandler};
 use aruna_core::egress::EgressPolicy;
+use aruna_core::id::NodeId;
 use aruna_core::metrics::NodeMetrics;
-use aruna_core::shutdown::Shutdown;
-use aruna_net::{NetConfig, NetHandle};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::{MetadataHandle, MetadataHandleOptions};
-use aruna_operations::node::startup::RecoveryStatus;
-use aruna_operations::sync::incoming::initialize_net_holder;
-use aruna_operations::tasks::incoming::{TaskQueues, install_task_queues};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_graph::{GraphHandle, GraphOptions};
+use aruna_net::NetHandle;
+use aruna_net::config::NetConfig;
+use aruna_operations::groups::deletion::coordinator::InstallOnboardingOperation;
+use aruna_operations::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
+use aruna_operations::metadata::provenance::export::ForgetSpoolOperation;
+use aruna_operations::node::counter_check::CounterCheckOperation;
+use aruna_operations::node::usage_publish::PublishUsageOperation;
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
+use aruna_operations::shard::recovery::RecoveryStatus;
+use aruna_operations::transfer::sharding::begin_range_rebuilds;
+use aruna_storage::storage::persistence::FjallPersistPolicy;
 use aruna_tasks::TaskHandle;
+use aruna_tasks::shutdown::Shutdown;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
-use crate::config::{Config, open_storage, resolve_config};
-use crate::settings::Settings;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
+use aruna_config::settings::Settings;
+use aruna_config::{Config, open_storage, resolve_config};
+
+/// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
+const RECORD_LIMITS: aruna_drivers::recorder::RecordLimits =
+    aruna_drivers::recorder::RecordLimits {
+        total_bytes: 64 << 20,
+        entry_bytes: 16 << 10,
+    };
+/// Pause before a failed background usage rebuild starts again from a new snapshot.
+const REBUILD_RETRY_PAUSE: Duration = Duration::from_secs(30);
 
 /// The node resources a running process owns. This is not the Tokio runtime.
 pub struct NodeResources {
@@ -50,7 +72,7 @@ pub struct NodeResources {
 /// The resources acquired so far. Infallible ownership is created up front;
 /// every fallible acquisition assigns its resource before the next step runs.
 struct Acquired {
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     jobs_runtime: Arc<JobsRuntime>,
     shutdown: Shutdown,
@@ -58,7 +80,7 @@ struct Acquired {
     readiness: Readiness,
     recovery: RecoveryStatus,
     net_handle: Option<NetHandle>,
-    metadata_handle: Option<MetadataHandle>,
+    graph_handle: Option<GraphHandle>,
     blob_handle: Option<BlobHandle>,
     driver_ctx: Option<Arc<DriverContext>>,
     monitoring: Option<Arc<MonitoringState>>,
@@ -69,17 +91,21 @@ struct Acquired {
 }
 
 impl Acquired {
-    fn new(storage_handle: aruna_storage::StorageHandle, task_handle: TaskHandle) -> Self {
+    fn new(
+        storage_handle: aruna_storage::storage::handle::StorageHandle,
+        task_handle: TaskHandle,
+    ) -> Self {
+        let jobs_runtime = JobsRuntime::new_paused();
         Self {
             storage_handle,
             task_handle,
-            jobs_runtime: JobsRuntime::new_paused(),
+            jobs_runtime,
             shutdown: Shutdown::new(),
             metrics: Arc::new(NodeMetrics::new()),
             readiness: Readiness::new(),
             recovery: RecoveryStatus::new(),
             net_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             blob_handle: None,
             driver_ctx: None,
             monitoring: None,
@@ -96,7 +122,10 @@ impl Acquired {
     pub(crate) async fn cleanup(self, grace: Duration) -> ShutdownOutcome {
         info!("Startup stopped early; releasing the acquired resources");
         let ops = self.ops_handle;
-        let driver_ctx = self.driver_ctx;
+        // Startup may stop before the context exists; leases are then handed back over storage.
+        let driver_ctx = self
+            .driver_ctx
+            .unwrap_or_else(|| Arc::new(DriverContext::storage_only(self.storage_handle.clone())));
         let outcome = NodeShutdown {
             shutdown: self.shutdown,
             readiness: self.readiness,
@@ -108,8 +137,9 @@ impl Acquired {
             monitoring: self.monitoring,
             task_handle: self.task_handle,
             jobs_runtime: self.jobs_runtime,
+            driver_ctx: driver_ctx.clone(),
             net_handle: self.net_handle,
-            metadata_handle: self.metadata_handle,
+            graph_handle: self.graph_handle,
             blob_handle: self.blob_handle,
             storage_handle: self.storage_handle,
             ops: None,
@@ -224,7 +254,11 @@ pub(crate) async fn acquire(
     }
     // Parsing operator settings is pure; the store is the first owned
     // resource, established before identity and enrollment I/O.
-    let settings = crate::settings::read_settings()?;
+    let settings = aruna_config::settings::read_settings()?;
+    if settings.event_recording {
+        aruna_drivers::recorder::enable(RECORD_LIMITS);
+    }
+    aruna_drivers::driver::set_hang_limits(settings.hang_limits);
     let storage_handle = open_storage(&settings)?;
     // The node runtime always exists here; a missing one is a concrete startup
     // error, never a scheduler-less handle that only looks started.
@@ -245,7 +279,7 @@ pub(crate) async fn acquire(
 /// a partial one is a typed error; `on_drain` arms escalation before each drain.
 pub(crate) async fn acquire_with_storage(
     settings: Settings,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     stop: &tokio_util::sync::CancellationToken,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
@@ -303,7 +337,7 @@ pub(crate) async fn acquire_with_storage(
 #[cfg(test)]
 pub(crate) async fn acquire_resources(
     config: Config,
-    storage_handle: aruna_storage::StorageHandle,
+    storage_handle: aruna_storage::storage::handle::StorageHandle,
     task_handle: TaskHandle,
     mut checkpoint: impl FnMut(StartupStage) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<NodeResources, Box<dyn std::error::Error>> {
@@ -343,12 +377,29 @@ async fn fill(
     );
     acquired
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::derive(
+        .open_vault(aruna_core::node::vault::NodeVaultKey::derive(
             &config.node_state.net_secret_key,
         ));
+    // Only holders of the realm signing key derive the realm keys; storage opens with them.
+    if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
+        realm_signing_key,
+        ..
+    } = &config.node_capabilities
+    {
+        let keys = aruna_core::realm_vault::RealmKeys::derive(realm_signing_key);
+        acquired.storage_handle.open_realm(keys);
+    }
+    // After every start no job work is admitted until the node caught up; the fence is durable
+    // before any peer can reach this node.
+    let fence = DriverContext::storage_only(acquired.storage_handle.clone());
+    let raise =
+        aruna_operations::jobs::fence::RaiseFenceOperation::new(config.node_id, config.realm_id);
+    drive(raise, &fence)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     if matches!(
         config.startup_mode,
-        crate::config::StartupMode::JoinRealm {
+        aruna_config::StartupMode::JoinRealm {
             phase: aruna_core::onboarding::OnboardingPhase::Bootstrapped
         }
     ) {
@@ -362,20 +413,17 @@ async fn fill(
             storage_handle: acquired.storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
-        aruna_operations::groups::deletion::install_onboarding(
-            &context,
-            &ticket,
-            config.realm_id,
-            config.node_id,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-        )
-        .await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let install =
+            InstallOnboardingOperation::new(&ticket, config.realm_id, config.node_id, now);
+        aruna_drivers::driver::drive(install, &context).await?;
         stopped(stop)?;
     }
     let net_handle = NetHandle::new(
@@ -397,6 +445,8 @@ async fn fill(
         acquired.storage_handle.clone(),
     )
     .await?;
+    // Only the net adapter signs federation payloads, so the key never enters an operation.
+    net_handle.install_federation_keys(config.node_capabilities.clone());
     if let Err(error) = net_handle.reload_realm_peers().await {
         warn!(error = %error, "Failed to refresh realm peers from persisted config during startup");
     }
@@ -404,30 +454,19 @@ async fn fill(
     checkpoint(StartupStage::Net)?;
     stopped(stop)?;
 
-    let mut metadata_options = MetadataHandleOptions::default()
-        .with_search_storage(config.metadata_search_storage)
-        .with_sync_policy(config.fjall_persist_policy);
-    // Only holders of the realm signing key derive the realm vault and seal keys.
-    if let aruna_core::structs::identity::auth::NodeCapabilities::Management {
-        realm_signing_key,
-        ..
-    } = &config.node_capabilities
-    {
-        let key = aruna_core::realm_vault::RealmVaultKey::derive(realm_signing_key);
-        let seal_key = aruna_core::realm_vault::RealmSealKey::derive(realm_signing_key);
-        metadata_options = metadata_options.with_vault_key(key).with_seal_key(seal_key);
-    }
-    let metadata_handle = MetadataHandle::new_with_options(
+    let graph_handle = GraphHandle::open(
         &config.metadata_storage_path,
         config.node_id,
-        acquired.storage_handle.clone(),
-        Some(net_handle.clone()),
         Some(net_handle.document_sync_node()),
         Some(net_handle.document_sync_database()),
-        metadata_options,
+        GraphOptions::default()
+            .with_search_storage(config.metadata_search_storage)
+            .with_sync_all(config.fjall_persist_policy == FjallPersistPolicy::SyncAll),
     )?;
-    metadata_handle.share_mail(acquired.jobs_runtime.mail());
-    acquired.metadata_handle = Some(metadata_handle.clone());
+    acquired.graph_handle = Some(graph_handle.clone());
+    acquired
+        .storage_handle
+        .install_metadata_indexes(&config.metadata_storage_path);
     checkpoint(StartupStage::Metadata)?;
     stopped(stop)?;
 
@@ -445,7 +484,7 @@ async fn fill(
 
     // Compute settings are collected once from the explicit process source at
     // the resource boundary, then passed into backend construction.
-    let compute_settings = crate::compute_setup::collect(&crate::settings::ProcessEnv)
+    let compute_settings = crate::compute_setup::collect(&aruna_config::settings::ProcessEnv)
         .map_err(std::io::Error::other)?;
     let compute = build_registry(config, &compute_settings)
         .await
@@ -455,17 +494,23 @@ async fn fill(
     checkpoint(StartupStage::Compute)?;
     stopped(stop)?;
 
+    let (http, policy) = blob_handle.repository_client();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: acquired.storage_handle.clone(),
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: Some(acquired.task_handle.clone()),
         compute_handle: compute_handle.clone(),
+        outbound_handle: Some(aruna_outbound::OutboundHandle::new(http, policy)),
     });
     // The driver context and the monitoring refresher it feeds are owned before
     // the ops listener can fail to bind.
     acquired.driver_ctx = Some(driver_ctx.clone());
+    // Projections read the skew setting from storage; it is stored before any of them runs.
+    if let Err(error) = drive(store_clock_skew(clock_skew_env()), &driver_ctx).await {
+        warn!(%error, "The clock skew setting could not be stored");
+    }
 
     // Start ops before realm bootstrap so readiness reports startup failure.
     let ops_state = MonitoringState::with_recovery(
@@ -473,8 +518,7 @@ async fn fill(
         acquired.metrics.clone(),
         acquired.readiness.clone(),
         acquired.recovery.clone(),
-    )
-    .await;
+    );
     acquired.monitoring = Some(ops_state.clone());
     let ops_listener = TcpListener::bind(config.ops_socket_addr).await?;
     let bound = ops_listener.local_addr()?;
@@ -490,9 +534,10 @@ async fn fill(
 
     // A rebuild is the only local evidence that counters were not carried over. It runs in
     // the background; quota-limited writes are refused until it finishes.
-    acquired.usage_counters_rebuilt = ensure_usage_counters(driver_ctx.as_ref()).await?;
+    acquired.usage_counters_rebuilt =
+        drive(CounterCheckOperation::new(), driver_ctx.as_ref()).await?;
     if acquired.usage_counters_rebuilt {
-        aruna_operations::node::usage_stats::spawn_usage_rebuild(
+        spawn_usage_rebuild(
             driver_ctx.clone(),
             config.realm_id,
             config.node_id,
@@ -506,16 +551,18 @@ async fn fill(
     open_managed_keys(driver_ctx.as_ref(), config).await?;
     record_restart_locks(driver_ctx.as_ref(), config).await?;
     // Cached realm secrets the config no longer names go before any email job runs.
-    let mail = acquired.jobs_runtime.mail();
-    aruna_operations::notifications::email::refresh_mail(&driver_ctx, config.realm_id, Some(&mail))
-        .await;
+    let refresh =
+        aruna_operations::notifications::email::RefreshMailOperation::new(config.realm_id);
+    if let Err(error) = drive(refresh, &driver_ctx).await {
+        warn!(%error, "Mail settings refresh stopped during startup");
+    }
+    // Exports cut off by the last stop left their working rows; no export runs before serving.
+    if let Err(error) = drive(ForgetSpoolOperation::all(), &driver_ctx).await {
+        warn!(%error, "Provenance working rows were not cleared during startup");
+    }
     // Recovery that weakened while the node was down, or later through role changes, is told.
     let origin = (config.realm_id, config.node_id);
-    aruna_operations::s3::bucket::key_recovery::spawn_recovery_sweep(
-        driver_ctx.clone(),
-        origin,
-        &acquired.shutdown,
-    );
+    crate::startup::sweeps::spawn_recovery_sweep(driver_ctx.clone(), origin, &acquired.shutdown);
     stopped(stop)?;
 
     // Bind compute reconciliation before startup recovery.
@@ -530,7 +577,6 @@ async fn fill(
         acquired.task_handle.clone(),
         acquired.jobs_runtime.clone(),
         config.rocrate_limits.clone(),
-        Some(config.node_capabilities.clone()),
     )
     .await;
     acquired.task_queues = Some(task_queues);
@@ -539,16 +585,22 @@ async fn fill(
     Ok(())
 }
 
+/// The largest clock skew a projection accepts, from `MAX_CLOCK_SKEW_SECS` in seconds.
+fn clock_skew_env() -> u64 {
+    let seconds = std::env::var("MAX_CLOCK_SKEW_SECS").ok();
+    let seconds = seconds.and_then(|value| value.parse::<u64>().ok());
+    seconds.map_or(DEFAULT_SKEW_MS, |seconds| seconds.saturating_mul(1000))
+}
+
 /// Opens the node-managed bucket keys, then resumes the work that waited for them. A key that
 /// fails stays locked and is reported.
 async fn open_managed_keys(
     driver_ctx: &DriverContext,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_core::time::unix_timestamp_millis;
-    use aruna_operations::driver::drive;
-    use aruna_operations::jobs::key_wake::wake_unlocked;
-    use aruna_operations::s3::bucket::key_startup::OpenManagedOperation;
+    use aruna_clock::unix_timestamp_millis;
+    use aruna_operations::jobs::key_wake::WakeUnlockedOperation;
+    use aruna_operations::s3::bucket::key::startup::OpenManagedOperation;
 
     let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
     for (key, reason) in &keys.failed {
@@ -570,7 +622,8 @@ async fn open_managed_keys(
     for key in keys.opened {
         let now_ms = unix_timestamp_millis();
         let limits = &config.rocrate_limits;
-        if let Err(error) = wake_unlocked(driver_ctx, key, now_ms, origin, limits).await {
+        let wake = WakeUnlockedOperation::new(key, now_ms, origin, limits);
+        if let Err(error) = drive(wake, driver_ctx).await {
             warn!(
                 bucket_id = %key.bucket_id,
                 generation = key.generation,
@@ -588,18 +641,17 @@ async fn record_restart_locks(
     driver_ctx: &DriverContext,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_operations::driver::drive;
-    use aruna_operations::s3::bucket::audit_retry::resume_records;
-    use aruna_operations::s3::bucket::key_restart::RestartScanOperation;
+    use aruna_operations::s3::bucket::audit_retry::ResumeAuditOperation;
+    use aruna_operations::s3::bucket::key::restart::RestartScanOperation;
     use aruna_operations::s3::restart_notice::RestartNoticeOperation;
 
     // Records kept by retry timers before the stop join the trail before it is read.
-    match resume_records(driver_ctx).await {
+    match drive(ResumeAuditOperation::default(), driver_ctx).await {
         Ok(0) => {}
         Ok(stored) => info!(records = stored, "Stored kept bucket key audit records"),
         Err(error) => warn!(error = %error, "Kept bucket key audit records not read"),
     }
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     let scan = RestartScanOperation::new(now_ms, config.realm_id);
     let buckets = drive(scan, driver_ctx).await?;
     if buckets.is_empty() {
@@ -619,115 +671,44 @@ async fn record_restart_locks(
     Ok(())
 }
 
-/// Reports whether the usage counters need a rebuild: shards or bucket rows are missing, or
-/// an earlier rebuild was interrupted. It then writes the rebuild marker, so the counters count
-/// as incomplete at once, and leaves the rebuild itself to the caller's background task.
-async fn ensure_usage_counters(
-    driver_ctx: &DriverContext,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-    use aruna_core::structs::storage::usage::{
-        USAGE_COMPLETE_KEY, USAGE_REBUILD_KEY, global_shard_keys,
-    };
-
-    let mut probe_keys = global_shard_keys();
-    probe_keys.push(USAGE_REBUILD_KEY.to_vec());
-    let event = driver_ctx
-        .storage_handle
-        .send_storage_effect(StorageEffect::BatchRead {
-            reads: probe_keys
-                .iter()
-                .map(|key| (USAGE_STATS_KEYSPACE.to_string(), key.clone().into()))
-                .collect(),
-            txn_id: None,
-        })
-        .await;
-
-    match event {
-        Event::Storage(StorageEvent::BatchReadResult { values }) => {
-            if values.len() != probe_keys.len() {
-                return Err(format!(
-                    "usage counter probe returned {} values for {} rows",
-                    values.len(),
-                    probe_keys.len()
-                )
-                .into());
+/// Rebuilds the usage counters in the background until one rebuild finishes, then publishes
+/// full usage snapshots. Startup does not wait; until then quota-limited writes are refused.
+fn spawn_usage_rebuild(
+    context: Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+    shutdown: &Shutdown,
+) {
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        // Range counters of distributed buckets are confirmed again by their own rebuilds.
+        match drive(begin_range_rebuilds(), &context).await {
+            Ok(begun) if begun > 0 => info!(ranges = begun, "Range counter rebuilds begun"),
+            Ok(_) => {}
+            Err(error) => warn!(%error, "Range counter rebuilds could not begin"),
+        }
+        loop {
+            let rebuild = drive(RebuildStatsOperation::new().with_realm(realm_id), &context);
+            let result = tokio::select! {
+                _ = token.cancelled() => return,
+                result = rebuild => result,
+            };
+            match result {
+                Ok(_) => break,
+                Err(error) => warn!(error = %error, "Usage counter rebuild failed; retrying"),
             }
-            let (marker, shards) = values.split_last().ok_or("usage counter probe is empty")?;
-            let shards_missing = shards.iter().any(|(_, value)| value.is_none());
-            if marker.1.is_some() || shards_missing || bucket_rows_missing(driver_ctx).await? {
-                // Missing group rows leave no complete counters for quota decisions.
-                if shards_missing {
-                    let forget = StorageEffect::Delete {
-                        key_space: USAGE_STATS_KEYSPACE.to_string(),
-                        key: USAGE_COMPLETE_KEY.to_vec().into(),
-                        txn_id: None,
-                    };
-                    let event = driver_ctx.storage_handle.send_storage_effect(forget).await;
-                    if !matches!(event, Event::Storage(StorageEvent::DeleteResult { .. })) {
-                        return Err(format!("usage completion marker kept: {event:?}").into());
-                    }
-                }
-                let mark = StorageEffect::Write {
-                    key_space: USAGE_STATS_KEYSPACE.to_string(),
-                    key: USAGE_REBUILD_KEY.to_vec().into(),
-                    value: Vec::new().into(),
-                    txn_id: None,
-                };
-                match driver_ctx.storage_handle.send_storage_effect(mark).await {
-                    Event::Storage(StorageEvent::WriteResult { .. }) => return Ok(true),
-                    other => {
-                        return Err(format!("usage rebuild marker not written: {other:?}").into());
-                    }
-                }
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(REBUILD_RETRY_PAUSE) => {}
             }
         }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(format!("usage counter probe failed: {error}").into());
+        info!("Usage counters rebuilt");
+        let serving = context.node_and_realm().map(|(_, realm_id)| realm_id);
+        let publish = PublishUsageOperation::new((node_id, realm_id), serving, true, true);
+        if let Err(error) = drive(publish, context.as_ref()).await {
+            warn!(error = %error, "Usage snapshots were not published after the rebuild");
         }
-        other => {
-            return Err(format!("usage counter probe received unexpected event: {other:?}").into());
-        }
-    }
-    Ok(false)
-}
-
-/// A first bucket without a counter row means bucket rows were never built.
-async fn bucket_rows_missing(
-    driver_ctx: &DriverContext,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::{S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE};
-    use aruna_core::structs::storage::usage::usage_bucket_key;
-
-    let storage = &driver_ctx.storage_handle;
-    let first = StorageEffect::Iter {
-        key_space: S3_BUCKET_KEYSPACE.to_string(),
-        prefix: None,
-        start: None,
-        limit: 1,
-        txn_id: None,
-    };
-    let bucket = match storage.send_storage_effect(first).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => match values.first() {
-            Some((bucket, _)) => bucket.to_vec(),
-            None => return Ok(false),
-        },
-        other => return Err(format!("bucket probe received unexpected event: {other:?}").into()),
-    };
-    let bucket = String::from_utf8(bucket)?;
-    let read = StorageEffect::Read {
-        key_space: USAGE_STATS_KEYSPACE.to_string(),
-        key: usage_bucket_key(&bucket).into(),
-        txn_id: None,
-    };
-    match storage.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value.is_none()),
-        other => Err(format!("bucket counter probe received unexpected event: {other:?}").into()),
-    }
+    });
 }
 
 #[cfg(test)]
@@ -739,23 +720,13 @@ mod tests {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, global_shard_keys};
-    use aruna_storage::StorageHandle;
-    use std::thread;
+    use aruna_drivers::testing::test_context;
+    use aruna_operations::node::counter_check::CounterCheckError;
+    use aruna_storage::storage::handle::StorageHandle;
     use tempfile::tempdir;
 
-    fn test_driver_ctx(storage_handle: StorageHandle) -> DriverContext {
-        DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
-
     fn open_storage(dir: &tempfile::TempDir) -> StorageHandle {
-        aruna_storage::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().expect("utf8 path"))
             .expect("storage opens")
     }
 
@@ -773,9 +744,12 @@ mod tests {
         value.map(|value| value.to_vec())
     }
 
+    async fn ensure_usage_counters(driver_ctx: &DriverContext) -> Result<bool, CounterCheckError> {
+        drive(CounterCheckOperation::new(), driver_ctx).await
+    }
+
     async fn rebuild(driver_ctx: &DriverContext) {
-        use aruna_operations::driver::drive;
-        use aruna_operations::node::usage_stats::RebuildStatsOperation;
+        use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
         drive(RebuildStatsOperation::new(), driver_ctx)
             .await
             .expect("usage rebuild finishes");
@@ -787,7 +761,7 @@ mod tests {
         use aruna_core::structs::storage::usage::USAGE_REBUILD_KEY;
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
 
         assert!(
             ensure_usage_counters(&driver_ctx).await.unwrap(),
@@ -843,7 +817,7 @@ mod tests {
 
         let temp = tempdir().expect("temp dir");
         let storage_handle = open_storage(&temp);
-        let driver_ctx = test_driver_ctx(storage_handle.clone());
+        let driver_ctx = test_context(storage_handle.clone());
         assert!(ensure_usage_counters(&driver_ctx).await.unwrap());
         rebuild(&driver_ctx).await;
         // A bucket from before bucket rows existed has shards but no row of its own.
@@ -886,53 +860,6 @@ mod tests {
         assert!(!ensure_usage_counters(&driver_ctx).await.unwrap());
     }
 
-    #[tokio::test]
-    async fn counters_return_errors() {
-        let (storage_handle, receivers) = StorageHandle::new();
-        let receiver = receivers.foreground;
-        let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
-                .recv()
-                .expect("usage counter ensure should probe storage");
-            assert!(matches!(effect, StorageEffect::BatchRead { .. }));
-            response_tx.send(StorageEvent::Error {
-                error: StorageError::ReadError("boom".to_string()),
-            });
-        });
-        let driver_ctx = test_driver_ctx(storage_handle);
-
-        let error = ensure_usage_counters(&driver_ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("usage counter probe failed"));
-        assert!(error.contains("boom"), "storage cause missing: {error}");
-        worker.join().expect("storage responder should finish");
-    }
-
-    #[tokio::test]
-    async fn counters_reject_events() {
-        let (storage_handle, receivers) = StorageHandle::new();
-        let receiver = receivers.foreground;
-        let worker = thread::spawn(move || {
-            let (effect, response_tx, _span, _queued_at, _in_flight) = receiver
-                .recv()
-                .expect("usage counter ensure should probe storage");
-            assert!(matches!(effect, StorageEffect::BatchRead { .. }));
-            response_tx.send(StorageEvent::SyncAllFinished);
-        });
-        let driver_ctx = test_driver_ctx(storage_handle);
-
-        let error = ensure_usage_counters(&driver_ctx)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("usage counter probe received unexpected event"));
-        worker.join().expect("storage responder should finish");
-    }
-
     // A failure with nothing fallible acquired still releases storage; later
     // acquisitions stay absent rather than faked. The smallest supported grace
     // funds writer phases rather than racing their acknowledgements against a zero budget.
@@ -943,7 +870,7 @@ mod tests {
         let task_handle = TaskHandle::new();
         let acquired = Acquired::new(storage_handle.clone(), task_handle);
         assert!(acquired.net_handle.is_none());
-        assert!(acquired.metadata_handle.is_none());
+        assert!(acquired.graph_handle.is_none());
         assert!(acquired.ops_handle.is_none());
 
         let outcome = acquired.cleanup(MIN_SHUTDOWN_GRACE).await;
@@ -1071,8 +998,8 @@ mod tests {
     // subset: every later stage is absent and the store lock is given back.
     #[tokio::test]
     async fn stage_failure_releases() {
-        use crate::config::resolve_settings;
-        use crate::settings::read_settings_from;
+        use aruna_config::resolve_settings;
+        use aruna_config::settings::read_settings_from;
 
         let stages = [
             StartupStage::Net,
@@ -1120,7 +1047,7 @@ mod tests {
             );
 
             // Cleanup released every store handle: reopening the same root works.
-            let reopened = aruna_storage::FjallStorage::open(&path);
+            let reopened = aruna_storage::storage::worker::FjallStorage::open(&path);
             assert!(
                 reopened.is_ok(),
                 "{stage:?}: storage stayed locked after cleanup: {:?}",
@@ -1133,7 +1060,7 @@ mod tests {
     // generating, or persisting an identity or sending enrollment traffic.
     #[tokio::test]
     async fn cancelled_startup_skips() {
-        use crate::settings::read_settings_from;
+        use aruna_config::settings::read_settings_from;
 
         let temp = tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
@@ -1149,7 +1076,7 @@ mod tests {
         .into_iter()
         .collect();
         let settings = read_settings_from(&map).expect("settings parse");
-        let storage = crate::config::open_storage(&settings).expect("storage opens");
+        let storage = aruna_config::open_storage(&settings).expect("storage opens");
         let task_handle = TaskHandle::new();
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
@@ -1166,9 +1093,9 @@ mod tests {
         .expect("an accepted stop is not a failure");
         assert!(outcome.is_none());
 
-        let reopened =
-            aruna_storage::FjallStorage::open(&path).expect("cleanup released the store");
-        let identity = crate::identity::IdentityStore::from_storage(reopened);
+        let reopened = aruna_storage::storage::worker::FjallStorage::open(&path)
+            .expect("cleanup released the store");
+        let identity = aruna_config::identity::IdentityStore::from_storage(reopened);
         assert!(
             identity.load().await.unwrap().is_none(),
             "a pre-cancelled startup must not generate or persist an identity"

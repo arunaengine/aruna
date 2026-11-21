@@ -9,10 +9,12 @@ use std::process::{Command, Stdio};
 use thiserror::Error;
 use wasmparser::Parser;
 
-use crate::artifact::{SectionError, attach_manifest, check_artifact, component_imports};
 use crate::limits::RuntimeConfig;
-use crate::manifest::{Manifest, ManifestError};
 use crate::runtime::{Compiled, Runtime};
+use aruna_plugin_types::artifact::{
+    SectionError, attach_manifest, check_artifact, component_imports,
+};
+use aruna_plugin_types::manifest::{Manifest, ManifestError};
 
 /// The target Rust projects compile to; the host adds no WASI there.
 pub const RUST_TARGET: &str = "wasm32-unknown-unknown";

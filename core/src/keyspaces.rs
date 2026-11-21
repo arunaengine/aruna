@@ -7,6 +7,8 @@ pub const GROUP_KEYSPACE: &str = "groups";
 pub const GROUP_DELETE_KEYSPACE: &str = "group_deletions";
 pub const OWNER_INDEX_KEYSPACE: &str = "group_owner_index";
 pub const REALM_CONFIG_KEYSPACE: &str = "realm_config";
+/// The working rows of running provenance exports; a node start clears them.
+pub const PROVENANCE_SPOOL_KEYSPACE: &str = "provenance_spool";
 pub const METADATA_INDEX_KEYSPACE: &str = "metadata_index";
 pub const DOCUMENT_INDEX_KEYSPACE: &str = "metadata_document_index";
 pub const IRI_INDEX_KEYSPACE: &str = "metadata_iri_reference_index";
@@ -52,8 +54,11 @@ pub const RAW_BUDGET_KEYSPACE: &str = "metadata_raw_budgets";
 pub const MATERIALIZATION_JOB_KEYSPACE: &str = "metadata_materialization_jobs";
 pub const DOCUMENT_JOB_KEYSPACE: &str = "metadata_materialization_document_jobs";
 pub const DEAD_LETTER_KEYSPACE: &str = "metadata_materialization_dead_letters";
-/// Jobs that published a Git snapshot whose graph their finish batch has not stored yet.
+/// Jobs that published a Git snapshot whose graph their finish batch has not stored yet, and
+/// the ready capture marks the Git capture drain takes in sequence order.
 pub const MATERIALIZATION_CAPTURE_KEYSPACE: &str = "metadata_materialization_captures";
+/// The next capture sequence of each document, counted by the finishes that ready its marks.
+pub const CAPTURE_SEQUENCE_KEYSPACE: &str = "metadata_capture_sequences";
 pub const MATERIALIZATION_PRUNE_KEYSPACE: &str = "metadata_materialization_prunes";
 pub const DOCUMENT_STATE_KEYSPACE: &str = "admin_document_state";
 /// Reduced distribution records by set id, materialized from their admin reducer state.
@@ -99,6 +104,11 @@ pub const FILL_CLAIM_KEYSPACE: &str = "distribution_fill_claims";
 pub const DOCUMENT_CONFLICT_KEYSPACE: &str = "admin_document_conflicts";
 pub const APPLIED_OPS_KEYSPACE: &str = "document_sync_applied_ops";
 pub const SYNC_OUTBOX_KEYSPACE: &str = "document_sync_outbox";
+/// Applied document reconciles whose follow-ups the node drain still runs, by reconcile id.
+pub const APPLIED_SYNC_KEYSPACE: &str = "document_applied_sync";
+/// The order queued follow-ups accepted a document's events in: a counter per document, and
+/// the id of each queued batch under the document and its sequence.
+pub const APPLIED_ORDER_KEYSPACE: &str = "document_applied_order";
 pub const OUTBOX_INDEX_KEYSPACE: &str = "token_revocation_outbox_index";
 pub const SYNC_REVISION_KEYSPACE: &str = "document_sync_revisions";
 pub const SYNC_CONFLICT_KEYSPACE: &str = "document_sync_conflicts";
@@ -137,6 +147,8 @@ pub const ASSISTANT_PROVIDER_KEYSPACE: &str = "assistant_providers";
 pub const PROVIDER_OWNER_KEYSPACE: &str = "assistant_provider_owner";
 pub const CHAT_HEAD_KEYSPACE: &str = "assistant_chat_heads";
 pub const CHAT_TURN_KEYSPACE: &str = "assistant_chat_turns";
+/// The live chat count and payload bytes of each user's assistant chats.
+pub const CHAT_TOTAL_KEYSPACE: &str = "assistant_chat_totals";
 /// The realm's central assistant provider on its holder node, one row.
 pub const CENTRAL_ASSISTANT_KEYSPACE: &str = "assistant_central";
 /// Central assistant calls of each user on the current UTC day, keyed by user.
@@ -176,6 +188,10 @@ pub const RENAMED_ROW_KEYSPACE: &str = "backend_import_renamed_rows";
 pub const STORAGE_CHECK_KEYSPACE: &str = "storage_checks";
 /// Buckets whose check is unfinished; the migration worker scans only these.
 pub const CHECK_QUEUE_KEYSPACE: &str = "storage_check_queue";
+/// Node-local count of a bucket's current versions against its placement rules.
+pub const COVERAGE_COUNT_KEYSPACE: &str = "coverage_counts";
+/// Buckets whose coverage count is unfinished; the migration worker scans only these.
+pub const COUNT_QUEUE_KEYSPACE: &str = "coverage_count_queue";
 /// Versions a check found broken, keyed by version key so one bucket is one prefix.
 pub const BROKEN_VERSION_KEYSPACE: &str = "broken_versions";
 pub const HIDDEN_RESERVATION_KEYSPACE: &str = "blob_hidden_reservations";
@@ -287,6 +303,8 @@ pub const NODE_INFO_KEYSPACE: &str = "node_info";
 /// Single-row local placement subject and its generation. Governed writes and
 /// internal serves are evaluated against it; a rejoin blocks serving here.
 pub const NODE_SUBJECT_KEYSPACE: &str = "node_subject";
+/// One `BackendConfigRecord` per compute backend name: its digests and config generation.
+pub const COMPUTE_BACKEND_KEYSPACE: &str = "compute_backends";
 pub const NOTIFICATION_INBOX_KEYSPACE: &str = "notification_inbox";
 pub const PRUNE_INDEX_KEYSPACE: &str = "notification_inbox_prune_index";
 pub const NOTIFICATION_OUTBOX_KEYSPACE: &str = "notification_outbox";
@@ -299,6 +317,8 @@ pub const WEBHOOK_SETTINGS_KEYSPACE: &str = "notification_webhook_settings";
 pub const OWNER_SECRETS_KEYSPACE: &str = "owner_secrets";
 pub const WATCH_SUBSCRIPTIONS_KEYSPACE: &str = "notification_watch_subscriptions";
 pub const WATCH_INTEREST_KEYSPACE: &str = "notification_watch_interest";
+/// Watch events producers queued for the notification drain to emit, by event id.
+pub const WATCH_OUTBOX_KEYSPACE: &str = "notification_watch_outbox";
 /// The newest deletion time of a bucket per recipient, which drops older notices about it.
 pub const NOTIFICATION_CUTOFF_KEYSPACE: &str = "notification_bucket_cutoff";
 
@@ -428,6 +448,8 @@ pub const LINK_SECRET_KEYSPACE: &str = "repository_link_secrets";
 pub const LINK_CONNECTOR_KEYSPACE: &str = "repository_link_connectors";
 /// Durable push checks per link id, drained by `TaskKey::DrainLinkQueue`.
 pub const LINK_QUEUE_KEYSPACE: &str = "repository_link_queue";
+/// Documents whose links need push checks, by change time; the link queue drain consumes them.
+pub const LINK_CHANGE_KEYSPACE: &str = "repository_link_changes";
 
 // Durable job framework keyspaces (#318).
 pub const JOB_KEYSPACE: &str = "jobs";
@@ -468,6 +490,9 @@ pub const FAMILY_PENDING_KEYSPACE: &str = "job_family_pending";
 pub const FAMILY_CONFLICT_KEYSPACE: &str = "job_family_conflicts";
 /// Alias index: one accepted `JobId` to the request family that admitted it.
 pub const FAMILY_ALIAS_KEYSPACE: &str = "job_family_aliases";
+/// Closure rows of plugin task submissions this node answered as not admitted; admission reads
+/// them, so no admission of that submission commits here afterwards.
+pub const SUBMISSION_CLOSURE_KEYSPACE: &str = "job_submission_closures";
 /// Per-family projection cache and its bounded revision. Derived state only; it
 /// is rebuilt from the immutable records and is never authority.
 pub const FAMILY_PROJECTION_KEYSPACE: &str = "job_family_projections";
@@ -485,6 +510,13 @@ pub const WITNESS_DEADLINE_KEYSPACE: &str = "job_witness_deadlines";
 pub const DEADLINE_INDEX_KEYSPACE: &str = "job_witness_deadline_index";
 /// Bounded explain record of the plan a witness stored before it launched.
 pub const PLAN_EXPLAIN_KEYSPACE: &str = "job_plan_explains";
+/// Launches without a receipt that their target answered as closed, by family and launch id.
+pub const LAUNCH_CLOSURE_KEYSPACE: &str = "job_launch_closures";
+/// Family prune index: due rows by due time and family, and one row per family naming its
+/// current due time.
+pub const FAMILY_PRUNE_KEYSPACE: &str = "job_family_prune";
+/// What stays of a pruned family on this node until it expires, by family.
+pub const FAMILY_TOMBSTONE_KEYSPACE: &str = "job_family_tombstones";
 pub const ARTIFACT_TOMBSTONE_KEYSPACE: &str = "job_artifact_tombstones";
 /// The single row recording what this node could not resolve when it departed.
 pub const COMPUTE_DEPARTURE_KEYSPACE: &str = "compute_departure";
@@ -620,6 +652,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_JOB_KEYSPACE,
     DEAD_LETTER_KEYSPACE,
     MATERIALIZATION_CAPTURE_KEYSPACE,
+    CAPTURE_SEQUENCE_KEYSPACE,
     MATERIALIZATION_PRUNE_KEYSPACE,
     DOCUMENT_STATE_KEYSPACE,
     DISTRIBUTION_KEYSPACE,
@@ -644,6 +677,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     DOCUMENT_CONFLICT_KEYSPACE,
     APPLIED_OPS_KEYSPACE,
     SYNC_OUTBOX_KEYSPACE,
+    APPLIED_SYNC_KEYSPACE,
+    APPLIED_ORDER_KEYSPACE,
     OUTBOX_INDEX_KEYSPACE,
     SYNC_REVISION_KEYSPACE,
     SYNC_CONFLICT_KEYSPACE,
@@ -669,6 +704,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     PROVIDER_OWNER_KEYSPACE,
     CHAT_HEAD_KEYSPACE,
     CHAT_TURN_KEYSPACE,
+    CHAT_TOTAL_KEYSPACE,
     CENTRAL_ASSISTANT_KEYSPACE,
     ASSISTANT_USAGE_KEYSPACE,
     BLOB_LOCATIONS_KEYSPACE,
@@ -687,6 +723,8 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     RENAMED_ROW_KEYSPACE,
     STORAGE_CHECK_KEYSPACE,
     CHECK_QUEUE_KEYSPACE,
+    COVERAGE_COUNT_KEYSPACE,
+    COUNT_QUEUE_KEYSPACE,
     BROKEN_VERSION_KEYSPACE,
     ABE_PARAMETERS_KEYSPACE,
     ABE_EPOCH_KEYSPACE,
@@ -739,6 +777,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     NODE_STATS_KEYSPACE,
     NODE_INFO_KEYSPACE,
     NODE_SUBJECT_KEYSPACE,
+    COMPUTE_BACKEND_KEYSPACE,
     NOTIFICATION_INBOX_KEYSPACE,
     PRUNE_INDEX_KEYSPACE,
     NOTIFICATION_OUTBOX_KEYSPACE,
@@ -747,6 +786,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     OWNER_SECRETS_KEYSPACE,
     WATCH_SUBSCRIPTIONS_KEYSPACE,
     WATCH_INTEREST_KEYSPACE,
+    WATCH_OUTBOX_KEYSPACE,
     NOTIFICATION_CUTOFF_KEYSPACE,
     STORAGE_ROUTING_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
@@ -791,6 +831,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     LINK_SECRET_KEYSPACE,
     LINK_CONNECTOR_KEYSPACE,
     LINK_QUEUE_KEYSPACE,
+    LINK_CHANGE_KEYSPACE,
     JOB_KEYSPACE,
     SCHEDULE_INDEX_KEYSPACE,
     JOB_INDEX_KEYSPACE,
@@ -810,6 +851,7 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     FAMILY_PENDING_KEYSPACE,
     FAMILY_CONFLICT_KEYSPACE,
     FAMILY_ALIAS_KEYSPACE,
+    SUBMISSION_CLOSURE_KEYSPACE,
     FAMILY_PROJECTION_KEYSPACE,
     FAMILY_OUTBOX_KEYSPACE,
     JOB_RESERVATION_KEYSPACE,
@@ -817,6 +859,9 @@ pub const KEYSPACE_CATALOG: &[&str] = &[
     WITNESS_DEADLINE_KEYSPACE,
     DEADLINE_INDEX_KEYSPACE,
     PLAN_EXPLAIN_KEYSPACE,
+    LAUNCH_CLOSURE_KEYSPACE,
+    FAMILY_PRUNE_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE,
     ARTIFACT_TOMBSTONE_KEYSPACE,
     COMPUTE_DEPARTURE_KEYSPACE,
     JOB_STATE_KEYSPACE,

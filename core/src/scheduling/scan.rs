@@ -135,20 +135,20 @@ impl<'a> Planner<'a> {
         let mut previous = self
             .cursor
             .as_ref()
-            .map(|cursor| (cursor.node_id.as_bytes(), cursor.executor_kind.as_str()));
+            .map(|cursor| (cursor.node_id.as_bytes(), cursor.backend.as_str()));
         for candidate in page {
             let order = target_order(candidate);
             match previous.map(|previous| previous.cmp(&order)) {
                 Some(Ordering::Equal) => {
                     return Err(PlanError::DuplicateTarget {
                         node_id: candidate.node_id,
-                        kind: candidate.capability.kind.clone(),
+                        backend: candidate.capability.backend.clone(),
                     });
                 }
                 Some(Ordering::Greater) => {
                     return Err(PlanError::PageOrder {
                         node_id: candidate.node_id,
-                        kind: candidate.capability.kind.clone(),
+                        backend: candidate.capability.backend.clone(),
                     });
                 }
                 _ => previous = Some(order),
@@ -218,6 +218,30 @@ mod tests {
         ));
         assert_eq!(planner.scanned(), 2);
         assert_eq!(planner.pages(), 1);
+    }
+
+    #[test]
+    fn pages_follow_names() {
+        // Two backends of one kind on one node are two targets, ordered by name.
+        let compute = config(Vec::new());
+        let named = |name: &str| {
+            let mut target = candidate(node(2), "docker");
+            target.capability.backend = name.to_string();
+            target
+        };
+        let mut planner = planner(&compute);
+        planner
+            .rank_page(&[named("edge"), named("lab")])
+            .expect("the page is ordered by name");
+
+        assert_eq!(
+            planner.cursor().map(|cursor| cursor.backend.as_str()),
+            Some("lab")
+        );
+        assert!(matches!(
+            planner.rank_page(&[named("edge")]),
+            Err(PlanError::PageOrder { .. })
+        ));
     }
 
     #[test]

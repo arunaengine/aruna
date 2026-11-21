@@ -4,14 +4,13 @@
 
 use crate::shared;
 
-use aruna_api::routes::credentials::CreatePathRestriction;
-use aruna_api::routes::groups::AddMemberRequest;
+use aruna_api::routes::access::credentials::CreatePathRestriction;
+use aruna_api::routes::access::groups::AddMemberRequest;
 use aruna_api::routes::info::{RealmInfoResponse, RealmQuotaConfig, RealmQuotaOverride};
 use aruna_api::routes::sync::{
     ApiReferenceHandling, ApiSyncMode, CreateSyncRequest, SyncDetailResponse,
     SyncRelationshipResponse, SyncSourceRequest, SyncTargetRequest,
 };
-use aruna_core::UserId;
 use aruna_core::compute::SecretBytes;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -21,6 +20,8 @@ use aruna_core::keyspaces::{
     RELATIONSHIP_IN_KEYSPACE, RELATIONSHIP_OUT_KEYSPACE, REPLICATION_JOB_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
+use aruna_core::metadata::protocol::mirror_created_answer;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
 use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
@@ -32,14 +33,16 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::encryption::public_key_of;
 use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_core::structs::{SyncRelationship, SyncState, sync_relationship_key};
-use aruna_kpabe::{Envelope, UserKey};
-use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::replication::queue::{LiveObligationRecord, live_obligation_key};
-use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
+use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState, sync_relationship_key};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_kpabe::envelope::Envelope;
+use aruna_kpabe::scheme::UserKey;
+use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -56,7 +59,6 @@ use shared::{
     shutdown_pair, spawn_complete_joiner, spawn_complete_seed, wait_group_member, wait_realm_nodes,
     wait_until,
 };
-use std::time::Duration;
 use ulid::Ulid;
 
 fn error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -237,27 +239,22 @@ impl ReplicationHarness {
         request: CreateSyncRequest,
     ) -> TestResult<SyncRelationshipResponse> {
         let answer = std::sync::Mutex::new(None);
-        let waited = wait_until(
-            "sync relationship creation",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || async {
-                let response = reqwest::Client::new()
-                    .post(format!("{base_url}/api/v1/data/sync/relationships"))
-                    .bearer_auth(bearer_token)
-                    .json(&request)
-                    .send()
-                    .await;
-                let Ok(response) = response else {
-                    return false;
-                };
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let retry = status == StatusCode::BAD_GATEWAY;
-                *answer.lock().expect("sync answer lock") = Some((status, body));
-                !retry
-            },
-        )
+        let waited = wait_until("sync relationship creation", shared::WAIT_CAP, || async {
+            let response = reqwest::Client::new()
+                .post(format!("{base_url}/api/v1/data/sync/relationships"))
+                .bearer_auth(bearer_token)
+                .json(&request)
+                .send()
+                .await;
+            let Ok(response) = response else {
+                return false;
+            };
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let retry = status == StatusCode::BAD_GATEWAY;
+            *answer.lock().expect("sync answer lock") = Some((status, body));
+            !retry
+        })
         .await;
         // A lasting 502 is reported with its reason rather than as a bare timeout.
         let Some((status, body)) = answer.into_inner().expect("sync answer lock") else {
@@ -331,7 +328,6 @@ impl ReplicationHarness {
         wait_until(
             "sync creator membership convergence",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let base_url = self.joiner.base_url.clone();
                 let group_id = self.group_id.clone();
@@ -418,25 +414,20 @@ impl ReplicationHarness {
     }
 
     async fn wait_for_object(&self, bucket: &str, key: &str) -> TestResult<()> {
-        wait_until(
-            "replicated object availability",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || {
-                let joiner_client = self.joiner_client.clone();
-                let bucket = bucket.to_string();
-                let key = key.to_string();
-                async move {
-                    joiner_client
-                        .head_object()
-                        .bucket(bucket)
-                        .key(key)
-                        .send()
-                        .await
-                        .is_ok()
-                }
-            },
-        )
+        wait_until("replicated object availability", shared::WAIT_CAP, || {
+            let joiner_client = self.joiner_client.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            async move {
+                joiner_client
+                    .head_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .send()
+                    .await
+                    .is_ok()
+            }
+        })
         .await
     }
 
@@ -462,29 +453,35 @@ impl ReplicationHarness {
         .await
     }
 
-    async fn assert_object_absent(
-        &self,
-        bucket: &str,
-        key: &str,
-        polls: usize,
-        interval: Duration,
-    ) -> TestResult<()> {
-        for _ in 0..polls {
-            let head_result = self
-                .joiner_client
-                .head_object()
-                .bucket(bucket)
-                .key(key)
-                .send()
-                .await;
-            assert_eq!(
-                error_status(&head_result),
-                Some(404),
-                "the object must be absent on the joiner, not merely forbidden"
-            );
-            tokio::time::sleep(interval).await;
-        }
+    /// Checks once that the object is absent on the joiner. Call it after
+    /// [`Self::wait_replication_drained`] past a known boundary, so no copy can still come.
+    async fn assert_object_absent(&self, bucket: &str, key: &str) -> TestResult<()> {
+        let head_result = self
+            .joiner_client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(
+            error_status(&head_result),
+            Some(404),
+            "the object must be absent on the joiner, not merely forbidden"
+        );
         Ok(())
+    }
+
+    /// Waits until both nodes hold no replication obligation or job, so every source change
+    /// made before a replicated boundary object has been processed.
+    async fn wait_replication_drained(&self) -> TestResult<()> {
+        let (seed, joiner) = (self.seed.context.as_ref(), self.joiner.context.as_ref());
+        wait_until("replication queue drain", shared::WAIT_CAP, || async {
+            keyspace_empty(seed, REPLICATION_OBLIGATION_KEYSPACE).await
+                && keyspace_empty(joiner, REPLICATION_OBLIGATION_KEYSPACE).await
+                && keyspace_empty(seed, REPLICATION_JOB_KEYSPACE).await
+                && keyspace_empty(joiner, REPLICATION_JOB_KEYSPACE).await
+        })
+        .await
     }
 
     async fn shutdown(self) {
@@ -500,33 +497,28 @@ async fn wait_for_body(
     body: &[u8],
 ) -> TestResult<()> {
     let expected = body.to_vec();
-    wait_until(
-        description,
-        shared::WAIT_CAP,
-        Duration::from_millis(200),
-        || {
-            let client = client.clone();
-            let bucket = bucket.to_string();
-            let key = key.to_string();
-            let expected = expected.clone();
-            async move {
-                let Ok(head) = client.head_object().bucket(&bucket).key(&key).send().await else {
-                    return false;
-                };
-                if head.content_length() != Some(expected.len() as i64) {
-                    return false;
-                }
-                let Ok(output) = client.get_object().bucket(bucket).key(key).send().await else {
-                    return false;
-                };
-                output
-                    .body
-                    .collect()
-                    .await
-                    .is_ok_and(|bytes| bytes.into_bytes().as_ref() == expected.as_slice())
+    wait_until(description, shared::WAIT_CAP, || {
+        let client = client.clone();
+        let bucket = bucket.to_string();
+        let key = key.to_string();
+        let expected = expected.clone();
+        async move {
+            let Ok(head) = client.head_object().bucket(&bucket).key(&key).send().await else {
+                return false;
+            };
+            if head.content_length() != Some(expected.len() as i64) {
+                return false;
             }
-        },
-    )
+            let Ok(output) = client.get_object().bucket(bucket).key(key).send().await else {
+                return false;
+            };
+            output
+                .body
+                .collect()
+                .await
+                .is_ok_and(|bytes| bytes.into_bytes().as_ref() == expected.as_slice())
+        }
+    })
     .await
 }
 
@@ -612,25 +604,28 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
             .body(ByteStream::from_static(b"must stay on source"))
             .send()
             .await?;
+        // A selected write after the excluded one: once it is copied and the queues are empty,
+        // the excluded write has been processed too.
+        harness
+            .seed_client
+            .put_object()
+            .bucket(source_bucket)
+            .key("selected/boundary.txt")
+            .body(ByteStream::from_static(b"boundary"))
+            .send()
+            .await?;
 
         harness.wait_for_object(target_bucket, target_key).await?;
         harness
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
         harness
-            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
+            .wait_for_object(target_bucket, "replica/boundary.txt")
             .await?;
-        harness
-            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
-            .await?;
-        harness
-            .assert_object_absent(
-                target_bucket,
-                excluded_target,
-                10,
-                Duration::from_millis(200),
-            )
-            .await?;
+        harness.wait_replication_drained().await?;
+        for key in [source_key, excluded_key, excluded_target] {
+            harness.assert_object_absent(target_bucket, key).await?;
+        }
 
         let delete_output = harness
             .seed_client
@@ -648,7 +643,6 @@ async fn continuous_remaps_prefix() -> TestResult<()> {
         wait_until(
             "remapped delete marker visibility",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let joiner_client = harness.joiner_client.clone();
                 async move {
@@ -752,20 +746,11 @@ async fn once_syncs_prefix() -> TestResult<()> {
         harness
             .assert_object_matches(target_bucket, target_key, &body)
             .await?;
-        harness
-            .assert_object_absent(target_bucket, source_key, 10, Duration::from_millis(200))
-            .await?;
-        harness
-            .assert_object_absent(target_bucket, excluded_key, 10, Duration::from_millis(200))
-            .await?;
-        harness
-            .assert_object_absent(
-                target_bucket,
-                excluded_target,
-                10,
-                Duration::from_millis(200),
-            )
-            .await?;
+        // The once sync has copied everything it selects once its job is gone.
+        harness.wait_replication_drained().await?;
+        for key in [source_key, excluded_key, excluded_target] {
+            harness.assert_object_absent(target_bucket, key).await?;
+        }
         Ok(())
     }
     .await;
@@ -951,28 +936,23 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             .version_id()
             .ok_or_else(|| std::io::Error::other("source delete did not return version id"))?
             .parse::<Ulid>()?;
-        wait_until(
-            "reference delete marker",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || {
-                let context = harness.joiner.context.clone();
-                async move {
-                    read_value(
-                        context.as_ref(),
-                        BLOB_VERSIONS_KEYSPACE,
-                        VersionKey::new(target_bucket, key, delete_version_id)
-                            .to_bytes()
-                            .unwrap(),
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|bytes| BlobVersion::from_bytes(&bytes).ok())
-                    .is_some_and(|version| version.is_deleted())
-                }
-            },
-        )
+        wait_until("reference delete marker", shared::WAIT_CAP, || {
+            let context = harness.joiner.context.clone();
+            async move {
+                read_value(
+                    context.as_ref(),
+                    BLOB_VERSIONS_KEYSPACE,
+                    VersionKey::new(target_bucket, key, delete_version_id)
+                        .to_bytes()
+                        .unwrap(),
+                )
+                .await
+                .ok()
+                .flatten()
+                .and_then(|bytes| BlobVersion::from_bytes(&bytes).ok())
+                .is_some_and(|version| version.is_deleted())
+            }
+        })
         .await?;
 
         let target_head = harness
@@ -1028,23 +1008,18 @@ async fn reference_syncs_lazily() -> TestResult<()> {
             SyncRelationship::from_bytes(&stub)?.state,
             SyncState::Detached
         );
-        wait_until(
-            "incoming mirror removal",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || {
-                let context = harness.joiner.context.clone();
-                async move {
-                    read_value(
-                        context.as_ref(),
-                        RELATIONSHIP_IN_KEYSPACE,
-                        sync_relationship_key(target_bucket, relationship_id),
-                    )
-                    .await
-                    .is_ok_and(|value| value.is_none())
-                }
-            },
-        )
+        wait_until("incoming mirror removal", shared::WAIT_CAP, || {
+            let context = harness.joiner.context.clone();
+            async move {
+                read_value(
+                    context.as_ref(),
+                    RELATIONSHIP_IN_KEYSPACE,
+                    sync_relationship_key(target_bucket, relationship_id),
+                )
+                .await
+                .is_ok_and(|value| value.is_none())
+            }
+        })
         .await?;
         let status_after_delete = reqwest::Client::new()
             .get(format!(
@@ -1119,7 +1094,6 @@ async fn quota_surfaces_failure() -> TestResult<()> {
         wait_until(
             "quota configuration convergence",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 let Ok(response) = reqwest::Client::new()
                     .get(format!("{}/api/v1/system/realm", harness.joiner.base_url))
@@ -1162,7 +1136,6 @@ async fn quota_surfaces_failure() -> TestResult<()> {
         wait_until(
             "quota failure relationship status",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let harness = &harness;
                 let relationship_id = relationship.id.clone();
@@ -1263,7 +1236,6 @@ async fn permission_rechecks_creator() -> TestResult<()> {
         wait_until(
             "creator permission failure status",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let harness = &harness;
                 let relationship_id = relationship.id.clone();
@@ -1333,20 +1305,14 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
         let target_bucket = "orphan-rollback-target";
         let realm_id = harness.seed.realm_id;
         let creator_id = UserId::local(Ulid::generate(), realm_id);
-        let seed_metadata = harness
-            .seed
-            .context
-            .metadata_handle
-            .clone()
-            .ok_or_else(|| std::io::Error::other("seed node has no metadata handle"))?;
+        let seed_net = (harness.seed.context.net_handle.clone())
+            .ok_or_else(|| std::io::Error::other("seed node has no net handle"))?;
 
         harness
             .create_bucket_pair(source_bucket, target_bucket)
             .await?;
         let creator_token = harness.add_member(creator_id).await?;
-        // Repair waits until the creator lost WRITE, so only a rollback can remove the mirror.
-        seed_metadata.hold_repair();
-        seed_metadata.drop_create_ack();
+        seed_net.drop_answer(mirror_created_answer());
         let response = reqwest::Client::new()
             .post(format!(
                 "{}/api/v1/data/sync/relationships",
@@ -1426,16 +1392,17 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
         wait_until(
             "joiner refuses the creator WRITE",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 matches!(
-                    authorize(
-                        &harness.joiner.context,
-                        realm_id,
-                        &creator,
-                        &write_path,
-                        &Permission::WRITE,
-                        PolicyRequestExtras::operation("s3.DeleteBucketReplication"),
+                    drive(
+                        AuthorizeOperation::new(
+                            realm_id,
+                            &creator,
+                            &write_path,
+                            &Permission::WRITE,
+                            PolicyRequestExtras::operation("s3.DeleteBucketReplication")
+                        ),
+                        &harness.joiner.context
                     )
                     .await,
                     Err(AuthorizeError::PermissionDenied)
@@ -1460,27 +1427,21 @@ async fn orphan_mirror_rollback() -> TestResult<()> {
             .await?
         );
 
-        seed_metadata.release_repair();
-        wait_until(
-            "orphan sync mirror rollback",
-            shared::WAIT_CAP,
-            Duration::from_millis(200),
-            || async {
-                let mirror = row_exists(
-                    &harness.joiner.context,
-                    RELATIONSHIP_IN_KEYSPACE,
-                    mirror_key.clone(),
-                )
-                .await;
-                let repair = row_exists(
-                    &harness.seed.context,
-                    MIRROR_REPAIR_KEYSPACE,
-                    repair_key.clone(),
-                )
-                .await;
-                matches!((mirror, repair), (Ok(false), Ok(false)))
-            },
-        )
+        wait_until("orphan sync mirror rollback", shared::WAIT_CAP, || async {
+            let mirror = row_exists(
+                &harness.joiner.context,
+                RELATIONSHIP_IN_KEYSPACE,
+                mirror_key.clone(),
+            )
+            .await;
+            let repair = row_exists(
+                &harness.seed.context,
+                MIRROR_REPAIR_KEYSPACE,
+                repair_key.clone(),
+            )
+            .await;
+            matches!((mirror, repair), (Ok(false), Ok(false)))
+        })
         .await?;
         assert!(keyspace_empty(&harness.seed.context, RELATIONSHIP_OUT_KEYSPACE).await);
         Ok(())
@@ -1603,7 +1564,6 @@ async fn chain_blocks_cycle() -> TestResult<()> {
         wait_until(
             "chained replication queue drain",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
@@ -1731,7 +1691,6 @@ async fn delete_marker_replicates() -> TestResult<()> {
         wait_until(
             "replicated delete marker visibility",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || {
                 let joiner_client = harness.joiner_client.clone();
                 async move {
@@ -1912,7 +1871,6 @@ async fn repair_honors_restrictions() -> TestResult<()> {
         wait_until(
             "replication obligation repair",
             shared::WAIT_CAP,
-            Duration::from_millis(200),
             || async {
                 keyspace_empty(
                     harness.seed.context.as_ref(),
@@ -1924,9 +1882,7 @@ async fn repair_honors_restrictions() -> TestResult<()> {
         )
         .await?;
 
-        harness
-            .assert_object_absent(bucket, scoped_key, 5, Duration::from_millis(200))
-            .await?;
+        harness.assert_object_absent(bucket, scoped_key).await?;
         Ok(())
     }
     .await;
@@ -1982,10 +1938,9 @@ async fn scoped_replication_paths() -> TestResult<()> {
         harness
             .assert_object_matches(bucket, control_key, &control_body)
             .await?;
-
-        harness
-            .assert_object_absent(bucket, scoped_key, 10, Duration::from_millis(200))
-            .await?;
+        // The control write followed the scoped one, so with the queues empty both were handled.
+        harness.wait_replication_drained().await?;
+        harness.assert_object_absent(bucket, scoped_key).await?;
 
         let scoped_destination_get = harness
             .joiner_client
@@ -2225,7 +2180,7 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
         let query = [("bucket", target), ("key", key), ("version_id", version)];
         let envelope_route = format!("{base}/api/v1/data/blobs/envelope");
         let url = reqwest::Url::parse_with_params(&envelope_route, query)?;
-        wait_until("target envelope", shared::WAIT_CAP, Duration::from_millis(200), || {
+        wait_until("target envelope", shared::WAIT_CAP, || {
             let request = http.get(url.clone()).bearer_auth(token);
             async move { request.send().await.is_ok_and(|r| r.status() == StatusCode::OK) }
         })
@@ -2246,7 +2201,7 @@ async fn encrypted_sync_regrants() -> TestResult<()> {
         let decode = |value: &serde_json::Value| STANDARD.decode(value.as_str().unwrap());
         let cipher = Envelope::from_bytes(&parameters, &decode(&envelopes[0]["envelope"]["abe"])?)?;
         let context = decode(&envelopes[0]["context"]["bytes"])?;
-        let object = aruna_kpabe::open(&parameters, &scoped, &cipher, &context)?;
+        let object = aruna_kpabe::envelope::open(&parameters, &scoped, &cipher, &context)?;
         let header = STANDARD.encode(object.as_bytes());
         let row = VersionKey::new(target, key, version.parse::<Ulid>()?).to_bytes()?;
         let content = format!("{base}/api/v1/data/blobs/content");

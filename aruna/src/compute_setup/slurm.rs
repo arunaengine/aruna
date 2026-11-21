@@ -2,20 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_compute::ExecutorRegistry;
+use aruna_compute::registry::WorkspaceEndpoint;
 use tracing::info;
 
 use super::settings::compute_s3_endpoint;
 use super::{ComputeBuildError, ComputeSettings, SlurmSettings};
-use crate::config::Config;
+use aruna_config::Config;
 
 pub(super) async fn build(
     settings: &ComputeSettings,
     slurm: &SlurmSettings,
     config: &Config,
-) -> Result<ExecutorRegistry, ComputeBuildError> {
+) -> Result<super::BuiltBackend, ComputeBuildError> {
     let backend = aruna_compute::executor::apptainer::slurm::SlurmBackend::with_config(
-        aruna_compute::SlurmConfig {
+        aruna_compute::executor::config::SlurmConfig {
             state_root: slurm.state_root.clone(),
             partition: slurm.partition.clone(),
             account: slurm.account.clone(),
@@ -24,18 +24,17 @@ pub(super) async fn build(
             envelope: settings
                 .envelope
                 .expect("a selected slurm backend has an envelope"),
-            ..aruna_compute::SlurmConfig::default()
+            ..aruna_compute::executor::config::SlurmConfig::default()
         },
     )
     .map_err(|error| error.to_string())?;
-    aruna_compute::ExecutorBackend::health(&backend)
+    aruna_compute::executor::ExecutorBackend::health(&backend)
         .await
         .map_err(|error| ComputeBuildError::Unavailable(error.to_string()))?;
     info!("Slurm executor backend enabled");
-    Ok(ExecutorRegistry::new()
-        .with_backend(std::sync::Arc::new(backend))
-        .with_workspace_endpoint(
-            compute_s3_endpoint(settings, config),
-            "eu-central-1".to_string(),
-        ))
+    let workspace = WorkspaceEndpoint {
+        endpoint: compute_s3_endpoint(settings, config),
+        ..WorkspaceEndpoint::default()
+    };
+    Ok((std::sync::Arc::new(backend), workspace))
 }

@@ -3,31 +3,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::routing::ensure_group_admin;
-use crate::auth::{ensure_permission, require_realm_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::bucket::rename::{
-    RenameError, RenameInput, RenameItem, RenamePlan, authorized_rename,
-};
+use aruna_drivers::driver::drive;
+use aruna_operations::s3::bucket::checked_rename::AuthorizedRenameOperation;
+use aruna_operations::s3::bucket::rename::{RenameError, RenameInput, RenameItem, RenamePlan};
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct RenameDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(RenameDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(preview_rename))
         .routes(routes!(rename_keys))
 }
@@ -107,7 +103,7 @@ pub(super) fn map_error(error: RenameError) -> ServerError {
         RenameError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("the bucket changed during the rename; try again".to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -115,13 +111,9 @@ pub(super) fn map_error(error: RenameError) -> ServerError {
 /// A restricted token could reach keys outside its paths, so it is refused.
 async fn authorize(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     bucket: &str,
 ) -> ServerResult<(AuthContext, ulid::Ulid)> {
-    let auth = require_realm_auth(state, auth)?;
-    if auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
     let group_id = match drive(
         GetBucketOperation::new(bucket.to_string()),
         &state.get_ctx(),
@@ -130,7 +122,7 @@ async fn authorize(
     {
         Ok(info) => info.group_id,
         Err(GetBucketError::NotFound) => return Err(ServerError::NotFound),
-        Err(other) => return Err(ServerError::InternalError(other.to_string())),
+        Err(other) => return Err(ServerError::InternalError(other.into())),
     };
     ensure_group_admin(state, &auth, group_id).await?;
     let path = bucket_permission_path(state.get_realm_id(), group_id, state.get_node_id(), bucket);
@@ -210,7 +202,6 @@ fn rename_input(
             })
         ),
         (status = 400, description = "`from` or `to` is not a folder, or both are equal", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The bucket cannot be renamed now", body = ErrorResponse)
@@ -219,16 +210,19 @@ fn rename_input(
 )]
 pub async fn preview_rename(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RenamePreviewRequest>,
 ) -> ServerResult<Json<RenameResponse>> {
     let (auth, group_id) = authorize(&state, auth, &bucket).await?;
     let folders = (request.from, request.to);
     let input = rename_input(&state, group_id, &bucket, folders, None);
-    let plan = authorized_rename(&state.get_ctx(), &auth, input)
-        .await
-        .map_err(map_error)?;
+    let plan = drive(
+        AuthorizedRenameOperation::new(&auth, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(plan_response(bucket, plan)))
 }
 
@@ -282,7 +276,6 @@ pub async fn preview_rename(
             })
         ),
         (status = 400, description = "Invalid folders, or keys outside `from`, repeated or too many", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path, the bucket or a key, or a restricted token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "A key has a conflict, or the bucket cannot be renamed now", body = ErrorResponse)
@@ -291,16 +284,19 @@ pub async fn preview_rename(
 )]
 pub async fn rename_keys(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(request): Json<RenameRequest>,
 ) -> ServerResult<Json<RenameResponse>> {
     let (auth, group_id) = authorize(&state, auth, &bucket).await?;
     let folders = (request.from, request.to);
     let input = rename_input(&state, group_id, &bucket, folders, Some(request.keys));
-    let plan = authorized_rename(&state.get_ctx(), &auth, input)
-        .await
-        .map_err(map_error)?;
+    let plan = drive(
+        AuthorizedRenameOperation::new(&auth, input),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     Ok(Json(plan_response(bucket, plan)))
 }
 

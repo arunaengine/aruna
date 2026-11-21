@@ -5,17 +5,26 @@
 use std::future::Future;
 use std::sync::Arc;
 
+use aruna_plugin_types::calls::{self, Intent};
+use aruna_plugin_types::permission::Permission;
+
 use crate::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
-    MetadataPatch, Method, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobTask, JobUpload, MetadataCreate,
+    MetadataPatch, SendRequest, StatePut, StateRemove,
 };
+use crate::host::wit::aruna::plugin::jobs::Status as JobStatus;
+use crate::host::wit::aruna::plugin::metadata_create::Created;
+use crate::host::wit::aruna::plugin::metadata_read::{Document, FilePage, Listing};
+use crate::host::wit::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
+use crate::host::wit::aruna::plugin::services::{Method, Response};
+use crate::host::wit::aruna::plugin::state::Entry;
+use crate::host::wit::aruna::plugin::types::{Field, HostError};
 use crate::host::wit::aruna::plugin::{
     jobs, log, metadata_create, metadata_read, metadata_write, objects_read, secrets, services,
     state, types,
 };
 use crate::host::{Needs, Session};
-use crate::permission::Permission;
+use crate::values::{guest_fields, node_fields};
 
 const MAX_LOG: usize = 1024;
 
@@ -39,7 +48,7 @@ impl Session {
     ) -> wasmtime::Result<Result<R, HostError>>
     where
         F: FnOnce(Arc<dyn Broker>, CallContext) -> Fut,
-        Fut: Future<Output = Result<R, HostError>> + Send + 'static,
+        Fut: Future<Output = Result<R, calls::HostError>> + Send + 'static,
         R: Send + 'static,
     {
         let started = match self.begin(size, needs)? {
@@ -73,19 +82,19 @@ impl Session {
             Ok(reply) => reply_size(reply),
             Err(error) => error.message.len(),
         };
-        self.finish(reply, size)
+        self.finish(reply.map_err(HostError::from), size)
     }
 }
 
-fn unknown(message: &str) -> HostError {
-    HostError::new(ErrorKind::UnknownOutcome, message)
+fn unknown(message: &str) -> calls::HostError {
+    calls::HostError::new(calls::ErrorKind::UnknownOutcome, message)
 }
 
-fn fields_len(fields: &[Field]) -> usize {
+fn fields_len(fields: &[calls::Field]) -> usize {
     fields.iter().map(|f| f.name.len() + f.value.len()).sum()
 }
 
-fn field_bytes(fields: &[Field]) -> Vec<u8> {
+fn field_bytes(fields: &[calls::Field]) -> Vec<u8> {
     let mut out = Vec::with_capacity(fields_len(fields) + fields.len() * 16);
     for field in fields {
         for part in [&field.name, &field.value] {
@@ -114,9 +123,10 @@ impl metadata_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::MetadataRead),
             |broker, cx| async move { broker.metadata_get(&cx, &resource).await },
-            |doc: &Document| doc.resource.len() + doc.revision.len() + doc.json.len(),
+            |doc: &calls::Document| doc.resource.len() + doc.revision.len() + doc.json.len(),
         )
         .await
+        .map(|reply| reply.map(Document::from))
     }
 
     async fn list(
@@ -128,12 +138,13 @@ impl metadata_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::MetadataRead),
             |broker, cx| async move { broker.metadata_list(&cx, cursor).await },
-            |page: &Listing| {
+            |page: &calls::Listing| {
                 let names: usize = page.resources.iter().map(String::len).sum();
                 names + page.cursor.as_ref().map_or(0, String::len)
             },
         )
         .await
+        .map(|reply| reply.map(Listing::from))
     }
 
     async fn files(
@@ -146,12 +157,13 @@ impl metadata_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::MetadataRead),
             |broker, cx| async move { broker.metadata_files(&cx, &resource, cursor).await },
-            |page: &FilePage| {
+            |page: &calls::FilePage| {
                 let files: usize = page.files.iter().map(|file| file.len() + 8).sum();
                 files + page.cursor.as_ref().map_or(0, String::len)
             },
         )
         .await
+        .map(|reply| reply.map(FilePage::from))
     }
 
     async fn summary(&mut self, resource: String) -> wasmtime::Result<Result<Document, HostError>> {
@@ -160,9 +172,10 @@ impl metadata_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::MetadataRead),
             |broker, cx| async move { broker.metadata_summary(&cx, &resource).await },
-            |doc: &Document| doc.resource.len() + doc.revision.len() + doc.json.len(),
+            |doc: &calls::Document| doc.resource.len() + doc.revision.len() + doc.json.len(),
         )
         .await
+        .map(|reply| reply.map(Document::from))
     }
 }
 
@@ -278,9 +291,10 @@ impl metadata_create::Host for Session {
             effect,
             Needs::Permission(Permission::MetadataCreate),
             |broker, cx| async move { broker.metadata_create(&cx, create).await },
-            |created: &Created| created.resource.len() + created.revision.len(),
+            |created: &calls::Created| created.resource.len() + created.revision.len(),
         )
         .await
+        .map(|reply| reply.map(Created::from))
     }
 }
 
@@ -312,9 +326,10 @@ impl objects_read::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::ObjectsRead),
             |broker, cx| async move { broker.objects_info(&cx, &path, version).await },
-            |info: &ObjectInfo| info.path.len() + info.version.len() + 8,
+            |info: &calls::ObjectInfo| info.path.len() + info.version.len() + 8,
         )
         .await
+        .map(|reply| reply.map(ObjectInfo::from))
     }
 
     async fn list(
@@ -331,6 +346,7 @@ impl objects_read::Host for Session {
             page_size,
         )
         .await
+        .map(|reply| reply.map(ObjectPage::from))
     }
 }
 
@@ -366,22 +382,25 @@ impl jobs::Host for Session {
         &mut self,
         request: jobs::DownloadRequest,
     ) -> wasmtime::Result<Result<String, HostError>> {
+        let query = node_fields(request.query);
+        let headers = node_fields(request.headers);
+        let checksums = node_fields(request.checksums);
         let size = request.service.len()
             + request.path.len()
-            + fields_len(&request.query)
-            + fields_len(&request.headers)
+            + fields_len(&query)
+            + fields_len(&headers)
             + request.target.len()
-            + fields_len(&request.checksums);
+            + fields_len(&checksums);
         let limit = request.size_limit.map(u64::to_le_bytes).unwrap_or_default();
         let parts: [&[u8]; 8] = [
             b"download",
             request.service.as_bytes(),
             request.path.as_bytes(),
-            &field_bytes(&request.query),
-            &field_bytes(&request.headers),
+            &field_bytes(&query),
+            &field_bytes(&headers),
             request.target.as_bytes(),
             &limit,
-            &field_bytes(&request.checksums),
+            &field_bytes(&checksums),
         ];
         let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
@@ -389,11 +408,11 @@ impl jobs::Host for Session {
         let download = JobDownload {
             service: request.service,
             path: request.path,
-            query: request.query,
-            headers: request.headers,
+            query,
+            headers,
             target: request.target,
             size_limit: request.size_limit,
-            checksums: request.checksums,
+            checksums,
             intent,
         };
         self.brokered(
@@ -412,40 +431,42 @@ impl jobs::Host for Session {
     ) -> wasmtime::Result<Result<String, HostError>> {
         let version = request.version.as_deref().unwrap_or_default();
         let file_field = request.file_field.as_deref().unwrap_or_default();
+        let (query, headers) = (node_fields(request.query), node_fields(request.headers));
+        let fields = node_fields(request.fields);
         let size = request.service.len()
             + request.path.len()
-            + fields_len(&request.query)
-            + fields_len(&request.headers)
+            + fields_len(&query)
+            + fields_len(&headers)
             + request.source.len()
             + version.len()
             + file_field.len()
-            + fields_len(&request.fields);
+            + fields_len(&fields);
         let method = format!("{:?}", request.method);
         let parts: [&[u8]; 10] = [
             b"upload",
             request.service.as_bytes(),
             method.as_bytes(),
             request.path.as_bytes(),
-            &field_bytes(&request.query),
-            &field_bytes(&request.headers),
+            &field_bytes(&query),
+            &field_bytes(&headers),
             request.source.as_bytes(),
             version.as_bytes(),
             file_field.as_bytes(),
-            &field_bytes(&request.fields),
+            &field_bytes(&fields),
         ];
         let intent = Intent::new(self.next_ordinal(), &parts);
         let effect = Effect::Write(intent.clone());
         let service = request.service.clone();
         let upload = JobUpload {
             service: request.service,
-            method: request.method,
+            method: request.method.into(),
             path: request.path,
-            query: request.query,
-            headers: request.headers,
+            query,
+            headers,
             source: request.source,
             version: request.version,
             file_field: request.file_field,
-            fields: request.fields,
+            fields,
             intent,
         };
         self.brokered(
@@ -453,6 +474,66 @@ impl jobs::Host for Session {
             effect,
             Needs::Transfer(Permission::TransfersUpload, &service),
             |broker, cx| async move { broker.jobs_upload(&cx, upload).await },
+            String::len,
+        )
+        .await
+    }
+
+    async fn start_task(
+        &mut self,
+        request: jobs::TaskRequest,
+    ) -> wasmtime::Result<Result<String, HostError>> {
+        let inputs: Vec<(String, String, Option<String>)> = (request.inputs.into_iter())
+            .map(|input| (input.path, input.source, input.version))
+            .collect();
+        let files: Vec<(String, Vec<u8>)> = (request.files.into_iter())
+            .map(|file| (file.path, file.content))
+            .collect();
+        let input_bytes: Vec<u8> = (inputs.iter())
+            .flat_map(|(path, source, version)| {
+                let version = version.as_deref().unwrap_or_default();
+                let parts = [path.as_bytes(), source.as_bytes(), version.as_bytes()];
+                parts.map(|part| [part, b"\0"].concat()).concat()
+            })
+            .collect();
+        let file_bytes: Vec<u8> = (files.iter())
+            .flat_map(|(path, content)| {
+                let length = (content.len() as u64).to_le_bytes();
+                [path.as_bytes(), b"\0", &length, content].concat()
+            })
+            .collect();
+        let (parameters, outputs) = (
+            node_fields(request.parameters),
+            node_fields(request.outputs),
+        );
+        let size = request.task.len()
+            + fields_len(&parameters)
+            + input_bytes.len()
+            + file_bytes.len()
+            + fields_len(&outputs);
+        let parts: [&[u8]; 6] = [
+            b"task",
+            request.task.as_bytes(),
+            &field_bytes(&parameters),
+            &input_bytes,
+            &file_bytes,
+            &field_bytes(&outputs),
+        ];
+        let intent = Intent::new(self.next_ordinal(), &parts);
+        let effect = Effect::Write(intent.clone());
+        let task = JobTask {
+            task: request.task,
+            parameters,
+            inputs,
+            files,
+            outputs,
+            intent,
+        };
+        self.brokered(
+            size,
+            effect,
+            Needs::Permission(Permission::JobsRun),
+            |broker, cx| async move { broker.jobs_start_task(&cx, task).await },
             String::len,
         )
         .await
@@ -467,6 +548,7 @@ impl jobs::Host for Session {
             status_size,
         )
         .await
+        .map(|reply| reply.map(JobStatus::from))
     }
 
     async fn outputs(
@@ -483,6 +565,7 @@ impl jobs::Host for Session {
             page_size,
         )
         .await
+        .map(|reply| reply.map(ObjectPage::from))
     }
 
     /// A cancel changes the job, so it takes its ordinal in the run.
@@ -500,7 +583,7 @@ impl jobs::Host for Session {
     }
 }
 
-fn status_size(status: &JobStatus) -> usize {
+fn status_size(status: &calls::JobStatus) -> usize {
     let texts = [&status.id, &status.kind, &status.path, &status.state];
     let optional = [&status.message, &status.version, &status.report];
     let body = status.reply_body.as_ref().map_or(0, Vec::len);
@@ -512,7 +595,7 @@ fn status_size(status: &JobStatus) -> usize {
     fixed + rest + body + fields_len(&status.reply_headers) + 16
 }
 
-fn page_size(page: &ObjectPage) -> usize {
+fn page_size(page: &calls::ObjectPage) -> usize {
     let items: usize = (page.objects.iter())
         .map(|object| object.path.len() + object.version.len() + 8)
         .sum();
@@ -532,9 +615,10 @@ impl services::Host for Session {
             Needs::Connection(&connection),
             // The broker applies the exposure; the reply passes through as it answers.
             |broker, cx| async move { broker.connection_send(&cx, outbound).await },
-            |reply: &Response| fields_len(&reply.headers) + reply.body.len() + 2,
+            |reply: &calls::Response| fields_len(&reply.headers) + reply.body.len() + 2,
         )
         .await
+        .map(|reply| reply.map(Response::from))
     }
 }
 
@@ -542,10 +626,11 @@ impl Session {
     /// A service request as the broker gets it, its size, and its intent when it may change
     /// remote state.
     fn outbound(&mut self, request: services::Request) -> (usize, Effect, SendRequest) {
+        let (query, headers) = (node_fields(request.query), node_fields(request.headers));
         let size = request.service.len()
             + request.path.len()
-            + fields_len(&request.query)
-            + fields_len(&request.headers)
+            + fields_len(&query)
+            + fields_len(&headers)
             + request.body.len();
         let mutating = !matches!(request.method, Method::Get | Method::Head);
         let intent = mutating.then(|| {
@@ -553,8 +638,8 @@ impl Session {
                 request.service.as_bytes(),
                 method_name(request.method).as_bytes(),
                 request.path.as_bytes(),
-                &field_bytes(&request.query),
-                &field_bytes(&request.headers),
+                &field_bytes(&query),
+                &field_bytes(&headers),
                 &request.body,
             ];
             Intent::new(self.next_ordinal(), &parts)
@@ -565,10 +650,10 @@ impl Session {
         };
         let outbound = SendRequest {
             connection: request.service,
-            method: request.method,
+            method: request.method.into(),
             path: request.path,
-            query: request.query,
-            headers: request.headers,
+            query,
+            headers,
             body: request.body,
             intent,
         };
@@ -583,9 +668,10 @@ impl state::Host for Session {
             Effect::Read,
             Needs::Free,
             |broker, cx| async move { broker.state_get(&cx, &key).await },
-            |entry: &Option<Entry>| entry.as_ref().map_or(0, |e| e.value.len() + 8),
+            |entry: &Option<calls::Entry>| entry.as_ref().map_or(0, |e| e.value.len() + 8),
         )
         .await
+        .map(|reply| reply.map(|entry| entry.map(Entry::from)))
     }
 
     async fn put(
@@ -651,9 +737,10 @@ impl secrets::Host for Session {
             Effect::Read,
             Needs::Permission(Permission::SecretsValue),
             |broker, cx| async move { broker.secret_value(&cx, &slot).await },
-            |fields| fields_len(fields),
+            |fields: &Vec<calls::Field>| fields_len(fields),
         )
         .await
+        .map(|reply| reply.map(guest_fields))
     }
 }
 

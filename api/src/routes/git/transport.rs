@@ -2,12 +2,15 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::{api_url, base_url, map_error, repository_id};
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::{GitEvent, GitRequest, MAX_GIT_BYTES};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::git;
 use axum::Extension;
 use axum::body::{Body, Bytes, to_bytes};
@@ -32,7 +35,7 @@ pub struct ServiceQuery {
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn advertise(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(token): Extension<Option<ValidatedBearer>>,
     Path(repository): Path<String>,
     Query(query): Query<ServiceQuery>,
@@ -44,23 +47,25 @@ pub async fn advertise(
     ) {
         return Err(ServerError::BadRequest);
     }
-    let auth = require_realm_auth(&state, auth)?;
     refuse_scoped_push(&auth, query.service == "git-receive-pack")?;
-    git::repository(
+    drive(
+        git::access::repository(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+            if query.service == "git-receive-pack" {
+                Permission::WRITE
+            } else {
+                Permission::READ
+            },
+        ),
         &state.get_ctx(),
-        &auth,
-        repository_id(&repository)?,
-        if query.service == "git-receive-pack" {
-            Permission::WRITE
-        } else {
-            Permission::READ
-        },
     )
     .await
     .map_err(map_error)?;
     serve(
         state,
-        Some(auth),
+        auth,
         token,
         repository,
         "GET",
@@ -82,7 +87,7 @@ pub async fn advertise(
               (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
 pub async fn rpc(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(token): Extension<Option<ValidatedBearer>>,
     Path((repository, service)): Path<(String, String)>,
     headers: HeaderMap,
@@ -91,17 +96,19 @@ pub async fn rpc(
     if !matches!(service.as_str(), "git-upload-pack" | "git-receive-pack") {
         return Err(ServerError::NotFound);
     }
-    let auth = require_realm_auth(&state, auth)?;
     refuse_scoped_push(&auth, service == "git-receive-pack")?;
-    git::repository(
+    drive(
+        git::access::repository(
+            state.get_ctx().node_id(),
+            &auth,
+            repository_id(&repository)?,
+            if service == "git-receive-pack" {
+                Permission::WRITE
+            } else {
+                Permission::READ
+            },
+        ),
         &state.get_ctx(),
-        &auth,
-        repository_id(&repository)?,
-        if service == "git-receive-pack" {
-            Permission::WRITE
-        } else {
-            Permission::READ
-        },
     )
     .await
     .map_err(map_error)?;
@@ -110,7 +117,7 @@ pub async fn rpc(
         .map_err(|_| ServerError::PayloadTooLarge("Git request exceeds limit".into()))?;
     serve(
         state,
-        Some(auth),
+        auth,
         token,
         repository,
         "POST",
@@ -125,7 +132,7 @@ pub async fn rpc(
 #[allow(clippy::too_many_arguments)]
 async fn serve(
     state: Arc<ServerState>,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     token: Option<ValidatedBearer>,
     repository: String,
     method: &str,
@@ -134,7 +141,6 @@ async fn serve(
     headers: HeaderMap,
     body: Bytes,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let id = repository_id(&repository)?;
     let permission = if action == "git-receive-pack" || query == "service=git-receive-pack" {
         Permission::WRITE
@@ -142,9 +148,12 @@ async fn serve(
         Permission::READ
     };
     refuse_scoped_push(&auth, permission == Permission::WRITE)?;
-    let (_, repository) = git::repository(&state.get_ctx(), &auth, id, permission)
-        .await
-        .map_err(map_error)?;
+    let (_, repository) = drive(
+        git::access::repository(state.get_ctx().node_id(), &auth, id, permission),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(map_error)?;
     let request = GitRequest {
         repository,
         method: method.into(),
@@ -171,14 +180,8 @@ async fn serve(
         metadata_url: format!("{}/metadata/{id}", api_url(&state).await?),
         push_key: String::new(),
     };
-    let result = git::transport(
-        &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
-        &auth,
-        request,
-    )
-    .await
-    .map_err(map_error)?;
+    let serve = git::transport::transport(&git_node(&state), &auth, request);
+    let result = drive(serve, &state.get_ctx()).await.map_err(map_error)?;
     let GitEvent::Response {
         status,
         headers,

@@ -3,18 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_drivers::driver::drive;
 use axum::http::HeaderMap;
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_operations::distribution::guard::bound_view;
+use aruna_operations::distribution::routing::bound_view;
 use serde::{Deserialize, Serialize};
 
 use super::{BulkRunRequest, BulkRunResponse, CoverageQuery, CoverageResponse};
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
-use crate::routes::storage::distributed::map_guard_error;
+use crate::lookup::map_guard_error;
 use crate::routes::storage::relay::{RestForward, relay_get, relay_json};
 use crate::server::state::ServerState;
 
@@ -37,18 +38,18 @@ impl SpreadCursor {
     }
 
     fn encode(&self) -> ServerResult<String> {
-        let bytes = serde_json::to_vec(self)
-            .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| ServerError::InternalError(error.into()))?;
         Ok(hex::encode(bytes))
     }
 }
 
 /// The nodes that coordinate a range of the set, from this node's record, each with one range.
-async fn coordinators(
+pub(super) async fn coordinators(
     state: &ServerState,
     binding: &DistributionBinding,
 ) -> ServerResult<Vec<RestForward>> {
-    let view = bound_view(state.get_ctx().as_ref(), binding)
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
         .map_err(map_guard_error)?;
     let snapshot = view.snapshot();
@@ -69,6 +70,18 @@ async fn coordinators(
         }
     }
     Ok(nodes)
+}
+
+/// The node of every member of the set, from this node's record.
+pub(super) async fn set_members(
+    state: &ServerState,
+    binding: &DistributionBinding,
+) -> ServerResult<Vec<NodeId>> {
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
+        .await
+        .map_err(map_guard_error)?;
+    let members = &view.snapshot().config.members;
+    Ok(members.iter().map(|member| member.node_id).collect())
 }
 
 /// A coordinator's answer, as far as the spread needs it: where its own pass goes on.
@@ -166,7 +179,7 @@ fn collect<T: Paged>(
     })
 }
 
-fn bucket_path(bucket: &str, route: &str) -> String {
+pub(super) fn bucket_path(bucket: &str, route: &str) -> String {
     let bucket: String = url::form_urlencoded::byte_serialize(bucket.as_bytes()).collect();
     format!("/data/buckets/{bucket}/placement/{route}")
 }

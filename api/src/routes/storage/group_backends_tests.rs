@@ -7,11 +7,12 @@ use super::{
     check_provider_bucket, create_group_backend, delete_group_backend, enable_group_backend,
     list_group_backends, list_import_roots,
 };
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::tests::storage_routing::setup_state;
 use aruna_core::structs::storage::backends::ImportRoot;
+use axum::Json;
 use axum::extract::{Path, State};
-use axum::{Extension, Json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -23,7 +24,7 @@ async fn requires_group_admin() {
 
     let result = list_group_backends(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path(test.group_id.to_string()),
     )
     .await;
@@ -32,7 +33,7 @@ async fn requires_group_admin() {
 
     let disabled = delete_group_backend(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path((test.group_id.to_string(), Ulid::generate().to_string())),
     )
     .await;
@@ -41,7 +42,7 @@ async fn requires_group_admin() {
 
     let enabled = enable_group_backend(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path((test.group_id.to_string(), Ulid::generate().to_string())),
     )
     .await;
@@ -50,7 +51,7 @@ async fn requires_group_admin() {
 
     let status = backend_reclaim_status(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path((test.group_id.to_string(), Ulid::generate().to_string())),
     )
     .await;
@@ -123,7 +124,7 @@ async fn status_needs_backend() {
 
     let result = backend_reclaim_status(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path((test.group_id.to_string(), Ulid::generate().to_string())),
     )
     .await;
@@ -138,7 +139,7 @@ async fn rejects_unknown_kind() {
 
     let result = create_group_backend(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(CreateBackendRequest {
             name: "tenant".to_string(),
@@ -159,7 +160,7 @@ async fn lists_empty_backends() {
 
     let Json(listed) = list_group_backends(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
     )
     .await
@@ -185,7 +186,7 @@ async fn lists_import_roots() {
 
     let Json(listed) = list_import_roots(
         State(state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
     )
     .await
@@ -204,7 +205,7 @@ async fn lists_import_roots() {
     );
     let denied = list_import_roots(
         State(state),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path(test.group_id.to_string()),
     )
     .await;
@@ -218,7 +219,7 @@ async fn refuses_unoffered_root() {
 
     let result = create_group_backend(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.group_id.to_string()),
         Json(CreateBackendRequest {
             name: "share".to_string(),
@@ -258,7 +259,7 @@ async fn bucket_check_refuses() {
     let check = |auth, backend_id: Ulid, bucket: &str| {
         check_provider_bucket(
             State(test.state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Path((
                 test.group_id.to_string(),
                 backend_id.to_string(),

@@ -2,16 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::structs::storage::distribution::{DistributionError, DistributionRevision};
-use aruna_operations::distribution::index_feed::IndexProgress;
-use aruna_operations::distribution::status::{
+use crate::lookup::map_guard_error;
+use aruna_core::id::NodeId;
+use aruna_core::structs::storage::distribution::DistributionRevision;
+use aruna_core::structs::storage::distribution::route::RouteError;
+use aruna_core::structs::storage::distribution::search::IndexProgress;
+use aruna_core::structs::storage::distribution::validate::DistributionError;
+use aruna_operations::distribution::guard::GuardError;
+use aruna_operations::replication::members::CopyLag;
+use aruna_operations::transfer::status_view::{
     CopyStatus, DeletionStatus, FillProgress, FillStatus, LifecycleStatus, MemberStatus,
     RangeStatus, TransferStatus,
 };
-use aruna_operations::replication::members::CopyLag;
 
 use super::*;
+use crate::auth::RealmAuth;
 
 fn node_text(seed: u8) -> String {
     iroh::SecretKey::from_bytes(&[seed; 32])
@@ -417,7 +422,7 @@ fn report_lists_members() {
     let report = CreationReport {
         set_id: Ulid::from_bytes([1; 16]),
         active: true,
-        members: vec![aruna_operations::distribution::create::MemberOutcome {
+        members: vec![aruna_operations::transfer::create::MemberOutcome {
             member_id: Ulid::from_bytes([2; 16]),
             node_id: node,
             admitted: false,
@@ -443,7 +448,7 @@ mod routes {
     ) -> ServerResult<Json<DistributedResponse>> {
         get_distributed(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Path((group_id, set_id)),
         )
         .await
@@ -537,7 +542,7 @@ mod routes {
         let retry = |auth: &AuthContext, set_id: Ulid| {
             retry_admission(
                 State(node.state.clone()),
-                Extension(Some(auth.clone())),
+                RealmAuth(auth.clone()),
                 Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
                 Path((node.group_id, set_id)),
             )
@@ -561,7 +566,7 @@ mod routes {
         let create = |auth: &AuthContext, request: CreateDistributedRequest| {
             create_distributed(
                 State(node.state.clone()),
-                Extension(Some(auth.clone())),
+                RealmAuth(auth.clone()),
                 Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
                 Path(node.group_id),
                 Json(request),

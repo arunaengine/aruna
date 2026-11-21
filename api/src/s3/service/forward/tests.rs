@@ -15,6 +15,12 @@ fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
     map
 }
 
+/// A coordinator's refusal body as this node's answer.
+fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) -> S3Error {
+    let message = xml_field(body, "Message").unwrap_or_default();
+    refused_error(forward.node_id, status, xml_field(body, "Code"), message)
+}
+
 fn forward() -> Forward {
     Forward {
         set_id: Ulid::from_bytes([1; 16]),

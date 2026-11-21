@@ -7,8 +7,9 @@ use crate::error::{ServerError, ServerSetupError};
 use crate::https::check_host;
 use crate::https::listener::CombinedListener;
 use crate::server::state::{PortalRuntimeState, ServerState};
-use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_wire::portal::{LegalDocument, PortalLogin};
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -16,8 +17,7 @@ use axum::middleware::{from_fn, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -43,59 +43,6 @@ pub struct PortalConfig {
     pub landing: bool,
     /// The deployment's legal documents in display order, served as `legal`.
     pub legal: Vec<LegalDocument>,
-}
-
-/// One legal document: a label and either an external page or Markdown text.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct LegalDocument {
-    pub label: String,
-    #[serde(flatten)]
-    pub source: LegalSource,
-}
-
-/// Served as `url` or `markdown` beside the label.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum LegalSource {
-    Url(String),
-    Markdown(String),
-}
-
-/// Login choices the portal offers in its login chooser, served unchanged as `login`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PortalLogin {
-    /// Replaces the plain realm sign-in row; an option without `params` is that sign-in.
-    #[serde(default)]
-    pub options: Vec<LoginOption>,
-    /// Page of the identity provider that lists and removes linked logins.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_url: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct LoginOption {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logo: Option<String>,
-    /// A copy of the logo for light backgrounds, for logos drawn in white.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub logo_light: Option<String>,
-    /// Extra authorization request parameters, such as `kc_idp_hint`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub params: BTreeMap<String, String>,
-    /// Extra parameters that link this login to the signed-in account; empty means not linkable.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub link_params: BTreeMap<String, String>,
-    /// The `id` of the realm OIDC provider that issues this option's ID tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    /// Base URL of the login bridge; the portal calls `<bridge>/authorize` and `<bridge>/token`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub bridge: Option<String>,
 }
 
 #[derive(Clone)]
@@ -181,7 +128,7 @@ async fn portal_config(State(state): State<PortalState>) -> Response {
             None => state.registry_url.clone(),
         },
         Err(GetConfigError::DocumentNotFound) => state.registry_url.clone(),
-        Err(error) => return ServerError::InternalError(error.to_string()).into_response(),
+        Err(error) => return ServerError::InternalError(error.into()).into_response(),
     };
     let config = Json(PortalRuntimeConfig {
         api_base_url: &state.api_base_url,
@@ -312,25 +259,28 @@ impl IntoResponse for PortalServeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{IMMUTABLE_CACHE, LegalSource, NO_CACHE, PortalConfig, serve_portal_request};
+    use super::{IMMUTABLE_CACHE, NO_CACHE, PortalConfig, serve_portal_request};
     use crate::cors::CorsConfig;
     use crate::csp::PortalCspConfig;
-    use crate::server::state::{PortalStatus, ServerState};
-    use crate::server::{MAX_BODY_SIZE, Server, ServerConfig};
-    use aruna_core::UserId;
+    use crate::server::state::ServerState;
+    use crate::server::{Server, ServerConfig};
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
     };
     use aruna_core::keys::generate_signing_key;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::listener::MAX_BODY_SIZE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetConfigOperation;
     use aruna_storage::storage;
     use aruna_tasks::TaskHandle;
+    use aruna_wire::info::PortalStatus;
+    use aruna_wire::portal::LegalSource;
     use axum::body::{Body, to_bytes};
     use axum::extract::Request;
     use axum::http::{Method, StatusCode, header};
@@ -345,14 +295,16 @@ mod tests {
 
     async fn setup_state() -> (Arc<ServerState>, TempDir) {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(TaskHandle::new()),
             compute_handle: None,
+            outbound_handle: None,
         });
 
         let realm_signing_key = generate_signing_key();
@@ -367,7 +319,7 @@ mod tests {
                 NodeCapabilities::user_node(realm_id).unwrap(),
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );

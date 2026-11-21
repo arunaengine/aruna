@@ -2,22 +2,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerResult};
-use crate::metadata::{
+use crate::metadata::model::{
     ExcludedFormResponse, MetadataReferencesParams, MetadataReferencesResponse, PreflightBody,
     PreflightCoverageResponse, PreflightFreshnessResponse, PreflightLocationResponse,
     PreflightResponse, PreflightStorageBody, PreflightTargetBody, PreflightTargetResponse,
-    PreflightVisibleResponse, bearer_token_string, map_api_error, map_query_mode,
-    map_references_response,
+    PreflightVisibleResponse,
+};
+use crate::metadata::{
+    bearer_token_string, map_api_error, map_query_mode, map_references_response,
 };
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::metadata::api::{
-    MetadataReferencesRequest, MetadataStorageOperation, ReferenceExecution, ReferenceRequest,
-    ReferenceTarget, references_metadata as run_references_metadata,
-    references_preflight as run_references_preflight,
+use aruna_core::metadata::api::MetadataIndexState;
+use aruna_drivers::driver::drive;
+use aruna_operations::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
+use aruna_operations::metadata::api::preflight_types::{
+    MetadataStorageOperation, ReferenceExecution, ReferenceRequest, ReferenceTarget,
 };
+use aruna_operations::metadata::api::read_types::MetadataReferencesRequest;
+use aruna_operations::metadata::api::references::ReferencesOperation;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -98,7 +103,6 @@ filtered by the caller's READ permission, so an unreadable referencing document 
             )
         ),
         (status = 400, description = "Missing iri, or an iri or predicate that is not a valid absolute IRI", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "The reference index could not answer within the page budget", body = ErrorResponse)
     ),
@@ -106,22 +110,23 @@ filtered by the caller's READ permission, so an unreadable referencing document 
 )]
 pub async fn metadata_references(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(params): Query<MetadataReferencesParams>,
 ) -> ServerResult<(StatusCode, Json<MetadataReferencesResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let ctx = state.get_ctx();
-    let execution = run_references_metadata(
+    let execution = drive(
+        ReferencesOperation::new(
+            state.get_realm_id(),
+            MetadataReferencesRequest {
+                auth: Some(auth),
+                iri: params.iri,
+                predicate: params.predicate,
+                limit: params.limit,
+                resolve: params.resolve,
+                after: params.after,
+            },
+        ),
         ctx.as_ref(),
-        state.get_realm_id(),
-        MetadataReferencesRequest {
-            auth: Some(auth),
-            iri: params.iri,
-            predicate: params.predicate,
-            limit: params.limit,
-            resolve: params.resolve,
-            after: params.after,
-        },
     )
     .await
     .map_err(map_api_error)?;
@@ -220,7 +225,6 @@ target names content identities directly and checks no storage permission.
                 }
             })),
         (status = 400, description = "Malformed or oversized target set, unsupported content identity, or invalid cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or WRITE is missing on the bucket, prefix or a resolved key", body = ErrorResponse),
         (status = 404, description = "Bucket not found", body = ErrorResponse),
         (status = 503, description = "With allow_partial=false a failed, stale or otherwise incomplete partition fails the request instead of silently downgrading it; retryable", body = ErrorResponse)
@@ -229,11 +233,10 @@ target names content identities directly and checks no storage permission.
 )]
 pub async fn metadata_reference_preflight(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<PreflightBody>,
 ) -> ServerResult<(StatusCode, Json<PreflightResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let target = match request.target {
         PreflightTargetBody::ContentW3ids {
             content_w3ids,
@@ -265,7 +268,6 @@ pub async fn metadata_reference_preflight(
         .s3
         .map(|interface| interface.base_url);
     let execution = run_references_preflight(
-        state.get_ctx().as_ref(),
         state.get_realm_id(),
         state.get_node_id(),
         ReferenceRequest {
@@ -279,9 +281,10 @@ pub async fn metadata_reference_preflight(
             target_nodes: None,
             allow_partial: request.allow_partial,
         },
-    )
-    .await
-    .map_err(map_api_error)?;
+    );
+    let execution = drive(execution, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     Ok((StatusCode::OK, Json(map_preflight_response(execution))))
 }
 
@@ -350,10 +353,10 @@ fn map_preflight_response(execution: ReferenceExecution) -> PreflightResponse {
                 .map(|freshness| PreflightFreshnessResponse {
                     node_id: freshness.node_id.to_string(),
                     index_state: match freshness.index_state {
-                        aruna_operations::metadata::api::MetadataIndexState::Current => "current",
-                        aruna_operations::metadata::api::MetadataIndexState::Pending => "pending",
-                        aruna_operations::metadata::api::MetadataIndexState::Failed => "failed",
-                        aruna_operations::metadata::api::MetadataIndexState::Mixed => "mixed",
+                        MetadataIndexState::Current => "current",
+                        MetadataIndexState::Pending => "pending",
+                        MetadataIndexState::Failed => "failed",
+                        MetadataIndexState::Mixed => "mixed",
                     }
                     .to_string(),
                     oldest_status_updated: freshness.oldest_status_updated,

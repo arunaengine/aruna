@@ -3,9 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
-use crate::tests::s3::{test_context, test_storage};
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE};
@@ -17,7 +14,12 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, CurrentVersionPointer};
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
 use aruna_storage::storage;
+use aruna_test_support::s3::test_storage;
 use std::collections::HashMap;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -479,7 +481,7 @@ async fn reference_object_lists() {
 }
 
 async fn seed_materialized_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
@@ -549,7 +551,7 @@ async fn seed_materialized_keys(
 }
 
 async fn seed_deleted_keys(
-    storage_handle: &storage::StorageHandle,
+    storage_handle: &storage::handle::StorageHandle,
     bucket: &str,
     keys: &[&str],
     created_by: UserId,
@@ -890,34 +892,30 @@ fn delimiter_input(
     }
 }
 
-fn step_transaction_started(operation: &mut ListBucketOperation) -> Effects {
-    let effects = operation.start();
-    assert!(matches!(
-        effects[0],
-        Effect::Storage(StorageEffect::StartTransaction { .. })
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::generate(),
-    }))
+fn scan_of(turn: &ListTurn) -> (&Option<IterStart>, usize) {
+    let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
+        panic!("expected a scan round: {turn:?}");
+    };
+    let Effect::Storage(StorageEffect::Iter { start, limit, .. }) = effect.as_ref() else {
+        panic!("expected a scan round: {effect:?}");
+    };
+    (start, *limit)
 }
 
 #[test]
 fn group_round_advances() {
     let mut operation = ListBucketOperation::new(delimiter_input(1, None, Some("/")));
+    assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
 
-    let effects = step_transaction_started(&mut operation);
-    let Effect::Storage(StorageEffect::Iter {
-        start: None, limit, ..
-    }) = &effects[0]
-    else {
-        panic!("expected initial scan round: {:?}", effects[0]);
-    };
+    let turn = operation.first();
+    let (start, limit) = scan_of(&turn);
+    assert_eq!(start, &None);
 
-    let pointer: aruna_core::types::Value = CurrentVersionPointer::new(Ulid::generate())
+    let pointer: Value = CurrentVersionPointer::new(Ulid::generate())
         .to_bytes()
         .unwrap()
         .into();
-    let values = (0..*limit)
+    let values = (0..limit)
         .map(|index| {
             (
                 BlobHeadKey::new("bucket", format!("dir/{index}"))
@@ -928,18 +926,19 @@ fn group_round_advances() {
             )
         })
         .collect();
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
+    let page = Event::Storage(StorageEvent::IterResult {
         values,
         next_start_after: None,
-    }));
+    });
+    let turn = operation.next(IoResult::Event(Box::new(page)));
 
     // The heads now need a version read before the group can be emitted.
-    let Effect::Storage(StorageEffect::BatchRead { reads, .. }) = &effects[0] else {
-        panic!("expected version read for grouped heads: {:?}", effects[0]);
+    let Ok(Next::Call(IoCall::Read(reads))) = &turn else {
+        panic!("expected version read for grouped heads: {turn:?}");
     };
     let created_by = UserId::local(Ulid::generate(), RealmId([7u8; 32]));
     let created_at = UNIX_EPOCH + Duration::from_secs(5);
-    let version: aruna_core::types::Value = BlobVersion::materialized(
+    let version: Value = BlobVersion::materialized(
         [1u8; 32],
         BackendRef::node_default(),
         EncodingClass::Raw,
@@ -950,17 +949,10 @@ fn group_round_advances() {
     .to_bytes()
     .unwrap()
     .into();
-    let version_values = reads
-        .iter()
-        .map(|(_, key)| (key.clone(), Some(version.clone())))
-        .collect();
-    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-        values: version_values,
-    }));
+    let answer = IoResult::Values(vec![Some(version); reads.len()]);
+    let turn = operation.next(answer);
 
-    let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
-        panic!("expected follow-up scan round: {:?}", effects[0]);
-    };
+    let (start, _) = scan_of(&turn);
     assert_eq!(start, &Some(IterStart::At(b"bucket/dir0".to_vec().into())));
 }
 
@@ -973,23 +965,28 @@ fn group_resume_advances() {
 
     let mut operation =
         ListBucketOperation::new(delimiter_input(10, Some(token.clone()), Some("/")));
-    let effects = step_transaction_started(&mut operation);
-    let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
-        panic!("expected resumed scan round: {:?}", effects[0]);
-    };
+    let turn = operation.first();
+    let (start, _) = scan_of(&turn);
     assert_eq!(start, &Some(IterStart::At(b"bucket/dir0".to_vec().into())));
 
     // Without the delimiter the group no longer applies: resume behind
     // the exclusive cursor instead of seeking.
     let mut operation = ListBucketOperation::new(delimiter_input(10, Some(token.clone()), None));
-    let effects = step_transaction_started(&mut operation);
-    let Effect::Storage(StorageEffect::Iter { start, .. }) = &effects[0] else {
-        panic!("expected resumed scan round: {:?}", effects[0]);
-    };
+    let turn = operation.first();
+    let (start, _) = scan_of(&turn);
     assert_eq!(
         start,
         &Some(IterStart::After(token.last_key.clone().into()))
     );
+}
+
+#[test]
+fn zero_limit_skips() {
+    let mut operation = ListBucketOperation::new(delimiter_input(0, None, None));
+    let Ok(Next::Done(result)) = operation.first() else {
+        panic!("a page of no keys needs no read");
+    };
+    assert!(result.objects.is_empty() && result.continuation_token.is_none());
 }
 
 #[tokio::test]
@@ -1156,11 +1153,12 @@ async fn markers_skipped() {
 
 #[tokio::test]
 async fn pending_archives_listed() {
-    use crate::s3::object::versions::{ListVersionsInput, ListVersionsItem, ListVersionsOperation};
+    use crate::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
     use aruna_core::keyspaces::PENDING_LOCATION_KEYSPACE;
     use aruna_core::structs::storage::blob::ArchiveKey;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::PithosLayout;
+    use aruna_core::structs::storage::listing::ListVersionsItem;
 
     let (_temp_handle, storage_handle) = test_storage();
     let driver_ctx = test_context(storage_handle.clone());

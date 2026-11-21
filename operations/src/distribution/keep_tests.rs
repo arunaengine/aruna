@@ -5,13 +5,14 @@
 
 use super::*;
 use crate::distribution::test_store::{context, get, open};
-use crate::driver::drive;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::distribution::on_use::{
     CLAIM_TTL_MS, CacheTotals, attachment_key, claim_key,
 };
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_storage::storage::StorageHandle;
+use aruna_drivers::driver::drive;
+use aruna_storage::storage::handle::StorageHandle;
 use std::collections::HashMap;
 use std::time::SystemTime;
 
@@ -55,9 +56,15 @@ fn cached(seed: u8, size: u64, capacity: u64) -> KeptCopy {
 
 /// An attachment of member `seed` of the stored two-shard record.
 async fn attached(handle: &StorageHandle, seed: u8) -> KeptCopy {
-    use crate::distribution::test_record::{member, record, store_record};
+    use crate::distribution::test_record::{member, record};
     let (snapshot, bytes) = record(true);
-    store_record(handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     KeptCopy {
         kind: KeptKind::Attachment,
         set_id: snapshot.set_id(),
@@ -108,6 +115,41 @@ async fn claims_fill_once() {
         claim(&handle, 2, 1_001 + CLAIM_TTL_MS).await,
         Claimed::Claimed
     );
+}
+
+// The claim row is read and written in one transaction; a fresh foreign claim writes nothing.
+#[test]
+fn claim_calls() {
+    let claim = |claim_id: u8, claimed_at_ms: u64| FillClaim {
+        claim_id: id(claim_id),
+        claimed_at_ms,
+    };
+    let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(1, 1_000));
+    assert_eq!(
+        operation.transaction(),
+        aruna_core::operation::TransactionMode::Write
+    );
+    let read = read_row(FILL_CLAIM_KEYSPACE, b"fill".to_vec());
+    assert_eq!(operation.first(), Ok(Next::Call(read)));
+    let row = (
+        FILL_CLAIM_KEYSPACE.to_string(),
+        b"fill".to_vec().into(),
+        claim(1, 1_000).to_bytes().unwrap().into(),
+    );
+    let absent = IoResult::Values(vec![None]);
+    assert_eq!(
+        operation.next(absent),
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    );
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Ok(Next::Done(Claimed::Claimed))
+    );
+
+    let mut operation = ClaimFillOperation::new(b"fill".to_vec(), claim(2, 1_001));
+    operation.first().unwrap();
+    let held = IoResult::Values(vec![Some(claim(1, 1_000).to_bytes().unwrap().into())]);
+    assert_eq!(operation.next(held), Ok(Next::Done(Claimed::Busy)));
 }
 
 // An attachment row names the verified copy and publishing releases the claim.

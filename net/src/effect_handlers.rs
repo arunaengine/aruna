@@ -7,16 +7,22 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::audit::AuditPageBatch;
+use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect, StreamEffect};
 use aruna_core::errors::{DhtError, StreamError};
 use aruna_core::events::{
-    DhtEntry, DhtEvent, JobControlEvent, JobRecordEvent, LaunchOfferEvent, NetEvent,
-    PolicyFetchEvent, PolicySignEvent, SnapshotSignEvent, StatementSignEvent, StreamEvent,
-    VaultFetchEvent, VaultSignEvent,
+    CatchUpEvent, DhtEntry, DhtEvent, ExecutionSignEvent, JobControlEvent, MetadataAnswer,
+    NetEvent, PeerRequestError, SnapshotSignEvent, StatementSignEvent, StreamEvent,
 };
-use aruna_core::id::{DhtKeyId, NodeId, hex_prefix};
+use aruna_core::id::{DhtKeyId, hex_prefix};
+use aruna_core::metadata::MetadataError;
+use aruna_core::structs::execution::job::family::{ExecutionClaim, JobRecordEnvelope};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::distribution::delegation::{Delegation, SignedDelegation};
+use aruna_core::structs::storage::distribution::snapshot::{SignedSnapshot, SnapshotClaim};
+use aruna_core::structs::storage::distribution::statement::{SignedStatement, StatementClaim};
+use aruna_core::structs::storage::read_grant::{ReadGrant, SignedGrant};
 use parking_lot::Mutex;
 #[cfg(test)]
 use tokio::sync::Notify;
@@ -25,7 +31,9 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::{debug, trace, warn};
 
-use crate::{DhtHandle, DocumentSyncService};
+use crate::dht::handle::DhtHandle;
+use crate::document_sync::DocumentSyncService;
+use aruna_core::events::ShardNetEvent;
 
 /// A snapshot younger than this answers without any DHT work.
 const PRESENCE_FRESH: Duration = Duration::from_secs(10);
@@ -42,6 +50,8 @@ const PUT_ANSWER_DEADLINE: Duration = Duration::from_secs(180);
 /// Everything a net effect needs besides the effect itself.
 pub struct NetEffectContext {
     pub dht: Arc<DhtHandle>,
+    /// This node's key, which signs snapshots and statements naming this node.
+    pub secret_key: iroh::SecretKey,
     pub document_sync: Arc<DocumentSyncService>,
     pub presence: RealmPresenceCache,
     pub tasks: TaskTracker,
@@ -196,69 +206,234 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
     match effect {
         NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
-            aruna_core::DocumentEffect::PublishDocuments { documents, peers } => {
-                NetEvent::DocumentSync(document_sync.publish_documents(documents, peers).await)
-            }
-            aruna_core::DocumentEffect::SyncDocument { topic, peers } => {
+            aruna_core::document::DocumentEffect::PublishDocuments {
+                documents,
+                peers,
+                expected,
+            } => NetEvent::DocumentSync(
+                document_sync
+                    .publish_expecting(documents, peers, expected)
+                    .await,
+            ),
+            aruna_core::document::DocumentEffect::SyncDocument { topic, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_document_event(topic, peers).await)
             }
-            aruna_core::DocumentEffect::SyncDocuments { topics, peers } => {
+            aruna_core::document::DocumentEffect::SyncDocuments { topics, peers } => {
                 NetEvent::DocumentSync(document_sync.sync_documents_event(topics, peers).await)
+            }
+            aruna_core::document::DocumentEffect::ReconcileBatch {
+                topic,
+                stored_cursor,
+            } => NetEvent::DocumentSync(document_sync.reconcile_batch_event(topic, stored_cursor)),
+            aruna_core::document::DocumentEffect::OverflowPage {
+                topic,
+                start,
+                applied,
+            } => NetEvent::DocumentSync(document_sync.overflow_page_event(topic, start, applied)),
+            aruna_core::document::DocumentEffect::NoteGitRecord { document_id } => {
+                NetEvent::DocumentSync(document_sync.note_git_record(document_id))
+            }
+            aruna_core::document::DocumentEffect::ReloadRealmPeers => {
+                NetEvent::DocumentSync(aruna_core::document::DocumentNetEvent::Error {
+                    target: None,
+                    error: "a peer reload must be dispatched by the operations runner".to_string(),
+                })
             }
         },
         NetEffect::Stream(stream_effect) => handle_stream_effect(stream_effect).await,
-        // Job-control and audit effects are executed by the operations runner,
-        // which holds the driver context; they never reach this handler.
+        // The net handle runs job-control round trips itself; they never reach this handler.
         NetEffect::JobControl(_) => NetEvent::JobControl(JobControlEvent::Unavailable(
-            "job-control effect must be dispatched by the operations runner".to_string(),
+            "job-control effect must be sent through the net handle".to_string(),
         )),
-        NetEffect::AuditPage(audit) => {
-            NetEvent::AuditPages(audit_fallback(audit.nodes, audit.request.limit))
+        NetEffect::PolicySign(claim) => {
+            NetEvent::PolicySign(crate::signing::sign_publication(&ctx.secret_key, *claim))
         }
-        // Policy, job-record, and launch protocols live in the operations
-        // runner too; reaching this handler is a wiring bug, never a success.
-        NetEffect::PolicyFetch(_) => NetEvent::PolicyFetch(PolicyFetchEvent::Unavailable(
-            "policy fetch must be dispatched by the operations runner".to_string(),
+        NetEffect::SignDeletePlan(plan) => {
+            NetEvent::DeletePlanSigned(crate::signing::sign_delete_plan(&ctx.secret_key, &plan))
+        }
+        NetEffect::SignCountRelay(relay) => {
+            NetEvent::CountRelaySigned(crate::signing::sign_count_relay(&ctx.secret_key, &relay))
+        }
+        NetEffect::VaultSign(records) => {
+            NetEvent::VaultSign(crate::signing::sign_records(&ctx.secret_key, *records))
+        }
+        NetEffect::SnapshotSign(claim) => {
+            NetEvent::SnapshotSign(sign_snapshot(&ctx.secret_key, *claim))
+        }
+        NetEffect::StatementSign(claim) => {
+            NetEvent::StatementSign(sign_statement(&ctx.secret_key, *claim))
+        }
+        NetEffect::ExecutionSign(claim) => {
+            NetEvent::ExecutionSign(sign_execution(&ctx.secret_key, *claim))
+        }
+        NetEffect::GrantSign(grant) => NetEvent::GrantSign(sign_grant(&ctx.secret_key, *grant)),
+        NetEffect::DelegationSign(delegation) => {
+            NetEvent::DelegationSign(sign_delegation(&ctx.secret_key, *delegation))
+        }
+        // The avoided holders are read through the handle the runner holds.
+        NetEffect::AvoidHolder { .. } => NetEvent::HolderAvoided,
+        // Positions are sealed with the key the runner holds for this process.
+        NetEffect::SealPosition(_) => NetEvent::PositionSealed(None),
+        NetEffect::OpenPosition(_) => NetEvent::PositionOpened(None),
+        // Secrets are drawn by the drivers adapter; this handler never answers one.
+        NetEffect::DrawSecret(_) => NetEvent::Error(aruna_core::events::NetError::InvalidEffect),
+        // Federation signatures are made by the drivers adapter; this handler never answers one.
+        NetEffect::FederationSign(_) => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
+        // Credentials are opened by the drivers adapter; this handler never answers one.
+        NetEffect::OpenCredential(_) => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
+        NetEffect::AdminSign { event, placement } => {
+            NetEvent::AdminSigned(sign_admin(&ctx.secret_key, &event, &placement))
+        }
+        NetEffect::CursorSign(bytes) => {
+            let signer = ctx.secret_key.public();
+            let signed = aruna_core::cursor::names_signer(&bytes, signer.as_bytes());
+            NetEvent::CursorSigned(signed.then(|| ctx.secret_key.sign(&bytes)))
+        }
+        // Peer contacts live on the net handle the runner holds.
+        NetEffect::PeerContact(_) => NetEvent::PeerContact,
+        // Metadata requests ride the metadata transport the runner holds.
+        NetEffect::MetadataRequest(request) => NetEvent::MetadataAnswer(Box::new(MetadataAnswer {
+            peer: request.peer,
+            elapsed: Duration::ZERO,
+            result: Err(PeerRequestError::Failed(MetadataError::Backend(
+                "metadata request must be dispatched by the operations runner".to_string(),
+            ))),
+        })),
+        // The peer set is reloaded through the handle the runner holds.
+        NetEffect::RefreshDocumentPeers(_) => NetEvent::DocumentPeers(Err(
+            "peer refreshes must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::JobRecord(_) => NetEvent::JobRecord(JobRecordEvent::Unavailable(
-            "job-record replication must be dispatched by the operations runner".to_string(),
+        // A granted read streams through the native protocol the runner opens.
+        NetEffect::GrantedRead(_) => {
+            NetEvent::GrantedRead(Err(aruna_core::errors::StagingSourceError::ReadError(
+                "granted reads must be dispatched by the operations runner".to_string(),
+            )))
+        }
+        NetEffect::DelegatedRead(_) => {
+            NetEvent::DelegatedRead(Err(aruna_core::errors::StagingSourceError::ReadError(
+                "delegated reads must be dispatched by the operations runner".to_string(),
+            )))
+        }
+        // Notification requests and inbox wakes need the net handle, which the runner holds.
+        NetEffect::Shard(_) => NetEvent::Shard(Box::new(ShardNetEvent::NoNetwork)),
+        NetEffect::EnsureTopics { .. }
+        | NetEffect::AllowTopicPeers { .. }
+        | NetEffect::SyncTopic { .. } => {
+            NetEvent::TopicPeers(Err(aruna_core::events::TopicPeerError::Failed(
+                "topic peers must be set by the operations runner".to_string(),
+            )))
+        }
+        NetEffect::MissingTopicPeers { .. } => NetEvent::MissingTopicPeers(Err(
+            "topic members must be read by the operations runner".to_string(),
         )),
-        NetEffect::LaunchOffer(_) => NetEvent::LaunchOffer(LaunchOfferEvent::Unavailable(
-            "launch offer must be dispatched by the operations runner".to_string(),
+        NetEffect::ConfigCatchUp(_) => NetEvent::ConfigCatchUp(CatchUpEvent::Failed(
+            "the realm config catch-up must be run by the operations runner".to_string(),
         )),
-        NetEffect::PolicySign(_) => NetEvent::PolicySign(PolicySignEvent::Unavailable(
-            "policy publication signing must be dispatched by the operations runner".to_string(),
+        NetEffect::Notification(_) => NetEvent::Notification(Err(
+            "notification requests must be dispatched by the operations runner".to_string(),
         )),
-        NetEffect::VaultFetch(_) => NetEvent::VaultFetch(VaultFetchEvent::Unavailable(
-            "vault fetch must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::VaultSign(_) => NetEvent::VaultSign(VaultSignEvent::Unavailable(
-            "vault signing must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::SnapshotSign(_) => NetEvent::SnapshotSign(SnapshotSignEvent::Unavailable(
-            "snapshot signing must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::StatementSign(_) => NetEvent::StatementSign(StatementSignEvent::Unavailable(
-            "statement signing must be dispatched by the operations runner".to_string(),
-        )),
-        NetEffect::Release(_) => NetEvent::Release(release_unavailable()),
+        NetEffect::WakeInbox(_)
+        | NetEffect::Heartbeat(_)
+        | NetEffect::HeartbeatSilence(_)
+        | NetEffect::DashboardChanged
+        | NetEffect::RecordSuppression(_)
+        | NetEffect::PeerContacts { .. }
+        | NetEffect::LocalNode
+        | NetEffect::LocalRealm
+        | NetEffect::IssuerKey { .. }
+        | NetEffect::WatchHolders { .. }
+        | NetEffect::RegisterInterest { .. }
+        | NetEffect::RetractInterest(_)
+        | NetEffect::ReplaceInterest(_)
+        | NetEffect::UpdateRealmInterest { .. } => {
+            NetEvent::Error(aruna_core::events::NetError::InvalidEffect)
+        }
     }
 }
 
-/// Release reads and holder requests run in the operations runner, never here.
-fn release_unavailable() -> aruna_core::structs::storage::release::ReleaseEvent {
-    let reason = "release reads must be dispatched by the operations runner".to_string();
-    aruna_core::structs::storage::release::ReleaseEvent::Holder(Err(reason))
+/// Signs a snapshot with this node's key, only when this node is the set's bound publisher.
+pub(crate) fn sign_snapshot(key: &iroh::SecretKey, claim: SnapshotClaim) -> SnapshotSignEvent {
+    if claim.snapshot.root.publisher != key.public() {
+        return SnapshotSignEvent::Unavailable("snapshot names another publisher".to_string());
+    }
+    let Ok(bytes) = claim.snapshot.signing_bytes(claim.realm_id) else {
+        return SnapshotSignEvent::Unavailable("snapshot does not encode".to_string());
+    };
+    SnapshotSignEvent::Signed(Box::new(SignedSnapshot {
+        signature: key.sign(&bytes),
+        snapshot: claim.snapshot,
+    }))
 }
 
-fn audit_fallback(nodes: Vec<NodeId>, limit: usize) -> AuditPageBatch {
-    let mut batch = AuditPageBatch::with_limit(limit);
-    // Every node of a fallback batch is missing; mark_missing bounds the set and
-    // rolls the excess into missing_overflow, so nothing is silently dropped.
-    for node in nodes {
-        batch.mark_missing(node);
+/// Signs a member statement with this node's key, only when the claim names this node.
+pub(crate) fn sign_statement(key: &iroh::SecretKey, claim: StatementClaim) -> StatementSignEvent {
+    if claim.signer != key.public() {
+        return StatementSignEvent::Unavailable("statement names another signer".to_string());
     }
-    batch
+    let Ok(bytes) = claim.statement.signing_bytes() else {
+        return StatementSignEvent::Unavailable("statement does not encode".to_string());
+    };
+    StatementSignEvent::Signed(Box::new(SignedStatement {
+        signature: key.sign(&bytes),
+        signer: claim.signer,
+        statement: claim.statement,
+    }))
+}
+
+/// Signs a read grant with this node's key, only when the grant names this node as issuer.
+pub(crate) fn sign_grant(key: &iroh::SecretKey, grant: ReadGrant) -> Option<Box<SignedGrant>> {
+    if grant.issuer != key.public() {
+        return None;
+    }
+    let signature = key.sign(&grant.signing_bytes().ok()?);
+    Some(Box::new(SignedGrant { signature, grant }))
+}
+
+/// Signs a delegation with this node's key, only when it names this node as issuer.
+pub(crate) fn sign_delegation(
+    key: &iroh::SecretKey,
+    delegation: Delegation,
+) -> Option<Box<SignedDelegation>> {
+    if delegation.issuer != key.public() {
+        return None;
+    }
+    let signature = key.sign(&delegation.signing_bytes().ok()?);
+    Some(Box::new(SignedDelegation {
+        delegation,
+        signature,
+    }))
+}
+
+/// Signs a job record with this node's key, only when the claim names this node as publisher.
+pub(crate) fn sign_execution(key: &iroh::SecretKey, claim: ExecutionClaim) -> ExecutionSignEvent {
+    if claim.publisher != key.public() {
+        return ExecutionSignEvent::Unavailable("record names another publisher".to_string());
+    }
+    match JobRecordEnvelope::signed_with(claim.realm_id, claim.record, claim.publisher, |bytes| {
+        key.sign(bytes)
+    }) {
+        Ok(envelope) => ExecutionSignEvent::Signed(Box::new(envelope)),
+        Err(error) => ExecutionSignEvent::Unavailable(error.to_string()),
+    }
+}
+
+/// Signs an admin event for relay with this node's key, only when this node originated it.
+fn sign_admin(
+    key: &iroh::SecretKey,
+    event: &AdminDocumentEvent,
+    placement: &PlacementRef,
+) -> Result<iroh::Signature, String> {
+    if event.origin_node_id != key.public() {
+        return Err("the admin event names another origin".to_string());
+    }
+    let bytes = event
+        .signing_bytes(placement)
+        .map_err(|error| error.to_string())?;
+    Ok(key.sign(&bytes))
 }
 
 #[tracing::instrument(
@@ -514,16 +689,49 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::DocumentSync(_) => "document_sync",
         NetEffect::Stream(_) => "stream",
         NetEffect::JobControl(_) => "job_control",
-        NetEffect::AuditPage(_) => "audit_page",
-        NetEffect::PolicyFetch(_) => "policy_fetch",
-        NetEffect::JobRecord(_) => "job_record",
-        NetEffect::LaunchOffer(_) => "launch_offer",
         NetEffect::PolicySign(_) => "policy_sign",
-        NetEffect::VaultFetch(_) => "vault_fetch",
+        NetEffect::SignDeletePlan(_) => "sign_delete_plan",
+        NetEffect::SignCountRelay(_) => "sign_count_relay",
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",
-        NetEffect::Release(_) => "release",
+        NetEffect::ExecutionSign(_) => "execution_sign",
+        NetEffect::MetadataRequest(_) => "metadata_request",
+        NetEffect::RefreshDocumentPeers(_) => "refresh_document_peers",
+        NetEffect::GrantedRead(_) => "granted_read",
+        NetEffect::DelegatedRead(_) => "delegated_read",
+        NetEffect::PeerContact(_) => "peer_contact",
+        NetEffect::GrantSign(_) => "grant_sign",
+        NetEffect::DelegationSign(_) => "delegation_sign",
+        NetEffect::AvoidHolder { .. } => "avoid_holder",
+        NetEffect::CursorSign(_) => "cursor_sign",
+        NetEffect::FederationSign(_) => "federation_sign",
+        NetEffect::OpenCredential(_) => "open_credential",
+        NetEffect::AdminSign { .. } => "admin_sign",
+        NetEffect::SealPosition(_) => "seal_position",
+        NetEffect::OpenPosition(_) => "open_position",
+        NetEffect::DrawSecret(_) => "draw_secret",
+        NetEffect::Shard(_) => "shard",
+        NetEffect::EnsureTopics { .. } => "ensure_topics",
+        NetEffect::AllowTopicPeers { .. } => "allow_topic_peers",
+        NetEffect::SyncTopic { .. } => "sync_topic",
+        NetEffect::MissingTopicPeers { .. } => "missing_topic_peers",
+        NetEffect::ConfigCatchUp(_) => "config_catch_up",
+        NetEffect::Notification(_) => "notification",
+        NetEffect::WakeInbox(_) => "wake_inbox",
+        NetEffect::Heartbeat(_) => "heartbeat",
+        NetEffect::HeartbeatSilence(_) => "heartbeat_silence",
+        NetEffect::DashboardChanged => "dashboard_changed",
+        NetEffect::RecordSuppression(_) => "record_suppression",
+        NetEffect::PeerContacts { .. } => "peer_contacts",
+        NetEffect::LocalNode => "local_node",
+        NetEffect::LocalRealm => "local_realm",
+        NetEffect::IssuerKey { .. } => "issuer_key",
+        NetEffect::WatchHolders { .. } => "watch_holders",
+        NetEffect::RegisterInterest { .. } => "register_interest",
+        NetEffect::RetractInterest(_) => "retract_interest",
+        NetEffect::ReplaceInterest(_) => "replace_interest",
+        NetEffect::UpdateRealmInterest { .. } => "update_realm_interest",
     }
 }
 
@@ -544,12 +752,44 @@ fn stream_effect_kind(effect: &StreamEffect) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Only a record naming this node as publisher is signed, and its signature verifies.
+    #[test]
+    fn signs_own_execution() {
+        use aruna_core::structs::execution::job::family::{
+            ExecutionUpdate, JobFamilyRecord, PhysicalExecutionState, SubmissionId,
+        };
+        let key = iroh::SecretKey::from_bytes(&[3; 32]);
+        let claim = |publisher| ExecutionClaim {
+            realm_id: RealmId::from_bytes([1; 32]),
+            record: JobFamilyRecord::Update(Box::new(ExecutionUpdate {
+                execution_id: ulid::Ulid::from_bytes([5; 16]),
+                submission_id: SubmissionId([6; 32]),
+                request_digest: [7; 32],
+                executor_node_id: key.public(),
+                sequence: 0,
+                previous_digest: [8; 32],
+                state: PhysicalExecutionState::Running,
+                observed_at_ms: 1,
+                result: None,
+            })),
+            publisher,
+        };
+        let ExecutionSignEvent::Signed(envelope) = sign_execution(&key, claim(key.public())) else {
+            panic!("a record of this node is signed");
+        };
+        assert!(envelope.verify_signature().is_ok());
+        let other = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        assert!(matches!(
+            sign_execution(&key, claim(other)),
+            ExecutionSignEvent::Unavailable(_)
+        ));
+    }
     use crate::test_support::make_repeated_node;
-    use aruna_core::audit::MAX_AUDIT_PEERS;
     use aruna_core::effects::{DhtEffect, DhtGetOptions, NetEffect};
     use aruna_core::events::{DhtEvent, NetEvent};
     use aruna_core::keys::realm_presence_key;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
@@ -559,13 +799,13 @@ mod tests {
             .expect("test storage");
         let realm_id = RealmId::from_bytes([seed; 32]);
         let handle = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
                 secret_key: Some(iroh::SecretKey::from_bytes(&[seed; 32])),
                 realm_id,
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             storage,
         )
@@ -573,6 +813,7 @@ mod tests {
         .expect("test net handle");
         let context = NetEffectContext {
             dht: handle.inner.dht.clone(),
+            secret_key: handle.inner.endpoint.secret_key().clone(),
             document_sync: handle.inner.document_sync.clone(),
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
@@ -609,28 +850,28 @@ mod tests {
         let second_secret = iroh::SecretKey::from_bytes(&[seed + 1; 32]);
         let second_id = second_secret.public();
         let first = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("first bind address"),
                 secret_key: Some(first_secret),
                 realm_id,
                 peer_nodes: vec![second_id],
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             first_storage,
         )
         .await
         .expect("first net handle");
         let second = crate::NetHandle::new(
-            crate::NetConfig {
+            crate::config::NetConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("second bind address"),
                 secret_key: Some(second_secret),
                 realm_id,
                 peer_nodes: vec![first.node_id()],
-                discovery_method: crate::DiscoveryMethod::None,
-                relay_method: crate::RelayMethod::None,
-                ..crate::NetConfig::default()
+                discovery_method: crate::config::DiscoveryMethod::None,
+                relay_method: crate::config::RelayMethod::None,
+                ..crate::config::NetConfig::default()
             },
             second_storage,
         )
@@ -640,6 +881,7 @@ mod tests {
         second.add_peer_addr(first.endpoint_addr()).await;
         let context = NetEffectContext {
             dht: first.inner.dht.clone(),
+            secret_key: first.inner.endpoint.secret_key().clone(),
             document_sync: first.inner.document_sync.clone(),
             presence: RealmPresenceCache::default(),
             tasks: TaskTracker::new(),
@@ -1186,35 +1428,5 @@ mod tests {
         cache.store(realm_id, vec![make_entry(4, realm_id)], start);
         cache.store(realm_id, Vec::new(), start);
         assert!(matches!(cache.serve(realm_id, start), PresenceServe::Cold));
-    }
-
-    #[test]
-    fn bounds_overflow() {
-        // A fallback batch has no completed node, so an oversized list must
-        // report the bounded prefix as missing instead of an empty page.
-        let nodes = (1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap())
-            .map(make_repeated_node)
-            .collect();
-        let batch = audit_fallback(nodes, usize::MAX);
-
-        assert!(batch.records.is_empty());
-        assert!(batch.completed_nodes.is_empty());
-        assert_eq!(batch.missing_nodes.len(), MAX_AUDIT_PEERS);
-        assert_eq!(batch.missing_overflow, 1);
-    }
-
-    #[test]
-    fn keeps_unique() {
-        let first = make_repeated_node(1);
-        let second = make_repeated_node(2);
-        let batch = audit_fallback(vec![second, first, first], usize::MAX);
-
-        let mut expected = vec![first, second];
-        expected.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-        assert_eq!(
-            batch.missing_nodes.into_iter().collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(batch.missing_overflow, 0);
     }
 }

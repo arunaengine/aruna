@@ -95,3 +95,70 @@ fn drops_credentials() {
     assert_eq!(request.url.as_str(), "https://public.example.org/v1/");
     assert_eq!(slot, None);
 }
+
+#[test]
+fn stored_answer_reads() {
+    let reply = Response {
+        status: 201,
+        headers: vec![Field {
+            name: "x-run".into(),
+            value: "7".into(),
+        }],
+        body: b"done".to_vec(),
+    };
+    let read = stored_whole(&whole_text(&reply)).unwrap();
+    assert_eq!((read.status, read.body), (201, b"done".to_vec()));
+    assert_eq!(read.headers[0].value, "7");
+    let large = stored_whole(&too_large(413)).unwrap_err();
+    assert_eq!(large.kind, ErrorKind::Limit);
+    assert!(stored_whole("{}").is_err());
+}
+
+mod connection_calls {
+    use aruna_core::outbound::ConnectionAnswer;
+
+    use super::*;
+
+    fn send() -> SendConnection {
+        let request = OutgoingRequest {
+            method: "GET".to_string(),
+            url: "https://example.org/a".parse().unwrap(),
+            headers: Vec::new(),
+        };
+        SendConnection::new(request, Vec::new())
+    }
+
+    fn answered(result: Result<ConnectionAnswer, ConnectionError>) -> IoResult {
+        let event = Event::Outbound(OutboundEvent::ConnectionAnswered { result });
+        IoResult::Event(Box::new(event))
+    }
+
+    #[test]
+    fn send_answers_status() {
+        let mut call = send();
+        let Ok(Next::Call(IoCall::Effect(effect))) = call.first() else {
+            panic!("a send is one outbound effect");
+        };
+        assert!(matches!(
+            *effect,
+            Effect::Outbound(OutboundEffect::Connection(_))
+        ));
+        let answer = ConnectionAnswer {
+            status: 204,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let done = call.next(answered(Ok(answer.clone())));
+        assert_eq!(done, Ok(Next::Done(answer)));
+    }
+
+    #[test]
+    fn send_reports_failure() {
+        let mut call = send();
+        call.first().unwrap();
+        let failed = ConnectionError::NotSent("no".to_string());
+        assert_eq!(call.next(answered(Err(failed.clone()))), Err(failed));
+        let other = call.next(IoResult::Done);
+        assert!(matches!(other, Err(ConnectionError::Unknown(_))));
+    }
+}

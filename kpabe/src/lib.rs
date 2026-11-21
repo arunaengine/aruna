@@ -14,9 +14,9 @@ extern crate std;
 
 mod crypto;
 mod encoding;
-mod envelope;
-mod policy;
-mod scheme;
+pub mod envelope;
+pub mod policy;
+pub mod scheme;
 
 #[cfg(test)]
 mod adversarial;
@@ -25,10 +25,7 @@ mod measure;
 #[cfg(test)]
 mod vectors;
 
-pub use envelope::{Envelope, open, seal};
-pub use policy::{Attribute, Policy};
-pub use scheme::{Ciphertext, KemKey, MasterSecret, PublicParameters, SecretKey, UserKey};
-pub use scheme::{decapsulate, encapsulate, issue, setup_from_seed};
+use scheme::SecretKey;
 
 /// Derives a guarded 32-byte seed with RFC 5869 HKDF-SHA256.
 pub fn derive_seed(ikm: &[u8], salt: &[u8], info: &[u8]) -> Result<SecretKey, Error> {

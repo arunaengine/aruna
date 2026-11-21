@@ -2,47 +2,50 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncRevision, DocumentTarget,
+};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::events::Event;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
-    METADATA_AUDIT_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    DOCUMENT_INDEX_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, METADATA_AUDIT_KEYSPACE,
 };
 use aruna_core::metadata::MetadataLifecycleRecord;
 use aruna_core::metadata::{
     GraphLifecycleRecord, MaterializationStatusRecord, MetadataEventRecord,
     MetadataMaterializationRecord,
 };
-pub use aruna_core::storage_entries::{
-    create_event_entry, create_projection_entries, document_job_entry, document_lifecycle_entry,
-    graph_lifecycle_entry, graph_lifecycle_key, lifecycle_manifest_entry, lifecycle_revision_entry,
-    materialization_job_entry, materialization_job_key, materialization_status_entry,
-    materialization_status_key, metadata_document_key, metadata_registry_key,
-    metadata_registry_prefix, registry_write_entries, shard_manifest_entry,
+use aruna_core::storage_entries::{
+    document_job_entry, document_lifecycle_entry, graph_lifecycle_key, lifecycle_manifest_entry,
+    lifecycle_revision_entry, materialization_job_entry, materialization_status_entry,
+    metadata_document_key, registry_write_entries, shard_manifest_entry,
 };
 use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditRecord, MetadataRegistryRecord,
 };
-use aruna_core::types::{Effects, GroupId, Key, TxnId};
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::types::{GroupId, Key, TxnId};
 use byteview::ByteView;
-use smallvec::smallvec;
+use std::time::Duration;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::storage_read::{parse_storage_iter, parse_storage_read};
+use aruna_core::placement::{registry_placement, resolve_shard_holders};
+use aruna_core::storage_entries::lifecycle_revision_change;
+use aruna_core::storage_read::parse_storage_read;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::structs::placement::record::PlacementRef;
 
-pub use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 pub const LIST_METADATA_SIZE: usize = 128;
 // Cache fills sweep whole keyspaces; large pages keep the number of storage
 // actor round trips low (the data volume is small, the trips dominate).
 pub const FILL_PAGE_SIZE: usize = 8192;
 
-pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
+pub(crate) fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Key {
     let mut bytes = Vec::with_capacity(48);
     bytes.extend_from_slice(&group_id.to_bytes());
     bytes.extend_from_slice(&document_id.to_bytes());
@@ -50,15 +53,7 @@ pub fn metadata_audit_key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) 
     ByteView::from(bytes)
 }
 
-pub fn read_registry_effect(group_id: GroupId, document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        key: metadata_registry_key(group_id, document_id),
-        txn_id,
-    })
-}
-
-pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
         key: metadata_document_key(document_id),
@@ -66,79 +61,12 @@ pub fn read_document_registry(document_id: Ulid, txn_id: Option<TxnId>) -> Effec
     })
 }
 
-pub fn read_status_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: MATERIALIZATION_STATUS_KEYSPACE.to_string(),
-        key: materialization_status_key(document_id),
-        txn_id,
-    })
-}
-
-pub fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
+pub(crate) fn read_lifecycle_effect(graph_iri: &str, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::Read {
         key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
         key: graph_lifecycle_key(graph_iri),
         txn_id,
     })
-}
-
-pub fn write_registry_effect(
-    record: &MetadataRegistryRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        key: metadata_registry_key(record.group_id, record.document_id),
-        value: postcard::to_allocvec(record)?.into(),
-        txn_id,
-    }))
-}
-
-pub fn delete_registry_effect(
-    group_id: GroupId,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        key: metadata_registry_key(group_id, document_id),
-        txn_id,
-    })
-}
-
-pub fn delete_index_effect(document_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: DOCUMENT_INDEX_KEYSPACE.to_string(),
-        key: metadata_document_key(document_id),
-        txn_id,
-    })
-}
-
-pub fn iter_registry_effect(
-    group_id: GroupId,
-    start_after: Option<Key>,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: METADATA_INDEX_KEYSPACE.to_string(),
-        prefix: Some(metadata_registry_prefix(group_id)),
-        start: start_after.map(IterStart::After),
-        limit: LIST_METADATA_SIZE,
-        txn_id,
-    })
-}
-
-pub fn write_graph_lifecycle(
-    record: &GraphLifecycleRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    let (key_space, key, value) = graph_lifecycle_entry(record)?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
-        txn_id,
-    }))
 }
 
 pub fn write_document_lifecycle(
@@ -154,12 +82,13 @@ pub fn write_document_lifecycle(
     }))
 }
 
-pub fn write_lifecycle_revision(
+/// The document lifecycle row, its sync revision and, when the bucket keeps one, its shard
+/// manifest entry.
+pub(crate) fn lifecycle_revision_entries(
     record: &MetadataLifecycleRecord,
     delete_actor: NodeId,
-    placement: aruna_core::structs::placement::record::PlacementRef,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
+    placement: PlacementRef,
+) -> Result<Vec<(String, Key, ByteView)>, ConversionError> {
     let mut writes = vec![
         document_lifecycle_entry(record)?,
         lifecycle_revision_entry(record, delete_actor, placement)?,
@@ -167,52 +96,19 @@ pub fn write_lifecycle_revision(
     if let Some(manifest) = lifecycle_manifest_entry(record, delete_actor, placement)? {
         writes.push(manifest);
     }
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes,
-        txn_id,
-    }))
+    Ok(writes)
 }
 
-pub fn delete_holders_effect(
-    group_id: GroupId,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Effect {
-    Effect::Storage(StorageEffect::Delete {
-        key_space: METADATA_HOLDERS_KEYSPACE.to_string(),
-        key: metadata_registry_key(group_id, document_id),
-        txn_id,
-    })
-}
-
-// DEFERRED (#280 audit trail): these audit records back the generic audit read endpoint;
-// the causal-event contract is the deferred remainder.
-pub fn write_audit_effect(
+/// The audit row of `record` under `audit_id`.
+pub(crate) fn audit_entry(
     record: &MetadataAuditRecord,
     audit_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space: METADATA_AUDIT_KEYSPACE.to_string(),
-        key: metadata_audit_key(record.group_id, record.document_id, audit_id),
-        value: postcard::to_allocvec(record)?.into(),
-        txn_id,
-    }))
-}
-
-pub fn write_create_effect(
-    record: &MetadataRegistryRecord,
-    audit: &MetadataAuditRecord,
-    audit_id: Ulid,
-    outbox: Option<&DocumentOutboxRecord>,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, ConversionError> {
-    let writes = create_outbox_entries(record, audit, audit_id, outbox)?;
-
-    Ok(Effect::Storage(StorageEffect::BatchWrite {
-        writes,
-        txn_id,
-    }))
+) -> Result<(String, Key, ByteView), ConversionError> {
+    Ok((
+        METADATA_AUDIT_KEYSPACE.to_string(),
+        metadata_audit_key(record.group_id, record.document_id, audit_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
 }
 
 pub fn create_outbox_entries(
@@ -228,7 +124,7 @@ pub fn create_outbox_entries(
         postcard::to_allocvec(audit)?.into(),
     ));
     if let Some(outbox) = outbox {
-        writes.push(crate::sync::document_outbox::outbox_write_entry(outbox)?);
+        writes.push(crate::sync::outbox::record::outbox_write_entry(outbox)?);
         if let Some((lifecycle, change)) = outbox_lifecycle_upsert(outbox)? {
             writes.push(lifecycle_revision_entry(
                 &lifecycle,
@@ -266,7 +162,7 @@ fn outbox_lifecycle_upsert(
     Ok(Some((lifecycle, *change)))
 }
 
-pub fn create_materialization_entries(
+pub(crate) fn create_materialization_entries(
     record: &MetadataRegistryRecord,
     audit: &MetadataAuditRecord,
     audit_id: Ulid,
@@ -281,7 +177,7 @@ pub fn create_materialization_entries(
     Ok(writes)
 }
 
-pub fn event_projection_entries(
+pub(crate) fn event_projection_entries(
     event: &MetadataEventRecord,
     audit: &MetadataAuditRecord,
     outbox: Option<&DocumentOutboxRecord>,
@@ -301,7 +197,7 @@ pub fn event_projection_entries(
     Ok(writes)
 }
 
-pub fn parse_registry_read(
+pub(crate) fn parse_registry_read(
     event: Event,
 ) -> Result<Option<MetadataRegistryRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -309,15 +205,7 @@ pub fn parse_registry_read(
     })
 }
 
-pub fn parse_status_read(
-    event: Event,
-) -> Result<Option<MaterializationStatusRecord>, StorageReadError> {
-    parse_storage_read(event, |bytes| {
-        postcard::from_bytes(bytes).map_err(ConversionError::from)
-    })
-}
-
-pub fn parse_lifecycle_read(
+pub(crate) fn parse_lifecycle_read(
     event: Event,
 ) -> Result<Option<GraphLifecycleRecord>, StorageReadError> {
     parse_storage_read(event, |bytes| {
@@ -325,67 +213,152 @@ pub fn parse_lifecycle_read(
     })
 }
 
-pub fn parse_registry_iter(
-    event: Event,
-) -> Result<(Vec<MetadataRegistryRecord>, Option<Key>), StorageReadError> {
-    parse_storage_iter(event, |bytes| {
-        postcard::from_bytes(bytes).map_err(ConversionError::from)
+/// Wakes the materialization drain at once.
+/// Wakes the projection drain after `after`.
+pub(crate) fn schedule_projection(after: Duration) -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainProjectionQueue,
+        after,
     })
 }
 
-pub fn empty_effects() -> Effects {
-    smallvec![]
+pub(crate) fn schedule_materialization() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainMaterializationQueue,
+        after: Duration::ZERO,
+    })
 }
 
-/// Untransacted batch delete of index keys in one keyspace, returning how many
-/// were dropped.
-pub async fn delete_index_keys(
-    context: &DriverContext,
-    keyspace: &str,
-    keys: Vec<Key>,
-) -> Result<usize, StorageReadError> {
-    if keys.is_empty() {
-        return Ok(0);
+/// The document's registry row, published on the registry class's own
+/// everywhere-bound topic rather than the replica-capped bucket topic, so every
+/// node learns the routing mapping. `None` without config or a holder; replay re-plans.
+pub(crate) fn registry_outbox_record(
+    event: &MetadataEventRecord,
+    realm_config: Option<&RealmConfigDocument>,
+    allow_genesis: bool,
+) -> Option<DocumentOutboxRecord> {
+    let record = &event.record;
+    let config = realm_config?;
+    let placement = registry_placement(config, record);
+    if placement == PlacementRef::NIL {
+        return None;
     }
-    let count = keys.len();
-    let deletes = keys
-        .into_iter()
-        .map(|key| (keyspace.to_string(), key))
-        .collect();
-    let event = context
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        }))
-        .await;
-    match event {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(count),
-        Event::Storage(StorageEvent::Error { error }) => Err(StorageReadError::Storage(error)),
-        _ => Err(StorageReadError::Storage(
-            aruna_core::errors::StorageError::WriteError("unexpected event".to_string()),
-        )),
+    let target = DocumentTarget::MetadataRegistry {
+        group_id: record.group_id,
+        document_id: record.document_id,
+    };
+    let peers = resolve_shard_holders(config, &placement);
+    if peers.is_empty() {
+        return None;
     }
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: record.updated_at_ms,
+            event_id: event.event_id,
+            actor: event.node_id,
+            updated_at_ms: record.updated_at_ms,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement,
+    };
+    Some(DocumentOutboxRecord {
+        outbox_id: event.event_id,
+        node_id: event.node_id,
+        target,
+        peers,
+        event: DocumentOutboxEvent::Upsert {
+            bytes: postcard::to_allocvec(record).expect("metadata registry record serializes"),
+            change,
+        },
+        placement,
+        generation: 0,
+        updated_at: event.occurred_at_ms / 1_000,
+        allow_genesis,
+        incarnation: None,
+    })
+}
+
+pub(crate) fn create_outbox_record(
+    event: &MetadataEventRecord,
+    message: Option<&str>,
+    realm_config: Option<&RealmConfigDocument>,
+    allow_genesis: bool,
+) -> DocumentOutboxRecord {
+    let lifecycle = MetadataLifecycleRecord::for_event(event.clone(), message.map(str::to_owned));
+    let target = DocumentTarget::MetadataDocumentLifecycle {
+        document_id: event.record.document_id,
+    };
+    // The bucket is the one the create stamped; peers are its live holders, so a publish after
+    // a rebalance targets the current holder set and not the event-time one.
+    let placement = event.record.placement;
+    let peers = realm_config
+        .map(|config| resolve_shard_holders(config, &placement))
+        .unwrap_or_default();
+    let change = lifecycle_revision_change(&lifecycle, event.node_id, placement);
+    DocumentOutboxRecord {
+        outbox_id: event.event_id,
+        node_id: event.node_id,
+        target,
+        peers,
+        event: DocumentOutboxEvent::Upsert {
+            bytes: postcard::to_allocvec(&lifecycle)
+                .expect("metadata document lifecycle event serializes"),
+            change,
+        },
+        placement,
+        generation: 0,
+        updated_at: event.occurred_at_ms / 1_000,
+        allow_genesis,
+        incarnation: None,
+    }
+}
+
+/// Wakes the prune drain at once.
+pub(crate) fn schedule_prune_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainPruneQueue,
+        after: Duration::ZERO,
+    })
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::metadata::projector::create_outbox_record;
-    use crate::sync::document_outbox::outbox_key;
+    use crate::sync::outbox::record::outbox_key;
     use aruna_core::document::{DocumentChange, DocumentChangeKind};
+    use aruna_core::keyspaces::DOCUMENT_INDEX_KEYSPACE;
+    use aruna_core::keyspaces::METADATA_HOLDERS_KEYSPACE;
+    use aruna_core::keyspaces::METADATA_INDEX_KEYSPACE;
     use aruna_core::keyspaces::{
         SHARD_MANIFEST_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_REVISION_KEYSPACE,
         UPDATED_INDEX_KEYSPACE,
     };
     use aruna_core::metadata::MetadataEventPayload;
-    use aruna_core::storage_entries::{shard_manifest_key, sync_revision_key, updated_index_key};
+    use aruna_core::storage_entries::{
+        metadata_registry_key, shard_manifest_key, sync_revision_key, updated_index_key,
+    };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
 
     fn node(seed: u8) -> NodeId {
         NodeId::from_bytes(&[seed; 32]).expect("node id")
+    }
+
+    fn write_create_effect(
+        record: &MetadataRegistryRecord,
+        audit: &MetadataAuditRecord,
+        audit_id: Ulid,
+        outbox: Option<&DocumentOutboxRecord>,
+        txn_id: Option<TxnId>,
+    ) -> Result<Effect, ConversionError> {
+        let writes = create_outbox_entries(record, audit, audit_id, outbox)?;
+
+        Ok(Effect::Storage(StorageEffect::BatchWrite {
+            writes,
+            txn_id,
+        }))
     }
 
     fn outbox_fixture() -> (

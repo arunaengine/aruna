@@ -3,9 +3,15 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::structs::storage::data::link::{set_versions_key, truncated_key};
 use aruna_core::structs::storage::global_id::GlobalId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_storage::storage::handle::StorageHandle;
 use tempfile::tempdir;
+
+use crate::tests::calls::{child, runs_child};
 
 const GRAPH: &str = "https://example.org/graph/1";
 const HAS_PART: &str = "http://schema.org/hasPart";
@@ -29,20 +35,6 @@ fn triple(subject: &str, predicate: &str, object: &str) -> (String, String, Stri
         predicate.to_string(),
         object.to_string(),
     )
-}
-
-fn scope() -> LinkScope {
-    LinkScope::Set {
-        realm_id: realm(),
-        set_id: Ulid::from_bytes([5; 16]),
-    }
-}
-
-fn budget() -> LinkBudget {
-    LinkBudget {
-        seeks: 64,
-        rows: 1024,
-    }
 }
 
 #[test]
@@ -90,6 +82,77 @@ fn descriptor_names_root() {
     assert!(links[&DataLink::parse(&folder).unwrap()].part);
 }
 
+/// Writes and deletes rows outside a transaction, as fixtures.
+pub(crate) async fn apply_rows(
+    storage: &StorageHandle,
+    rows: LinkRows,
+) -> Result<(), DataLinkError> {
+    let writes = StorageEffect::BatchWrite {
+        writes: rows.writes,
+        txn_id: None,
+    };
+    let deletes = StorageEffect::BatchDelete {
+        deletes: rows.deletes,
+        txn_id: None,
+    };
+    for effect in [writes, deletes] {
+        match storage.send_storage_effect(effect).await {
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+            | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {}
+            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
+            other => return Err(DataLinkError::UnexpectedEvent(other.label().to_string())),
+        }
+    }
+    Ok(())
+}
+
+/// The rows of the data link keyspace below `prefix`.
+async fn rows_below(storage: &StorageHandle, prefix: Vec<u8>) -> Vec<(ByteView, ByteView)> {
+    let scan = StorageEffect::Iter {
+        key_space: DATA_LINK_KEYSPACE.to_string(),
+        prefix: Some(prefix.into()),
+        start: None,
+        limit: 64,
+        txn_id: None,
+    };
+    match storage.send_storage_effect(scan).await {
+        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+        other => panic!("expected the rows, got {}", other.label()),
+    }
+}
+
+fn context(storage: &StorageHandle) -> DriverContext {
+    DriverContext::storage_only(storage.clone())
+}
+
+async fn plan_link_rows(
+    storage: &StorageHandle,
+    document_id: Ulid,
+    links: &BTreeMap<DataLink, LinkPosting>,
+) -> Result<LinkRows, DataLinkError> {
+    let rows = LinkRowsOperation::new(document_id, links.clone());
+    drive(rows, &context(storage)).await
+}
+
+async fn document_rows(
+    storage: &StorageHandle,
+    key_space: &'static str,
+    document_id: Ulid,
+) -> Result<Vec<Vec<u8>>, DataLinkError> {
+    let rows = DocumentRowsOperation::new(key_space, document_id);
+    drive(rows, &context(storage)).await
+}
+
+async fn settle_unverified(
+    storage: &StorageHandle,
+    (key, value): (&ByteView, &ByteView),
+    document_id: Ulid,
+    link: Option<DataLink>,
+) -> Result<(), DataLinkError> {
+    let settle = SettleUnverifiedOperation::new((key.clone(), value.clone()), document_id, link);
+    drive(settle, &context(storage)).await
+}
+
 async fn stored(rows: LinkRows, storage: &StorageHandle) {
     apply_rows(storage, rows).await.unwrap();
 }
@@ -97,7 +160,8 @@ async fn stored(rows: LinkRows, storage: &StorageHandle) {
 #[tokio::test]
 async fn replaces_own_postings() {
     let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document = Ulid::from_bytes([9; 16]);
     let first = project_links(
         GRAPH,
@@ -123,153 +187,13 @@ async fn replaces_own_postings() {
     assert_eq!(rows.deletes.len(), 2);
     stored(rows, &storage).await;
 
-    let mut budget = budget();
     let a = DataLink::parse(&set_url("a/")).unwrap().key();
-    let (gone, _) = read_postings(&storage, &a, None, 10, &mut budget)
-        .await
-        .unwrap();
-    assert!(gone.is_empty());
+    assert!(rows_below(&storage, a).await.is_empty());
     let b = DataLink::parse(&set_url("b/")).unwrap().key();
-    let (kept, more) = read_postings(&storage, &b, None, 10, &mut budget)
-        .await
-        .unwrap();
+    let kept = rows_below(&storage, b).await;
     assert_eq!(kept.len(), 1);
-    assert_eq!(kept[0].1.cursor, Ulid::from_bytes([2; 16]));
-    assert!(!more);
-}
-
-#[tokio::test]
-async fn probes_used_lengths() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    for (seed, prefix) in [(1u8, ""), (2, "raw/"), (3, "raw/2026/"), (4, "other/")] {
-        let links = project_links(
-            GRAPH,
-            Ulid::nil(),
-            &[triple(GRAPH, HAS_PART, &set_url(prefix))],
-        );
-        let rows = plan_link_rows(&storage, Ulid::from_bytes([seed; 16]), &links)
-            .await
-            .unwrap();
-        stored(rows, &storage).await;
-    }
-    let mut budget = budget();
-    let (links, complete) = key_prefixes(&storage, &scope(), "raw/2026/a.fastq", &mut budget)
-        .await
-        .unwrap();
-    assert!(complete);
-    let prefixes: Vec<_> = links
-        .iter()
-        .map(|link| link.scope().unwrap().1.to_string())
-        .collect();
-    // The length of `other/` is probed as `raw/20`; no key outside the used lengths is read.
-    assert_eq!(prefixes, vec!["", "raw/", "raw/20", "raw/2026/"]);
-    // One seek per used length plus the final miss.
-    assert_eq!(budget.seeks, 64 - 5);
-}
-
-#[tokio::test]
-async fn budget_marks_incomplete() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    for (seed, prefix) in [(1u8, "a"), (2, "ab"), (3, "abc")] {
-        let links = project_links(
-            GRAPH,
-            Ulid::nil(),
-            &[triple(GRAPH, HAS_PART, &set_url(prefix))],
-        );
-        let rows = plan_link_rows(&storage, Ulid::from_bytes([seed; 16]), &links)
-            .await
-            .unwrap();
-        stored(rows, &storage).await;
-    }
-    let mut budget = LinkBudget { seeks: 2, rows: 10 };
-    let (links, complete) = key_prefixes(&storage, &scope(), "abcd", &mut budget)
-        .await
-        .unwrap();
-    assert!(!complete);
-    assert_eq!(links.len(), 2);
-}
-
-#[tokio::test]
-async fn deletion_leaves_nothing() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let document = Ulid::from_bytes([7; 16]);
-    let links = project_links(
-        GRAPH,
-        Ulid::nil(),
-        &[triple(GRAPH, HAS_PART, &set_url("a/"))],
-    );
-    stored(
-        plan_link_rows(&storage, document, &links).await.unwrap(),
-        &storage,
-    )
-    .await;
-    delete_documents(&storage, &BTreeSet::from([document]))
-        .await
-        .unwrap();
-    assert!(
-        document_rows(&storage, DOCUMENT_LINK_KEYSPACE, document)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    let mut budget = budget();
-    let key = DataLink::parse(&set_url("a/")).unwrap().key();
-    let (postings, _) = read_postings(&storage, &key, None, 10, &mut budget)
-        .await
-        .unwrap();
-    assert!(postings.is_empty());
-}
-
-#[tokio::test]
-async fn pages_both_ranges() {
-    let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let set_id = Ulid::from_bytes([5; 16]);
-    let mut links = project_links(
-        GRAPH,
-        Ulid::nil(),
-        &[triple(GRAPH, HAS_PART, &set_url("a/"))],
-    );
-    links.insert(
-        DataLink::SetVersion {
-            realm_id: realm(),
-            set_id,
-            version_id: Ulid::from_bytes([8; 16]),
-        },
-        LinkPosting::default(),
-    );
-    links.insert(
-        DataLink::Unverified {
-            realm_id: realm(),
-            version_id: Ulid::from_bytes([6; 16]),
-        },
-        LinkPosting::default(),
-    );
-    let rows = plan_link_rows(&storage, Ulid::from_bytes([1; 16]), &links)
-        .await
-        .unwrap();
-    stored(rows, &storage).await;
-
-    // One row per page walks the prefix range first, then the verified versions.
-    let (first, next) = set_postings(&storage, &scope(), set_id, None, 1)
-        .await
-        .unwrap();
-    assert_eq!(first.len(), 1);
-    assert!(first[0].0.starts_with(&scope().key()));
-    let (second, next) = set_postings(&storage, &scope(), set_id, next, 1)
-        .await
-        .unwrap();
-    assert_eq!(second.len(), 1);
-    assert!(second[0].0.starts_with(&set_versions_key(set_id)));
-    let (rest, end) = set_postings(&storage, &scope(), set_id, next, 1)
-        .await
-        .unwrap();
-    assert!(rest.is_empty());
-    assert_eq!(end, None);
-    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
+    let posting = LinkPosting::from_bytes(&kept[0].1).unwrap();
+    assert_eq!(posting.cursor, Ulid::from_bytes([2; 16]));
 }
 
 // A document over the link limit keeps a marker, so lookups never claim to be complete.
@@ -283,7 +207,8 @@ async fn truncation_is_marked() {
     assert_eq!(links.len(), MAX_DOCUMENT_LINKS + 1);
 
     let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let document = Ulid::from_bytes([1; 16]);
     let marked = BTreeMap::from([(DataLink::Truncated, LinkPosting::default())]);
     stored(
@@ -291,20 +216,21 @@ async fn truncation_is_marked() {
         &storage,
     )
     .await;
-    assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 1);
+    assert_eq!(rows_below(&storage, truncated_key()).await.len(), 1);
     // A later projection within the limit drops the marker with the document's other rows.
     let rows = plan_link_rows(&storage, document, &BTreeMap::new())
         .await
         .unwrap();
     stored(rows, &storage).await;
-    assert_eq!(truncated_documents(&storage, 10).await.unwrap(), 0);
+    assert_eq!(rows_below(&storage, truncated_key()).await.len(), 0);
 }
 
 // A verified retry moves the posting to its set; a newer materialization's row is kept.
 #[tokio::test]
 async fn retry_settles_unverified() {
     let dir = tempdir().unwrap();
-    let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage =
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let (document, version_id, set_id) = (
         Ulid::from_bytes([1; 16]),
         Ulid::from_bytes([6; 16]),
@@ -332,7 +258,7 @@ async fn retry_settles_unverified() {
     settle_unverified(&storage, (&key, &stale), document, None)
         .await
         .unwrap();
-    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 1);
+    assert_eq!(rows_below(&storage, unverified_key()).await.len(), 1);
 
     let verified = DataLink::SetVersion {
         realm_id: realm(),
@@ -343,14 +269,181 @@ async fn retry_settles_unverified() {
     settle_unverified(&storage, (&key, &value), document, Some(verified))
         .await
         .unwrap();
-    assert_eq!(unverified_versions(&storage, 10).await.unwrap(), 0);
-    let (rows, _) = set_postings(&storage, &scope(), set_id, None, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows_below(&storage, unverified_key()).await.len(), 0);
+    assert_eq!(
+        rows_below(&storage, set_versions_key(set_id)).await.len(),
+        1
+    );
     // The document's own rows name the set posting, so its next projection replaces it.
     let rows = document_rows(&storage, DOCUMENT_LINK_KEYSPACE, document)
         .await
         .unwrap();
     assert_eq!(rows, vec![posting_key(&verified_key, document)]);
+}
+
+fn version() -> Ulid {
+    Ulid::from_parts(9, 9)
+}
+
+fn posting() -> LinkPosting {
+    LinkPosting {
+        cursor: Ulid::from_parts(1, 1),
+        part: false,
+        subjects: vec!["#file".to_string()],
+    }
+}
+
+fn version_link() -> DataLink {
+    DataLink::Version {
+        realm_id: realm(),
+        version_id: version(),
+    }
+}
+
+// One local set whose hint matches the version, so the version index is read there.
+fn members(set_id: Ulid) -> BTreeMap<SetHint, Vec<Ulid>> {
+    BTreeMap::from([(SetHint::of_version(version()), vec![set_id])])
+}
+
+fn index_read(set_id: Ulid) -> IoCall {
+    let key = Key::from(index_key(set_id, version()));
+    IoCall::Read(vec![(VERSION_INDEX_KEYSPACE.to_string(), key)])
+}
+
+#[test]
+fn members_empty_page() {
+    let mut local = LocalMembersOperation::new();
+    let page = page_call(DISTRIBUTION_KEYSPACE, Vec::new(), None);
+    assert_eq!(local.first(), Ok(Next::Call(page)));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(local.next(empty), Ok(Next::Done(BTreeMap::new())));
+}
+
+#[test]
+fn members_skip_malformed() {
+    let mut local = LocalMembersOperation::new();
+    local.first().unwrap();
+    let after = Key::from(vec![2]);
+    let malformed = IoResult::Page {
+        rows: vec![(Key::from(vec![1]), ByteView::from(vec![0xff]))],
+        next: Some(after.clone()),
+    };
+    let page = page_call(DISTRIBUTION_KEYSPACE, Vec::new(), Some(after));
+    assert_eq!(local.next(malformed), Ok(Next::Call(page)));
+}
+
+#[test]
+fn no_versions_done() {
+    let link = DataLink::SetPrefix {
+        realm_id: realm(),
+        set_id: Ulid::from_parts(5, 5),
+        prefix: String::new(),
+    };
+    let links = BTreeMap::from([(link, posting())]);
+    let mut associate = AssociateVersionsOperation::new(links.clone());
+    assert_eq!(associate.first(), Ok(Next::Done(links)));
+}
+
+#[test]
+fn unknown_version_unverified() {
+    let mut associate =
+        AssociateVersionsOperation::new(BTreeMap::from([(version_link(), posting())]));
+    assert!(runs_child(associate.first()));
+    let none = child(Ok::<_, DataLinkError>(BTreeMap::<SetHint, Vec<Ulid>>::new()));
+    let unverified = DataLink::Unverified {
+        realm_id: realm(),
+        version_id: version(),
+    };
+    let expected = BTreeMap::from([(version_link(), posting()), (unverified, posting())]);
+    assert_eq!(associate.next(none), Ok(Next::Done(expected)));
+}
+
+#[test]
+fn indexed_version_verified() {
+    let set_id = Ulid::from_parts(5, 5);
+    let mut associate =
+        AssociateVersionsOperation::new(BTreeMap::from([(version_link(), posting())]));
+    associate.first().unwrap();
+    let local = child(Ok::<_, DataLinkError>(members(set_id)));
+    assert_eq!(associate.next(local), Ok(Next::Call(index_read(set_id))));
+    let found = IoResult::Values(vec![Some(ByteView::from(Vec::new()))]);
+    let verified = DataLink::SetVersion {
+        realm_id: realm(),
+        set_id,
+        version_id: version(),
+    };
+    let expected = BTreeMap::from([(version_link(), posting()), (verified, posting())]);
+    assert_eq!(associate.next(found), Ok(Next::Done(expected)));
+}
+
+fn unverified_row() -> (Key, ByteView) {
+    let link = DataLink::Unverified {
+        realm_id: realm(),
+        version_id: version(),
+    };
+    let key = posting_key(&link.key(), Ulid::from_parts(3, 3));
+    (
+        Key::from(key),
+        ByteView::from(posting().to_bytes().unwrap()),
+    )
+}
+
+#[test]
+fn retry_empty_page() {
+    let mut retry = RetryUnverifiedOperation::new(None, None);
+    let page = IoCall::Page {
+        space: DATA_LINK_KEYSPACE.to_string(),
+        prefix: Key::from(unverified_key()),
+        after: None,
+        limit: RETRY_PAGE,
+    };
+    assert_eq!(retry.first(), Ok(Next::Call(page)));
+    let empty = IoResult::Page {
+        rows: Vec::new(),
+        next: None,
+    };
+    assert_eq!(retry.next(empty), Ok(Next::Done(None)));
+}
+
+#[test]
+fn retry_settles_local() {
+    let set_id = Ulid::from_parts(5, 5);
+    let mut retry = RetryUnverifiedOperation::new(None, None);
+    retry.first().unwrap();
+    let after = Key::from(vec![7]);
+    let page = IoResult::Page {
+        rows: vec![unverified_row()],
+        next: Some(after),
+    };
+    assert!(runs_child(retry.next(page)));
+    let local = child(Ok::<_, DataLinkError>(members(set_id)));
+    assert_eq!(retry.next(local), Ok(Next::Call(index_read(set_id))));
+    let found = IoResult::Values(vec![Some(ByteView::from(Vec::new()))]);
+    assert!(runs_child(retry.next(found)));
+    let settled = child(Ok::<(), DataLinkError>(()));
+    assert_eq!(retry.next(settled), Ok(Next::Done(Some(vec![7]))));
+}
+
+#[test]
+fn retry_skips_conflict() {
+    let mut retry = RetryUnverifiedOperation::new(None, None);
+    retry.first().unwrap();
+    let page = IoResult::Page {
+        rows: vec![unverified_row()],
+        next: None,
+    };
+    retry.next(page).unwrap();
+    let set_id = Ulid::from_parts(5, 5);
+    retry
+        .next(child(Ok::<_, DataLinkError>(members(set_id))))
+        .unwrap();
+    retry
+        .next(IoResult::Values(vec![Some(ByteView::from(Vec::new()))]))
+        .unwrap();
+    let conflict = DataLinkError::Storage(StorageError::TransactionConflict);
+    let lost = child(Err::<(), _>(conflict));
+    assert_eq!(retry.next(lost), Ok(Next::Done(None)));
 }

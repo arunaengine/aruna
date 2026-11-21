@@ -2,21 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::versions::{
     BranchList, BranchView, MergeConflictView, MergeView, NamedView, TagList, VersionView,
-    expected, failure, named_view, store, version_view,
+    expected, failure, named_view, version_view,
 };
-use crate::auth::{require_realm_auth, require_unrestricted_auth};
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_drivers::driver::drive;
 use aruna_operations::git::GitError;
 use aruna_operations::git::merge::{self, Merged};
 use aruna_operations::git::versions::{self, Named, WriteOptions};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -70,11 +71,11 @@ fn merge_view(merged: Merged) -> MergeView {
               (status = 404, description = "Document missing or not held by this node")))]
 pub async fn branches(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::branches(&state.get_ctx(), store(&state)?, &auth, id).await;
+    let branches = versions::branches(&git_node(&state), &auth, id);
+    let result = drive(branches, &state.get_ctx()).await;
     Ok(match result {
         Ok(heads) => Json(BranchList {
             branches: heads
@@ -104,22 +105,20 @@ pub async fn branches(
               (status = 409, description = "The branch already exists")))]
 pub async fn create_branch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Json(request): Json<CreateBranch>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let name = format!("refs/heads/{}", request.name);
-    let result = versions::change_ref(
-        &state.get_ctx(),
-        store(&state)?,
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         name,
         Some(&request.from),
         None,
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(created(result, &request.name))
 }
 
@@ -157,21 +156,19 @@ fn deleted(result: Result<Named, GitError>) -> Response {
               (status = 412, description = "The branch moved")))]
 pub async fn delete_branch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, name)): Path<(Ulid, String)>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::change_ref(
-        &state.get_ctx(),
-        store(&state)?,
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         format!("refs/heads/{name}"),
         None,
         expected(&headers).as_deref(),
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(deleted(result))
 }
 
@@ -190,31 +187,29 @@ pub async fn delete_branch(
               (status = 412, description = "The branch moved")))]
 pub async fn edit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((id, name)): Path<(Ulid, String)>,
     headers: HeaderMap,
     Json(request): Json<EditDraft>,
 ) -> ServerResult<Response> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     if !request.rocrate.is_object() {
         return Err(ServerError::BadRequestMessage(
             "rocrate must be a JSON-LD object".into(),
         ));
     }
     let jsonld = serde_json::to_string(&request.rocrate).map_err(|_| ServerError::BadRequest)?;
-    let result = merge::edit(
-        &state.get_ctx(),
-        store(&state)?,
+    let edit = merge::edit(
+        &git_node(&state),
         &auth,
         id,
         &name,
         jsonld,
         WriteOptions {
             message: request.message,
-            expected: expected(&headers).as_deref(),
+            expected: expected(&headers),
         },
-    )
-    .await;
+    );
+    let result = drive(edit, &state.get_ctx()).await;
     Ok(match result {
         Ok(version) => Json(version_view(version)).into_response(),
         Err(error) => failure(error),
@@ -236,25 +231,23 @@ pub async fn edit(
               (status = 412, description = "The target branch moved")))]
 pub async fn merge(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, name)): Path<(Ulid, String)>,
     headers: HeaderMap,
     Json(request): Json<MergeBranch>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = merge::merge(
-        &state.get_ctx(),
-        store(&state)?,
+    let merge = merge::merge(
+        &git_node(&state),
         &auth,
         id,
         &format!("refs/heads/{name}"),
         &request.into,
         WriteOptions {
             message: request.message,
-            expected: expected(&headers).as_deref(),
+            expected: expected(&headers),
         },
-    )
-    .await;
+    );
+    let result = drive(merge, &state.get_ctx()).await;
     Ok(match result {
         Ok(merged) => Json(merge_view(merged)).into_response(),
         Err(error) => failure(error),
@@ -270,11 +263,11 @@ pub async fn merge(
               (status = 404, description = "Document missing or not held by this node")))]
 pub async fn tags(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::tags(&state.get_ctx(), store(&state)?, &auth, id).await;
+    let tags = versions::tags(&git_node(&state), &auth, id);
+    let result = drive(tags, &state.get_ctx()).await;
     Ok(match result {
         Ok(names) => Json(TagList {
             tags: names.into_iter().map(named_view).collect(),
@@ -296,21 +289,19 @@ pub async fn tags(
               (status = 409, description = "The tag already exists")))]
 pub async fn create_tag(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Json(request): Json<CreateTag>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::change_ref(
-        &state.get_ctx(),
-        store(&state)?,
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         format!("refs/tags/{}", request.name),
         Some(&request.version),
         None,
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(created(result, &request.name))
 }
 
@@ -326,21 +317,19 @@ pub async fn create_tag(
               (status = 412, description = "The tag names another version")))]
 pub async fn delete_tag(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, name)): Path<(Ulid, String)>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::change_ref(
-        &state.get_ctx(),
-        store(&state)?,
+    let change = versions::change_ref(
+        &git_node(&state),
         &auth,
         id,
         format!("refs/tags/{name}"),
         None,
         expected(&headers).as_deref(),
-    )
-    .await;
+    );
+    let result = drive(change, &state.get_ctx()).await;
     Ok(deleted(result))
 }
 
@@ -358,21 +347,13 @@ pub async fn delete_tag(
               (status = 412, description = "The branch moved")))]
 pub async fn merge_conflict(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, conflict)): Path<(Ulid, Ulid)>,
     headers: HeaderMap,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let expected = expected(&headers);
-    let git = store(&state)?;
-    let result = merge::resolve_conflict(
-        &state.get_ctx(),
-        git,
-        &auth,
-        (id, conflict),
-        expected.as_deref(),
-    )
-    .await;
+    let resolve =
+        merge::resolve_conflict(&git_node(&state), &auth, (id, conflict), expected(&headers));
+    let result = drive(resolve, &state.get_ctx()).await;
     Ok(match result {
         Ok(merged) => Json(merge_view(merged)).into_response(),
         Err(error) => failure(error),
@@ -389,14 +370,16 @@ pub async fn merge_conflict(
               (status = 404, description = "Conflict missing")))]
 pub async fn discard_conflict(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, conflict)): Path<(Ulid, Ulid)>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let context = state.get_ctx();
-    let git = store(&state)?;
-    let result = match versions::conflict_ref(&context, git, &auth, id, conflict).await {
-        Ok(name) => versions::change_ref(&context, git, &auth, id, name, None, None).await,
+    let node = git_node(&state);
+    let result = match drive(versions::conflict_ref(&node, &auth, id, conflict), &context).await {
+        Ok(name) => {
+            let change = versions::change_ref(&node, &auth, id, name, None, None);
+            drive(change, &context).await
+        }
         Err(error) => Err(error),
     };
     Ok(deleted(result))

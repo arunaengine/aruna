@@ -4,23 +4,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{
-    OBJECT_PATH, Share, TokioBlocking, WORKING_SET, cipher, key_mode, pithos_level, working_set,
-    write_error,
+    OBJECT_PATH, Share, TokioBlocking, cipher, key_mode, pithos_level, working_set, write_error,
 };
 use crate::blob::BlobHandler;
 use crate::blob::backend::build_part_path;
 use crate::blob::io::compose_chunk;
-use crate::hash::Hasher;
-use aruna_core::UserId;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
 use aruna_core::structs::storage::multipart::{
     MAX_PART_SIZE, MultipartPart, MultipartPartKey, PartPiece, UploadEncryption, WorkingShare,
 };
+use aruna_core::structs::storage::pithos::{MAX_SIZE, WORKING_SET};
+use aruna_core::user::id::UserId;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use opendal::{Operator, Writer};
@@ -271,8 +271,8 @@ impl BlobHandler {
         // The completion reserved before it loaded the piece records and keeps it until here.
         let content = parts.iter().map(|part| part.location.blob_size).sum();
         // One supported size for every sealed copy, so any of them can be re-encoded later.
-        if content > super::MAX_SIZE {
-            let limit = super::MAX_SIZE;
+        if content > MAX_SIZE {
+            let limit = MAX_SIZE;
             return BlobEvent::Error(BlobError::SizeLimitExceeded { limit });
         }
         if working_set(content) > share.bytes {

@@ -3,10 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_compute::ExecutorRegistry;
-use aruna_compute::executor::{BackendCaps, ExecutorBackend, SessionChannel};
-use aruna_compute::session::{SessionConfig, SessionPhase};
-use aruna_core::UserId;
+use crate::auth::UnrestrictedAuth;
+use crate::tests::execution::auth_for;
+use aruna_compute::executor::{ExecutorBackend, SessionChannel};
+use aruna_compute::registry::ExecutorRegistry;
+use aruna_compute::session::{Session, SessionConfig};
+use aruna_core::compute::offer::BackendCaps;
+use aruna_core::compute::session::SessionPhase;
 use aruna_core::compute::{
     AttemptRef, AttemptStatus, BackendError, CancelEvidence, ExecutorKind, FenceContext, LogLimits,
     LogTails, NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, UserSpec,
@@ -17,8 +20,10 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{
-    CollisionPolicy, ComputeResources, ExecutionSpec, JobId, SessionReportDetail, SessionReportRow,
+use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, PLACEMENT_POLICY_KEYSPACE};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CollisionPolicy, ComputeResources, ExecutionSpec, SessionReportDetail, SessionReportRow,
 };
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -27,19 +32,31 @@ use aruna_core::structs::execution::staging::{
 };
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+};
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy::document::{
+    PlacementPolicyDocument, PolicyPublicationClaim, placement_policy_key,
+};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicy, PlacementPolicyRef, PlacementSelector, PlacementSubject, VerifiedPolicy,
 };
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::{
-    ClaimOutcome, cancel_running_job, claim_job, insert_job, put_job_entry, read_job_record,
-};
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_operations::jobs::store::JobMutation;
+use aruna_operations::jobs::store::job_calls::{ClaimOutcome, change_job};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_support::jobs::insert_job;
+use aruna_test_support::jobs::put_job_entry;
+use aruna_test_support::jobs::{cancel_running_job, claim_job, read_job_record};
 use async_trait::async_trait;
 use byteview::ByteView;
 use std::collections::{BTreeMap, HashMap};
@@ -157,15 +174,6 @@ fn user(seed: u8) -> UserId {
     UserId::new(ulid::Ulid::from_bytes([seed; 16]), realm())
 }
 
-fn auth_for(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
-}
-
 fn session_spec() -> ExecutionSpec {
     let mut tags = BTreeMap::new();
     tags.insert(
@@ -188,6 +196,7 @@ fn session_spec() -> ExecutionSpec {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -205,14 +214,15 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     let backend = Arc::new(FakeBackend {
         helper: AsyncMutex::new(Some(node_side)),
     });
-    let registry = Arc::new(ExecutorRegistry::new().with_backend(backend.clone()));
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", backend.clone()));
     let ctx = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: Some(registry.clone()),
+        outbound_handle: None,
     });
     let job_id = JobId::from_bytes([3u8; 16]);
     let mut record = JobRecord::new(
@@ -226,9 +236,7 @@ async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexS
     );
     record.state = JobState::Running;
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&ctx.storage_handle, &record)
-        .await
-        .expect("the job is stored");
+    insert_job(&ctx, &record).await.expect("the job is stored");
     registry.sessions().open(
         SessionConfig {
             job_id: job_id.to_string(),
@@ -288,7 +296,7 @@ async fn hides_foreign_job() {
     let (_dir, state, job_id, _helper) = build_node(owner).await;
     let response = get_session(
         State(state),
-        Extension(auth_for(user(9))),
+        UnrestrictedAuth(auth_for(user(9)).expect("a signed-in caller")),
         Path(job_id.to_string()),
     )
     .await;
@@ -301,7 +309,7 @@ async fn hides_unknown_job() {
     let (_dir, state, _job_id, _helper) = build_node(owner).await;
     let response = get_session(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(JobId::from_bytes([8u8; 16]).to_string()),
     )
     .await;
@@ -311,15 +319,16 @@ async fn hides_unknown_job() {
 #[tokio::test]
 async fn refuses_restricted_token() {
     let owner = user(2);
-    let (_dir, state, job_id, _helper) = build_node(owner).await;
+    let (_dir, state, _job, _helper) = build_node(owner).await;
     let auth = Some(AuthContext {
         user_id: owner,
         realm_id: realm(),
         path_restrictions: Some(Vec::new()),
         session: None,
     });
-    let response = get_session(State(state), Extension(auth), Path(job_id.to_string())).await;
-    assert!(matches!(response, Err(ServerError::Forbidden)));
+    // `get_session` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let response = crate::auth::extract::<UnrestrictedAuth>(&state, auth).await;
+    assert_eq!(response.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[tokio::test]
@@ -329,7 +338,7 @@ async fn refuses_early_cells() {
     let (_dir, state, job_id, _helper) = build_node(owner).await;
     let response = submit_cell(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SubmitCellRequest {
             cell_id: "c1".to_string(),
@@ -348,7 +357,7 @@ async fn refuses_unregistered_cell() {
     drop_session(&state, job_id);
     let response = submit_cell(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SubmitCellRequest {
             cell_id: "c1".to_string(),
@@ -368,7 +377,7 @@ async fn limits_submit_burst() {
     for index in 0..aruna_core::compute::session::MAX_SUBMITS {
         let response = submit_cell(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(job_id.to_string()),
             Json(SubmitCellRequest {
                 cell_id: format!("c{index}"),
@@ -381,7 +390,7 @@ async fn limits_submit_burst() {
     }
     let refused = submit_cell(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SubmitCellRequest {
             cell_id: "late".to_string(),
@@ -401,7 +410,7 @@ async fn busy_cell_conflicts() {
     for expected in [StatusCode::ACCEPTED, StatusCode::CONFLICT] {
         let response = submit_cell(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(job_id.to_string()),
             Json(SubmitCellRequest {
                 cell_id: "c1".to_string(),
@@ -422,7 +431,7 @@ async fn resumes_from_after() {
     make_ready(&state, job_id, &mut helper).await;
     let response = stream_session(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Query(EventsQuery { after: Some(1) }),
         HeaderMap::new(),
@@ -457,7 +466,7 @@ async fn stream_reports_gap() {
     assert!(session.subscribe(1).is_err(), "the ring rolled over");
     let response = stream_session(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Query(EventsQuery { after: Some(1) }),
         HeaderMap::new(),
@@ -477,7 +486,7 @@ async fn end_answers_status() {
     for _ in 0..2 {
         let response = end_session(
             State(state.clone()),
-            Extension(auth_for(owner)),
+            UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
             Path(job_id.to_string()),
         )
         .await
@@ -519,7 +528,7 @@ async fn finished_job_ends() {
     record.state = JobState::Cancelled;
     record.finished_at_ms = Some(2_000);
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&state.get_ctx().storage_handle, &record)
+    insert_job(&state.get_ctx(), &record)
         .await
         .expect("the settled job is stored");
     let body = session_body(&state, owner, settled).await;
@@ -535,7 +544,7 @@ async fn reported_reason_wins() {
     // The reason the workflow recorded beats the state's own default.
     let owner = user(2);
     let (_dir, state, _job_id, _helper) = build_node(owner).await;
-    let storage = state.get_ctx().storage_handle.clone();
+    let context = state.get_ctx();
     let settled = JobId::from_bytes([5u8; 16]);
     let mut record = JobRecord::new(
         settled,
@@ -547,10 +556,10 @@ async fn reported_reason_wins() {
         None,
     );
     record.workspace_bucket = Some("lab-data".to_string());
-    insert_job(&storage, &record)
+    insert_job(&context, &record)
         .await
         .expect("the queued job is stored");
-    let ClaimOutcome::Claimed(claimed) = claim_job(&storage, settled, node(), 1_100)
+    let ClaimOutcome::Claimed(claimed) = claim_job(&context, settled, node(), 1_100)
         .await
         .expect("the job is claimable")
     else {
@@ -563,10 +572,10 @@ async fn reported_reason_wins() {
             reason: "idle".to_string(),
         },
     };
-    put_job_entry(&storage, settled, token, b"end", &row)
+    put_job_entry(&context, settled, token, b"end", &row)
         .await
         .expect("the report row is stored");
-    cancel_running_job(&storage, settled, token, 2_000)
+    cancel_running_job(&context, settled, token, 2_000)
         .await
         .expect("the job settles");
 
@@ -582,7 +591,7 @@ async fn reported_reason_wins() {
 fn failed_item_redacted() {
     let failed = failed_input(
         "data/b.txt".to_string(),
-        &ServerError::InternalError("private backend detail".to_string()),
+        &ServerError::InternalError("private backend detail".to_string().into()),
     );
     assert!(!failed.error.contains("private backend detail"));
 }
@@ -698,10 +707,16 @@ async fn seed_bucket(state: &Arc<ServerState>, bucket: &str, group_id: Ulid, own
     .await;
 }
 
-/// Puts `input.txt` into `bucket` as a reference bound to a connector.
-async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
+/// Puts `input.txt` into `bucket` as a reference bound to a connector, governed by `policies`,
+/// and returns its version id.
+async fn seed_reference(
+    state: &Arc<ServerState>,
+    bucket: &str,
+    owner: UserId,
+    policies: Vec<PlacementPolicyRef>,
+) -> Ulid {
     let version_id = Ulid::generate();
-    let version = BlobVersion::reference(
+    let mut version = BlobVersion::reference(
         VersionSourceBinding {
             strategy: StagingStrategy::Reference,
             descriptor: PortableSourceDescriptor {
@@ -729,6 +744,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
         owner,
         UNIX_EPOCH,
     );
+    version.placement_policies = policies;
     let storage = &state.get_ctx().storage_handle;
     write_row(
         storage,
@@ -750,6 +766,7 @@ async fn seed_reference(state: &Arc<ServerState>, bucket: &str, owner: UserId) {
         version.to_bytes().unwrap(),
     )
     .await;
+    version_id
 }
 
 async fn inputs_body(response: Response) -> SessionInputsResponse {
@@ -778,7 +795,7 @@ async fn checks_keys_first() {
     let (_dir, state, job_id, _helper) = build_node(owner).await;
     let response = stage_inputs(
         State(state),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("source", "data/a.txt"), input("source", "../escape")],
@@ -797,11 +814,11 @@ async fn queues_reference_copy() {
     let group_id = seed_group(&state, owner, true).await;
     seed_bucket(&state, "source", group_id, owner).await;
     seed_bucket(&state, "lab-data", group_id, owner).await;
-    seed_reference(&state, "source", owner).await;
+    let version_id = seed_reference(&state, "source", owner, Vec::new()).await;
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("source", "data/genomes/ref.fna")],
@@ -817,7 +834,7 @@ async fn queues_reference_copy() {
     assert_eq!(body.pending[0].source_node_id, node().to_string());
 
     let copy_id = JobId::from_str(&body.pending[0].job_id).expect("a job id");
-    let record = read_job_record(&state.get_ctx().storage_handle, copy_id, None)
+    let record = read_job_record(&state.get_ctx(), copy_id, None)
         .await
         .expect("the record reads")
         .expect("the copy job is stored");
@@ -829,6 +846,8 @@ async fn queues_reference_copy() {
         ("source", "lab-data")
     );
     assert_eq!(spec.dest_key, "data/genomes/ref.fna");
+    // No version was asked for: the copy takes exactly the version that was checked.
+    assert_eq!(spec.source_version_id, Some(version_id));
     assert_eq!(spec.auth_context.user_id, owner);
     assert_eq!(record.progress.unit, "bytes");
 
@@ -854,13 +873,13 @@ async fn link_crosses_groups() {
     let shared_group = seed_group(&state, owner, true).await;
     seed_bucket(&state, "lab-data", own_group, owner).await;
     seed_bucket(&state, "shared", shared_group, owner).await;
-    seed_reference(&state, "shared", owner).await;
+    seed_reference(&state, "shared", owner, Vec::new()).await;
 
     let mut item = input("shared", "data/genomes/ref.fna");
     item.strategy = SessionInputStrategy::Reference;
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest { items: vec![item] }),
     )
@@ -903,11 +922,11 @@ async fn refuses_unreadable_source() {
     let foreign_group = seed_group(&state, owner, false).await;
     seed_bucket(&state, "lab-data", own_group, owner).await;
     seed_bucket(&state, "foreign", foreign_group, user(3)).await;
-    seed_reference(&state, "foreign", user(3)).await;
+    seed_reference(&state, "foreign", user(3), Vec::new()).await;
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("foreign", "data/ref.fna")],
@@ -930,7 +949,7 @@ async fn keeps_refusal_reason() {
 
     let response = stage_inputs(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
         Json(SessionInputsRequest {
             items: vec![input("missing", "data/a.txt")],
@@ -991,7 +1010,7 @@ fn queued_is_progress() {
 async fn session_body(state: &Arc<ServerState>, owner: UserId, job_id: JobId) -> SessionResponse {
     let response = get_session(
         State(state.clone()),
-        Extension(auth_for(owner)),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
         Path(job_id.to_string()),
     )
     .await
@@ -1001,4 +1020,220 @@ async fn session_body(state: &Arc<ServerState>, owner: UserId, job_id: JobId) ->
         .await
         .expect("the body reads");
     serde_json::from_slice(&bytes).expect("the body parses")
+}
+
+#[tokio::test]
+async fn refuses_governed_source() {
+    // A governed source is staged only where its policy admits the session's execution site;
+    // a site this node cannot name admits nothing, and nothing is copied or queued.
+    let owner = user(2);
+    let (_dir, state, job_id, _helper) = build_node(owner).await;
+    let group_id = seed_group(&state, owner, true).await;
+    seed_bucket(&state, "source", group_id, owner).await;
+    seed_bucket(&state, "lab-data", group_id, owner).await;
+    let policy = PlacementPolicyRef {
+        policy_id: Ulid::from_bytes([4u8; 16]),
+        digest: [4u8; 32],
+    };
+    seed_reference(&state, "source", owner, vec![policy]).await;
+
+    let response = stage_inputs(
+        State(state.clone()),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
+        Path(job_id.to_string()),
+        Json(SessionInputsRequest {
+            items: vec![input("source", "data/ref.fna")],
+        }),
+    )
+    .await;
+    assert!(matches!(response, Err(ServerError::Forbidden)));
+    let session = registry_session(&state, job_id).expect("session is live");
+    assert!(session.pending().is_empty() && session.inventory().is_empty());
+}
+
+/// Publishes a placement rule with `selector` the way a realm admin's node would, and gives this
+/// node its placement subject, so the staging gate resolves the rule locally.
+async fn seed_policy(
+    state: &Arc<ServerState>,
+    owner: UserId,
+    selector: PlacementSelector,
+) -> PlacementPolicyRef {
+    let realm_id = realm();
+    let actor = Actor {
+        node_id: node(),
+        user_id: owner,
+        realm_id,
+    };
+    let publisher = iroh::SecretKey::from_bytes(&[3u8; 32]);
+    let mut auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+    for role in auth.roles.values_mut() {
+        role.assigned_users.insert(owner);
+    }
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.ensure_node(publisher.public(), RealmNodeKind::Server);
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let storage = &state.get_ctx().storage_handle;
+    let auth = auth.to_bytes(&actor).unwrap();
+    write_row(storage, AUTH_KEYSPACE, (*realm_id.as_bytes()).into(), auth).await;
+    let config = config.to_bytes(&actor).unwrap();
+    write_row(
+        storage,
+        target.storage_keyspace(),
+        target.storage_key(),
+        config,
+    )
+    .await;
+    let rule = PlacementPolicy::new(Ulid::generate(), "lab-rule".to_string(), vec![selector]);
+    let policy = VerifiedPolicy::verify(rule.unwrap()).unwrap();
+    let event_id = Ulid::from_bytes([5u8; 16]);
+    let publication = PolicyPublicationClaim::new(
+        realm_id,
+        &policy,
+        publisher.public(),
+        owner,
+        event_id,
+        7,
+        [0u8; 32],
+    )
+    .sign(&publisher);
+    let document = PlacementPolicyDocument::new(realm_id, &policy, publication);
+    let key = placement_policy_key(policy.policy().policy_id).into();
+    write_row(
+        storage,
+        PLACEMENT_POLICY_KEYSPACE,
+        key,
+        document.to_bytes().unwrap(),
+    )
+    .await;
+    let subject = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: node(),
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: BTreeMap::new(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap();
+    let key = NODE_SUBJECT_KEY.to_vec().into();
+    write_row(
+        storage,
+        NODE_SUBJECT_KEYSPACE,
+        key,
+        subject.to_bytes().unwrap(),
+    )
+    .await;
+    policy.policy_ref()
+}
+
+/// Stages one reference governed by a rule with `selector`, or by a rule this node cannot
+/// resolve when `None`, and returns the handler's answer.
+async fn stage_governed(
+    selector: Option<PlacementSelector>,
+) -> (Arc<ServerState>, JobId, TempDir, ServerResult<Response>) {
+    let owner = user(2);
+    let (dir, state, job_id, _helper) = build_node(owner).await;
+    let group_id = seed_group(&state, owner, true).await;
+    seed_bucket(&state, "source", group_id, owner).await;
+    seed_bucket(&state, "lab-data", group_id, owner).await;
+    let policy = match selector {
+        Some(selector) => seed_policy(&state, owner, selector).await,
+        None => {
+            seed_policy(&state, owner, node_selector()).await;
+            PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([6u8; 16]),
+                digest: [6u8; 32],
+            }
+        }
+    };
+    seed_reference(&state, "source", owner, vec![policy]).await;
+    let response = stage_inputs(
+        State(state.clone()),
+        UnrestrictedAuth(auth_for(owner).expect("a signed-in caller")),
+        Path(job_id.to_string()),
+        Json(SessionInputsRequest {
+            items: vec![input("source", "data/ref.fna")],
+        }),
+    )
+    .await;
+    (state, job_id, dir, response)
+}
+
+/// A rule that admits this node whatever site its backends run at.
+fn node_selector() -> PlacementSelector {
+    PlacementSelector {
+        node_id: Some(node()),
+        location: None,
+        labels: Vec::new(),
+        executor_kind: None,
+    }
+}
+
+#[tokio::test]
+async fn stages_allowed_source() {
+    // A rule that admits the session backend's site lets the governed source through.
+    let (_state, _job_id, _dir, response) = stage_governed(Some(node_selector())).await;
+    let response = response.expect("an admitted source is staged");
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(inputs_body(response).await.pending.len(), 1);
+}
+
+#[tokio::test]
+async fn refuses_denied_site() {
+    // The node is in eu-west, but the session's backend proves no location, so a rule that
+    // admits only eu-west refuses the item with 403 and nothing moves.
+    let selector = PlacementSelector {
+        node_id: None,
+        location: Some("eu-west".to_string()),
+        labels: Vec::new(),
+        executor_kind: None,
+    };
+    let (state, job_id, _dir, response) = stage_governed(Some(selector)).await;
+    assert!(matches!(response, Err(ServerError::Forbidden)));
+    let session = registry_session(&state, job_id).expect("session is live");
+    assert!(session.pending().is_empty() && session.inventory().is_empty());
+}
+
+#[tokio::test]
+async fn unresolved_policy_unavailable() {
+    // A rule this node cannot resolve is never treated as allowed: 503, nothing moves.
+    let (state, job_id, _dir, response) = stage_governed(None).await;
+    let reason = match response {
+        Err(ServerError::ServiceUnavailableReason(reason)) => reason,
+        other => panic!("an unresolved rule must not stage: {:?}", other.err()),
+    };
+    assert_eq!(reason, "placement_policy_unavailable");
+    let session = registry_session(&state, job_id).expect("session is live");
+    assert!(session.pending().is_empty() && session.inventory().is_empty());
+}
+
+#[tokio::test]
+async fn uses_physical_backend() {
+    // A logical session id answers with the request's spec, which names no backend; the gate
+    // must use the backend the physical execution was placed on.
+    let owner = user(2);
+    let (_dir, state, job_id, _helper) = build_node(owner).await;
+    let placed = change_job(job_id, |record| {
+        if let JobPayload::Execution(spec) = &mut record.payload {
+            spec.backend = Some("b".to_string());
+        }
+        Ok(JobMutation::Persist)
+    });
+    drive(placed, &state.get_ctx())
+        .await
+        .expect("the physical record is updated");
+    let logical = JobRecord::new(
+        JobId::from_bytes([8u8; 16]),
+        JobPayload::Execution(session_spec()),
+        owner,
+        node(),
+        1_000,
+        1_000,
+        None,
+    );
+
+    let spec = running_spec(&state, &logical, Some(job_id))
+        .await
+        .expect("the spec resolves")
+        .expect("a session runs an execution");
+    assert_eq!(spec.backend.as_deref(), Some("b"));
 }

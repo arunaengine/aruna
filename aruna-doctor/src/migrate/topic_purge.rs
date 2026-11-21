@@ -9,7 +9,7 @@ use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, QUARANTINE_USAGE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE,
 };
-use aruna_core::structs::QUARANTINE_USAGE_KEY;
+use aruna_core::structs::sync_quarantine::QUARANTINE_USAGE_KEY;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, PersistMode};
 use irokle::{FjallStorage, Storage, TopicId};
 use serde::Serialize;

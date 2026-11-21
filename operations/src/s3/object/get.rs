@@ -2,51 +2,42 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::abe::envelope::EnvelopeOperation;
-use crate::blob::holders::GetHoldersOperation;
-use crate::blob::managed_copy::ManagedCopyError;
-use crate::blob::promote::{
-    PromoteError, PromotePendingOperation, Promotion, drop_mismatch, reject_archive,
-};
-use crate::blob::records::blob_location_read;
 use crate::connectors::repository::{connector_reference_write, source_connector_key};
-use crate::connectors::{ResolveBindingInput, resolve_binding_effect};
-use crate::distribution::pull::{
-    HeldElsewhere, PullRequest, kept_location, kept_reads, kept_source_location, kept_source_reads,
-    pinned_blob, pull_through,
+use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
+use crate::distribution::held::{
+    HeldElsewhere, kept_location, kept_reads, kept_source_location, kept_source_reads,
 };
-use crate::distribution::source_keep::{SourceKeep, keep_first};
-use crate::driver::{DriverContext, drive};
-use crate::node::usage_stats::{RowChange, UsageCounterUpdate, UsageUpdateError};
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, local_is_user, managed_read};
-use crate::replication::protocol::{
-    BaoReadRefusal, BaoReadRequest, BaoReadTarget, ReferenceAdvance,
-};
-use crate::replication::queue::{
-    LiveObligationRecord, LiveVersionInput, LiveVersionOperation, live_obligation_entry,
-};
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use crate::s3::object::lookup::{
-    ExpectedNode, LookupError, begin_copy_check, finish_copy_check, location_from_read,
-    multipart_summary_read, summary_from_read,
+    ExpectedNode, LookupError, check_copy_values, copy_check_call, location_from_value,
+    summary_call, summary_from_value,
 };
 use crate::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use crate::s3::object::put::abe::keyed;
 use crate::s3::object::source::choice::{Candidate, choose_source};
-use aruna_core::compute::SharedSecret;
-use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect, StorageEffect};
+use crate::s3::usage::{RowChange, UsageCounterUpdate, UsageUpdateError};
+use aruna_core::id_mint::IdMint;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_core::rows::{StagedCall, outside_answer};
+use aruna_core::structs::storage::replication_queue::MAX_AUTO_ADVANCES;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, SystemTime};
+
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::{
     BlobError, ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
-use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, StorageEvent, SubOperationEvent};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent, SubOperationEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    ABE_GRANT_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
-    OBJECT_METADATA_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
-use aruna_core::operation::{Operation, boxed_suboperation};
+use aruna_core::managed_copy::ManagedCopyError;
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::rows::read_row;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::checksum::HASH_MD5;
-use aruna_core::structs::checksum::{ExpectedChecksum, unmatched_checksum};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::checksum::{ExpectedChecksum, HASH_MD5, unmatched_checksum};
 use aruna_core::structs::execution::source_access::{
     ObservationMatch, ResolvedSourceAccess, SourceMetadata, SourceStats, source_weight,
 };
@@ -55,48 +46,40 @@ use aruna_core::structs::execution::staging::VersionSourceBinding;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::{PlacementPolicyError, PlacementPolicyRef};
-use aruna_core::structs::storage::abe::AbeEffect;
-use aruna_core::structs::storage::abe::AbeError;
-use aruna_core::structs::storage::abe_access::{KeyGrant, MAX_REQUESTS};
-use aruna_core::structs::storage::blob::HiddenBlobKey;
+use aruna_core::structs::storage::abe::{AbeEffect, AbeError};
 use aruna_core::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion,
     BlobVersionState, BucketInfo, CurrentVersionPointer, ManagedCopyKey, VersionKey,
+    strong_validator,
 };
-use aruna_core::structs::storage::distribution::on_use::{ATTACHMENT_NAMESPACE, CACHE_NAMESPACE};
 use aruna_core::structs::storage::distribution::source_root::RootEntry;
 use aruna_core::structs::storage::encryption::{
-    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease, TokenCredential,
+    BucketEncryption, BucketKeyError, BucketKeyRef, ReadLease,
 };
-use aruna_core::structs::storage::multipart::{
-    MultipartChecksumType, MultipartObjectKey, MultipartObjectSummary,
+use aruna_core::structs::storage::multipart::MultipartChecksumType;
+use aruna_core::structs::storage::object_read::{
+    InvalidRange, ObjectInfo, ObjectRangeRequest, ResolvedObjectRange,
 };
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
+use aruna_core::structs::storage::replication_queue::ReferenceAdvance;
+use aruna_core::structs::storage::replication_queue::live_obligation_entry;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::types::Effects;
-use aruna_core::{NodeId, UserId};
+use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
-use futures_util::StreamExt;
-use smallvec::{SmallVec, smallvec};
-use std::collections::{HashMap, VecDeque};
-use std::ops::Range;
-use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use tracing::{debug, warn};
+use ulid::Ulid;
 
 /// Maximum successors attempted before a still-changing current read fails.
 const MAX_DRIFT_ATTEMPTS: u8 = 3;
+
 /// Minimum age of the current reference version before a read may mint another
 /// successor. Rate-limits a READ-only caller pointing at a source they control.
 pub const MIN_ADVANCE_INTERVAL: Duration = Duration::from_secs(60);
-/// Hard bound on automatic successors per explicit binding: the interval only
-/// slows growth, this stops it. Only a WRITE or rebind starts a fresh count.
-pub const MAX_AUTO_ADVANCES: u16 = 100;
-use ulid::Ulid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum GetObjectState {
-    Init,
-    StartTransaction,
     GetVersion,
     CheckManagedCopy,
     GetBlobLocation,
@@ -112,20 +95,10 @@ pub enum GetObjectState {
     /// Asks how several sources performed lately, to pick the one this read uses.
     RankSources,
     ReadMultipartSummary,
-    CommitTransaction,
     HeadReferenceSource,
-    StartAdvanceTransaction,
-    /// Reads the bucket in the advance transaction; a distributed bucket never advances here.
-    ReadBucketAdvance,
-    /// A distributed bucket's advance is dropped, then a refresh is queued for its coordinator.
-    AbortAdvance,
-    ReadHeadAdvance,
-    ReadAdvance,
-    WriteSuccessor,
-    UpdateReferenceUsage,
-    CommitAdvance,
+    /// Records a same-binding successor of a drifted reference in its own transaction.
+    AdvanceReference,
     QueueSuccessorReplication,
-    RestartReference,
     GetBlob,
     ReadReferenceSource,
     /// The bound read failed its condition: a refresh is queued to observe the source.
@@ -140,8 +113,7 @@ pub enum GetObjectState {
     /// A reference version of an encrypting bucket needs its bucket unlocked.
     ReadReferenceSettings,
     CheckReferenceKey,
-    Finish,
-    Error,
+    Init,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -155,11 +127,11 @@ pub enum GetObjectError {
         current: GetObjectState,
         expected: GetObjectState,
     },
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
+    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received}]")]
     InvalidStateEvent {
         state: GetObjectState,
         expected: &'static str,
-        received: Event,
+        received: &'static str,
     },
     #[error("No transaction found")]
     NoTransactionFound,
@@ -241,55 +213,6 @@ pub enum GetObjectError {
     Abe(#[from] aruna_core::structs::storage::abe::AbeError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ObjectRangeRequest {
-    StartEnd { start: u64, end: u64 },
-    Start { start: u64 },
-    Suffix { length: u64 },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedObjectRange {
-    pub range: Range<u64>,
-    pub content_length: i64,
-    pub content_range: String,
-}
-
-impl ObjectRangeRequest {
-    pub fn resolve(&self, full_length: u64) -> Result<ResolvedObjectRange, GetObjectError> {
-        if full_length == 0 {
-            return Err(GetObjectError::InvalidRange);
-        }
-
-        let range = match self {
-            ObjectRangeRequest::StartEnd { start, end } => {
-                if start > end || *start >= full_length {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                *start..((*end).min(full_length - 1) + 1)
-            }
-            ObjectRangeRequest::Start { start } => {
-                if *start >= full_length {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                *start..full_length
-            }
-            ObjectRangeRequest::Suffix { length } => {
-                if *length == 0 {
-                    return Err(GetObjectError::InvalidRange);
-                }
-                full_length.saturating_sub(*length)..full_length
-            }
-        };
-
-        Ok(ResolvedObjectRange {
-            content_range: format!("bytes {}-{}/{}", range.start, range.end - 1, full_length),
-            content_length: (range.end - range.start) as i64,
-            range,
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetObjectInput {
     pub bucket: String,
@@ -302,20 +225,6 @@ pub struct GetObjectInput {
     pub realm_id: RealmId,
     /// Local node recorded on the replication obligation of a drift successor.
     pub node_id: NodeId,
-}
-
-/// Authoritative whole-object facts of one read, carried independently of any
-/// physical location. `size` is the whole-object size; a ranged read reports its
-/// response length in `GetObjectResult::resolved_range` instead.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ObjectInfo {
-    pub size: u64,
-    pub version_created_at: Option<SystemTime>,
-    pub etag: Option<String>,
-    pub checksum_type: MultipartChecksumType,
-    pub hashes: HashMap<String, Vec<u8>>,
-    pub composite_hashes: HashMap<String, Vec<u8>>,
-    pub part_count: Option<usize>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -337,14 +246,30 @@ pub struct GetObjectResult {
     pub served_source: Option<VersionSourceBinding>,
 }
 
+impl From<IoError> for GetObjectError {
+    fn from(error: IoError) -> Self {
+        Self::StorageError(error.into())
+    }
+}
+
+impl From<InvalidRange> for GetObjectError {
+    fn from(_: InvalidRange) -> Self {
+        Self::InvalidRange
+    }
+}
+
+type Turn = Result<Next<GetObjectResult>, GetObjectError>;
+
 #[derive(Debug, PartialEq)]
 pub struct GetObjectOperation {
     input: GetObjectInput,
     state: GetObjectState,
-    txn_id: Option<Ulid>,
+    /// Still reading the object's records, before the bytes or the source are read.
+    reading: bool,
+    /// A reference advance lost to another writer: the records are read again, each on its own.
+    restarted: bool,
     location: Option<BackendLocation>,
     reference_access: Option<ResolvedSourceAccess>,
-    reference_stream: Option<BackendStream<Result<Bytes, StreamError>>>,
     /// Stored observation of the reference version being read, the drift baseline.
     reference_cached: Option<SourceMetadata>,
     /// `last_refresh` of the stored reference version; served when undrifted.
@@ -355,10 +280,6 @@ pub struct GetObjectOperation {
     reference_explicit: bool,
     /// Fresh observation to record in the successor and then serve.
     advance_observation: Option<SourceMetadata>,
-    /// Offered directory bytes the superseded head stops charging.
-    released_bytes: u64,
-    /// Embedded `referenced_bytes` counter update for the successor.
-    usage_update: Option<UsageCounterUpdate>,
     /// Advance attempts so a still-drifting source cannot spin forever.
     drift_attempts: u8,
     /// Reader's scoped credential, carried onto the successor's obligation.
@@ -367,10 +288,9 @@ pub struct GetObjectOperation {
     reference_creator: Option<UserId>,
     /// Publisher-attested predecessor lineage for the successor.
     reference_advance: Option<ReferenceAdvance>,
-    /// Head pointer revalidated inside the advance transaction.
-    advance_pointer: Option<CurrentVersionPointer>,
     /// Injected wall clock for the advance interval check; tests set it.
-    now_override: Option<SystemTime>,
+    /// The runner clock of the current step.
+    now_ms: u64,
     metadata: HashMap<String, String>,
     source_metadata: Option<SourceMetadata>,
     source_binding: Option<VersionSourceBinding>,
@@ -405,7 +325,6 @@ pub struct GetObjectOperation {
     source_weights: Vec<f64>,
     /// Why the last source failed, reported when no other source serves.
     source_failure: Option<GetObjectError>,
-    output: Option<Result<GetObjectResult, GetObjectError>>,
     /// Active key of an encrypting bucket whose reference or unsealed copy is read.
     reference_key: Option<BucketKeyRef>,
     /// Admitted plaintext read of that bucket; the served stream keeps it until it ends.
@@ -424,23 +343,20 @@ impl GetObjectOperation {
         GetObjectOperation {
             input,
             state: GetObjectState::Init,
-            txn_id: None,
+            reading: true,
+            restarted: false,
             location: None,
             reference_access: None,
-            reference_stream: None,
             reference_cached: None,
             reference_last_refresh: None,
             verify_digests: Vec::new(),
             reference_explicit: false,
             advance_observation: None,
-            released_bytes: 0,
-            usage_update: None,
             drift_attempts: 0,
             restrictions: None,
             reference_creator: None,
             reference_advance: None,
-            advance_pointer: None,
-            now_override: None,
+            now_ms: 0,
             metadata: HashMap::new(),
             source_metadata: None,
             source_binding: None,
@@ -463,7 +379,6 @@ impl GetObjectOperation {
             chosen_source: None,
             source_weights: Vec::new(),
             source_failure: None,
-            output: None,
             reference_key: None,
             reference_lease: None,
             token: false,
@@ -501,149 +416,79 @@ impl GetObjectOperation {
         }
     }
 
-    pub fn emit_error(&mut self, error: GetObjectError) -> Effects {
-        self.state = GetObjectState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
+    fn call(&mut self, state: GetObjectState, call: IoCall) -> Turn {
+        self.state = state;
+        Ok(Next::Call(call))
     }
 
-    fn lookup_error(&self, expected: &'static str, error: LookupError) -> GetObjectError {
+    fn effect(&mut self, state: GetObjectState, effect: Effect) -> Turn {
+        self.call(state, effect.into())
+    }
+
+    /// A read of the object's records: in the read snapshot, or on its own after a restart.
+    fn read(&mut self, state: GetObjectState, call: IoCall) -> Turn {
+        let call = match self.restarted {
+            true => StagedCall::Outside(call).into_call(),
+            false => call,
+        };
+        self.call(state, call)
+    }
+
+    fn unexpected(&self, expected: &'static str, event: Event) -> GetObjectError {
+        GetObjectError::InvalidStateEvent {
+            state: self.state.clone(),
+            expected,
+            received: event.label(),
+        }
+    }
+
+    fn lookup_error(error: LookupError) -> GetObjectError {
         match error {
             LookupError::Conversion(err) => GetObjectError::ConversionError(err),
             LookupError::Managed(err) => GetObjectError::ManagedCopyError(err),
-            LookupError::InvalidEvent(received) => GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected,
-                received,
-            },
             LookupError::Missing => GetObjectError::GetObjectFailed,
         }
     }
 
-    /// Fails the read and releases the advance transaction it holds, so a policy
-    /// rejection never leaves a write transaction open.
-    fn abort_with_error(&mut self, error: GetObjectError) -> Effects {
-        let effects = self.txn_id.take().map_or_else(SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        });
-        self.state = GetObjectState::Error;
-        self.output = Some(Err(error));
-        effects
-    }
-
-    pub fn handle_init(&mut self) -> Effects {
-        if self.state != GetObjectState::Init {
-            self.emit_error(GetObjectError::InvalidState {
-                current: self.state.clone(),
-                expected: GetObjectState::Init,
-            })
-        } else {
-            self.state = GetObjectState::StartTransaction;
-            smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                read: true
-            })]
+    /// The version the caller named, or the head pointer of the key.
+    fn read_first(&mut self) -> Turn {
+        if let Some(version_id) = self.input.version_id {
+            let key =
+                VersionKey::new(&self.input.bucket, &self.input.key, version_id).to_bytes()?;
+            return self.read(
+                GetObjectState::GetVersion,
+                read_row(BLOB_VERSIONS_KEYSPACE, key),
+            );
         }
+        let key = BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes()?;
+        self.read(
+            GetObjectState::GetCurrentVersion,
+            read_row(BLOB_HEAD_KEYSPACE, key),
+        )
     }
 
-    pub fn handle_transaction_started(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event {
-            self.txn_id = Some(txn_id);
-            if let Some(version_id) = self.input.version_id {
-                self.state = GetObjectState::GetVersion;
-                let key = match VersionKey::new(&self.input.bucket, &self.input.key, version_id)
-                    .to_bytes()
-                {
-                    Ok(key) => key.into(),
-                    Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-                };
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-                    key,
-                    txn_id: self.txn_id,
-                })]
-            } else {
-                self.state = GetObjectState::GetCurrentVersion;
-
-                let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
-                    Ok(key) => key.into(),
-                    Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-                };
-                smallvec![Effect::Storage(StorageEffect::Read {
-                    key_space: BLOB_HEAD_KEYSPACE.to_string(),
-                    key,
-                    txn_id: self.txn_id,
-                })]
-            }
-        } else {
-            self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
-            })
-        }
-    }
-
-    pub fn handle_received_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-
+    fn handle_received_version(&mut self, value: Option<Value>) -> Turn {
         let Some(val) = value else {
-            return self.emit_error(if self.input.version_id.is_some() {
-                GetObjectError::NoSuchVersion
-            } else {
-                GetObjectError::NoSuchKey
+            return Err(match self.input.version_id.is_some() {
+                true => GetObjectError::NoSuchVersion,
+                false => GetObjectError::NoSuchKey,
             });
         };
-
-        let version = match BlobVersion::from_bytes(val.as_ref()) {
-            Ok(version) => version,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-
-        let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-
+        let version = BlobVersion::from_bytes(val.as_ref())?;
+        let version_id = self.resolved_version_id.or(self.input.version_id);
+        let version_id = version_id.ok_or(GetObjectError::GetObjectFailed)?;
         self.read_version(version_id, version, self.input.version_id.is_some())
     }
 
-    fn current_version_received(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-
-        let Some(val) = value else {
-            return self.emit_error(GetObjectError::NoSuchKey);
-        };
-
-        let pointer = match CurrentVersionPointer::from_bytes(val.as_ref()) {
-            Ok(pointer) => pointer,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-
-        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
-            .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-
+    fn current_version_received(&mut self, value: Option<Value>) -> Turn {
+        let val = value.ok_or(GetObjectError::NoSuchKey)?;
+        let pointer = CurrentVersionPointer::from_bytes(val.as_ref())?;
+        let key = VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id);
         self.resolved_version_id = Some(pointer.version_id);
-        self.state = GetObjectState::GetVersion;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
+        self.read(
+            GetObjectState::GetVersion,
+            read_row(BLOB_VERSIONS_KEYSPACE, key.to_bytes()?),
+        )
     }
 
     fn read_version(
@@ -651,7 +496,7 @@ impl GetObjectOperation {
         version_id: Ulid,
         version: BlobVersion,
         explicit_version_request: bool,
-    ) -> Effects {
+    ) -> Turn {
         self.resolved_version_id = Some(version_id);
         self.metadata = version.metadata.clone();
         self.source_policies = version.placement_policies.clone();
@@ -671,10 +516,9 @@ impl GetObjectOperation {
                 }
                 self.check_managed_copy(version_id, location_key)
             }
-            BlobVersionState::Deleted => self.emit_error(if explicit_version_request {
-                GetObjectError::DeleteMarker
-            } else {
-                GetObjectError::NoSuchKey
+            BlobVersionState::Deleted => Err(match explicit_version_request {
+                true => GetObjectError::DeleteMarker,
+                false => GetObjectError::NoSuchKey,
             }),
             BlobVersionState::Reference {
                 source,
@@ -682,7 +526,7 @@ impl GetObjectOperation {
                 ..
             } if HeldElsewhere::of(&source, version.identity).is_some() => {
                 let Some((set_id, identity)) = HeldElsewhere::of(&source, version.identity) else {
-                    return self.emit_error(GetObjectError::GetObjectFailed);
+                    return Err(GetObjectError::GetObjectFailed);
                 };
                 let held = HeldElsewhere {
                     set_id,
@@ -697,15 +541,11 @@ impl GetObjectOperation {
                 self.version_created_at = held.version_created_at;
                 // A governed version is never kept, so only its holders serve it.
                 if !held.source_policies.is_empty() {
-                    return self.emit_error(GetObjectError::HeldElsewhere(Box::new(held)));
+                    return Err(GetObjectError::HeldElsewhere(Box::new(held)));
                 }
-                self.state = GetObjectState::ReadKept;
                 let reads = kept_reads(&held);
                 self.held = Some(held);
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads,
-                    txn_id: self.txn_id,
-                })]
+                self.read(GetObjectState::ReadKept, IoCall::Read(reads))
             }
             BlobVersionState::Reference {
                 source,
@@ -715,7 +555,7 @@ impl GetObjectOperation {
             } => {
                 if source.descriptor.kind == SourceConnectorKind::ArunaLink {
                     let linked = Box::new((source, cached_metadata));
-                    return self.emit_error(GetObjectError::Link(linked));
+                    return Err(GetObjectError::Link(linked));
                 }
                 // Access-driven successor-on-drift (#256); verified cache,
                 // origin relay and sync polling stay deferred (#375/#380/#314).
@@ -726,34 +566,29 @@ impl GetObjectOperation {
                 self.reference_creator = Some(version.created_by);
                 self.location = None;
                 self.reference_access = None;
-                self.reference_stream = None;
                 self.source_metadata = None;
                 self.last_refresh = None;
                 self.version_created_at = None;
                 // Only a distributed bucket fixes an identity; its member may keep the bytes.
                 self.source_identity = version.identity;
                 if version.identity.is_some() {
-                    self.state = GetObjectState::ReadSourceBucket;
-                    return smallvec![Effect::Storage(StorageEffect::Read {
-                        key_space: S3_BUCKET_KEYSPACE.to_string(),
-                        key: self.input.bucket.as_bytes().into(),
-                        txn_id: self.txn_id,
-                    })];
+                    let read = read_row(S3_BUCKET_KEYSPACE, self.input.bucket.as_bytes().to_vec());
+                    return self.read(GetObjectState::ReadSourceBucket, read);
                 }
                 self.resolve_reference()
             }
             BlobVersionState::PendingContent { archive, .. }
                 if self.token || self.object.is_some() =>
             {
-                self.abort_with_error(GetObjectError::PendingContent(archive))
+                Err(GetObjectError::PendingContent(archive))
             }
             BlobVersionState::PendingContent { .. } => {
-                self.emit_error(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
+                Err(ConversionError::BucketKey(BucketKeyError::Unsupported).into())
             }
         }
     }
 
-    fn resolve_reference(&mut self) -> Effects {
+    fn resolve_reference(&mut self) -> Turn {
         self.source_queue.clear();
         self.source_slot = 0;
         self.source_failure = None;
@@ -761,22 +596,18 @@ impl GetObjectOperation {
     }
 
     /// Resolves the source in `source_slot`; the sources of a binding resolve one by one.
-    fn resolve_source(&mut self) -> Effects {
+    fn resolve_source(&mut self) -> Turn {
         let source = self.source_binding.as_ref();
-        let Some(source) = source.and_then(|binding| binding.source_at(self.source_slot)) else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        self.state = GetObjectState::ResolveReferenceAccess;
+        let source = source.and_then(|binding| binding.source_at(self.source_slot));
+        let source = source.ok_or(GetObjectError::GetObjectFailed)?;
         let group_id = Some(self.input.group_id);
-        smallvec![resolve_binding_effect(ResolveBindingInput {
-            source,
-            group_id
-        })]
+        let resolve = resolve_binding_effect(ResolveBindingInput { source, group_id });
+        self.effect(GetObjectState::ResolveReferenceAccess, resolve)
     }
 
     /// Orders the resolved sources: one picked by measured speed, then the others in their
     /// order, failing ones last. A restarted read keeps its source while it is not failing.
-    fn sources_ranked(&mut self, event: Event) -> Effects {
+    fn sources_ranked(&mut self, event: Event) -> Turn {
         let (stats, draw) = match event {
             Event::StagingSource(StagingSourceEvent::HealthResult { stats, draw })
                 if stats.len() == self.source_queue.len() =>
@@ -784,11 +615,10 @@ impl GetObjectOperation {
                 (stats, draw)
             }
             other => {
-                return self.emit_error(GetObjectError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::StagingSource(StagingSourceEvent::HealthResult)",
-                    received: other,
-                });
+                return Err(self.unexpected(
+                    "Event::StagingSource(StagingSourceEvent::HealthResult)",
+                    other,
+                ));
             }
         };
         let weights = self.source_weights.iter().copied();
@@ -859,7 +689,7 @@ impl GetObjectOperation {
     }
 
     /// Reads the next source: the first opens the read, a later one only heads its source.
-    fn next_source(&mut self) -> Effects {
+    fn next_source(&mut self) -> Turn {
         let Some((slot, access)) = self.source_queue.pop_front() else {
             let error = self.source_failure.take();
             return self.source_failed(error.unwrap_or(GetObjectError::GetObjectFailed));
@@ -868,22 +698,15 @@ impl GetObjectOperation {
         self.chosen_source = self.source_binding.as_ref().and_then(|b| b.source_at(slot));
         self.reference_access = Some(access.clone());
         self.verify_digests.clear();
-        if self.txn_id.is_some() {
+        if self.reading {
             return self.read_reference();
         }
-        self.state = GetObjectState::HeadReferenceSource;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+        let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+        self.effect(GetObjectState::HeadReferenceSource, head)
     }
 
     /// A member of a distributed bucket looks for its kept copy of the reference first.
-    fn source_bucket_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
+    fn source_bucket_read(&mut self, value: Option<Value>) -> Turn {
         let binding = value
             .as_deref()
             .and_then(|value| BucketInfo::from_bytes(value).ok())
@@ -897,26 +720,13 @@ impl GetObjectOperation {
         if !self.source_policies.is_empty() {
             return self.resolve_reference();
         }
-        self.state = GetObjectState::ReadSourceKept;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: kept_source_reads(binding.set_id, version_id, identity),
-            txn_id: self.txn_id,
-        })]
+        let reads = kept_source_reads(binding.set_id, version_id, identity);
+        self.read(GetObjectState::ReadSourceKept, IoCall::Read(reads))
     }
 
     /// Serves the kept copy of a reference without asking its source, or reads the source.
-    fn source_kept_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
-            });
-        };
-        let size = self
-            .reference_cached
-            .as_ref()
-            .map(|cached| cached.content_length);
+    fn source_kept_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
+        let size = (self.reference_cached.as_ref()).map(|cached| cached.content_length);
         match size.and_then(|size| kept_source_location(&values, size)) {
             Some(location) => self.read_multipart_summary(location, self.resolved_version_id),
             None => self.resolve_reference(),
@@ -925,7 +735,7 @@ impl GetObjectOperation {
 
     /// A distributed member whose source failed reads the bytes from a member keeping a copy,
     /// so data stays readable without its origin; elsewhere the failure stands.
-    fn source_failed(&mut self, error: GetObjectError) -> Effects {
+    fn source_failed(&mut self, error: GetObjectError) -> Turn {
         // A source that lacks the object never hides another source's outage or refusal.
         let absent = GetObjectError::StagingSourceError(StagingSourceError::NotFound);
         let error = match self.source_failure.take() {
@@ -950,104 +760,74 @@ impl GetObjectOperation {
                 source_policies: self.source_policies.clone(),
             });
         match held {
-            Some(held) => self.emit_error(GetObjectError::HeldElsewhere(Box::new(held))),
-            None => self.emit_error(error),
+            Some(held) => Err(GetObjectError::HeldElsewhere(Box::new(held))),
+            None => Err(error),
         }
     }
 
     /// Reads this member's kept copy, or hands the read to the holders of the version.
-    fn kept_read(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                received: event,
-            });
-        };
-        let Some(held) = self.held.take() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
+    fn kept_read(&mut self, values: Vec<(Key, Option<Value>)>) -> Turn {
+        let held = self.held.take().ok_or(GetObjectError::GetObjectFailed)?;
         match kept_location(&held, &values) {
             Some(location) => self.read_multipart_summary(location, Some(held.version_id)),
-            None => self.emit_error(GetObjectError::HeldElsewhere(Box::new(held))),
+            None => Err(GetObjectError::HeldElsewhere(Box::new(held))),
         }
     }
 
-    fn read_blob_location(&mut self, key: BlobLocationKey) -> Effects {
+    fn read_blob_location(&mut self, key: BlobLocationKey) -> Turn {
         self.missing_blake3 = Some(key.blake3_hash);
-        self.state = GetObjectState::GetBlobLocation;
-        smallvec![blob_location_read(&key, self.txn_id)]
+        let read = read_row(BLOB_LOCATIONS_KEYSPACE, key.to_bytes());
+        self.read(GetObjectState::GetBlobLocation, read)
     }
 
     /// A governed version is only serveable from a registered local copy, so an
     /// unregistered or quarantined copy fails closed before any byte moves.
-    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Effects {
-        let check = match begin_copy_check(
-            &self.input.bucket,
-            &self.input.key,
-            version_id,
-            location_key,
-            self.txn_id,
-        ) {
-            Ok(check) => check,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        self.pending_copy = Some(check.copy_key);
-        self.pending_location = Some(check.location_key);
-        self.state = GetObjectState::CheckManagedCopy;
-        smallvec![check.effect]
+    fn check_managed_copy(&mut self, version_id: Ulid, location_key: BlobLocationKey) -> Turn {
+        let version = VersionKey::new(&self.input.bucket, &self.input.key, version_id);
+        let copy_key = ManagedCopyKey::new(version, location_key.backend.clone());
+        let call = copy_check_call(&copy_key)?;
+        self.pending_copy = Some(copy_key);
+        self.pending_location = Some(location_key);
+        self.read(GetObjectState::CheckManagedCopy, call)
     }
 
-    fn handle_managed_copy(&mut self, event: Event) -> Effects {
-        let key = match finish_copy_check(
-            event,
+    fn handle_managed_copy(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let key = check_copy_values(
+            values,
             &mut self.pending_copy,
             &mut self.pending_location,
             &self.source_policies,
             ExpectedNode::Exact(self.input.node_id),
-        ) {
-            Ok(key) => key,
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::BatchReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
+        )
+        .map_err(Self::lookup_error)?;
         self.read_blob_location(key)
     }
 
-    fn location_read(&mut self, event: Event) -> Effects {
-        let location = match location_from_read(event) {
-            Ok(Some(location)) => location,
-            Ok(None) => {
-                return match self.missing_blake3 {
-                    Some(blake3) => self.emit_error(GetObjectError::BlobNotLocal {
-                        blake3,
-                        version_id: self.resolved_version_id,
-                        metadata: self.metadata.clone(),
-                        version_created_at: self.version_created_at,
-                        source_policies: self.source_policies.clone(),
-                    }),
-                    None => self.emit_error(GetObjectError::GetObjectFailed),
-                };
-            }
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
-                return self.emit_error(error);
-            }
+    fn location_read(&mut self, value: Option<Value>) -> Turn {
+        let location = location_from_value(value).map_err(Self::lookup_error)?;
+        let Some(location) = location else {
+            return Err(match self.missing_blake3 {
+                Some(blake3) => GetObjectError::BlobNotLocal {
+                    blake3,
+                    version_id: self.resolved_version_id,
+                    metadata: self.metadata.clone(),
+                    version_created_at: self.version_created_at,
+                    source_policies: self.source_policies.clone(),
+                },
+                None => GetObjectError::GetObjectFailed,
+            });
         };
-
         self.read_multipart_summary(location, self.resolved_version_id)
     }
 
-    fn reference_access_resolved(&mut self, event: Event) -> Effects {
+    fn reference_access_resolved(&mut self, event: Event) -> Turn {
         let result = match event {
             Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) => result,
             other => {
-                return self.emit_error(GetObjectError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                    received: other,
-                });
+                return Err(self.unexpected(
+                    "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                    other,
+                ));
             }
         };
         let count = (self.source_binding.as_ref()).map_or(1, VersionSourceBinding::source_count);
@@ -1066,7 +846,7 @@ impl GetObjectOperation {
     }
 
     /// Reads the connectors of the queued sources, whose weight hint may change any time.
-    fn read_weights(&mut self) -> Effects {
+    fn read_weights(&mut self) -> Turn {
         let binding = self.source_binding.as_ref();
         let group_id = self.input.group_id;
         let reads: Vec<_> = (self.source_queue.iter())
@@ -1079,26 +859,11 @@ impl GetObjectOperation {
         if reads.is_empty() {
             return self.ask_health(HashMap::new());
         }
-        self.state = GetObjectState::ReadSourceWeights;
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: self.txn_id,
-        })]
+        self.read(GetObjectState::ReadSourceWeights, IoCall::Read(reads))
     }
 
-    fn weights_read(&mut self, event: Event) -> Effects {
-        let values = match event {
-            Event::Storage(StorageEvent::BatchReadResult { values }) => values,
-            Event::Storage(StorageEvent::Error { error }) => return self.emit_error(error.into()),
-            other => {
-                return self.emit_error(GetObjectError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Storage(StorageEvent::BatchReadResult)",
-                    received: other,
-                });
-            }
-        };
-        let connectors = values.iter().filter_map(|(_, value)| value.as_deref());
+    fn weights_read(&mut self, values: Vec<Option<Value>>) -> Turn {
+        let connectors = values.iter().filter_map(|value| value.as_deref());
         let weights = connectors
             .filter_map(|value| SourceConnector::from_bytes(value).ok())
             .filter_map(|connector| {
@@ -1111,7 +876,7 @@ impl GetObjectOperation {
         self.ask_health(weights)
     }
 
-    fn ask_health(&mut self, weights: HashMap<Ulid, f64>) -> Effects {
+    fn ask_health(&mut self, weights: HashMap<Ulid, f64>) -> Turn {
         let binding = self.source_binding.as_ref();
         let weight = |slot: usize| {
             let connector_id = binding.and_then(|binding| binding.source_at(slot)?.connector_id);
@@ -1125,74 +890,45 @@ impl GetObjectOperation {
                 .unwrap_or(1.0)
         });
         self.source_weights = weights.collect();
-        self.state = GetObjectState::RankSources;
         let accesses = self.source_queue.iter().map(|(_, access)| access.clone());
-        smallvec![Effect::StagingSource(StagingSourceEffect::Health {
-            accesses: accesses.collect()
-        })]
+        let health = Effect::StagingSource(StagingSourceEffect::Health {
+            accesses: accesses.collect(),
+        });
+        self.effect(GetObjectState::RankSources, health)
     }
 
     fn read_multipart_summary(
         &mut self,
         location: BackendLocation,
         resolved_version_id: Option<Ulid>,
-    ) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-
+    ) -> Turn {
         self.location = Some(location);
         self.resolved_version_id = resolved_version_id;
-
         let Some(version_id) = resolved_version_id else {
             return self.read_blob();
         };
-
-        let effect = match multipart_summary_read(version_id, Some(txn_id)) {
-            Ok(effect) => effect,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-
-        self.state = GetObjectState::ReadMultipartSummary;
-        smallvec![effect]
+        let call = summary_call(version_id)?;
+        self.read(GetObjectState::ReadMultipartSummary, call)
     }
 
-    pub fn summary_read(&mut self, event: Event) -> Effects {
-        let summary = match summary_from_read(event) {
-            Ok(summary) => summary,
-            Err(err) => {
-                let error = self.lookup_error("Event::Storage(StorageEvent::ReadResult)", err);
-                return self.emit_error(error);
-            }
-        };
-
+    fn summary_read(&mut self, value: Option<Value>) -> Turn {
+        let summary = summary_from_value(value).map_err(Self::lookup_error)?;
         if let Some(summary) = summary {
             self.checksum_type = summary.checksum_type;
             self.composite_hashes = summary.composite_hashes;
             self.part_count = Some(summary.part_count);
         }
-
         self.read_blob()
     }
 
-    fn read_blob(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-        let Some(location) = self.location.clone() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-
-        let resolved_range = match self.input.range.as_ref() {
-            Some(range) => match range.resolve(location.blob_size) {
-                Ok(range) => Some(range),
-                Err(err) => return self.emit_error(err),
-            },
+    fn read_blob(&mut self) -> Turn {
+        let location = self.location.clone();
+        let location = location.ok_or(GetObjectError::GetObjectFailed)?;
+        self.resolved_range = match self.input.range.as_ref() {
+            Some(range) => Some(range.resolve(location.blob_size)?),
             None => None,
         };
-        self.resolved_range = resolved_range.clone();
-
-        // A sealed copy is read only under a lease of its key, admitted after the commit.
+        // A sealed copy is read only under a lease of its key, admitted after the record reads.
         if let Some(key) = location.format.bucket_key() {
             let archive = ArchiveKey::of(&location);
             let admit = if let Some((envelope, mapping, private)) = self.object.take() {
@@ -1202,33 +938,25 @@ impl GetObjectOperation {
                     || envelope.context.parameters.key != key
                     || envelope.context.object_key != self.input.key
                 {
-                    return self.emit_error(GetObjectError::Abe(
-                        aruna_core::structs::storage::abe::AbeError::Context,
-                    ));
+                    return Err(GetObjectError::Abe(AbeError::Context));
                 }
-                BlobEffect::Abe(Box::new(
-                    aruna_core::structs::storage::abe::AbeEffect::Admit {
-                        envelope,
-                        archive,
-                        private,
-                    },
-                ))
+                BlobEffect::Abe(Box::new(AbeEffect::Admit {
+                    envelope,
+                    archive,
+                    private,
+                }))
             } else {
                 BlobEffect::AdmitRead { key, archive }
             };
-            self.state = GetObjectState::CommitTransaction;
-            return smallvec![
-                Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-                Effect::Blob(admit)
-            ];
+            self.reading = false;
+            return self.effect(GetObjectState::AdmitRead, Effect::Blob(admit));
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
-        self.state = GetObjectState::ReadContentSettings;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: Some(txn_id),
-        })]
+        let read = read_row(
+            BUCKET_ENCRYPTION_KEYSPACE,
+            self.input.bucket.as_bytes().to_vec(),
+        );
+        self.read(GetObjectState::ReadContentSettings, read)
     }
 
     /// The read of a plain copy over the resolved range.
@@ -1243,47 +971,33 @@ impl GetObjectOperation {
         })
     }
 
-    fn content_settings_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-        let settings = match BucketEncryption::from_row(value.as_deref()) {
-            Ok(settings) => settings,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn content_settings_read(&mut self, value: Option<Value>) -> Turn {
+        let settings = BucketEncryption::from_row(value.as_deref())?;
         let (Some(read_effect), Some(location)) = (self.plain_read(), self.location.as_ref())
         else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+            return Err(GetObjectError::GetObjectFailed);
         };
         // The lease pins the physical copy, so conversion and cleanup wait for this read.
         let archive = ArchiveKey::of(location);
         self.reference_key = settings.active_key();
-        self.state = GetObjectState::CommitTransaction;
-        let next = match self.reference_key {
-            Some(key) => BlobEffect::AdmitRead { key, archive },
-            None => read_effect,
-        };
-        smallvec![
-            Effect::Storage(StorageEffect::CommitTransaction { txn_id }),
-            Effect::Blob(next)
-        ]
+        self.reading = false;
+        match self.reference_key {
+            Some(key) => {
+                let admit = BlobEffect::AdmitRead { key, archive };
+                self.effect(GetObjectState::AdmitPlain, Effect::Blob(admit))
+            }
+            None => self.effect(GetObjectState::GetBlob, Effect::Blob(read_effect)),
+        }
     }
 
     /// Reads a plain copy of an encrypting bucket once its bucket lease is admitted.
-    fn plain_admitted(&mut self, event: Event) -> Effects {
+    fn plain_admitted(&mut self, event: Event) -> Turn {
         let (Some(key), Some(read_effect), Some(location)) = (
             self.reference_key,
             self.plain_read(),
             self.location.as_ref(),
         ) else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+            return Err(GetObjectError::GetObjectFailed);
         };
         let archive = ArchiveKey::of(location);
         match event {
@@ -1291,26 +1005,18 @@ impl GetObjectOperation {
                 if lease.key == key && lease.archive == archive =>
             {
                 self.reference_lease = Some(lease);
-                self.state = GetObjectState::GetBlob;
-                smallvec![Effect::Blob(read_effect)]
+                self.effect(GetObjectState::GetBlob, Effect::Blob(read_effect))
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
-                self.emit_error(locked(error))
-            }
-            Event::Blob(BlobEvent::Error(_)) => self.emit_error(GetObjectError::GetObjectFailed),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                received: other,
-            }),
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
+            Event::Blob(BlobEvent::Error(_)) => Err(GetObjectError::GetObjectFailed),
+            other => Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
         }
     }
 
     /// Reads the sealed copy with the admitted lease; a locked key ends the read typed.
-    fn read_admitted(&mut self, event: Event) -> Effects {
-        let Some(location) = self.location.clone() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
+    fn read_admitted(&mut self, event: Event) -> Turn {
+        let location = self.location.clone();
+        let location = location.ok_or(GetObjectError::GetObjectFailed)?;
         let lease = match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease })
                 if Some(lease.key) == location.format.bucket_key()
@@ -1320,134 +1026,70 @@ impl GetObjectOperation {
             }
             // A locked key stays typed: `BucketKeyError::Locked` names the bucket.
             Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => {
-                return self.emit_error(GetObjectError::Abe(error));
+                return Err(GetObjectError::Abe(error));
             }
             Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
-                return self.emit_error(locked(error));
+                return Err(locked(error));
             }
-            Event::Blob(BlobEvent::Error(_)) => {
-                return self.emit_error(GetObjectError::GetObjectFailed);
-            }
-            other => {
-                return self.emit_error(GetObjectError::InvalidStateEvent {
-                    state: self.state.clone(),
-                    expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                    received: other,
-                });
-            }
+            Event::Blob(BlobEvent::Error(_)) => return Err(GetObjectError::GetObjectFailed),
+            other => return Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
         };
-        let range = self
-            .resolved_range
-            .as_ref()
-            .map(|range| range.range.clone());
-        self.state = GetObjectState::GetBlob;
-        smallvec![Effect::Blob(BlobEffect::ReadSealed {
+        let range = (self.resolved_range.as_ref()).map(|range| range.range.clone());
+        let read = BlobEffect::ReadSealed {
             location,
             range,
             lease: Box::new(lease),
-        })]
+        };
+        self.effect(GetObjectState::GetBlob, Effect::Blob(read))
     }
 
-    fn read_reference(&mut self) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
+    /// An encrypting bucket gates plaintext of every version, not only of sealed copies.
+    fn read_reference(&mut self) -> Turn {
         if self.reference_access.is_none() {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+            return Err(GetObjectError::GetObjectFailed);
         }
-
-        // An encrypting bucket gates plaintext of every version, not only of sealed copies.
-        self.state = GetObjectState::ReadReferenceSettings;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BUCKET_ENCRYPTION_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: Some(txn_id),
-        })]
+        let read = read_row(
+            BUCKET_ENCRYPTION_KEYSPACE,
+            self.input.bucket.as_bytes().to_vec(),
+        );
+        self.read(GetObjectState::ReadReferenceSettings, read)
     }
 
-    /// Release the read snapshot, then HEAD the source: the fresh observation decides whether
+    /// The record reads are done; HEAD the source: the fresh observation decides whether
     /// this read serves, advances the binding, or 404s. A locked bucket refuses first.
-    fn reference_settings_read(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-        let settings = match BucketEncryption::from_row(value.as_deref()) {
-            Ok(settings) => settings,
-            Err(error) => return self.emit_error(error.into()),
-        };
+    fn reference_settings_read(&mut self, value: Option<Value>) -> Turn {
+        let settings = BucketEncryption::from_row(value.as_deref())?;
         self.reference_key = settings.active_key();
-        self.state = GetObjectState::CommitTransaction;
-        let mut effects: Effects =
-            smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
+        self.reading = false;
         if let Some(key) = self.reference_key {
             let archive = reference_archive(key);
-            effects.push(Effect::Blob(BlobEffect::AdmitRead { key, archive }));
+            let admit = Effect::Blob(BlobEffect::AdmitRead { key, archive });
+            return self.effect(GetObjectState::CheckReferenceKey, admit);
         }
-        effects
+        let access = self.reference_access.clone();
+        let access = access.ok_or(GetObjectError::GetObjectFailed)?;
+        let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+        self.effect(GetObjectState::HeadReferenceSource, head)
     }
 
-    fn reference_key_checked(&mut self, event: Event) -> Effects {
+    fn reference_key_checked(&mut self, event: Event) -> Turn {
         let (Some(key), Some(access)) = (self.reference_key, self.reference_access.clone()) else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+            return Err(GetObjectError::GetObjectFailed);
         };
         match event {
             Event::Blob(BlobEvent::ReadAdmitted { lease })
                 if lease.key == key && lease.archive == reference_archive(key) =>
             {
                 self.reference_lease = Some(lease);
-                self.state = GetObjectState::HeadReferenceSource;
-                smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })]
+                let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+                self.effect(GetObjectState::HeadReferenceSource, head)
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
-                self.emit_error(locked(error))
-            }
-            Event::Blob(BlobEvent::Error(_)) => self.emit_error(GetObjectError::GetObjectFailed),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::ReadAdmitted)",
-                received: other,
-            }),
+            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
+            Event::Blob(BlobEvent::Error(_)) => Err(GetObjectError::GetObjectFailed),
+            other => Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
         }
     }
-
-    pub fn handle_transaction_committed(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event {
-            self.txn_id = None;
-            if self.reference_access.is_some() && self.reference_key.is_some() {
-                self.state = GetObjectState::CheckReferenceKey;
-                return smallvec![];
-            }
-            if let Some(access) = self.reference_access.clone() {
-                self.state = GetObjectState::HeadReferenceSource;
-                return smallvec![Effect::StagingSource(StagingSourceEffect::Head { access })];
-            }
-            let sealed = self
-                .location
-                .as_ref()
-                .is_some_and(|location| location.format.bucket_key().is_some());
-            self.state = match (sealed, self.reference_key.is_some()) {
-                (true, _) => GetObjectState::AdmitRead,
-                (false, true) => GetObjectState::AdmitPlain,
-                (false, false) => GetObjectState::GetBlob,
-            };
-            smallvec![]
-        } else {
-            self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: event,
-            })
-        }
-    }
-
-    pub fn reference_head_received(&mut self, event: Event) -> Effects {
+    fn reference_head_received(&mut self, event: Event) -> Turn {
         match event {
             Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
                 let stored = self.reference_cached.clone();
@@ -1554,397 +1196,137 @@ impl GetObjectOperation {
                     }
                     return self.begin_reference_advance(metadata);
                 }
-                self.emit_error(GetObjectError::ReferenceSourceChanged)
+                Err(GetObjectError::ReferenceSourceChanged)
             }
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.source_failed(error.into())
             }
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::StagingSource(StagingSourceEvent::HeadResult)",
-                received: other,
-            }),
+            other => Err(self.unexpected(
+                "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                other,
+            )),
         }
     }
 
     /// Issues the source read for the observation `metadata`, resolving the requested range
     /// against its content length; a `bound` read stays on that observation's ETag.
-    fn serve_reference_source(&mut self, metadata: SourceMetadata, bound: bool) -> Effects {
-        let Some(access) = self.reference_access.clone() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
+    fn serve_reference_source(&mut self, metadata: SourceMetadata, bound: bool) -> Turn {
+        let access = self.reference_access.clone();
+        let access = access.ok_or(GetObjectError::GetObjectFailed)?;
         let range = match self.input.range.as_ref() {
-            Some(range_request) => match range_request.resolve(metadata.content_length) {
-                Ok(resolved) => {
-                    self.resolved_range = Some(resolved.clone());
-                    Some(resolved.range)
-                }
-                Err(err) => return self.emit_error(err),
-            },
+            Some(range_request) => {
+                let resolved = range_request.resolve(metadata.content_length)?;
+                self.resolved_range = Some(resolved.clone());
+                Some(resolved.range)
+            }
             None => None,
         };
         let expected = bound.then(|| metadata.clone());
         // Verified bytes are read whole and spooled; the range is cut from the spool.
         let range = range.filter(|_| self.verify_digests.is_empty());
         self.source_metadata = Some(metadata);
-        self.state = GetObjectState::ReadReferenceSource;
-        smallvec![Effect::StagingSource(StagingSourceEffect::Read {
+        let read = Effect::StagingSource(StagingSourceEffect::Read {
             access,
             range,
             expected,
-        })]
+        });
+        self.effect(GetObjectState::ReadReferenceSource, read)
     }
 
-    /// Opens the write transaction that records a same-binding successor for a
-    /// drifted current-version read.
-    fn begin_reference_advance(&mut self, observation: SourceMetadata) -> Effects {
+    /// Records a same-binding successor for a drifted current-version read, in its own
+    /// write transaction.
+    fn begin_reference_advance(&mut self, observation: SourceMetadata) -> Turn {
         // The successor is read from the source it records, never from another one.
         self.source_queue.clear();
         self.drift_attempts = self.drift_attempts.saturating_add(1);
         self.advance_observation = Some(observation);
-        self.state = GetObjectState::StartAdvanceTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
+        let advance = self.advance()?;
+        self.call(GetObjectState::AdvanceReference, IoCall::child(advance))
     }
 
-    fn handle_advance_started(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionStarted)",
-                received: event,
-            });
-        };
-        self.txn_id = Some(txn_id);
-        self.state = GetObjectState::ReadBucketAdvance;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            key: self.input.bucket.as_bytes().into(),
-            txn_id: self.txn_id,
-        })]
-    }
-
-    /// Source changes of a distributed bucket become successors only through the coordinated
-    /// refresh, so a read there queues one durably and fails instead of advancing the binding.
-    fn handle_advance_bucket(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.abort_with_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-        let bucket = match value
-            .map(|value| BucketInfo::from_bytes(&value))
-            .transpose()
-        {
-            Ok(bucket) => bucket,
-            Err(err) => return self.abort_with_error(GetObjectError::ConversionError(err)),
-        };
-        if bucket.is_some_and(|bucket| bucket.distribution.is_some()) {
-            let Some(txn_id) = self.txn_id.take() else {
-                return self.queue_changed_refresh();
-            };
-            self.state = GetObjectState::AbortAdvance;
-            return smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })];
-        }
-        let key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
-            Ok(key) => key.into(),
-            Err(err) => return self.abort_with_error(GetObjectError::ConversionError(err)),
-        };
-        self.state = GetObjectState::ReadHeadAdvance;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_HEAD_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    fn advance_aborted(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(
-                StorageEvent::TransactionAborted { .. } | StorageEvent::Error { .. },
-            ) => self.queue_changed_refresh(),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: other,
-            }),
-        }
-    }
-
-    fn handle_advance_head(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-        let Some(value) = value else {
-            return self.restart_after_conflict();
-        };
-        let pointer = match CurrentVersionPointer::from_bytes(value.as_ref()) {
-            Ok(pointer) => pointer,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        // CAS: only advance while the head still names the version we headed;
-        // otherwise a concurrent writer won and we serve its successor instead.
-        if Some(pointer.version_id) != self.resolved_version_id {
-            return self.restart_after_conflict();
-        }
-        let key = match VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id)
-            .to_bytes()
-        {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        self.advance_pointer = Some(pointer);
-        self.state = GetObjectState::ReadAdvance;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
-            key,
-            txn_id: self.txn_id,
-        })]
-    }
-
-    /// Enforces the durable advance bounds against the reread current version and
-    /// writes the successor in the same transaction.
-    fn handle_advance_version(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::ReadResult)",
-                received: event,
-            });
-        };
-        let Some(value) = value else {
-            return self.restart_after_conflict();
-        };
-        let current = match BlobVersion::from_bytes(value.as_ref()) {
-            Ok(current) => current,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        let Some(advance_count) = current.advance_count() else {
-            return self.restart_after_conflict();
-        };
-        self.released_bytes = current
-            .offered_size(&self.input.bucket, &self.input.key)
-            .unwrap_or(0);
-        if advance_count >= MAX_AUTO_ADVANCES {
-            return self.abort_with_error(GetObjectError::ReferenceAdvanceExhausted);
-        }
-        let now = self.now_override.unwrap_or_else(SystemTime::now);
-        // A backwards clock makes `duration_since` fail, which fails the advance
-        // closed rather than granting an unbounded budget.
-        if !now
-            .duration_since(current.created_at)
-            .is_ok_and(|elapsed| elapsed >= MIN_ADVANCE_INTERVAL)
-        {
-            return self.abort_with_error(GetObjectError::ReferenceSourceChanged);
-        }
-        let Some(successor_count) = advance_count.checked_add(1) else {
-            return self.abort_with_error(GetObjectError::ReferenceAdvanceExhausted);
-        };
-
-        let (Some(observation), Some(source_binding), Some(creator), Some(txn_id), Some(pointer)) = (
+    /// The advance of the drifted reference this read headed.
+    fn advance(&self) -> Result<AdvanceReference, GetObjectError> {
+        let (Some(observation), Some(binding), Some(creator), Some(headed)) = (
             self.advance_observation.clone(),
             self.source_binding.clone(),
             self.reference_creator,
-            self.txn_id,
-            self.advance_pointer.clone(),
+            self.resolved_version_id,
         ) else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
+            return Err(GetObjectError::GetObjectFailed);
         };
-
-        let new_version_id = Ulid::generate();
-        // The successor of a governed reference keeps its predecessor's refs:
-        // an automatic advance must never relax an attachment.
-        let successor = match BlobVersion::reference(source_binding, observation, now, creator, now)
-            .with_metadata(self.metadata.clone())
-            .with_advance_count(successor_count)
-            .with_policies(current.placement_policies.clone())
-        {
-            Ok(successor) => successor,
-            Err(err) => return self.emit_error(err.into()),
-        };
-        let version_key =
-            match VersionKey::new(&self.input.bucket, &self.input.key, new_version_id).to_bytes() {
-                Ok(key) => key.into(),
-                Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-            };
-        let version_value = match successor.to_bytes() {
-            Ok(value) => value.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        let head_key = match BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes() {
-            Ok(key) => key.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        let next_pointer = match CurrentVersionPointer::next_for(Some(&pointer), new_version_id) {
-            Ok(next_pointer) => next_pointer,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        let head_value = match next_pointer.to_bytes() {
-            Ok(value) => value.into(),
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        let reference_advance = ReferenceAdvance {
-            generation: next_pointer.generation,
-            predecessor: pointer.version_id,
-        };
-
-        // The durable obligation rides the same transaction as the successor, so
-        // a lost enqueue is still discoverable by the repair scanner.
-        let obligation = LiveObligationRecord::new(
-            self.input.node_id,
-            self.auth_context(),
-            self.input.bucket.clone(),
-            self.input.key.clone(),
-            new_version_id,
-            false,
-        )
-        .with_reference_advance(reference_advance);
-        let obligation_entry = match live_obligation_entry(&obligation) {
-            Ok(entry) => entry,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-
-        let successor_key = VersionKey::new(&self.input.bucket, &self.input.key, new_version_id);
-        let connector_row = match connector_reference_write(&successor, &successor_key) {
-            Ok(row) => row,
-            Err(err) => return self.emit_error(GetObjectError::ConversionError(err)),
-        };
-        let mut writes = vec![
-            (
-                BLOB_VERSIONS_KEYSPACE.to_string(),
-                version_key,
-                version_value,
-            ),
-            (BLOB_HEAD_KEYSPACE.to_string(), head_key, head_value),
-            obligation_entry,
-        ];
-        writes.extend(connector_row);
-
-        self.resolved_version_id = Some(new_version_id);
-        self.reference_advance = Some(reference_advance);
-        self.state = GetObjectState::WriteSuccessor;
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        Ok(AdvanceReference {
+            input: self.input.clone(),
+            auth_context: self.auth_context(),
+            headed,
+            observation,
+            binding,
+            creator,
+            metadata: self.metadata.clone(),
+            now: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
+            now_ms: 0,
+            ids: IdMint::default(),
+            step: AdvanceStep::ReadBucket,
+            pointer: None,
+            released_bytes: 0,
+            usage: None,
+            advanced: None,
+        })
     }
 
-    fn handle_successor_written(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::BatchWriteResult)",
-                received: event,
-            });
-        };
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-        let Some(observation) = self.advance_observation.as_ref() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        // The successor adds its own size. A superseded reference stays stored and
-        // charged, except an offered directory observation, which is released.
-        let referenced_bytes =
-            i128::from(observation.content_length) - i128::from(self.released_bytes);
-        let mut update = UsageCounterUpdate::for_group(
-            self.input.group_id,
-            UsageDelta {
-                referenced_bytes,
-                ..Default::default()
-            },
-        )
-        .in_bucket(&self.input.bucket, RowChange::AddedVersion);
-        if update.is_noop() {
-            self.state = GetObjectState::CommitAdvance;
-            return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-        }
-        self.state = GetObjectState::UpdateReferenceUsage;
-        let effects = update.start(txn_id);
-        self.usage_update = Some(update);
-        effects
-    }
-
-    fn handle_advance_usage(&mut self, event: Event) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.emit_error(GetObjectError::NoTransactionFound);
-        };
-        let Some(update) = self.usage_update.as_mut() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        match update.step(event, txn_id) {
-            Ok(Some(effects)) => effects,
-            Ok(None) => {
-                self.state = GetObjectState::CommitAdvance;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            Err(err) => self.emit_error(err.into()),
-        }
-    }
-
-    fn handle_advance_committed(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                self.txn_id = None;
+    fn reference_advanced(&mut self, result: IoResult) -> Turn {
+        match result.child::<AdvanceEnd, GetObjectError>()? {
+            Ok(AdvanceEnd::Committed {
+                version_id,
+                advance,
+            }) => {
+                self.resolved_version_id = Some(version_id);
+                self.reference_advance = Some(advance);
                 self.queue_successor_replication()
             }
-            Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }) => {
-                self.txn_id = None;
-                self.restart_after_conflict()
+            Ok(AdvanceEnd::Distributed) => self.queue_changed_refresh(),
+            // Another writer moved the head: the read starts again against the winner.
+            Ok(AdvanceEnd::Conflict)
+            | Err(GetObjectError::StorageError(StorageError::TransactionConflict)) => {
+                self.restart()
             }
-            Event::Storage(StorageEvent::Error { .. }) => {
-                self.emit_error(GetObjectError::GetObjectFailed)
-            }
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionCommitted)",
-                received: other,
-            }),
+            Err(GetObjectError::StorageError(_)) => Err(GetObjectError::GetObjectFailed),
+            Err(error) => Err(error),
         }
     }
 
     /// Enqueues the committed successor for live replication, the same way the
     /// normal write path does after its commit.
-    fn queue_successor_replication(&mut self) -> Effects {
-        let Some(version_id) = self.resolved_version_id else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        let Some(reference_advance) = self.reference_advance else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        self.state = GetObjectState::QueueSuccessorReplication;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            LiveVersionOperation::new(LiveVersionInput {
-                local_node_id: self.input.node_id,
-                auth_context: self.auth_context(),
-                bucket: self.input.bucket.clone(),
-                key: self.input.key.clone(),
-                version_id,
-                delete_marker: false,
-            })
-            .with_reference_advance(reference_advance),
-            |result| Event::SubOperation(SubOperationEvent::LiveReplicationQueued {
+    fn queue_successor_replication(&mut self) -> Turn {
+        let version_id = self.resolved_version_id;
+        let version_id = version_id.ok_or(GetObjectError::GetObjectFailed)?;
+        let reference_advance = self.reference_advance;
+        let reference_advance = reference_advance.ok_or(GetObjectError::GetObjectFailed)?;
+        let live = LiveVersionOperation::new(LiveVersionInput {
+            local_node_id: self.input.node_id,
+            auth_context: self.auth_context(),
+            bucket: self.input.bucket.clone(),
+            key: self.input.key.clone(),
+            version_id,
+            delete_marker: false,
+        })
+        .with_reference_advance(reference_advance);
+        let queue = boxed_suboperation(live, |result| {
+            Event::SubOperation(SubOperationEvent::LiveReplicationQueued {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
+            })
+        });
+        self.call(
+            GetObjectState::QueueSuccessorReplication,
+            IoCall::Child(queue),
+        )
     }
 
-    fn handle_successor_queued(&mut self, event: Event) -> Effects {
+    fn handle_successor_queued(&mut self, event: Event) -> Turn {
         let Event::SubOperation(SubOperationEvent::LiveReplicationQueued { result }) = event else {
-            return self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::SubOperation(SubOperationEvent::LiveReplicationQueued)",
-                received: event,
-            });
+            return Err(self.unexpected(
+                "Event::SubOperation(SubOperationEvent::LiveReplicationQueued)",
+                event,
+            ));
         };
         // The committed obligation is what repair replays, so a failed enqueue
         // must not fail the read.
@@ -1956,42 +1338,15 @@ impl GetObjectOperation {
         }
         // Kept until the read returns: it is the fingerprint the committed
         // successor promises, so the served bytes are checked against it.
-        let Some(observation) = self.advance_observation.clone() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-        self.last_refresh = Some(SystemTime::now());
+        let observation = self.advance_observation.clone();
+        let observation = observation.ok_or(GetObjectError::GetObjectFailed)?;
+        self.last_refresh = Some(SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms));
         self.serve_reference_source(observation, true)
     }
 
-    /// Aborts an in-flight advance transaction and re-reads against the winner.
-    fn restart_after_conflict(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => {
-                self.state = GetObjectState::RestartReference;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => self.restart_reference_read(),
-        }
-    }
-
-    fn handle_restart_reference(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::TransactionAborted { .. }) => {
-                self.restart_reference_read()
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.emit_error(error.into()),
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::TransactionAborted)",
-                received: other,
-            }),
-        }
-    }
-
-    /// Re-reads the current head after conflict. The preserved advance counter
-    /// makes repeated source drift terminate.
-    fn restart_reference_read(&mut self) -> Effects {
-        self.txn_id = None;
+    /// Reads the records again after a lost advance. The preserved advance counter makes
+    /// repeated source drift terminate.
+    fn restart(&mut self) -> Turn {
         self.reference_access = None;
         self.source_queue.clear();
         self.reference_cached = None;
@@ -1999,15 +1354,12 @@ impl GetObjectOperation {
         self.verify_digests = Vec::new();
         self.reference_creator = None;
         self.reference_advance = None;
-        self.advance_pointer = None;
         self.source_metadata = None;
         self.advance_observation = None;
-        self.usage_update = None;
         self.resolved_version_id = None;
-        self.state = GetObjectState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
+        self.reading = true;
+        self.restarted = true;
+        self.read_first()
     }
 
     /// Authoritative facts of the object this read serves. A local location
@@ -2038,48 +1390,38 @@ impl GetObjectOperation {
         })
     }
 
-    pub fn handle_received_blob(&mut self, event: Event) -> Effects {
-        if let Event::Blob(BlobEvent::ReadFinished { mut blob, .. }) = event {
-            if let Some(lease) = self.reference_lease.take() {
-                blob = leased(blob, lease);
-            }
-            let Some(location) = self.location.clone() else {
-                return self.emit_error(GetObjectError::GetObjectFailed);
-            };
-            let Some(info) = self.object_info(Some(&location), None) else {
-                return self.emit_error(GetObjectError::GetObjectFailed);
-            };
-            self.state = GetObjectState::Finish;
-            self.output = Some(Ok(GetObjectResult {
-                blob,
-                location: Some(location),
-                metadata: self.metadata.clone(),
-                info,
-                source_metadata: None,
-                source_binding: self.source_binding.clone(),
-                last_refresh: None,
-                version_id: self.resolved_version_id.or(self.input.version_id),
-                resolved_version_id: self.resolved_version_id,
-                resolved_range: self.resolved_range.clone(),
-                source_policies: self.source_policies.clone(),
-                served_source: None,
-            }));
-            smallvec![]
-        } else {
-            self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Blob(BlobEvent::ReadFinished)",
-                received: event,
-            })
+    fn handle_received_blob(&mut self, event: Event) -> Turn {
+        let Event::Blob(BlobEvent::ReadFinished { mut blob, .. }) = event else {
+            return Err(self.unexpected("Event::Blob(BlobEvent::ReadFinished)", event));
+        };
+        if let Some(lease) = self.reference_lease.take() {
+            blob = blob.keep(lease);
         }
+        let location = self.location.clone();
+        let location = location.ok_or(GetObjectError::GetObjectFailed)?;
+        let info = self.object_info(Some(&location), None);
+        let info = info.ok_or(GetObjectError::GetObjectFailed)?;
+        Ok(Next::Done(GetObjectResult {
+            blob,
+            location: Some(location),
+            metadata: self.metadata.clone(),
+            info,
+            source_metadata: None,
+            source_binding: self.source_binding.clone(),
+            last_refresh: None,
+            version_id: self.resolved_version_id.or(self.input.version_id),
+            resolved_version_id: self.resolved_version_id,
+            resolved_range: self.resolved_range.clone(),
+            source_policies: self.source_policies.clone(),
+            served_source: None,
+        }))
     }
 
-    pub fn reference_source_received(&mut self, event: Event) -> Effects {
+    fn reference_source_received(&mut self, event: Event) -> Turn {
         match event {
             Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
-                let Some(head_metadata) = self.source_metadata.as_ref() else {
-                    return self.emit_error(GetObjectError::GetObjectFailed);
-                };
+                let head_metadata = self.source_metadata.as_ref();
+                let head_metadata = head_metadata.ok_or(GetObjectError::GetObjectFailed)?;
                 let comparison = head_metadata.compare(&metadata);
                 if comparison == ObservationMatch::Changed {
                     if self.source_slot > 0 && self.others_remain() {
@@ -2088,7 +1430,7 @@ impl GetObjectOperation {
                     if self.reference_explicit {
                         return self.proof_failed(GetObjectError::HistoricalReferenceUnavailable);
                     }
-                    return self.restart_after_conflict();
+                    return self.restart();
                 }
                 // Without digests, only the read's own validators prove a pinned version.
                 if comparison == ObservationMatch::Unknown
@@ -2108,8 +1450,7 @@ impl GetObjectOperation {
                 if !self.verify_digests.is_empty() {
                     return self.spool_reference(stream, size);
                 }
-                self.reference_stream = Some(stream);
-                self.finish_reference_output()
+                self.finish_reference_output(stream)
             }
             Event::StagingSource(StagingSourceEvent::Error {
                 error: StagingSourceError::ConditionFailed,
@@ -2117,44 +1458,41 @@ impl GetObjectOperation {
             Event::StagingSource(StagingSourceEvent::Error { error }) => {
                 self.source_failed(error.into())
             }
-            other => self.emit_error(GetObjectError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::StagingSource(StagingSourceEvent::ReadResult)",
-                received: other,
-            }),
+            other => Err(self.unexpected(
+                "Event::StagingSource(StagingSourceEvent::ReadResult)",
+                other,
+            )),
         }
     }
 
     /// Queues a request to observe a source whose bound read failed, so the refresh worker
     /// records the change and retries the observation until it succeeds; the read fails.
-    fn queue_changed_refresh(&mut self) -> Effects {
-        let Some(version_id) = self.resolved_version_id.or(self.input.version_id) else {
-            return self.emit_error(GetObjectError::ReferenceSourceChanged);
-        };
+    fn queue_changed_refresh(&mut self) -> Turn {
+        let version_id = self.resolved_version_id.or(self.input.version_id);
+        let version_id = version_id.ok_or(GetObjectError::ReferenceSourceChanged)?;
         let refresh = ReferenceRefresh {
             bucket: self.input.bucket.clone(),
             key: self.input.key.clone(),
             version_id,
             metadata: None,
-            refreshed_at: self.now_override.unwrap_or_else(SystemTime::now),
+            refreshed_at: SystemTime::UNIX_EPOCH + Duration::from_millis(self.now_ms),
             node_id: self.input.node_id,
             auth_context: self.auth_context(),
         };
-        self.state = GetObjectState::QueueChangedRefresh;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            QueueRefreshOperation::new(refresh),
-            |result| Event::SubOperation(SubOperationEvent::RefreshQueued {
+        let queue = boxed_suboperation(QueueRefreshOperation::new(refresh), |result| {
+            Event::SubOperation(SubOperationEvent::RefreshQueued {
                 result: result.map(|_| ()).map_err(|error| error.to_string()),
-            }),
-        ))]
+            })
+        });
+        self.call(GetObjectState::QueueChangedRefresh, IoCall::Child(queue))
     }
 
-    fn handle_refresh_queued(&mut self, event: Event) -> Effects {
+    fn handle_refresh_queued(&mut self, event: Event) -> Turn {
         if let Event::SubOperation(SubOperationEvent::RefreshQueued { result: Err(error) }) = &event
         {
             warn!(error = %error, "Changed reference source refresh was not queued");
         }
-        self.emit_error(GetObjectError::ReferenceSourceChanged)
+        Err(GetObjectError::ReferenceSourceChanged)
     }
 
     /// Spools the whole source bytes to a local unnamed file, so nothing is served before they
@@ -2163,28 +1501,25 @@ impl GetObjectOperation {
         &mut self,
         stream: BackendStream<Result<Bytes, StreamError>>,
         size: u64,
-    ) -> Effects {
-        self.state = GetObjectState::SpoolReference;
-        let range = self
-            .resolved_range
-            .as_ref()
-            .map(|resolved| resolved.range.clone());
-        smallvec![Effect::Blob(BlobEffect::SpoolLocal {
+    ) -> Turn {
+        let range = (self.resolved_range.as_ref()).map(|resolved| resolved.range.clone());
+        let spool = Effect::Blob(BlobEffect::SpoolLocal {
             size,
             deadline: None,
             range,
             blob: stream,
-        })]
+        });
+        self.effect(GetObjectState::SpoolReference, spool)
     }
 
-    fn handle_reference_spooled(&mut self, event: Event) -> Effects {
+    fn handle_reference_spooled(&mut self, event: Event) -> Turn {
         let (hashes, blob) = match event {
             Event::Blob(BlobEvent::LocalSpooled { hashes, blob, .. }) => (hashes, blob),
             Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
-                return self.emit_error(GetObjectError::SpoolBudgetExhausted);
+                return Err(GetObjectError::SpoolBudgetExhausted);
             }
             Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit })) => {
-                return self.emit_error(GetObjectError::ReferenceTooLarge { limit });
+                return Err(GetObjectError::ReferenceTooLarge { limit });
             }
             // A source that sent other bytes than it announced changed behind the version.
             Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
@@ -2195,15 +1530,14 @@ impl GetObjectOperation {
                 debug!(error = %error, "Spooling a reference source failed");
                 return self.source_failed(GetObjectError::GetObjectFailed);
             }
-            _ => return self.emit_error(GetObjectError::GetObjectFailed),
+            _ => return Err(GetObjectError::GetObjectFailed),
         };
         let expected = std::mem::take(&mut self.verify_digests);
         // Dropping the stream of a spool that missed the digests removes the spool.
         if unmatched_checksum(&expected, &hashes).is_some() {
             return self.proof_failed(GetObjectError::ReferenceChecksumMismatch);
         }
-        self.reference_stream = Some(blob);
-        self.finish_reference_output()
+        self.finish_reference_output(blob)
     }
 
     /// Whether further sources remain to try.
@@ -2213,23 +1547,22 @@ impl GetObjectOperation {
 
     /// Bytes that fail their proof were not served, so any remaining source is tried; the
     /// failure stands once none is left.
-    fn proof_failed(&mut self, error: GetObjectError) -> Effects {
+    fn proof_failed(&mut self, error: GetObjectError) -> Turn {
         match self.others_remain() {
             true => self.source_failed(error),
-            false => self.emit_error(error),
+            false => Err(error),
         }
     }
 
-    fn finish_reference_output(&mut self) -> Effects {
-        let Some(mut blob) = self.reference_stream.take() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
+    fn finish_reference_output(
+        &mut self,
+        mut blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> Turn {
         if let Some(lease) = self.reference_lease.take() {
-            blob = leased(blob, lease);
+            blob = blob.keep(lease);
         }
-        let Some(mut source_metadata) = self.source_metadata.clone() else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
+        let source_metadata = self.source_metadata.clone();
+        let mut source_metadata = source_metadata.ok_or(GetObjectError::GetObjectFailed)?;
         // Bytes from another source answer with the version's own validators.
         if let Some(cached) = self
             .reference_cached
@@ -2241,12 +1574,9 @@ impl GetObjectOperation {
             let content_type = cached.content_type.clone();
             source_metadata.content_type = content_type.or(source_metadata.content_type);
         }
-        let Some(info) = self.object_info(None, Some(&source_metadata)) else {
-            return self.emit_error(GetObjectError::GetObjectFailed);
-        };
-
-        self.state = GetObjectState::Finish;
-        self.output = Some(Ok(GetObjectResult {
+        let info = self.object_info(None, Some(&source_metadata));
+        let info = info.ok_or(GetObjectError::GetObjectFailed)?;
+        Ok(Next::Done(GetObjectResult {
             blob,
             location: None,
             metadata: self.metadata.clone(),
@@ -2260,20 +1590,316 @@ impl GetObjectOperation {
             source_policies: self.source_policies.clone(),
             served_source: (self.source_binding.as_ref())
                 .and_then(|binding| binding.source_at(self.source_slot)),
-        }));
-        smallvec![]
+        }))
     }
 }
 
-/// Keeps `lease` with the stream until the stream ends.
-pub(crate) fn leased(
-    blob: BackendStream<Result<Bytes, StreamError>>,
-    lease: ReadLease,
-) -> BackendStream<Result<Bytes, StreamError>> {
-    BackendStream(Box::pin(blob.0.map(move |chunk| {
-        let _lease = &lease;
-        chunk
-    })))
+impl Operation for GetObjectOperation {
+    type Output = GetObjectResult;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> Turn {
+        self.read_first()
+    }
+
+    fn next(&mut self, result: IoResult) -> Turn {
+        match self.state {
+            GetObjectState::GetVersion => {
+                self.handle_received_version(outside_answer(result)?.value()?)
+            }
+            GetObjectState::CheckManagedCopy => {
+                self.handle_managed_copy(outside_answer(result)?.values()?)
+            }
+            GetObjectState::GetBlobLocation => self.location_read(outside_answer(result)?.value()?),
+            GetObjectState::GetCurrentVersion => {
+                self.current_version_received(outside_answer(result)?.value()?)
+            }
+            GetObjectState::ReadKept => self.kept_read(keyed(&outside_answer(result)?.values()?)),
+            GetObjectState::ReadSourceBucket => {
+                self.source_bucket_read(outside_answer(result)?.value()?)
+            }
+            GetObjectState::ReadSourceKept => {
+                self.source_kept_read(keyed(&outside_answer(result)?.values()?))
+            }
+            GetObjectState::ResolveReferenceAccess => {
+                self.reference_access_resolved(result.event()?)
+            }
+            GetObjectState::ReadSourceWeights => {
+                self.weights_read(outside_answer(result)?.values()?)
+            }
+            GetObjectState::RankSources => self.sources_ranked(result.event()?),
+            GetObjectState::ReadMultipartSummary => {
+                self.summary_read(outside_answer(result)?.value()?)
+            }
+            GetObjectState::HeadReferenceSource => self.reference_head_received(result.event()?),
+            GetObjectState::AdvanceReference => self.reference_advanced(result),
+            GetObjectState::QueueSuccessorReplication => {
+                self.handle_successor_queued(result.event()?)
+            }
+            GetObjectState::GetBlob => self.handle_received_blob(result.event()?),
+            GetObjectState::ReadReferenceSource => self.reference_source_received(result.event()?),
+            GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(result.event()?),
+            GetObjectState::SpoolReference => self.handle_reference_spooled(result.event()?),
+            GetObjectState::AdmitRead => self.read_admitted(result.event()?),
+            GetObjectState::ReadContentSettings => {
+                self.content_settings_read(outside_answer(result)?.value()?)
+            }
+            GetObjectState::AdmitPlain => self.plain_admitted(result.event()?),
+            GetObjectState::ReadReferenceSettings => {
+                self.reference_settings_read(outside_answer(result)?.value()?)
+            }
+            GetObjectState::CheckReferenceKey => self.reference_key_checked(result.event()?),
+            GetObjectState::Init => Err(GetObjectError::InvalidState {
+                current: GetObjectState::Init,
+                expected: GetObjectState::GetVersion,
+            }),
+        }
+    }
+
+    /// The record reads see one snapshot of the bucket.
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::ReadSnapshot
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+}
+
+/// How a reference advance ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdvanceEnd {
+    /// The successor and its obligation committed.
+    Committed {
+        version_id: Ulid,
+        advance: ReferenceAdvance,
+    },
+    /// A distributed bucket advances only through its coordinated refresh.
+    Distributed,
+    /// The head moved meanwhile; the read starts again against the winner.
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdvanceStep {
+    ReadBucket,
+    ReadHead,
+    ReadVersion,
+    WriteSuccessor,
+    UpdateUsage,
+}
+
+/// Writes the same-binding successor of a drifted reference and moves the head to it, in one
+/// write transaction that rechecks the head and the durable advance bounds.
+#[derive(Debug, PartialEq)]
+struct AdvanceReference {
+    now_ms: u64,
+    ids: IdMint,
+    input: GetObjectInput,
+    auth_context: AuthContext,
+    /// The version the drifted read headed; the head must still name it.
+    headed: Ulid,
+    observation: SourceMetadata,
+    binding: VersionSourceBinding,
+    creator: UserId,
+    metadata: HashMap<String, String>,
+    now: SystemTime,
+    step: AdvanceStep,
+    pointer: Option<CurrentVersionPointer>,
+    /// Offered directory bytes the superseded head stops charging.
+    released_bytes: u64,
+    usage: Option<UsageCounterUpdate>,
+    advanced: Option<(Ulid, ReferenceAdvance)>,
+}
+
+type AdvanceTurn = Result<Next<AdvanceEnd>, GetObjectError>;
+
+impl AdvanceReference {
+    fn read(&mut self, step: AdvanceStep, call: IoCall) -> AdvanceTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    /// Source changes of a distributed bucket become successors only through the coordinated
+    /// refresh, so a read there queues one durably and fails instead of advancing the binding.
+    fn bucket_read(&mut self, value: Option<Value>) -> AdvanceTurn {
+        let bucket = value
+            .map(|value| BucketInfo::from_bytes(&value))
+            .transpose()?;
+        if bucket.is_some_and(|bucket| bucket.distribution.is_some()) {
+            return Ok(Next::Done(AdvanceEnd::Distributed));
+        }
+        let key = BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes()?;
+        self.read(AdvanceStep::ReadHead, read_row(BLOB_HEAD_KEYSPACE, key))
+    }
+
+    fn head_read(&mut self, value: Option<Value>) -> AdvanceTurn {
+        let Some(value) = value else {
+            return Ok(Next::Done(AdvanceEnd::Conflict));
+        };
+        let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+        // CAS: only advance while the head still names the version we headed;
+        // otherwise a concurrent writer won and we serve its successor instead.
+        if pointer.version_id != self.headed {
+            return Ok(Next::Done(AdvanceEnd::Conflict));
+        }
+        let key = VersionKey::new(&self.input.bucket, &self.input.key, pointer.version_id);
+        self.pointer = Some(pointer);
+        let read = read_row(BLOB_VERSIONS_KEYSPACE, key.to_bytes()?);
+        self.read(AdvanceStep::ReadVersion, read)
+    }
+
+    /// Enforces the durable advance bounds against the reread current version and
+    /// writes the successor in the same transaction.
+    fn version_read(&mut self, value: Option<Value>) -> AdvanceTurn {
+        let Some(value) = value else {
+            return Ok(Next::Done(AdvanceEnd::Conflict));
+        };
+        let current = BlobVersion::from_bytes(value.as_ref())?;
+        let Some(advance_count) = current.advance_count() else {
+            return Ok(Next::Done(AdvanceEnd::Conflict));
+        };
+        self.released_bytes = current
+            .offered_size(&self.input.bucket, &self.input.key)
+            .unwrap_or(0);
+        if advance_count >= MAX_AUTO_ADVANCES {
+            return Err(GetObjectError::ReferenceAdvanceExhausted);
+        }
+        let now = self.now;
+        // A backwards clock makes `duration_since` fail, which fails the advance
+        // closed rather than granting an unbounded budget.
+        if !now
+            .duration_since(current.created_at)
+            .is_ok_and(|elapsed| elapsed >= MIN_ADVANCE_INTERVAL)
+        {
+            return Err(GetObjectError::ReferenceSourceChanged);
+        }
+        let successor_count = advance_count.checked_add(1);
+        let successor_count = successor_count.ok_or(GetObjectError::ReferenceAdvanceExhausted)?;
+        let pointer = self
+            .pointer
+            .clone()
+            .ok_or(GetObjectError::GetObjectFailed)?;
+
+        let new_version_id = self.ids.mint(self.now_ms);
+        // The successor of a governed reference keeps its predecessor's refs:
+        // an automatic advance must never relax an attachment.
+        let successor = BlobVersion::reference(
+            self.binding.clone(),
+            self.observation.clone(),
+            now,
+            self.creator,
+            now,
+        )
+        .with_metadata(self.metadata.clone())
+        .with_advance_count(successor_count)
+        .with_policies(current.placement_policies.clone())?;
+        let successor_key = VersionKey::new(&self.input.bucket, &self.input.key, new_version_id);
+        let next_pointer = CurrentVersionPointer::next_for(Some(&pointer), new_version_id)?;
+        let reference_advance = ReferenceAdvance {
+            generation: next_pointer.generation,
+            predecessor: pointer.version_id,
+        };
+        // The durable obligation rides the same transaction as the successor, so
+        // a lost enqueue is still discoverable by the repair scanner.
+        let obligation = LiveObligationRecord::new(
+            self.input.node_id,
+            self.auth_context.clone(),
+            self.input.bucket.clone(),
+            self.input.key.clone(),
+            new_version_id,
+            false,
+        )
+        .with_reference_advance(reference_advance);
+        let head_key = BlobHeadKey::new(&self.input.bucket, &self.input.key).to_bytes()?;
+        let mut writes = vec![
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                successor_key.to_bytes()?.into(),
+                successor.to_bytes()?.into(),
+            ),
+            (
+                BLOB_HEAD_KEYSPACE.to_string(),
+                head_key.into(),
+                next_pointer.to_bytes()?.into(),
+            ),
+            live_obligation_entry(&obligation)?,
+        ];
+        writes.extend(connector_reference_write(&successor, &successor_key)?);
+        self.advanced = Some((new_version_id, reference_advance));
+        self.read(AdvanceStep::WriteSuccessor, IoCall::Write(writes))
+    }
+
+    /// The successor adds its own size. A superseded reference stays stored and charged,
+    /// except an offered directory observation, which is released.
+    fn successor_written(&mut self) -> AdvanceTurn {
+        let referenced_bytes =
+            i128::from(self.observation.content_length) - i128::from(self.released_bytes);
+        let delta = UsageDelta {
+            referenced_bytes,
+            ..Default::default()
+        };
+        let mut update = UsageCounterUpdate::for_group(self.input.group_id, delta)
+            .in_bucket(&self.input.bucket, RowChange::AddedVersion);
+        if update.is_noop() {
+            return self.committed();
+        }
+        let call = update.start_calls(self.ids.mint(self.now_ms)).into_call();
+        self.usage = Some(update);
+        self.read(AdvanceStep::UpdateUsage, call)
+    }
+
+    fn usage_updated(&mut self, result: IoResult) -> AdvanceTurn {
+        let update = self.usage.as_mut().ok_or(GetObjectError::GetObjectFailed)?;
+        match update.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.committed(),
+        }
+    }
+
+    fn committed(&mut self) -> AdvanceTurn {
+        let advanced = self.advanced.take();
+        let (version_id, advance) = advanced.ok_or(GetObjectError::GetObjectFailed)?;
+        Ok(Next::Done(AdvanceEnd::Committed {
+            version_id,
+            advance,
+        }))
+    }
+}
+
+impl Operation for AdvanceReference {
+    type Output = AdvanceEnd;
+    type Error = GetObjectError;
+
+    fn first(&mut self) -> AdvanceTurn {
+        let read = read_row(S3_BUCKET_KEYSPACE, self.input.bucket.as_bytes().to_vec());
+        self.read(AdvanceStep::ReadBucket, read)
+    }
+
+    fn next(&mut self, result: IoResult) -> AdvanceTurn {
+        match self.step {
+            AdvanceStep::ReadBucket => self.bucket_read(result.value()?),
+            AdvanceStep::ReadHead => self.head_read(result.value()?),
+            AdvanceStep::ReadVersion => self.version_read(result.value()?),
+            AdvanceStep::WriteSuccessor => {
+                result.done()?;
+                self.successor_written()
+            }
+            AdvanceStep::UpdateUsage => self.usage_updated(result),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
 }
 
 /// A reference version has no archive, so its lease names the bucket id, which no archive uses.
@@ -2281,764 +1907,10 @@ pub(crate) fn reference_archive(key: BucketKeyRef) -> ArchiveKey {
     ArchiveKey::new(key.bucket_id, BackendRef::node_default())
 }
 
-fn locked(error: BucketKeyError) -> GetObjectError {
+pub(crate) fn locked(error: BucketKeyError) -> GetObjectError {
     GetObjectError::ConversionError(ConversionError::BucketKey(error))
-}
-
-impl Operation for GetObjectOperation {
-    type Output = GetObjectResult;
-    type Error = GetObjectError;
-
-    fn start(&mut self) -> Effects {
-        self.handle_init()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match &self.state {
-            GetObjectState::Init => self.handle_init(),
-            GetObjectState::StartTransaction => self.handle_transaction_started(event),
-            GetObjectState::GetVersion => self.handle_received_version(event),
-            GetObjectState::CheckManagedCopy => self.handle_managed_copy(event),
-            GetObjectState::GetBlobLocation => self.location_read(event),
-            GetObjectState::GetCurrentVersion => self.current_version_received(event),
-            GetObjectState::ReadKept => self.kept_read(event),
-            GetObjectState::ReadSourceBucket => self.source_bucket_read(event),
-            GetObjectState::ReadSourceKept => self.source_kept_read(event),
-            GetObjectState::ResolveReferenceAccess => self.reference_access_resolved(event),
-            GetObjectState::ReadSourceWeights => self.weights_read(event),
-            GetObjectState::RankSources => self.sources_ranked(event),
-            GetObjectState::ReadMultipartSummary => self.summary_read(event),
-            GetObjectState::CommitTransaction => self.handle_transaction_committed(event),
-            GetObjectState::HeadReferenceSource => self.reference_head_received(event),
-            GetObjectState::StartAdvanceTransaction => self.handle_advance_started(event),
-            GetObjectState::ReadBucketAdvance => self.handle_advance_bucket(event),
-            GetObjectState::AbortAdvance => self.advance_aborted(event),
-            GetObjectState::ReadHeadAdvance => self.handle_advance_head(event),
-            GetObjectState::ReadAdvance => self.handle_advance_version(event),
-            GetObjectState::WriteSuccessor => self.handle_successor_written(event),
-            GetObjectState::UpdateReferenceUsage => self.handle_advance_usage(event),
-            GetObjectState::CommitAdvance => self.handle_advance_committed(event),
-            GetObjectState::QueueSuccessorReplication => self.handle_successor_queued(event),
-            GetObjectState::RestartReference => self.handle_restart_reference(event),
-            GetObjectState::GetBlob => self.handle_received_blob(event),
-            GetObjectState::ReadReferenceSource => self.reference_source_received(event),
-            GetObjectState::QueueChangedRefresh => self.handle_refresh_queued(event),
-            GetObjectState::SpoolReference => self.handle_reference_spooled(event),
-            GetObjectState::AdmitRead => self.read_admitted(event),
-            GetObjectState::ReadContentSettings => self.content_settings_read(event),
-            GetObjectState::AdmitPlain => self.plain_admitted(event),
-            GetObjectState::ReadReferenceSettings => self.reference_settings_read(event),
-            GetObjectState::CheckReferenceKey => self.reference_key_checked(event),
-            GetObjectState::Finish => smallvec![],
-            GetObjectState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, GetObjectState::Finish | GetObjectState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(GetObjectError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.txn_id.take().map_or_else(SmallVec::new, |txn_id| {
-            smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-        })
-    }
-}
-
-/// Reads an object, continuing against the realm's holders when this node holds
-/// the version record but not its bytes. Only User nodes route, since elsewhere a
-/// missing local blob is a fault; a routed range streams the whole blob and skips to it.
-pub async fn get_object_routed(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-) -> Result<GetObjectResult, GetObjectError> {
-    get_object_token(context, input, restrictions, None).await
-}
-
-/// The token credential of one S3 request and the limits of a promotion it starts.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TokenRead {
-    pub credential: TokenCredential,
-    pub limits: RoCrateLimits,
-}
-
-/// `get_object_routed` where `token` admits a read of a locked bucket key. A pending version
-/// is promoted with the token first, then read like any other.
-pub async fn get_object_token(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    token: Option<TokenRead>,
-) -> Result<GetObjectResult, GetObjectError> {
-    let range = input.range.clone();
-    let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    let (bucket, key, group_id) = (input.bucket.clone(), input.key.clone(), input.group_id);
-    let again = input.clone();
-    let mut result = read_local(context, input, restrictions.clone(), token.as_ref()).await;
-    // A member of a distributed bucket receives references without a connector id; the one it
-    // read from the source may be kept.
-    let keep = match &result {
-        Ok(read)
-            if read.source_metadata.is_some()
-                && read.location.is_none()
-                && (read.source_binding.as_ref())
-                    .is_some_and(|source| source.connector_id.is_none()) =>
-        {
-            (read.resolved_version_id.or(read.version_id)).map(|version_id| SourceKeep {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                version_id,
-                group_id,
-                user_id,
-                ranged: range.is_some(),
-            })
-        }
-        _ => None,
-    };
-    // A member that fills first serves the range from the copy it just kept.
-    if let Some(keep) = keep
-        && keep_first(context, keep).await
-    {
-        result = read_local(context, again, restrictions.clone(), token.as_ref()).await;
-    }
-    if let Ok(read) = &mut result
-        && let Some(location) = read
-            .location
-            .as_ref()
-            .filter(|location| kept_copy(location))
-    {
-        let empty = BackendStream(Box::pin(futures_util::stream::empty()));
-        read.blob = pinned_blob(location, std::mem::replace(&mut read.blob, empty));
-    }
-    if let Err(GetObjectError::HeldElsewhere(held)) = result {
-        let auth = AuthContext {
-            user_id,
-            realm_id,
-            path_restrictions: restrictions,
-            session: None,
-        };
-        let request = PullRequest {
-            bucket,
-            key,
-            range,
-            auth,
-            held: *held,
-        };
-        return pull_through(context, request).await;
-    }
-    let Err(GetObjectError::BlobNotLocal {
-        blake3,
-        version_id,
-        metadata,
-        version_created_at,
-        source_policies,
-    }) = result
-    else {
-        return result;
-    };
-    if !local_is_user(context, realm_id).await {
-        return Err(GetObjectError::GetObjectFailed);
-    }
-    let read = RoutedRead {
-        user_id,
-        realm_id,
-        blake3,
-        version_id,
-        metadata,
-        version_created_at,
-        source_policies,
-        restrictions,
-    };
-    let mut result = routed_blob(context, read).await?;
-    if let Some(range) = range {
-        let resolved = range.resolve(result.info.size)?;
-        result.blob = slice_blob(result.blob, resolved.range.clone());
-        result.resolved_range = Some(resolved);
-    }
-    Ok(result)
-}
-
-/// Whether `location` is a copy a member keeps on use, which eviction may remove.
-fn kept_copy(location: &BackendLocation) -> bool {
-    HiddenBlobKey::try_from(location)
-        .and_then(|key| key.namespace())
-        .is_ok_and(|namespace| namespace == ATTACHMENT_NAMESPACE || namespace == CACHE_NAMESPACE)
-}
-
-/// The bytes of `range` from a stream of the whole object; the rest is skipped.
-fn slice_blob(
-    blob: BackendStream<Result<Bytes, StreamError>>,
-    range: Range<u64>,
-) -> BackendStream<Result<Bytes, StreamError>> {
-    let sliced = blob
-        .0
-        .scan(0u64, move |offset, chunk| {
-            let start = *offset;
-            let item = match chunk {
-                Ok(_) if start >= range.end => return futures_util::future::ready(None),
-                Ok(chunk) => {
-                    let len = chunk.len() as u64;
-                    *offset = start + len;
-                    let from = range.start.saturating_sub(start).min(len) as usize;
-                    let to = (range.end - start).min(len) as usize;
-                    (from < to).then(|| Ok(chunk.slice(from..to)))
-                }
-                Err(error) => Some(Err(error)),
-            };
-            futures_util::future::ready(Some(item))
-        })
-        .filter_map(futures_util::future::ready);
-    BackendStream(Box::pin(sliced))
-}
-
-/// Reads a copy source like [`read_local`]; a record-only version of a distributed bucket is
-/// read through a holder of its range under the caller's authority.
-pub(crate) async fn read_source(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    token: Option<&TokenRead>,
-) -> Result<GetObjectResult, GetObjectError> {
-    let (bucket, key, range) = (input.bucket.clone(), input.key.clone(), input.range.clone());
-    let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    match read_local(context, input, restrictions.clone(), token).await {
-        Err(GetObjectError::HeldElsewhere(held)) => {
-            let auth = AuthContext {
-                user_id,
-                realm_id,
-                path_restrictions: restrictions,
-                session: None,
-            };
-            let request = PullRequest {
-                bucket,
-                key,
-                range,
-                auth,
-                held: *held,
-            };
-            pull_through(context, request).await
-        }
-        result => result,
-    }
-}
-
-/// Reads the local copy; with a token, a locked or pending version is read with the object key
-/// that a grant of the credential opens.
-pub(crate) async fn read_local(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    token: Option<&TokenRead>,
-) -> Result<GetObjectResult, GetObjectError> {
-    let operation = GetObjectOperation::new(input.clone())
-        .with_restrictions(restrictions.clone())
-        .with_token(token.is_some());
-    let result = drive(operation, context).await;
-    let Some(token) = token else {
-        return result;
-    };
-    match result {
-        Err(GetObjectError::PendingContent(_)) => {}
-        Err(GetObjectError::ConversionError(ConversionError::BucketKey(
-            BucketKeyError::Locked(_),
-        ))) => {}
-        result => return result,
-    }
-    let (input, private) = token_object(context, input, &token.credential).await?;
-    read_object(context, input, restrictions, private, &token.limits).await
-}
-
-/// Reads a version with the object key of a request header; without a version id, the
-/// current version is pinned first.
-pub async fn get_object_keyed(
-    context: &DriverContext,
-    mut input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    private: SharedSecret,
-    limits: &RoCrateLimits,
-) -> Result<GetObjectResult, GetObjectError> {
-    pin_version(context, &mut input).await?;
-    read_object(context, input, restrictions, private, limits).await
-}
-
-/// Sets the version id of `input` to the current version when none was named.
-async fn pin_version(
-    context: &DriverContext,
-    input: &mut GetObjectInput,
-) -> Result<Ulid, GetObjectError> {
-    if let Some(version) = input.version_id {
-        return Ok(version);
-    }
-    let head = HeadObjectOperation::new(HeadObjectInput {
-        bucket: input.bucket.clone(),
-        key: input.key.clone(),
-        version_id: None,
-    });
-    let head = drive(head, context)
-        .await
-        .map_err(|_| GetObjectError::GetObjectFailed)?;
-    let version = head
-        .resolved_version_id
-        .or(head.version_id)
-        .ok_or(GetObjectError::NoSuchKey)?;
-    input.version_id = Some(version);
-    Ok(version)
-}
-
-/// Pins the version and opens its object key with a grant of `credential` that covers it.
-async fn token_object(
-    context: &DriverContext,
-    mut input: GetObjectInput,
-    credential: &TokenCredential,
-) -> Result<(GetObjectInput, SharedSecret), GetObjectError> {
-    let version = pin_version(context, &mut input).await?;
-    let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
-    let (envelope, _) = drive(read, context).await?;
-    let key = envelope.context.parameters.key;
-    let user = input.user_identity.to_storage_key();
-    let scan = StorageEffect::Iter {
-        key_space: ABE_GRANT_KEYSPACE.to_string(),
-        prefix: Some([&key.bucket_id.to_bytes()[..], &user].concat().into()),
-        start: None,
-        limit: MAX_REQUESTS + 1,
-        txn_id: None,
-    };
-    let values = match context.storage_handle.send_storage_effect(scan).await {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => values,
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        _ => return Err(GetObjectError::GetObjectFailed),
-    };
-    let mut error = locked(BucketKeyError::Locked(key.bucket_id));
-    for (_, value) in values {
-        let Ok(grant) = KeyGrant::from_bytes(&value) else {
-            continue;
-        };
-        let request = &grant.context.request;
-        if request.credential_id.as_deref() != Some(credential.access_key.as_str())
-            || request.parameters != envelope.context.parameters
-            || !request.epochs.contains(&envelope.context.epoch)
-            || !request.covers(&input.key)
-        {
-            continue;
-        }
-        match grant.open_object(credential.token.bytes(), &envelope) {
-            Ok(private) => return Ok((input, private)),
-            Err(AbeError::WrongKey) => error = locked(BucketKeyError::InvalidToken),
-            Err(other) => error = other.into(),
-        }
-    }
-    Err(error)
-}
-
-/// Reads a pinned version with an object key; a pending version is promoted under that key once.
-pub async fn read_object(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-    private: SharedSecret,
-    limits: &RoCrateLimits,
-) -> Result<GetObjectResult, GetObjectError> {
-    let version = input.version_id.ok_or(GetObjectError::NoSuchVersion)?;
-    let mut promoted = false;
-    loop {
-        let read = EnvelopeOperation::new(input.bucket.clone(), input.key.clone(), version);
-        let (envelope, mapping) = drive(read, context).await?;
-        let operation = GetObjectOperation::new(input.clone())
-            .with_restrictions(restrictions.clone())
-            .with_object(envelope.clone(), mapping.clone(), private.clone());
-        let archive = match drive(operation, context).await {
-            Err(GetObjectError::PendingContent(archive))
-                if !promoted && archive == mapping.archive =>
-            {
-                archive
-            }
-            result => return result,
-        };
-        promoted = true;
-        let blob = context
-            .blob_handle
-            .as_ref()
-            .ok_or(GetObjectError::GetObjectFailed)?;
-        let admit = AbeEffect::Admit {
-            envelope,
-            archive: archive.clone(),
-            private: private.clone(),
-        };
-        let lease = match blob
-            .send_blob_effect(BlobEffect::Abe(Box::new(admit)))
-            .await
-        {
-            Event::Blob(BlobEvent::ReadAdmitted { lease }) => lease,
-            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => return Err(error.into()),
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
-                return Err(locked(error));
-            }
-            _ => return Err(GetObjectError::GetObjectFailed),
-        };
-        promote_leased(context, &input, archive, lease, limits).await?;
-    }
-}
-
-/// Promotes the pending `archive` under `lease`, as an unlock would.
-async fn promote_leased(
-    context: &DriverContext,
-    input: &GetObjectInput,
-    archive: ArchiveKey,
-    lease: ReadLease,
-    limits: &RoCrateLimits,
-) -> Result<(), GetObjectError> {
-    let (realm_id, node_id) = (input.realm_id, input.node_id);
-    let promote = PromotePendingOperation::new(archive.clone(), realm_id, node_id, limits.clone());
-    let outcome = match drive(promote.with_lease(lease), context).await {
-        Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
-            reject_archive(context, &archive, (realm_id, node_id), reason)
-                .await
-                .map_err(|_| GetObjectError::GetObjectFailed)?;
-            return Err(GetObjectError::GetObjectFailed);
-        }
-        result => result.map_err(|error| {
-            warn!(error = %error, "Token promotion of a pending version failed");
-            GetObjectError::GetObjectFailed
-        })?,
-    };
-    match outcome {
-        Promotion::Promoted { .. } | Promotion::Gone => Ok(()),
-        Promotion::AwaitingKey(_) => Err(GetObjectError::GetObjectFailed),
-        Promotion::Mismatch { claimed } => {
-            drop_mismatch(context, &archive, claimed, (realm_id, node_id))
-                .await
-                .map_err(|_| GetObjectError::GetObjectFailed)?;
-            Err(GetObjectError::GetObjectFailed)
-        }
-    }
-}
-
-/// Resolves complete object facts without transferring holder bytes.
-pub async fn get_object_info(
-    context: &DriverContext,
-    input: GetObjectInput,
-    restrictions: Option<Vec<PathRestriction>>,
-) -> Result<ObjectInfo, GetObjectError> {
-    if input.range.is_some() {
-        return Err(GetObjectError::InvalidRange);
-    }
-    let (user_id, realm_id) = (input.user_identity, input.realm_id);
-    let operation = GetObjectOperation::new(input).with_restrictions(restrictions.clone());
-    match drive(operation, context).await {
-        Ok(result) => Ok(result.info),
-        Err(GetObjectError::HeldElsewhere(held)) => Ok(held.info()),
-        Err(GetObjectError::BlobNotLocal {
-            blake3,
-            version_id,
-            metadata,
-            version_created_at,
-            source_policies,
-        }) if local_is_user(context, realm_id).await => {
-            let read = RoutedRead {
-                user_id,
-                realm_id,
-                blake3,
-                version_id,
-                metadata,
-                version_created_at,
-                source_policies,
-                restrictions,
-            };
-            routed_metadata(context, read).await
-        }
-        Err(error) => Err(error),
-    }
-}
-
-/// One holder-backed read: the local version facts plus the caller's scoped
-/// credential, so the routed result is never less constrained than the record.
-struct RoutedRead {
-    user_id: UserId,
-    realm_id: RealmId,
-    blake3: [u8; 32],
-    version_id: Option<Ulid>,
-    metadata: HashMap<String, String>,
-    version_created_at: Option<SystemTime>,
-    source_policies: Vec<PlacementPolicyRef>,
-    restrictions: Option<Vec<PathRestriction>>,
-}
-
-/// How the consulted holders failed, folded so the final answer keeps the most
-/// informative cause. A read where no holder served is absence only when every
-/// holder confirmed absence.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct HolderFailures {
-    /// Whether at least one holder answered at all, so zero holders stay
-    /// distinguishable from every holder confirming absence.
-    contacted: bool,
-    governed: bool,
-    denied: bool,
-    integrity: bool,
-    unavailable: bool,
-    metadata_only: bool,
-    /// A holder refused because its copy's bucket is locked there.
-    locked: Option<Ulid>,
-}
-
-impl HolderFailures {
-    fn record(&mut self, error: BaoReadError) {
-        self.contacted = true;
-        match error {
-            BaoReadError::Refused(BaoReadRefusal::NotFound) => {}
-            BaoReadError::Refused(BaoReadRefusal::ReadDenied) => self.denied = true,
-            BaoReadError::Refused(BaoReadRefusal::HashMismatch) => self.integrity = true,
-            BaoReadError::Refused(BaoReadRefusal::BucketLocked(bucket_id)) => {
-                self.locked = Some(bucket_id);
-            }
-            // A member keeping only the record proves no absence: the bytes are elsewhere.
-            BaoReadError::Refused(
-                BaoReadRefusal::BackendFailure
-                | BaoReadRefusal::RealmPeerDenied
-                | BaoReadRefusal::InvalidTarget
-                | BaoReadRefusal::HeldBy { .. },
-            ) => self.unavailable = true,
-            BaoReadError::GovernedUnavailable
-            | BaoReadError::PolicyRequired { .. }
-            | BaoReadError::PolicyDenied { .. }
-            | BaoReadError::Gate(_)
-            | BaoReadError::NoDestination => self.governed = true,
-            BaoReadError::Blob(_)
-            | BaoReadError::Conversion(_)
-            | BaoReadError::Unexpected { .. }
-            | BaoReadError::NotFinished
-            | BaoReadError::ManagedCopy(_) => self.unavailable = true,
-        }
-    }
-
-    pub(crate) fn into_error(self) -> GetObjectError {
-        if let Some(bucket_id) = self.locked {
-            return locked(BucketKeyError::Locked(bucket_id));
-        }
-        if self.governed {
-            GetObjectError::GovernedUnavailable
-        } else if self.integrity {
-            GetObjectError::HolderIntegrityFailure
-        } else if self.denied {
-            GetObjectError::HolderAccessDenied
-        } else if self.unavailable || self.metadata_only || !self.contacted {
-            GetObjectError::HoldersUnavailable
-        } else {
-            GetObjectError::NoSuchKey
-        }
-    }
-
-    pub(crate) fn consider(
-        &mut self,
-        result: Result<BaoReadOutput, BaoReadError>,
-    ) -> Option<BaoReadOutput> {
-        match result {
-            Ok(output @ BaoReadOutput::Stream { .. }) => Some(output),
-            Ok(BaoReadOutput::Metadata { .. }) => {
-                self.contacted = true;
-                self.metadata_only = true;
-                None
-            }
-            Err(error) => {
-                self.record(error);
-                None
-            }
-        }
-    }
-}
-
-async fn routed_blob(
-    context: &DriverContext,
-    read: RoutedRead,
-) -> Result<GetObjectResult, GetObjectError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = read.realm_id;
-    let holders = drive(
-        GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
-        context,
-    )
-    .await
-    .map_err(|_| GetObjectError::GetObjectFailed)?;
-    let summary = local_multipart_summary(context, read.version_id).await?;
-
-    let mut failures = HolderFailures::default();
-    for holder in holders {
-        let request = BaoReadRequest {
-            auth_context: AuthContext {
-                user_id: read.user_id,
-                realm_id,
-                path_restrictions: read.restrictions.clone(),
-                session: None,
-            },
-            realm_id,
-            target: BaoReadTarget::Blake3(read.blake3),
-            expected_blake3: Some(read.blake3),
-            metadata_only: false,
-            destination: None,
-            known_refs: Vec::new(),
-            range: None,
-        };
-        match failures.consider(managed_read(context, holder, request).await) {
-            Some(BaoReadOutput::Stream {
-                blob,
-                size,
-                etag,
-                hashes,
-                ..
-            }) => {
-                return Ok(routed_result(read, blob, size, etag, hashes, summary));
-            }
-            None => {}
-            Some(BaoReadOutput::Metadata { .. }) => unreachable!("metadata does not serve bytes"),
-        }
-    }
-    Err(failures.into_error())
-}
-
-async fn routed_metadata(
-    context: &DriverContext,
-    read: RoutedRead,
-) -> Result<ObjectInfo, GetObjectError> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or(GetObjectError::GetObjectFailed)?;
-    let realm_id = read.realm_id;
-    let holders = drive(
-        GetHoldersOperation::new(read.blake3, realm_id, net_handle.node_id()),
-        context,
-    )
-    .await
-    .map_err(|_| GetObjectError::GetObjectFailed)?;
-    let summary = local_multipart_summary(context, read.version_id).await?;
-    let mut failures = HolderFailures::default();
-
-    for holder in holders {
-        let request = BaoReadRequest {
-            auth_context: AuthContext {
-                user_id: read.user_id,
-                realm_id,
-                path_restrictions: read.restrictions.clone(),
-                session: None,
-            },
-            realm_id,
-            target: BaoReadTarget::Blake3(read.blake3),
-            expected_blake3: Some(read.blake3),
-            metadata_only: true,
-            destination: None,
-            known_refs: Vec::new(),
-            range: None,
-        };
-        match managed_read(context, holder, request).await {
-            Ok(BaoReadOutput::Metadata {
-                size, etag, hashes, ..
-            }) => {
-                return Ok(routed_info(&read, size, etag, hashes, summary));
-            }
-            Ok(BaoReadOutput::Stream { .. }) => failures.unavailable = true,
-            Err(error) => failures.record(error),
-        }
-    }
-    Err(failures.into_error())
-}
-
-/// Holder hashes describe the bytes; the local version describes logical multipart facts.
-fn routed_result(
-    read: RoutedRead,
-    blob: BackendStream<Result<Bytes, StreamError>>,
-    size: u64,
-    etag: Option<String>,
-    hashes: HashMap<String, Vec<u8>>,
-    summary: Option<MultipartObjectSummary>,
-) -> GetObjectResult {
-    let info = routed_info(&read, size, etag, hashes, summary);
-    GetObjectResult {
-        blob,
-        location: None,
-        metadata: read.metadata,
-        info,
-        source_metadata: None,
-        source_binding: None,
-        last_refresh: None,
-        version_id: read.version_id,
-        resolved_version_id: read.version_id,
-        resolved_range: None,
-        source_policies: read.source_policies,
-        served_source: None,
-    }
-}
-
-fn routed_info(
-    read: &RoutedRead,
-    size: u64,
-    etag: Option<String>,
-    hashes: HashMap<String, Vec<u8>>,
-    summary: Option<MultipartObjectSummary>,
-) -> ObjectInfo {
-    let (checksum_type, composite_hashes, part_count) = match summary {
-        Some(summary) => (
-            summary.checksum_type,
-            summary.composite_hashes,
-            Some(summary.part_count),
-        ),
-        None => (MultipartChecksumType::FullObject, HashMap::new(), None),
-    };
-    ObjectInfo {
-        size,
-        version_created_at: read.version_created_at,
-        etag,
-        checksum_type,
-        hashes,
-        composite_hashes,
-        part_count,
-    }
-}
-
-/// The local version owns multipart facts even when another holder supplies bytes.
-async fn local_multipart_summary(
-    context: &DriverContext,
-    version_id: Option<Ulid>,
-) -> Result<Option<MultipartObjectSummary>, GetObjectError> {
-    let Some(version_id) = version_id else {
-        return Ok(None);
-    };
-    let key = MultipartObjectKey::summary(version_id)
-        .to_bytes()
-        .map_err(GetObjectError::ConversionError)?;
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: OBJECT_METADATA_KEYSPACE.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await;
-    match event {
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        event => summary_from_read(event).map_err(|error| match error {
-            LookupError::Conversion(error) => GetObjectError::ConversionError(error),
-            _ => GetObjectError::GetObjectFailed,
-        }),
-    }
 }
 
 #[cfg(test)]
 #[path = "get_tests.rs"]
 mod test;
-
-/// Whether an ETag can bind a read through `If-Match`: present and not weak.
-pub(crate) fn strong_validator(etag: Option<&str>) -> bool {
-    etag.map(str::trim)
-        .is_some_and(|etag| !etag.is_empty() && !etag.starts_with("W/"))
-}

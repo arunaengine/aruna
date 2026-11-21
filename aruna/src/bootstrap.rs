@@ -2,25 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::identity::PersistedNodeState;
-use aruna_api::server::state::{ONBOARDING_SECRET_KEY, load_persisted_state, persist_state};
-use aruna_core::document::{DocumentNetEvent, DocumentTarget};
-use aruna_core::effects::{Effect, NetEffect, StorageEffect};
-use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::auth::ONBOARDING_SECRET_KEY;
+use aruna_core::document::DocumentTarget;
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingTicket,
 };
-use aruna_core::{DocumentEffect, NodeId, UserId};
-use aruna_operations::device::realm_documents::fetch_from_peers;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::notifications::watch::interest::{
-    ensure_interest_digest, mark_interest_dirty,
-};
+use aruna_core::placement::target_placement_ref;
+use aruna_core::structs::identity::node_state::PersistedNodeState;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::device_node::realm_documents::fetch_from_peers;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation};
+use aruna_operations::notifications::watch::digest::InterestOperation;
 use aruna_operations::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_operations::placement::target_placement_ref;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::sync::reconcile::SyncTopicsOperation;
 use aruna_operations::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
@@ -34,6 +35,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
 use tracing::{info, warn};
 
 const PLACEMENT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -47,9 +50,7 @@ const DEVICE_FETCH_BUDGET: Duration = Duration::from_secs(10);
 
 /// Delay before retry `attempt`, doubling from the base interval up to the cap.
 fn backoff(attempt: u32) -> Duration {
-    PLACEMENT_RETRY_INTERVAL
-        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
-        .min(PLACEMENT_RETRY_MAX)
+    capped_backoff(PLACEMENT_RETRY_INTERVAL, PLACEMENT_RETRY_MAX, attempt, 0)
 }
 
 pub async fn realm_bootstrap_exists(
@@ -117,11 +118,12 @@ pub async fn prepare_core_documents(
     allow_genesis: bool,
     include_node_info: bool,
 ) -> Result<Vec<DocumentTarget>, Box<dyn std::error::Error>> {
-    let digest_created = ensure_interest_digest(&driver_ctx.storage_handle, realm_id, node_id)
+    let ensure = InterestOperation::ensure(realm_id, node_id);
+    let digest_created = drive(ensure, driver_ctx)
         .await
         .map_err(|error| format!("failed to initialize local watch interest digest: {error}"))?;
     if digest_created {
-        mark_interest_dirty(driver_ctx, realm_id)
+        drive(InterestOperation::mark(realm_id), driver_ctx)
             .await
             .map_err(|error| format!("failed to mark local watch interest dirty: {error}"))?;
     }
@@ -207,9 +209,6 @@ pub async fn fetch_core_documents(
         .as_deref()
         .ok_or("missing onboarding sync ticket")?;
     let onboarding_sync_ticket = OnboardingTicket::decode(onboarding_sync_ticket)?;
-    let Some(net_handle) = driver_ctx.net_handle.as_ref() else {
-        return Err("net handle unavailable".into());
-    };
     let realm_id = *realm_id;
 
     // Shared documents include the config needed to route user documents to shard topics.
@@ -223,7 +222,7 @@ pub async fn fetch_core_documents(
             realm_id,
             &aruna_core::structs::placement::record::PlacementRef::NIL,
         );
-        sync_with_retry(net_handle, topic, bootstrap_peer, &document, timeout).await?;
+        sync_with_retry(driver_ctx, topic, bootstrap_peer, &document, timeout).await?;
     }
 
     if !user_documents.is_empty() {
@@ -246,7 +245,7 @@ pub async fn fetch_core_documents(
             // The peer serves shard topics only to members. Placement expansion admits the
             // joiner after any transition already in flight.
             if let Err(error) =
-                sync_peer_topic(net_handle, topic, bootstrap_peer, &document, timeout).await
+                sync_peer_topic(driver_ctx, topic, bootstrap_peer, &document, timeout).await
             {
                 warn!(error = %error, document = ?document, "Leaving an onboarding user document to placement sync");
             }
@@ -269,7 +268,18 @@ async fn fetch_device_documents(
     let budget = timeout.min(DEVICE_FETCH_BUDGET);
     let mut attempt = 0;
     loop {
-        if fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+        if drive(
+            fetch_from_peers(
+                driver_ctx.node_and_realm(),
+                owner,
+                vec![bootstrap_peer],
+                budget,
+            ),
+            driver_ctx,
+        )
+        .await
+        .unwrap_or(false)
+        {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
@@ -317,16 +327,24 @@ pub async fn wait_for_placement(
             // re-reads the documents the same way it first fetched them.
             Some(owner) => {
                 let budget = timeout.min(DEVICE_FETCH_BUDGET);
-                if !fetch_from_peers(driver_ctx, owner, vec![bootstrap_peer], budget).await {
+                if !drive(
+                    fetch_from_peers(
+                        driver_ctx.node_and_realm(),
+                        owner,
+                        vec![bootstrap_peer],
+                        budget,
+                    ),
+                    driver_ctx,
+                )
+                .await
+                .unwrap_or(false)
+                {
                     warn!(peer = %bootstrap_peer, "Retrying the device realm document fetch");
                 }
                 None
             }
             None => sync_peer_topic(
-                driver_ctx
-                    .net_handle
-                    .as_ref()
-                    .ok_or("net handle unavailable")?,
+                driver_ctx,
                 target.sync_topic_id(
                     realm_id,
                     &aruna_core::structs::placement::record::PlacementRef::NIL,
@@ -447,41 +465,34 @@ fn retry_deadline(
 }
 
 async fn sync_peer_topic(
-    net_handle: &aruna_net::NetHandle,
+    context: &DriverContext,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
     document_for_error: &DocumentTarget,
     timeout: Duration,
 ) -> Result<(), SyncFailure> {
     let document_for_error = document_for_error.clone();
-    let sync = net_handle.send_effect(Effect::Net(NetEffect::DocumentSync(
-        DocumentEffect::SyncDocument {
-            topic,
-            peers: vec![bootstrap_peer],
-        },
-    )));
-    let event = tokio::time::timeout(timeout, sync).await.map_err(|_| {
-        SyncFailure::Unreachable(format!(
-            "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
-        ))
-    })?;
-
-    match event {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsReconciled { .. })) => Ok(()),
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error { error, .. })) => {
-            Err(SyncFailure::Refused(error.to_string()))
-        }
-        Event::Net(NetEvent::Error(error)) => Err(SyncFailure::Refused(format!("{error:?}"))),
-        other => Err(SyncFailure::Refused(format!(
-            "unexpected document sync result: {other:?}"
-        ))),
-    }
+    let net_handle = context
+        .net_handle
+        .as_ref()
+        .ok_or_else(|| SyncFailure::Refused("net handle unavailable".to_string()))?;
+    let sync = SyncTopicsOperation::single(*net_handle.realm_id(), topic, vec![bootstrap_peer]);
+    let synced = tokio::time::timeout(timeout, drive(sync, context))
+        .await
+        .map_err(|_| {
+            SyncFailure::Unreachable(format!(
+                "timed out after {timeout:?} fetching onboarding document {document_for_error:?} from bootstrap peer {bootstrap_peer}"
+            ))
+        })?;
+    synced
+        .map(|_| ())
+        .map_err(|error| SyncFailure::Refused(error.to_string()))
 }
 
 /// The bootstrap peer may refuse a fresh joiner until the config update that
 /// admits it reaches the peer, so failures retry within the same time budget.
 async fn sync_with_retry(
-    net_handle: &aruna_net::NetHandle,
+    context: &DriverContext,
     topic: ::irokle::TopicId,
     bootstrap_peer: NodeId,
     document: &DocumentTarget,
@@ -490,11 +501,10 @@ async fn sync_with_retry(
     let mut deadline = tokio::time::Instant::now() + timeout;
     let mut attempt = 0;
     loop {
-        let error =
-            match sync_peer_topic(net_handle, topic, bootstrap_peer, document, timeout).await {
-                Ok(()) => return Ok(()),
-                Err(error) => error,
-            };
+        let error = match sync_peer_topic(context, topic, bootstrap_peer, document, timeout).await {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
         let now = tokio::time::Instant::now();
         let Some(next) = retry_deadline(deadline, &error, now, timeout) else {
             return Err(error.into());
@@ -507,7 +517,7 @@ async fn sync_with_retry(
 }
 
 /// Persisted onboarding secret, encrypted at rest under the node key.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct EncryptedOnboardingSecret {
     nonce: [u8; 24],
     ciphertext: Vec<u8>,
@@ -525,9 +535,12 @@ pub async fn ensure_onboarding_secret(
     net_secret_key: &[u8; 32],
     realm_id: aruna_core::structs::identity::realm::RealmId,
 ) -> Result<OnboardingSecret, Box<dyn std::error::Error>> {
-    if let Some(encrypted) =
-        load_persisted_state::<EncryptedOnboardingSecret>(driver_ctx, ONBOARDING_SECRET_KEY).await
-    {
+    let stored = LoadStateOperation::<EncryptedOnboardingSecret>::new(ONBOARDING_SECRET_KEY);
+    let stored = drive(stored, driver_ctx).await.unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to load persisted API state");
+        None
+    });
+    if let Some(encrypted) = stored {
         let nonce = crypto_box::Nonce::from(encrypted.nonce);
         let plaintext = onboarding_secret_box(net_secret_key)
             .decrypt(&nonce, encrypted.ciphertext.as_ref())
@@ -567,15 +580,17 @@ pub async fn ensure_onboarding_secret(
         .map_err(|_| "failed to encrypt onboarding secret")?;
     let mut nonce_bytes = [0u8; 24];
     nonce_bytes.copy_from_slice(nonce.as_slice());
-    persist_state(
-        driver_ctx,
-        ONBOARDING_SECRET_KEY,
-        &EncryptedOnboardingSecret {
-            nonce: nonce_bytes,
-            ciphertext,
-        },
-    )
-    .await;
+    let encrypted = EncryptedOnboardingSecret {
+        nonce: nonce_bytes,
+        ciphertext,
+    };
+    let saved = match SaveStateOperation::new(ONBOARDING_SECRET_KEY, &encrypted) {
+        Ok(operation) => drive(operation, driver_ctx).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = saved {
+        warn!(error = %error, "Failed to persist API state");
+    }
     Ok(onboarding_secret)
 }
 

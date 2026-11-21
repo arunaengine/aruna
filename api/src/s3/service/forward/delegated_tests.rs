@@ -3,8 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::structs::storage::distribution::delegation::{
     DELEGATION_HEADER, Delegation, Payload,
 };
@@ -12,14 +11,38 @@ use http::{HeaderMap, Method};
 use s3s::dto::StreamingBlob;
 
 use super::forwarded_digest;
-use crate::s3::service::payload::frame_body;
 use crate::tests::members::{BUCKET, Members, members};
+use aruna_core::jobs::ByteStream;
+use aruna_core::member_read::{TrailerSeal, TrailerValue, framed_stream};
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::storage::distribution::delegation::BodyTrailer;
+use aruna_drivers::driver::DriverContext;
 
-fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+/// Seals a trailer with the key of the node whose context it holds.
+struct ContextSeal(std::sync::Arc<DriverContext>);
+
+impl TrailerSeal for ContextSeal {
+    fn seal(&self, trailer: &BodyTrailer, nonce: &[u8; 16]) -> Option<Vec<u8>> {
+        let net = self.0.net_handle.as_ref()?;
+        let signature = net.sign(&trailer.signing_bytes(nonce));
+        Some(trailer.encode(&signature).ok()?.to_vec())
+    }
+}
+
+/// `body` framed as the sending member frames it.
+fn frame_body(
+    body: StreamingBlob,
+    context: std::sync::Arc<DriverContext>,
+    nonce: [u8; 16],
+    checksum: Option<TrailerValue>,
+) -> ByteStream {
+    let stream = BackendStream::new_from_boxed(body);
+    framed_stream(
+        stream,
+        nonce,
+        checksum,
+        std::sync::Arc::new(ContextSeal(context)),
+    )
 }
 
 /// What one delegated request names; `key` is the key the delegation binds.
@@ -49,7 +72,7 @@ fn delegation(
         group_id: user.group_id,
         credential_id: user.access_key.clone(),
         restrictions: None,
-        credential_expiry: now() + 3600,
+        credential_expiry: unix_timestamp_secs() + 3600,
         operation: request.operation.to_string(),
         bucket: BUCKET.to_string(),
         key: request.key.to_string(),
@@ -57,7 +80,7 @@ fn delegation(
         request_digest: forwarded_digest(&request.method, BUCKET, request.key, None, headers),
         payload: request.payload.clone(),
         nonce: rand::random(),
-        issued_at: now(),
+        issued_at: unix_timestamp_secs(),
         valid_secs: 10,
     }
 }
@@ -112,7 +135,7 @@ async fn stored(members: &Members, key: &str) {
     let mut extensions = http::Extensions::new();
     extensions.insert(members.user_on(1));
     extensions.insert(node.bucket().await);
-    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    extensions.insert(aruna_core::request_policy::PolicyRequestExtras::rest());
     let request = s3s::S3Request {
         input,
         method: Method::PUT,
@@ -208,7 +231,7 @@ async fn refuses_strangers() {
     let (status, _) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);
     let mut expired = delegation(&members, (0, 1), &request, &accept());
-    expired.issued_at = now() - 3600;
+    expired.issued_at = unix_timestamp_secs() - 3600;
     let value = expired.sign(&members.nodes[0].secret).encode().unwrap();
     let (status, _) = send(&members, 1, (Method::GET, "k/held"), &[value], None).await;
     assert_eq!(status, http::StatusCode::FORBIDDEN);
@@ -299,7 +322,7 @@ async fn framed_body_checked() {
         let framed = frame_body(body, issuer.context.clone(), signed.delegation.nonce, None);
         use futures_util::TryStreamExt;
         let mut bytes: Vec<u8> =
-            (framed.try_collect::<Vec<bytes::Bytes>>().await.unwrap()).concat();
+            (framed.0.try_collect::<Vec<bytes::Bytes>>().await.unwrap()).concat();
         if forged {
             let last = bytes.len() - 1;
             bytes[last] ^= 1;
@@ -356,12 +379,12 @@ async fn framed_send(
     let mut delegation = delegation(members, (0, 1), &request, &headers);
     delegation.request_digest = forwarded_digest(&Method::PUT, BUCKET, key, query, &headers);
     let signed = delegation.sign(&issuer.secret);
-    let value: Option<crate::s3::service::payload::ChecksumValue> =
-        checksum.map(|checksum| std::sync::Arc::new(move || Some(checksum.clone())) as _);
+    let value =
+        checksum.map(|checksum| TrailerValue(std::sync::Arc::new(move || Some(checksum.clone()))));
     let blob = StreamingBlob::from(bytes::Bytes::from_static(body));
     let framed = frame_body(blob, issuer.context.clone(), signed.delegation.nonce, value);
     use futures_util::TryStreamExt;
-    let bytes: Vec<u8> = (framed.try_collect::<Vec<bytes::Bytes>>().await.unwrap()).concat();
+    let bytes: Vec<u8> = (framed.0.try_collect::<Vec<bytes::Bytes>>().await.unwrap()).concat();
     let mut url = format!("{}/{BUCKET}/{key}", members.nodes[1].url);
     if let Some(query) = query {
         url = format!("{url}?{query}");
@@ -379,7 +402,7 @@ async fn framed_send(
 
 fn crc32(body: &[u8]) -> String {
     use base64::Engine;
-    let mut sums = aruna_blob::hash::Hasher::new();
+    let mut sums = aruna_core::structs::checksum::Hasher::new();
     sums.update(body);
     let crc = sums.to_map()[aruna_core::structs::checksum::HASH_CRC32].clone();
     base64::engine::general_purpose::STANDARD.encode(crc)
@@ -415,7 +438,7 @@ async fn trailer_checksum_checked() {
     let mut extensions = http::Extensions::new();
     extensions.insert(members.user_on(1));
     extensions.insert(node.bucket().await);
-    extensions.insert(aruna_operations::auth::request_policy::PolicyRequestExtras::rest());
+    extensions.insert(aruna_core::request_policy::PolicyRequestExtras::rest());
     let create = s3s::S3Request {
         input,
         method: Method::POST,

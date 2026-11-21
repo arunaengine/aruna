@@ -3,44 +3,37 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::device::replica::ReplicaRecord;
-use crate::forward::authorize::peer_acts_for;
-use crate::forward::replay::create_record_matches;
-use crate::forward::replay::routed_record_matches;
-use crate::forward::replay::update_record_matches;
 use crate::forward::routing::MetadataWriteRoute;
 use crate::forward::routing::distinct_holders;
 use crate::forward::routing::holder_intersection;
-use crate::forward::routing::holds_metadata_id;
 use crate::forward::routing::write_route;
-use crate::forward::transport::RetryDisposition;
-use crate::forward::transport::retry_disposition;
 use crate::metadata::create_document::CreateDocumentConfig;
 use crate::metadata::create_document::resolve_metadata_id;
-use crate::metadata::handle::MetadataRequestDelivery;
-use crate::metadata::protocol::MetadataReadError;
-use crate::placement::resolve_shard_holders;
-use aruna_core::MetaResourceId;
-use aruna_core::NodeId;
-use aruna_core::StructuredId;
-use aruna_core::UserId;
+use crate::metadata::forward::holders::holds_metadata_id;
+use crate::metadata::forward::replay::{create_record_matches, routed_record_matches};
+use crate::realm::peer_trust::peer_acts_for;
+use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataMergedRevision;
 use aruna_core::metadata::ProfileValidationStatus;
+use aruna_core::metadata::protocol::MetadataReadError;
+use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use super::read::device_raw_revision;
+use super::holder_reads::device_raw_revision;
+use super::holder_reads::{AuthFailure, ReadDecision, reduce_holder_reads};
 use super::read::keep_status;
-
-use super::*;
 
 use crate::device::replica::ReplicaOrigin;
 use aruna_core::metadata::{ProfileValidationCompleteness, ProfileValidationState};
-use aruna_core::structs::placement::record::{METADATA_HANDLE, PlacementStrategy};
+use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
 
 fn node(seed: u8) -> NodeId {
@@ -141,27 +134,7 @@ fn auth_policies_differ() {
 }
 
 fn config_and_placement() -> (RealmConfigDocument, PlacementRef) {
-    let mut config = RealmConfigDocument::new(RealmId::from_bytes([7u8; 32]), Vec::new(), 3);
-    let strategy = PlacementStrategy {
-        strategy_id: Ulid::from_bytes([4u8; 16]),
-        name: "default".to_string(),
-        replica_count: Some(2),
-        distinct_locations: false,
-        affinity: Vec::new(),
-        shard_count: 64,
-    };
-    config.default_strategy_id = Some(strategy.strategy_id);
-    config.strategies = vec![strategy.clone()];
-    for seed in 1..=4u8 {
-        config.ensure_node(node(seed), RealmNodeKind::Server);
-    }
-    (
-        config,
-        PlacementRef {
-            strategy_id: strategy.strategy_id,
-            shard: 9,
-        },
-    )
+    crate::tests::calls::placed_config()
 }
 
 #[test]
@@ -242,18 +215,6 @@ fn unplaced_writes_local() {
     assert_eq!(
         write_route(None, &PlacementRef::NIL, node(1)),
         MetadataWriteRoute::Local
-    );
-}
-
-#[test]
-fn ambiguous_delivery_stops() {
-    assert_eq!(
-        retry_disposition(MetadataRequestDelivery::PossiblySent),
-        RetryDisposition::Stop
-    );
-    assert_eq!(
-        retry_disposition(MetadataRequestDelivery::DefinitelyNotSent),
-        RetryDisposition::TryNext
     );
 }
 
@@ -339,14 +300,14 @@ fn response_records_checked() {
     let create = CreateDocumentConfig {
         actor: Actor {
             node_id: node(1),
-            user_id: aruna_core::UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
             realm_id,
         },
         group_id,
         document_id: Ulid::nil(),
         document_path: "/docs/one/".to_string(),
         public: true,
-        payload: crate::metadata::create_document::CreateDocumentPayload::Scaffold {
+        payload: aruna_core::metadata::api::CreateDocumentPayload::Scaffold {
             name: "one".to_string(),
             description: String::new(),
             date_published: "2026-01-01".to_string(),
@@ -370,7 +331,7 @@ fn response_records_checked() {
 
     let mut changed = record.clone();
     changed.document_path = "docs/two".to_string();
-    assert!(!update_record_matches(&record, &changed));
+    assert!(!record.same_identity(&changed));
 }
 
 #[test]
@@ -391,4 +352,26 @@ fn frozen_holders_intersect() {
 
     assert_eq!(holder_intersection(&current, &frozen), vec![node(2)]);
     assert!(holder_intersection(&[node(1)], &[node(2)]).is_empty());
+}
+
+#[test]
+fn summary_refusals_unreadable() {
+    use super::read::summary_answer;
+    use crate::metadata::api::MetadataApiError;
+    use aruna_core::structs::storage::dataset_description::DescriptionError;
+    for error in [
+        MetadataApiError::NotFound,
+        MetadataApiError::Forbidden,
+        MetadataApiError::Unauthorized,
+        MetadataApiError::BadRequest,
+    ] {
+        assert_eq!(
+            summary_answer(Err(error)),
+            Err(DescriptionError::Unreadable)
+        );
+    }
+    assert_eq!(
+        summary_answer(Err(MetadataApiError::ServiceUnavailable)),
+        Err(DescriptionError::Unavailable)
+    );
 }

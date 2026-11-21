@@ -5,65 +5,66 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::SyncMode;
 use aruna_core::structs::execution::source_access::{DigestOrigin, DigestScope};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::identity::content_id;
-use aruna_core::structs::storage::distribution::ReadRoute;
 use aruna_core::structs::storage::distribution::delegation::COPY_READ_HEADER;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::origin::{
     OriginProjection, OriginVersion, SyncHop, UploadClient, VersionOrigin,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_operations::auth::request_authorization::BucketAccess;
-use aruna_operations::distribution::guard::{
-    GuardError, copy_readers, read_coordinator, route_read,
-};
+use aruna_core::structs::sync_relationship::SyncMode;
+use aruna_drivers::driver::{drive, drive_until};
+use aruna_operations::blob::migration::misplaced::AccessRule;
+use aruna_operations::distribution::guard::GuardError;
 use aruna_operations::distribution::resolve::{
-    GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version,
+    GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved,
 };
-use aruna_operations::s3::bucket::sources::{FileSource, bucket_sources};
-use aruna_operations::s3::object::origin::{OriginError, OriginView, bucket_runs, read_origin};
+use aruna_operations::distribution::routing::route_read;
+use aruna_operations::distribution::routing::{copy_readers, read_coordinator};
+use aruna_operations::s3::bucket::sources::{BucketSourcesOperation, FileSource};
+use aruna_operations::transfer::origin::{
+    BucketRunsOperation, OriginError, OriginView, ReadOriginOperation,
+};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::lookup::map_guard_error;
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::bucket::metadata::{
     BucketIdentifierBody, BucketMetadataBody, DatasetDescriptionBody, describe_bucket,
 };
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::distributed::map_guard_error;
 use crate::routes::storage::relay::{
     self, RestForward, node_directed, node_read, relay_get, relayed_set, stale_miss,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
-use aruna_operations::s3::bucket::release::{
-    BucketScope, MembershipCaller, MembershipQuery, release_members,
-};
+use aruna_core::structs::storage::release::MembershipQuery;
+use aruna_operations::auth::request_authorization::BucketAccessOperation;
+use aruna_operations::transfer::release::access::MembersCheckOperation;
+use aruna_operations::transfer::release::{BucketScope, MembershipCaller};
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct OriginApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OriginApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_origin))
         .routes(routes!(get_version_origin))
         .routes(routes!(get_sources))
@@ -413,7 +414,6 @@ impl From<OriginView> for OriginResponse {
             "identifiers": [],
             "content_id": "https://w3id.org/aruna/data/af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket or version not found, or not found on a copy that may be behind", body = ErrorResponse),
         (status = 503, description = "No holder of the key's range answered", body = ErrorResponse)
@@ -422,13 +422,12 @@ impl From<OriginView> for OriginResponse {
 )]
 pub async fn get_origin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(bucket): Path<String>,
     Query(params): Query<OriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     origin_answer(&state, &auth, bearer, &headers, bucket, params).await
 }
 
@@ -462,7 +461,7 @@ async fn origin_answer(
         let context = state.get_ctx();
         if params.version_id.is_none() {
             let path = origin_path(&bucket, &params);
-            let coordinator = read_coordinator(context.as_ref(), binding, &params.key).await;
+            let coordinator = drive(read_coordinator(binding, &params.key), context.as_ref()).await;
             let asked = match coordinator.map_err(map_guard_error) {
                 Ok(None) => None,
                 Ok(Some((range_id, node_id))) => {
@@ -474,7 +473,7 @@ async fn origin_answer(
             };
             match asked {
                 Some(Err(error)) if error.status_code().is_server_error() => {
-                    let readers = copy_readers(context.as_ref(), binding, &params.key).await;
+                    let readers = drive(copy_readers(binding, &params.key), context.as_ref()).await;
                     let (range_id, here, copies) = readers.map_err(map_guard_error)?;
                     if !here && copies.is_empty() {
                         return Err(error);
@@ -489,9 +488,11 @@ async fn origin_answer(
                 None => {}
             }
         }
-        let route = route_read(context.as_ref(), binding, &params.key, false).await;
+        let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
         if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
-            let mut holders = key_holders(context.as_ref(), binding.set_id, &params.key).await;
+            let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref())
+                .await
+                .unwrap_or_default();
             holders.retain(|holder| *holder != state.get_node_id());
             holders.push(node_id);
             let target = (binding.set_id, range_id, node_id);
@@ -505,7 +506,11 @@ async fn origin_answer(
         && headers.contains_key(RELAY_HOP_HEADER)
         && !headers.contains_key(COPY_READ_HEADER)
     {
-        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        let coordinator = drive(
+            read_coordinator(binding, &params.key),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
             return Err(map_guard_error(GuardError::NotCoordinator {
                 set_id: binding.set_id,
@@ -514,12 +519,14 @@ async fn origin_answer(
             }));
         }
     }
-    let view = read_origin(
+    let view = drive(
+        ReadOriginOperation::new(
+            state.get_realm_id(),
+            &bucket,
+            &params.key,
+            params.version_id,
+        ),
         state.get_ctx().as_ref(),
-        (state.get_realm_id(), state.get_node_id()),
-        &bucket,
-        &params.key,
-        params.version_id,
     )
     .await;
     // A copy may not have the version yet, so its miss goes on to the range's coordinator; a
@@ -527,7 +534,11 @@ async fn origin_answer(
     if let (Err(OriginError::VersionMissing), Some(binding), None) =
         (&view, info.distribution.as_ref(), stale)
     {
-        let coordinator = read_coordinator(state.get_ctx().as_ref(), binding, &params.key).await;
+        let coordinator = drive(
+            read_coordinator(binding, &params.key),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {
@@ -550,7 +561,7 @@ async fn origin_answer(
     let view = view.map_err(|error| match (error, stale) {
         (OriginError::VersionMissing, Some(range_id)) => stale_miss(range_id),
         (OriginError::BucketMissing | OriginError::VersionMissing, _) => ServerError::NotFound,
-        (OriginError::Storage(reason), _) => ServerError::InternalError(reason),
+        (OriginError::Storage(reason), _) => ServerError::InternalError(reason.into()),
     })?;
     let version_id = view.version_id;
     let token = forwarded_auth_token(bearer.clone())?;
@@ -574,7 +585,12 @@ async fn origin_answer(
         key: params.key.clone(),
         version_id,
     }];
-    match release_members(state.get_ctx().as_ref(), scope, caller, &query).await {
+    match drive(
+        MembersCheckOperation::new(scope, caller, &query),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    {
         Ok(mut found) => {
             let members = found.answers.remove(0);
             answer.releases = members.releases.into_iter().map(Into::into).collect();
@@ -590,7 +606,7 @@ async fn origin_answer(
 async fn copy_origin(
     state: &ServerState,
     (set_id, range_id): (Ulid, Ulid),
-    copies: Vec<aruna_core::NodeId>,
+    copies: Vec<aruna_core::id::NodeId>,
     path: &str,
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {
@@ -654,7 +670,6 @@ pub struct VersionOriginParams {
             "content_id": null
         })),
         (status = 400, description = "Not a version id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Version not found", body = ErrorResponse),
         (status = 409, description = "The read was directed at another node", body = ErrorResponse),
@@ -664,12 +679,11 @@ pub struct VersionOriginParams {
 )]
 pub async fn get_version_origin(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Query(params): Query<VersionOriginParams>,
 ) -> ServerResult<Json<OriginResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let deadline = tokio::time::Instant::now() + RELAY_DEADLINE;
     version_answer(&state, &auth, bearer, &headers, (&params.version, deadline)).await
 }
@@ -724,7 +738,14 @@ async fn global_origin(
     version_id: Ulid,
 ) -> ServerResult<Json<OriginResponse>> {
     let deadline = tokio::time::Instant::now() + RESOLVE_BUDGET;
-    let found = match resolve_version(state.get_ctx().as_ref(), version_id, deadline).await {
+    let found = match resolved(
+        drive_until(
+            resolve_version(state.get_ctx().node_and_realm(), version_id, RESOLVE_BUDGET),
+            state.get_ctx().as_ref(),
+            deadline,
+        )
+        .await,
+    ) {
         GlobalResolution::Found(found) => found,
         GlobalResolution::NotFound => return Err(ServerError::NotFound),
         GlobalResolution::Unavailable => {
@@ -760,8 +781,8 @@ async fn global_origin(
 /// Asks `holders` in turn for the origin; a copy's miss goes on, the coordinator's decides.
 async fn relay_origin(
     state: &ServerState,
-    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::NodeId),
-    holders: Vec<aruna_core::NodeId>,
+    (set_id, range_id, coordinator): (Ulid, Ulid, aruna_core::id::NodeId),
+    holders: Vec<aruna_core::id::NodeId>,
     (path, sent): (&str, HeaderMap),
     bearer: Option<ValidatedBearer>,
 ) -> ServerResult<Json<OriginResponse>> {
@@ -848,7 +869,6 @@ pub struct FileSourcesResponse {
             }],
             "complete": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -856,10 +876,9 @@ pub struct FileSourcesResponse {
 )]
 pub async fn get_sources(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<FileSourcesResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let path = bucket_permission_path(
         state.get_realm_id(),
@@ -868,9 +887,10 @@ pub async fn get_sources(
         &bucket,
     );
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let (sources, complete) = bucket_sources(state.get_ctx().as_ref(), info.group_id, &bucket)
+    let listing = BucketSourcesOperation::new(info.group_id, &bucket);
+    let (sources, complete) = drive(listing, state.get_ctx().as_ref())
         .await
-        .map_err(ServerError::InternalError)?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(Json(FileSourcesResponse {
         sources: sources
             .into_iter()
@@ -984,14 +1004,19 @@ pub async fn get_bucket_runs(
         .await
         .map_err(hidden)?;
     let context = state.get_ctx();
-    let access = BucketAccess::load(&context, &auth, (realm_id, info.group_id, node_id), &bucket)
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    let access = drive(
+        BucketAccessOperation::new(&auth, (realm_id, info.group_id, node_id), &bucket),
+        &context,
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     // A file the caller may not read, as a listing hides it, names no run.
-    let read = |key: &str| access.allows(Some(key), &Permission::READ);
-    let found = bucket_runs(context.as_ref(), &bucket, &params.prefix, read)
+    let read = AccessRule::new(Arc::new(access), Permission::READ);
+    let runs = BucketRunsOperation::new(&bucket, &params.prefix, read)
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let found = drive(runs, &context)
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let runs = found.run_ids.iter().map(|run_id| BucketRunBody {
         run_id: run_id.to_string(),
     });

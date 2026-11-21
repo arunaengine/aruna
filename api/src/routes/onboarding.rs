@@ -4,23 +4,22 @@
 
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
+use aruna_clock::unix_timestamp_secs as now_timestamp;
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::onboarding::{
     BootstrapOnboardingRequest, BootstrapOnboardingResponse, CreateSecretRequest,
     CreateSecretResponse, OnboardingMode, OnboardingPurpose, OnboardingSecret,
-    OnboardingSecretRecord, OnboardingSecretState, RequestedOnboardingMode, issuer_proof_message,
-    node_proof_message,
+    OnboardingSecretRecord, RequestedOnboardingMode, issuer_proof_message, node_proof_message,
 };
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
-use aruna_core::time::unix_timestamp_secs as now_timestamp;
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::onboarding::consume_secret::ConsumeSecretError;
 use aruna_operations::onboarding::create_secret::{
     CreateSecretError, CreateSecretInput, CreateSecretOperation,
@@ -28,17 +27,18 @@ use aruna_operations::onboarding::create_secret::{
 use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
+use aruna_operations::onboarding::expiry_page::ExpiryPageOperation;
 use aruna_operations::onboarding::finalize_bootstrap::{
-    BootstrapFinalizeError, BootstrapFinalizeInput, bootstrap_onboarding_finalize,
+    BootstrapFinalizeError, BootstrapFinalizeInput, FinalizeBootstrapOperation,
 };
 use aruna_operations::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
-use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
+use aruna_operations::onboarding::live_page::LivePageOperation;
+use aruna_operations::onboarding::read_secret::ReadSecretOperation;
 use aruna_operations::onboarding::reserve_secret::ReserveSecretError;
 use aruna_operations::realm::ensure_config::EnsureConfigError;
-use aruna_operations::realm::get_config::GetConfigOperation;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use base64::Engine;
@@ -52,7 +52,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use ulid::Ulid;
 use url::Url;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -60,14 +60,8 @@ const SECRET_TTL_SECS: u64 = 3600;
 /// Policy operation name device enrollment is evaluated under.
 const ENROLL_DEVICE_OPERATION: &str = "onboarding.enroll_device";
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/onboarding", description = "Node onboarding and bootstrap operations"))
-)]
-pub struct OnboardingApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(OnboardingApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(bootstrap_onboarding))
         .routes(routes!(create_onboarding_secret, list_onboarding_secrets))
         .routes(routes!(revoke_onboarding_secret))
@@ -145,6 +139,18 @@ pub struct RealmEndpointDoc {
 #[schema(as = ListOnboardingSecretsResponse)]
 pub struct ListSecretsResponse {
     pub secrets: Vec<OnboardingSecretSummary>,
+    /// Continues the list after this page; absent on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// One page of the onboarding secret list.
+#[derive(Debug, Default, serde::Deserialize, IntoParams)]
+pub struct ListSecretsQuery {
+    /// The `next_cursor` of the previous page.
+    pub cursor: Option<String>,
+    /// Secrets per page, 1 to 1000; 100 by default.
+    pub limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, ToSchema)]
@@ -239,32 +245,21 @@ async fn enforce_enrollment_policies(
         PolicyRequestExtras::operation(ENROLL_DEVICE_OPERATION),
     );
     // Fail closed: a denial and unreadable policy state both refuse.
-    enforce_policies(&state.get_ctx(), realm_id, &request)
-        .await
-        .map_err(|_| ServerError::Forbidden)
+    drive(
+        EnforcePolicyOperation::new(realm_id, request.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)
 }
 
-async fn prune_stale_secrets(state: &Arc<ServerState>) -> ServerResult<()> {
-    let now = now_timestamp();
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
+/// Prunes the expired secrets of the first expiry page that no enrollment finishes, so a mint
+/// frees what lapsed without walking a whole backlog; later pages go with later requests.
+async fn prune_head(state: &Arc<ServerState>) -> ServerResult<()> {
+    let head = LivePageOperation::new(now_timestamp(), None, 256);
+    drive(head, &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-
-    for secret in secrets {
-        if secret.record.expires_at < now
-            && !matches!(&secret.state, OnboardingSecretState::Finalizing { .. })
-        {
-            drive(
-                DeleteSecretOperation::new(DeleteSecretInput {
-                    enrollment_id: secret.record.enrollment_id,
-                }),
-                &state.get_ctx(),
-            )
-            .await
-            .map_err(map_delete_error)?;
-        }
-    }
-
+        .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok(())
 }
 
@@ -329,7 +324,6 @@ unrestricted token. A management node serves the route, and every other node rel
             })
         ),
         (status = 400, description = "No seed URL was given and this node publishes no REST interface", body = crate::error::ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm or is path-restricted, the caller lacks WRITE on the realm's onboarding admin path, or a realm policy forbids device enrollment", body = crate::error::ErrorResponse),
         (status = 409, description = "The owner is at the realm's device cap, or a concurrent mint won the transaction; retryable", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
@@ -360,7 +354,7 @@ pub async fn create_onboarding_secret(
             owner: auth.user_id,
         },
     };
-    prune_stale_secrets(&state).await?;
+    prune_head(&state).await?;
 
     let ttl = request
         .expires_in_seconds
@@ -382,7 +376,7 @@ pub async fn create_onboarding_secret(
     };
     let encoded_secret = onboarding_secret
         .encode()
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.into()))?;
     let record = OnboardingSecretRecord {
         enrollment_id: onboarding_secret.enrollment_id,
         secret_hash: onboarding_secret.secret_hash(),
@@ -444,7 +438,7 @@ async fn seed_url(state: &Arc<ServerState>, requested: String) -> ServerResult<S
 /// query keys `secret`, `seed` and `realm`.
 fn enroll_url(secret: &str, seed_url: &str, realm_id: RealmId) -> ServerResult<String> {
     let mut url =
-        Url::parse("aruna://enroll").map_err(|err| ServerError::InternalError(err.to_string()))?;
+        Url::parse("aruna://enroll").map_err(|err| ServerError::InternalError(err.into()))?;
     url.query_pairs_mut()
         .append_pair("secret", secret)
         .append_pair("seed", seed_url)
@@ -464,8 +458,11 @@ node serves it, and every other node relays the call to one.
 
 **Behavior**
 - The secret value itself is never returned, because only its hash was kept when it was minted.
-- Expired secrets that are not mid-enrollment are discarded before the list is built.
+- Expired secrets of the returned page that are not mid-enrollment are discarded and left out.
+- The list comes in pages of `limit` secrets (1 to 1000, 100 by default); `next_cursor`
+  continues it, soonest expiry first across pages.
 - The list is this management node's own state, not a realm-wide fan-out."#,
+    params(ListSecretsQuery),
     responses(
         (
             status = 200,
@@ -490,7 +487,6 @@ node serves it, and every other node relays the call to one.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 503, description = "Called on a node that is not a management node and no management node was reachable; code `no_management_node`", body = crate::error::ErrorResponse)
     ),
@@ -499,21 +495,33 @@ node serves it, and every other node relays the call to one.
 pub async fn list_onboarding_secrets(
     State(state): State<Arc<ServerState>>,
     Extension(auth): Extension<Option<AuthContext>>,
+    Query(query): Query<ListSecretsQuery>,
 ) -> ServerResult<(StatusCode, Json<ListSecretsResponse>)> {
     let _auth = authorize_onboarding_admin(&state, auth).await?;
-    prune_stale_secrets(&state).await?;
-    let mut secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
+    let after = match query.cursor {
+        Some(text) => {
+            let key = aruna_core::cursor::decode(&text).map_err(|_| ServerError::BadRequest)?;
+            if !ExpiryPageOperation::index_key(&key) {
+                return Err(ServerError::BadRequest);
+            }
+            Some(byteview::ByteView::from(key))
+        }
+        None => None,
+    };
+    // The page's own expired secrets are pruned and left out; finalizing ones stay listed.
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    let page = LivePageOperation::new(now_timestamp(), after, limit);
+    let page = drive(page, &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    secrets.sort_by_key(|entry| entry.record.expires_at);
+        .map_err(|err| ServerError::InternalError(err.into()))?;
 
     Ok((
         StatusCode::OK,
         Json(ListSecretsResponse {
-            secrets: secrets
-                .into_iter()
+            secrets: (page.entries.into_iter())
                 .map(|entry| OnboardingSecretSummary::from(entry.record))
                 .collect(),
+            next_cursor: page.next.map(aruna_core::cursor::encode),
         }),
     ))
 }
@@ -536,7 +544,6 @@ node serves it, and every other node relays the call to one.
     params(("id" = String, Path, description = "Enrollment id of the secret, as reported when it was minted and by the listing")),
     responses(
         (status = 204, description = "Secret deleted and no longer redeemable"),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks WRITE on the realm's onboarding admin path", body = crate::error::ErrorResponse),
         (status = 404, description = "No onboarding secret with this id on this node, including one an earlier call already revoked", body = crate::error::ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = crate::error::ErrorResponse),
@@ -610,11 +617,9 @@ pub async fn get_secret_status(
 ) -> ServerResult<(StatusCode, Json<OnboardingSecretResponse>)> {
     let enrollment_id = Ulid::from_string(&enrollment_id).map_err(|_| ServerError::BadRequest)?;
     let caller = auth.clone().ok_or(ServerError::Unauthorized)?;
-    let entry = drive(ListSecretsOperation::new(), &state.get_ctx())
+    let entry = drive(ReadSecretOperation::new(enrollment_id), &state.get_ctx())
         .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?
-        .into_iter()
-        .find(|entry| entry.record.enrollment_id == enrollment_id)
+        .map_err(|err| ServerError::InternalError(err.into()))?
         .ok_or(ServerError::NotFound)?;
 
     // The owner polls its own device; anybody else needs the admin path. A
@@ -778,7 +783,7 @@ pub async fn bootstrap_onboarding(
 
     let bootstrap_endpoint = state
         .bootstrap_endpoint()
-        .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string()))?;
+        .ok_or_else(|| ServerError::InternalError("net handle unavailable".to_string().into()))?;
     let wrapped_management_key = if matches!(record.mode, OnboardingMode::Management) {
         Some(wrap_realm_key(
             &state,
@@ -810,8 +815,8 @@ pub async fn bootstrap_onboarding(
         _ => return Err(ServerError::Forbidden),
     };
 
-    let finalized = bootstrap_onboarding_finalize(
-        BootstrapFinalizeInput {
+    let finalized = aruna_drivers::driver::drive(
+        FinalizeBootstrapOperation::new(BootstrapFinalizeInput {
             enrollment_id: onboarding_secret.enrollment_id,
             secret_hash: onboarding_secret.secret_hash(),
             node_id,
@@ -822,8 +827,8 @@ pub async fn bootstrap_onboarding(
             node_location: request.node_location.clone(),
             node_weight: request.node_weight,
             node_labels: request.node_labels.clone(),
-        },
-        state.get_ctx(),
+        }),
+        &state.get_ctx(),
     )
     .await
     .map_err(map_finalize_error)?;
@@ -881,7 +886,7 @@ async fn realm_endpoints(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
     Ok(declared_endpoints(&config, &joiner.to_string()))
 }
 
@@ -905,13 +910,13 @@ fn declared_endpoints(config: &RealmConfigDocument, joiner: &str) -> Vec<StaticR
         .collect()
 }
 
-fn map_consume_error(error: ConsumeSecretError) -> ServerError {
+pub(crate) fn map_consume_error(error: ConsumeSecretError) -> ServerError {
     match error {
         ConsumeSecretError::NotFound
         | ConsumeSecretError::Expired
         | ConsumeSecretError::AlreadyClaimed
         | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -931,11 +936,7 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
         BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
             StorageError::TransactionConflict,
         )) => ServerError::Conflict("concurrent enrollment conflict; retry".to_string()),
-        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
-            StorageError::CleanupCapacity,
-        )) => ServerError::ServiceUnavailableReason(
-            "storage cleanup capacity exhausted; retry".to_string(),
-        ),
+        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(error)) => error.into(),
         BootstrapFinalizeError::Consume(error) => map_consume_error(error),
         BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::DeletionPending) => {
             ServerError::Conflict("group deletion is pending; retry enrollment".into())
@@ -948,17 +949,17 @@ fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
         }
         BootstrapFinalizeError::ReservedNodeLabel(label) => ServerError::ReservedLabel(label),
         BootstrapFinalizeError::LongNodeLocation => ServerError::BadRequest,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_inspect_error(error: InspectSecretError) -> ServerError {
+pub(crate) fn map_inspect_error(error: InspectSecretError) -> ServerError {
     match error {
         InspectSecretError::NotFound
         | InspectSecretError::Expired
         | InspectSecretError::AlreadyClaimed
         | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -968,19 +969,15 @@ fn map_create_error(error: CreateSecretError) -> ServerError {
         CreateSecretError::StorageError(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent enrollment secret conflict; retry".to_string())
         }
-        CreateSecretError::StorageError(StorageError::CleanupCapacity) => {
-            ServerError::ServiceUnavailableReason(
-                "storage cleanup capacity exhausted; retry".to_string(),
-            )
-        }
-        other => ServerError::InternalError(other.to_string()),
+        CreateSecretError::StorageError(error) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 fn map_delete_error(error: DeleteSecretError) -> ServerError {
     match error {
         DeleteSecretError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1054,7 +1051,7 @@ fn wrap_realm_key(
     let nonce = SalsaBox::generate_nonce(&mut CryptoOsRng);
     let ciphertext = cipher
         .encrypt(&nonce, realm_key_pem.as_bytes())
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
+        .map_err(|err| ServerError::InternalError(err.to_string().into()))?;
 
     Ok((
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(ciphertext),

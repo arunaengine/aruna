@@ -5,8 +5,8 @@
 use super::{cold_backend, read_back, s3_env, setup_s3_mixed, stream_from_bytes, test_user_id};
 use crate::blob::BlobHandler;
 use crate::codec::PART_MIN;
-use crate::hash::Hasher;
 use aruna_core::events::BlobEvent;
+use aruna_core::structs::checksum::Hasher;
 use aruna_core::structs::storage::blob::{BackendLocation, ResolvedBackend};
 use aruna_core::structs::storage::format::{Compression, EncodingClass, StoredLayout};
 use aruna_core::structs::storage::multipart::{BackendUpload, MultipartPart, MultipartPartKey};
@@ -265,15 +265,8 @@ async fn s3_decoded_compose() {
 }
 
 /// Seeded xorshift bytes, which do not compress.
-fn noise(len: usize, mut seed: u64) -> Vec<u8> {
-    (0..len)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            seed as u8
-        })
-        .collect()
+fn noise(len: usize, seed: u64) -> Vec<u8> {
+    crate::codec::tests::random(len, seed)
 }
 
 /// Streams parts 1 to 3, then replaces parts 1 and 3 with staged blobs of `sizes`.
@@ -402,7 +395,7 @@ async fn s3_bucketless_framed() {
     // A group storage without a fixed bucket: parts stream into its default bucket, and the
     // short last part waits in that bucket's own parts folder.
     use super::{s3_config, unique_name};
-    use crate::blob::NodeBackend;
+    use crate::blob::registry::NodeBackend;
     use crate::s3::make_bucket;
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};
     use aruna_core::structs::storage::group_backend::{

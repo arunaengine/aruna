@@ -2,7 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 use super::*;
-use crate::driver::drive;
+use crate::blob::migration::job_pages::{
+    JobAccessOperation, ProcessLinkedOperation, StillAdminOperation, StoreJobOperation,
+};
+use crate::s3::bucket::job_progress::JobStep;
 use crate::s3::bucket::rename::tests::{
     BUCKET, access, get, group, head_key, object, realm, setup,
 };
@@ -10,8 +13,16 @@ use crate::tests::records::node;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, COMPRESSION_QUEUE_KEYSPACE};
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::structs::storage::format::Compression;
-use aruna_core::structs::storage::linked_job::RemapPlan;
+use aruna_core::structs::storage::linked_job::{LinkedTask, RemapPlan};
+use aruna_drivers::driver::{DriverContext, drive};
 use ulid::Ulid;
+
+async fn process_linked(
+    context: &DriverContext,
+) -> Result<Option<std::time::Duration>, crate::blob::migration::shared::MigrationError> {
+    let routing = aruna_drivers::driver::node_routing(context);
+    drive(ProcessLinkedOperation::new(routing), context).await
+}
 
 fn grant() -> TokenGrant {
     TokenGrant {
@@ -140,7 +151,12 @@ async fn abort_keeps_progress() {
         done: 1,
         ..JobStep::default()
     };
-    store(&context, BUCKET, &running, step, None).await.unwrap();
+    drive(
+        StoreJobOperation::new(BUCKET, &running, step, None),
+        &context,
+    )
+    .await
+    .unwrap();
     let ended = stored(&context).await;
     assert_eq!((ended.state, ended.done), (LinkedState::Aborted, 1));
     assert_eq!(ended.cursor.as_deref(), Some("a.faa.gz"));
@@ -198,15 +214,147 @@ async fn needs_group_admin() {
     // A job runs only while its caller still administers the group.
     let (_directory, context) = setup().await;
     let auth = access(&context).await;
-    assert!(still_admin(&context, &auth, group()).await.unwrap());
+    let admin = StillAdminOperation::new(&auth, group());
+    assert!(drive(admin, &context).await.unwrap());
     let stranger = aruna_core::structs::identity::auth::AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::from_parts(77, 7), realm()),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(77, 7), realm()),
         ..auth.clone()
     };
-    assert!(!still_admin(&context, &stranger, group()).await.unwrap());
+    let admin = StillAdminOperation::new(&stranger, group());
+    assert!(!drive(admin, &context).await.unwrap());
     let mut job = job(stranger);
     job.task = LinkedTask::Unify {
         prefix: String::new(),
     };
-    assert!(job_access(&context, BUCKET, &job).await.unwrap().is_none());
+    let access = drive(JobAccessOperation::new(BUCKET, &job), &context).await;
+    assert!(access.unwrap().is_none());
+}
+
+fn bucket_key() -> Key {
+    BUCKET.as_bytes().to_vec().into()
+}
+
+fn job_rows(
+    linked: Option<&LinkedJob>,
+    rename: Option<(&CompressionMigration, &RenameRequest)>,
+) -> IoResult {
+    let migration = rename.map(|(record, _)| record.to_bytes().unwrap().into());
+    let request = rename.map(|(_, request)| request.to_bytes().unwrap().into());
+    IoResult::Values(vec![
+        linked.map(|row| row.to_bytes().unwrap().into()),
+        migration,
+        request,
+    ])
+}
+
+fn linked_job(state: LinkedState, started_at_ms: u64) -> LinkedJob {
+    let mut row = job(aruna_core::structs::identity::auth::AuthContext::anonymous(
+        realm(),
+    ));
+    (row.state, row.started_at_ms) = (state, started_at_ms);
+    row
+}
+
+fn rename_move(started_at_ms: u64, request_ms: u64) -> (CompressionMigration, RenameRequest) {
+    let mut record = CompressionMigration::new(Compression::Off, started_at_ms);
+    record.moving = true;
+    let request = RenameRequest {
+        started_at_ms: request_ms,
+        auth: aruna_core::structs::identity::auth::AuthContext::anonymous(realm()),
+        node_id: node(4),
+        grant: grant(),
+        paused: false,
+        aborted_at_ms: None,
+    };
+    (record, request)
+}
+
+fn shown(result: IoResult) -> Result<Next<Option<BucketJob>>, LinkedError> {
+    ShownJobOperation::new(BUCKET).next(result)
+}
+
+#[test]
+fn reads_bucket_job() {
+    let reads = [
+        LINKED_JOB_KEYSPACE,
+        COMPRESSION_MIGRATION_KEYSPACE,
+        RENAME_MOVE_KEYSPACE,
+    ];
+    let reads = reads
+        .map(|space| (space.to_string(), bucket_key()))
+        .to_vec();
+    let mut operation = ShownJobOperation::new(BUCKET);
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(reads))));
+    let running = linked_job(LinkedState::Running, 3);
+    let answer = operation.next(job_rows(Some(&running), None));
+    assert_eq!(answer, Ok(Next::Done(Some(BucketJob::Linked(running)))));
+}
+
+#[test]
+fn shows_job_chosen() {
+    // A running job wins; between ended ones the later start wins; another move's rows are not
+    // a rename.
+    let running = linked_job(LinkedState::Running, 3);
+    let early = linked_job(LinkedState::Finished, 5);
+    let late = linked_job(LinkedState::Finished, 9);
+    let (record, request) = rename_move(7, 7);
+    let mut ended = record.clone();
+    ended.finished_at_ms = Some(8);
+    let (other, unrelated) = rename_move(7, 6);
+    let linked = |row: &LinkedJob| Ok(Next::Done(Some(BucketJob::Linked(row.clone()))));
+    let renamed = |record: &CompressionMigration| {
+        Ok(Next::Done(Some(BucketJob::Rename(
+            record.clone(),
+            request.clone(),
+        ))))
+    };
+    let cases = [
+        (Some(&running), Some((&record, &request)), linked(&running)),
+        (Some(&early), Some((&record, &request)), renamed(&record)),
+        (Some(&late), Some((&ended, &request)), linked(&late)),
+        (Some(&early), Some((&ended, &request)), renamed(&ended)),
+        (Some(&early), Some((&other, &unrelated)), linked(&early)),
+        (None, Some((&ended, &request)), renamed(&ended)),
+        (None, None, Ok(Next::Done(None))),
+    ];
+    for (row, rename, expected) in cases {
+        assert_eq!(shown(job_rows(row, rename)), expected);
+    }
+}
+
+#[test]
+fn bucket_job_errors() {
+    let corrupt = IoResult::Values(vec![Some(vec![0xff].into()), None, None]);
+    assert!(matches!(shown(corrupt), Err(LinkedError::Conversion(_))));
+    assert!(matches!(
+        shown(IoResult::Done),
+        Err(LinkedError::Io(IoError::Unexpected { .. }))
+    ));
+    let conflict = LinkedError::from(IoError::Conflict);
+    assert_eq!(
+        conflict,
+        LinkedError::Storage(StorageError::TransactionConflict)
+    );
+}
+
+#[test]
+fn reads_rename_total() {
+    let row = |started_at_ms| RenameTotal {
+        started_at_ms,
+        total: 3,
+    };
+    let stored = |value: Option<RenameTotal>| {
+        IoResult::Values(vec![value.map(|row| row.to_bytes().unwrap().into())])
+    };
+    let mut operation = RenameTotalOperation::new(BUCKET, 7);
+    let read = vec![(RENAME_TOTAL_KEYSPACE.to_string(), bucket_key())];
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
+    assert_eq!(
+        operation.next(stored(Some(row(7)))),
+        Ok(Next::Done(Some(3)))
+    );
+    // A total stored for another move, or none, is no total.
+    for value in [Some(row(8)), None] {
+        assert_eq!(operation.next(stored(value)), Ok(Next::Done(None)));
+    }
 }

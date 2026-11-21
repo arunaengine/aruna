@@ -2,38 +2,41 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::id_mint::IdMint;
 use std::collections::BTreeSet;
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
-use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent, SubOperationEvent};
+use aruna_core::events::Event;
+#[cfg(test)]
 use aruna_core::keyspaces::DOCUMENT_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_suboperation};
-use aruna_core::reducer::{
-    AdminDocumentError, AdminDocumentState, CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH,
-};
+use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::reducer::paths::{CONFIG_QUOTA_PATH, CONFIG_REPLICAS_PATH};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+#[cfg(test)]
+use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::storage_entries::{
-    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+    conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmConfigDocument, ReplicaQuota};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_core::task::TaskEvent;
-use aruna_core::types::{Effects, Key, KeySpace, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::Value;
 use thiserror::Error;
 use tracing::warn;
 
 use super::COMMIT_ATTEMPTS;
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::placement::target_placement_ref;
 use crate::realm::mutate_placement::is_management;
-use crate::sync::document_outbox::{
+use crate::realm::write_stage::{WriteStage, WriteStep};
+use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
+use aruna_core::placement::target_placement_ref;
 
+use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetQuotaConfig {
     pub actor: Actor,
@@ -45,36 +48,12 @@ pub struct SetQuotaConfig {
     pub replicas: ReplicaQuota,
 }
 
+/// Checks the caller's config permission, then writes the change in a write transaction that
+/// reruns after a lost conflict, since a background config write can win its commit.
 #[derive(Debug, PartialEq)]
 pub struct SetQuotaOperation {
-    config: SetQuotaConfig,
-    txn_id: Option<TxnId>,
-    attempts: usize,
-    state: SetQuotaState,
-    output: Option<Result<RealmConfigDocument, SetQuotaError>>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum SetQuotaState {
-    Init,
-    Auth,
-    StartTransaction,
-    ReadCurrent,
-    WriteDocumentState {
-        document: RealmConfigDocument,
-        stale_conflict_deletes: Vec<(KeySpace, Key)>,
-    },
-    DeleteAdminConflicts {
-        document: RealmConfigDocument,
-    },
-    CommitTransaction {
-        document: RealmConfigDocument,
-    },
-    ScheduleSyncDrain {
-        document: RealmConfigDocument,
-    },
-    Finish,
-    Error,
+    config: Arc<SetQuotaConfig>,
+    authorized: bool,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -93,26 +72,105 @@ pub enum SetQuotaError {
     NotManagementNode,
     #[error("invalid quota configuration: {reason}")]
     InvalidQuota { reason: String },
-    #[error("missing active transaction")]
-    MissingTransaction,
     #[error("operation did not finish")]
     NotFinished,
     #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
+}
+
+impl From<IoError> for SetQuotaError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "SetQuota".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
 }
 
 impl SetQuotaOperation {
     pub fn new(config: SetQuotaConfig) -> Self {
         Self {
+            config: Arc::new(config),
+            authorized: false,
+        }
+    }
+
+    fn change(&self) -> IoCall {
+        let config = Arc::clone(&self.config);
+        let seed = self.config.actor.user_id.to_bytes();
+        let build = move || QuotaWrite::new(Arc::clone(&config));
+        let child = boxed_retry(build, &seed, |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        IoCall::Child(child)
+    }
+}
+
+impl Operation for SetQuotaOperation {
+    type Output = RealmConfigDocument;
+    type Error = SetQuotaError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, SetQuotaError> {
+        if self.config.auth_context.realm_id != self.config.actor.realm_id {
+            return Err(SetQuotaError::Unauthorized);
+        }
+        Ok(Next::Call(IoCall::child(CheckPermissionsOperation::new(
+            CheckPermissionsConfig {
+                auth_context: self.config.auth_context.clone(),
+                path: policy_admin_path(self.config.actor.realm_id),
+                required_permission: Permission::WRITE,
+            },
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetQuotaError> {
+        if self.authorized {
+            return result
+                .child::<RealmConfigDocument, SetQuotaError>()?
+                .map(Next::Done);
+        }
+        match result.child::<bool, AuthorizationError>()? {
+            Ok(true) => {
+                self.authorized = true;
+                Ok(Next::Call(self.change()))
+            }
+            Ok(false) => Err(SetQuotaError::Unauthorized),
+            Err(AuthorizationError::StorageError(error)) => Err(error.into()),
+            Err(error) => {
+                warn!(error = %error, "Realm quota authorization check failed");
+                Err(SetQuotaError::Unauthorized)
+            }
+        }
+    }
+}
+
+/// Reads the realm config and its admin state, then stores the change and its queued admin
+/// events in one write transaction.
+#[derive(Debug, PartialEq)]
+struct QuotaWrite {
+    config: Arc<SetQuotaConfig>,
+    write: WriteStage,
+    document: Option<RealmConfigDocument>,
+}
+
+impl QuotaWrite {
+    fn new(config: Arc<SetQuotaConfig>) -> Self {
+        Self {
             config,
-            txn_id: None,
-            attempts: 0,
-            state: SetQuotaState::Init,
-            output: None,
+            write: WriteStage::default(),
+            document: None,
         }
     }
 
@@ -128,42 +186,11 @@ impl SetQuotaOperation {
         }
     }
 
-    fn start_transaction(&mut self) -> Effects {
-        self.attempts += 1;
-        self.state = SetQuotaState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    }
-
-    fn emit_read_current(&mut self, txn_id: TxnId) -> Effects {
-        self.txn_id = Some(txn_id);
-        self.state = SetQuotaState::ReadCurrent;
-        let document = self.document_ref();
-        let target = self.admin_target();
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (
-                    document.storage_keyspace().to_string(),
-                    document.storage_key(),
-                ),
-                (
-                    DOCUMENT_STATE_KEYSPACE.to_string(),
-                    reducer_state_key(&target),
-                ),
-            ],
-            txn_id: Some(txn_id),
-        })]
-    }
-
     fn emit_document_write(
         &mut self,
         document_value: Option<Value>,
         reducer_state_value: Option<Value>,
-    ) -> Result<Effects, SetQuotaError> {
-        let Some(txn_id) = self.txn_id else {
-            return Err(SetQuotaError::MissingTransaction);
-        };
+    ) -> Result<Next<RealmConfigDocument>, SetQuotaError> {
         validate_quota(&self.config.quota)?;
 
         let Some(document_value) = document_value else {
@@ -197,12 +224,14 @@ impl SetQuotaOperation {
             AdminDocumentOperation::ConfigQuotaSet {
                 quota: self.config.quota.clone(),
             },
+            self.write.ids.mint(self.write.now_ms),
         )?;
         let replicas_event = reducer_state.apply_operation(
             &self.config.actor,
             AdminDocumentOperation::ConfigReplicasSet {
                 replicas: self.config.replicas.clone(),
             },
+            self.write.ids.mint(self.write.now_ms),
         )?;
         // Materialized reducer state keeps local and replicated quota conflict outcomes equal.
         apply_reducer_quota(&mut document, &reducer_state);
@@ -233,185 +262,49 @@ impl SetQuotaOperation {
         }
         writes.extend(conflict_write_entries(&reducer_state)?);
 
-        self.output = Some(Ok(document.clone()));
-        self.state = SetQuotaState::WriteDocumentState {
-            document,
-            stale_conflict_deletes,
-        };
-
-        Ok(smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })])
+        self.document = Some(document.clone());
+        self.write.written(stale_conflict_deletes, false);
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
-    fn emit_commit_transaction(&mut self, document: RealmConfigDocument) -> Effects {
-        let Some(txn_id) = self.txn_id else {
-            return self.fail(SetQuotaError::MissingTransaction);
-        };
-        self.state = SetQuotaState::CommitTransaction { document };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn fail(&mut self, error: SetQuotaError) -> Effects {
-        let cleanup = self.abort();
-        self.state = SetQuotaState::Error;
-        self.output = Some(Err(error));
-        cleanup
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(SetQuotaError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<RealmConfigDocument>, SetQuotaError> {
+        let output = self.document.take().ok_or(SetQuotaError::NotFinished)?;
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
     }
 }
 
-impl Operation for SetQuotaOperation {
+impl Operation for QuotaWrite {
     type Output = RealmConfigDocument;
     type Error = SetQuotaError;
 
-    fn start(&mut self) -> Effects {
-        if self.config.auth_context.realm_id != self.config.actor.realm_id {
-            return self.fail(SetQuotaError::Unauthorized);
-        }
-        self.state = SetQuotaState::Auth;
-        smallvec![Effect::SubOperation(boxed_suboperation(
-            CheckPermissionsOperation::new(CheckPermissionsConfig {
-                auth_context: self.config.auth_context.clone(),
-                path: policy_admin_path(self.config.actor.realm_id),
-                required_permission: Permission::WRITE,
-            }),
-            |allowed| Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }),
-        ))]
+    fn seed(&mut self, entropy: u128) {
+        self.write.ids = IdMint::new(entropy);
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state.clone() {
-            SetQuotaState::Auth => match event {
-                Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) => {
-                    match allowed {
-                        Ok(true) => self.start_transaction(),
-                        Ok(false) => self.fail(SetQuotaError::Unauthorized),
-                        Err(error) => {
-                            warn!(error = %error, "Realm quota authorization check failed");
-                            match error {
-                                AuthorizationError::StorageError(error) => {
-                                    self.fail(SetQuotaError::StorageError(error))
-                                }
-                                _ => self.fail(SetQuotaError::Unauthorized),
-                            }
-                        }
-                    }
-                }
-                other => self.unexpected_event("authorization result", format!("{other:?}")),
-            },
-            SetQuotaState::StartTransaction => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.emit_read_current(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("transaction start result", format!("{other:?}")),
-            },
-            SetQuotaState::ReadCurrent => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, document_value), (_, reducer_state_value)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "storage batch read result with realm config and reducer state",
-                            format!("{values:?}"),
-                        );
-                    };
-                    match self
-                        .emit_document_write(document_value.clone(), reducer_state_value.clone())
-                    {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
-            },
-            SetQuotaState::WriteDocumentState {
-                document,
-                stale_conflict_deletes,
-            } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => {
-                    let Some(txn_id) = self.txn_id else {
-                        return self.fail(SetQuotaError::MissingTransaction);
-                    };
-                    if !stale_conflict_deletes.is_empty() {
-                        self.state = SetQuotaState::DeleteAdminConflicts { document };
-                        return smallvec![Effect::Storage(StorageEffect::BatchDelete {
-                            deletes: stale_conflict_deletes,
-                            txn_id: Some(txn_id),
-                        })];
-                    }
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch write result", format!("{other:?}")),
-            },
-            SetQuotaState::DeleteAdminConflicts { document } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => {
-                    self.emit_commit_transaction(document)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch delete result", format!("{other:?}")),
-            },
-            SetQuotaState::CommitTransaction { document } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => {
-                    self.txn_id = None;
-                    self.state = SetQuotaState::ScheduleSyncDrain { document };
-                    smallvec![schedule_drain_effect()]
-                }
-                Event::Storage(StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                }) if self.attempts < COMMIT_ATTEMPTS => {
-                    self.txn_id = None;
-                    self.start_transaction()
-                }
-                Event::Storage(StorageEvent::Error { error }) => {
-                    self.txn_id = None;
-                    self.fail(error.into())
-                }
-                other => self.unexpected_event("transaction commit result", format!("{other:?}")),
-            },
-            SetQuotaState::ScheduleSyncDrain { .. } => match event {
-                Event::Task(TaskEvent::TimerScheduled { .. }) => {
-                    self.state = SetQuotaState::Finish;
-                    smallvec![]
-                }
-                Event::Task(TaskEvent::Error { message, .. }) => {
-                    warn!(error = %message, "Failed to schedule admin document operation outbox drain; durable outbox remains retryable");
-                    self.state = SetQuotaState::Finish;
-                    smallvec![]
-                }
-                other => self.unexpected_event(
-                    "document sync outbox drain timer schedule",
-                    format!("{other:?}"),
-                ),
-            },
-            SetQuotaState::Finish | SetQuotaState::Error | SetQuotaState::Init => {
-                smallvec![]
-            }
-        }
+    fn stamp(&mut self, now_ms: u64) {
+        self.write.now_ms = now_ms;
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, SetQuotaState::Finish | SetQuotaState::Error)
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(SetQuotaError::NotFinished))
+    fn conflict_retries() -> u32 {
+        COMMIT_ATTEMPTS as u32 - 1
     }
 
-    fn abort(&mut self) -> Effects {
-        match self.txn_id.take() {
-            Some(txn_id) => smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })],
-            None => smallvec![],
+    fn first(&mut self) -> Result<Next<Self::Output>, SetQuotaError> {
+        let reads = crate::realm::document_reads(self.document_ref(), &self.admin_target());
+        Ok(Next::Call(reads))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SetQuotaError> {
+        match self.write.step(result)? {
+            WriteStep::Read([document, reducer]) => self.emit_document_write(document, reducer),
+            WriteStep::Call(call) => Ok(Next::Call(call)),
+            WriteStep::Done => self.finish(),
         }
     }
 }
@@ -505,29 +398,17 @@ fn validate_quota(quota: &QuotaConfig) -> Result<(), SetQuotaError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{DriverContext, drive};
-    use crate::realm::get_config::GetConfigOperation;
-    use aruna_core::UserId;
+    use crate::document_repository::GetConfigOperation;
     use aruna_core::document::DocumentTarget;
-    use aruna_core::events::StorageEvent;
-    use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::realm::{
-        GroupQuotaOverride, RealmAuthorizationDocument, RealmConfigDocument, RealmId,
-        RealmNodeKind, UserCapOverride,
+        GroupQuotaOverride, RealmConfigDocument, RealmId, RealmNodeKind, UserCapOverride,
     };
+    use aruna_core::types::Key;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::testing::path_context;
     use tempfile::tempdir;
     use ulid::Ulid;
-
-    fn test_ctx(root: &str) -> DriverContext {
-        DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        }
-    }
 
     fn actor(seed: u8, realm_id: RealmId) -> Actor {
         Actor {
@@ -538,12 +419,7 @@ mod tests {
     }
 
     fn auth(actor: &Actor) -> AuthContext {
-        AuthContext {
-            user_id: actor.user_id,
-            realm_id: actor.realm_id,
-            path_restrictions: None,
-            session: None,
-        }
+        AuthContext::new(actor.user_id, actor.realm_id)
     }
 
     fn quota_config(actor: &Actor, quota: QuotaConfig) -> SetQuotaConfig {
@@ -558,23 +434,7 @@ mod tests {
     /// The realm admin role only grants what the operation checks, so the
     /// permission sub-operation decides on stored rules like production does.
     async fn seed_realm_admin(ctx: &DriverContext, actor: &Actor) {
-        let mut document = RealmAuthorizationDocument::default_realm_doc(actor.realm_id);
-        for role in document.roles.values_mut() {
-            role.assigned_users.insert(actor.user_id);
-        }
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: AUTH_KEYSPACE.to_string(),
-                key: (*actor.realm_id.as_bytes()).into(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_realm_admin(ctx, actor).await;
     }
 
     fn management_config(realm_id: RealmId, actor: &Actor) -> RealmConfigDocument {
@@ -584,22 +444,7 @@ mod tests {
     }
 
     async fn seed_config(ctx: &DriverContext, actor: &Actor, document: &RealmConfigDocument) {
-        let target = DocumentTarget::RealmConfig {
-            realm_id: actor.realm_id,
-        };
-        match ctx
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: target.storage_keyspace().to_string(),
-                key: target.storage_key(),
-                value: document.to_bytes(actor).unwrap().into(),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {}
-            other => panic!("unexpected event: {other:?}"),
-        }
+        crate::tests::realm::seed_config(ctx, actor, document).await;
     }
 
     fn custom_quota() -> QuotaConfig {
@@ -626,7 +471,7 @@ mod tests {
     #[tokio::test]
     async fn quota_round_trips() {
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let document = management_config(realm_id, &actor);
@@ -660,7 +505,7 @@ mod tests {
     async fn rejects_zero_limits() {
         // Zero would silence every enrolled device; unset is the uncapped value.
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let document = management_config(realm_id, &actor);
@@ -693,7 +538,7 @@ mod tests {
     async fn rejects_zero_cap() {
         // A zero `devices_per_user` would enroll nobody; unset means no cap.
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([1; 32]);
         let actor = actor(1, realm_id);
         let document = management_config(realm_id, &actor);
@@ -719,7 +564,7 @@ mod tests {
     #[tokio::test]
     async fn missing_config_fails() {
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([2; 32]);
         let actor = actor(2, realm_id);
         seed_realm_admin(&ctx, &actor).await;
@@ -737,7 +582,7 @@ mod tests {
     async fn refuses_server_node() {
         // A realm admin token still may not write the config on a server node.
         let dir = tempdir().unwrap();
-        let ctx = test_ctx(dir.path().to_str().unwrap());
+        let ctx = path_context(dir.path().to_str().unwrap());
         let realm_id = RealmId::from_bytes([5; 32]);
         let actor = actor(5, realm_id);
         let mut document = RealmConfigDocument::new(realm_id, Vec::new(), 3);
@@ -754,125 +599,50 @@ mod tests {
         assert_eq!(error, SetQuotaError::NotManagementNode);
     }
 
-    #[test]
-    fn start_checks_permission() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let actor = actor(1, realm_id);
+    fn checked(
+        allowed: Result<bool, AuthorizationError>,
+    ) -> Result<Next<RealmConfigDocument>, SetQuotaError> {
+        let actor = actor(1, RealmId::from_bytes([1; 32]));
         let mut operation = SetQuotaOperation::new(quota_config(&actor, custom_quota()));
-        let effects = operation.start();
-        assert!(matches!(effects.as_slice(), [Effect::SubOperation(_)]));
-        let emitted = format!("{effects:?}");
-        assert!(emitted.contains(&policy_admin_path(realm_id)));
-        assert!(emitted.contains("WRITE"));
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        operation.next(IoResult::Child(ChildOutcome::new(allowed)))
     }
 
     #[test]
     fn denied_is_terminal() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let actor = actor(1, realm_id);
-        let mut operation = SetQuotaOperation::new(quota_config(&actor, custom_quota()));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(false) },
-        ));
-        assert!(effects.is_empty());
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(SetQuotaError::Unauthorized));
+        assert_eq!(checked(Ok(false)), Err(SetQuotaError::Unauthorized));
     }
 
     #[test]
     fn capacity_not_denied() {
         // Storage exhaustion inside the check is infrastructure, not a verdict.
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let actor = actor(1, realm_id);
-        let mut operation = SetQuotaOperation::new(quota_config(&actor, custom_quota()));
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult {
-                allowed: Err(AuthorizationError::StorageError(
-                    StorageError::CleanupCapacity,
-                )),
-            },
-        ));
-        assert!(operation.is_complete());
+        let capacity = AuthorizationError::StorageError(StorageError::CleanupCapacity);
         assert_eq!(
-            operation.finalize(),
+            checked(Err(capacity)),
             Err(SetQuotaError::StorageError(StorageError::CleanupCapacity))
         );
     }
 
     #[test]
-    fn allowed_starts_transaction() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let actor = actor(1, realm_id);
-        let mut operation = SetQuotaOperation::new(quota_config(&actor, custom_quota()));
-        operation.start();
-        let effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
+    fn allowed_runs_write() {
+        // The change runs as a write child that reruns from its read after a lost commit.
+        assert!(matches!(
+            checked(Ok(true)),
+            Ok(Next::Call(IoCall::Child(_)))
         ));
-        assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })]
-        );
+        crate::realm::commit_retry::retries_conflicts::<QuotaWrite>();
     }
 
     #[test]
-    fn retries_commit_conflict() {
-        // A commit lost to another realm-config writer re-reads and re-applies the quota.
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let actor = actor(1, realm_id);
-        let document = management_config(realm_id, &actor)
-            .to_bytes(&actor)
-            .unwrap();
-        let mut operation = SetQuotaOperation::new(quota_config(&actor, custom_quota()));
-        operation.start();
-        let mut effects = operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        for attempt in 1..=COMMIT_ATTEMPTS {
-            assert!(
-                matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::StartTransaction { .. })]
-                ),
-                "attempt {attempt} starts a fresh transaction"
-            );
-            let txn_id = Ulid::from(attempt as u128);
-            operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-            operation.step(Event::Storage(StorageEvent::BatchReadResult {
-                values: vec![
-                    (Key::from(vec![1]), Some(document.clone().into())),
-                    (Key::from(vec![2]), None),
-                ],
-            }));
-            operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-                entries: Vec::new(),
-            }));
-            effects = operation.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::TransactionConflict,
-            }));
-        }
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
-            Err(SetQuotaError::StorageError(
-                StorageError::TransactionConflict
-            ))
-        );
-    }
-
-    #[test]
-    fn retry_rereads_config() {
-        // The retry reads in its own transaction and builds its writes from the newer state, so
-        // what another writer committed in between survives and the drain follows the commit.
+    fn write_keeps_newer() {
+        // The write builds on the config and admin state it reads, so what another writer
+        // committed before survives, and the config comes out only after the commit.
         let realm_id = RealmId::from_bytes([1; 32]);
         let owner = actor(1, realm_id);
         let other = actor(9, realm_id);
-        let first = management_config(realm_id, &owner)
-            .to_bytes(&owner)
-            .unwrap();
         let mut newer = management_config(realm_id, &owner);
         newer.description = "changed elsewhere".to_string();
         newer.ensure_node(other.node_id, RealmNodeKind::Server);
@@ -884,6 +654,7 @@ mod tests {
                 AdminDocumentOperation::ConfigDescriptionSet {
                     description: "changed elsewhere".to_string(),
                 },
+                ulid::Ulid::generate(),
             )
             .unwrap();
         let (_, _, reducer_value) = reducer_state_entry(&reducer).unwrap();
@@ -897,62 +668,21 @@ mod tests {
             reducer_state_key(&target),
         );
 
-        let mut operation = SetQuotaOperation::new(quota_config(&owner, custom_quota()));
-        operation.start();
-        operation.step(Event::SubOperation(
-            SubOperationEvent::AuthorizationResult { allowed: Ok(true) },
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from(1u128),
-        }));
-        operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (document_key.1.clone(), Some(first.into())),
-                (reducer_key.1.clone(), None),
-            ],
-        }));
-        operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::TransactionConflict,
-        }));
+        let mut write = QuotaWrite::new(Arc::new(quota_config(&owner, custom_quota())));
         assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::StartTransaction {
-                read: false
-            })],
-            "a lost commit starts over and schedules no drain"
+            write.first(),
+            Ok(Next::Call(IoCall::Read(vec![
+                document_key.clone(),
+                reducer_key.clone()
+            ])))
         );
-
-        let txn_id = Ulid::from(2u128);
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
-        assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::BatchRead {
-                reads: vec![document_key.clone(), reducer_key.clone()],
-                txn_id: Some(txn_id),
-            })]
-        );
-        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![
-                (
-                    document_key.1.clone(),
-                    Some(newer.to_bytes(&owner).unwrap().into()),
-                ),
-                (reducer_key.1.clone(), Some(reducer_value)),
-            ],
-        }));
-        let [
-            Effect::Storage(StorageEffect::BatchWrite {
-                writes,
-                txn_id: write_txn,
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("the retry writes in one batch: {effects:?}");
+        let read = IoResult::Values(vec![
+            Some(newer.to_bytes(&owner).unwrap().into()),
+            Some(reducer_value),
+        ]);
+        let Ok(Next::Call(IoCall::Write(writes))) = write.next(read) else {
+            panic!("the write stores its rows in one batch");
         };
-        assert_eq!(*write_txn, Some(txn_id));
         let value_of = |(space, key): &(String, Key)| {
             writes
                 .iter()
@@ -971,21 +701,10 @@ mod tests {
         assert!(state.applied_event_ids.contains(&prior.event_id));
         assert_eq!(state.applied_event_ids.len(), 3);
 
-        let effects = operation.step(Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        }));
-        assert_eq!(
-            effects.as_slice(),
-            &[Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-        );
-        let effects = operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-            txn_id,
-        }));
-        assert_eq!(effects.as_slice(), &[schedule_drain_effect()]);
-        assert_eq!(
-            operation.finalize().unwrap().description,
-            "changed elsewhere"
-        );
+        let Ok(Next::Then { output, .. }) = write.next(IoResult::Done) else {
+            panic!("expected the config with the drain wake");
+        };
+        assert_eq!(output.description, "changed elsewhere");
     }
 
     #[test]
@@ -995,8 +714,7 @@ mod tests {
         let mut config = quota_config(&actor, custom_quota());
         config.auth_context.realm_id = RealmId::from_bytes([2; 32]);
         let mut operation = SetQuotaOperation::new(config);
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Err(SetQuotaError::Unauthorized));
+        assert_eq!(operation.first(), Err(SetQuotaError::Unauthorized));
     }
 
     #[test]
@@ -1132,14 +850,14 @@ mod tests {
             AdminDocumentClock, AdminDocumentEvent, AdminDocumentTarget,
         };
 
-        fn node(seed: u8) -> aruna_core::NodeId {
+        fn node(seed: u8) -> aruna_core::id::NodeId {
             iroh::SecretKey::from_bytes(&[seed; 32]).public()
         }
 
         let target = AdminDocumentTarget::RealmConfig { realm_id };
         let mut state = AdminDocumentState::new(target.clone());
         let quota_event =
-            |seed: u8, origin: aruna_core::NodeId, quota: QuotaConfig| AdminDocumentEvent {
+            |seed: u8, origin: aruna_core::id::NodeId, quota: QuotaConfig| AdminDocumentEvent {
                 event_id: Ulid::from_bytes([seed; 16]),
                 target: target.clone(),
                 origin_node_id: origin,

@@ -5,21 +5,23 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{parse_group_id, require_owner};
+use crate::auth::OwnerAuth;
+use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::id::NodeId;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::group_backend::valid_bucket;
-use aruna_operations::device::sync::folders::{RealmBucketInput, create_realm_bucket};
+use aruna_drivers::driver::drive;
+use aruna_operations::device::sync::folders::RealmBucketInput;
+use aruna_operations::device::sync::folders::bind::create_realm_bucket;
 
 use super::folders::map_folder_error;
 
@@ -80,7 +82,6 @@ bind with `create_bucket`.
                 "group_id": "01JGROUP0123456789ABCDEFGH"
             })),
         (status = 400, description = "Malformed ids, an invalid bucket name, or a node that is not a realm server", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller is not this device's owner, or the realm node refuses the owner", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
         (status = 409, description = "The node already holds a bucket of that name", body = ErrorResponse),
@@ -91,10 +92,9 @@ bind with `create_bucket`.
 )]
 pub(super) async fn create_device_bucket(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    OwnerAuth(auth): OwnerAuth,
     Json(request): Json<CreateBucketRequest>,
 ) -> ServerResult<(StatusCode, Json<CreatedBucket>)> {
-    let auth = require_owner(&state, auth).await?;
     let group_id = parse_group_id(&request.group_id)?;
     let node_id = NodeId::from_str(&request.node_id)
         .map_err(|_| ServerError::BadRequestReason("node_id is not a node id".to_string()))?;
@@ -105,15 +105,15 @@ pub(super) async fn create_device_bucket(
                 .to_string(),
         ));
     }
-    create_realm_bucket(
-        &state.get_ctx(),
-        RealmBucketInput {
+    drive(
+        create_realm_bucket(RealmBucketInput {
             bucket: request.name.clone(),
             group_id,
             node_id,
             realm_id: state.get_realm_id(),
             user_id: auth.user_id,
-        },
+        }),
+        &state.get_ctx(),
     )
     .await
     .map_err(map_folder_error)?;

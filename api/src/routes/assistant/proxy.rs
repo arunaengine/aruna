@@ -9,8 +9,9 @@ use super::{
 use crate::auth::require_unrestricted_auth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_core::structs::assistant_provider::{AssistantProvider, AssistantProviderKind};
+use aruna_core::structs::central_assistant::CENTRAL_PROVIDER_ID;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{AssistantProvider, AssistantProviderKind, CENTRAL_PROVIDER_ID};
 use axum::Extension;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Path, Request, State};
@@ -72,7 +73,7 @@ fn force_chatgpt(body: &[u8]) -> ServerResult<Vec<u8>> {
     })?;
     object.insert("store".to_string(), serde_json::Value::Bool(false));
     serde_json::to_vec(&value)
-        .map_err(|_| ServerError::InternalError("proxy JSON encoding failed".to_string()))
+        .map_err(|_| ServerError::InternalError("proxy JSON encoding failed".to_string().into()))
 }
 
 fn target_url(provider: &AssistantProvider, path: &str) -> String {
@@ -85,7 +86,7 @@ fn target_url(provider: &AssistantProvider, path: &str) -> String {
 
 fn sensitive_header(value: &str) -> ServerResult<HeaderValue> {
     let mut value = HeaderValue::try_from(value).map_err(|_| {
-        ServerError::InternalError("stored provider credential is invalid".to_string())
+        ServerError::InternalError("stored provider credential is invalid".to_string().into())
     })?;
     value.set_sensitive(true);
     Ok(value)
@@ -105,10 +106,14 @@ pub(super) async fn send_upstream(
     }
     let secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     let custom_headers = provider
         .open_headers(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider headers unavailable".to_string().into())
+        })?;
     let body = if provider.kind == AssistantProviderKind::Chatgpt && method == Method::POST {
         force_chatgpt(&body)?
     } else {
@@ -116,7 +121,9 @@ pub(super) async fn send_upstream(
     };
     let mut request = state
         .assistant_client()
-        .ok_or_else(|| ServerError::InternalError("assistant client unavailable".to_string()))?
+        .ok_or_else(|| {
+            ServerError::InternalError("assistant client unavailable".to_string().into())
+        })?
         .request(method, target_url(provider, path))
         .body(body);
     let sanitized = sanitize_headers(inbound_headers);
@@ -125,10 +132,10 @@ pub(super) async fn send_upstream(
     }
     for (name, value) in custom_headers.0 {
         let name = HeaderName::try_from(name.as_str()).map_err(|_| {
-            ServerError::InternalError("stored provider header is invalid".to_string())
+            ServerError::InternalError("stored provider header is invalid".to_string().into())
         })?;
         let mut value = HeaderValue::try_from(value.expose()).map_err(|_| {
-            ServerError::InternalError("stored provider header is invalid".to_string())
+            ServerError::InternalError("stored provider header is invalid".to_string().into())
         })?;
         if !forbidden_header(&name) {
             value.set_sensitive(true);
@@ -272,7 +279,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
         (status = 400, description = "The body is not JSON a ChatGPT request can carry, the provider credentials are incomplete, or a central call lacks a valid session id or names a model that is not allowed", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
@@ -322,7 +328,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     ),
     responses(
         (status = 200, description = "Upstream response streamed unchanged"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, a path this kind does not allow, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),

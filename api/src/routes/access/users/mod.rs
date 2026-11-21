@@ -7,11 +7,13 @@ mod merge;
 mod status;
 mod vault;
 
-use crate::auth::{OidcIdentity, bearer_token, ensure_permission, require_unrestricted_auth};
+use crate::auth::UnrestrictedAuth;
+use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
+use crate::auth::{RealmAuth, TokenAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::onboarding::authorize_onboarding_admin;
+use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
 use crate::server::state::ServerState;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_secs as now_timestamp;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
 use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission, Role, SessionKind,
@@ -19,31 +21,28 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
-use aruna_core::time::unix_timestamp_secs as now_timestamp;
+use aruna_core::user::id::UserId;
 use aruna_core::user::validation::email_hash;
-use aruna_operations::auth::bearer_token::decode_bearer_token;
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
 use aruna_operations::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
-use aruna_operations::device::remove_node::{
+use aruna_operations::device_node::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::onboarding::consume_secret::{
-    ConsumeSecretError, ConsumeSecretInput, ConsumeSecretOperation,
-};
+use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
-use aruna_operations::onboarding::inspect_secret::{
-    InspectSecretError, InspectSecretInput, InspectSecretOperation,
-};
-use aruna_operations::onboarding::list_secrets::ListSecretsOperation;
-use aruna_operations::realm::get_config::{GetConfigError, GetConfigOperation};
+use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
+use aruna_operations::onboarding::list_secrets::{ListSecretsOperation, OnboardingSecretEntry};
 use aruna_operations::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_operations::session::{CreateSessionConfig, CreateSessionError, create_making_room};
+use aruna_operations::session::create::{CreateSessionConfig, CreateSessionError};
+use aruna_operations::session::limit::MakeRoomOperation;
 use aruna_operations::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_operations::users::get_user::{GetUserInput, GetUserOperation};
 use aruna_operations::users::list_users::{ListUsersInput, ListUsersOperation};
@@ -54,6 +53,7 @@ use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use aruna_operations::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_operations::users::update_user::{UpdateUserInput, UpdateUserOperation};
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use http::{HeaderMap, StatusCode};
@@ -63,21 +63,12 @@ use std::str::FromStr;
 use std::sync::Arc;
 use tracing::error;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "access/users", description = "User operations"),
-        (name = "access/devices", description = "User device administration")
-    )
-)]
-pub struct UsersApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(UsersApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(register_user))
         .routes(routes!(get_token))
         .routes(routes!(get_user_info, patch_user_info))
@@ -92,25 +83,6 @@ pub fn router() -> OpenApiRouter<Arc<ServerState>> {
         .merge(vault::router())
         .merge(keys::router())
         .merge(merge::router())
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterUserRequest {
-    pub onboarding_secret: Option<String>,
-    /// Create a new account although an account with this email or name exists.
-    #[serde(default)]
-    pub create_new: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegisterUserResponse {
-    pub id: String,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GetTokenResponse {
-    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -321,36 +293,7 @@ fn preferences_from_attributes(attributes: &HashMap<String, String>) -> UserPref
     }
 }
 
-impl From<User> for RegisterUserResponse {
-    fn from(value: User) -> Self {
-        RegisterUserResponse {
-            name: value.name,
-            id: value.user_id.to_string(),
-        }
-    }
-}
-
-fn map_consume_error(error: ConsumeSecretError) -> ServerError {
-    match error {
-        ConsumeSecretError::NotFound
-        | ConsumeSecretError::Expired
-        | ConsumeSecretError::AlreadyClaimed
-        | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-fn map_inspect_error(error: InspectSecretError) -> ServerError {
-    match error {
-        InspectSecretError::NotFound
-        | InspectSecretError::Expired
-        | InspectSecretError::AlreadyClaimed
-        | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.to_string()),
-    }
-}
-
-const TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
+pub const TOKEN_EXPIRY_SECONDS: u64 = 24 * 60 * 60;
 
 async fn issue_user_session(
     state: &Arc<ServerState>,
@@ -374,14 +317,17 @@ async fn issue_user_session(
         auth_time,
         cutoff: None,
     };
-    let created = create_making_room(&state.get_ctx(), state.get_node_id(), config)
-        .await
-        .map_err(|err| match err {
-            CreateSessionError::LimitReached { .. } => {
-                ServerError::Conflict("active session limit reached".to_string())
-            }
-            error => ServerError::InternalError(error.to_string()),
-        })?;
+    let created = drive(
+        MakeRoomOperation::new(state.get_node_id(), config),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| match err {
+        CreateSessionError::LimitReached { .. } => {
+            ServerError::Conflict("active session limit reached".to_string())
+        }
+        error => ServerError::InternalError(error.into()),
+    })?;
     Ok(created.token.expose().to_string())
 }
 
@@ -396,7 +342,7 @@ pub(crate) async fn ensure_active(state: &ServerState, user_id: UserId) -> Serve
     match drive(ReadUserOperation::new(user_id), &state.get_ctx()).await {
         Ok(user) if user.is_deactivated() => Err(ServerError::Forbidden),
         Ok(_) | Err(ReadUserError::NotFound) => Ok(()),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -421,19 +367,19 @@ fn map_subject_error(error: SubjectCheckError) -> ServerError {
     match error {
         SubjectCheckError::Unauthorized => ServerError::Unauthorized,
         SubjectCheckError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 fn map_user_error(error: ReadUserError) -> ServerError {
     match error {
         ReadUserError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 fn map_realm_error(error: ReadAuthorizationError) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.into())
 }
 
 fn collect_realm_roles(
@@ -466,7 +412,7 @@ async fn collect_group_memberships(
 ) -> ServerResult<Vec<UserGroupResponse>> {
     let groups = drive(ListGroupOperation::new(), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut memberships = Vec::new();
     for Group { group_id, .. } in groups {
         let (group, auth_doc) = drive(
@@ -474,7 +420,7 @@ async fn collect_group_memberships(
             &state.get_ctx(),
         )
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
         let roles = collect_group_roles(auth_doc, user_id);
         if roles.is_empty() {
             continue;
@@ -634,7 +580,7 @@ async fn register_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
 
     claim_initial_admin(state, user.user_id).await;
     Ok(user)
@@ -765,7 +711,7 @@ async fn register_user(
                 ResolveOidcError::MatchPending => {
                     ServerError::Refused(StatusCode::CONFLICT, "account_match", err.to_string())
                 }
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.into()),
             })?
         }
     };
@@ -840,7 +786,8 @@ async fn get_token(
                 .map_or(SessionKind::Portal, |session| session.kind);
             // Renewal keeps the primary login time, so it never makes a login look fresh.
             let token = bearer_token(&headers).ok_or(ServerError::Unauthorized)?;
-            let claims = decode_bearer_token(state.as_ref(), token)
+            let claims = state
+                .decode_token(token)
                 .await
                 .map_err(|_| ServerError::Unauthorized)?;
             let restrictions = aruna_ctx.path_restrictions;
@@ -863,7 +810,7 @@ async fn get_token(
                     "account_missing",
                     "no account is registered for this sign-in".to_string(),
                 ),
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.into()),
             })?;
             (
                 user.user_id,
@@ -876,7 +823,7 @@ async fn get_token(
 
     ensure_active(&state, user_id).await?;
     let now = now_timestamp();
-    let expiry = aruna_operations::session::bound_session_expiry(
+    let expiry = aruna_operations::session::create::bound_session_expiry(
         now,
         query.expires_in_seconds,
         now.saturating_add(TOKEN_EXPIRY_SECONDS),
@@ -959,7 +906,6 @@ takes no user id.
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node holds no user document for the caller, which can happen while a registration made elsewhere is still replicating", body = ErrorResponse)
     ),
@@ -967,9 +913,8 @@ takes no user id.
 )]
 async fn get_user_info(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    TokenAuth(auth): TokenAuth,
 ) -> ServerResult<(StatusCode, Json<UserInfoResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     Ok((
         StatusCode::OK,
         Json(build_user_response(&state, auth).await?),
@@ -1059,7 +1004,6 @@ user document and takes no user id.
             })
         ),
         (status = 400, description = "The name is out of range, an attribute key or value is rejected, or the user would hold more than 128 attributes", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse),
         (status = 404, description = "This node holds no user document for the caller", body = ErrorResponse)
     ),
@@ -1067,14 +1011,10 @@ user document and takes no user id.
 )]
 async fn patch_user_info(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<PatchUserRequest>,
 ) -> ServerResult<(StatusCode, Json<UserInfoResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id || auth.path_restrictions.is_some() {
-        return Err(ServerError::Forbidden);
-    }
 
     drive(
         UpdateUserOperation::new(UpdateUserInput {
@@ -1113,7 +1053,7 @@ async fn patch_user_info(
         aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
 
     Ok((
@@ -1166,21 +1106,16 @@ request policies are evaluated as well and may deny a read the role grant alone 
             })
         ),
         (status = 400, description = "The `start_after` cursor is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the caller lacks READ on the realm's user administration path", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
-async fn list_users(
+pub async fn list_users(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<ListUsersQuery>,
 ) -> ServerResult<(StatusCode, Json<ListUsersResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
 
     let limit = query
         .limit
@@ -1212,7 +1147,7 @@ async fn list_users(
         aruna_operations::users::list_users::ListUsersError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
 
     Ok((
@@ -1238,22 +1173,25 @@ pub(crate) async fn authorize_directory(
         state.get_realm_id(),
         user_id.unwrap_or("**")
     );
-    aruna_operations::auth::request_policy::enforce_policies(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        &aruna_operations::auth::request_policy::policy_request_with(
-            &path,
-            &Permission::READ,
-            Some(auth),
-            aruna_operations::auth::request_policy::PolicyRequestExtras::rest(),
+    drive(
+        EnforcePolicyOperation::new(
+            state.get_realm_id(),
+            aruna_core::request_policy::policy_request_with(
+                &path,
+                &Permission::READ,
+                Some(auth),
+                aruna_core::request_policy::PolicyRequestExtras::rest(),
+            )
+            .clone(),
         ),
+        &state.get_ctx(),
     )
     .await
     .map_err(|error| match error {
-        aruna_operations::auth::request_policy::PolicyEnforcementError::Denied { .. } => {
+        aruna_operations::auth::error::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })
 }
 
@@ -1293,21 +1231,16 @@ pub(crate) async fn authorize_directory(
             })
         ),
         (status = 400, description = "The query is shorter than 2 characters after trimming, or the `start_after` cursor is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the token is path-restricted, or realm policy denies the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 async fn search_users(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<SearchUsersQuery>,
 ) -> ServerResult<(StatusCode, Json<SearchUsersResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
     let q = query.q.trim().to_string();
     if q.chars().count() < MIN_QUERY_CHARS {
         return Err(ServerError::BadRequest);
@@ -1332,7 +1265,7 @@ async fn search_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
 
     Ok((
         StatusCode::OK,
@@ -1397,21 +1330,16 @@ async fn search_users(
             ])
         ),
         (status = 400, description = "More than 100 user ids were sent, or an entry is not a user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or the token is path-restricted, or realm policy denies the read", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 async fn resolve_users(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ResolveUsersRequest>,
 ) -> ServerResult<(StatusCode, Json<Vec<ResolveUserResult>>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
     if request.user_ids.len() > MAX_USER_IDS {
         return Err(ServerError::BadRequest);
     }
@@ -1427,7 +1355,7 @@ async fn resolve_users(
         &state.get_ctx(),
     )
     .await
-    .map_err(|err| ServerError::InternalError(err.to_string()))?;
+    .map_err(|err| ServerError::InternalError(err.into()))?;
 
     Ok((
         StatusCode::OK,
@@ -1478,19 +1406,17 @@ complete document. Realm request policies may deny either read.
             })
         ),
         (status = 400, description = "Malformed user id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Path-restricted token without a matching grant, or realm policy denies the read", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id, and the caller is allowed to know that", body = ErrorResponse),
         (status = 501, description = "The token was issued by another trusted realm; forwarding the read to the owning realm is not implemented", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
-async fn get_user(
+pub async fn get_user(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    TokenAuth(auth): TokenAuth,
     Path(user_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
     if auth.realm_id != realm_id {
         // TODO: Forwarding for foreign realm users
@@ -1513,7 +1439,7 @@ async fn get_user(
             .await
             .map_err(|error| match error {
                 ReadUserError::NotFound => ServerError::NotFound,
-                other => ServerError::InternalError(other.to_string()),
+                other => ServerError::InternalError(other.into()),
             })?;
         let response = if auth.user_id == target {
             user.into()
@@ -1540,7 +1466,7 @@ async fn get_user(
     .map_err(|err| match err {
         aruna_operations::users::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
         aruna_operations::users::get_user::GetUserError::UserNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
 
     Ok((StatusCode::OK, Json(user.into())))
@@ -1596,23 +1522,18 @@ path and additionally passes the realm request policies.
             })
         ),
         (status = 400, description = "The id is not a user id, the name is out of range, or an attribute key or value is rejected", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, a path-restricted token attempted a self-update, or the caller lacks WRITE on that user's administration path", body = ErrorResponse),
         (status = 404, description = "This node holds no user with that id", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
-async fn update_user(
+pub async fn update_user(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(user_id): Path<String>,
     Json(request): Json<UpdateUserRequest>,
 ) -> ServerResult<(StatusCode, Json<GetUserResponse>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
-    if auth.realm_id != realm_id {
-        return Err(ServerError::Forbidden);
-    }
 
     // A non-self update is a privileged write; run the realm policy and RBAC
     // boundary at the route before the operation repeats it as defense in depth.
@@ -1664,7 +1585,7 @@ async fn update_user(
         aruna_operations::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
 
     Ok((StatusCode::OK, Json(user.into())))
@@ -1686,7 +1607,7 @@ fn enrollment_status(claimed: bool, expires_at: u64, now: u64) -> &'static str {
 /// an outstanding enrollment secret only shows what has not landed yet.
 async fn owned_devices(
     state: &Arc<ServerState>,
-    owner: aruna_core::UserId,
+    owner: aruna_core::user::id::UserId,
 ) -> ServerResult<Vec<UserDeviceResponse>> {
     let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
@@ -1695,7 +1616,7 @@ async fn owned_devices(
     .await
     .map_err(|err| match err {
         GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     let mut devices = config
         .nodes
@@ -1710,10 +1631,8 @@ async fn owned_devices(
         })
         .collect::<Vec<_>>();
 
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    let now = aruna_core::time::unix_timestamp_secs();
+    let secrets = secrets_where(state, |entry| entry.record.mode.owner() == Some(owner)).await?;
+    let now = aruna_clock::unix_timestamp_secs();
     for entry in secrets {
         if entry.record.mode.owner() != Some(owner) {
             continue;
@@ -1783,7 +1702,6 @@ devices and takes no user id, so it grants no view of anybody else's.
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
@@ -1791,9 +1709,8 @@ devices and takes no user id, so it grants no view of anybody else's.
 )]
 async fn list_user_devices(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<UserDevicesResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let devices = owned_devices(&state, auth.user_id).await?;
     Ok((StatusCode::OK, Json(UserDevicesResponse { devices })))
 }
@@ -1821,7 +1738,6 @@ can be revoked; a device owned by anybody else answers 404 rather than admitting
     params(("id" = String, Path, description = "Enrollment id or node id of the device, as reported by `GET /access/users/me/devices`")),
     responses(
         (status = 204, description = "Device enrollment revoked, or the device evicted from the realm"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "No device of the calling user carries this id, including one an earlier call already revoked", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
@@ -1831,10 +1747,9 @@ can be revoked; a device owned by anybody else answers 404 rather than admitting
 )]
 async fn revoke_user_device(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(device_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let device = owned_devices(&state, auth.user_id)
         .await?
         .into_iter()
@@ -1846,7 +1761,8 @@ async fn revoke_user_device(
         return Ok(StatusCode::NO_CONTENT);
     }
 
-    let node_id = aruna_core::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
+    let node_id =
+        aruna_core::id::NodeId::from_str(&device.id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::Owner).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1874,7 +1790,6 @@ too. A management node serves it, and every other node relays the call to one.
     params(("node_id" = String, Path, description = "Node id of the enrolled device to evict, as the realm configuration lists it")),
     responses(
         (status = 204, description = "Device evicted from the realm"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The caller lacks WRITE on the realm's onboarding administration path", body = ErrorResponse),
         (status = 404, description = "No enrolled device carries this node id, including one an earlier call already evicted", body = ErrorResponse),
         (status = 502, description = "A relayed call failed after the management node may already have applied it; code `relay_failed`", body = ErrorResponse),
@@ -1888,7 +1803,7 @@ async fn evict_device(
     Path(node_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     let auth = authorize_onboarding_admin(&state, auth).await?;
-    let node_id = aruna_core::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
+    let node_id = aruna_core::id::NodeId::from_str(&node_id).map_err(|_| ServerError::NotFound)?;
     evict_node(&state, &auth, node_id, DeviceEvictionScope::RealmAdmin).await?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1900,7 +1815,7 @@ async fn evict_device(
 async fn evict_node(
     state: &Arc<ServerState>,
     auth: &AuthContext,
-    node_id: aruna_core::NodeId,
+    node_id: aruna_core::id::NodeId,
     scope: DeviceEvictionScope,
 ) -> ServerResult<()> {
     if let Some(enrollment_id) = claimed_enrollment(state, &node_id.to_string()).await? {
@@ -1927,20 +1842,35 @@ async fn evict_node(
         RemoveNodeError::DeletionPending => {
             ServerError::Conflict("group deletion is pending; retry device removal".into())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(())
 }
 
 /// Enrollment whose secret this node claimed, so an eviction can retire it.
 async fn claimed_enrollment(state: &Arc<ServerState>, node_id: &str) -> ServerResult<Option<Ulid>> {
-    let secrets = drive(ListSecretsOperation::new(), &state.get_ctx())
-        .await
-        .map_err(|err| ServerError::InternalError(err.to_string()))?;
-    Ok(secrets
-        .into_iter()
-        .find(|entry| entry.state.claimed_node_id() == Some(node_id))
-        .map(|entry| entry.record.enrollment_id))
+    let claimed = secrets_where(state, |entry| {
+        entry.state.claimed_node_id() == Some(node_id)
+    });
+    Ok((claimed.await?.into_iter().next()).map(|entry| entry.record.enrollment_id))
+}
+
+/// The onboarding secrets `keep` selects, read a page at a time.
+async fn secrets_where(
+    state: &Arc<ServerState>,
+    keep: impl Fn(&OnboardingSecretEntry) -> bool,
+) -> ServerResult<Vec<OnboardingSecretEntry>> {
+    let (mut kept, mut after) = (Vec::new(), None);
+    loop {
+        let page = drive(ListSecretsOperation::new(after), &state.get_ctx())
+            .await
+            .map_err(|err| ServerError::InternalError(err.into()))?;
+        kept.extend(page.entries.into_iter().filter(&keep));
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(kept),
+        }
+    }
 }
 
 async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> ServerResult<()> {
@@ -1951,7 +1881,7 @@ async fn delete_enrollment(state: &Arc<ServerState>, enrollment_id: Ulid) -> Ser
     .await
     .map_err(|err| match err {
         DeleteSecretError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     })?;
     Ok(())
 }

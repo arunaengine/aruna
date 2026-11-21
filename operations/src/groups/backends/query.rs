@@ -2,17 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{RecordReadError, backend_key, index_prefix, parse_iter, parse_read};
-use crate::driver::DriverContext;
-use aruna_core::effects::{BlobEffect, Effect, IterStart, StorageEffect};
+use super::RecordReadError;
+use super::{backend_key, index_prefix};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::group_backend::GroupStorage;
-use aruna_core::types::{Effects, GroupId, Key};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 use ulid::Ulid;
 
@@ -24,14 +24,8 @@ pub enum GroupQueryError {
     Read(#[from] RecordReadError),
     #[error("query never completed")]
     Incomplete,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum QueryState {
-    Init,
-    Reading,
-    Finish,
-    Error,
+    #[error(transparent)]
+    Io(#[from] IoError),
 }
 
 /// Reads one backend record. The caller checks that the record's group matches
@@ -39,23 +33,11 @@ enum QueryState {
 #[derive(Debug, PartialEq)]
 pub struct GetBackendOperation {
     backend_id: Ulid,
-    state: QueryState,
-    output: Option<Result<Option<GroupStorage>, GroupQueryError>>,
 }
 
 impl GetBackendOperation {
     pub fn new(backend_id: Ulid) -> Self {
-        Self {
-            backend_id,
-            state: QueryState::Init,
-            output: None,
-        }
-    }
-
-    fn reject(&mut self) -> Effects {
-        self.state = QueryState::Error;
-        self.output = Some(Err(RecordReadError::Unexpected.into()));
-        smallvec![]
+        Self { backend_id }
     }
 }
 
@@ -63,45 +45,23 @@ impl Operation for GetBackendOperation {
     type Output = Option<GroupStorage>;
     type Error = GroupQueryError;
 
-    fn start(&mut self) -> Effects {
-        self.state = QueryState::Reading;
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: STORAGE_BACKEND_KEYSPACE.to_string(),
-            key: backend_key(self.backend_id),
-            txn_id: None,
-        })]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let row = (
+            STORAGE_BACKEND_KEYSPACE.to_string(),
+            backend_key(self.backend_id),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            QueryState::Init => self.start(),
-            QueryState::Reading => {
-                match parse_read(event, GroupStorage::from_bytes) {
-                    Ok(record) => {
-                        self.state = QueryState::Finish;
-                        self.output = Some(Ok(record));
-                    }
-                    Err(error) => {
-                        self.state = QueryState::Error;
-                        self.output = Some(Err(error.into()));
-                    }
-                }
-                smallvec![]
-            }
-            QueryState::Finish | QueryState::Error => self.reject(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, QueryState::Finish | QueryState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GroupQueryError::Incomplete))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Values(values) = result else {
+            return Err(RecordReadError::Unexpected.into());
+        };
+        let record = (values.into_iter().next().flatten())
+            .map(|value| GroupStorage::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(RecordReadError::Conversion)?;
+        Ok(Next::Done(record))
     }
 }
 
@@ -110,35 +70,24 @@ impl Operation for GetBackendOperation {
 #[derive(Debug, PartialEq)]
 pub struct ListBackendsOperation {
     group_id: GroupId,
-    state: QueryState,
     found: Vec<GroupStorage>,
-    output: Option<Result<Vec<GroupStorage>, GroupQueryError>>,
 }
 
 impl ListBackendsOperation {
     pub fn new(group_id: GroupId) -> Self {
         Self {
             group_id,
-            state: QueryState::Init,
             found: Vec::new(),
-            output: None,
         }
     }
 
-    fn iter_effect(&self, start_after: Option<Key>) -> Effect {
-        Effect::Storage(StorageEffect::Iter {
-            key_space: BACKEND_INDEX_KEYSPACE.to_string(),
-            prefix: Some(index_prefix(self.group_id)),
-            start: start_after.map(IterStart::After),
+    fn page(&self, after: Option<Key>) -> Next<Vec<GroupStorage>> {
+        Next::Call(IoCall::Page {
+            space: BACKEND_INDEX_KEYSPACE.to_string(),
+            prefix: index_prefix(self.group_id),
+            after,
             limit: LIST_PAGE_SIZE,
-            txn_id: None,
         })
-    }
-
-    fn reject(&mut self) -> Effects {
-        self.state = QueryState::Error;
-        self.output = Some(Err(RecordReadError::Unexpected.into()));
-        smallvec![]
     }
 }
 
@@ -146,89 +95,109 @@ impl Operation for ListBackendsOperation {
     type Output = Vec<GroupStorage>;
     type Error = GroupQueryError;
 
-    fn start(&mut self) -> Effects {
-        self.state = QueryState::Reading;
-        smallvec![self.iter_effect(None)]
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        Ok(self.page(None))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            QueryState::Init => self.start(),
-            QueryState::Reading => match parse_iter(event, GroupStorage::from_bytes) {
-                Ok((records, next_start_after)) => {
-                    self.found.extend(
-                        records
-                            .into_iter()
-                            .filter(|record| record.group_id == self.group_id),
-                    );
-                    if let Some(start_after) = next_start_after {
-                        return smallvec![self.iter_effect(Some(start_after))];
-                    }
-                    self.state = QueryState::Finish;
-                    self.output = Some(Ok(std::mem::take(&mut self.found)));
-                    smallvec![]
-                }
-                Err(error) => {
-                    self.state = QueryState::Error;
-                    self.output = Some(Err(error.into()));
-                    smallvec![]
-                }
-            },
-            QueryState::Finish | QueryState::Error => self.reject(),
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Page { rows, next } = result else {
+            return Err(RecordReadError::Unexpected.into());
+        };
+        for (_, value) in rows {
+            let record =
+                GroupStorage::from_bytes(value.as_ref()).map_err(RecordReadError::Conversion)?;
+            if record.group_id == self.group_id {
+                self.found.push(record);
+            }
         }
+        Ok(match next {
+            Some(after) => self.page(Some(after)),
+            None => Next::Done(std::mem::take(&mut self.found)),
+        })
     }
+}
 
-    fn is_complete(&self) -> bool {
-        matches!(self.state, QueryState::Finish | QueryState::Error)
-    }
+/// Why a bucket check has no answer: the storage's refusal, or a runner failure.
+#[derive(Debug, Error, PartialEq)]
+pub enum BucketCheckError {
+    #[error(transparent)]
+    Blob(BlobError),
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
 
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(GroupQueryError::Incomplete))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+impl BucketCheckError {
+    /// The message a caller shows for the failed check.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Blob(error) => error.reason(),
+            Self::Io(error) => error.to_string(),
+        }
     }
 }
 
 /// Whether `bucket` exists on the storage without a bucket `backend_id`, and for an existing
 /// bucket whether Aruna may write and delete there. Nothing is created.
-pub async fn check_bucket(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct BucketCheckOperation {
     backend_id: Ulid,
-    bucket: &str,
-) -> Result<(bool, Option<bool>), BlobError> {
-    let Some(blob_handle) = context.blob_handle.as_ref() else {
-        return Err(BlobError::UnknownBackend(
-            "blob handle unavailable".to_string(),
-        ));
-    };
-    let effect = BlobEffect::HeadBucket {
-        backend: BackendRef::Group(backend_id),
-        bucket: bucket.to_string(),
-    };
-    match blob_handle.send_blob_effect(effect).await {
-        Event::Blob(BlobEvent::BucketExists { exists, writable }) => Ok((exists, writable)),
-        Event::Blob(BlobEvent::Error(error)) => Err(error),
-        other => Err(BlobError::UnknownBackend(format!(
-            "unexpected bucket check answer: {other:?}"
-        ))),
+    bucket: String,
+}
+
+impl BucketCheckOperation {
+    pub fn new(backend_id: Ulid, bucket: &str) -> Self {
+        Self {
+            backend_id,
+            bucket: bucket.to_string(),
+        }
+    }
+}
+
+impl Operation for BucketCheckOperation {
+    type Output = (bool, Option<bool>);
+    type Error = BucketCheckError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
+        let head = Effect::Blob(BlobEffect::HeadBucket {
+            backend: BackendRef::Group(self.backend_id),
+            bucket: self.bucket.clone(),
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(head))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, Self::Error> {
+        let IoResult::Event(event) = result else {
+            return Err(BucketCheckError::Blob(BlobError::UnknownBackend(
+                "unexpected bucket check answer".to_string(),
+            )));
+        };
+        match *event {
+            Event::Blob(BlobEvent::BucketExists { exists, writable }) => {
+                Ok(Next::Done((exists, writable)))
+            }
+            // Kept from the direct handle call: a node without blob access says so this way.
+            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => {
+                let missing = BlobError::UnknownBackend("blob handle unavailable".to_string());
+                Err(BucketCheckError::Blob(missing))
+            }
+            Event::Blob(BlobEvent::Error(error)) => Err(BucketCheckError::Blob(error)),
+            other => Err(BucketCheckError::Blob(BlobError::UnknownBackend(format!(
+                "unexpected bucket check answer: {}",
+                other.label()
+            )))),
+        }
     }
 }
 
 #[cfg(test)]
 mod pure_tests {
     use super::super::RecordReadError;
-    use super::super::{index_key, index_prefix};
-    use super::{GetBackendOperation, GroupQueryError, ListBackendsOperation};
-    use aruna_core::effects::{Effect, StorageEffect};
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::BACKEND_INDEX_KEYSPACE;
-    use aruna_core::operation::Operation;
-    use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage};
+    use super::super::{backend_key, index_key, index_prefix};
+    use super::*;
+    use aruna_core::errors::StorageError;
+    use aruna_core::structs::storage::group_backend::GroupBackendKind;
     use std::collections::HashMap;
     use std::time::SystemTime;
-    use ulid::Ulid;
 
     fn record(group_id: Ulid) -> GroupStorage {
         GroupStorage {
@@ -239,87 +208,133 @@ mod pure_tests {
             public_config: HashMap::new(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: false,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }
     }
 
     #[test]
-    fn reads_absent_record() {
-        let mut operation = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
-        operation.start();
-
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"x".to_vec().into(),
-            value: None,
-        }));
-
-        assert_eq!(operation.finalize().unwrap(), None);
+    fn reads_one_record() {
+        // One read of the backend row; a missing row is none.
+        let backend_id = Ulid::from_bytes([9u8; 16]);
+        let stored = record(Ulid::from_bytes([1u8; 16]));
+        let mut operation = GetBackendOperation::new(backend_id);
+        let row = (
+            STORAGE_BACKEND_KEYSPACE.to_string(),
+            backend_key(backend_id),
+        );
+        assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+        let answer = IoResult::Values(vec![Some(stored.to_bytes().unwrap().into())]);
+        assert_eq!(operation.next(answer), Ok(Next::Done(Some(stored))));
+        let mut operation = GetBackendOperation::new(backend_id);
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(None))
+        );
     }
 
     #[test]
     fn scopes_by_group() {
-        // The index prefix is what keeps another tenant's records out.
+        // The index prefix keeps another tenant's records out, and a stray record is dropped.
         let group_id = Ulid::from_bytes([1u8; 16]);
         let mine = record(group_id);
+        let other = record(Ulid::from_bytes([2u8; 16]));
         let mut operation = ListBackendsOperation::new(group_id);
-        let effects = operation.start();
-
-        let [
-            Effect::Storage(StorageEffect::Iter {
-                key_space,
-                prefix: Some(prefix),
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected a prefixed scan, got {effects:?}")
-        };
-        assert_eq!(key_space, BACKEND_INDEX_KEYSPACE);
-        assert_eq!(prefix, &index_prefix(group_id));
-
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
-                index_key(group_id, mine.backend_id),
-                mine.to_bytes().unwrap().into(),
-            )],
-            next_start_after: None,
-        }));
-
-        assert_eq!(operation.finalize().unwrap(), vec![mine]);
-    }
-
-    // A state that expects no event must reject one instead of ignoring it.
-    #[test]
-    fn terminal_rejects_event() {
-        let stray = || {
-            Event::Storage(StorageEvent::ReadResult {
-                key: b"x".to_vec().into(),
-                value: None,
+        let page = |after| {
+            Next::Call(IoCall::Page {
+                space: BACKEND_INDEX_KEYSPACE.to_string(),
+                prefix: index_prefix(group_id),
+                after,
+                limit: LIST_PAGE_SIZE,
             })
         };
+        assert_eq!(operation.first(), Ok(page(None)));
+        let cursor = index_key(group_id, mine.backend_id);
+        let rows = vec![(cursor.clone(), mine.to_bytes().unwrap().into())];
+        let answer = operation.next(IoResult::Page {
+            rows,
+            next: Some(cursor.clone()),
+        });
+        assert_eq!(answer, Ok(page(Some(cursor))));
+        let rows = vec![(Key::from(vec![1u8]), other.to_bytes().unwrap().into())];
+        let answer = operation.next(IoResult::Page { rows, next: None });
+        assert_eq!(answer, Ok(Next::Done(vec![mine])));
+    }
 
-        let mut get = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
-        get.start();
-        get.step(stray());
-        get.step(stray());
+    #[test]
+    fn query_failures_end() {
+        // An undecodable row, an answer of the wrong kind or a runner failure ends the query.
+        let mut operation = GetBackendOperation::new(Ulid::from_bytes([9u8; 16]));
+        operation.first().unwrap();
+        let broken = IoResult::Values(vec![Some(vec![0xff; 3].into())]);
         assert!(matches!(
-            get.finalize(),
-            Err(GroupQueryError::Read(RecordReadError::Unexpected))
+            operation.next(broken),
+            Err(GroupQueryError::Read(RecordReadError::Conversion(_)))
         ));
+        let mut operation = ListBackendsOperation::new(Ulid::from_bytes([1u8; 16]));
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(IoResult::Done),
+            Err(GroupQueryError::Read(RecordReadError::Unexpected))
+        );
+        let error = GroupQueryError::from(IoError::Storage(StorageError::Timeout));
+        assert_eq!(
+            error,
+            GroupQueryError::Io(IoError::Storage(StorageError::Timeout))
+        );
+    }
 
-        let group_id = Ulid::from_bytes([1u8; 16]);
-        let mut list = ListBackendsOperation::new(group_id);
-        list.start();
-        list.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        list.step(stray());
-        assert!(matches!(
-            list.finalize(),
-            Err(GroupQueryError::Read(RecordReadError::Unexpected))
-        ));
+    fn bucket_check() -> BucketCheckOperation {
+        BucketCheckOperation::new(Ulid::from_bytes([9u8; 16]), "data")
+    }
+
+    #[test]
+    fn checks_one_bucket() {
+        // One head request on the group storage; its answer is the result.
+        let mut operation = bucket_check();
+        let head = Effect::Blob(BlobEffect::HeadBucket {
+            backend: BackendRef::Group(Ulid::from_bytes([9u8; 16])),
+            bucket: "data".to_string(),
+        });
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(Box::new(head))))
+        );
+        let answer = Event::Blob(BlobEvent::BucketExists {
+            exists: true,
+            writable: Some(false),
+        });
+        let answer = operation.next(IoResult::Event(Box::new(answer)));
+        assert_eq!(answer, Ok(Next::Done((true, Some(false)))));
+    }
+
+    #[test]
+    fn bucket_errors_returned() {
+        // A storage error is returned as is; a node without blob access names that.
+        let down = || BlobError::ConnectionFailed("down".to_string());
+        let mut operation = bucket_check();
+        operation.first().unwrap();
+        let error = Event::Blob(BlobEvent::Error(down()));
+        let answer = operation.next(IoResult::Event(Box::new(error)));
+        assert_eq!(answer, Err(BucketCheckError::Blob(down())));
+        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let mut operation = bucket_check();
+        operation.first().unwrap();
+        let unknown = BlobError::UnknownBackend("blob handle unavailable".to_string());
+        assert_eq!(
+            operation.next(IoResult::Event(Box::new(missing))),
+            Err(BucketCheckError::Blob(unknown))
+        );
+    }
+
+    #[test]
+    fn bucket_rejects_answers() {
+        // An answer that is not a blob event fails the check with a reason.
+        let mut operation = bucket_check();
+        operation.first().unwrap();
+        let error = operation.next(IoResult::Done).unwrap_err();
+        assert!(error.reason().contains("unexpected bucket check answer"));
     }
 }

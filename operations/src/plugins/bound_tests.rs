@@ -6,120 +6,25 @@
 use std::collections::BTreeMap;
 
 use aruna_core::compute::Secret;
-use aruna_core::document::DocumentTarget;
-use aruna_core::secrets::{Delivery, ResponseExposure, SecretConsumer, SecretFields};
-use ed25519_dalek::SigningKey;
+use aruna_core::secrets::Delivery;
+use aruna_core::secrets::ResponseExposure;
+use aruna_core::secrets::SecretFields;
 use serde_json::json;
 
 use super::*;
-use crate::driver::drive;
-use crate::plugins::install::tests::{Fixture, REALM_KEY};
-use crate::plugins::install::{pick_version, read_config, read_manifest};
+use crate::plugins::calls::*;
+use crate::plugins::install::{pick_version, read_manifest};
+use crate::plugins::secret_use::slot_kind;
 use crate::secrets::SecretChange;
 use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
-
-pub(crate) const TOKEN: &str = "canary-release-4f1e";
-pub(crate) const ORIGIN: &str = "https://api.example.org";
-
-pub(crate) fn keys() -> ReleaseKeys {
-    let key = SigningKey::from_bytes(&REALM_KEY);
-    ReleaseKeys {
-        seal: Some(Arc::new(RealmSealKey::derive(&key))),
-        vault: Some(Arc::new(RealmVaultKey::derive(&key))),
-    }
-}
-
-/// Writes the realm config as it is after `edit`.
-pub(crate) async fn edit_config(fixture: &Fixture, edit: impl FnOnce(&mut RealmConfigDocument)) {
-    let mut config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    edit(&mut config);
-    let target = DocumentTarget::RealmConfig {
-        realm_id: fixture.actor.realm_id,
-    };
-    let value = config.to_bytes(&fixture.actor).unwrap();
-    let key = target.storage_key().to_vec();
-    fixture
-        .write_row(target.storage_keyspace(), key, value)
-        .await;
-}
-
-/// An install moved to a version whose `catalog` connection injects the bearer slot `api_key`,
-/// with that slot bound to the group secret `api-key`.
-pub(crate) async fn bound(fixture: &Fixture) -> PluginInstall {
-    let slots = json!({
-        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
-        "connections": { "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } }
-    });
-    let installed = fixture.install(&fixture.request(None)).await.unwrap();
-    let digest = fixture.publish("0.2.0", "cd", slots).await;
-    let binding = SecretBinding::parse("group:api-key").unwrap();
-    edit_config(fixture, |config| {
-        let install = (config.installs.iter_mut())
-            .find(|install| install.install_id == installed.install_id)
-            .unwrap();
-        (install.digest, install.version) = (digest, "0.2.0".to_string());
-        install.secrets = BTreeMap::from([("api_key".to_string(), binding)]);
-    })
-    .await;
-    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    config.installs.into_iter().next().unwrap()
-}
-
-/// The `inject` rule of `install` toward the fixture origins with `response`.
-pub(crate) fn rule_for(install: &PluginInstall, response: ResponseExposure) -> UseRule {
-    UseRule {
-        consumer: SecretConsumer::Plugin {
-            plugin_id: install.plugin.clone(),
-            install_id: install.install_id,
-        },
-        delivery: Delivery::Inject,
-        origins: vec![ORIGIN.to_string()],
-        paths: Vec::new(),
-        methods: Vec::new(),
-        response,
-        groups: Vec::new(),
-    }
-}
-
-/// The group secret `api-key` with one `inject` rule for `install` toward `ORIGIN`.
-pub(crate) async fn secret(fixture: &Fixture, install: &PluginInstall) {
-    secret_with(fixture, install, ResponseExposure::Status).await;
-}
-
-/// The group secret `api-key` whose one rule for `install` exposes `response`.
-pub(crate) async fn secret_with(
-    fixture: &Fixture,
-    install: &PluginInstall,
-    response: ResponseExposure,
-) {
-    let rule = rule_for(install, response);
-    let change = SecretChange::Create {
-        name: SecretName::try_from("api-key".to_string()).unwrap(),
-        kind: SecretKind::parse("bearer").unwrap(),
-        description: String::new(),
-        settings: SecretSettings::new(),
-        uses: vec![rule],
-        fields: SecretFields::new([("token".to_string(), Secret::new(TOKEN))].into()),
-    };
-    let input = OwnerChange {
-        realm_id: fixture.actor.realm_id,
-        node_id: fixture.actor.node_id,
-        owner: SecretOwner::Group(install.group_id),
-        actor: fixture.actor.user_id,
-        change,
-        readable: false,
-        now_ms: 1,
-        write_ids: [1, 2, 3].map(|part| Ulid::from_parts(77, part)),
-        txn_id: None,
-    };
-    drive(OwnerSecretOperation::new(input), &fixture.ctx)
-        .await
-        .unwrap();
-}
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::plugins::{Refusal, ReleaseError};
+use aruna_core::secrets::UseRule;
+use aruna_drivers::driver::drive;
+use aruna_test_support::plugins::Fixture;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::{TOKEN, bound, hold_keys, rule_for, secret};
+use ulid::Ulid;
 
 #[tokio::test]
 async fn selects_group_secret() {
@@ -148,12 +53,12 @@ async fn selects_group_secret() {
         (selected.rules.len(), selected.incarnation.is_some()),
         (1, true)
     );
-    let opened = open(&fixture.ctx, &keys(), config.realm_id, &selected.sealed).await;
+    let missing = open(&fixture.ctx, config.realm_id, &selected.sealed).await;
+    assert!(matches!(missing, Err(ReleaseError::Unavailable(_))));
+    hold_keys(&fixture.ctx);
+    let opened = open(&fixture.ctx, config.realm_id, &selected.sealed).await;
     let fields = SecretFields::decode(&opened.unwrap());
     assert_eq!(fields.unwrap().get("token"), Some(TOKEN));
-    let none = ReleaseKeys::default();
-    let missing = open(&fixture.ctx, &none, config.realm_id, &selected.sealed).await;
-    assert!(matches!(missing, Err(ReleaseError::Unavailable(_))));
     let realm = SecretBinding::parse("realm:api-key").unwrap();
     assert!(
         select(&fixture.ctx, &config, &install, &realm)
@@ -174,7 +79,7 @@ async fn node_binding_checks() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let name = SecretName::try_from("api-key".to_string()).unwrap();
     let bearer = SecretKind::parse("bearer").unwrap();
     let local = fixture.actor.node_id;
@@ -212,13 +117,11 @@ async fn node_binding_checks() {
     let remote = check_node_binding(&fixture.ctx, (local, receiver), &name, &bearer).await;
     assert_eq!(remote, Err(NodeCheckError::Unavailable));
     // Only a management node may ask a receiver.
-    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap();
-    let served = node_check_for(&fixture.ctx, (&config, receiver), &name, &bearer).await;
-    assert_eq!(served, Err(NodeCheckError::Forbidden));
-    let asked = node_check_for(&fixture.ctx, (&config, local), &name, &bearer).await;
-    assert_eq!(asked, Ok(None));
+    let place = (fixture.actor.realm_id, local);
+    let check = |peer| ServeNodeCheck::new(place, peer, name.clone(), bearer.clone());
+    let served = drive(check(receiver), &fixture.ctx).await;
+    assert_eq!(served, Err(NodeCheckFailure(NodeCheckError::Forbidden)));
+    assert_eq!(drive(check(local), &fixture.ctx).await, Ok(None));
 }
 
 #[tokio::test]
@@ -262,7 +165,7 @@ async fn slots_bind() {
     fixture
         .ctx
         .storage_handle
-        .open_vault(aruna_core::node_vault::NodeVaultKey::random());
+        .open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let input = crate::secrets::node::NodeChange {
         realm_id: fixture.actor.realm_id,
         node_id: fixture.actor.node_id,
@@ -338,7 +241,6 @@ pub(crate) async fn hook_secret(
         readable: false,
         now_ms: 1 + round,
         write_ids: [1, 2, 3].map(|part| Ulid::from_parts(88 + round, part)),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await
@@ -376,4 +278,136 @@ async fn delivery_clashes() {
     let selected = selected.unwrap().unwrap();
     assert!(delivery_clash(&manifest, "hook_key", &selected.settings));
     assert!(!delivery_clash(&manifest, "api_key", &selected.settings));
+}
+
+mod operations {
+    use aruna_core::plugins::NodeCheckError;
+
+    use super::*;
+    use crate::document_repository::GetConfigError;
+    use crate::plugins::entry::EntryError;
+    use crate::plugins::fixtures::{
+        self, config_result, is_child, is_effect, node, peer_says, peer_silent,
+    };
+    use crate::plugins::rows::tests::{child_result, values_result};
+    use aruna_core::metadata::protocol::MetadataTransportMessage;
+
+    fn key() -> (SecretName, SecretKind) {
+        let name = SecretName::try_from("key".to_string()).unwrap();
+        (name, SecretKind::parse("bearer").unwrap())
+    }
+
+    fn checked(result: Result<Option<String>, NodeCheckFailure>) -> IoResult {
+        child_result(result)
+    }
+
+    fn slots(requested: &[(&str, &str)], receiver: Option<NodeId>) -> BindSlots {
+        let extra = json!({
+            "secrets": { "hook_key": { "title": "Hook key", "kind": "bearer" } }
+        });
+        let plugin = fixtures::plugin(extra);
+        let manifest = read_manifest(&plugin).unwrap();
+        let install = fixtures::install();
+        let place = BindPlace {
+            group_id: install.group_id,
+            local: Some(node(3)),
+            receiver,
+        };
+        let requested = (requested.iter())
+            .map(|(slot, text)| (slot.to_string(), text.to_string()))
+            .collect();
+        let config = Arc::new(fixtures::config(&install, json!({})));
+        BindSlots::new(config, place, &manifest, &requested)
+    }
+
+    #[test]
+    fn slots_refuse_unknown() {
+        let mut bind = slots(&[("other", "group:key")], None);
+        assert!(matches!(bind.first(), Err(BindError::Invalid(_))));
+        let mut bind = slots(&[("hook_key", "node:key")], None);
+        assert!(matches!(bind.first(), Err(BindError::Unavailable(_))));
+    }
+
+    #[test]
+    fn slots_read_group() {
+        let mut bind = slots(&[], None);
+        assert!(is_child(&bind.first()));
+        let none = child_result(Ok::<Option<SecretEntry>, EntryError>(None));
+        assert!(matches!(bind.next(none), Err(BindError::Invalid(_))));
+    }
+
+    #[test]
+    fn slots_check_node() {
+        let requested = [("hook_key", "node:key")];
+        let mut bind = slots(&requested, Some(node(1)));
+        assert!(is_child(&bind.first()));
+        let Ok(Next::Done((bound, warnings))) = bind.next(checked(Ok(None))) else {
+            panic!("a checked node secret binds the slot");
+        };
+        assert!(bound.contains_key("hook_key"));
+        assert_eq!(warnings.len(), 1);
+        let mut silent = slots(&requested, Some(node(1)));
+        silent.first().unwrap();
+        let failed = NodeCheckFailure(NodeCheckError::Unavailable);
+        let answer = silent.next(checked(Err(failed)));
+        assert!(matches!(answer, Err(BindError::Unavailable(_))));
+        let mut missing = slots(&requested, Some(node(1)));
+        missing.first().unwrap();
+        let failed = NodeCheckFailure(NodeCheckError::Missing);
+        assert!(matches!(
+            missing.next(checked(Err(failed))),
+            Err(BindError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn node_secret_missing() {
+        let (name, kind) = key();
+        let mut fits = NodeSecretFits::new(&name, &kind);
+        assert!(matches!(fits.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let missing = NodeCheckFailure(NodeCheckError::Missing);
+        assert_eq!(fits.next(values_result(vec![None])), Err(missing));
+    }
+
+    #[test]
+    fn binding_asks_receiver() {
+        let (name, kind) = key();
+        let mut here = CheckNodeBinding::new((node(3), node(3)), &name, &kind);
+        assert!(is_child(&here.first()));
+        let header = Some("x-key".to_string());
+        let answer = here.next(checked(Ok(header.clone())));
+        assert_eq!(answer, Ok(Next::Done(header.clone())));
+        let mut there = CheckNodeBinding::new((node(3), node(1)), &name, &kind);
+        assert!(is_effect(&there.first()));
+        let result = Ok(header.clone());
+        let said = peer_says(
+            node(1),
+            &MetadataTransportMessage::NodeSecretChecked { result },
+        );
+        assert_eq!(there.next(said), Ok(Next::Done(header)));
+        let silent = NodeCheckFailure(NodeCheckError::Unavailable);
+        assert_eq!(there.next(peer_silent(node(1))), Err(silent));
+    }
+
+    #[test]
+    fn serve_refuses_devices() {
+        let (name, kind) = key();
+        let place = (fixtures::realm(), node(1));
+        let mut device = ServeNodeCheck::new(place, node(4), name.clone(), kind.clone());
+        assert!(is_child(&device.first()));
+        let refused = NodeCheckFailure(NodeCheckError::Forbidden);
+        let answer = device.next(config_result(fixtures::realm_nodes()));
+        assert_eq!(answer, Err(refused));
+        let mut server = ServeNodeCheck::new(place, node(3), name, kind);
+        server.first().unwrap();
+        assert!(is_child(
+            &server.next(config_result(fixtures::realm_nodes()))
+        ));
+        assert_eq!(server.next(checked(Ok(None))), Ok(Next::Done(None)));
+        let mut lost = ServeNodeCheck::new(place, node(3), key().0, key().1);
+        lost.first().unwrap();
+        let failed = child_result(Err::<RealmConfigDocument, _>(GetConfigError::NotFinished));
+        let unavailable = NodeCheckFailure(NodeCheckError::Unavailable);
+        assert_eq!(lost.next(failed), Err(unavailable));
+    }
 }

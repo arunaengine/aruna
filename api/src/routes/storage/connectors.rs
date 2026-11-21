@@ -6,15 +6,17 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::auth::{parse_group_id, require_realm_auth, require_unrestricted_auth};
+use crate::auth::parse_group_id;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::staging::map_resolution_error;
 use crate::server::state::ServerState;
-use aruna_core::errors::SourceResolutionError;
 use aruna_core::structs::execution::source_access::{
     ListCursor, ListRequest, ResolvedSourceAccess, SourceEntryKind,
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_drivers::driver::drive;
 use aruna_operations::connectors::create_connector::{
     SourceConnectorError, SourceConnectorInput, SourceConnectorOperation,
 };
@@ -30,24 +32,23 @@ use aruna_operations::connectors::list_connectors::{
 use aruna_operations::connectors::replace_connector::{
     ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
 };
-use aruna_operations::connectors::resolver::{resolve_inline_access, validate_source_path};
+use aruna_operations::connectors::resolver::{
+    ResolveConnectorInput, ResolveConnectorOperation, resolve_inline_access, validate_source_path,
+};
 use aruna_operations::connectors::secret_config::{HasConfigError, HasConfigOperation};
 use aruna_operations::connectors::validation::validate_connector_input;
-use aruna_operations::connectors::{ResolveConnectorInput, ResolveConnectorOperation};
-use aruna_operations::driver::drive;
 use aruna_operations::staging::check_source::CheckSourceOperation;
 use aruna_operations::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
 };
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::time::timeout;
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -55,14 +56,8 @@ const CONNECTOR_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_ENTRY_LIMIT: usize = 200;
 const MAX_ENTRY_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "data/connectors", description = "External source connector registration"))
-)]
-pub struct ConnectorsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ConnectorsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(check_source_connector))
         .routes(routes!(create_source_connector, list_source_connectors))
         .routes(routes!(
@@ -347,7 +342,6 @@ pub struct ListSourceResponse {
             description = "The group id is not a ULID, or the name, kind or configuration failed validation; the body names no reason",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -359,11 +353,10 @@ pub struct ListSourceResponse {
 )]
 pub async fn create_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateConnectorRequest>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let chosen_id = request.connector_id.as_deref().map(parse_connector_id);
     let chosen_id = chosen_id.transpose()?;
@@ -435,7 +428,6 @@ pub async fn create_source_connector(
             })
         ),
         (status = 400, description = "The group id is not a ULID", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -446,10 +438,9 @@ pub async fn create_source_connector(
 )]
 pub async fn list_source_connectors(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ListSourceResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
 
@@ -515,7 +506,6 @@ pub async fn list_source_connectors(
             description = "The group id or the connector id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -531,10 +521,9 @@ pub async fn list_source_connectors(
 )]
 pub async fn get_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
@@ -626,7 +615,6 @@ pub async fn get_source_connector(
             description = "An id is not a ULID, or the new name, kind or configuration failed validation; the body names no reason",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -652,11 +640,10 @@ pub async fn get_source_connector(
 )]
 pub async fn replace_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Json(request): Json<ReplaceConnectorRequest>,
 ) -> ServerResult<(StatusCode, Json<SourceConnectorResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
@@ -673,6 +660,7 @@ pub async fn replace_source_connector(
         &state.get_ctx(),
     )
     .await
+    .and_then(|result| result.ok_or(ReplaceSourceError::ReferencesPending))
     .map_err(map_replace_error)?;
 
     Ok((
@@ -713,7 +701,6 @@ pub async fn replace_source_connector(
             description = "The group id or the connector id is not a ULID",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -739,10 +726,9 @@ pub async fn replace_source_connector(
 )]
 pub async fn delete_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
@@ -755,6 +741,7 @@ pub async fn delete_source_connector(
         &state.get_ctx(),
     )
     .await
+    .and_then(|result| result.ok_or(DeleteSourceError::ReferencesPending))
     .map_err(map_delete_error)?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -832,7 +819,6 @@ because the body carries credentials the node then opens a connection with.
             description = "The group id is not a ULID, or the candidate configuration failed validation; the message names the offending field",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no WRITE on the group's data path, including when the group does not exist",
@@ -843,11 +829,10 @@ because the body carries credentials the node then opens a connection with.
 )]
 pub async fn check_source_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(group_id): Path<String>,
     Json(request): Json<SourceConnectorRequest>,
 ) -> ServerResult<Json<ConnectorCheckResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::WRITE).await?;
 
@@ -917,7 +902,6 @@ mean the stored record must be replaced."#,
             description = "An id is not a ULID, or the stored record names a kind that cannot be probed at all",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -933,10 +917,9 @@ mean the stored record must be replaced."#,
 )]
 pub async fn check_stored_connector(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
 ) -> ServerResult<Json<ConnectorCheckResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
@@ -1030,7 +1013,6 @@ path.
             description = "An id is not a ULID, the path escapes the connector root, the limit is zero, or the cursor is invalid or past what the source can continue",
             body = ErrorResponse
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token is path-restricted or from another realm, or no READ on the group's data path, including when the group does not exist",
@@ -1051,11 +1033,10 @@ path.
 )]
 pub async fn list_connector_entries(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, connector_id)): Path<(String, String)>,
     Query(query): Query<ConnectorEntriesQuery>,
 ) -> ServerResult<Json<ConnectorEntriesResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let group_id = parse_group_id(&group_id)?;
     let connector_id = parse_connector_id(&connector_id)?;
     ensure_data_permission(&state, &auth, group_id, Permission::READ).await?;
@@ -1109,30 +1090,26 @@ pub async fn list_connector_entries(
     }))
 }
 
-/// Cursors are opaque to clients: a tagged key or offset in URL-safe base64.
+/// Cursors are opaque to clients: a tagged key or walked path in URL-safe base64.
 fn encode_cursor(cursor: &ListCursor) -> String {
     let raw = match cursor {
         ListCursor::After(key) => format!("k{key}"),
         ListCursor::At(key) => format!("a{key}"),
-        ListCursor::Offset(offset) => format!("o{offset}"),
+        ListCursor::Walk(path) => format!("w{path}"),
     };
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    aruna_core::cursor::encode(raw)
 }
 
 fn decode_cursor(cursor: &str) -> ServerResult<ListCursor> {
     let invalid = || ServerError::BadRequestReason("cursor is invalid".to_string());
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(cursor)
+    let raw = aruna_core::cursor::decode(cursor)
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
         .ok_or_else(invalid)?;
     match raw.split_at_checked(1) {
         Some(("k", key)) if !key.is_empty() => Ok(ListCursor::After(key.to_string())),
         Some(("a", key)) if !key.is_empty() => Ok(ListCursor::At(key.to_string())),
-        Some(("o", offset)) => offset
-            .parse()
-            .map(ListCursor::Offset)
-            .map_err(|_| invalid()),
+        Some(("w", path)) if !path.is_empty() => Ok(ListCursor::Walk(path.to_string())),
         _ => Err(invalid()),
     }
 }
@@ -1221,7 +1198,7 @@ async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> Server
 }
 
 fn map_secret_error(error: HasConfigError) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.into())
 }
 
 fn map_connector_response(
@@ -1249,12 +1226,12 @@ fn map_create_error(error: SourceConnectorError) -> ServerError {
     match error {
         SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
         SourceConnectorError::IdTaken => ServerError::Conflict(error.to_string()),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
 fn map_connector_list(error: ListSourceError) -> ServerError {
-    ServerError::InternalError(error.to_string())
+    ServerError::InternalError(error.into())
 }
 
 fn map_get_error(
@@ -1262,9 +1239,9 @@ fn map_get_error(
 ) -> ServerError {
     match error {
         GetSourceError::NotFound => ServerError::NotFound,
-        GetSourceError::StorageError(_)
-        | GetSourceError::ConversionError(_)
-        | GetSourceError::GetConnectorFailed => ServerError::InternalError(error.to_string()),
+        GetSourceError::StorageError(_) | GetSourceError::ConversionError(_) => {
+            ServerError::InternalError(error.into())
+        }
     }
 }
 
@@ -1276,7 +1253,7 @@ fn map_replace_error(error: ReplaceSourceError) -> ServerError {
         ReplaceSourceError::ReferencesPending => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1287,16 +1264,7 @@ fn map_delete_error(error: DeleteSourceError) -> ServerError {
         DeleteSourceError::ReferencesPending => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        _ => ServerError::InternalError(error.to_string()),
-    }
-}
-
-fn map_resolution_error(error: SourceResolutionError) -> ServerError {
-    match error {
-        SourceResolutionError::NotFound => ServerError::NotFound,
-        SourceResolutionError::InvalidSourcePath
-        | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 
@@ -1310,7 +1278,7 @@ fn map_list_error(error: ListStagingError) -> ServerError {
             reason,
         )) => ServerError::BadRequestReason(reason),
         ListStagingError::Staging(error) => ServerError::BadGatewayReason(error.to_string()),
-        _ => ServerError::InternalError(error.to_string()),
+        _ => ServerError::InternalError(error.into()),
     }
 }
 

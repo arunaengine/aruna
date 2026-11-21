@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{Opening, read_within, working_set};
+use super::{Opening, StoredArchive, read_within, working_set};
 use crate::blob::BlobHandler;
 use crate::blob::backend::build_backend_path;
 use crate::blob::frames::read_range;
@@ -20,7 +20,6 @@ use opendal::Operator;
 use pithos_lib::archive::{AccessKeys, AsyncArchive, GrantReplacement, OpenOptions};
 use pithos_lib::crypto::{PrivateKey, PublicKey};
 use pithos_lib::error::PithosError;
-use pithos_lib::source::{AsyncArchiveSource, SourceError};
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll};
@@ -43,36 +42,6 @@ impl<S: Stream> Stream for Exclusive<S> {
             Ok(stream) => stream.as_mut().poll_next(context),
             Err(_) => Poll::Ready(None),
         }
-    }
-}
-
-/// The stored bytes of one archive, served to the Pithos reader by range.
-pub(super) struct StoredBytes {
-    pub(super) operator: Operator,
-    pub(super) path: String,
-    pub(super) idle: Duration,
-}
-
-impl AsyncArchiveSource for StoredBytes {
-    async fn len(&self) -> Result<u64, SourceError> {
-        let metadata = self.operator.stat(&self.path).await;
-        metadata
-            .map(|metadata| metadata.content_length())
-            .map_err(|error| SourceError::Remote {
-                offset: 0,
-                message: error.to_string(),
-            })
-    }
-
-    async fn read_at(&self, offset: u64, len: u64) -> Result<Vec<u8>, SourceError> {
-        let end = offset.saturating_add(len);
-        let bytes = read_range(&self.operator, &self.path, offset..end, self.idle).await;
-        bytes
-            .map(|bytes| bytes.to_vec())
-            .map_err(|error| SourceError::Remote {
-                offset,
-                message: error.to_string(),
-            })
     }
 }
 
@@ -217,7 +186,7 @@ impl BlobHandler {
         let operator = self.operator_from_location(source)?;
         let path = self.object_path(source)?;
         let idle = self.transfer_idle_timeout();
-        let stored = StoredBytes {
+        let stored = StoredArchive {
             operator: operator.clone(),
             path: path.clone(),
             idle,

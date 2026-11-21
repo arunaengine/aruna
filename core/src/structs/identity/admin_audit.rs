@@ -6,12 +6,12 @@ use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use crate::plugin_installs::PluginInstall;
 use crate::secrets::{Delivery, SecretName, SecretScope};
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 const REALM_SCOPE: u8 = b'r';
 const GROUP_SCOPE: u8 = b'g';
@@ -96,9 +96,10 @@ pub struct AdminAuditRecord {
 }
 
 impl AdminAuditRecord {
-    pub fn new(action: AdminAuditAction, actor: UserId, target: UserId) -> Self {
+    /// A record under `audit_id`, which orders the audit rows by time.
+    pub fn new(audit_id: Ulid, action: AdminAuditAction, actor: UserId, target: UserId) -> Self {
         Self {
-            audit_id: Ulid::generate(),
+            audit_id,
             action,
             actor,
             target,
@@ -111,7 +112,12 @@ impl AdminAuditRecord {
     }
 
     /// A row about a plugin install: the target is its account, the group its owner.
-    pub fn for_install(action: AdminAuditAction, actor: UserId, install: &PluginInstall) -> Self {
+    pub fn for_install(
+        audit_id: Ulid,
+        action: AdminAuditAction,
+        actor: UserId,
+        install: &PluginInstall,
+    ) -> Self {
         Self {
             group_id: Some(install.group_id),
             plugin: Some(PluginAudit {
@@ -119,12 +125,17 @@ impl AdminAuditRecord {
                 version: install.version.clone(),
                 install_id: install.install_id,
             }),
-            ..Self::new(action, actor, install.account)
+            ..Self::new(audit_id, action, actor, install.account)
         }
     }
 
     /// A row about one use of a secret by an install, which acts as its account.
-    pub fn for_use(install: &PluginInstall, secret: SecretAudit, used: SecretUse) -> Self {
+    pub fn for_use(
+        audit_id: Ulid,
+        install: &PluginInstall,
+        secret: SecretAudit,
+        used: SecretUse,
+    ) -> Self {
         let action = match used.refused {
             Some(_) => AdminAuditAction::SecretRefused,
             None => AdminAuditAction::SecretReleased,
@@ -132,12 +143,17 @@ impl AdminAuditRecord {
         Self {
             secret: Some(secret),
             secret_use: Some(used),
-            ..Self::for_install(action, install.account, install)
+            ..Self::for_install(audit_id, action, install.account, install)
         }
     }
 
     /// A row about a secret: the owner is the target of a user secret, else the actor.
-    pub fn for_secret(action: AdminAuditAction, actor: UserId, secret: SecretAudit) -> Self {
+    pub fn for_secret(
+        audit_id: Ulid,
+        action: AdminAuditAction,
+        actor: UserId,
+        secret: SecretAudit,
+    ) -> Self {
         let (target, group_id) = match secret.scope {
             SecretScope::User(owner) => (owner, None),
             SecretScope::Group(group_id) => (actor, Some(group_id)),
@@ -147,7 +163,7 @@ impl AdminAuditRecord {
             target,
             group_id,
             secret: Some(secret),
-            ..Self::new(action, actor, target)
+            ..Self::new(audit_id, action, actor, target)
         }
     }
 
@@ -208,8 +224,12 @@ mod tests {
     fn group_rows_indexed() {
         let realm = RealmId::from_bytes([1; 32]);
         let actor = UserId::local(Ulid::from_parts(1, 1), realm);
-        let mut record =
-            AdminAuditRecord::new(AdminAuditAction::ServiceAccountCreated, actor, actor);
+        let mut record = AdminAuditRecord::new(
+            Ulid::from_parts(1, 2),
+            AdminAuditAction::ServiceAccountCreated,
+            actor,
+            actor,
+        );
         assert_eq!(record.entries().unwrap().len(), 1);
         let group = Ulid::from_parts(2, 2);
         record.group_id = Some(group);
@@ -238,6 +258,7 @@ mod tests {
             write_id: None,
         };
         let record = AdminAuditRecord::for_secret(
+            Ulid::from_parts(1, 3),
             AdminAuditAction::SecretRead,
             owner,
             secret(SecretScope::User(owner)),
@@ -255,8 +276,12 @@ mod tests {
         assert!(!entries[1].1.starts_with(audit_prefix(group)));
         let admin = UserId::local(Ulid::from_parts(2, 2), realm);
         let scope = SecretScope::Group(Ulid::from_parts(3, 3));
-        let grouped =
-            AdminAuditRecord::for_secret(AdminAuditAction::SecretCreated, admin, secret(scope));
+        let grouped = AdminAuditRecord::for_secret(
+            Ulid::from_parts(1, 3),
+            AdminAuditAction::SecretCreated,
+            admin,
+            secret(scope),
+        );
         assert_eq!(
             (grouped.target, grouped.group_id),
             (admin, Some(Ulid::from_parts(3, 3)))
@@ -279,7 +304,8 @@ mod tests {
             run_id: Some(Ulid::from_parts(6, 6)),
             refused: refused.map(str::to_string),
         };
-        let released = AdminAuditRecord::for_use(&install, secret.clone(), used(None));
+        let released =
+            AdminAuditRecord::for_use(Ulid::from_parts(1, 3), &install, secret.clone(), used(None));
         assert_eq!(released.action, AdminAuditAction::SecretReleased);
         assert_eq!(
             (released.actor, released.target),
@@ -291,7 +317,8 @@ mod tests {
             AdminAuditRecord::from_bytes(&entries[1].2).unwrap(),
             released
         );
-        let refused = AdminAuditRecord::for_use(&install, secret, used(Some("rule")));
+        let refused =
+            AdminAuditRecord::for_use(Ulid::from_parts(1, 3), &install, secret, used(Some("rule")));
         assert_eq!(refused.action, AdminAuditAction::SecretRefused);
     }
 }

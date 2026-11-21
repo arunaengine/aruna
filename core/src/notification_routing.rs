@@ -1,0 +1,817 @@
+//! Picks the recipients of a resource event or a watch event notification.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::id_mint::IdMint;
+use crate::structs::execution::notification::{
+    NotificationClass, NotificationKind, NotificationRecord, ResourceEvent,
+};
+use crate::structs::execution::notification_watch::{
+    WatchEvent, WatchSubscription, watch_notification_id, watch_path_matches,
+};
+use crate::structs::identity::group::GroupAuthorizationDocument;
+use crate::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
+use crate::user::id::UserId;
+
+pub fn group_admin_ids(auth_doc: &GroupAuthorizationDocument) -> Vec<UserId> {
+    let mut ids: Vec<UserId> = auth_doc
+        .roles
+        .values()
+        .filter(|role| role.name == "admin")
+        .flat_map(|role| role.assigned_users.iter().copied())
+        .filter(|id| !id.is_nil())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+pub fn realm_admin_ids(auth_doc: &RealmAuthorizationDocument) -> Vec<UserId> {
+    let mut ids: Vec<UserId> = auth_doc
+        .roles
+        .values()
+        .filter(|role| role.name == "realm_admin")
+        .flat_map(|role| role.assigned_users.iter().copied())
+        .filter(|id| !id.is_nil())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+pub struct RoutingContext<'a> {
+    pub group_auth: Option<&'a GroupAuthorizationDocument>,
+    pub realm_auth: Option<&'a RealmAuthorizationDocument>,
+    /// The serving realm; users of other realms have no inbox here and get no record.
+    pub realm_id: RealmId,
+}
+
+pub fn route_resource_event(
+    event: &ResourceEvent,
+    ctx: RoutingContext<'_>,
+    now_ms: u64,
+    ids: &mut IdMint,
+) -> Vec<NotificationRecord> {
+    let realm_id = ctx.realm_id;
+    let mut records = Vec::new();
+    match event {
+        ResourceEvent::GroupJoinRequested {
+            group_id,
+            request_id,
+            actor_user_id,
+        } => {
+            if let Some(group_auth) = ctx.group_auth {
+                for admin in group_admin_ids(group_auth) {
+                    if admin == *actor_user_id || admin.is_nil() {
+                        continue;
+                    }
+                    records.push(NotificationRecord::new(
+                        ids.mint(now_ms),
+                        admin,
+                        NotificationClass::Direct,
+                        NotificationKind::GroupJoinRequested {
+                            group_id: *group_id,
+                            request_id: *request_id,
+                            actor_user_id: *actor_user_id,
+                        },
+                        now_ms,
+                    ));
+                }
+            }
+        }
+        ResourceEvent::GroupMemberAdded {
+            group_id,
+            affected_user,
+            actor_user_id,
+        } => {
+            if affected_user != actor_user_id {
+                records.push(NotificationRecord::new(
+                    ids.mint(now_ms),
+                    *affected_user,
+                    NotificationClass::Direct,
+                    NotificationKind::AddedToGroup {
+                        group_id: *group_id,
+                        actor_user_id: *actor_user_id,
+                    },
+                    now_ms,
+                ));
+            }
+            if let Some(group_auth) = ctx.group_auth {
+                for admin in group_admin_ids(group_auth) {
+                    if admin == *affected_user || admin == *actor_user_id {
+                        continue;
+                    }
+                    records.push(NotificationRecord::new(
+                        ids.mint(now_ms),
+                        admin,
+                        NotificationClass::Direct,
+                        NotificationKind::GroupMemberAdded {
+                            group_id: *group_id,
+                            member_user_id: *affected_user,
+                            actor_user_id: *actor_user_id,
+                        },
+                        now_ms,
+                    ));
+                }
+            }
+        }
+        ResourceEvent::GroupMemberRemoved {
+            group_id,
+            affected_user,
+            actor_user_id,
+        } => {
+            if affected_user != actor_user_id {
+                records.push(NotificationRecord::new(
+                    ids.mint(now_ms),
+                    *affected_user,
+                    NotificationClass::Direct,
+                    NotificationKind::RemovedFromGroup {
+                        group_id: *group_id,
+                        actor_user_id: *actor_user_id,
+                    },
+                    now_ms,
+                ));
+            }
+        }
+        ResourceEvent::SecretUseWidened {
+            name,
+            group_id,
+            node_id,
+            actor_user_id,
+        } => {
+            let mut managers = match (group_id, ctx.group_auth, ctx.realm_auth) {
+                (Some(_), Some(group_auth), _) => group_admin_ids(group_auth),
+                (None, _, Some(realm_auth)) => realm_admin_ids(realm_auth),
+                _ => Vec::new(),
+            };
+            // The actor may manage through another role, such as a realm groups administrator.
+            managers.push(*actor_user_id);
+            managers.sort();
+            managers.dedup();
+            for manager in managers {
+                records.push(NotificationRecord::new(
+                    ids.mint(now_ms),
+                    manager,
+                    NotificationClass::Direct,
+                    NotificationKind::SecretUseWidened {
+                        name: name.clone(),
+                        group_id: *group_id,
+                        node_id: *node_id,
+                        actor_user_id: *actor_user_id,
+                    },
+                    now_ms,
+                ));
+            }
+        }
+        ResourceEvent::NodeOnboarded { realm_id, node_id } => {
+            if let Some(realm_auth) = ctx.realm_auth {
+                for admin in realm_admin_ids(realm_auth) {
+                    records.push(NotificationRecord::new(
+                        ids.mint(now_ms),
+                        admin,
+                        NotificationClass::Direct,
+                        NotificationKind::NodeOnboarded {
+                            realm_id: *realm_id,
+                            node_id: *node_id,
+                        },
+                        now_ms,
+                    ));
+                }
+            }
+        }
+    }
+    records.retain(|record| record.recipient.realm_id == realm_id);
+    records
+}
+
+/// Expands an event for every matching subscription, including the actor's.
+/// Record ids are deterministic in `(event_id, watch_id)`, so redelivery is
+/// idempotent.
+pub fn route_watch_event(
+    event: &WatchEvent,
+    subscriptions: &[WatchSubscription],
+) -> Vec<NotificationRecord> {
+    let mut records = Vec::new();
+    for subscription in subscriptions {
+        if subscription.created_at_ms > event.occurred_at_ms {
+            continue;
+        }
+        if !watch_path_matches(event.kind, &event.path, &subscription.path_prefix) {
+            continue;
+        }
+        if !subscription.event_mask.contains(event.kind) {
+            continue;
+        }
+        records.push(NotificationRecord {
+            notification_id: watch_notification_id(event.event_id, subscription.watch_id),
+            recipient: subscription.owner,
+            class: NotificationClass::Transient,
+            kind: event.notification_kind(),
+            created_at_ms: event.occurred_at_ms,
+            read_at_ms: None,
+            watch_authorization: Some(subscription.authorization.clone()),
+        });
+    }
+    records
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+    use crate::structs::execution::notification_watch::{
+        WatchEventDetail, WatchEventKind, WatchEventMask,
+    };
+    use crate::structs::identity::auth::Role;
+    use crate::structs::identity::realm::RealmId;
+    use std::collections::{HashMap, HashSet};
+    use ulid::Ulid;
+
+    const REALM: RealmId = RealmId([7u8; 32]);
+
+    fn user(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), REALM)
+    }
+
+    fn group_with_admins(assigned: HashSet<UserId>) -> GroupAuthorizationDocument {
+        let mut doc = GroupAuthorizationDocument::default_group_doc(
+            user(200),
+            REALM,
+            Ulid::from_bytes([9u8; 16]),
+        );
+        doc.roles
+            .values_mut()
+            .find(|role| role.name == "admin")
+            .expect("default group admin role exists")
+            .assigned_users = assigned;
+        doc
+    }
+
+    #[test]
+    fn join_notifies_admins() {
+        let requester = user(3);
+        let admins = HashSet::from([user(1), user(2), requester, UserId::nil(REALM)]);
+        let doc = group_with_admins(admins);
+        let request_id = Ulid::from_bytes([4; 16]);
+        let records = route_resource_event(
+            &ResourceEvent::GroupJoinRequested {
+                group_id: doc.group_id,
+                request_id,
+                actor_user_id: requester,
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            100,
+            &mut IdMint::new(1),
+        );
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.recipient)
+                .collect::<Vec<_>>(),
+            vec![user(1), user(2)]
+        );
+        assert!(
+            records
+                .iter()
+                .all(|record| record.class == NotificationClass::Direct
+                    && record.kind
+                        == NotificationKind::GroupJoinRequested {
+                            group_id: doc.group_id,
+                            request_id,
+                            actor_user_id: requester
+                        })
+        );
+    }
+
+    #[test]
+    fn resolves_group_admins() {
+        let creator = user(1);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let doc = GroupAuthorizationDocument::default_group_doc(creator, REALM, group_id);
+        assert_eq!(group_admin_ids(&doc), vec![creator]);
+
+        let (u2, u3, ignored) = (user(2), user(3), user(4));
+        let mut doc = doc;
+        doc.roles
+            .values_mut()
+            .find(|role| role.name == "admin")
+            .expect("default group admin role exists")
+            .assigned_users
+            .extend([u2, u3]);
+        let custom_role = Role {
+            role_id: Ulid::from_parts(1, 1),
+            name: "custom-admin-label".to_string(),
+            permissions: HashMap::new(),
+            assigned_users: HashSet::from([ignored]),
+        };
+        doc.roles.insert(custom_role.role_id, custom_role);
+
+        let mut expected = vec![creator, u2, u3];
+        expected.sort();
+        assert_eq!(group_admin_ids(&doc), expected);
+    }
+
+    #[test]
+    fn nil_admins_ignored() {
+        let nil = UserId::nil(REALM);
+        let group = group_with_admins(HashSet::from([nil]));
+        assert!(group_admin_ids(&group).is_empty());
+        let joins = route_resource_event(
+            &ResourceEvent::GroupJoinRequested {
+                group_id: group.group_id,
+                request_id: Ulid::from_bytes([4; 16]),
+                actor_user_id: user(1),
+            },
+            RoutingContext {
+                group_auth: Some(&group),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1,
+            &mut IdMint::new(1),
+        );
+        assert!(joins.is_empty());
+
+        let mut realm = RealmAuthorizationDocument::default_realm_doc(REALM);
+        realm
+            .roles
+            .values_mut()
+            .find(|role| role.name == "realm_admin")
+            .expect("default realm admin role exists")
+            .assigned_users = HashSet::from([nil]);
+        assert!(realm_admin_ids(&realm).is_empty());
+        let onboarded = route_resource_event(
+            &ResourceEvent::NodeOnboarded {
+                realm_id: REALM,
+                node_id: iroh::SecretKey::from_bytes(&[6u8; 32]).public(),
+            },
+            RoutingContext {
+                group_auth: None,
+                realm_auth: Some(&realm),
+                realm_id: REALM,
+            },
+            1,
+            &mut IdMint::new(1),
+        );
+        assert!(onboarded.is_empty());
+    }
+
+    #[test]
+    fn foreign_member_uninformed() {
+        // A federated member has no inbox here; the local admin still learns of the addition.
+        let admin = user(10);
+        let foreign = UserId::new(Ulid::from_bytes([20; 16]), RealmId([8u8; 32]));
+        let doc = group_with_admins(HashSet::from([admin, foreign]));
+        let records = route_resource_event(
+            &ResourceEvent::GroupMemberAdded {
+                group_id: doc.group_id,
+                affected_user: foreign,
+                actor_user_id: user(11),
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+            &mut IdMint::new(1),
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, admin);
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::GroupMemberAdded { member_user_id, .. } if member_user_id == foreign
+        ));
+    }
+
+    #[test]
+    fn added_event_targets() {
+        let (a1, a2, affected) = (user(10), user(11), user(20));
+        let doc = group_with_admins(HashSet::from([a1, a2]));
+        let records = route_resource_event(
+            &ResourceEvent::GroupMemberAdded {
+                group_id: doc.group_id,
+                affected_user: affected,
+                actor_user_id: a1,
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+            &mut IdMint::new(1),
+        );
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].recipient, affected);
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::AddedToGroup { .. }
+        ));
+        assert_eq!(records[1].recipient, a2);
+        assert!(matches!(
+            records[1].kind,
+            NotificationKind::GroupMemberAdded { .. }
+        ));
+        assert!(records.iter().all(|r| r.class == NotificationClass::Direct));
+        let ids: HashSet<Ulid> = records.iter().map(|r| r.notification_id).collect();
+        assert_eq!(ids.len(), records.len());
+    }
+
+    #[test]
+    fn self_add_admins() {
+        let (a1, a2, actor) = (user(10), user(11), user(30));
+        let doc = group_with_admins(HashSet::from([a1, a2]));
+        let records = route_resource_event(
+            &ResourceEvent::GroupMemberAdded {
+                group_id: doc.group_id,
+                affected_user: actor,
+                actor_user_id: actor,
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+            &mut IdMint::new(1),
+        );
+
+        assert!(
+            records
+                .iter()
+                .all(|r| matches!(r.kind, NotificationKind::GroupMemberAdded { .. }))
+        );
+        assert_eq!(records.len(), 2);
+    }
+
+    #[test]
+    fn admin_gets_membership() {
+        let (a1, actor) = (user(10), user(30));
+        let doc = group_with_admins(HashSet::from([a1]));
+        let records = route_resource_event(
+            &ResourceEvent::GroupMemberAdded {
+                group_id: doc.group_id,
+                affected_user: a1,
+                actor_user_id: actor,
+            },
+            RoutingContext {
+                group_auth: Some(&doc),
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+            &mut IdMint::new(1),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, a1);
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::AddedToGroup { .. }
+        ));
+    }
+
+    #[test]
+    fn removed_event_targets() {
+        let (affected, actor) = (user(20), user(30));
+        let group_id = Ulid::from_bytes([9u8; 16]);
+        let records = route_resource_event(
+            &ResourceEvent::GroupMemberRemoved {
+                group_id,
+                affected_user: affected,
+                actor_user_id: actor,
+            },
+            RoutingContext {
+                group_auth: None,
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+            &mut IdMint::new(1),
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, affected);
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::RemovedFromGroup { .. }
+        ));
+
+        let self_removal = route_resource_event(
+            &ResourceEvent::GroupMemberRemoved {
+                group_id,
+                affected_user: actor,
+                actor_user_id: actor,
+            },
+            RoutingContext {
+                group_auth: None,
+                realm_auth: None,
+                realm_id: REALM,
+            },
+            1_000,
+            &mut IdMint::new(1),
+        );
+        assert!(self_removal.is_empty());
+    }
+
+    fn watch_subscription(owner: UserId, prefix: &str, mask: WatchEventMask) -> WatchSubscription {
+        WatchSubscription::new(
+            ulid::Ulid::generate(),
+            owner,
+            prefix.to_string(),
+            mask,
+            1_000,
+        )
+    }
+
+    fn upload_event(actor: UserId, path: &str) -> WatchEvent {
+        let resource = crate::structs::execution::notification_watch::parse_watch_path(path)
+            .expect("canonical data watch path");
+        WatchEvent {
+            event_id: Ulid::from_bytes([7u8; 16]),
+            realm_id: REALM,
+            kind: WatchEventKind::DataUploaded,
+            path: path.to_string(),
+            actor,
+            occurred_at_ms: 5_000,
+            detail: WatchEventDetail::DataUploaded {
+                group_id: resource.group_id,
+                node_id: resource.node_id,
+                bucket: resource.bucket.to_string(),
+                key: resource.key_prefix.to_string(),
+                size_bytes: 10,
+            },
+        }
+    }
+
+    fn sync_event(actor: UserId, path: &str) -> WatchEvent {
+        let resource = crate::structs::execution::notification_watch::parse_watch_path(path)
+            .expect("canonical data watch path");
+        WatchEvent {
+            event_id: Ulid::from_bytes([9u8; 16]),
+            realm_id: REALM,
+            kind: WatchEventKind::SyncCompleted,
+            path: path.to_string(),
+            actor,
+            occurred_at_ms: 5_000,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id: resource.group_id,
+                node_id: resource.node_id,
+                bucket: resource.bucket.to_string(),
+                relationship_id: Ulid::from_bytes([10u8; 16]),
+                versions_synced: 4,
+            },
+        }
+    }
+
+    fn data_path(node_id: crate::id::NodeId, bucket: &str, key: &str) -> String {
+        crate::structs::execution::notification_watch::watch_resource_path(
+            Ulid::from_bytes([6u8; 16]),
+            node_id,
+            bucket,
+            key,
+        )
+    }
+
+    fn metadata_event(actor: UserId, group_id: Ulid, document_id: Ulid) -> WatchEvent {
+        WatchEvent {
+            event_id: Ulid::from_bytes([8u8; 16]),
+            realm_id: REALM,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/datasets/project/runs/run-42"),
+            actor,
+            occurred_at_ms: 5_000,
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        }
+    }
+
+    #[test]
+    fn self_event_delivered() {
+        let owner = user(1);
+        let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let subs = vec![
+            // Matches: prefix + mask.
+            watch_subscription(
+                owner,
+                &data_path(data_node, "bucket", ""),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+            // Prefix mismatch.
+            watch_subscription(
+                owner,
+                &data_path(data_node, "other", ""),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+            // Mask mismatch.
+            watch_subscription(
+                owner,
+                &data_path(data_node, "bucket", ""),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            ),
+            // A matching owner receives their own upload event.
+            watch_subscription(
+                actor,
+                &data_path(data_node, "bucket", ""),
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+        ];
+
+        let records = route_watch_event(
+            &upload_event(actor, &data_path(data_node, "bucket", "object")),
+            &subs,
+        );
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].recipient, owner);
+        assert_eq!(records[1].recipient, actor);
+        assert_eq!(records[0].class, NotificationClass::Transient);
+        assert_eq!(records[0].created_at_ms, 5_000);
+        assert_eq!(
+            records[0]
+                .watch_authorization
+                .as_ref()
+                .unwrap()
+                .watch_path_prefix,
+            subs[0].path_prefix
+        );
+        assert!(matches!(
+            records[0].kind,
+            NotificationKind::DataUploaded { .. }
+        ));
+    }
+
+    #[test]
+    fn nested_path_matches() {
+        let owner = user(1);
+        let actor = user(2);
+        let group_id = Ulid::from_bytes([3u8; 16]);
+        let document_id = Ulid::from_bytes([4u8; 16]);
+        let subscription = watch_subscription(
+            owner,
+            &format!("meta/{group_id}/datasets/project"),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+        );
+
+        let records = route_watch_event(
+            &metadata_event(actor, group_id, document_id),
+            &[subscription],
+        );
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            &records[0].kind,
+            NotificationKind::MetadataCreated {
+                path,
+                group_id: event_group_id,
+                document_id: event_document_id,
+                ..
+            } if path == &format!("meta/{group_id}/datasets/project/runs/run-42")
+                && event_group_id == &group_id
+                && event_document_id == &document_id
+        ));
+    }
+
+    #[test]
+    fn routes_sync_events() {
+        let owner = user(1);
+        let actor = user(2);
+        let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let path = data_path(node_id, "bucket", "prefix/");
+        let subscription = watch_subscription(
+            owner,
+            &data_path(node_id, "bucket", ""),
+            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted]),
+        );
+
+        let records = route_watch_event(&sync_event(actor, &path), &[subscription]);
+
+        assert_eq!(records.len(), 1);
+        assert!(matches!(
+            &records[0].kind,
+            NotificationKind::SyncCompleted {
+                relationship_id,
+                versions_synced: 4,
+                ..
+            } if relationship_id == &Ulid::from_bytes([10u8; 16])
+        ));
+    }
+
+    #[test]
+    fn event_ids_deterministic() {
+        let owner = user(1);
+        let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let subs = vec![watch_subscription(
+            owner,
+            &data_path(data_node, "bucket", ""),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )];
+        let event = upload_event(actor, &data_path(data_node, "bucket", "object"));
+
+        let first = route_watch_event(&event, &subs);
+        let second = route_watch_event(&event, &subs);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].notification_id, second[0].notification_id);
+    }
+
+    #[test]
+    fn unmatched_event_empty() {
+        let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        assert!(
+            route_watch_event(
+                &upload_event(actor, &data_path(data_node, "bucket", "object")),
+                &[]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn delayed_event_skips() {
+        let owner = user(1);
+        let actor = user(2);
+        let data_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let prefix = data_path(data_node, "bucket", "");
+        let mut existing = watch_subscription(owner, &prefix, mask);
+        existing.created_at_ms = 5_000;
+        let mut retroactive = watch_subscription(user(3), &prefix, mask);
+        retroactive.created_at_ms = 5_001;
+
+        let records = route_watch_event(
+            &upload_event(actor, &data_path(data_node, "bucket", "object")),
+            &[existing, retroactive],
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].recipient, owner);
+    }
+
+    #[test]
+    fn data_prefix_disambiguated() {
+        let owner = user(1);
+        let actor = user(2);
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let watched_node = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+        let other_node = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let scoped = vec![watch_subscription(
+            owner,
+            &data_path(watched_node, "reports", ""),
+            mask,
+        )];
+
+        assert!(
+            route_watch_event(
+                &upload_event(actor, &data_path(other_node, "reports", "x")),
+                &scoped
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            route_watch_event(
+                &upload_event(actor, &data_path(watched_node, "reports", "x")),
+                &scoped
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn widening_reaches_actor() {
+        // A realm groups administrator outside the group admin role still gets the notice, once.
+        let doc = group_with_admins(HashSet::from([user(1), user(2)]));
+        let notice = |actor| ResourceEvent::SecretUseWidened {
+            name: "catalog-key".to_string(),
+            group_id: Some(doc.group_id),
+            node_id: None,
+            actor_user_id: actor,
+        };
+        let context = || RoutingContext {
+            group_auth: Some(&doc),
+            realm_auth: None,
+            realm_id: REALM,
+        };
+        let recipients = |actor| {
+            let records = route_resource_event(&notice(actor), context(), 100, &mut IdMint::new(1));
+            records
+                .iter()
+                .map(|record| record.recipient)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(recipients(user(5)), vec![user(1), user(2), user(5)]);
+        assert_eq!(
+            recipients(user(1)),
+            vec![user(1), user(2)],
+            "no duplicate for an admin"
+        );
+    }
+}

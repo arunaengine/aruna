@@ -3,18 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::connectors::descriptor::build_source_binding;
 use crate::s3::purge_fence::PurgeFenceError;
-use crate::staging::descriptor::build_source_binding;
-use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES};
-use aruna_core::UserId;
+use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES, PageEntry};
+use aruna_core::calls::CallRun;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
+use aruna_core::id_mint::run_entropy;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
     REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{
-    JobClaim, JobId, JobPayload, JobRecord, StagingJobCheckpoint, StagingJobPhase,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobPhase,
 };
+use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
 use aruna_core::structs::execution::source_access::SourceMetadata;
 use aruna_core::structs::execution::source_connector::{
     SourceConnector, SourceConnectorKind, SourceConnectorSecret,
@@ -27,6 +32,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -36,10 +42,6 @@ const JOB_CREATED_MS: u64 = 1_000_000;
 
 fn token() -> Ulid {
     Ulid::from_bytes([7; 16])
-}
-
-fn txn() -> TxnId {
-    Ulid::from_bytes([9; 16])
 }
 
 fn node() -> NodeId {
@@ -171,7 +173,7 @@ fn record(claim_token: Ulid) -> JobRecord {
 }
 
 fn claim(record: &JobRecord) -> Option<Value> {
-    let guard = crate::jobs::store::ClaimGuard::of(record)?;
+    let guard = aruna_core::structs::execution::job::rows::ClaimGuard::of(record)?;
     value(guard.to_bytes().unwrap())
 }
 
@@ -179,66 +181,59 @@ fn value(bytes: Vec<u8>) -> Option<Value> {
     Some(ByteView::from(bytes))
 }
 
-fn guards(fence: Option<Value>, record: &JobRecord) -> Event {
-    let values = vec![
-        (Key::from(b"fence".to_vec()), fence),
-        (
-            Key::from(b"bucket".to_vec()),
-            value(bucket().to_bytes().unwrap()),
-        ),
-        (
-            Key::from(b"connector".to_vec()),
-            value(connector().to_bytes().unwrap()),
-        ),
-        (Key::from(b"job".to_vec()), claim(record)),
-    ];
-    Event::Storage(StorageEvent::BatchReadResult { values })
+fn guard_values(fence: Option<Value>, record: &JobRecord) -> Vec<Option<Value>> {
+    vec![
+        fence,
+        value(bucket().to_bytes().unwrap()),
+        value(connector().to_bytes().unwrap()),
+        claim(record),
+    ]
+}
+
+fn guards(fence: Option<Value>, record: &JobRecord) -> IoResult {
+    IoResult::Values(guard_values(fence, record))
+}
+
+fn range_page(next: Option<Key>) -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: next,
+    })))
 }
 
 /// Answers the head interval read as holding too many other keys, then the head reads with
 /// `heads` in entry order.
-fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> Effects {
-    let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: Some(Key::from(b"other".to_vec())),
-    }));
+fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> IoCall {
+    let other = Some(Key::from(b"other".to_vec()));
+    let reads = operation.next(range_page(other));
     assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == heads.len()
+        reads,
+        Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == heads.len()
     ));
-    let values = (heads.into_iter())
-        .map(|head| (Key::from(b"head".to_vec()), head))
-        .collect();
-    operation.step(Event::Storage(StorageEvent::BatchReadResult { values }))
+    called(operation.next(IoResult::Values(heads)))
+}
+
+fn called(next: Result<Next<PageImportResult>, PageImportError>) -> IoCall {
+    match next {
+        Ok(Next::Call(call)) => call,
+        other => panic!("expected a call, got {other:?}"),
+    }
 }
 
 /// The answer to the relationship read: `count` relationships replicate the bucket.
-fn relationships(count: usize) -> Event {
+fn relationships(count: usize) -> IoResult {
     let row = || (Key::from(b"rel".to_vec()), ByteView::from(Vec::new()));
-    Event::Storage(StorageEvent::IterResult {
-        values: (0..count).map(|_| row()).collect(),
-        next_start_after: None,
-    })
+    IoResult::Page {
+        rows: (0..count).map(|_| row()).collect(),
+        next: None,
+    }
 }
 
-fn no_secret() -> Event {
-    Event::Storage(StorageEvent::VaultResult {
+fn no_secret() -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(StorageEvent::VaultResult {
         entry: SourceConnectorSecret::vault_entry(connector().connector_id),
         secret: None,
-    })
-}
-
-fn scheduled(key: TaskKey) -> Event {
-    Event::Task(TaskEvent::TimerScheduled {
-        key,
-        after: Duration::ZERO,
-    })
-}
-
-fn written() -> Event {
-    Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    })
+    })))
 }
 
 fn head(version_id: Ulid) -> Option<Value> {
@@ -269,34 +264,45 @@ fn run_to_writes(
     heads: Vec<Option<Value>>,
     versions: Option<Vec<Option<Value>>>,
 ) -> Vec<(KeySpace, Key, Value)> {
-    assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { reads, .. })] if reads.len() == GUARD_READS
-    ));
-    operation.step(guards(None, &record(token())));
-    answer_heads(operation, heads);
-    operation.step(relationships(1));
-    let mut effects = operation.step(no_secret());
-    if let Some(versions) = versions {
-        let values = versions
-            .into_iter()
-            .map(|version| (Key::from(b"version".to_vec()), version))
-            .collect();
-        effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
-    }
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the page rows, got {effects:?}");
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
+        panic!("expected the guard reads");
     };
-    writes.clone()
+    assert_eq!(reads.len(), GUARD_READS);
+    operation.next(guards(None, &record(token()))).unwrap();
+    answer_heads(operation, heads);
+    operation.next(relationships(1)).unwrap();
+    let mut call = called(operation.next(no_secret()));
+    if let Some(versions) = versions {
+        call = called(operation.next(IoResult::Values(versions)));
+    }
+    let IoCall::Write(writes) = call else {
+        panic!("expected the page rows, got {call:?}");
+    };
+    writes
+}
+
+/// Answers the row write and the empty delete; the next call is the usage update or nothing.
+fn after_rows(
+    operation: &mut PageImportOperation,
+) -> Result<Next<PageImportResult>, PageImportError> {
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(Vec::new())))
+    );
+    operation.next(IoResult::Done)
+}
+
+/// Answers the usage write and the dirty markers, and takes the outcome with its wake-ups.
+fn after_usage(operation: &mut PageImportOperation) -> (PageImportResult, Vec<IoCall>) {
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Write(_)))
+    ));
+    match operation.next(IoResult::Done) {
+        Ok(Next::Then { output, calls }) => (output, calls),
+        other => panic!("expected the outcome, got {other:?}"),
+    }
 }
 
 fn rows_in(writes: &[(KeySpace, Key, Value)], key_space: &str) -> usize {
@@ -317,14 +323,11 @@ fn page_registers_atomically() {
     assert_eq!(rows_in(&writes, CONNECTOR_REFERENCE_KEYSPACE), 2);
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
     assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 2);
-    let effects = operation.step(written());
-    let [
-        Effect::Storage(StorageEffect::AddUsage {
-            deltas, buckets, ..
-        }),
-    ] = effects.as_slice()
+    let Ok(Next::Call(IoCall::AddUsage {
+        deltas, buckets, ..
+    })) = after_rows(&mut operation)
     else {
-        panic!("expected one usage update, got {effects:?}");
+        panic!("expected one usage update");
     };
     assert!(
         deltas
@@ -339,31 +342,24 @@ fn page_registers_atomically() {
         (bucket.objects, bucket.versions, bucket.referenced_bytes),
         (2, 2, 6)
     );
-    operation.step(written());
+    let (result, wakes) = after_usage(&mut operation);
+    let [publish, drain] = wakes.as_slice() else {
+        panic!("expected two wake-ups, got {wakes:?}");
+    };
     assert!(matches!(
-        operation.step(written()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
+        publish,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishUsageSnapshots,
+            ..
+        }))
     ));
     assert!(matches!(
-        operation
-            .step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: txn()
-            }))
-            .as_slice(),
-        [Effect::Task(_)]
-    ));
-    assert!(matches!(
-        operation
-            .step(scheduled(TaskKey::PublishUsageSnapshots))
-            .as_slice(),
-        [Effect::Task(TaskEffect::ResetTimer {
+        drain,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Task(TaskEffect::ResetTimer {
             key: TaskKey::DrainReplicationQueue,
             ..
-        })]
+        }))
     ));
-    operation.step(scheduled(TaskKey::DrainReplicationQueue));
-
-    let result = operation.finalize().unwrap();
     assert_eq!(
         (result.registered, result.unchanged, result.kept),
         (2, 0, 0)
@@ -405,18 +401,9 @@ fn replay_counts_once() {
     assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
     assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
     // Nothing new is registered, so no usage moves and no publication is scheduled.
-    assert!(matches!(
-        operation.step(written()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    assert!(
-        operation
-            .step(Event::Storage(StorageEvent::TransactionCommitted {
-                txn_id: txn()
-            }))
-            .is_empty()
-    );
-    let result = operation.finalize().unwrap();
+    let Ok(Next::Done(result)) = after_rows(&mut operation) else {
+        panic!("expected the page outcome");
+    };
     assert_eq!((result.registered, result.unchanged), (0, 1));
 }
 
@@ -424,27 +411,16 @@ fn replay_counts_once() {
 fn prepare(entries: Vec<PageEntry>) -> PreparedRows {
     let heads = entries.iter().map(|_| None).collect();
     let mut operation = PreparePageOperation::new(input(entries));
-    assert!(matches!(
-        operation.start().as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: true
-        })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    operation.step(guards(None, &record(token())));
+    assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
     answer_heads(&mut operation.0, heads);
-    operation.step(relationships(1));
+    operation.next(relationships(1)).unwrap();
     // The snapshot ends without a write.
-    assert!(matches!(
-        operation.step(no_secret()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: txn(),
-    }));
-    operation.finalize().unwrap()
+    match operation.next(no_secret()) {
+        Ok(Next::Done(prepared)) => prepared,
+        other => panic!("expected the prepared rows, got {other:?}"),
+    }
 }
 
 // Rows prepared before the turn are written when the transaction reads what they were built
@@ -464,6 +440,8 @@ fn prepared_rows_checked() {
     let prepared = prepare(entries.clone());
     let expected = prepared.rows.writes.clone();
     let mut operation = PageImportOperation::new(input(entries)).with_prepared(Some(prepared));
+    // The runner seeds every run with its own entropy; the preparation kept the default.
+    operation.seed(run_entropy(1, 1));
     let other = reference("data/x", observation("x"), false);
     let heads = vec![head(Ulid::from_parts(JOB_CREATED_MS - 5, 1)), None];
     let writes = run_to_writes(&mut operation, heads, Some(vec![other]));
@@ -496,23 +474,15 @@ fn newer_write_kept() {
 
     // Only the head written before the job started is replaced.
     assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 1);
-    let effects = operation.step(written());
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-        panic!("expected one usage update, got {effects:?}");
+    let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = after_rows(&mut operation) else {
+        panic!("expected one usage update");
     };
     assert!(
         deltas
             .iter()
             .all(|(_, delta)| delta.objects == 0 && delta.referenced_bytes == 3)
     );
-    operation.step(written());
-    operation.step(written());
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: txn(),
-    }));
-    operation.step(scheduled(TaskKey::PublishUsageSnapshots));
-    operation.step(scheduled(TaskKey::DrainReplicationQueue));
-    let result = operation.finalize().unwrap();
+    let (result, _) = after_usage(&mut operation);
     assert_eq!((result.registered, result.kept), (1, 1));
     assert_eq!(result.checkpoint.items_failed, 1);
     assert_eq!(result.checkpoint.errors[0].target_key, newer.target_key);
@@ -532,11 +502,9 @@ fn newer_same_kept() {
     );
 
     assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
-    operation.step(written());
-    operation.step(Event::Storage(StorageEvent::TransactionCommitted {
-        txn_id: txn(),
-    }));
-    let result = operation.finalize().unwrap();
+    let Ok(Next::Done(result)) = after_rows(&mut operation) else {
+        panic!("expected the page outcome");
+    };
     assert_eq!((result.registered, result.kept), (0, 1));
 }
 
@@ -558,22 +526,10 @@ fn guards_abort_page() {
             PageImportError::ClaimLost,
         ),
     ];
-    for (event, expected) in cases {
+    for (read, expected) in cases {
         let mut operation = PageImportOperation::new(input(vec![entry("a")]));
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: txn(),
-        }));
-
-        assert!(matches!(
-            operation.step(event).as_slice(),
-            [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-        ));
-        operation.step(Event::Storage(StorageEvent::TransactionAborted {
-            txn_id: txn(),
-        }));
-        assert!(operation.is_complete());
-        assert_eq!(operation.finalize(), Err(expected));
+        operation.first().unwrap();
+        assert_eq!(operation.next(read), Err(expected));
     }
 }
 
@@ -583,22 +539,14 @@ fn changed_secret_aborts() {
         secret_fingerprint: Some([1; 16]),
         ..input(vec![entry("a")])
     });
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    operation.step(guards(None, &record(token())));
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
     answer_heads(&mut operation, vec![None]);
-    operation.step(relationships(1));
-
-    assert!(matches!(
-        operation.step(no_secret()).as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: txn(),
-    }));
-    assert_eq!(operation.finalize(), Err(PageImportError::ConnectorChanged));
+    operation.next(relationships(1)).unwrap();
+    assert_eq!(
+        operation.next(no_secret()),
+        Err(PageImportError::ConnectorChanged)
+    );
 }
 
 // The heads of a page are read as one interval of its keys; an empty interval proves every
@@ -608,80 +556,57 @@ fn interval_proves_absence() {
     use aruna_core::effects::{IterEnd, IterStart};
     use aruna_core::structs::storage::blob::BlobHeadKey;
     let mut operation = PageImportOperation::new(input(vec![entry("b"), entry("a")]));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
+    operation.first().unwrap();
 
-    let effects = operation.step(guards(None, &record(token())));
+    let call = called(operation.next(guards(None, &record(token()))));
 
     let key = |name| Key::from(BlobHeadKey::new("imports", name).to_bytes().unwrap());
-    let [Effect::Storage(StorageEffect::IterRange { start, end, .. })] = effects.as_slice() else {
-        panic!("expected one head interval read, got {effects:?}");
+    let IoCall::Effect(read) = call else {
+        panic!("expected one head interval read, got {call:?}");
+    };
+    let Effect::Storage(StorageEffect::IterRange {
+        start, end, txn_id, ..
+    }) = *read
+    else {
+        panic!("expected one head interval read, got {read:?}");
     };
     assert_eq!(
-        (start, end),
-        (&IterStart::At(key("a")), &IterEnd::Through(key("b")))
+        (start, end, txn_id),
+        (IterStart::At(key("a")), IterEnd::Through(key("b")), None)
     );
-    operation.step(Event::Storage(StorageEvent::IterResult {
-        values: Vec::new(),
-        next_start_after: None,
-    }));
-    operation.step(relationships(1));
-    let effects = operation.step(no_secret());
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the page rows, got {effects:?}");
+    operation.next(range_page(None)).unwrap();
+    operation.next(relationships(1)).unwrap();
+    let IoCall::Write(writes) = called(operation.next(no_secret())) else {
+        panic!("expected the page rows");
     };
-    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
 }
 
 // A bucket nothing replicates gets no replication obligation per imported file.
 #[test]
 fn obligations_need_downstream() {
     let mut operation = PageImportOperation::new(input(vec![entry("a"), entry("b")]));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-    operation.step(guards(None, &record(token())));
-    let effects = answer_heads(&mut operation, vec![None, None]);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter {
-            limit: 1,
-            txn_id: Some(_),
-            ..
-        })]
-    ));
-    operation.step(relationships(0));
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
+    let call = answer_heads(&mut operation, vec![None, None]);
+    assert!(matches!(call, IoCall::Page { limit: 1, .. }));
+    operation.next(relationships(0)).unwrap();
 
-    let effects = operation.step(no_secret());
-
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the page rows, got {effects:?}");
+    let IoCall::Write(writes) = called(operation.next(no_secret())) else {
+        panic!("expected the page rows");
     };
-    assert_eq!(rows_in(writes, BLOB_VERSIONS_KEYSPACE), 2);
-    assert_eq!(rows_in(writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
 }
 
+// An answer of another kind than the pending read fails the page.
 #[test]
 fn page_rejects_event() {
     let mut operation = PageImportOperation::new(input(vec![entry("a")]));
-    operation.start();
-    operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: txn(),
-    }));
-
+    operation.first().unwrap();
     assert!(matches!(
-        operation.step(no_secret()).as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    operation.step(Event::Storage(StorageEvent::TransactionAborted {
-        txn_id: txn(),
-    }));
-    assert!(matches!(
-        operation.finalize(),
-        Err(PageImportError::UnexpectedEvent { .. })
+        operation.next(no_secret()),
+        Err(PageImportError::Storage(_))
     ));
 }
 
@@ -691,11 +616,8 @@ fn page_bounds_entries() {
         .map(|index| entry(&index.to_string()))
         .collect();
     let mut operation = PageImportOperation::new(input(entries));
-
-    assert!(operation.start().is_empty());
-    assert!(operation.is_complete());
     assert_eq!(
-        operation.finalize(),
+        operation.first(),
         Err(PageImportError::TooManyEntries(MAX_PAGE_ENTRIES + 1))
     );
 }
@@ -703,8 +625,9 @@ fn page_bounds_entries() {
 // A progress flush and a lease renewal that commit while the page is open must not conflict.
 #[tokio::test]
 async fn flush_keeps_page() {
-    use crate::jobs::store::{flush_progress, renew_lease};
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -713,12 +636,14 @@ async fn flush_keeps_page() {
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
     let job = record(token());
-    crate::jobs::store::insert_job(storage, &job).await.unwrap();
-    let mut operation = PageImportOperation::new(PageImportInput {
+    aruna_test_support::jobs::insert_job(context, &job)
+        .await
+        .unwrap();
+    let mut operation = CallRun::new(PageImportOperation::new(PageImportInput {
         connector,
         expected_bucket,
         ..input(vec![entry("a")])
-    });
+    }));
 
     let mut pending = std::collections::VecDeque::from(operation.start().into_vec());
     while let Some(effect) = pending.pop_front() {
@@ -728,12 +653,18 @@ async fn flush_keeps_page() {
         let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
         if commit {
             let progress = job.progress.clone();
-            flush_progress(storage, job.job_id, token(), progress, 2)
-                .await
-                .unwrap();
-            renew_lease(storage, job.job_id, token(), 3, None)
-                .await
-                .unwrap();
+            aruna_drivers::driver::drive(
+                crate::jobs::store::job_calls::flush_progress(job.job_id, token(), progress, 2),
+                context,
+            )
+            .await
+            .unwrap();
+            aruna_drivers::driver::drive(
+                crate::jobs::store::job_calls::renew_lease(job.job_id, token(), 3, None),
+                context,
+            )
+            .await
+            .unwrap();
         }
         let event = storage.send_storage_effect(effect).await;
         if commit {
@@ -756,16 +687,18 @@ async fn flush_keeps_page() {
 #[tokio::test]
 async fn bare_size_unchanged() {
     use crate::connectors::repository::source_connector_key;
-    use crate::driver::drive;
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
+    use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::insert_job(&context.storage_handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let bare = |content_length| PageEntry {
@@ -806,7 +739,7 @@ async fn bare_size_unchanged() {
     let mut later = record(token());
     later.job_id = job_id;
     (later.created_at_ms, later.updated_at_ms) = (started, started);
-    crate::jobs::store::insert_job(&context.storage_handle, &later)
+    aruna_test_support::jobs::insert_job(context, &later)
         .await
         .unwrap();
     let mut moved = connector.clone();
@@ -835,18 +768,20 @@ async fn bare_size_unchanged() {
 // registered head, so usage and connector rows are counted once.
 #[tokio::test]
 async fn replay_charges_once() {
-    use crate::driver::drive;
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::effects::IterStart;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+    use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
     let group_id = bucket().group_id;
     let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::insert_job(&context.storage_handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -903,7 +838,8 @@ async fn replay_charges_once() {
 
 #[test]
 fn guards_carry_hint() {
-    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::distribution::hint::SetHint;
 
     let mut bound = bucket();
     bound.distribution = Some(DistributionBinding {
@@ -913,16 +849,10 @@ fn guards_carry_hint() {
         revision: Default::default(),
     });
     let values = vec![
-        (Key::from(b"fence".to_vec()), None),
-        (
-            Key::from(b"bucket".to_vec()),
-            value(bound.to_bytes().unwrap()),
-        ),
-        (
-            Key::from(b"connector".to_vec()),
-            value(connector().to_bytes().unwrap()),
-        ),
-        (Key::from(b"job".to_vec()), claim(&record(token()))),
+        None,
+        value(bound.to_bytes().unwrap()),
+        value(connector().to_bytes().unwrap()),
+        claim(&record(token())),
     ];
     let input = input(vec![entry("a")]);
     let guards = crate::staging::page::rows::check_guards(&input, values).unwrap();
@@ -937,11 +867,13 @@ fn guards_carry_hint() {
 #[tokio::test]
 async fn page_maintains_inventory() {
     use crate::distribution::test_store::{counters, has_row, install, range};
-    use crate::driver::drive;
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::accounting::generation_key;
     use aruna_core::structs::storage::distribution::inventory::head_position;
+    use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -952,7 +884,13 @@ async fn page_maintains_inventory() {
     // Member 1 of the test set coordinates the keys "a" and "b".
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -965,7 +903,7 @@ async fn page_maintains_inventory() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::insert_job(handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -1007,12 +945,14 @@ async fn page_maintains_inventory() {
 #[tokio::test]
 async fn page_needs_coordinator() {
     use crate::distribution::guard::GuardError;
-    use crate::distribution::test_record::{binding, record as set_record, store_record};
+    use crate::distribution::test_record::{binding, record as set_record};
     use crate::distribution::test_store::{has_row, install, range};
-    use crate::driver::drive;
-    use crate::tests::staging::{create_http_connector, create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
     use aruna_core::structs::storage::distribution::inventory::head_position;
+    use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
 
     let test = setup_driver_context().await;
     let context = &test.driver_context;
@@ -1023,7 +963,13 @@ async fn page_needs_coordinator() {
     // Member 1 coordinates "a"; member 2 coordinates "x".
     let (snapshot, record_bytes) = set_record(true);
     let set_id = snapshot.set_id();
-    store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1036,7 +982,7 @@ async fn page_needs_coordinator() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::insert_job(handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let page = PageImportInput {
@@ -1056,7 +1002,9 @@ async fn page_needs_coordinator() {
 }
 
 /// Bytes of keys and values per keyspace in `handle`.
-async fn keyspace_bytes(handle: &aruna_storage::StorageHandle) -> HashMap<&'static str, usize> {
+async fn keyspace_bytes(
+    handle: &aruna_storage::storage::handle::StorageHandle,
+) -> HashMap<&'static str, usize> {
     let mut sizes = HashMap::new();
     for key_space in aruna_core::keyspaces::KEYSPACE_CATALOG {
         let iter = StorageEffect::Iter {
@@ -1077,7 +1025,7 @@ async fn keyspace_bytes(handle: &aruna_storage::StorageHandle) -> HashMap<&'stat
 }
 
 /// A public bakrep-like S3 connector stored for the test group.
-async fn bakrep_connector(context: &crate::driver::DriverContext) -> SourceConnector {
+async fn bakrep_connector(context: &aruna_drivers::driver::DriverContext) -> SourceConnector {
     use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
     let input = SourceConnectorInput {
         group_id: bucket().group_id,
@@ -1096,7 +1044,7 @@ async fn bakrep_connector(context: &crate::driver::DriverContext) -> SourceConne
         secret_config: HashMap::new(),
     };
     let operation = SourceConnectorOperation::new(input);
-    crate::driver::drive(operation, context)
+    aruna_drivers::driver::drive(operation, context)
         .await
         .unwrap()
         .connector
@@ -1144,9 +1092,9 @@ fn print_sizes(
 #[tokio::test]
 async fn distributed_sizes_measured() {
     use crate::distribution::test_store::{install, range};
-    use crate::driver::drive;
-    use crate::tests::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 
     const ENTRIES: usize = 100;
     let test = setup_driver_context().await;
@@ -1157,7 +1105,13 @@ async fn distributed_sizes_measured() {
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1167,7 +1121,7 @@ async fn distributed_sizes_measured() {
     };
     handle.send_storage_effect(write).await;
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::insert_job(handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let before = keyspace_bytes(handle).await;
@@ -1189,8 +1143,8 @@ async fn distributed_sizes_measured() {
 // for the entry size work, not a size contract. Run with `--nocapture` to read it.
 #[tokio::test]
 async fn entry_sizes_measured() {
-    use crate::driver::drive;
-    use crate::tests::staging::{create_test_bucket, setup_driver_context};
+    use aruna_drivers::driver::drive;
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 
     const ENTRIES: usize = 100;
     let test = setup_driver_context().await;
@@ -1199,7 +1153,7 @@ async fn entry_sizes_measured() {
     let connector = bakrep_connector(context).await;
     let group_id = bucket().group_id;
     let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
-    crate::jobs::store::insert_job(handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     let before = keyspace_bytes(handle).await;
@@ -1216,23 +1170,53 @@ async fn entry_sizes_measured() {
     print_sizes("plain", &before, &after, ENTRIES);
 }
 
-/// Drives `operation` against `handle` and counts its storage request/response exchanges.
+/// Answers one storage or timer effect and counts the storage exchange.
+async fn exchange(
+    effect: Effect,
+    handle: &aruna_storage::storage::handle::StorageHandle,
+    exchanges: &mut usize,
+) -> Event {
+    match effect {
+        Effect::Storage(effect) => {
+            *exchanges += 1;
+            handle.send_storage_effect(effect).await
+        }
+        Effect::Task(
+            TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
+        ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+/// Drives `operation` against `handle` and counts its storage request/response exchanges,
+/// those of the reads it runs as children included.
 async fn count_exchanges(
-    mut operation: PageImportOperation,
-    handle: &aruna_storage::StorageHandle,
+    operation: PageImportOperation,
+    handle: &aruna_storage::storage::handle::StorageHandle,
+    process: u32,
 ) -> (usize, Result<PageImportResult, PageImportError>) {
+    let mut operation = CallRun::new(operation);
+    // Each run gets its own entropy, as the runner gives it.
+    let (now_ms, mut slot) = (2_000_000, 0);
+    operation.stamp(now_ms);
+    operation.seed(run_entropy(process, slot));
     let mut exchanges = 0;
     let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     while let Some(effect) = effects.pop_front() {
         let event = match effect {
-            Effect::Storage(effect) => {
-                exchanges += 1;
-                handle.send_storage_effect(effect).await
+            Effect::SubOperation(mut child) => {
+                slot += 1;
+                child.stamp(now_ms);
+                child.seed(run_entropy(process, slot));
+                let mut inner: std::collections::VecDeque<Effect> =
+                    child.start().into_iter().collect();
+                while let Some(effect) = inner.pop_front() {
+                    let event = exchange(effect, handle, &mut exchanges).await;
+                    inner.extend(child.step(event));
+                }
+                child.finalize()
             }
-            Effect::Task(
-                TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
-            ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
-            other => panic!("unexpected effect: {other:?}"),
+            effect => exchange(effect, handle, &mut exchanges).await,
         };
         effects.extend(operation.step(event));
     }
@@ -1245,8 +1229,8 @@ async fn count_exchanges(
 #[tokio::test]
 async fn page_exchanges_measured() {
     use crate::distribution::test_store::{install, range};
-    use crate::tests::staging::{create_test_bucket, setup_driver_context};
     use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_test_support::staging::{create_test_bucket, setup_driver_context};
 
     const ENTRIES: usize = 500;
     let test = setup_driver_context().await;
@@ -1257,7 +1241,13 @@ async fn page_exchanges_measured() {
     let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
     let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
     let set_id = snapshot.set_id();
-    crate::distribution::test_record::store_record(handle, set_id, record_bytes).await;
+    aruna_drivers::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
     bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     let write = StorageEffect::Write {
         key_space: S3_BUCKET_KEYSPACE.to_string(),
@@ -1267,7 +1257,7 @@ async fn page_exchanges_measured() {
     };
     handle.send_storage_effect(write).await;
     install(handle, set_id, &[range(1, "", None)]).await;
-    crate::jobs::store::insert_job(handle, &record(token()))
+    aruna_test_support::jobs::insert_job(context, &record(token()))
         .await
         .unwrap();
     for page in 0..4 {
@@ -1278,7 +1268,8 @@ async fn page_exchanges_measured() {
             expected_bucket: bound.clone(),
             ..input(entries.collect())
         };
-        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        let operation = PageImportOperation::new(input);
+        let (exchanges, result) = count_exchanges(operation, handle, page as u32).await;
         assert_eq!(result.unwrap().registered, ENTRIES as u64);
         println!("distributed page {page}: {exchanges} storage exchanges for {ENTRIES} keys");
     }
@@ -1293,7 +1284,8 @@ async fn page_exchanges_measured() {
             ..input(entries.collect())
         };
         let started = std::time::Instant::now();
-        let (exchanges, result) = count_exchanges(PageImportOperation::new(input), handle).await;
+        let operation = PageImportOperation::new(input);
+        let (exchanges, result) = count_exchanges(operation, handle, 4 + page as u32).await;
         assert_eq!(result.unwrap().registered, GATHERED as u64);
         let elapsed = started.elapsed().as_millis();
         println!(
@@ -1323,13 +1315,8 @@ fn mirror_connector_rechecked() {
     let reads = crate::staging::page::rows::guard_reads(&input).unwrap();
     assert_eq!(reads.len(), GUARD_READS + 1);
     let values = |found: Option<&SourceConnector>| {
-        let Event::Storage(StorageEvent::BatchReadResult { mut values }) =
-            guards(None, &record(token()))
-        else {
-            unreachable!()
-        };
-        let found = found.map(|connector| connector.to_bytes().unwrap().into());
-        values.push((Key::from(b"mirror".to_vec()), found));
+        let mut values = guard_values(None, &record(token()));
+        values.push(found.map(|connector| connector.to_bytes().unwrap().into()));
         values
     };
     let check = crate::staging::page::rows::check_guards;

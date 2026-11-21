@@ -8,56 +8,14 @@ pub mod identity;
 pub mod placement;
 pub mod storage;
 
-mod assistant_chat;
-mod assistant_provider;
-mod central_assistant;
+pub mod assistant_chat;
+pub mod assistant_provider;
+pub mod central_assistant;
 pub mod checksum;
-mod info;
-mod path_claim;
-mod persistent_id;
+pub mod info;
+pub mod path_claim;
+pub mod persistent_id;
 pub mod secondary_id;
-mod sync_quarantine;
-mod sync_relationship;
-mod synced_folder;
-
-pub use assistant_chat::{
-    AssistantChatHead, AssistantChatTurn, MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS,
-    MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
-};
-pub use assistant_provider::{
-    AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
-    AssistantProviderStatus, AssistantSecretError,
-};
-pub use central_assistant::{
-    AssistantUsage, CENTRAL_PROVIDER_ID, CentralAssistant, QuotaReached, SESSION_HEADER,
-    USER_HEADER, charge, secs_to_midnight, utc_day,
-};
-pub use info::{
-    BackendState, BlobState, ConnectionAddressState, ConnectionAddressStatus,
-    ConnectionMonitorState, NetState, NetworkDiagnosticsState, OpenConnection, PeerConnectionState,
-    PeerConnectionStatus, ProtocolConnectionState, RequestSummaryState, Status,
-};
-pub use path_claim::{PathClaimRecord, PathResolution, resolve_path_claim};
-pub use persistent_id::{
-    LegacyMapping, MintPersistentSpec, PersistentIdFailure, PersistentIdKind, PersistentIdMapping,
-    PersistentIdProvider, PersistentIdRevision, PersistentIdStatus, persistent_id_change,
-    persistent_id_key, persistent_id_target, secondary_index_deletes, secondary_index_entries,
-};
-pub use sync_quarantine::{
-    QUARANTINE_MAX_BYTES, QUARANTINE_MAX_RECORDS, QUARANTINE_USAGE_KEY, SyncQuarantineCapacity,
-    SyncQuarantineError, SyncQuarantineEvidence, SyncQuarantineFamily, SyncQuarantineIdentity,
-    SyncQuarantineInput, SyncQuarantineRecord, SyncQuarantineUsage, SyncQuarantineWrite,
-    build_quarantine_entries, check_quarantine_capacity, quarantine_row_entry,
-    quarantine_usage_entry, sync_quarantine_key,
-};
-pub use sync_relationship::{
-    ReferenceHandling, SyncCounters, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
-    sync_relationship_key, sync_relationship_prefix, sync_state_key,
-};
-pub use synced_folder::{
-    ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
-    LocalOrigin, MAX_SYNC_PAGE, ORIGIN_DEVICE_TAG, Observed, PendingMark, RemoteBinding,
-    RemoteHead, ReplaceReason, SYNC_TRASH_DIR, SYNC_VERSION_TAG, SyncAction, SyncActionRecord,
-    SyncBase, SyncListCursor, SyncPageLimit, SyncPolicy, SyncPull, SyncPullAck, SyncPullStatus,
-    SyncRefusal, SyncVersionPage, SyncedBytes, SyncedFolder, WriteGuard, decide, tagged_receipt,
-};
+pub mod sync_quarantine;
+pub mod sync_relationship;
+pub mod synced_folder;

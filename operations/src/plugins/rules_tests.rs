@@ -7,9 +7,12 @@ use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::secrets::{Delivery, ResponseExposure};
 
 use super::*;
-use crate::plugins::bound::select;
-use crate::plugins::bound::tests::{ORIGIN, bound, edit_config, secret};
-use crate::plugins::install::tests::Fixture;
+use crate::plugins::calls::*;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::test_support::edit_rules;
+use crate::plugins::test_support::{install_as, install_request};
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::{ORIGIN, bound, edit_config, secret};
 
 fn rule(consumer: &SecretConsumer, response: ResponseExposure) -> UseRule {
     UseRule {
@@ -153,12 +156,12 @@ pub(crate) async fn plain_secret(
     (name, kind): (&str, &str),
     settings: &[(&str, &str)],
 ) {
-    use crate::driver::drive;
     use crate::secrets::SecretChange;
     use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
     use aruna_core::compute::Secret;
     use aruna_core::secret_registers::SecretOwner;
     use aruna_core::secrets::{SecretFields, SecretKind};
+    use aruna_drivers::driver::drive;
     let field = match kind {
         "bearer" => "token",
         _ => "value",
@@ -182,7 +185,6 @@ pub(crate) async fn plain_secret(
         readable: false,
         now_ms: 1,
         write_ids: [1, 2, 3].map(|_| Ulid::generate()),
-        txn_id: None,
     };
     drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await
@@ -191,8 +193,6 @@ pub(crate) async fn plain_secret(
 
 #[tokio::test]
 async fn installs_with_secrets() {
-    use crate::plugins::grants::GrantError;
-    use crate::plugins::install::InstallError;
     let fixture = Fixture::keyed().await;
     plain_secret(&fixture, ("api-key", "bearer"), &[]).await;
     plain_secret(
@@ -213,12 +213,12 @@ async fn installs_with_secrets() {
         "permissions": { "required": ["metadata.read"], "optional": ["secrets.value"] }
     });
     let digest = fixture.publish("0.4.0", "aa", features).await;
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.version = Some(digest);
     request.secrets = [("api_key", "group:api-key"), ("hook_key", "group:hook-key")]
         .map(|(slot, secret)| (slot.to_string(), secret.to_string()))
         .into();
-    let install = fixture.install(&request).await.unwrap();
+    let install = install_as(&fixture, &request).await.unwrap();
     assert_eq!(
         install.state,
         aruna_core::plugin_installs::InstallState::Active
@@ -243,24 +243,20 @@ async fn installs_with_secrets() {
         delivered("hook_key").await,
         [Delivery::Verify, Delivery::Value]
     );
-    // Container work stays refused.
+    // Container work installs within the group's per-job limits.
     let jobs = serde_json::json!({ "permissions": { "required": ["jobs.run"] } });
     let digest = fixture.publish("0.5.0", "bb", jobs).await;
-    let mut request = fixture.request(None);
+    let mut request = install_request(&fixture, None);
     request.version = Some(digest);
-    let refused = fixture.install(&request).await;
-    assert!(
-        matches!(
-            refused,
-            Err(InstallError::Grant(GrantError::Unsupported(_)))
-        ),
-        "{refused:?}"
-    );
+    let installed = install_as(&fixture, &request).await;
+    assert!(installed.is_ok(), "{installed:?}");
 }
 
 /// The bound install moved to a version whose `catalog` and `mirror` connections inject the
 /// slots `api_key` and `other_key`, both bound to the group secret `api-key`.
-async fn shared_install(fixture: &Fixture) -> (PluginInstall, aruna_plugins::manifest::Manifest) {
+async fn shared_install(
+    fixture: &Fixture,
+) -> (PluginInstall, aruna_plugin_types::manifest::Manifest) {
     use aruna_core::plugin_installs::SecretBinding;
     let install = bound(fixture).await;
     secret(fixture, &install).await;
@@ -321,19 +317,20 @@ async fn shared_secret_slots() {
 async fn equal_rules_collapse() {
     let fixture = Fixture::keyed().await;
     let (mut install, _) = shared_install(&fixture).await;
-    let manifest: aruna_plugins::manifest::Manifest = serde_json::from_value(serde_json::json!({
-        "name": "announcer", "version": "0.4.0",
-        "settings": { "catalog_url": { "title": "Catalog", "type": "url" } },
-        "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
-        "connections": {
-            "ids": { "url": "{catalog_url}/api/", "auth": "api_key" },
-            "names": { "url": "{catalog_url}/api/", "auth": "api_key" },
-            "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key" },
-            "whole": { "url": "{catalog_url}/files/", "auth": "api_key" },
-            "brief": { "url": "{catalog_url}/files/", "auth": "api_key" }
-        }
-    }))
-    .unwrap();
+    let manifest: aruna_plugin_types::manifest::Manifest =
+        serde_json::from_value(serde_json::json!({
+            "name": "announcer", "version": "0.4.0",
+            "settings": { "catalog_url": { "title": "Catalog", "type": "url" } },
+            "secrets": { "api_key": { "title": "API key", "kind": "bearer" } },
+            "connections": {
+                "ids": { "url": "{catalog_url}/api/", "auth": "api_key" },
+                "names": { "url": "{catalog_url}/api/", "auth": "api_key" },
+                "deep": { "url": "{catalog_url}/api/v2/", "auth": "api_key" },
+                "whole": { "url": "{catalog_url}/files/", "auth": "api_key" },
+                "brief": { "url": "{catalog_url}/files/", "auth": "api_key" }
+            }
+        }))
+        .unwrap();
     let scope = super::super::grants::InstallScope {
         realm_id: install.account.realm_id,
         group_id: install.group_id,
@@ -360,4 +357,86 @@ async fn equal_rules_collapse() {
             (vec!["/api".to_string()], ResponseExposure::Full),
         ]
     );
+}
+
+fn edit_actor(install: &PluginInstall) -> Actor {
+    Actor {
+        node_id: install.receiver,
+        user_id: install.granted_by,
+        realm_id: install.account.realm_id,
+    }
+}
+
+fn edit_of(install: &PluginInstall, guard: RuleGuard) -> EditRules {
+    let name = SecretName::try_from("api".to_string()).unwrap();
+    let ours = consumer(install);
+    let actor = edit_actor(install);
+    EditRules::new(
+        &actor,
+        (install.group_id, &name),
+        (&ours, Vec::new()),
+        guard,
+        5,
+    )
+}
+
+fn config_with(install: Option<&PluginInstall>) -> IoResult {
+    let realm = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1))
+        .account
+        .realm_id;
+    let mut config = RealmConfigDocument::new(realm, Vec::new(), 3);
+    config.installs.extend(install.cloned());
+    child_result(Ok::<_, GetConfigError>(config))
+}
+
+#[test]
+fn stale_guard_skips() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let current = RuleGuard::Revision {
+        install_id: install.install_id,
+        revision: install.revision + 1,
+    };
+    let mut edit = edit_of(&install, current);
+    assert!(matches!(edit.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(
+        edit.next(config_with(Some(&install))),
+        Ok(Next::Done(false))
+    );
+    let retired = RuleGuard::Retired {
+        install_id: install.install_id,
+    };
+    let mut gone = edit_of(&install, retired);
+    let read = gone.next(config_with(None));
+    assert!(
+        matches!(read, Ok(Next::Call(IoCall::Child(_)))),
+        "a gone install may be cleaned"
+    );
+}
+
+#[test]
+fn missing_entry_refused() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let guard = RuleGuard::Retired {
+        install_id: install.install_id,
+    };
+    let mut edit = edit_of(&install, guard);
+    edit.next(config_with(None)).unwrap();
+    let none = child_result(Ok::<Option<SecretEntry>, EntryError>(None));
+    assert_eq!(edit.next(none), Err(RuleError::Missing));
+}
+
+fn bound_group(install: &mut PluginInstall) {
+    let binding = SecretBinding::parse("group:api").unwrap();
+    install.secrets.insert("slot".to_string(), binding);
+}
+
+#[test]
+fn retiring_skips_missing() {
+    let mut install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    bound_group(&mut install);
+    let actor = edit_actor(&install);
+    let mut retire = RetireRules::new(&actor, &install, 5);
+    assert!(matches!(retire.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let missing = child_result(Err::<bool, _>(RuleError::Missing));
+    assert_eq!(retire.next(missing), Ok(Next::Done(())));
 }

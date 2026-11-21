@@ -5,11 +5,14 @@
 use crate::error::{ServerError, ServerResult};
 use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server::state::ServerState;
-use aruna_core::NodeId;
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_drivers::driver::drive;
 use aruna_operations::realm::ensure_config::EnsureConfigError;
-use aruna_operations::realm::promote_node::{PromoteNodeConfig, PromoteNodeError, promote_node};
+use aruna_operations::realm::promote_node::{
+    PromoteNodeConfig, PromoteNodeError, PromoteNodeOperation,
+};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -65,7 +68,6 @@ other node relays the call to one.
     responses(
         (status = 200, description = "The node holds the realm key and its own realm configuration lists it as a management node; restart it now", body = PromoteNodeResponse, example = json!({"ready": true})),
         (status = 202, description = "The realm configuration lists the node as a management node, but the change has not reached the node yet; repeat the call before restarting it", body = PromoteNodeResponse, example = json!({"ready": false})),
-        (status = 401, description = "Missing or invalid bearer token", body = crate::error::ErrorResponse),
         (status = 403, description = "The caller lacks WRITE on the realm's onboarding administration path", body = crate::error::ErrorResponse),
         (status = 404, description = "No realm node carries this node id", body = crate::error::ErrorResponse),
         (status = 409, description = "The node is a device or the serving node itself, its id is lower than that of the management node keeping the database requests, a group deletion is pending, or another update of the realm configuration won the race; retry", body = crate::error::ErrorResponse),
@@ -96,7 +98,7 @@ pub async fn promote_server_node(
         node_id,
         realm_signing_key: realm_signing_key.clone(),
     };
-    let ready = promote_node(&state.get_ctx(), config)
+    let ready = drive(PromoteNodeOperation::new(config), &state.get_ctx())
         .await
         .map_err(map_promote_error)?;
     let status = match ready {
@@ -134,12 +136,8 @@ fn map_promote_error(error: PromoteNodeError) -> ServerError {
         PromoteNodeError::Ensure(EnsureConfigError::StorageError(
             StorageError::TransactionConflict,
         )) => ServerError::Conflict("concurrent realm configuration update; retry".to_string()),
-        PromoteNodeError::Ensure(EnsureConfigError::StorageError(
-            StorageError::CleanupCapacity,
-        )) => ServerError::ServiceUnavailableReason(
-            "storage cleanup capacity exhausted; retry".to_string(),
-        ),
-        other => ServerError::InternalError(other.to_string()),
+        PromoteNodeError::Ensure(EnsureConfigError::StorageError(error)) => error.into(),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

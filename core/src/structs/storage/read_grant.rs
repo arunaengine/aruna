@@ -8,15 +8,20 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::UserId;
 use crate::id::NodeId;
-use crate::structs::execution::job::SubmissionId;
+use crate::structs::execution::job::family::SubmissionId;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::replication::VersionedObjectArn;
+use crate::user::id::UserId;
 
 /// The longest a granted request may be valid.
 pub const MAX_REQUEST_SECS: u64 = 30;
+
+/// The policy operation of a byte read, the same name the S3 surface uses.
+pub const READ_OPERATION: &str = "s3.GetObject";
+/// The policy operation of a metadata read or of one listed entry.
+pub const HEAD_OPERATION: &str = "s3.HeadObject";
 /// Clock difference between nodes a request tolerates at its start.
 const SKEW_SECS: u64 = 30;
 const GRANT_DOMAIN: &str = "aruna-read-grant-v1";

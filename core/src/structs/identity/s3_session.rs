@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::auth::credential_hash;
 use crate::credential_encryption::{
     CredentialEncryptionKey, EncryptedS3Secret, EncryptionError, credential_aad,
@@ -11,6 +10,7 @@ use crate::errors::ConversionError;
 use crate::structs::identity::auth::PathRestriction;
 use crate::structs::storage::blob::UserAccess;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime};
 use ulid::Ulid;
@@ -89,12 +89,17 @@ impl S3Session {
     }
 
     pub fn credential_aad(&self) -> Vec<u8> {
+        self.aad_until(self.expiry)
+    }
+
+    /// The AAD of this session's identity with `expiry`, its current or its previous one.
+    fn aad_until(&self, expiry: SystemTime) -> Vec<u8> {
         credential_aad(
             &self.access_key,
             self.user_identity,
             self.group_id,
             self.issued_by,
-            self.expiry,
+            expiry,
         )
     }
 
@@ -102,8 +107,9 @@ impl S3Session {
         &mut self,
         key: &CredentialEncryptionKey,
         plaintext: &str,
+        nonce: [u8; 24],
     ) -> Result<(), EncryptionError> {
-        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad())?;
+        self.secret = EncryptedS3Secret::encrypt(key, plaintext, &self.credential_aad(), nonce)?;
         Ok(())
     }
 
@@ -121,14 +127,7 @@ impl S3Session {
         let Some(previous) = token_hash.and_then(|hash| self.previous_for(hash, now)) else {
             return self.open_secret(key);
         };
-        let aad = credential_aad(
-            &self.access_key,
-            self.user_identity,
-            self.group_id,
-            self.issued_by,
-            previous.expiry,
-        );
-        previous.secret.open(key, &aad)
+        previous.secret.open(key, &self.aad_until(previous.expiry))
     }
 
     pub fn as_user_access(&self) -> UserAccess {
@@ -203,10 +202,10 @@ mod tests {
         let key = CredentialEncryptionKey::random();
         let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
         let mut old = session(start + SESSION_MAX_TTL);
-        old.encrypt_secret(&key, "old-secret").unwrap();
+        old.encrypt_secret(&key, "old-secret", [3; 24]).unwrap();
         let mut current = session(start + 2 * SESSION_MAX_TTL);
         current.token_hash = S3Session::hash_token("new-token");
-        current.encrypt_secret(&key, "new-secret").unwrap();
+        current.encrypt_secret(&key, "new-secret", [3; 24]).unwrap();
         current.previous = Some(PreviousCredential {
             secret: old.secret,
             token_hash: old.token_hash,

@@ -4,9 +4,9 @@
 
 use super::*;
 use aruna_core::keyspaces::{REPOSITORY_LINK_KEYSPACE, SHARD_MANIFEST_KEYSPACE};
-use aruna_core::repository::{LinkRemote, LinkStatus, RepositoryLink, link_key};
+use aruna_core::repository::link::{LinkRemote, LinkStatus, RepositoryLink, link_key};
 use aruna_core::storage_entries::shard_manifest_key;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 
 fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) -> RepositoryLink {
     RepositoryLink {
@@ -31,7 +31,7 @@ fn link(document_id: Ulid, owner: NodeId, realm_id: RealmId, generation: u64) ->
         updated_at: std::time::SystemTime::UNIX_EPOCH,
         generation,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     }
 }

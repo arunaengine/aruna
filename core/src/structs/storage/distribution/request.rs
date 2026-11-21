@@ -6,6 +6,7 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use ulid::Ulid;
 
 use super::lifecycle::{
@@ -18,10 +19,13 @@ use super::snapshot::{DistributionSnapshot, Lifecycle};
 use super::split::{admin_split, apply_split};
 use super::validate::validate_config;
 use super::{
-    DistributionConfig, DistributionError, DistributionMember, DistributionSettings,
-    MAX_RECORD_BYTES, MemberState, SetPhase, SetRoot, SignedStatement, StatementKind,
+    DistributionConfig, DistributionMember, DistributionSettings, MAX_RECORD_BYTES, MemberState,
+    SetPhase,
 };
+use crate::calls::IoError;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::distribution::statement::{SetRoot, SignedStatement, StatementKind};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 /// What the former coordinator becomes after a transfer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -461,6 +465,27 @@ fn current(next: &DistributionSnapshot, signed: &SignedStatement, target: Ulid) 
             next.catch_up_cover(signed.statement.member_id, target) == *ranges
         }
         _ => false,
+    }
+}
+
+/// Why the publisher refused or could not take a request.
+#[derive(Clone, Debug, Error, Eq, PartialEq, Serialize, Deserialize)]
+pub enum PublishRefusal {
+    #[error("the bearer token is missing or invalid")]
+    Unauthorized,
+    #[error("caller may not administer the distributed bucket's owner group")]
+    Forbidden,
+    #[error("{0}")]
+    Rejected(String),
+    #[error("the statement is already part of the record")]
+    Replayed,
+    #[error("configuration changes unavailable: {0}")]
+    Unavailable(String),
+}
+
+impl From<IoError> for PublishRefusal {
+    fn from(error: IoError) -> Self {
+        Self::Unavailable(error.to_string())
     }
 }
 

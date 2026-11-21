@@ -88,7 +88,9 @@ async fn quarantine_keeps_placement() {
 
 #[tokio::test]
 async fn quarantine_retains_families() {
-    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEventKind, WatchEventMask, WatchSubscription,
+    };
 
     let (_storage_dir, storage) = test_storage();
     let doc_dir = tempfile::tempdir().expect("doc dir");
@@ -123,18 +125,21 @@ async fn quarantine_retains_families() {
     // Same family, invalid then valid: an unusable path prefix, a delete
     // signed by a node that is not the revision's actor, then a good upsert.
     let invalid_watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         owner,
         "/leading-slash".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
         1,
     );
     let deleted_watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         owner,
         "deleted".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
         1,
     );
     let valid_watch = WatchSubscription::new(
+        ulid::Ulid::generate(),
         owner,
         "documents".to_string(),
         WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
@@ -552,15 +557,7 @@ async fn quarantine_batch_accounting() {
     let commit = |rejections: Vec<SyncRejection>| {
         let service = service.clone();
         async move {
-            let txn_id = start_storage_transaction(&service.storage)
-                .await
-                .expect("transaction starts");
-            let entries = service
-                .quarantine_entries(&rejections, txn_id)
-                .await
-                .expect("evidence builds")
-                .expect("capacity is available");
-            replace_batch_in(&service.storage, txn_id, Vec::new(), entries)
+            run_plan(&service.storage, EvidencePlan(rejections))
                 .await
                 .expect("evidence commits");
         }

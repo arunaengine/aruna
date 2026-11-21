@@ -3,115 +3,230 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::{ADMIN_AUDIT_KEYSPACE, PLUGIN_HOOKS_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::plugin_installs::InstallState;
 use aruna_core::plugin_runs::{HOOK_RETENTION_MS, HOOK_ROW, HOOK_TIME_ROW};
 use aruna_core::structs::identity::admin_audit::{AdminAuditRecord, AuditIndex, audit_prefix};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
-use super::store::{StoreError, Txn, decode, transact};
-use crate::driver::DriverContext;
+use super::rows::{
+    Row, Scan, StoreError, decode, delete_call, done, page_call, page_of, read_call, row, values,
+};
 
 /// How long a node keeps the audit rows of the secret uses it served, like finished runs.
 pub const USE_AUDIT_RETENTION: u64 = 30 * 24 * 3600 * 1000;
-const PAGE: usize = 1_000;
+/// Rows of one prune page.
+pub const PAGE: usize = 1_000;
 /// The realm audit key the use prune checked last, kept in the webhook keyspace. Every older
 /// row was pruned or is kept for good, so the prune goes on from there after a restart.
 const AUDIT_CURSOR: &[u8] = b"c";
 
-/// Deletes the use audit rows past their retention; answers how many records went.
-pub async fn prune_uses(ctx: &DriverContext, now_ms: u64) -> Result<usize, StoreError> {
-    let mut pruned = 0;
-    loop {
-        let (count, more) = prune_page(ctx, now_ms, PAGE).await?;
-        pruned += count;
-        if !more {
-            return Ok(pruned);
-        }
+/// One page of at most `page` use audit rows past their retention, deleted with its cursor in
+/// one transaction; answers how many records went and whether older rows may follow.
+pub(crate) fn prune_uses(now_ms: u64, page: usize) -> PruneUses {
+    PruneUses {
+        cutoff: now_ms.saturating_sub(USE_AUDIT_RETENTION),
+        page,
+        phase: UsesPhase::Cursor,
     }
 }
 
-/// One page of the use prune, written with its cursor in one transaction; answers how many
-/// records went and whether older rows may follow.
-async fn prune_page(
-    ctx: &DriverContext,
-    now_ms: u64,
+#[derive(Debug, PartialEq)]
+pub struct PruneUses {
+    cutoff: u64,
     page: usize,
-) -> Result<(usize, bool), StoreError> {
-    let cutoff = now_ms.saturating_sub(USE_AUDIT_RETENTION);
-    let prefix = audit_prefix(AuditIndex::Realm);
-    transact(ctx, async |txn: &Txn<'_>| {
-        let after = txn.read(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR).await?;
-        let (rows, next) = (txn.page(ADMIN_AUDIT_KEYSPACE, &prefix, after, page)).await?;
-        let (mut dropped, mut count, mut checked, mut young) = (Vec::new(), 0, None, false);
-        for (key, value) in rows {
-            let id = key
-                .get(prefix.len()..)
-                .and_then(|id| <[u8; 16]>::try_from(id).ok());
-            if id.is_some_and(|id| Ulid::from_bytes(id).timestamp_ms() >= cutoff) {
-                young = true;
-                break;
+    phase: UsesPhase,
+}
+
+#[derive(Debug, PartialEq)]
+enum UsesPhase {
+    Cursor,
+    Page,
+    Deleting(Vec<Row>, (usize, bool)),
+    Writing((usize, bool)),
+}
+
+impl Operation for PruneUses {
+    type Output = (usize, bool);
+    type Error = StoreError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        let cursor = vec![(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec())];
+        Ok(Next::Call(read_call(cursor)))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<Self::Output>, StoreError> {
+        let prefix = audit_prefix(AuditIndex::Realm);
+        match std::mem::replace(&mut self.phase, UsesPhase::Writing((0, false))) {
+            UsesPhase::Cursor => {
+                let [after] = values::<1>(answer)?;
+                self.phase = UsesPhase::Page;
+                Ok(Next::Call(page_call(
+                    ADMIN_AUDIT_KEYSPACE,
+                    prefix,
+                    after,
+                    self.page,
+                )))
             }
-            let record = AdminAuditRecord::from_bytes(&value).ok();
-            let record = record.filter(|record| record.secret_use.is_some());
-            if let Some(entries) = record.and_then(|record| record.entries().ok()) {
-                dropped.extend(entries.into_iter().map(|(_, key, _)| key.to_vec()));
-                count += 1;
+            UsesPhase::Page => {
+                let (rows, next) = page_of(answer)?;
+                let (mut dropped, mut count, mut checked, mut young) = (Vec::new(), 0, None, false);
+                for (key, value) in rows {
+                    let id = (key.get(prefix.len()..)).and_then(|id| <[u8; 16]>::try_from(id).ok());
+                    if id.is_some_and(|id| Ulid::from_bytes(id).timestamp_ms() >= self.cutoff) {
+                        young = true;
+                        break;
+                    }
+                    let record = AdminAuditRecord::from_bytes(&value).ok();
+                    let record = record.filter(|record| record.secret_use.is_some());
+                    if let Some(entries) = record.and_then(|record| record.entries().ok()) {
+                        let keys = entries.into_iter().map(|(_, key, _)| key.to_vec());
+                        dropped.extend(keys.map(|key| (ADMIN_AUDIT_KEYSPACE, key)));
+                        count += 1;
+                    }
+                    checked = Some(key);
+                }
+                let cursor =
+                    checked.map(|key| row(PLUGIN_HOOKS_KEYSPACE, AUDIT_CURSOR.to_vec(), key));
+                let outcome = (count, !young && next.is_some());
+                self.phase = UsesPhase::Deleting(cursor.into_iter().collect(), outcome);
+                Ok(Next::Call(delete_call(dropped)))
             }
-            checked = Some(key);
+            UsesPhase::Deleting(cursor, outcome) => {
+                done(answer)?;
+                self.phase = UsesPhase::Writing(outcome);
+                Ok(Next::Call(IoCall::Write(cursor)))
+            }
+            UsesPhase::Writing(outcome) => {
+                done(answer)?;
+                Ok(Next::Done(outcome))
+            }
         }
-        txn.delete(ADMIN_AUDIT_KEYSPACE, dropped).await?;
-        if let Some(key) = checked {
-            let cursor = vec![(AUDIT_CURSOR.to_vec(), key)];
-            txn.write(PLUGIN_HOOKS_KEYSPACE, cursor).await?;
-        }
-        Ok((count, !young && next.is_some()))
-    })
-    .await
+    }
 }
 
 /// Deletes the webhook delivery ids past their retention, and every one of a removing
 /// install; answers how many went.
-pub async fn prune_hooks(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    now_ms: u64,
-) -> Result<usize, StoreError> {
-    let cutoff = now_ms.saturating_sub(HOOK_RETENTION_MS);
-    let txn = Txn::direct(ctx);
-    let mut pruned = 0;
-    loop {
-        let (rows, next) = (txn.page(PLUGIN_HOOKS_KEYSPACE, &[HOOK_TIME_ROW], None, PAGE)).await?;
-        let total = rows.len();
-        let old: Vec<Vec<u8>> = (rows.into_iter())
-            .map(|(key, _)| key)
-            .take_while(|key| received(key).is_none_or(|at| at < cutoff))
-            .collect();
-        let ids = (old.iter()).filter_map(|key| Some([&[HOOK_ROW][..], key.get(9..)?].concat()));
-        let ids = ids.collect();
-        pruned += old.len();
-        let done = old.len() < total || next.is_none();
-        remove(ctx, ids, old).await?;
-        if done {
-            break;
-        }
+pub fn prune_hooks(config: &RealmConfigDocument, now_ms: u64) -> PruneHooks {
+    let mut removing: Vec<Ulid> = (config.installs.iter())
+        .filter(|install| install.state == InstallState::Removing)
+        .map(|install| install.install_id)
+        .collect();
+    removing.reverse();
+    PruneHooks {
+        cutoff: now_ms.saturating_sub(HOOK_RETENTION_MS),
+        removing,
+        phase: HooksPhase::Times,
+        pruned: 0,
     }
-    let removing =
-        (config.installs.iter()).filter(|install| install.state == InstallState::Removing);
-    for install in removing {
-        let prefix = [&[HOOK_ROW][..], &install.install_id.to_bytes()].concat();
-        let (mut ids, mut times) = (Vec::new(), Vec::new());
-        for (key, value) in txn.scan(PLUGIN_HOOKS_KEYSPACE, &prefix).await? {
-            if let (Ok(at), Some(rest)) = (decode::<u64>(&value), key.get(1..)) {
-                times.push([&[HOOK_TIME_ROW][..], &at.to_be_bytes(), rest].concat());
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PruneHooks {
+    cutoff: u64,
+    /// The removing installs whose delivery ids are still to delete, last first.
+    removing: Vec<Ulid>,
+    phase: HooksPhase,
+    pruned: usize,
+}
+
+#[derive(Debug, PartialEq)]
+enum HooksPhase {
+    /// Reads the oldest time rows, deleted a page at a time with their ids.
+    Times,
+    /// Deletes a page of old rows; `true` when more old rows may follow.
+    DeletingOld(bool),
+    /// Reads a removing install's delivery ids a page at a time.
+    Removing(Scan),
+    /// Deletes one page of them; the scan goes on while it has more.
+    DeletingRemoved(Option<Scan>),
+}
+
+impl PruneHooks {
+    fn times() -> IoCall {
+        page_call(PLUGIN_HOOKS_KEYSPACE, vec![HOOK_TIME_ROW], None, PAGE)
+    }
+
+    /// The scan of the next removing install, or the outcome once none is left.
+    fn next_removing(&mut self) -> Next<usize> {
+        let Some(install_id) = self.removing.pop() else {
+            return Next::Done(self.pruned);
+        };
+        let prefix = [&[HOOK_ROW][..], &install_id.to_bytes()].concat();
+        let scan = Scan::new(PLUGIN_HOOKS_KEYSPACE, prefix);
+        let ask = scan.ask();
+        self.phase = HooksPhase::Removing(scan);
+        Next::Call(ask)
+    }
+}
+
+impl Operation for PruneHooks {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(Self::times()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        match std::mem::replace(&mut self.phase, HooksPhase::DeletingRemoved(None)) {
+            HooksPhase::Times => {
+                let (rows, next) = page_of(answer)?;
+                let total = rows.len();
+                let old: Vec<Vec<u8>> = (rows.into_iter())
+                    .map(|(key, _)| key)
+                    .take_while(|key| received(key).is_none_or(|at| at < self.cutoff))
+                    .collect();
+                let more = old.len() == total && next.is_some();
+                self.pruned += old.len();
+                let ids =
+                    (old.iter()).filter_map(|key| Some([&[HOOK_ROW][..], key.get(9..)?].concat()));
+                let mut keys: Vec<_> = ids.map(|key| (PLUGIN_HOOKS_KEYSPACE, key)).collect();
+                keys.extend(old.into_iter().map(|key| (PLUGIN_HOOKS_KEYSPACE, key)));
+                self.phase = HooksPhase::DeletingOld(more);
+                Ok(Next::Call(delete_call(keys)))
             }
-            ids.push(key);
+            HooksPhase::DeletingOld(more) => {
+                done(answer)?;
+                if more {
+                    self.phase = HooksPhase::Times;
+                    return Ok(Next::Call(Self::times()));
+                }
+                Ok(self.next_removing())
+            }
+            HooksPhase::Removing(mut scan) => {
+                let (rows, more) = scan.page(answer)?;
+                self.phase = HooksPhase::DeletingRemoved(more.then_some(scan));
+                let (mut ids, mut times) = (Vec::new(), Vec::new());
+                for (key, value) in rows {
+                    if let (Ok(at), Some(rest)) = (decode::<u64>(&value), key.get(1..)) {
+                        let time = [&[HOOK_TIME_ROW][..], &at.to_be_bytes(), rest].concat();
+                        times.push((PLUGIN_HOOKS_KEYSPACE, time));
+                    }
+                    ids.push((PLUGIN_HOOKS_KEYSPACE, key));
+                }
+                self.pruned += ids.len();
+                ids.append(&mut times);
+                Ok(Next::Call(delete_call(ids)))
+            }
+            HooksPhase::DeletingRemoved(scan) => {
+                done(answer)?;
+                let Some(scan) = scan else {
+                    return Ok(self.next_removing());
+                };
+                let ask = scan.ask();
+                self.phase = HooksPhase::Removing(scan);
+                Ok(Next::Call(ask))
+            }
         }
-        pruned += ids.len();
-        remove(ctx, ids, times).await?;
     }
-    Ok(pruned)
 }
 
 /// The receipt time of a time row.
@@ -119,16 +234,40 @@ fn received(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(key.get(1..9)?.try_into().ok()?))
 }
 
-async fn remove(
-    ctx: &DriverContext,
-    ids: Vec<Vec<u8>>,
-    times: Vec<Vec<u8>>,
-) -> Result<(), StoreError> {
-    transact(ctx, async |txn: &Txn<'_>| {
-        txn.delete(PLUGIN_HOOKS_KEYSPACE, ids).await?;
-        txn.delete(PLUGIN_HOOKS_KEYSPACE, times).await
-    })
-    .await
+/// Deletes the use audit rows past their retention, a page per transaction; answers how many
+/// records went.
+#[derive(Debug, PartialEq)]
+pub struct PruneAudit {
+    now_ms: u64,
+    pruned: usize,
+}
+
+impl PruneAudit {
+    pub fn new(now_ms: u64) -> Self {
+        Self { now_ms, pruned: 0 }
+    }
+
+    fn page(&self) -> IoCall {
+        IoCall::child(prune_uses(self.now_ms, PAGE))
+    }
+}
+
+impl Operation for PruneAudit {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(Next::Call(self.page()))
+    }
+
+    fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
+        let (count, more) = answer.child::<(usize, bool), StoreError>()??;
+        self.pruned += count;
+        Ok(match more {
+            true => Next::Call(self.page()),
+            false => Next::Done(self.pruned),
+        })
+    }
 }
 
 #[cfg(test)]

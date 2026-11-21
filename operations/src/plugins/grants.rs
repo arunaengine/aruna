@@ -5,17 +5,20 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use aruna_core::structs::identity::auth::Permission as Access;
+use aruna_core::compute::quota::ComputeQuota;
+use aruna_core::id::NodeId;
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission as Access};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::types::GroupId;
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::{Grant, Permission};
+use aruna_plugin_types::calls::{ErrorKind, HostError};
+use aruna_plugin_types::manifest::Manifest;
+use aruna_plugin_types::permission::{Grant, Permission};
 use thiserror::Error;
 use ulid::Ulid;
 
-/// Granted resource patterns: `read` and `write` as the installer scoped them, and the paths of
-/// the services and readable secrets the manifest declares.
-pub type Grants = BTreeMap<Grant, BTreeSet<String>>;
+use crate::auth::install_access::{Grants, accesses, covers, patterns_for};
 
 pub const READ_ROLE: &str = "plugin-read";
 pub const WRITE_ROLE: &str = "plugin-write";
@@ -61,10 +64,18 @@ impl InstallScope {
     }
 }
 
-/// Refuses what this version of Aruna cannot run yet: container work.
-pub fn check_supported(manifest: &Manifest) -> Result<(), GrantError> {
-    if manifest.requested().contains(&Permission::JobsRun) {
-        return Err(GrantError::Unsupported("jobs.run cannot be granted yet"));
+/// Refuses a task whose resources no job of the group may have: above the per-job CPU, RAM or
+/// walltime limit of the group's compute quota.
+pub(crate) fn check_supported(manifest: &Manifest, quota: &ComputeQuota) -> Result<(), GrantError> {
+    for recipe in manifest.recipes.values() {
+        let over = quota.job_cpu_cores.is_some_and(|cpu| recipe.cpu > cpu)
+            || quota.job_ram_bytes.is_some_and(|ram| recipe.memory > ram)
+            || (quota.job_walltime_ms).is_some_and(|time| recipe.time.saturating_mul(1000) > time);
+        if over {
+            return Err(GrantError::Unsupported(
+                "a task asks for more CPU, memory or time than the group's jobs may have",
+            ));
+        }
     }
     Ok(())
 }
@@ -76,7 +87,7 @@ pub fn writes(manifest: &Manifest) -> bool {
 
 /// `read`, and `write` when requested, on the whole group, and every declared service and
 /// readable secret.
-pub fn default_grants(manifest: &Manifest, scope: &InstallScope) -> Grants {
+pub(crate) fn default_grants(manifest: &Manifest, scope: &InstallScope) -> Grants {
     let whole = BTreeSet::from([format!("{}/**", scope.group())]);
     let mut grants = Grants::from([(Grant::Read, whole.clone())]);
     if writes(manifest) {
@@ -103,7 +114,7 @@ fn declared(manifest: &Manifest, scope: &InstallScope) -> Grants {
 
 /// The default grants with the admin's choices applied: `read` or `write` keeps only the listed
 /// patterns, and an empty list removes it.
-pub fn narrow_grants(
+pub(crate) fn narrow_grants(
     manifest: &Manifest,
     scope: &InstallScope,
     choices: &BTreeMap<String, Vec<String>>,
@@ -160,13 +171,13 @@ fn resource_grants(
         .collect()
 }
 
-/// The granted patterns a call of `permission` may use.
-pub fn patterns_for(grants: &Grants, permission: Permission) -> BTreeSet<String> {
-    (permission.grants().iter())
-        .filter_map(|grant| grants.get(grant))
-        .flatten()
-        .cloned()
-        .collect()
+/// Whether a held pattern reaches every path of `pattern`: a subtree only by a subtree.
+pub(crate) fn held_covers(held: &BTreeSet<String>, pattern: &str) -> bool {
+    let (base, subtree) = match pattern.strip_suffix("/**") {
+        Some(base) => (base, true),
+        None => (pattern, false),
+    };
+    (held.iter()).any(|q| (!subtree || q.ends_with("/**")) && covers(q, base))
 }
 
 /// Whether `pattern` names `root/**` or a path or subtree below `root`: clean segments, and
@@ -190,24 +201,8 @@ pub fn within(pattern: &str, root: &str) -> bool {
     })
 }
 
-/// The accesses a permission's actions need on its patterns, as the plan's table checks them.
-pub fn accesses(permission: Permission) -> &'static [Access] {
-    match permission {
-        Permission::ObjectsCopy => &[Access::READ, Access::WRITE],
-        Permission::MetadataWrite
-        | Permission::MetadataCreate
-        | Permission::TransfersDownload
-        | Permission::JobsRun => &[Access::WRITE],
-        Permission::MetadataRead
-        | Permission::ObjectsRead
-        | Permission::TransfersUpload
-        | Permission::ConnectionsSend
-        | Permission::SecretsValue => &[Access::READ],
-    }
-}
-
 /// The access the role needs on a grant's patterns.
-pub fn grant_access(grant: Grant) -> Access {
+pub(crate) fn grant_access(grant: Grant) -> Access {
     match grant {
         Grant::Write => Access::WRITE,
         Grant::Read | Grant::Services | Grant::Secrets => Access::READ,
@@ -229,7 +224,7 @@ pub fn role_paths(grants: &Grants) -> HashMap<String, Access> {
 }
 
 /// `plugin-write` when any path needs WRITE, else `plugin-read`.
-pub fn role_name(paths: &HashMap<String, Access>) -> &'static str {
+pub(crate) fn role_name(paths: &HashMap<String, Access>) -> &'static str {
     match paths.values().any(|access| *access == Access::WRITE) {
         true => WRITE_ROLE,
         false => READ_ROLE,
@@ -239,7 +234,7 @@ pub fn role_name(paths: &HashMap<String, Access>) -> &'static str {
 /// What an update to `manifest` keeps of `granted`: `read`, `write` while the new version still
 /// writes, and the services and secrets it declares. It grants nothing new; the second value
 /// lists what the new version requires but nobody granted yet.
-pub fn carry_grants(
+pub(crate) fn carry_grants(
     granted: &Grants,
     manifest: &Manifest,
     scope: &InstallScope,
@@ -264,13 +259,72 @@ pub fn stored_grants(grants: &Grants) -> BTreeMap<String, Vec<String>> {
         .collect()
 }
 
-/// Grants read back from an install record; names this version does not know are dropped.
-pub fn parse_grants(stored: &BTreeMap<String, Vec<String>>) -> Grants {
-    (stored.iter())
-        .filter_map(|(name, patterns)| {
-            Some((name.parse().ok()?, patterns.iter().cloned().collect()))
+/// The full permission path of an object path a plugin gives: a path below the realm as it is,
+/// or `bucket/key` (a prefix ends in `/`) on this node. Expanded before any grant check, so a
+/// path the plugin did not mean is never checked.
+pub fn object_path(
+    (realm_id, local): (RealmId, NodeId),
+    group: GroupId,
+    text: &str,
+) -> Result<String, HostError> {
+    if text.starts_with('/') {
+        return Ok(text.to_string());
+    }
+    let invalid = || {
+        let message = format!("`{text}` is not a bucket path such as `bucket/key`");
+        HostError::new(ErrorKind::Invalid, message)
+    };
+    let (bucket, key) = text.split_once('/').unwrap_or((text, ""));
+    let segments: Vec<&str> = key.split('/').collect();
+    let last = segments.len() - 1;
+    let plain = (segments.iter().enumerate()).all(|(index, segment)| {
+        !matches!(*segment, "." | "..") && (index == last || !segment.is_empty())
+    });
+    if matches!(bucket, "" | "." | "..") || !plain {
+        return Err(invalid());
+    }
+    Ok(object_permission_path(realm_id, group, local, bucket, key))
+}
+
+/// The `bucket/key` of a permission path of an object on `local` in the install's group; any other
+/// text stays as it is.
+pub fn short_path(path: &str, (install, local): (&PluginInstall, NodeId)) -> String {
+    let realm = install.account.realm_id;
+    let root = format!("/{realm}/g/{}/data/{local}/", install.group_id);
+    path.strip_prefix(&root).unwrap_or(path).to_string()
+}
+
+/// The scope of an install, for its generated grant paths.
+pub fn install_scope(install: &PluginInstall) -> InstallScope {
+    InstallScope {
+        realm_id: install.account.realm_id,
+        group_id: install.group_id,
+        install_id: install.install_id,
+    }
+}
+
+/// The install's account restricted to `patterns`, at the access `permission` needs.
+pub(crate) fn restricted_account(
+    (install, realm_id): (&PluginInstall, RealmId),
+    patterns: &BTreeSet<String>,
+    permission: Permission,
+) -> AuthContext {
+    let access = match accesses(permission).contains(&Access::WRITE) {
+        true => Access::WRITE,
+        false => Access::READ,
+    };
+    let restrictions = (patterns.iter())
+        .map(|pattern| PathRestriction {
+            pattern: pattern.clone(),
+            permission: access.clone(),
         })
-        .collect()
+        .collect();
+    AuthContext {
+        user_id: install.account,
+        realm_id,
+        path_restrictions: Some(restrictions),
+        session: None,
+    }
 }
 
 #[cfg(test)]

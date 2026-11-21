@@ -15,9 +15,11 @@ use wasmtime_wasi::p2::{DynPollable, OutputStream, Pollable, StreamError, Stream
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_io::bindings::wasi::io::poll::Host as _;
 
-use crate::broker::{Broker, CallContext, ErrorKind, HostError};
+use aruna_plugin_types::permission::Permission;
+
+use crate::broker::{Broker, CallContext};
 use crate::limits::Limits;
-use crate::permission::Permission;
+use wit::aruna::plugin::types::{ErrorKind, HostError};
 
 pub mod wit {
     wasmtime::component::bindgen!({
@@ -26,6 +28,15 @@ pub mod wit {
         imports: { default: async | trappable },
         additional_derives: [PartialEq, Eq],
     });
+}
+
+impl HostError {
+    pub(crate) fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
 }
 
 const MAX_TABLE: usize = 100_000;

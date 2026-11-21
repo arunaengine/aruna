@@ -1,5 +1,5 @@
-//! Builds each plugin example once and runs its cases against one fake group of datasets, objects,
-//! service answers, secrets, state and copies. Opt in with ARUNA_PLUGIN_LANGUAGES=1.
+//! Builds each plugin example and runs its cases against one fake group (datasets, objects,
+//! answers, secrets, state, copies); ignored by default, a run on purpose needs the toolchains.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -11,20 +11,24 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
 
+use aruna_plugin_types::calls::{
+    Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, JobStatus, Listing,
+    ObjectInfo, ObjectPage, Response, merge_into,
+};
+use aruna_plugin_types::permission::Permission;
+use aruna_plugins::CancellationToken;
 use aruna_plugins::broker::{
-    Broker, CallContext, Created, Document, Entry, ErrorKind, Field, FileChange, FilePage,
-    HostError, Intent, JobCopy, JobDownload, JobStatus, JobUpload, Listing, MetadataCreate,
-    MetadataPatch, ObjectInfo, ObjectPage, Response, SendRequest, StatePut, StateRemove,
+    Broker, CallContext, FileChange, JobCopy, JobDownload, JobTask, JobUpload, MetadataCreate,
+    MetadataPatch, SendRequest, StatePut, StateRemove,
+};
+use aruna_plugins::host::wit::aruna::plugin::types::{
+    Failure, FailureKind, Trigger, WatchEvent, WebhookDelivery, WebhookRequest,
 };
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
-use aruna_plugins::permission::Permission;
-use aruna_plugins::{
-    CancellationToken, Compiled, Failure, FailureKind, Invocation, InvokeError, Runtime, Trigger,
-    WatchEvent, WebhookDelivery, WebhookRequest,
-};
+use aruna_plugins::runtime::{Compiled, Invocation, InvokeError, Runtime};
 
-use common::{available, limits};
+use common::{limits, require};
 
 mod common;
 
@@ -55,6 +59,9 @@ struct Transfer {
     path: String,
     state: String,
     reply: Option<(u16, Vec<u8>)>,
+    /// A task's report and the objects it wrote.
+    report: Option<String>,
+    outputs: Vec<String>,
 }
 
 #[derive(Default)]
@@ -104,6 +111,8 @@ impl State {
             path,
             state: "queued".into(),
             reply: None,
+            report: None,
+            outputs: Vec::new(),
         };
         self.transfers.entry(id.clone()).or_insert(transfer);
         id
@@ -190,6 +199,28 @@ impl Group {
             .collect()
     }
 
+    /// Ends task `id` in `state` with its report and the objects it wrote.
+    fn finish_task(&self, id: &str, state: &str, (report, outputs): (Option<Value>, &[&str])) {
+        self.with(|group| {
+            let task = group.transfers.get_mut(id).unwrap();
+            task.state = state.into();
+            task.report = report.map(|report| report.to_string());
+            task.outputs = outputs.iter().map(|path| path.to_string()).collect();
+            for path in outputs {
+                let version = Version {
+                    id: format!("{id}-out"),
+                    content: b"bam".to_vec(),
+                    marked: false,
+                };
+                group
+                    .objects
+                    .entry(path.to_string())
+                    .or_default()
+                    .push(version);
+            }
+        });
+    }
+
     /// Ends job `id` in `state` with an upload's `reply`; a download that succeeded wrote its
     /// target as a new version named by the job.
     fn finish(&self, id: &str, state: &str, reply: Option<(u16, Value)>) {
@@ -269,26 +300,6 @@ fn paged<T: Clone>(items: &[T], cursor: Option<String>) -> (Vec<T>, Option<Strin
     let next = start + PAGE;
     let page = items.iter().skip(start).take(PAGE).cloned().collect();
     (page, (next < items.len()).then(|| next.to_string()))
-}
-
-/// Applies a JSON merge patch by the host's rules; `merge_cases.json` holds both to the same cases.
-fn merge_into(target: &mut Value, patch: Value) {
-    let Value::Object(changes) = patch else {
-        *target = patch;
-        return;
-    };
-    if !target.is_object() {
-        *target = Value::Object(Map::new());
-    }
-    let Value::Object(fields) = target else {
-        return;
-    };
-    for (key, value) in changes {
-        match value {
-            Value::Null => drop(fields.remove(&key)),
-            value => merge_into(fields.entry(key).or_insert(Value::Null), value),
-        }
-    }
 }
 
 /// An entity id as the node stores it, by the rule of `normalize_entity_id` in
@@ -549,6 +560,45 @@ impl Broker for Group {
         }))
     }
 
+    async fn jobs_start_task(&self, cx: &CallContext, task: JobTask) -> Result<String, HostError> {
+        let pairs = |fields: &[Field]| -> Vec<String> {
+            (fields.iter())
+                .map(|field| format!("{}={}", field.name, field.value))
+                .collect()
+        };
+        let inputs: Vec<String> = (task.inputs.iter())
+            .map(|(path, source, _)| format!("{path}={source}"))
+            .collect();
+        let files: Vec<String> = (task.files.iter())
+            .map(|(path, content)| format!("{path}={}", String::from_utf8_lossy(content)))
+            .collect();
+        let call = format!(
+            "task {} {} {} {} {}",
+            task.task,
+            pairs(&task.parameters).join(","),
+            inputs.join(","),
+            files.join(","),
+            pairs(&task.outputs).join(",")
+        );
+        Ok(self.with(|state| state.transfer(cx, &task.intent, call, ("task", String::new()))))
+    }
+
+    async fn jobs_outputs(
+        &self,
+        _: &CallContext,
+        id: &str,
+        cursor: Option<String>,
+    ) -> Result<ObjectPage, HostError> {
+        let outputs = self.with(|state| state.transfers.get(id).map(|task| task.outputs.clone()));
+        let outputs =
+            outputs.ok_or_else(|| HostError::new(ErrorKind::NotFound, format!("no job {id}")))?;
+        let infos: Vec<ObjectInfo> = (outputs.iter())
+            .map(|path| info(self.version(path, None).unwrap()))
+            .collect();
+        let (objects, cursor) = paged(&infos, cursor);
+        Ok(ObjectPage { objects, cursor })
+    }
+
     /// As on the node, a source the install may not send is not found.
     async fn jobs_upload(&self, cx: &CallContext, upload: JobUpload) -> Result<String, HostError> {
         let (_, source) = self.version(&upload.source, upload.version.as_deref())?;
@@ -582,8 +632,8 @@ impl Broker for Group {
                 reply_headers: status.map(|_| headers).unwrap_or_default(),
                 reply_status: status,
                 reply_body: body,
-                exit_code: None,
-                report: None,
+                exit_code: (transfer.kind == "task").then_some(0),
+                report: transfer.report,
             });
         }
         let copy = self.with(|state| state.copies.get(id).cloned());
@@ -646,8 +696,8 @@ struct Example {
     connections: BTreeSet<String>,
 }
 
-/// Builds `plugins/examples/<name>`, or answers none when its toolchain is missing.
-async fn example(name: &str) -> Option<Example> {
+/// Builds `plugins/examples/<name>`; a missing toolchain fails the test.
+async fn example(name: &str) -> Example {
     let project = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples")
         .join(name);
@@ -656,9 +706,7 @@ async fn example(name: &str) -> Option<Example> {
         _ if project.join("plugin.js").is_file() => ("javascript", "npx"),
         _ => ("python", "uv"),
     };
-    if !available(language, program) {
-        return None;
-    }
+    require(language, program);
     let built = tokio::task::spawn_blocking(move || build_project(&project))
         .await
         .unwrap();
@@ -670,12 +718,12 @@ async fn example(name: &str) -> Option<Example> {
     };
     let runtime = Runtime::new(config).unwrap();
     let compiled = runtime.prepare(built.artifact).await.unwrap();
-    Some(Example {
+    Example {
         runtime,
         compiled,
         permissions: built.manifest.requested(),
         connections: built.manifest.connections.keys().cloned().collect(),
-    })
+    }
 }
 
 impl Example {
@@ -755,9 +803,7 @@ fn merge_cases() {
 /// Posts a new dataset to the catalog and saves the catalog's id on it, then again by hand; an
 /// answer without an id or with status 500 fails the run before anything is written.
 async fn announce(language: &str) {
-    let Some(example) = example(&format!("announcer/{language}")).await else {
-        return;
-    };
+    let example = example(&format!("announcer/{language}")).await;
     let settings = json!({ "catalog_url": "https://catalog.example.org" });
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));
@@ -806,26 +852,28 @@ async fn announce(language: &str) {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn announcer_python() {
     announce("python").await;
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn announcer_javascript() {
     announce("javascript").await;
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn announcer_rust() {
     announce("rust").await;
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn import_record() {
     // A record becomes a dataset named by its path, so a second import answers the same one.
-    let Some(example) = example("import-record").await else {
-        return;
-    };
+    let example = example("import-record").await;
     let group = Group::new();
     let meta = json!({ "title": "Gel images", "keywords": ["gel"], "license": { "id": "cc-by-4.0" },
         "publication_date": "2026-01-02", "creators": [{ "name": "Ada" }] });
@@ -869,11 +917,10 @@ async fn import_record() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn fill_defaults() {
     // Only missing fields are filled; a dataset that has them all makes no write.
-    let Some(example) = example("fill-defaults").await else {
-        return;
-    };
+    let example = example("fill-defaults").await;
     let settings = json!({ "license": "CC0-1.0", "publisher": "Lab" });
     let group = Group::new();
     group.dataset(
@@ -900,11 +947,10 @@ async fn fill_defaults() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn link_objects() {
     // Every object below the path is linked once, by its `s3://` address, across listing pages.
-    let Some(example) = example("link-objects").await else {
-        return;
-    };
+    let example = example("link-objects").await;
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));
     for (name, content) in [("a.fq", "ACGT"), ("b.fq", "ACGTAC"), ("c.fq", "AC")] {
@@ -928,12 +974,11 @@ async fn link_objects() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn archive_uploads() {
     // The copy is pinned to the uploaded version, also when a newer one came since; a rerun of
     // the run gets the same job, and an upload elsewhere is left alone.
-    let Some(example) = example("archive-uploads").await else {
-        return;
-    };
+    let example = example("archive-uploads").await;
     let settings = json!({ "incoming": "lab-incoming/", "archive": "lab-archive/" });
     let group = Group::new();
     group.object("lab-incoming/run/a.txt", "v1", b"first");
@@ -966,12 +1011,11 @@ async fn archive_uploads() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn archive_inside() {
     // The node delivers the copy's own upload too, so overlapping paths are refused before
     // anything is copied.
-    let Some(example) = example("archive-uploads").await else {
-        return;
-    };
+    let example = example("archive-uploads").await;
     let group = Group::new();
     group.object("lab/incoming/run/a.txt", "v1", b"first");
     let upload = event("data_uploaded", "lab/incoming/run/a.txt", "v1");
@@ -988,11 +1032,10 @@ async fn archive_inside() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn nightly_report() {
     // Datasets without a description are reported once; the next night reports nothing new.
-    let Some(example) = example("nightly-report").await else {
-        return;
-    };
+    let example = example("nightly-report").await;
     let settings = json!({ "chat_url": "https://chat.example.org", "channel": "c-9" });
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));
@@ -1015,11 +1058,10 @@ async fn nightly_report() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn set_keywords() {
     // Keywords are added once each, or replace the old ones; an empty form is invalid input.
-    let Some(example) = example("set-keywords").await else {
-        return;
-    };
+    let example = example("set-keywords").await;
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7", "keywords": ["seq", "pcr"] }));
     let form = |keywords: &str, replace: bool| {
@@ -1038,11 +1080,10 @@ async fn set_keywords() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn tag_updates() {
     // A changed dataset gets the keyword once; the change that adds it writes nothing more.
-    let Some(example) = example("tag-updates").await else {
-        return;
-    };
+    let example = example("tag-updates").await;
     let settings = json!({ "tag": "changed" });
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7", "keywords": ["seq"] }));
@@ -1058,11 +1099,10 @@ async fn tag_updates() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn link_uploads() {
     // An upload below the path becomes a file of the dataset, named by its `s3://` address.
-    let Some(example) = example("link-uploads").await else {
-        return;
-    };
+    let example = example("link-uploads").await;
     let settings = json!({ "dataset": "D1", "prefix": "lab-incoming/" });
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));
@@ -1087,11 +1127,10 @@ async fn link_uploads() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn upload_counter() {
     // Each bucket keeps its own count across runs.
-    let Some(example) = example("upload-counter").await else {
-        return;
-    };
+    let example = example("upload-counter").await;
     let group = Group::new();
     for (path, content) in [("raw/a", "ab"), ("raw/b", "abc"), ("other/c", "a")] {
         group.object(path, "v1", content.as_bytes());
@@ -1111,11 +1150,10 @@ async fn upload_counter() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn object_report() {
     // The report reads every page of the listing; an empty path reports no objects.
-    let Some(example) = example("object-report").await else {
-        return;
-    };
+    let example = example("object-report").await;
     let group = Group::new();
     for (name, content) in [("a.fq", "ACGT"), ("b.fq", "ACGTACGT"), ("c.fq", "AC")] {
         group.object(&format!("raw/run-7/{name}"), "v1", content.as_bytes());
@@ -1144,11 +1182,10 @@ fn webhook(delivery: &str, body: Value) -> Trigger {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn release_datasets() {
     // A published release becomes a dataset; a repeated delivery answers the same one.
-    let Some(example) = example("release-datasets").await else {
-        return;
-    };
+    let example = example("release-datasets").await;
     let group = Group::new();
     let release = json!({ "id": 7, "tag_name": "v1.0", "name": "First", "body": "Notes",
         "html_url": "https://github.com/lab/tool/releases/v1.0",
@@ -1177,11 +1214,10 @@ async fn release_datasets() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn fill_license() {
     // A dataset outside the install's write scope answers `NotAllowed` and is skipped.
-    let Some(example) = example("fill-license").await else {
-        return;
-    };
+    let example = example("fill-license").await;
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));
     group.dataset("D2", json!({ "name": "Run 8", "license": "CC0-1.0" }));
@@ -1197,12 +1233,11 @@ async fn fill_license() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn orcid_names() {
     // The author is added as a reference to the ORCID iD, next to the one already there, and
     // once only; the name from the public record is the run's answer.
-    let Some(example) = example("orcid-names").await else {
-        return;
-    };
+    let example = example("orcid-names").await;
     let group = Group::new();
     let before = json!({ "@id": "https://orcid.org/0000-0001-5109-3700" });
     group.dataset("D1", json!({ "name": "Run 7", "author": [before] }));
@@ -1228,12 +1263,11 @@ async fn orcid_names() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn sync_alerts() {
     // The first failure after a success is sent; a post the chat refused is tried again at the
     // next failure, and a completed sync starts again.
-    let Some(example) = example("sync-alerts").await else {
-        return;
-    };
+    let example = example("sync-alerts").await;
     let settings = json!({ "chat_url": "https://chat.example.org" });
     let group = Group::new();
     let sync = |kind: &str, job: &str| {
@@ -1274,12 +1308,11 @@ async fn sync_alerts() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn fetch_reads() {
     // Each file of the run starts one bounded, checked download; a finished download is linked to
     // the dataset, a failed one only logged, and each mapping is used once.
-    let Some(example) = example("fetch-reads").await else {
-        return;
-    };
+    let example = example("fetch-reads").await;
     let settings = json!({ "bucket": "raw" });
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7" }));
@@ -1327,12 +1360,11 @@ async fn fetch_reads() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn zenodo_deposit() {
     // The current version goes to a new draft, and Zenodo's answer is recorded on the dataset
     // once the upload ended; a failed upload fails the run and keeps its mapping.
-    let Some(example) = example("zenodo-deposit").await else {
-        return;
-    };
+    let example = example("zenodo-deposit").await;
     let group = Group::new();
     group.dataset("D1", json!({ "name": "Run 7", "description": "Reads" }));
     group.object("raw/run-7/r1.fq", "v1", b"@r1");
@@ -1374,4 +1406,64 @@ async fn zenodo_deposit() {
     let marked = manual(json!({ "dataset": "D1", "file": "raw/run-7/m.fq" }));
     assert!(example.run(&group, json!({}), marked).await.is_err());
     assert_eq!(group.transfers().len(), 2, "a marked version is not sent");
+}
+
+#[tokio::test]
+async fn map_reads() {
+    // The reads below a bucket path and a sample sheet go to one task; its outputs are linked to
+    // the dataset and its report's numbers recorded, or left out without a report.
+    let example = example("map-reads").await;
+    let settings = json!({ "results": "results" });
+    let group = Group::new();
+    group.dataset("D1", json!({ "name": "Run 7" }));
+    group.object("raw/run-7/a.fastq.gz", "v1", b"@a");
+    group.object("raw/run-7/notes.txt", "v1", b"notes");
+    let form = |reference: &str| {
+        manual(json!({ "dataset": "D1", "reads": "raw/run-7/", "reference": reference }))
+    };
+    let wrong = example.run(&group, settings.clone(), form("hg38")).await;
+    assert_eq!(wrong.unwrap_err().kind, FailureKind::InvalidInput);
+    let started = example
+        .run(&group, settings.clone(), form("GCF_000005845.2"))
+        .await;
+    assert_eq!(started.unwrap(), json!({ "job": "job-1", "reads": 1 }));
+    let results = "results/D1/GCF_000005845.2/";
+    let task = format!(
+        "task map reference=GCF_000005845.2 /in/reads/=raw/run-7/ \
+         /in/samples.tsv=a.fastq.gz\tRun 7\n /out/results/={results}"
+    );
+    assert_eq!(group.transfers(), [task]);
+    let output = format!("{results}a.bam");
+    let report = json!({ "reads": 1000, "mapped_percent": 97.5 });
+    group.finish_task("job-1", "succeeded", (Some(report), &[output.as_str()]));
+    let recorded = example
+        .run(&group, settings.clone(), event("job_finished", "job-1", ""))
+        .await;
+    assert_eq!(recorded.unwrap(), Value::Null);
+    let entity = group.entity("D1");
+    let mapping = json!({ "reference": "GCF_000005845.2", "reads": 1000, "mappedPercent": 97.5 });
+    assert_eq!(entity["mapping"], mapping);
+    let files = group.files("D1");
+    assert_eq!(files[0]["contentUrl"], json!(format!("s3://{output}")));
+    assert_eq!(group.value("job/job-1"), None);
+    // Without a report the task is still recorded, with a warning.
+    let again = example
+        .run(&group, settings.clone(), form("GCF_000001405.40"))
+        .await;
+    assert_eq!(again.unwrap()["job"], "job-2");
+    group.finish_task("job-2", "succeeded", (None, &[]));
+    let recorded = example
+        .run(&group, settings, event("job_finished", "job-2", ""))
+        .await;
+    assert_eq!(recorded.unwrap(), Value::Null);
+    assert_eq!(
+        group.entity("D1")["mapping"],
+        json!({ "reference": "GCF_000001405.40" })
+    );
+    let lines = group.with(|state| state.lines.clone());
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("report was left out"))
+    );
 }

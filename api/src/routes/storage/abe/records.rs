@@ -3,13 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::routes::access::groups::KeyRequestFailure;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
-use aruna_operations::abe::rekey::rekey_page;
-use aruna_operations::abe::{
-    EpochDueOperation, KeyAction, KeyResult, MemberKeysOperation, ReissueOperation, drive_key,
-};
+use aruna_operations::abe::member::MemberKeysOperation;
+use aruna_operations::abe::reissue::ReissueOperation;
+use aruna_operations::auth::epoch_due::EpochDueOperation;
+use aruna_operations::transfer::abe_rekey::RekeyOperation;
 use axum::extract::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -138,21 +141,49 @@ async fn execute(
         .await
         .map_err(key_error)
 }
-/// Opens key requests for members in the group's encrypted buckets and returns open ids.
+/// The key requests a member grant opened, the pairs that failed, and whether all were opened.
+#[derive(Debug, Default)]
+pub(crate) struct MemberKeyRequests {
+    pub opened: Vec<String>,
+    pub failed: Vec<KeyRequestFailure>,
+    pub complete: bool,
+}
+
+impl MemberKeyRequests {
+    /// The outcome of a change that opens no key request.
+    pub fn none() -> Self {
+        Self {
+            complete: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Opens key requests for members in the group's encrypted buckets; the membership change holds
+/// whatever fails, and the failed pairs are named so the caller can retry them.
 pub(crate) async fn member_requests(
     state: &ServerState,
     auth: &AuthContext,
     group_id: Ulid,
-    members: Vec<aruna_core::UserId>,
-) -> Vec<String> {
-    let now = aruna_core::time::unix_timestamp_millis();
+    members: Vec<aruna_core::user::id::UserId>,
+) -> MemberKeyRequests {
+    let now = aruna_clock::unix_timestamp_millis();
     let node = state.get_node_id();
     let operation = MemberKeysOperation::new(auth.clone(), node, group_id, members, now);
     match drive(operation, &state.get_ctx()).await {
-        Ok(ids) => ids.iter().map(Ulid::to_string).collect(),
+        Ok(keys) => MemberKeyRequests {
+            opened: keys.opened.iter().map(Ulid::to_string).collect(),
+            complete: keys.failed.is_empty(),
+            failed: (keys.failed.into_iter())
+                .map(|(bucket, member)| KeyRequestFailure {
+                    bucket,
+                    user_id: member.to_string(),
+                })
+                .collect(),
+        },
         Err(error) => {
             tracing::warn!(event = "abe.member_requests.failed", error = %error);
-            Vec::new()
+            MemberKeyRequests::default()
         }
     }
 }
@@ -177,7 +208,7 @@ async fn raise_run(
     };
     let node = state.get_node_id();
     for _ in 0..100_000 {
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let page = ReissueOperation::new(bucket.into(), auth.clone(), node, now, MAX_REQUESTS);
         match drive(page, &state.get_ctx()).await {
             Ok(true) => {}
@@ -193,7 +224,7 @@ async fn raise_run(
 /// Raises the node managed buckets of a group, or of every group without one, after the change
 /// that lost a READ scope marked them due in its transaction.
 pub(crate) async fn epoch_due(state: &ServerState, auth: &AuthContext, group_id: Option<Ulid>) {
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let managed = match drive(EpochDueOperation::new(group_id, now), &state.get_ctx()).await {
         Ok(managed) => managed,
         Err(error) => {
@@ -239,11 +270,10 @@ fn unexpected() -> ServerError {
         (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn request_key(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(body): Json<RequestBody>,
 ) -> ServerResult<(StatusCode, Json<RecordView>)> {
-    let auth = crate::auth::require_realm_auth(&state, auth)?;
     let scope = match body.scope {
         ScopeView::Exact(v) => KeyScope::Exact(v),
         ScopeView::Subtree(v) => KeyScope::Subtree(v),
@@ -308,11 +338,10 @@ async fn request_writes(
         (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn open_requests(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(page): Query<PageQuery>,
 ) -> ServerResult<Json<RecordList>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     // A holder opening the list is an issuance run: a due raise happens before listing.
     if page.cursor.is_none() {
         epoch_run(&state, &auth, &bucket, false).await?;
@@ -354,11 +383,10 @@ pub async fn open_requests(
         (status = 503, body = ErrorResponse, description = "A due epoch raise or storage failed; retry")), security(("bearer_auth" = [])))]
 pub async fn publish_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((bucket, request)): Path<(String, String)>,
     Json(body): Json<GrantBody>,
 ) -> ServerResult<Json<RecordView>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     if body.context.len() > 128 * 1024 || body.ciphertext.len() > 128 * 1024 {
         return Err(ServerError::PayloadTooLarge("grant limit".into()));
     }
@@ -399,11 +427,10 @@ pub async fn publish_grant(
         (status = 404, body = ErrorResponse, description = "Bucket missing")), security(("bearer_auth" = [])))]
 pub async fn own_grants(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Query(page): Query<PageQuery>,
 ) -> ServerResult<Json<RecordList>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let KeyResult::Grants(grants, next) =
         execute(&state, auth, bucket, KeyAction::Grants(page.decode()?)).await?
     else {
@@ -437,10 +464,9 @@ pub async fn own_grants(
     security(("bearer_auth" = [])))]
 pub async fn raise_epoch(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<EpochView>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let epoch = epoch_run(&state, &auth, &bucket, true).await?;
     Ok(Json(EpochView { epoch }))
 }
@@ -473,16 +499,18 @@ pub async fn raise_epoch(
     security(("bearer_auth" = [])))]
 pub async fn rekey_subtree(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(bucket): Path<String>,
     Json(body): Json<RekeyBody>,
 ) -> ServerResult<Json<RekeyView>> {
-    let auth = crate::auth::require_unrestricted_auth(&state, auth)?;
     let scope = KeyScope::Subtree(body.prefix.clone());
     scope.validate().map_err(|_| ServerError::BadRequest)?;
     raise_run(&state, &auth, &bucket, KeyAction::Rekey).await?;
-    let page = rekey_page(&state.get_ctx(), &bucket, &body.prefix, MAX_REQUESTS).await;
-    let (progress, done) = page.map_err(key_error)?;
+    let context = state.get_ctx();
+    let origin = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+    let now = std::time::SystemTime::now();
+    let operation = RekeyOperation::new(&bucket, &body.prefix, MAX_REQUESTS, origin, now);
+    let (progress, done) = drive(operation, &context).await.map_err(key_error)?;
     Ok(Json(RekeyView {
         prefix: progress.prefix,
         epoch: progress.epoch,

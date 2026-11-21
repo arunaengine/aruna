@@ -5,15 +5,13 @@
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
 use aruna_core::types::GroupId;
-use aruna_core::{MetaResourceId, StructuredId};
 use aruna_storage::storage;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::handle::MetadataHandle;
+use aruna_drivers::driver::DriverContext;
 
 pub(crate) const TEST_REALM_ID: RealmId = RealmId([7u8; 32]);
 
@@ -27,25 +25,26 @@ pub(crate) fn metadata_test() -> MetadataTest {
     let storage_dir = tempdir().expect("storage dir");
     let metadata_dir = tempdir().expect("metadata dir");
     let storage_handle =
-        storage::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
             .expect("storage opens");
-    let metadata_handle = MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
-        storage_handle.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .expect("metadata handle");
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     MetadataTest {
         context: DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         },
         _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,

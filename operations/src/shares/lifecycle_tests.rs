@@ -56,66 +56,60 @@ fn create(link: ShareLink, caller: u8) -> CreateShareOperation {
     })
 }
 
-fn read_result(link: &ShareLink) -> Event {
-    Event::Storage(StorageEvent::ReadResult {
-        key: link.id.to_bytes().to_vec().into(),
-        value: Some(link.to_bytes().unwrap().into()),
-    })
+fn read_result(link: &ShareLink) -> IoResult {
+    IoResult::Values(vec![Some(link.to_bytes().unwrap().into())])
 }
 
-fn allowed(result: Result<bool, AuthorizationError>) -> Event {
-    Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed: result })
+fn event(event: Event) -> IoResult {
+    IoResult::Event(Box::new(event))
 }
 
-fn batch_written() -> Event {
-    Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    })
+fn allowed(result: Result<bool, AuthorizationError>) -> IoResult {
+    event(Event::SubOperation(
+        SubOperationEvent::AuthorizationResult { allowed: result },
+    ))
 }
 
-fn log_written() -> Event {
-    Event::SubOperation(SubOperationEvent::ShareLogged { result: Ok(()) })
+fn log_written() -> IoResult {
+    event(Event::SubOperation(SubOperationEvent::ShareLogged {
+        result: Ok(()),
+    }))
 }
 
 #[test]
 fn create_checks_creator() {
     let mut denied = create(link(ShareMode::Upload), 4);
-    assert!(matches!(denied.start()[0], Effect::SubOperation(_)));
-    assert!(denied.step(allowed(Ok(false))).is_empty());
-    assert_eq!(denied.finalize(), Err(ShareError::Denied));
+    assert!(matches!(denied.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(denied.next(allowed(Ok(false))), Err(ShareError::Denied));
     let mut allowed_op = create(link(ShareMode::Upload), 4);
-    allowed_op.start();
-    let save = allowed_op.step(allowed(Ok(true)));
-    assert!(matches!(
-        save[0],
-        Effect::Storage(StorageEffect::BatchWrite { .. })
-    ));
-    allowed_op.step(batch_written());
-    assert_eq!(allowed_op.finalize().unwrap(), link(ShareMode::Upload));
+    allowed_op.first().unwrap();
+    let save = allowed_op.next(allowed(Ok(true)));
+    assert!(matches!(save, Ok(Next::Call(IoCall::Write(_)))));
+    assert_eq!(
+        allowed_op.next(IoResult::Done),
+        Ok(Next::Done(link(ShareMode::Upload)))
+    );
 }
 
 #[test]
 fn refuses_before_io() {
     // A link for someone else, or a bad link, never reaches the permission check.
     let mut foreign = create(link(ShareMode::Read), 9);
-    assert!(foreign.start().is_empty());
-    assert_eq!(foreign.finalize(), Err(ShareError::Denied));
+    assert_eq!(foreign.first(), Err(ShareError::Denied));
     let mut object = link(ShareMode::Upload);
     object.target = ShareTarget::Object {
         bucket: "data".into(),
         key: "a.txt".into(),
     };
     let mut bad = create(object, 4);
-    assert!(bad.start().is_empty());
     assert_eq!(
-        bad.finalize(),
+        bad.first(),
         Err(ShareError::Rule(ShareRuleError::UploadTarget))
     );
     let mut unexpected = create(link(ShareMode::Read), 4);
-    unexpected.start();
-    unexpected.step(batch_written());
+    unexpected.first().unwrap();
     assert_eq!(
-        unexpected.finalize(),
+        unexpected.next(log_written()),
         Err(ShareError::UnexpectedEvent("create"))
     );
 }
@@ -135,23 +129,25 @@ fn open_checks_password() {
     let mut guarded = link(ShareMode::Read);
     guarded.password = Some(PasswordHash::new("secret", CHEAP, [8; 16]).unwrap());
     let mut missing = open(&guarded, None);
-    missing.start();
-    missing.step(read_result(&guarded));
-    assert!(missing.step(creator(None)).is_empty());
-    assert_eq!(missing.finalize(), Err(ShareError::PasswordRequired));
+    missing.first().unwrap();
+    missing.next(read_result(&guarded)).unwrap();
+    assert_eq!(
+        missing.next(creator(None)),
+        Err(ShareError::PasswordRequired)
+    );
     let mut wrong = open(&guarded, Some("guess"));
-    wrong.start();
-    wrong.step(read_result(&guarded));
-    let log = wrong.step(creator(None));
-    assert!(matches!(log[0], Effect::SubOperation(_)));
-    wrong.step(log_written());
-    assert_eq!(wrong.finalize(), Err(ShareError::WrongPassword));
+    wrong.first().unwrap();
+    wrong.next(read_result(&guarded)).unwrap();
+    let log = wrong.next(creator(None));
+    assert!(matches!(log, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(wrong.next(log_written()), Err(ShareError::WrongPassword));
     let mut right = open(&guarded, Some("secret"));
-    right.start();
-    right.step(read_result(&guarded));
-    right.step(creator(Some(false)));
-    right.step(log_written());
-    let opened = right.finalize().unwrap();
+    right.first().unwrap();
+    right.next(read_result(&guarded)).unwrap();
+    right.next(creator(Some(false))).unwrap();
+    let Ok(Next::Done(opened)) = right.next(log_written()) else {
+        panic!("the right password opens the link");
+    };
     assert_eq!(
         opened.expires_at,
         500 + aruna_core::structs::storage::share::VISIT_SECS
@@ -161,7 +157,7 @@ fn open_checks_password() {
 }
 
 /// The creator's user document read: absent, active or deactivated.
-fn creator(deactivated: Option<bool>) -> Event {
+fn creator(deactivated: Option<bool>) -> IoResult {
     let value = deactivated.map(|deactivated| {
         let attributes = match deactivated {
             true => [(
@@ -185,10 +181,7 @@ fn creator(deactivated: Option<bool>) -> Event {
         };
         account.to_bytes(&actor).unwrap().into()
     });
-    Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value,
-    })
+    IoResult::Values(vec![value])
 }
 
 #[test]
@@ -198,14 +191,13 @@ fn deactivation_ends_link() {
     guarded.password = Some(PasswordHash::new("secret", CHEAP, [8; 16]).unwrap());
     for password in [None, Some("guess"), Some("secret")] {
         let mut operation = open(&guarded, password);
-        operation.start();
-        let read = operation.step(read_result(&guarded));
-        assert!(matches!(
-            read[0],
-            Effect::Storage(StorageEffect::Read { .. })
-        ));
-        assert!(operation.step(creator(Some(true))).is_empty());
-        assert_eq!(operation.finalize(), Err(ShareError::Unavailable));
+        operation.first().unwrap();
+        let read = operation.next(read_result(&guarded));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            operation.next(creator(Some(true))),
+            Err(ShareError::Unavailable)
+        );
     }
 }
 
@@ -214,42 +206,42 @@ fn open_hides_ended() {
     let mut revoked = link(ShareMode::Read);
     revoked.revoked_at = Some(400);
     let mut operation = open(&revoked, None);
-    operation.start();
-    operation.step(read_result(&revoked));
-    assert_eq!(operation.finalize(), Err(ShareError::Unavailable));
+    operation.first().unwrap();
+    assert_eq!(
+        operation.next(read_result(&revoked)),
+        Err(ShareError::Unavailable)
+    );
     let mut unknown = open(&link(ShareMode::Read), None);
-    unknown.start();
-    unknown.step(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: None,
-    }));
-    assert_eq!(unknown.finalize(), Err(ShareError::Unavailable));
+    unknown.first().unwrap();
+    assert_eq!(
+        unknown.next(IoResult::Values(vec![None])),
+        Err(ShareError::Unavailable)
+    );
     // A visit token cannot reopen a link to skip its password.
     let own = link(ShareMode::Read);
     let mut replay = OpenShareOperation::new(OpenShareConfig {
         token: ShareToken::parse(&own.visit_token(600)).unwrap(),
         ..open(&own, None).config
     });
-    replay.start();
-    replay.step(read_result(&own));
-    assert_eq!(replay.finalize(), Err(ShareError::Unavailable));
+    replay.first().unwrap();
+    assert_eq!(replay.next(read_result(&own)), Err(ShareError::Unavailable));
 }
 
 #[test]
 fn revoke_own_link() {
     let own = link(ShareMode::Read);
     let mut foreign = RevokeShareOperation::new(user(9), own.id, 600);
-    foreign.start();
-    assert!(foreign.step(read_result(&own)).is_empty());
-    assert_eq!(foreign.finalize(), Err(ShareError::Unavailable));
+    foreign.first().unwrap();
+    assert_eq!(
+        foreign.next(read_result(&own)),
+        Err(ShareError::Unavailable)
+    );
     let mut mine = RevokeShareOperation::new(own.created_by, own.id, 600);
-    mine.start();
-    let save = mine.step(read_result(&own));
-    let Effect::Storage(StorageEffect::BatchWrite { writes, .. }) = &save[0] else {
+    mine.first().unwrap();
+    let Ok(Next::Call(IoCall::Write(writes))) = mine.next(read_result(&own)) else {
         panic!("revoke saves the link");
     };
     let stored = ShareLink::from_bytes(&writes[0].2).unwrap();
     assert_eq!(stored.revoked_at, Some(600));
-    mine.step(batch_written());
-    assert_eq!(mine.finalize(), Ok(()));
+    assert_eq!(mine.next(IoResult::Done), Ok(Next::Done(())));
 }

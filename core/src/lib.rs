@@ -4,59 +4,100 @@
 
 #![allow(clippy::result_large_err)]
 
+pub mod admin_checks;
 pub mod admin_documents;
 pub mod alpn;
+pub mod archive_path;
 pub mod audit;
 pub mod auth;
+pub mod backoff;
+pub mod blob_paths;
+pub mod blob_records;
+pub mod bucket_read;
+pub mod calls;
 pub mod compute;
+pub mod config_authority;
 pub mod crate_merge;
 pub mod credential_encryption;
+pub mod cursor;
+pub mod deferred_topics;
+pub mod device_wipe;
 pub mod document;
+pub mod document_apply;
 pub mod download_slots;
 pub mod effects;
 pub mod egress;
+pub mod entity_patch;
+pub mod entropy;
 pub mod errors;
 pub mod events;
 pub mod federation;
 pub mod git;
+pub mod git_state;
 pub mod handle;
 pub mod handoff;
 pub mod heartbeat;
 pub mod id;
+pub mod id_mint;
 pub mod injection;
+pub mod install_work;
+pub mod job_request;
 pub mod jobs;
 pub mod join_request;
+pub mod key_index;
 pub mod key_seal;
 pub mod keys;
 pub mod keyspaces;
 pub mod link;
+pub mod listener;
+pub mod live_version;
+pub mod managed_copy;
+pub mod member_read;
 pub mod metadata;
 pub mod metrics;
-pub mod node_vault;
+pub mod native_reference;
+pub mod node;
+pub mod notification_routing;
 pub mod onboarding;
 pub mod operation;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod operation_check;
+pub mod outbound;
 pub mod password;
 pub mod permission_path;
+pub mod placement;
 pub mod plugin_installs;
 pub mod plugin_runs;
 pub mod plugins;
+pub mod profile_shapes;
 pub mod realm_vault;
 pub mod recovery_code;
 pub mod reducer;
 pub mod register;
+pub mod replication_protocol;
 pub mod repo_layout;
 pub mod repository;
 pub mod request_policy;
+pub mod rocrate_archive;
+pub mod row_plan;
+pub mod rows;
 pub mod scheduling;
+pub mod search;
+pub mod search_enrichment;
 pub mod secret_registers;
 pub mod secrets;
-pub mod shutdown;
+pub mod staging_checkpoint;
 pub mod storage_entries;
+pub mod storage_read;
 pub mod stream;
 pub mod structs;
 pub mod structured_id;
+pub mod sync_checks;
 pub mod task;
 pub mod telemetry;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod testing;
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod time;
 pub mod trace_context;
 pub mod transfer;
@@ -66,19 +107,3 @@ pub mod vault_format;
 
 #[cfg(test)]
 mod tests;
-
-pub use document::{
-    DocumentApplyDecision, DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent,
-    DocumentEvictedDocument, DocumentNetEvent, DocumentSyncRevision, DocumentTarget,
-};
-pub use id::{DhtKeyId, NodeId, NodeIdExt, TopicId};
-pub use keyspaces::*;
-pub use metadata::*;
-pub use onboarding::*;
-pub use structured_id::{
-    BucketId, ClockHealthError, IdEnvironment, JobId, MetaResourceId, PlacementHandle,
-    StructuredId, StructuredIdGenerator, SystemEnvironment,
-};
-pub use task::{TaskEffect, TaskEvent, TaskKey};
-pub use trace_context::DistributedTraceContext;
-pub use user::id::UserId;

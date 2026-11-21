@@ -7,6 +7,7 @@ mod browse;
 pub mod checksum;
 mod cors;
 mod error;
+mod join_registry;
 pub mod multipart_join;
 mod scope;
 pub mod server;

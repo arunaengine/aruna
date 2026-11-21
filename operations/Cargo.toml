@@ -9,79 +9,65 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
-autotests = false
 
 [features]
-# Test seams for integration tests; only aruna's dev-dependencies enable it.
-test-hooks = []
+# Pure test fixtures for the tests of other crates; only dev-dependencies enable it.
+test-hooks = ["aruna-core/test-hooks"]
 
 [dependencies]
-aruna-blob = { workspace = true }
-aruna-compute = { workspace = true, default-features = false }
 aruna-core = { workspace = true }
-aruna-plugins = { workspace = true, features = ["runtime"] }
-aruna-storage = { workspace = true }
-aruna-net = { workspace = true }
-aruna-tasks = { workspace = true }
+aruna-plugin-types = { workspace = true }
 craqle = { workspace = true }
-async-compression = { workspace = true }
-async-trait = { workspace = true }
-async_zip = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
+http = { workspace = true }
 md5 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 byteview = { workspace = true }
-chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 croner = { workspace = true }
 globset = { workspace = true }
-fjall = { workspace = true }
-rustix = { workspace = true }
-futures-util = { workspace = true }
-http = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
 jsonwebtoken = { workspace = true }
-lettre = { workspace = true }
-lru = { workspace = true }
-opentelemetry = { workspace = true }
 postcard = { workspace = true }
 quick-xml = { workspace = true }
-rand = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 smallvec = { workspace = true }
-spareval = { workspace = true }
 spargebra = { workspace = true }
-sysinfo = { workspace = true }
-tantivy = { workspace = true }
-tokio = { workspace = true }
-tokio-util = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 ulid = { workspace = true }
-unicode-normalization = { workspace = true }
 ed25519-dalek = { workspace = true }
 oxrdf = { workspace = true }
 oxttl = { workspace = true }
 percent-encoding = { workspace = true }
-reqwest = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+aruna-test-support = { workspace = true }
+async-trait = { workspace = true }
+aruna-blob = { workspace = true }
+aruna-graph = { workspace = true }
+aruna-net = { workspace = true, features = ["test-hooks"] }
+aruna-outbound = { workspace = true }
+async_zip = { workspace = true }
+tokio-util = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
+aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-drivers = { workspace = true, features = ["test-hooks"] }
+aruna-operations = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+aruna-tasks = { workspace = true }
 axum = { workspace = true }
-flate2 = { workspace = true }
+futures-util = { workspace = true }
 proptest = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+spareval = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true }
 zip = { workspace = true }
-
-[[test]]
-name = "integration"
-path = "tests/main.rs"

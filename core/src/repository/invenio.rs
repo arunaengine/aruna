@@ -14,8 +14,8 @@ use crate::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind, SecondaryI
 use serde_json::{Value, json};
 
 #[path = "projection.rs"]
-mod projection;
-pub use projection::normalize_metadata;
+pub mod projection;
+use projection::normalize_metadata;
 
 /// Reference binding config keys: the file a reference reads and the group of its connector.
 pub const REFERENCE_RECORD: &str = "record_id";

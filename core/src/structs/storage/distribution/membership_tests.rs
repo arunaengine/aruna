@@ -7,10 +7,11 @@ use ulid::Ulid;
 use super::*;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::storage::distribution::presets::replica_layout;
+use crate::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
 use crate::structs::storage::distribution::snapshot::Deletion;
+use crate::structs::storage::distribution::statement::{SetRoot, Statement};
 use crate::structs::storage::distribution::{
-    DataStrategy, DistributionConfig, DistributionRequest, DistributionSettings, MetadataCoverage,
-    SetRoot, Statement, next_snapshot,
+    DataStrategy, DistributionConfig, DistributionSettings, MetadataCoverage,
 };
 
 fn secret(seed: u8) -> iroh::SecretKey {

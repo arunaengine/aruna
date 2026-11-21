@@ -12,11 +12,18 @@ rust-version.workspace = true
 # Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
 autotests = false
 
+[features]
+# Test seams for integration tests; only dev-dependencies enable it.
+test-hooks = []
+
 [dependencies]
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 aruna-storage = { workspace = true }
+blake3 = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
+lru = { workspace = true }
 fjall = { workspace = true }
 opentelemetry = { workspace = true }
 tokio = { workspace = true }
@@ -34,9 +41,11 @@ tracing-opentelemetry = { workspace = true }
 smallvec = { workspace = true }
 crossfire = { workspace = true }
 ulid = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+aruna-clock = { workspace = true, features = ["test-hooks"] }
+aruna-core = { workspace = true, features = ["test-hooks"] }
 
 [[test]]
 name = "integration"

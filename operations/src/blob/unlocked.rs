@@ -1,0 +1,484 @@
+//! Tells whether this node holds a key unlock, promotes pending archives after one and drops
+//! received archives whose hash was rejected.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::errors::BlobError;
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{
+    BLOB_QUARANTINE_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_CLAIM_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::rows::{PrefixPages, read_row, values};
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{
+    ArchiveKey, BackendLocation, BlobQuarantineRecord, BlobVersion, BucketInfo, VersionKey,
+};
+use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::types::{Key, Value};
+use std::collections::VecDeque;
+
+use super::promote::{
+    PROMOTE_PAGE, PromoteError, PromotePendingOperation, Promotion, RejectOwnersOperation,
+};
+use crate::s3::object::delete::{
+    DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
+};
+
+#[derive(Debug, PartialEq)]
+enum PromoteStep {
+    Page,
+    Promote(ArchiveKey),
+    Drop,
+}
+
+type PromoteTurn = Result<Next<usize>, PromoteError>;
+
+/// Promotes every pending archive sealed with `key`, one page of pending rows at a time. Run it
+/// once `key` is installed; archives of other keys are skipped. Outputs how many were promoted.
+#[derive(Debug, PartialEq)]
+pub struct PromoteUnlockedOperation {
+    key: BucketKeyRef,
+    origin: (RealmId, NodeId),
+    limits: RoCrateLimits,
+    pages: PrefixPages,
+    rows: VecDeque<(Key, Value)>,
+    step: PromoteStep,
+    promoted: usize,
+}
+
+impl PromoteUnlockedOperation {
+    pub fn new(key: BucketKeyRef, origin: (RealmId, NodeId), limits: &RoCrateLimits) -> Self {
+        Self {
+            key,
+            origin,
+            limits: limits.clone(),
+            pages: PrefixPages::new(
+                PENDING_LOCATION_KEYSPACE,
+                Key::from(Vec::new()),
+                PROMOTE_PAGE,
+            ),
+            rows: VecDeque::new(),
+            step: PromoteStep::Page,
+            promoted: 0,
+        }
+    }
+
+    fn call(&mut self, step: PromoteStep, call: IoCall) -> PromoteTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn next_row(&mut self) -> PromoteTurn {
+        while let Some((row, value)) = self.rows.pop_front() {
+            let location = BackendLocation::from_bytes(&value)?;
+            if location.format.bucket_key() != Some(self.key) {
+                continue;
+            }
+            let archive = ArchiveKey::from_bytes(&row)?;
+            let (realm_id, node_id) = self.origin;
+            let promote = PromotePendingOperation::new(
+                archive.clone(),
+                realm_id,
+                node_id,
+                self.limits.clone(),
+            );
+            return self.call(PromoteStep::Promote(archive), IoCall::child(promote));
+        }
+        if self.pages.done() {
+            return Ok(Next::Done(self.promoted));
+        }
+        let page = self.pages.call();
+        self.call(PromoteStep::Page, page)
+    }
+
+    fn promoted(
+        &mut self,
+        archive: ArchiveKey,
+        outcome: Result<Promotion, PromoteError>,
+    ) -> PromoteTurn {
+        let drop = match outcome {
+            Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(reason))) => {
+                DropReceivedOperation::rejected(archive, self.origin, reason)
+            }
+            Err(error) => return Err(error),
+            Ok(Promotion::Promoted { .. }) => {
+                self.promoted += 1;
+                return self.next_row();
+            }
+            // A lock in between leaves the rest pending until the next unlock.
+            Ok(Promotion::AwaitingKey(_)) => return Ok(Next::Done(self.promoted)),
+            Ok(Promotion::Gone) => return self.next_row(),
+            Ok(Promotion::Mismatch { claimed }) => {
+                DropReceivedOperation::mismatched(archive, claimed, self.origin)
+            }
+        };
+        self.call(PromoteStep::Drop, IoCall::child(drop))
+    }
+}
+
+impl Operation for PromoteUnlockedOperation {
+    type Output = usize;
+    type Error = PromoteError;
+
+    fn first(&mut self) -> PromoteTurn {
+        let page = self.pages.call();
+        self.call(PromoteStep::Page, page)
+    }
+
+    fn next(&mut self, result: IoResult) -> PromoteTurn {
+        match std::mem::replace(&mut self.step, PromoteStep::Page) {
+            PromoteStep::Page => {
+                self.rows = self.pages.take(result)?.into();
+                self.next_row()
+            }
+            PromoteStep::Promote(archive) => {
+                self.promoted(archive, result.child::<Promotion, PromoteError>()?)
+            }
+            PromoteStep::Drop => {
+                result.child::<usize, PromoteError>()??;
+                self.next_row()
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DropStep {
+    Claim,
+    Record,
+    Owners,
+    Version(VersionKey),
+    Delete,
+}
+
+type DropTurn = Result<Next<usize>, PromoteError>;
+
+/// Quarantines a received archive whose content was rejected and deletes the versions that use
+/// it; none of them was registered. Outputs how many versions were deleted.
+#[derive(Debug, PartialEq)]
+pub struct DropReceivedOperation {
+    now_ms: u64,
+    archive: ArchiveKey,
+    claimed: Option<[u8; 32]>,
+    origin: (RealmId, NodeId),
+    reason: String,
+    step: DropStep,
+    fence: Option<RejectOwnersOperation>,
+    attempts: u32,
+    owners: VecDeque<VersionKey>,
+    dropped: usize,
+    /// What the previous pass over the owners had dropped.
+    before: usize,
+}
+
+impl DropReceivedOperation {
+    /// The archive's content differs from the hash its sender claimed.
+    pub fn mismatched(archive: ArchiveKey, claimed: [u8; 32], origin: (RealmId, NodeId)) -> Self {
+        let reason = "replicated content hash differs from the claimed hash".to_string();
+        Self::new(archive, Some(claimed), origin, reason)
+    }
+
+    /// The archive failed its integrity check; the hash its sender claimed is read first.
+    pub fn rejected(archive: ArchiveKey, origin: (RealmId, NodeId), reason: String) -> Self {
+        Self::new(archive, None, origin, reason)
+    }
+
+    fn new(
+        archive: ArchiveKey,
+        claimed: Option<[u8; 32]>,
+        origin: (RealmId, NodeId),
+        reason: String,
+    ) -> Self {
+        Self {
+            now_ms: 0,
+            archive,
+            claimed,
+            origin,
+            reason,
+            step: DropStep::Claim,
+            fence: None,
+            attempts: 0,
+            owners: VecDeque::new(),
+            dropped: 0,
+            before: 0,
+        }
+    }
+
+    fn call(&mut self, step: DropStep, call: IoCall) -> DropTurn {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn claim_read(&mut self, claim: Option<Value>) -> DropTurn {
+        let claimed = claim.and_then(|claim| <[u8; 32]>::try_from(claim.as_ref()).ok());
+        let Some(claimed) = claimed else {
+            let reason = std::mem::take(&mut self.reason);
+            return Err(BlobError::IntegrityCheckFailed(reason).into());
+        };
+        self.write_record(claimed)
+    }
+
+    fn write_record(&mut self, claimed: [u8; 32]) -> DropTurn {
+        let backend = self.archive.backend.clone();
+        let reason = std::mem::take(&mut self.reason);
+        let record = BlobQuarantineRecord::new(claimed, backend, reason, self.now_ms);
+        let row = (
+            BLOB_QUARANTINE_KEYSPACE.to_string(),
+            record.key().into(),
+            record.to_bytes()?.into(),
+        );
+        self.fence = Some(RejectOwnersOperation::new(self.archive.clone(), &record)?);
+        self.call(DropStep::Record, IoCall::Write(vec![row]))
+    }
+
+    fn list_owners(&mut self) -> DropTurn {
+        let Some(fence) = self.fence.clone() else {
+            return Err(PromoteError::InvalidStateEvent {
+                state: "Drop",
+                expected: "quarantine record",
+                received: "no record",
+            });
+        };
+        self.attempts += 1;
+        self.call(DropStep::Owners, IoCall::child(fence))
+    }
+
+    fn owners_listed(&mut self, owners: Result<Vec<VersionKey>, PromoteError>) -> DropTurn {
+        let owners = match owners {
+            Ok(owners) => owners,
+            Err(error)
+                if RejectOwnersOperation::is_conflict(&error)
+                    && self.attempts <= RejectOwnersOperation::conflict_retries() =>
+            {
+                return self.list_owners();
+            }
+            Err(error) => return Err(error),
+        };
+        self.attempts = 0;
+        if owners.is_empty() {
+            return Ok(Next::Done(self.dropped));
+        }
+        self.owners = owners.into();
+        self.before = self.dropped;
+        self.next_owner()
+    }
+
+    fn next_owner(&mut self) -> DropTurn {
+        let Some(version) = self.owners.pop_front() else {
+            if self.dropped == self.before {
+                return Err(PromoteError::Dropped(
+                    "pending owners could not be removed".into(),
+                ));
+            }
+            return self.list_owners();
+        };
+        let reads = vec![
+            (
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                version.to_bytes()?.into(),
+            ),
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                version.bucket.as_bytes().to_vec().into(),
+            ),
+        ];
+        self.call(DropStep::Version(version), IoCall::Read(reads))
+    }
+
+    fn version_read(
+        &mut self,
+        version: VersionKey,
+        [stored, info]: [Option<Value>; 2],
+    ) -> DropTurn {
+        let Some(stored) = stored else {
+            return self.next_owner();
+        };
+        let stored = BlobVersion::from_bytes(&stored)?;
+        let Some(info) = info else {
+            return self.next_owner();
+        };
+        if stored.state.pending_archive() != Some(&self.archive) {
+            return self.next_owner();
+        }
+        let (realm_id, node_id) = self.origin;
+        let delete = DeleteObjectOperation::new(DeleteObjectInput {
+            bucket: version.bucket.clone(),
+            key: version.key.clone(),
+            version_id: Some(version.version_id),
+            group_id: BucketInfo::from_bytes(&info)?.group_id,
+            realm_id,
+            node_id,
+            deleted_by: stored.created_by,
+        });
+        self.call(DropStep::Delete, IoCall::child(delete))
+    }
+}
+
+impl Operation for DropReceivedOperation {
+    type Output = usize;
+    type Error = PromoteError;
+
+    fn first(&mut self) -> DropTurn {
+        if let Some(claimed) = self.claimed {
+            return self.write_record(claimed);
+        }
+        let read = read_row(PENDING_CLAIM_KEYSPACE, self.archive.to_bytes());
+        self.call(DropStep::Claim, read)
+    }
+
+    fn next(&mut self, result: IoResult) -> DropTurn {
+        match std::mem::replace(&mut self.step, DropStep::Owners) {
+            DropStep::Claim => self.claim_read(result.value()?),
+            DropStep::Record => {
+                result.done()?;
+                self.list_owners()
+            }
+            DropStep::Owners => {
+                self.owners_listed(result.child::<Vec<VersionKey>, PromoteError>()?)
+            }
+            DropStep::Version(version) => self.version_read(version, values::<2>(result)?),
+            DropStep::Delete => {
+                result
+                    .child::<DeleteObjectResult, DeleteObjectError>()?
+                    .map_err(|error| PromoteError::Dropped(error.to_string()))?;
+                self.dropped += 1;
+                self.next_owner()
+            }
+        }
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+}
+
+/// Whether this node holds an active unlock of `key`. A node that cannot tell holds none.
+#[derive(Debug, PartialEq)]
+pub struct KeyUnlockedOperation {
+    key: BucketKeyRef,
+}
+
+impl KeyUnlockedOperation {
+    pub fn new(key: BucketKeyRef) -> Self {
+        Self { key }
+    }
+}
+
+impl Operation for KeyUnlockedOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        let effect = Effect::Blob(BlobEffect::ReadKeyStatus {
+            bucket_id: self.key.bucket_id,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(effect))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        let unlocked = match result {
+            IoResult::Event(event) => match *event {
+                Event::Blob(BlobEvent::KeyStatus { generations }) => generations
+                    .iter()
+                    .any(|status| status.key == self.key && status.active),
+                _ => false,
+            },
+            _ => false,
+        };
+        Ok(Next::Done(unlocked))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::storage::blob::BackendRef;
+
+    fn archive() -> ArchiveKey {
+        ArchiveKey::new(ulid::Ulid::from_bytes([5; 16]), BackendRef::node_default())
+    }
+
+    fn origin() -> (RealmId, NodeId) {
+        let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        (RealmId::from_bytes([1; 32]), node)
+    }
+
+    fn owners(result: Result<Vec<VersionKey>, PromoteError>) -> IoResult {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn listing() -> DropReceivedOperation {
+        let mut drop = DropReceivedOperation::mismatched(archive(), [1; 32], origin());
+        assert!(matches!(drop.first(), Ok(Next::Call(IoCall::Write(_)))));
+        assert!(matches!(
+            drop.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        drop
+    }
+
+    #[test]
+    fn no_owners_ends() {
+        assert_eq!(listing().next(owners(Ok(Vec::new()))), Ok(Next::Done(0)));
+    }
+
+    #[test]
+    fn unclaimed_rejection_fails() {
+        let mut drop = DropReceivedOperation::rejected(archive(), origin(), "bad".to_string());
+        assert!(matches!(drop.first(), Ok(Next::Call(IoCall::Read(_)))));
+        assert_eq!(
+            drop.next(IoResult::Values(vec![None])),
+            Err(PromoteError::Blob(BlobError::IntegrityCheckFailed(
+                "bad".to_string()
+            )))
+        );
+    }
+
+    #[test]
+    fn stuck_owner_fails() {
+        // An owner that stays after a whole pass would loop for ever.
+        let mut drop = listing();
+        let version = VersionKey::new("bucket", "key", ulid::Ulid::from_bytes([3; 16]));
+        let turn = drop.next(owners(Ok(vec![version])));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+        assert!(matches!(
+            drop.next(IoResult::Values(vec![None, None])),
+            Err(PromoteError::Dropped(_))
+        ));
+    }
+
+    #[test]
+    fn empty_queue_finishes() {
+        let key = BucketKeyRef::new(ulid::Ulid::from_bytes([4; 16]), 1);
+        let limits = RoCrateLimits::default();
+        let mut operation = PromoteUnlockedOperation::new(key, origin(), &limits);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(page), Ok(Next::Done(0)));
+    }
+
+    // Only an active unlock of exactly this key counts; a missing blob handle holds none.
+    #[test]
+    fn unlock_needs_status() {
+        let key = BucketKeyRef {
+            bucket_id: ulid::Ulid::from_parts(1, 1),
+            generation: 1,
+        };
+        let mut check = KeyUnlockedOperation::new(key);
+        assert!(matches!(check.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        assert_eq!(check.next(IoResult::Done), Ok(Next::Done(false)));
+    }
+}

@@ -6,7 +6,7 @@ use super::BlobHandler;
 use super::backend::{key_fits, split_bucket};
 use super::io::{backend_version, compose_chunk};
 use crate::s3::NativeMultipart;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
@@ -20,6 +20,7 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobCleanupWork, ResolvedBackend,
 };
 use aruna_core::structs::storage::format::{Compression, StoredFormat, StoredLayout};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use futures::StreamExt;
 use opendal::{ErrorKind, Operator};
@@ -567,9 +568,7 @@ impl BlobHandler {
         let space = BLOB_CLEANUP_KEYSPACE.to_string();
         let effect = match upload {
             Some((location, upload_id)) => {
-                let since_ms = SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_millis() as u64);
+                let since_ms = unix_timestamp_millis();
                 let work = BlobCleanupWork::SettleUpload {
                     attempt,
                     location: location.clone(),
@@ -645,7 +644,7 @@ impl BlobHandler {
             }
         }
         location.blob_size = 0;
-        location.hashes = crate::hash::Hasher::new().to_map();
+        location.hashes = aruna_core::structs::checksum::Hasher::new().to_map();
         match location.is_external() {
             true => BlobEvent::PlainWritten {
                 location,

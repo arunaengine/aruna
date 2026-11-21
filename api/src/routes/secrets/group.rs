@@ -5,12 +5,10 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_operations::secrets::SecretChange;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -19,14 +17,12 @@ use super::{
     SecretView, entry_example, entry_view, expected, owner_change, owner_create, owner_for,
     owner_list, owner_read, parse_name, replace_change, rotate_change,
 };
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-pub struct GroupSecretsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(GroupSecretsDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_group_secrets, create_group_secret))
         .routes(routes!(
             get_group_secret,
@@ -46,13 +42,12 @@ groups administrator. User devices refuse the call."#,
     responses(
         (status = 200, description = "One page of group secrets", body = SecretPage, example = json!({"secrets": [entry_example()]})),
         (status = 400, description = "Invalid group id or cursor", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
 pub async fn list_group_secrets(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Query(query): Query<SecretListQuery>,
 ) -> ServerResult<Json<SecretPage>> {
@@ -70,14 +65,13 @@ groups administrator. User devices refuse the call."#,
     responses(
         (status = 200, description = "The secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid group id or name", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
 pub async fn get_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
 ) -> ServerResult<Json<SecretView>> {
     let (_, secret_owner) = owner_for(&state, auth, Some(&group_id)).await?;
@@ -104,14 +98,13 @@ groups administrator. User devices refuse the call.
     responses(
         (status = 201, description = "The stored secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 409, description = "The name exists in this node's view", body = ErrorResponse)
     ),
     security(("bearer_auth" = [])))]
 pub async fn create_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(group_id): Path<String>,
     Json(request): Json<CreateSecretRequest>,
 ) -> ServerResult<(StatusCode, Json<SecretView>)> {
@@ -123,7 +116,8 @@ pub async fn create_group_secret(
     }
     let (create, _) = owner_create(request)?;
     let stored = owner_change(&state, &auth, secret_owner, create, false).await?;
-    let entry = stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string()))?;
+    let entry =
+        stored.ok_or_else(|| ServerError::InternalError("nothing stored".to_string().into()))?;
     Ok((StatusCode::CREATED, Json(entry_view(entry))))
 }
 
@@ -139,7 +133,6 @@ groups administrator. User devices refuse the call."#,
     responses(
         (status = 200, description = "The changed secret", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -147,7 +140,7 @@ groups administrator. User devices refuse the call."#,
     security(("bearer_auth" = [])))]
 pub async fn replace_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
     headers: HeaderMap,
     Json(request): Json<ReplaceSecretRequest>,
@@ -175,7 +168,6 @@ groups administrator. User devices refuse the call.
     responses(
         (status = 200, description = "The rotated secret, without field values", body = SecretView, example = json!(entry_example())),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -183,7 +175,7 @@ groups administrator. User devices refuse the call.
     security(("bearer_auth" = [])))]
 pub async fn rotate_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
     headers: HeaderMap,
     Json(request): Json<RotateSecretRequest>,
@@ -211,7 +203,6 @@ groups administrator. User devices refuse the call.
     responses(
         (status = 204, description = "The secret is deleted in this node's view"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not a group admin, a path-restricted token, or a user device", body = ErrorResponse),
         (status = 404, description = "No secret with this name in this node's view", body = ErrorResponse),
         (status = 412, description = "The secret changed since the given revision in this node's view", body = ErrorResponse)
@@ -219,7 +210,7 @@ groups administrator. User devices refuse the call.
     security(("bearer_auth" = [])))]
 pub async fn delete_group_secret(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path((group_id, name)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> ServerResult<StatusCode> {

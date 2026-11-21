@@ -1,0 +1,24 @@
+{
+  "crate_allow": {
+    "aruna-doctor": [
+      "aruna-net",
+      "aruna-tasks",
+      "aruna-wire"
+    ]
+  },
+  "structural": {
+    "async_parallel": 0,
+    "core_clocks": 0,
+    "duplicate_groups": 0,
+    "group_cycle_modules": 0,
+    "group_mutual_pairs": 0,
+    "mixed_files": 0,
+    "operation_clocks": 0,
+    "pure_async_refs": 0,
+    "silent_skips": 0,
+    "state_clones": 0,
+    "test_sleeps": 3,
+    "trigger_arms": 5,
+    "upward_refs": 0
+  }
+}

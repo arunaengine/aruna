@@ -10,27 +10,36 @@ use aruna_core::download_slots::DownloadSlots;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::heartbeat::NodeHeartbeat;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
-    DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    DISTRIBUTION_KEYSPACE, NODE_INFO_KEYSPACE, NODE_SUBJECT_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    S3_BUCKET_KEYSPACE,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities, TokenClaims};
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmId, RealmNode, RealmNodeKind,
 };
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy::PlacementSubject;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
 use aruna_core::structs::storage::distribution::presets::{replica_layout, shard_layout};
+use aruna_core::structs::storage::distribution::request::{DistributionRequest, next_snapshot};
+use aruna_core::structs::storage::distribution::snapshot::{
+    DistributionSnapshot, DistributionView, SignedSnapshot,
+};
+use aruna_core::structs::storage::distribution::statement::{SetRoot, Statement};
 use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionConfig, DistributionRequest, DistributionSettings,
-    DistributionSnapshot, DistributionView, SetRoot, SignedSnapshot, Statement, next_snapshot,
+    DistributionBinding, DistributionConfig, DistributionSettings,
 };
 use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
-use aruna_core::{NodeId, UserId};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_operations::distribution::inventory::open_ranges;
-use aruna_operations::driver::DriverContext;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::Router;
 use axum::http::{StatusCode, Uri};
 use std::collections::HashMap;
@@ -71,7 +80,7 @@ pub(crate) async fn node_state() -> Node {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let storage = FjallStorage::open(root).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId([3; 32]);
     let config = NetConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -94,22 +103,23 @@ pub(crate) async fn node_state() -> Node {
     let blob = BlobHandler::new(backend, storage.clone(), net.clone())
         .await
         .unwrap();
-    let metadata = aruna_operations::metadata::MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         dir.path().join("metadata"),
         node_id(LOCAL),
-        storage.clone(),
-        Some(net.clone()),
         None,
         None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    storage.install_metadata_indexes(dir.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: Some(net),
         blob_handle: Some(blob),
-        metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let auth = |seed: u8| AuthContext {
         user_id: UserId::local(Ulid::from_bytes([seed; 16]), realm_id),
@@ -168,7 +178,7 @@ pub(crate) async fn node_state() -> Node {
 pub(crate) async fn hidden_link(node: &Node, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let target = LinkTarget {
         arn: VersionedObjectArn {
             realm_id: node.owner.realm_id,
@@ -203,9 +213,12 @@ pub(crate) async fn hidden_link(node: &Node, key: &str) {
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.state.get_ctx(), write)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.state.get_ctx(),
+    )
+    .await
+    .unwrap();
 }
 
 pub(crate) fn bucket_info(group_id: Ulid, distribution: Option<DistributionBinding>) -> BucketInfo {
@@ -220,6 +233,21 @@ pub(crate) fn bucket_info(group_id: Ulid, distribution: Option<DistributionBindi
         compression: Default::default(),
         distribution,
     }
+}
+
+/// Stores the placement subject of the local node, so placement may choose it.
+pub(crate) async fn advertise(node: &Node) {
+    let record = NodeSubjectRecord::seed(PlacementSubject {
+        node_id: node_id(LOCAL),
+        generation: 1,
+        location: "eu-west".to_string(),
+        labels: Default::default(),
+        executor_kind: None,
+        local_to_controller: true,
+    })
+    .unwrap();
+    let (key, value) = (NODE_SUBJECT_KEY.to_vec(), record.to_bytes().unwrap());
+    write(&node.state, NODE_SUBJECT_KEYSPACE, key, value).await;
 }
 
 pub(crate) async fn write(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
@@ -459,7 +487,7 @@ pub(crate) const CLOSED_API: &str = "http://127.0.0.1:0";
 pub(crate) async fn peer_heartbeat(state: &ServerState) {
     let net = state.get_ctx().net_handle.clone().unwrap();
     net.reload_realm_peers().await.unwrap();
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let heartbeat = NodeHeartbeat {
         realm_id: state.get_realm_id(),
         epoch: AdvertisementEpoch {
@@ -492,7 +520,7 @@ pub(crate) async fn peer_heartbeat(state: &ServerState) {
 /// signature.
 pub(crate) fn unsigned_token(auth: &AuthContext) -> String {
     use base64::Engine;
-    let now = aruna_core::time::unix_timestamp_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let claims = TokenClaims {
         sub: auth.user_id.to_string(),
         iss: auth.realm_id.to_base64(),

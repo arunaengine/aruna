@@ -3,31 +3,28 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::structs::storage::blob::{BlobHeadKey, BucketInfo, UserAccess};
-use aruna_core::structs::storage::distribution::fence::LocalFence;
-use aruna_core::structs::storage::distribution::{
-    DistributionBinding, DistributionSnapshot, KeyRange,
+use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_drivers::driver::drive;
+use aruna_operations::distribution::routing::{copies_interval, lists_interval};
+use aruna_operations::s3::object::list::ListBucketInput;
+use aruna_operations::s3::object::member::merge::MergeResume as Resume;
+use aruna_operations::s3::object::member::merge::{
+    MergeCaller, MergeError, MergeShows, MergedObject, MergedObjectsOperation,
 };
-use aruna_operations::distribution::guard::{
-    bound_view, copies_interval, lists_interval, local_fence,
-};
-use aruna_operations::s3::object::list::{ListBucketInput, ListContinuationToken};
-use aruna_operations::s3::object::pages::{self, ListRequest, ObjectPage};
-use aruna_operations::s3::object::visible::{HiddenCursor, is_sealed, open_cursor};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use http::Method;
-use percent_encoding::{percent_decode_str, utf8_percent_encode};
+use aruna_operations::s3::object::visible::VisibleError;
+use percent_encoding::utf8_percent_encode;
 use s3s::dto::{CommonPrefix, ETag, Object, Owner, Timestamp, TimestampFormat};
 use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::{Forward, ForwardBody, ForwardRequest, answer_text, xml_field};
+use super::reads::delegated_caller;
 use crate::s3::auth::DelegatedRequest;
-use crate::s3::error::guard_error;
+use crate::s3::error::{IntoS3Error, guard_error};
 use crate::s3::scope::SubpathScope;
-use crate::s3::service::listing::{ObjectListingPage, scoped_marker};
+use crate::s3::service::link::link_error;
+use crate::s3::service::listing::{ObjectListingPage, ScopedKeys};
 use crate::s3::service::{ArunaS3Service, URL_ENCODE_SET};
 
 /// The query parameters a forwarded listing names its key range with.
@@ -44,27 +41,6 @@ struct BoundToken {
     query: [u8; 32],
     position: Resume,
 }
-
-/// Where a merged listing continues: after a listed entry, or at the first key of a range when
-/// a page visited its bound number of ranges without an entry, or inside the range starting at
-/// `lower`, from the sealed cursor of the member that stopped there among hidden entries.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(in crate::s3::service) enum Resume {
-    After(ListContinuationToken),
-    From(String),
-    Sealed {
-        lower: String,
-        node: aruna_core::NodeId,
-        copy: bool,
-        cursor: String,
-        group: Option<String>,
-    },
-}
-
-/// Ranges one merged page visits at most, so its fan-out stays bounded.
-pub(in crate::s3::service) const MAX_PAGE_RANGES: usize = 64;
-/// Bytes of keys and prefixes after which a merged page visits no further range.
-pub(in crate::s3::service) const MAX_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 fn query_digest(prefix: Option<&str>, delimiter: Option<&str>) -> [u8; 32] {
     let bytes = postcard::to_allocvec(&(prefix, delimiter)).unwrap_or_default();
@@ -87,8 +63,7 @@ pub(in crate::s3::service) fn encode_bound(
                 query: query_digest(prefix, delimiter),
                 position: position.clone(),
             };
-            postcard::to_allocvec(&token)
-                .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+            aruna_core::cursor::encode_value(&token)
                 .map_err(|error| s3_error!(InternalError, "{error}"))
         })
         .transpose()
@@ -103,8 +78,8 @@ pub(in crate::s3::service) fn decode_bound(
     let invalid = || s3_error!(InvalidArgument, "Invalid continuation token");
     token
         .map(|token| {
-            let bytes = URL_SAFE_NO_PAD.decode(token).map_err(|_| invalid())?;
-            let token: BoundToken = postcard::from_bytes(&bytes).map_err(|_| invalid())?;
+            let token: BoundToken =
+                aruna_core::cursor::decode_value(token).map_err(|_| invalid())?;
             match token.set_id == set_id && token.query == query_digest(prefix, delimiter) {
                 true => Ok(token.position),
                 false => Err(invalid()),
@@ -132,48 +107,17 @@ fn named_copy(query: Option<&str>) -> bool {
     pairs.into_iter().any(|(name, _)| name == COPY_PARAM)
 }
 
-/// The query of a listing a holder answers for one range.
-pub(in crate::s3::service) fn range_query(base: &[(&str, String)], range: &KeyRange) -> String {
-    let mut query = url::form_urlencoded::Serializer::new(String::new());
-    for (name, value) in base {
-        query.append_pair(name, value);
-    }
-    query.append_pair(LOWER_PARAM, &range.lower);
-    if let Some(upper) = &range.upper {
-        query.append_pair(UPPER_PARAM, upper);
-    }
-    query.finish()
-}
-
 /// No holder of a range answered, so the listing cannot be complete.
-pub(in crate::s3::service) fn incomplete(set_id: Ulid, range: &KeyRange) -> S3Error {
+pub(in crate::s3::service) fn incomplete(set_id: Ulid, range_id: Ulid) -> S3Error {
     let mut error = S3Error::with_message(
         S3ErrorCode::Custom("ListingIncomplete".into()),
         format!(
-            "No holder of range {} of distributed bucket {set_id} answered, so the listing \
-             would be incomplete. Retry later.",
-            range.range_id
+            "No holder of range {range_id} of distributed bucket {set_id} answered, so the listing \
+             would be incomplete. Retry later."
         ),
     );
     error.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
     error
-}
-
-/// Whether another holder may answer instead: the node was unreachable or could not serve
-/// the range from its own view, for example while it no longer holds it or catches up.
-pub(in crate::s3::service) fn unreachable(error: &S3Error) -> bool {
-    error
-        .status_code()
-        .is_none_or(|status| status.is_server_error())
-}
-
-/// The XML elements `tag` of a listing body.
-pub(in crate::s3::service) fn elements<'a>(body: &'a str, tag: &str) -> Vec<&'a str> {
-    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-    body.split(open.as_str())
-        .skip(1)
-        .filter_map(|part| part.split(close.as_str()).next())
-        .collect()
 }
 
 pub(in crate::s3::service) fn timestamp(text: Option<String>) -> Option<Timestamp> {
@@ -184,144 +128,11 @@ pub(in crate::s3::service) fn e_tag(text: Option<String>) -> Option<ETag> {
     text.and_then(|text| ETag::parse_http_header(text.as_bytes()).ok())
 }
 
-/// Where a holder resumes the first listed range: at the full position of the request, so a
-/// common prefix is skipped as a whole and not listed again after its name.
-fn remote_start(input: &ListBucketInput, first: bool) -> S3Result<Option<(&'static str, String)>> {
-    Ok(match (first, &input.continuation_token) {
-        (true, Some(token)) => ArunaS3Service::encode_list_token(Some(token))?
-            .map(|token| ("continuation-token", token)),
-        (true, None) => (input.start_after.clone())
-            .filter(|start| !start.is_empty())
-            .map(|start| ("start-after", start)),
-        (false, _) => None,
-    })
-}
-
-/// Narrows a holder's page to what this node's own scope of the caller allows, as a local
-/// page is narrowed.
-fn scope_part(part: &mut ObjectListingPage, scope: &SubpathScope, url_encoded: bool) {
-    let raw = |value: Option<&String>| {
-        ArunaS3Service::raw(value.map(String::as_str).unwrap_or_default(), url_encoded)
-    };
-    (part.contents).retain(|object| scope.allows_key(&raw(object.key.as_ref())));
-    (part.common_prefixes).retain(|group| scope.allows_prefix(&raw(group.prefix.as_ref())));
-}
-
-/// An object another member listed, as its listing names it; `last_modified` is ISO 8601.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MemberObject {
-    pub key: String,
-    pub size: Option<u64>,
-    pub last_modified: Option<String>,
-    pub etag: Option<String>,
-}
-
-/// The S3 continuation token a holder resumes a `pages` cursor at; a sealed one passes as is.
-fn holder_token(bucket: &str, cursor: Option<&str>) -> S3Result<Option<String>> {
-    let invalid = || s3_error!(InvalidArgument, "Invalid continuation token");
-    let Some(cursor) = cursor else {
-        return Ok(None);
-    };
-    if is_sealed(cursor) {
-        return Ok(Some(cursor.to_string()));
-    }
-    match pages::decode_resume::<()>(cursor).map_err(|_| invalid())? {
-        pages::Resume::After { key, group } => {
-            let token = pages::resume_token::<()>(bucket, &key, group.as_deref());
-            ArunaS3Service::encode_list_token(Some(&token.map_err(|_| invalid())?))
-        }
-        pages::Resume::From(_) | pages::Resume::Hidden { .. } => Err(invalid()),
-    }
-}
-
-/// The `pages` cursor a holder's next token continues at; a sealed one passes as is.
-fn page_cursor(token: Option<String>) -> S3Result<Option<String>> {
-    let Some(token) = token else {
-        return Ok(None);
-    };
-    if is_sealed(&token) {
-        return Ok(Some(token));
-    }
-    let decoded = ArunaS3Service::decode_list_token(Some(&token))?;
-    let cursor = decoded.map(pages::after_cursor::<()>).transpose();
-    cursor.map_err(|_| s3_error!(InternalError, "A member answered with an invalid token"))
-}
-
-/// A holder's listing body as one page of `pages`.
-fn member_page(body: &str) -> S3Result<ObjectPage<MemberObject>> {
-    let objects = (elements(body, "Contents").into_iter())
-        .filter_map(|entry| {
-            Some(MemberObject {
-                key: xml_field(entry, "Key")?,
-                size: xml_field(entry, "Size").and_then(|size| size.parse().ok()),
-                last_modified: xml_field(entry, "LastModified"),
-                etag: xml_field(entry, "ETag"),
-            })
-        })
-        .collect();
-    let prefixes = (elements(body, "CommonPrefixes").into_iter())
-        .filter_map(|entry| xml_field(entry, "Prefix"))
-        .collect();
-    Ok(ObjectPage {
-        objects,
-        prefixes,
-        next_cursor: page_cursor(xml_field(body, "NextContinuationToken"))?,
-        ..ObjectPage::default()
-    })
-}
-
 impl ArunaS3Service {
-    /// One range's page from member `node_id`, or with `copy` from its copy, for a caller
-    /// another surface verified; cursors in and out are cursors of `pages`.
-    pub(crate) async fn member_list(
-        &self,
-        user: &UserAccess,
-        (set_id, node_id, copy): (Ulid, aruna_core::NodeId, bool),
-        range: &KeyRange,
-        (request, cursor): (&ListRequest, Option<&str>),
-    ) -> S3Result<ObjectPage<MemberObject>> {
-        let mut base = vec![
-            ("list-type", "2".to_string()),
-            ("max-keys", request.limit.to_string()),
-        ];
-        let named = |value: &Option<String>| value.clone().filter(|value| !value.is_empty());
-        base.extend(named(&request.prefix).map(|prefix| ("prefix", prefix)));
-        base.extend(named(&request.delimiter).map(|delimiter| ("delimiter", delimiter)));
-        let token = holder_token(&request.bucket, cursor)?;
-        base.extend(token.map(|token| ("continuation-token", token)));
-        let query = match copy {
-            true => format!("{}&{COPY_PARAM}=1", range_query(&base, range)),
-            false => range_query(&base, range),
-        };
-        let forward = Forward {
-            set_id,
-            range_id: range.range_id,
-            node_id,
-        };
-        let listing = ForwardRequest {
-            method: Method::GET,
-            operation: "ListObjectsV2",
-            bucket: request.bucket.clone(),
-            key: String::new(),
-            query: Some(query),
-            headers: Vec::new(),
-            body: ForwardBody::Empty,
-        };
-        let response = self.forward_read(user, &forward, listing).await?;
-        member_page(&answer_text(response).await?)
-    }
-
     pub(in crate::s3::service) fn encoded(&self, value: String, url_encoded: bool) -> String {
         match url_encoded {
             true => utf8_percent_encode(&value, URL_ENCODE_SET).to_string(),
             false => value,
-        }
-    }
-
-    pub(in crate::s3::service) fn raw(value: &str, url_encoded: bool) -> String {
-        match url_encoded {
-            true => percent_decode_str(value).decode_utf8_lossy().into_owned(),
-            false => value.to_string(),
         }
     }
 
@@ -341,9 +152,9 @@ impl ArunaS3Service {
         let (lower, upper) = named_bounds(query)
             .ok_or_else(|| s3_error!(AccessDenied, "Delegation refused: no key range named"))?;
         let state = self.state.as_ref();
-        let held = match lists_interval(state, binding, &lower, upper.as_deref()).await {
+        let held = match drive(lists_interval(binding, &lower, upper.as_deref()), state).await {
             Ok(false) if named_copy(query) => {
-                copies_interval(state, binding, &lower, upper.as_deref()).await
+                drive(copies_interval(binding, &lower, upper.as_deref()), state).await
             }
             held => held,
         };
@@ -361,143 +172,38 @@ impl ArunaS3Service {
         }
     }
 
-    pub(in crate::s3::service) async fn snapshot(
-        &self,
-        binding: &DistributionBinding,
-    ) -> S3Result<DistributionSnapshot> {
-        bound_view(self.state.as_ref(), binding)
-            .await
-            .map(|view| view.head.snapshot)
-            .map_err(|error| guard_error(&error))
-    }
-
-    pub(in crate::s3::service) async fn fence(
-        &self,
-        binding: &DistributionBinding,
-    ) -> S3Result<LocalFence> {
-        local_fence(self.state.as_ref(), binding.set_id)
-            .await
-            .map_err(|error| guard_error(&error))
-    }
-
-    /// Asks the member that lists `range`, or with `copies` its ready copies, which answer
-    /// while the coordinator cannot; a range none answers ends the listing.
-    pub(in crate::s3::service) async fn ask_holders(
+    /// Who a merged listing asks other members for.
+    pub(in crate::s3::service) fn merge_caller(
         &self,
         user: &UserAccess,
-        context: (&DistributionBinding, &DistributionSnapshot),
-        (range, copies): (&KeyRange, bool),
-        request: (&'static str, &str, String),
-    ) -> S3Result<String> {
-        let asked = (range, copies, None);
-        let answer = self.ask_members(user, context, asked, request).await;
-        answer.map(|(body, _)| body)
-    }
-
-    /// Like `ask_holders`, from the member `only` names when it does, with the member that
-    /// answered.
-    async fn ask_members(
-        &self,
-        user: &UserAccess,
-        (binding, snapshot): (&DistributionBinding, &DistributionSnapshot),
-        (range, copies, only): (&KeyRange, bool, Option<aruna_core::NodeId>),
-        (operation, bucket, query): (&'static str, &str, String),
-    ) -> S3Result<(String, aruna_core::NodeId)> {
-        let (holders, query) = match copies {
-            true => (
-                snapshot.copy_holders(range),
-                format!("{query}&{COPY_PARAM}=1"),
-            ),
-            false => (snapshot.list_holder(range).into_iter().collect(), query),
-        };
-        let others = (holders.into_iter())
-            .filter(|member| member.member_id != binding.member_id)
-            .filter(|member| only.is_none_or(|node| member.node_id == node));
-        for member in others {
-            let forward = Forward {
-                set_id: binding.set_id,
-                range_id: range.range_id,
-                node_id: member.node_id,
-            };
-            let request = ForwardRequest {
-                method: Method::GET,
-                operation,
-                bucket: bucket.to_string(),
-                key: String::new(),
-                query: Some(query.clone()),
-                headers: Vec::new(),
-                body: ForwardBody::Empty,
-            };
-            let answer = match self.forward_read(user, &forward, request).await {
-                Ok(response) => answer_text(response).await,
-                Err(error) => Err(error),
-            };
-            match answer {
-                Ok(body) => return Ok((body, member.node_id)),
-                Err(error) if unreachable(&error) => continue,
-                Err(error) => return Err(error),
-            }
+        binding: &DistributionBinding,
+    ) -> MergeCaller {
+        MergeCaller {
+            ids: self.state.node_and_realm(),
+            caller: delegated_caller(user),
+            binding: binding.clone(),
         }
-        Err(incomplete(binding.set_id, range))
     }
 
-    /// One range's object page from a holder, keys mapped as this request encodes them, with
-    /// the member that listed it.
-    async fn remote_objects(
-        &self,
-        user: &UserAccess,
-        context: (&DistributionBinding, &DistributionSnapshot),
-        asked: (&KeyRange, bool, Option<aruna_core::NodeId>),
-        (input, start, remaining): (&ListBucketInput, Option<(&'static str, String)>, usize),
-        (owner, url_encoded): (Option<&Owner>, bool),
-    ) -> S3Result<(ObjectListingPage, aruna_core::NodeId)> {
-        let range = asked.0;
-        let mut base = vec![
-            ("list-type", "2".to_string()),
-            ("max-keys", remaining.to_string()),
-        ];
-        base.extend(input.prefix.clone().map(|prefix| ("prefix", prefix)));
-        base.extend(
-            input
-                .delimiter
-                .clone()
-                .map(|delimiter| ("delimiter", delimiter)),
-        );
-        base.extend(start);
-        let query = range_query(&base, range);
-        let request = ("ListObjectsV2", input.bucket.as_str(), query);
-        let (body, lister) = (self.ask_members(user, context, asked, request)).await?;
-        let contents = (elements(&body, "Contents").into_iter())
-            .filter_map(|entry| {
-                Some(Object {
-                    key: Some(self.encoded(xml_field(entry, "Key")?, url_encoded)),
-                    last_modified: timestamp(xml_field(entry, "LastModified")),
-                    e_tag: e_tag(xml_field(entry, "ETag")),
-                    size: xml_field(entry, "Size").and_then(|size| size.parse().ok()),
-                    owner: owner.cloned(),
-                    ..Default::default()
-                })
-            })
-            .collect();
-        let common_prefixes = (elements(&body, "CommonPrefixes").into_iter())
-            .filter_map(|entry| xml_field(entry, "Prefix"))
-            .map(|prefix| CommonPrefix {
-                prefix: Some(self.encoded(prefix, url_encoded)),
-            })
-            .collect();
-        // A member that stopped among hidden entries answers with its own sealed cursor.
-        let (continuation_token, sealed) = match xml_field(&body, "NextContinuationToken") {
-            Some(token) if is_sealed(&token) => (None, Some(token)),
-            Some(token) => (Self::decode_list_token(Some(&token))?, None),
-            None => (None, None),
-        };
-        let page = ObjectListingPage {
-            contents,
-            common_prefixes,
-            continuation_token,
-            sealed,
-        };
-        Ok((page, lister))
+    /// A merged listing's failure as this node's answer.
+    pub(in crate::s3::service) fn merge_error(&self, error: MergeError) -> S3Error {
+        match error {
+            MergeError::Route(error) => guard_error(&error),
+            MergeError::Member(refusal) => self.member_error(refusal.into()),
+            MergeError::Incomplete { set_id, range_id } => incomplete(set_id, range_id),
+            MergeError::Token => s3_error!(InvalidArgument, "Invalid continuation token"),
+            MergeError::VersionMarker => s3_error!(InvalidArgument, "Invalid version-id-marker"),
+            MergeError::Listing(VisibleError::List(error)) => error.into_s3_error(),
+            MergeError::Listing(VisibleError::Shows(error)) => link_error(error),
+            MergeError::Listing(VisibleError::Cursor) => {
+                s3_error!(InternalError, "The listing cursor was not sealed")
+            }
+            MergeError::Listing(VisibleError::Unopened) => {
+                s3_error!(InvalidArgument, "Invalid continuation token")
+            }
+            MergeError::Listing(VisibleError::Io(error)) => s3_error!(InternalError, "{error}"),
+            MergeError::Failed(reason) => s3_error!(InternalError, "{reason}"),
+        }
     }
 
     /// One merged object page over every range under the prefix, at most `max_keys` entries,
@@ -508,212 +214,50 @@ impl ArunaS3Service {
         binding: &DistributionBinding,
         input: ListBucketInput,
         (owner, url_encoded, scope): (Option<Owner>, bool, Option<&SubpathScope>),
-        (from, bounded): (Option<Resume>, bool),
+        resume: (Option<Resume>, bool),
     ) -> S3Result<(ObjectListingPage, Option<Resume>, Vec<Ulid>)> {
-        let snapshot = self.snapshot(binding).await?;
-        let fence = self.fence(binding).await?;
-        let max = input
-            .max_keys
-            .unwrap_or(aruna_operations::s3::object::list::ListBucketOperation::DEFAULT_MAX_KEYS);
-        let prefix = input.prefix.clone().unwrap_or_default();
-        let resume = match &input.continuation_token {
-            Some(token) => Some((
-                BlobHeadKey::from_bytes(&token.last_key)
-                    .map_err(|_| s3_error!(InvalidArgument, "Invalid continuation token"))?
-                    .key,
-                token.last_common_prefix.clone(),
-            )),
-            None => (input.start_after.clone())
-                .filter(|start| !start.is_empty())
-                .map(|start| (start, None)),
+        let shows = MergeShows {
+            keys: ScopedKeys(scope.cloned()),
+            caller: self.listing_caller(Some(user), &input.bucket).await,
+            realm_id: self.realm_id,
+            node: self.link_node(),
         };
-        let mut merged = ObjectListingPage {
-            contents: Vec::new(),
-            common_prefixes: Vec::new(),
-            continuation_token: None,
+        let from = self.merge_caller(user, binding);
+        let merge = MergedObjectsOperation::new(from, shows, input, resume);
+        let merged =
+            (drive(merge, self.state.as_ref()).await).map_err(|error| self.merge_error(error))?;
+        let contents = (merged.objects.into_iter())
+            .map(|object| match object {
+                MergedObject::Local(object) => self.listed_object(*object, &owner, url_encoded),
+                MergedObject::Remote(object) => Object {
+                    key: Some(self.encoded(object.key, url_encoded)),
+                    last_modified: timestamp(object.last_modified),
+                    e_tag: e_tag(object.etag),
+                    size: object.size,
+                    owner: owner.clone(),
+                    ..Default::default()
+                },
+            })
+            .collect();
+        let common_prefixes = (merged.prefixes.into_iter())
+            .map(|prefix| CommonPrefix {
+                prefix: Some(self.encoded(prefix, url_encoded)),
+            })
+            .collect();
+        let page = ObjectListingPage {
+            contents,
+            common_prefixes,
+            continuation_token: merged.token,
             sealed: None,
         };
-        let mut last_prefix = resume.as_ref().and_then(|(_, group)| group.clone());
-        // A sealed position resumes its range at the member that sealed it.
-        let (from, mut resumed) = match from {
-            Some(Resume::From(lower)) => (Some(lower), None),
-            Some(Resume::Sealed {
-                lower,
-                node,
-                copy,
-                cursor,
-                group,
-            }) => {
-                last_prefix = group;
-                (Some(lower), Some((node, copy, cursor)))
-            }
-            _ => (None, None),
-        };
-        // Only entries of this page move its token on; a resumed prefix would repeat it.
-        let mut page_prefix: Option<String> = None;
-        let mut last_key: Option<String> = None;
-        let ranges = snapshot.listed_ranges(&prefix);
-        let ranges = ranges.into_iter().filter(|range| {
-            let after = resume.as_ref().is_none_or(|(key, _)| {
-                range
-                    .upper
-                    .as_deref()
-                    .is_none_or(|upper| key.as_str() < upper)
-            });
-            after
-                && from
-                    .as_deref()
-                    .is_none_or(|from| range.lower.as_str() >= from)
-        });
-        let mut first = true;
-        let mut bytes = 0usize;
-        let mut stale = Vec::new();
-        for (visited, range) in ranges.enumerate() {
-            let remaining =
-                max.saturating_sub(merged.contents.len() + merged.common_prefixes.len());
-            let full = bounded && (visited == MAX_PAGE_RANGES || bytes >= MAX_PAGE_BYTES);
-            if remaining == 0 || full {
-                merged.continuation_token =
-                    scoped_marker(&input.bucket, last_key.as_deref(), page_prefix.as_deref())?;
-                // Nothing listed yet: the next page starts at this range.
-                let next = (merged.continuation_token.is_none())
-                    .then(|| Resume::From(range.lower.clone()));
-                return Ok((merged, next, stale));
-            }
-            let (context, shape) = ((binding, &snapshot), (owner.as_ref(), url_encoded));
-            let resumed = resumed.take();
-            // A copy may be behind its coordinator, so a range resumed at one is marked stale.
-            if resumed.as_ref().is_some_and(|(_, copy, _)| *copy) {
-                stale.push(range.range_id);
-            }
-            let local = match &resumed {
-                Some((node, ..)) => *node == self.node_id,
-                None => snapshot.lists_locally(binding.member_id, range, &fence),
-            };
-            let remote = match (local, &resumed) {
-                (true, _) => None,
-                (false, Some((node, copy, cursor))) => {
-                    let start = Some(("continuation-token", cursor.clone()));
-                    let query = (&input, start, remaining);
-                    let asked = (range, *copy, Some(*node));
-                    let part = self
-                        .remote_objects(user, context, asked, query, shape)
-                        .await?;
-                    Some((part, *copy))
-                }
-                (false, None) => {
-                    let query = (&input, remote_start(&input, first)?, remaining);
-                    let asked = (range, false, None);
-                    match self
-                        .remote_objects(user, context, asked, query.clone(), shape)
-                        .await
-                    {
-                        Ok(part) => Some((part, false)),
-                        // The coordinator cannot answer, so this member's copy or another lists.
-                        Err(error) if unreachable(&error) => {
-                            stale.push(range.range_id);
-                            let here = (snapshot.record_holders(range).iter())
-                                .any(|member| member.member_id == binding.member_id);
-                            match here {
-                                true => None,
-                                false => Some((
-                                    (self.remote_objects(
-                                        user,
-                                        context,
-                                        (range, true, None),
-                                        query,
-                                        shape,
-                                    ))
-                                    .await?,
-                                    true,
-                                )),
-                            }
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-            };
-            let (part, lister, copy) = match remote {
-                Some(((mut part, lister), copy)) => {
-                    if let Some(scope) = scope {
-                        scope_part(&mut part, scope, url_encoded);
-                    }
-                    (part, lister, copy)
-                }
-                None => {
-                    let mut sub = input.clone();
-                    sub.max_keys = Some(remaining);
-                    if !first || resumed.is_some() {
-                        (sub.continuation_token, sub.start_after) = (None, None);
-                    }
-                    let hidden = match &resumed {
-                        Some((_, _, cursor)) => {
-                            Some(open_cursor::<HiddenCursor>(cursor).ok_or_else(|| {
-                                s3_error!(InvalidArgument, "Invalid continuation token")
-                            })?)
-                        }
-                        None => None,
-                    };
-                    let bounds = Some((range.lower.clone(), range.upper.clone()));
-                    let reader = (owner.clone(), Some(user));
-                    let part = self.run_object_listing(
-                        sub,
-                        reader,
-                        url_encoded,
-                        (scope, None),
-                        (bounds, hidden),
-                    );
-                    // Listing here instead of the coordinator lists this member's copy.
-                    let copy = resumed.as_ref().map_or(!local, |(_, copy, _)| *copy);
-                    (part.await?, self.node_id, copy)
-                }
-            };
-            first = false;
-            let keys = part
-                .contents
-                .iter()
-                .filter_map(|object| object.key.as_ref());
-            let groups = part
-                .common_prefixes
-                .iter()
-                .filter_map(|group| group.prefix.as_ref());
-            bytes += keys.chain(groups).map(String::len).sum::<usize>();
-            for prefix in part.common_prefixes {
-                let raw = Self::raw(prefix.prefix.as_deref().unwrap_or_default(), url_encoded);
-                if last_prefix.as_deref() == Some(raw.as_str()) {
-                    continue;
-                }
-                last_prefix = Some(raw.clone());
-                page_prefix = Some(raw);
-                merged.common_prefixes.push(prefix);
-            }
-            if let Some(object) = part.contents.last() {
-                last_key = object.key.as_deref().map(|key| Self::raw(key, url_encoded));
-            }
-            merged.contents.extend(part.contents);
-            // A range that stopped among hidden entries goes on from its member's cursor.
-            if let Some(cursor) = part.sealed {
-                let next = Resume::Sealed {
-                    lower: range.lower.clone(),
-                    node: lister,
-                    copy,
-                    cursor,
-                    group: last_prefix,
-                };
-                return Ok((merged, Some(next), stale));
-            }
-            if part.continuation_token.is_some() {
-                merged.continuation_token = part.continuation_token;
-                break;
-            }
-        }
-        Ok((merged, None, stale))
+        Ok((page, merged.next, merged.stale))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_operations::s3::object::list::ListContinuationToken;
 
     #[test]
     fn tokens_bind_query() {
@@ -739,119 +283,12 @@ mod tests {
     }
 
     #[test]
-    fn bounds_round_trip() {
-        let range = KeyRange {
-            range_id: Ulid::from_bytes([1; 16]),
-            lower: "a b".to_string(),
-            upper: Some("m&n".to_string()),
-            lineage: None,
-            coordinator: Ulid::from_bytes([2; 16]),
-            epoch: 1,
-            replicas: Vec::new(),
-        };
-        let query = range_query(&[("list-type", "2".to_string())], &range);
+    fn bounds_read_query() {
+        let query = "list-type=2&aruna-lower=a+b&aruna-upper=m%26n";
         assert_eq!(
-            named_bounds(Some(&query)),
+            named_bounds(Some(query)),
             Some(("a b".to_string(), Some("m&n".to_string())))
         );
         assert_eq!(named_bounds(Some("list-type=2")), None);
-    }
-
-    #[test]
-    fn holder_resumes_group() {
-        let token = ListContinuationToken {
-            last_key: BlobHeadKey::object_prefix("spire", "d/").unwrap(),
-            last_common_prefix: Some("d/".to_string()),
-        };
-        let input = ListBucketInput {
-            bucket: "spire".to_string(),
-            group_id: Ulid::from_bytes([1; 16]),
-            continuation_token: Some(token.clone()),
-            max_keys: Some(10),
-            prefix: None,
-            delimiter: Some("/".to_string()),
-            start_after: None,
-        };
-        let (name, value) = remote_start(&input, true).unwrap().unwrap();
-        assert_eq!(name, "continuation-token");
-        let sent = ArunaS3Service::decode_list_token(Some(&value)).unwrap();
-        assert_eq!(sent, Some(token));
-        assert_eq!(remote_start(&input, false).unwrap(), None);
-    }
-
-    #[test]
-    fn next_holder_answers() {
-        let mut not_held = S3Error::with_message(S3ErrorCode::Custom("RangeNotHeld".into()), "");
-        not_held.set_status_code(http::StatusCode::SERVICE_UNAVAILABLE);
-        assert!(unreachable(&not_held));
-        assert!(!unreachable(&s3_error!(AccessDenied, "denied")));
-    }
-
-    #[test]
-    fn holder_page_scoped() {
-        let mut part = ObjectListingPage {
-            contents: vec![Object {
-                key: Some("secret".to_string()),
-                ..Default::default()
-            }],
-            common_prefixes: vec![CommonPrefix {
-                prefix: Some("private/".to_string()),
-            }],
-            continuation_token: None,
-            sealed: None,
-        };
-        // A scope without grants hides what the holder listed under its own rules.
-        scope_part(&mut part, &SubpathScope::default(), false);
-        assert!(part.contents.is_empty() && part.common_prefixes.is_empty());
-    }
-
-    // A `pages` cursor reaches a holder as its S3 token, and the holder's token comes back
-    // as a `pages` cursor; sealed cursors pass both ways unread.
-    #[test]
-    fn member_cursors_map() {
-        let after = pages::Resume::After {
-            key: "m/a".to_string(),
-            group: Some("m/".to_string()),
-        };
-        let cursor = pages::encode_resume::<()>(&after).unwrap();
-        let token = holder_token("spire", Some(&cursor)).unwrap().unwrap();
-        let sent = ArunaS3Service::decode_list_token(Some(&token))
-            .unwrap()
-            .unwrap();
-        assert_eq!(sent.last_common_prefix.as_deref(), Some("m/"));
-        assert_eq!(BlobHeadKey::from_bytes(&sent.last_key).unwrap().key, "m/");
-        // A position inside a common prefix resumes past the whole prefix.
-        let back = page_cursor(Some(token)).unwrap().unwrap();
-        let past = pages::Resume::After {
-            key: "m/".to_string(),
-            group: Some("m/".to_string()),
-        };
-        assert_eq!(pages::decode_resume::<()>(&back).unwrap(), past);
-        let from = pages::encode_resume::<()>(&pages::Resume::From("m".to_string())).unwrap();
-        assert!(holder_token("spire", Some(&from)).is_err());
-        let sealed = aruna_operations::s3::object::visible::seal_cursor(&1u8).unwrap();
-        assert_eq!(
-            holder_token("spire", Some(&sealed)).unwrap(),
-            Some(sealed.clone())
-        );
-        assert_eq!(page_cursor(Some(sealed.clone())).unwrap(), Some(sealed));
-        let body = "<ListBucketResult><Contents><Key>m/x</Key><Size>3</Size>\
-                    <LastModified>2026-10-30T08:00:00.000Z</LastModified></Contents>\
-                    <CommonPrefixes><Prefix>m/d/</Prefix></CommonPrefixes></ListBucketResult>";
-        let page = member_page(body).unwrap();
-        assert_eq!(page.objects[0].key, "m/x");
-        assert_eq!(page.objects[0].size, Some(3));
-        assert_eq!(page.prefixes, ["m/d/"]);
-        assert!(page.next_cursor.is_none());
-    }
-
-    #[test]
-    fn listing_bodies_parse() {
-        let body = "<ListBucketResult><Contents><Key>a&amp;b</Key><Size>3</Size></Contents>\
-                    <CommonPrefixes><Prefix>d/</Prefix></CommonPrefixes></ListBucketResult>";
-        let contents = elements(body, "Contents");
-        assert_eq!(xml_field(contents[0], "Key").as_deref(), Some("a&b"));
-        let prefixes = elements(body, "CommonPrefixes");
-        assert_eq!(xml_field(prefixes[0], "Prefix").as_deref(), Some("d/"));
     }
 }

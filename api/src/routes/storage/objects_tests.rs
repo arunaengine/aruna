@@ -116,7 +116,7 @@ async fn refuses_bad_listings() {
     )
     .await;
     assert!(matches!(stranger, Err(ServerError::Forbidden)));
-    let from = encode_resume::<()>(&Resume::From("m".to_string())).unwrap();
+    let from = encode_resume(&Resume::From("m".to_string())).unwrap();
     let cursor = list(
         &node,
         &node.owner,
@@ -334,7 +334,7 @@ async fn unanswered_range_fails() {
 
 /// Writes a link at `key` in the test bucket to `target`, as the owner.
 async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
-    use aruna_operations::staging::reference::{ReferenceWrite, write_reference_version};
+    use aruna_operations::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let write = ReferenceWrite {
         job_id: None,
         preassigned_version_id: None,
@@ -359,9 +359,12 @@ async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link
         restrictions: None,
         mirror_guards: Vec::new(),
     };
-    write_reference_version(&node.state.get_ctx(), write)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        WriteReferenceOperation::new(write, std::time::SystemTime::now(), ulid::Ulid::generate()),
+        &node.state.get_ctx(),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -426,7 +429,7 @@ async fn hides_link_folders() {
         key: "a.md".to_string(),
         group: None,
     };
-    assert_eq!(decode_resume::<()>(&cursor).unwrap(), after);
+    assert_eq!(decode_resume(&cursor).unwrap(), after);
 }
 
 #[tokio::test]
@@ -470,10 +473,7 @@ async fn merges_past_hidden() {
     .unwrap();
     assert!(second.objects.is_empty() && second.prefixes.is_empty());
     let cursor = second.next_cursor.expect("the hidden run goes on");
-    assert!(matches!(
-        decode_resume::<()>(&cursor),
-        Ok(Resume::Hidden { .. })
-    ));
+    assert!(matches!(decode_resume(&cursor), Ok(Resume::Hidden { .. })));
     let third = list(
         &node,
         &node.owner,
@@ -522,7 +522,7 @@ async fn cursor_names_copy() {
     // A copy that sealed its range is named as a copy, so a member resuming there asks it as
     // one while the coordinator is down.
     let (_node, cursor, _) = sealed_copy_page().await;
-    let resume = decode_resume::<()>(&cursor).unwrap();
+    let resume = decode_resume(&cursor).unwrap();
     assert!(
         matches!(resume, Resume::Hidden { copy: true, .. }),
         "{resume:?}"
@@ -572,7 +572,9 @@ async fn open_prefix(node: &Node, pattern: &str) {
         role_id,
         name: "public".to_string(),
         permissions: std::collections::HashMap::from([(path, Permission::READ)]),
-        assigned_users: std::collections::HashSet::from([aruna_core::UserId::nil(realm_id)]),
+        assigned_users: std::collections::HashSet::from([aruna_core::user::id::UserId::nil(
+            realm_id,
+        )]),
     };
     document.roles.insert(role_id, role);
     let group = Group {

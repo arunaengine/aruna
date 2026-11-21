@@ -2,20 +2,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::map_error;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_blob::git::GitStore;
 use aruna_core::git::{CommitInfo, FileChange, FileChangeKind};
-use aruna_core::structs::identity::auth::AuthContext;
+use aruna_drivers::driver::drive;
+use aruna_operations::git::GitError;
 use aruna_operations::git::changes::EntityChangeKind;
+use aruna_operations::git::changes::PropertyConflict;
 use aruna_operations::git::versions::{self, Comparison, Named, Version, VersionQuery};
-use aruna_operations::git::{GitError, PropertyConflict};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -195,10 +196,6 @@ pub struct CompareQuery {
     pub to: String,
 }
 
-pub(super) fn store(state: &ServerState) -> ServerResult<&GitStore> {
-    state.git().ok_or(ServerError::ServiceUnavailable)
-}
-
 /// The version from `If-Match`, with or without quotes.
 pub(crate) fn expected(headers: &HeaderMap) -> Option<String> {
     headers
@@ -361,20 +358,20 @@ fn comparison_view(comparison: Comparison) -> ComparisonView {
               (status = 503, description = "Git storage unavailable")))]
 pub async fn list(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Query(query): Query<ListQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let branch = query.branch.unwrap_or_else(|| "main".into());
     let limit = query.limit.unwrap_or(50);
     let query = VersionQuery {
-        branch: &branch,
-        since: query.since.as_deref(),
-        cursor: query.cursor.as_deref(),
+        branch,
+        since: query.since,
+        cursor: query.cursor,
         limit,
     };
-    let result = versions::list(&state.get_ctx(), store(&state)?, &auth, id, query).await;
+    let list = versions::list(&git_node(&state), &auth, id, query);
+    let result = drive(list, &state.get_ctx()).await;
     Ok(match result {
         Ok((list, next_cursor)) => Json(VersionList {
             versions: list.into_iter().map(version_view).collect(),
@@ -396,11 +393,11 @@ pub async fn list(
               (status = 503, description = "Git storage unavailable")))]
 pub async fn show(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::show(&state.get_ctx(), store(&state)?, &auth, id, &revision).await;
+    let show = versions::show(&git_node(&state), &auth, id, &revision);
+    let result = drive(show, &state.get_ctx()).await;
     Ok(match result {
         Ok((version, files)) => Json(VersionDetail {
             version: version_view(version),
@@ -423,18 +420,11 @@ pub async fn show(
               (status = 503, description = "Git storage or converter unavailable")))]
 pub async fn rocrate(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = aruna_operations::git::snapshot::export(
-        &state.get_ctx(),
-        store(&state)?,
-        &auth,
-        id,
-        revision,
-    )
-    .await;
+    let export = aruna_operations::git::snapshot::export(&git_node(&state), &auth, id, revision);
+    let result = drive(export, &state.get_ctx()).await;
     Ok(match result {
         Ok(bytes) => {
             let value: Value =
@@ -455,20 +445,18 @@ pub async fn rocrate(
               (status = 503, description = "Git storage unavailable")))]
 pub async fn compare(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Query(query): Query<CompareQuery>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::compare(
-        &state.get_ctx(),
-        store(&state)?,
+    let compare = versions::compare(
+        &git_node(&state),
         &auth,
         id,
         query.from.as_deref(),
         &query.to,
-    )
-    .await;
+    );
+    let result = drive(compare, &state.get_ctx()).await;
     Ok(match result {
         Ok(comparison) => Json(comparison_view(comparison)).into_response(),
         Err(error) => failure(error),
@@ -484,11 +472,11 @@ pub async fn compare(
               (status = 404, description = "Document missing or not held by this node")))]
 pub async fn conflicts(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
-    let result = versions::conflicts(&state.get_ctx(), store(&state)?, &auth, id).await;
+    let conflicts = versions::conflicts(&git_node(&state), &auth, id);
+    let result = drive(conflicts, &state.get_ctx()).await;
     Ok(match result {
         Ok(conflicts) => Json(ConflictList {
             conflicts: conflicts

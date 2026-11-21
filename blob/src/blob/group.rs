@@ -2,7 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{BlobHandler, NodeBackend};
+use super::BlobHandler;
+use super::registry::NodeBackend;
 use crate::opendal::build_group_service;
 use crate::s3::{self, check_keys};
 use aruna_core::effects::{BlobEffect, StorageEffect};
@@ -160,6 +161,9 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         BlobEffect::Read { location }
         | BlobEffect::ReadRange { location, .. }
         | BlobEffect::Delete { location }
+        | BlobEffect::ReconcileReservation { location }
+        | BlobEffect::DiscardTarget { location }
+        | BlobEffect::AbortTarget { location }
         | BlobEffect::ReadHiddenRange { location, .. }
         | BlobEffect::Replicate { location, .. }
         | BlobEffect::ServeRead { location, .. } => push(&mut ids, &location.backend),
@@ -168,8 +172,12 @@ fn group_ids(effect: &BlobEffect) -> Vec<Ulid> {
         // An observation is served straight from the owner's filesystem, so it
         // claims no tenant backend at all.
         BlobEffect::ServeSourceRead { .. }
+        | BlobEffect::CollectStream { .. }
+        | BlobEffect::PinRead { .. }
+        | BlobEffect::ReadHeld { .. }
         | BlobEffect::SpoolHidden { .. }
         | BlobEffect::SpoolLocal { .. }
+        | BlobEffect::Remote(_)
         | BlobEffect::ListHidden { .. }
         | BlobEffect::OpenConnection { .. }
         | BlobEffect::SendMessage { .. }
@@ -666,7 +674,7 @@ mod tests {
                 .collect(),
             created_at: SystemTime::UNIX_EPOCH,
             updated_at: SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             disabled: false,
             cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
         }

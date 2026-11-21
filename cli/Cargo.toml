@@ -15,7 +15,13 @@ rust-version.workspace = true
 name = "aruna-cli"
 path = "src/main.rs"
 
+[features]
+# The upload record fixture of the integration tests; only dev-dependencies enable it.
+test-hooks = []
+
 [dependencies]
+aruna-wire = { workspace = true }
+aruna-plugin-types = { workspace = true }
 aruna-plugins = { workspace = true, features = ["build"] }
 aws-sdk-s3 = { workspace = true }
 base64 = { workspace = true }

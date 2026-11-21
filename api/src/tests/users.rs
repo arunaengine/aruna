@@ -3,11 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::server::state::ServerState;
-use crate::tests::routes::{test_context, test_state, test_storage};
-use aruna_core::UserId;
+use crate::tests::routes::{test_state, test_storage};
 use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
+use aruna_drivers::testing::test_context;
 use std::sync::Arc;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -36,4 +37,9 @@ pub(crate) fn realm_auth(realm_id: RealmId) -> AuthContext {
         path_restrictions: None,
         session: None,
     }
+}
+
+/// The auth of a fresh user in a realm no test state belongs to.
+pub(crate) fn foreign_auth() -> AuthContext {
+    realm_auth(RealmId::from_bytes([7u8; 32]))
 }

@@ -506,8 +506,8 @@ fn key_document(key: &[u8]) -> Option<Ulid> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::UserId;
     use crate::structs::storage::metadata_registry::MetadataAuditOperation;
+    use crate::user::id::UserId;
 
     fn key(group_id: GroupId, document_id: Ulid, audit_id: Ulid) -> Vec<u8> {
         let mut key = Vec::with_capacity(AUDIT_KEY_BYTES);
@@ -719,5 +719,29 @@ mod tests {
         assert_eq!(batch.bytes, MAX_BATCH_BYTES);
         assert!(batch.completed_nodes.contains(&node));
         assert!(batch.missing_nodes.is_empty());
+    }
+
+    #[test]
+    fn missing_bounds_overflow() {
+        // Past the bound a missing node is counted, so an oversized list is never silently cut.
+        let mut batch = AuditPageBatch::with_limit(usize::MAX);
+        for seed in 1u8..=u8::try_from(MAX_AUDIT_PEERS + 1).unwrap() {
+            batch.mark_missing(iroh::SecretKey::from_bytes(&[seed; 32]).public());
+        }
+        assert!(batch.completed_nodes.is_empty());
+        assert_eq!(batch.missing_nodes.len(), MAX_AUDIT_PEERS);
+        assert_eq!(batch.missing_overflow, 1);
+    }
+
+    #[test]
+    fn missing_keeps_unique() {
+        let first = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let second = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let mut batch = AuditPageBatch::with_limit(usize::MAX);
+        for node in [second, first, first] {
+            batch.mark_missing(node);
+        }
+        assert_eq!(batch.missing_nodes, BTreeSet::from([first, second]));
+        assert_eq!(batch.missing_overflow, 0);
     }
 }

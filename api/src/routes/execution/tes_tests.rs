@@ -3,48 +3,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::tests::execution::{auth_for, build_state, management_state, node_id, realm};
 use std::time::Duration;
 
 use axum::body::to_bytes;
 
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
-use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, USER_ACCESS_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{JobError, OutputObject};
-use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+use aruna_core::structs::execution::job::local::{JobError, OutputObject};
+use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
     RealmAuthorizationDocument, RealmConfigDocument, RealmId,
 };
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::jobs::store::insert_job;
-use aruna_storage::FjallStorage;
-use tempfile::TempDir;
-
-fn realm() -> RealmId {
-    RealmId([1u8; 32])
-}
-
-fn node_id() -> NodeId {
-    iroh::SecretKey::from_bytes(&[7u8; 32]).public()
-}
+use aruna_core::user::id::UserId;
+use aruna_test_support::jobs::insert_job;
 
 fn user(byte: u8) -> UserId {
     UserId::new(Ulid::from_bytes([byte; 16]), realm())
-}
-
-fn auth_for(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
 }
 
 const TES_SECRET: &str = "tes-secret";
@@ -68,7 +47,7 @@ fn credential(group_id: Ulid) -> UserAccess {
 fn issued_access(state: &ServerState, group_id: Ulid) -> UserAccess {
     let mut access = credential(group_id);
     access
-        .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
+        .encrypt_secret(state.credential_encryption_key(), TES_SECRET, [3; 24])
         .unwrap();
     access
 }
@@ -145,30 +124,6 @@ async fn write_auth(state: &ServerState, group_id: Ulid, owner: UserId) {
             })
             .await;
     }
-}
-
-async fn build_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    });
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        NodeCapabilities::user_node(realm()).unwrap(),
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
 }
 
 fn sample_task(group: Ulid) -> TesTask {
@@ -275,10 +230,10 @@ async fn redacts_internal_detail() {
 fn maps_submit_errors() {
     // A TES client retries 500, so every non-retryable admission refusal
     // must keep the status the native submit surface answers with.
-    use aruna_core::ClockHealthError;
     use aruna_core::compute::quota::{QuotaDenied, QuotaDimension, QuotaScope};
-    use aruna_core::structs::execution::job::CompositionError;
-    use aruna_operations::jobs::submit::SubmitJobError;
+    use aruna_core::job_request::SubmitJobError;
+    use aruna_core::structs::execution::job::input::CompositionError;
+    use aruna_core::structured_id::clock_health::ClockHealthError;
 
     let cases = [
         (
@@ -672,7 +627,9 @@ fn rejects_unsupported_fields() {
     task.inputs[0].kind = TesFileType::Directory;
     let (spec, _) =
         map_execution_spec(&task, None, ExecutionTarget::Realm).expect("directory maps");
-    let InputSource::S3 { key, .. } = &spec.inputs[0].source;
+    let InputSource::S3 { key, .. } = &spec.inputs[0].source else {
+        panic!("the input names an object");
+    };
     assert!(key.ends_with('/') && spec.inputs[0].dest_key.ends_with('/'));
     task.inputs[0].kind = TesFileType::File;
     task.executors[0].stdout = Some("/logs/out".to_string());
@@ -889,6 +846,7 @@ fn maps_states() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1051,15 +1009,16 @@ fn view_projections() {
 }
 
 /// The replicated family behind one succeeded distributed task.
-fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
+fn family_fixture() -> aruna_operations::jobs::lifecycle::report::FamilyReport {
     use aruna_core::jobs::{JobKind, JobStatusView};
-    use aruna_core::structs::execution::job::{
-        EffectiveResources, JobAdmissionRecord, JobProgress, JobRetryPolicy, LogicalJobSpec,
-        LogicalJobState, OutputObject, SubmissionId, WorkspaceMode,
+    use aruna_core::structs::execution::job::family::{
+        EffectiveResources, JobAdmissionRecord, JobRetryPolicy, LogicalJobSpec, LogicalJobState,
+        SubmissionId,
     };
+    use aruna_core::structs::execution::job::local::{JobProgress, WorkspaceMode};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::jobs::lifecycle::FamilyReport;
+    use aruna_operations::jobs::lifecycle::report::FamilyReport;
 
     let realm_id = RealmId([1u8; 32]);
     let created_by = UserId::new(Ulid::from_bytes([2u8; 16]), realm_id);
@@ -1085,6 +1044,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1101,7 +1061,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
         group_id: payload.group_id,
         created_by,
         created_at_ms: 10,
-        retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+        retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
         payload,
         request_digest: [7u8; 32],
         spec_digest: [8u8; 32],
@@ -1134,6 +1094,7 @@ fn family_fixture() -> aruna_operations::jobs::lifecycle::FamilyReport {
             state: JobState::Succeeded,
             attempts: 2,
             cancel_requested: false,
+            expiry_reason: None,
             created_at_ms: 10,
             updated_at_ms: 20,
             finished_at_ms: Some(20),
@@ -1204,11 +1165,11 @@ fn family_pins_inputs() {
         name: None,
         description: None,
     }];
-    report.spec.captured_inputs = vec![aruna_core::structs::execution::job::CapturedInput {
+    report.spec.captured_inputs = vec![aruna_core::structs::execution::job::input::CapturedInput {
         destination_key: "dir/a.txt".to_string(),
         source_node_id: holder,
         version_id: version,
-        content: aruna_core::structs::execution::job::InputContent::Blake3([1; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([1; 32]),
         bytes: 1,
         policies: Vec::new(),
         source_group_id: Ulid::from_bytes([5u8; 16]),
@@ -1236,8 +1197,8 @@ fn family_pins_inputs() {
 
 #[test]
 fn family_preserves_versions() {
+    use aruna_core::structs::execution::job::family::LogicalJobState;
     // TES preserves canonical output versions and reports none before canonical success.
-    use aruna_core::structs::execution::job::LogicalJobState;
 
     let report = family_fixture();
     let version_id = Ulid::from_bytes([9u8; 16]);
@@ -1276,7 +1237,7 @@ fn derives_family_tags() {
     // Placement details are stamped at read time, so a task that was never
     // placed carries the job id and logical state and nothing more.
     use aruna_core::compute::ExecutionTargetId;
-    use aruna_operations::jobs::lifecycle::PlanEstimate;
+    use aruna_operations::jobs::lifecycle::report::PlanEstimate;
 
     let mut report = family_fixture();
     let unplaced = project_task(
@@ -1299,6 +1260,7 @@ fn derives_family_tags() {
     report.plan = Some(PlanEstimate {
         target: Some(ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[4u8; 32]).public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         }),
         scheduler_node_id: None,
@@ -1328,39 +1290,10 @@ fn derives_family_tags() {
     assert!(minimal.tags.is_empty());
 }
 
-async fn management_state() -> (TempDir, Arc<ServerState>) {
-    let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let ctx = Arc::new(DriverContext {
-        storage_handle: storage,
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    });
-    let capabilities =
-        NodeCapabilities::management_node(aruna_core::keys::generate_signing_key()).unwrap();
-    let state = ServerState::new(
-        ctx,
-        realm(),
-        node_id(),
-        capabilities,
-        false,
-        None,
-        JobsRuntime::new(),
-    )
-    .await;
-    (dir, Arc::new(state))
-}
-
 /// Writes a live user cutoff for `user` into this realm's config.
 async fn deactivate(state: &ServerState, user: UserId) {
     use aruna_core::structs::identity::realm::TokenRevocation;
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let now = aruna_clock::unix_timestamp_secs();
     let mut config = RealmConfigDocument::default_for_realm(realm(), Vec::new());
     config.revoked_tokens.push(TokenRevocation {
         token_hash: aruna_core::auth::user_cutoff_hash(&user),
@@ -1415,15 +1348,6 @@ fn local_task(group: Ulid) -> TesTask {
     task
 }
 
-fn bearer_auth(user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: realm(),
-        path_restrictions: None,
-        session: None,
-    })
-}
-
 #[tokio::test]
 async fn local_needs_device() {
     // A node that serves no device plane refuses the target, not the caller.
@@ -1432,7 +1356,7 @@ async fn local_needs_device() {
 
     let response = create_task(
         State(state),
-        Extension(bearer_auth(user(2))),
+        Extension(auth_for(user(2))),
         Extension(None),
         HeaderMap::new(),
         Json(local_task(group)),
@@ -1450,7 +1374,7 @@ async fn local_refuses_stranger() {
 
     let response = create_task(
         State(state),
-        Extension(bearer_auth(user(3))),
+        Extension(auth_for(user(3))),
         Extension(None),
         HeaderMap::new(),
         Json(local_task(group)),
@@ -1506,6 +1430,19 @@ fn rejects_derived_tag() {
 }
 
 #[test]
+fn rejects_plugin_tag() {
+    let mut task = sample_task(Ulid::from_bytes([5u8; 16]));
+    task.tags.insert(
+        "aruna-engine.org/plugin-work".to_string(),
+        Ulid::nil().to_string(),
+    );
+
+    let error = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap_err();
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(error.code.as_deref(), Some("reserved_tag"));
+}
+
+#[test]
 fn projects_full_command() {
     // Docker runs entrypoint + command together; the projection shows both.
     let mut spec = ExecutionSpec {
@@ -1520,6 +1457,7 @@ fn projects_full_command() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -1585,7 +1523,7 @@ async fn basic_foreign_owner() {
         let mut access = credential(Ulid::from_bytes([5u8; 16]));
         access.user_identity = owner;
         access
-            .encrypt_secret(state.credential_encryption_key(), TES_SECRET)
+            .encrypt_secret(state.credential_encryption_key(), TES_SECRET, [3; 24])
             .unwrap();
         write_credential(&state, &access).await;
         let result = authenticate_tes(&state, None, &basic_headers(&access, TES_SECRET)).await;
@@ -1704,12 +1642,9 @@ async fn basic_scopes_tasks() {
     for (job_id, group_id) in [(visible_id, group), (hidden_id, sibling)] {
         let (spec, _) =
             map_execution_spec(&sample_task(group_id), None, ExecutionTarget::Realm).unwrap();
-        insert_job(
-            &state.get_ctx().storage_handle,
-            &execution_record(job_id, owner, spec),
-        )
-        .await
-        .unwrap();
+        insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+            .await
+            .unwrap();
     }
 
     let visible = get_task(
@@ -1786,7 +1721,7 @@ async fn lists_zero_pagesize() {
     let headers = basic_headers(&access, TES_SECRET);
     let (spec, _) = map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
     insert_job(
-        &state.get_ctx().storage_handle,
+        &state.get_ctx(),
         &execution_record(JobId::from_bytes([9u8; 16]), owner, spec),
     )
     .await
@@ -1829,12 +1764,9 @@ async fn lists_derived_tags() {
     ] {
         let (spec, _) =
             map_execution_spec(&sample_task(group), None, ExecutionTarget::Realm).unwrap();
-        insert_job(
-            &state.get_ctx().storage_handle,
-            &execution_record(job_id, owner, spec),
-        )
-        .await
-        .unwrap();
+        insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+            .await
+            .unwrap();
     }
 
     let raw_query = format!("tag_key=aruna-engine.org%2Fjob-id&tag_value={target}");
@@ -1877,12 +1809,9 @@ async fn get_resolves() {
     )
     .unwrap();
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx().storage_handle,
-        &execution_record(job_id, owner, spec),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+        .await
+        .unwrap();
 
     let response = get_task(
         State(state.clone()),
@@ -1925,12 +1854,9 @@ async fn cancel_maps_through() {
     )
     .unwrap();
     let job_id = JobId::from_bytes([9u8; 16]);
-    insert_job(
-        &state.get_ctx().storage_handle,
-        &execution_record(job_id, owner, spec),
-    )
-    .await
-    .unwrap();
+    insert_job(&state.get_ctx(), &execution_record(job_id, owner, spec))
+        .await
+        .unwrap();
 
     let ok = cancel_task(
         State(state.clone()),
@@ -2002,6 +1928,7 @@ fn projects_input_identity() {
         env: BTreeMap::new(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -2035,11 +1962,11 @@ fn projects_input_identity() {
         unpinned.inputs[0].url.as_deref(),
         Some("s3://src/in/data.csv")
     );
-    record.captured_inputs = vec![aruna_core::structs::execution::job::CapturedInput {
+    record.captured_inputs = vec![aruna_core::structs::execution::job::input::CapturedInput {
         destination_key: "in/data.csv".to_string(),
         source_node_id: holder,
         version_id: version,
-        content: aruna_core::structs::execution::job::InputContent::Blake3([1; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([1; 32]),
         bytes: 1,
         policies: Vec::new(),
         source_group_id: Ulid::from_bytes([5u8; 16]),
@@ -2071,4 +1998,20 @@ fn projects_input_identity() {
             version_id: Some(version.to_string()),
         }
     );
+}
+
+#[test]
+fn maps_backend_tag() {
+    // The compute backend tag names the backend a task runs on and is reported back.
+    let group = Ulid::from_bytes([5u8; 16]);
+    let mut task = sample_task(group);
+    task.tags.insert(
+        "aruna-engine.org/compute-backend".to_string(),
+        "lab".to_string(),
+    );
+    let (spec, _) = map_execution_spec(&task, None, ExecutionTarget::Realm).unwrap();
+    assert_eq!(spec.backend.as_deref(), Some("lab"));
+    let projected = project_tags(&spec);
+    let tag = projected.get("aruna-engine.org/compute-backend");
+    assert_eq!(tag.map(String::as_str), Some("lab"));
 }

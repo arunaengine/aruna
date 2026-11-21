@@ -9,8 +9,9 @@ use rand_core::TryCryptoRng;
 use zeroize::Zeroizing;
 
 use crate::encoding::{Reader, bounded, header};
-use crate::{Attribute, Ciphertext, Error, PublicParameters, SecretKey, UserKey, check_context};
-use crate::{decapsulate, encapsulate};
+use crate::policy::Attribute;
+use crate::scheme::{Ciphertext, PublicParameters, SecretKey, UserKey, decapsulate, encapsulate};
+use crate::{Error, check_context};
 
 /// A public KEM ciphertext and an authenticated, sealed 32-byte object private key.
 #[derive(Debug, Clone)]
@@ -84,11 +85,11 @@ pub fn seal(
 /// All failures use the same error and expose no partially recovered plaintext.
 #[doc = ""]
 /// ```compile_fail,E0277
-/// let debug = |p, k, e| format!("{:?}", aruna_kpabe::open(p, k, e, b"ctx").unwrap());
+/// let debug = |p, k, e| format!("{:?}", aruna_kpabe::envelope::open(p, k, e, b"ctx").unwrap());
 /// ```
 #[doc = ""]
 /// ```compile_fail,E0599
-/// let clone = |p, k, e| aruna_kpabe::open(p, k, e, b"ctx").unwrap().clone();
+/// let clone = |p, k, e| aruna_kpabe::envelope::open(p, k, e, b"ctx").unwrap().clone();
 /// ```
 pub fn open(
     parameters: &PublicParameters,

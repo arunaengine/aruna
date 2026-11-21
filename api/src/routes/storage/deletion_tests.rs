@@ -3,25 +3,26 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::RELATIONSHIP_OUT_KEYSPACE;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{
+use aruna_core::structs::sync_relationship::{
     SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot, sync_relationship_key,
 };
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::FjallStorage;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_storage::storage::worker::FjallStorage;
 use std::time::SystemTime;
 
 #[tokio::test]
 async fn preflight_discloses_cleanup() {
     let storage_dir = tempfile::tempdir().unwrap();
     let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()
@@ -34,9 +35,10 @@ async fn preflight_discloses_cleanup() {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }),
         realm_id,
         local_node,
@@ -54,7 +56,7 @@ async fn preflight_discloses_cleanup() {
         reference_handling: Default::default(),
         reference_serving: false,
         replicate_deletes: true,
-        created_by: aruna_core::UserId::nil(realm_id),
+        created_by: aruna_core::user::id::UserId::nil(realm_id),
         created_at: SystemTime::UNIX_EPOCH,
         state: SyncState::Enabled,
         status: SyncStatusSnapshot::default(),
@@ -100,7 +102,7 @@ mod coverage {
         };
         let (_, Json(answer)) = deletion_preflight(
             State(node.state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
             Json(request),
         )

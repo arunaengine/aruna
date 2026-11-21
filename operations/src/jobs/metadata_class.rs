@@ -2,13 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::errors::StorageError;
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::structs::placement::binding_directory::BindingError;
 
-use crate::forward::transport::MetadataWriteError;
 use crate::metadata::create_document::CreateDocumentError;
 use crate::metadata::delete_document::DeleteDocumentError;
+use crate::metadata::forward::write::MetadataWriteError;
 use crate::metadata::update_document::UpdateDocumentError;
 
 /// What a job should do about a failed metadata write, shared by every job that
@@ -48,8 +47,8 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
         | MetadataWriteError::NotFound => false,
         MetadataWriteError::Undeliverable(_) => true,
         MetadataWriteError::Create(error) => match error {
-            CreateDocumentError::StorageError(error) => storage_is_transient(error),
-            CreateDocumentError::MetadataError(error) => metadata_error_transient(error),
+            CreateDocumentError::StorageError(error) => error.is_transient(),
+            CreateDocumentError::MetadataError(error) => error.is_transient(),
             CreateDocumentError::ClockHealth(_)
             | CreateDocumentError::TopicAnnouncement(_)
             | CreateDocumentError::HoldsNoBucket
@@ -58,14 +57,14 @@ pub fn metadata_is_transient(error: &MetadataWriteError) -> bool {
             _ => false,
         },
         MetadataWriteError::Update(error) => match error {
-            UpdateDocumentError::StorageError(error) => storage_is_transient(error),
-            UpdateDocumentError::MetadataError(error) => metadata_error_transient(error),
+            UpdateDocumentError::StorageError(error) => error.is_transient(),
+            UpdateDocumentError::MetadataError(error) => error.is_transient(),
             UpdateDocumentError::TopicAnnouncement(_) => true,
             _ => false,
         },
         MetadataWriteError::Delete(error) => match error {
-            DeleteDocumentError::StorageError(error) => storage_is_transient(error),
-            DeleteDocumentError::MetadataError(error) => metadata_error_transient(error),
+            DeleteDocumentError::StorageError(error) => error.is_transient(),
+            DeleteDocumentError::MetadataError(error) => error.is_transient(),
             DeleteDocumentError::SyncDelete(_) => true,
             _ => false,
         },
@@ -82,38 +81,10 @@ fn binding_is_transient(error: &BindingError) -> bool {
     }
 }
 
-fn storage_is_transient(error: &StorageError) -> bool {
-    !matches!(
-        error,
-        StorageError::KeyNotFound | StorageError::InvalidEffect
-    )
-}
-
-/// A missing graph is a durable registry row whose materialization has not
-/// caught up, which the read API already reports as service unavailable. Only a
-/// rejected document stays permanent.
-pub(crate) fn metadata_error_transient(error: &MetadataError) -> bool {
-    match error {
-        MetadataError::ProfileValidation(findings) => {
-            !findings.is_empty()
-                && findings.iter().all(|finding| {
-                    matches!(
-                        finding.code.as_str(),
-                        "profile_unavailable" | "validator_unavailable"
-                    )
-                })
-        }
-        MetadataError::Validation(_)
-        | MetadataError::InvalidInput(_)
-        | MetadataError::InvalidEffect => false,
-        MetadataError::Storage(error) => storage_is_transient(error),
-        _ => true,
-    }
-}
-
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+    use aruna_core::errors::StorageError;
     use aruna_core::metadata::{
         ProfileValidationCompleteness, ProfileValidationFinding, ProfileValidationSeverity,
     };
@@ -205,34 +176,23 @@ mod pure_tests {
             MetadataWriteError::Forbidden,
             MetadataWriteError::NotFound,
             create(CreateDocumentError::DocumentAlreadyExists),
-            create(CreateDocumentError::MissingTransaction),
-            create(CreateDocumentError::NotFinished),
+            create(CreateDocumentError::Io(
+                aruna_core::calls::IoError::Unfinished,
+            )),
             create(CreateDocumentError::RawLimit),
-            create(CreateDocumentError::UnexpectedEvent {
-                state: "s".to_string(),
-                expected: "e",
-                got: "g".to_string(),
-            }),
             create(CreateDocumentError::MetadataError(
                 MetadataError::InvalidInput("bad".to_string()),
             )),
             create(CreateDocumentError::StorageError(StorageError::KeyNotFound)),
             update(UpdateDocumentError::DocumentNotFound),
-            update(UpdateDocumentError::MissingTransaction),
-            update(UpdateDocumentError::NotFinished),
+            update(UpdateDocumentError::Io(
+                aruna_core::calls::IoError::Unfinished,
+            )),
             update(UpdateDocumentError::RawLimit),
-            update(UpdateDocumentError::UnexpectedEvent {
-                state: "s".to_string(),
-                expected: "e",
-                got: "g".to_string(),
-            }),
             delete(DeleteDocumentError::DocumentNotFound),
-            delete(DeleteDocumentError::MissingTransaction),
-            delete(DeleteDocumentError::UnexpectedEvent {
-                state: "s".to_string(),
-                expected: "e",
-                got: "g".to_string(),
-            }),
+            delete(DeleteDocumentError::Io(
+                aruna_core::calls::IoError::Unfinished,
+            )),
             // Settled values of the immutable binding set; a retry replays them.
             create(CreateDocumentError::PlacementBinding(
                 BindingError::Conflicted(handle()),

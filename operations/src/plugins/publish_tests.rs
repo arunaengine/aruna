@@ -3,29 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::plugins::copies::read_local;
-use aruna_core::NodeId;
-use aruna_core::UserId;
+use crate::plugins::calls::*;
+use crate::plugins::runs::tests::opened;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::StorageEvent;
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::AUTH_KEYSPACE;
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId, RealmNodeKind};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
 use std::collections::BTreeSet;
-use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
 const FIXTURE: &[u8] = include_bytes!("../../../plugins/tests/fixture.wasm");
-
-fn context() -> (TempDir, DriverContext) {
-    let dir = tempdir().unwrap();
-    let ctx = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    };
-    (dir, ctx)
-}
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -41,12 +31,7 @@ fn actor() -> Actor {
 }
 
 fn auth(actor: &Actor) -> AuthContext {
-    AuthContext {
-        user_id: actor.user_id,
-        realm_id: actor.realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(actor.user_id, actor.realm_id)
 }
 
 async fn write(ctx: &DriverContext, key_space: &str, key: Key, value: Vec<u8>) {
@@ -126,7 +111,7 @@ async fn published(ctx: &DriverContext) -> Vec<PublishedPlugin> {
 
 #[tokio::test]
 async fn writes_entry_once() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 0, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     assert_eq!(write_entry(&ctx, entry(&digest)).await, Ok(entry(&digest)));
@@ -146,14 +131,14 @@ async fn writes_entry_once() {
 
 #[tokio::test]
 async fn entry_refusals() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Server, 1, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     assert_eq!(
         write_entry(&ctx, entry(&digest)).await,
         Err(EntryError::NotManagementNode)
     );
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 0, false).await;
     assert_eq!(
         write_entry(&ctx, entry(&digest)).await,
@@ -164,7 +149,7 @@ async fn entry_refusals() {
 
 #[tokio::test]
 async fn publishes_after_copies() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 0, true).await;
     let plugin = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec())
@@ -193,7 +178,7 @@ async fn publishes_after_copies() {
 
 #[tokio::test]
 async fn too_few_copies() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 2, true).await;
     let refused = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec()).await;
@@ -215,7 +200,7 @@ async fn too_few_copies() {
 
 #[tokio::test]
 async fn refuses_before_storing() {
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     let actor = actor();
     seed(&ctx, &actor, RealmNodeKind::Management, 0, false).await;
     let refused = publish_plugin(&ctx, actor.clone(), auth(&actor), FIXTURE.to_vec()).await;
@@ -237,7 +222,7 @@ async fn refuses_before_storing() {
 #[tokio::test]
 async fn counts_current_managers() {
     // Managers 1, 10 and 11: a copy confirmed by a node that left the managers does not count.
-    let (_dir, ctx) = context();
+    let (_dir, ctx) = opened();
     seed(&ctx, &actor(), RealmNodeKind::Management, 2, true).await;
     let digest = format!("sha256:{}", "ab".repeat(32));
     let left = BTreeSet::from([node(1), node(99)]);
@@ -253,4 +238,235 @@ async fn counts_current_managers() {
     let remote = BTreeSet::from([node(1), node(10)]);
     assert!(write_copies(&ctx, entry(&digest), remote).await.is_ok());
     assert_eq!(published(&ctx).await.len(), 1);
+}
+
+/// A finished window member with the answer `stored`.
+fn answered(index: usize, stored: Result<bool, String>) -> IoResult {
+    let result = stored.map_err(|_| aruna_core::metadata::protocol::MetadataReadError::Unavailable);
+    let answer = MetadataTransportMessage::ArtifactStored { result };
+    let event = Event::Net(NetEvent::MetadataAnswer(Box::new(
+        aruna_core::events::MetadataAnswer {
+            peer: node(0),
+            elapsed: std::time::Duration::ZERO,
+            result: Ok(encode_message(&answer).unwrap()),
+        },
+    )));
+    IoResult::Group(GroupEvent::Member {
+        index,
+        result: GroupResult::Done(Box::new(event)),
+    })
+}
+
+fn sent(node_id: NodeId, artifact: &[u8], index: u32) -> Effect {
+    let chunk = chunk_of("sha256:d", artifact, index);
+    Effect::Net(NetEffect::MetadataRequest(Box::new(store_request(
+        node_id, chunk,
+    ))))
+}
+
+#[test]
+fn copies_in_window() {
+    use crate::plugins::copy::rows::CHUNK;
+    let artifact = vec![7u8; CHUNK + 1];
+    let (first, second) = (node(1), node(2));
+    let mut copy = copy_artifact(
+        vec![first, second],
+        "sha256:d".into(),
+        artifact.clone().into(),
+    );
+    let group = EffectGroup {
+        members: vec![sent(first, &artifact, 0), sent(second, &artifact, 0)],
+        limit: 2,
+        form: GroupForm::Window,
+    };
+    assert_eq!(copy.first(), Ok(Next::Call(IoCall::Group(group))));
+    // The first node goes on with its second chunk and completes; the second fails.
+    let next = Box::new(sent(first, &artifact, 1));
+    assert_eq!(
+        copy.next(answered(0, Ok(false))),
+        Ok(Next::Call(IoCall::Effect(next)))
+    );
+    assert_eq!(copy.next(answered(1, Err("down".into()))), Ok(Next::Wait));
+    assert_eq!(copy.next(answered(2, Ok(true))), Ok(Next::Wait));
+    let closed = IoResult::Group(GroupEvent::Closed);
+    assert_eq!(copy.next(closed), Ok(Next::Done(BTreeSet::from([first]))));
+}
+
+#[test]
+fn copy_refuses_answers() {
+    let mut copy = copy_artifact(vec![node(1)], "sha256:d".into(), vec![1u8].into());
+    copy.first().unwrap();
+    let got = "GroupEvent::Member";
+    let unknown = copy.next(answered(5, Ok(true)));
+    assert_eq!(unknown, Err(CopyError::Unexpected { got }));
+    let got = "IoResult::Done";
+    assert_eq!(
+        copy.next(IoResult::Done),
+        Err(CopyError::Unexpected { got })
+    );
+    // Without peers nothing is sent and no node confirms.
+    let mut alone = copy_artifact(Vec::new(), "sha256:d".into(), vec![1u8].into());
+    assert_eq!(alone.first(), Ok(Next::Done(BTreeSet::new())));
+}
+
+mod operations {
+    use super::*;
+    use crate::plugins::fixtures::{config_result, is_child};
+    use crate::plugins::rows::tests::child_result;
+
+    fn managers_of(count: u8) -> RealmConfigDocument {
+        let mut config = RealmConfigDocument::new(actor().realm_id, Vec::new(), 3);
+        config.ensure_node(actor().node_id, RealmNodeKind::Management);
+        for seed in 0..count {
+            config.ensure_node(node(100 + seed), RealmNodeKind::Management);
+        }
+        config
+    }
+
+    fn check() -> CheckPublish {
+        let actor = actor();
+        CheckPublish::new(&actor, &auth(&actor), FIXTURE, 5).unwrap()
+    }
+
+    fn allowed() -> IoResult {
+        child_result(Ok::<bool, AuthorizationError>(true))
+    }
+
+    #[test]
+    fn check_refuses_artifacts() {
+        let actor = actor();
+        let auth = auth(&actor);
+        let large = vec![0; MAX_ARTIFACT + 1];
+        let refused = CheckPublish::new(&actor, &auth, &large, 5);
+        assert_eq!(refused.unwrap_err(), PublishError::TooLarge);
+        let invalid = CheckPublish::new(&actor, &auth, b"not wasm", 5);
+        assert!(matches!(invalid, Err(PublishError::Invalid(_))));
+    }
+
+    #[test]
+    fn check_needs_admin() {
+        let mut publish = check();
+        assert!(is_child(&publish.first()));
+        let denied = child_result(Ok::<bool, AuthorizationError>(false));
+        assert_eq!(publish.next(denied), Err(PublishError::Unauthorized));
+    }
+
+    #[test]
+    fn check_plans_store() {
+        let mut publish = check();
+        publish.first().unwrap();
+        assert!(is_child(&publish.next(allowed())));
+        let Ok(Next::Done(PublishStep::Store(plan))) = publish.next(config_result(managers_of(0)))
+        else {
+            panic!("a new version is stored");
+        };
+        assert_eq!(plan.entry.published_at_ms, 5);
+        let mut other = check();
+        other.first().unwrap();
+        other.next(allowed()).unwrap();
+        let bare = RealmConfigDocument::new(actor().realm_id, Vec::new(), 3);
+        let refused = other.next(config_result(bare));
+        assert_eq!(refused, Err(PublishError::NotManagementNode));
+    }
+
+    #[test]
+    fn check_knows_version() {
+        let mut publish = check();
+        let entry = publish.entry.clone();
+        publish.first().unwrap();
+        publish.next(allowed()).unwrap();
+        let mut config = managers_of(0);
+        config.plugins.push(entry.clone());
+        let known = publish.next(config_result(config));
+        assert_eq!(known, Ok(Next::Done(PublishStep::Known(entry))));
+    }
+
+    fn finish(managers: u8) -> FinishPublish {
+        let actor = actor();
+        let auth = auth(&actor);
+        let plan = PublishPlan {
+            config: managers_of(managers),
+            entry: entry("sha256:aa"),
+        };
+        FinishPublish::new(actor, auth, plan, Bytes::from_static(FIXTURE))
+    }
+
+    #[test]
+    fn finish_counts_copies() {
+        let mut publish = finish(2);
+        assert!(is_child(&publish.first()));
+        let none = child_result(Ok::<_, CopyError>(BTreeSet::<NodeId>::new()));
+        let short = PublishError::TooFewCopies {
+            stored: 1,
+            needed: 2,
+        };
+        assert_eq!(publish.next(none), Err(short));
+    }
+
+    #[test]
+    fn finish_writes_entry() {
+        let mut publish = finish(2);
+        publish.first().unwrap();
+        let copies = BTreeSet::from([node(100)]);
+        assert!(is_child(
+            &publish.next(child_result(Ok::<_, CopyError>(copies)))
+        ));
+        let written = entry("sha256:aa");
+        let answer = publish.next(child_result(Ok::<_, EntryError>(written.clone())));
+        assert_eq!(answer, Ok(Next::Done(written)));
+    }
+
+    fn publish() -> PublishPlugin {
+        let actor = actor();
+        let mut publish = PublishPlugin::new(actor.clone(), auth(&actor), Bytes::from(FIXTURE));
+        publish.stamp(7);
+        publish
+    }
+
+    /// A publish whose check planned to store a new version.
+    fn checked() -> PublishPlugin {
+        let mut publish = publish();
+        assert!(is_child(&publish.first()), "the check runs first");
+        let plan = Box::new(PublishPlan {
+            config: managers_of(0),
+            entry: entry("sha256:aa"),
+        });
+        let planned = Ok::<_, PublishError>(PublishStep::Store(plan));
+        assert!(is_child(&publish.next(child_result(planned))), "store here");
+        publish
+    }
+
+    #[test]
+    fn publish_runs_steps() {
+        let mut publish = checked();
+        assert!(matches!(publish.phase, PublishPhase::Storing(_)));
+        let stored = child_result(Ok::<(), ArtifactError>(()));
+        assert!(is_child(&publish.next(stored)), "copy and write");
+        assert!(publish.artifact.is_empty(), "the finish holds the artifact");
+        let written = entry("sha256:aa");
+        let finished = child_result(Ok::<_, PublishError>(written.clone()));
+        assert_eq!(publish.next(finished), Ok(Next::Done(written)));
+    }
+
+    #[test]
+    fn publish_stops_early() {
+        let mut known = publish();
+        assert_eq!(known.now_ms, 7);
+        known.first().unwrap();
+        let same = entry("sha256:aa");
+        let planned = Ok::<_, PublishError>(PublishStep::Known(same.clone()));
+        assert_eq!(known.next(child_result(planned)), Ok(Next::Done(same)));
+        let mut refused = publish();
+        refused.first().unwrap();
+        let denied = child_result(Err::<PublishStep, _>(PublishError::Unauthorized));
+        assert_eq!(refused.next(denied), Err(PublishError::Unauthorized));
+        let mut lost = checked();
+        let failed = child_result(Err::<(), _>(ArtifactError::Busy));
+        let busy = Err(PublishError::Artifact(ArtifactError::Busy));
+        assert_eq!(lost.next(failed), busy, "no copies without one here");
+        let actor = actor();
+        let large = vec![0u8; MAX_ARTIFACT + 1].into();
+        let mut large = PublishPlugin::new(actor.clone(), auth(&actor), large);
+        assert_eq!(large.first(), Err(PublishError::TooLarge));
+    }
 }

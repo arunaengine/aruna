@@ -4,41 +4,35 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::effects::{JobRecordFrame, LaunchFrame};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    JobFamilyRecord, JobId, JobRecordKind, JobState, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordKind, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 
-use super::admission_race::{config, envelope, rows, seed};
+use super::admission_race::{commit_receipt, commit_with, config, envelope, rows, seed};
 use super::terminal::{node_context, physical, reserve_execution, seed_family};
-use crate::driver::{DriverContext, drive};
+use super::{admit_launch, cancel_family};
 use crate::jobs::lifecycle::LifecycleError;
-use crate::jobs::lifecycle::cancel::cancel_family;
-use crate::jobs::lifecycle::target::{admit_launch, commit_receipt, commit_with};
-use crate::jobs::records::transport::serve_job_record;
-use crate::jobs::records::{
-    Admission, AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_kind_complete,
-};
-use crate::jobs::store::read_job_record;
-use crate::metadata::protocol::MetadataTransportMessage;
-use crate::tests::records::{Family, REALM, user};
+use crate::jobs::records::admit::Admission;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
+use crate::tests::records::{Family, REALM, serve_job_record, user};
+use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_test_support::jobs::read_job_record;
 
 fn auth(user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, REALM)
 }
 
 /// Whether the local physical row of the seeded execution is flagged.
 async fn flagged(ctx: &DriverContext) -> bool {
-    read_job_record(&ctx.storage_handle, physical(), None)
+    read_job_record(ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists")
@@ -60,7 +54,7 @@ async fn cancel_stops_local() {
         .expect("alias names a family")
         .expect("cancellation publishes");
 
-    let record = read_job_record(&ctx.storage_handle, physical(), None)
+    let record = read_job_record(&ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -81,7 +75,7 @@ async fn repeated_cancel_quiet() {
         .await
         .expect("alias names a family")
         .expect("cancellation publishes");
-    let first = read_job_record(&ctx.storage_handle, physical(), None)
+    let first = read_job_record(&ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -90,7 +84,7 @@ async fn repeated_cancel_quiet() {
         .expect("alias names a family")
         .expect("cancellation publishes");
 
-    let second = read_job_record(&ctx.storage_handle, physical(), None)
+    let second = read_job_record(&ctx, physical(), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
@@ -111,6 +105,7 @@ async fn admit_cancel(ctx: &Arc<DriverContext>, family: &Family) {
         family.holder.public(),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(record),
         },
     )
@@ -138,6 +133,7 @@ async fn admitted_cancel_stops() {
         family.holder.public(),
         MetadataTransportMessage::ForwardJobRecord {
             placement: family.placement,
+            attached: Vec::new(),
             record: Box::new(
                 JobRecordFrame::new(family.sign(
                     &family.holder,
@@ -177,6 +173,7 @@ async fn promoted_cancel_stops() {
             family.holder.public(),
             MetadataTransportMessage::ForwardJobRecord {
                 placement: family.placement,
+                attached: Vec::new(),
                 record: Box::new(JobRecordFrame::new(family.sign(&family.holder, record)).unwrap()),
             },
         )
@@ -281,13 +278,13 @@ async fn winner_cancel_recovers() {
     .unwrap();
 
     assert_eq!(accepted, raced);
-    let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
+    let record = read_job_record(&ctx, JobId::from_bytes([1u8; 16]), None)
         .await
         .unwrap()
         .unwrap();
     assert!(record.cancel_requested);
     assert!(
-        read_job_record(&ctx.storage_handle, JobId::from_bytes([2u8; 16]), None)
+        read_job_record(&ctx, JobId::from_bytes([2u8; 16]), None)
             .await
             .unwrap()
             .is_none()
@@ -309,15 +306,18 @@ async fn late_cancel_flags() {
         .expect("commit decides")
         .expect("receipt commits");
 
-    let record = read_job_record(&ctx.storage_handle, JobId::from_bytes([1u8; 16]), None)
+    let record = read_job_record(&ctx, JobId::from_bytes([1u8; 16]), None)
         .await
         .expect("physical row read")
         .expect("physical row exists");
     assert!(record.cancel_requested);
     assert_eq!(rows(&ctx, JOB_RESERVATION_KEYSPACE, None).await, 0);
-    let updates = load_kind_complete(&ctx, family.family(), JobRecordKind::Update)
-        .await
-        .unwrap();
+    let updates = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Update),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert!(updates.iter().any(|envelope| matches!(
         &envelope.record,
         JobFamilyRecord::Update(update) if update.state == PhysicalExecutionState::Cancelled
@@ -350,9 +350,9 @@ async fn remote_run_untouched() {
 #[tokio::test]
 async fn deletion_hides_family() {
     // Once its submitter deleted the run, a read by id answers absent; nobody else may delete.
-    use crate::jobs::JobRouteError;
-    use crate::jobs::lifecycle::cancel::publish_deletion;
-    use crate::jobs::lifecycle::report::family_report;
+    use super::family_report;
+    use super::publish_deletion;
+    use crate::jobs::route::JobRouteError;
     let family = Family::new([43u8; 32]);
     let (_dir, ctx) = node_context(&family, &family.holder).await;
     seed_family(&ctx, &family).await;
@@ -375,12 +375,12 @@ async fn deletion_hides_family() {
 async fn unrecorded_deletion_kept() {
     // A node that cannot record the deletion in the run's family keeps the run, so a retried
     // delete records it again; a holder records it before the run goes.
-    use crate::jobs::service::delete_owned_run;
-    use crate::jobs::store::{RunDelete, insert_job};
+    use crate::jobs::job::reads::tests::delete_owned_run;
+    use crate::jobs::store::RunDelete;
     use crate::tests::records::secret;
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobPayload, JobRecord,
-    };
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::JobRecord;
+    use aruna_test_support::jobs::insert_job;
     let family = Family::new([45u8; 32]);
     let job_id = family.spec().job_id;
     let finished = |node| {
@@ -396,6 +396,7 @@ async fn unrecorded_deletion_kept() {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -413,25 +414,29 @@ async fn unrecorded_deletion_kept() {
     let outsider = secret(9);
     let (_dir, ctx) = node_context(&family, &outsider).await;
     seed_family(&ctx, &family).await;
-    insert_job(&ctx.storage_handle, &finished(outsider.public()))
+    insert_job(&ctx, &finished(outsider.public()))
         .await
         .expect("run row written");
     let kept = delete_owned_run(&ctx, &owner, job_id)
         .await
         .expect("delete runs");
     assert!(matches!(kept, RunDelete::Unrecorded(_)), "{kept:?}");
-    let row = read_job_record(&ctx.storage_handle, job_id, None).await;
+    let row = read_job_record(&ctx, job_id, None).await;
     assert!(row.expect("run row read").is_some());
 
     let (_dir, ctx) = node_context(&family, &family.holder).await;
     seed_family(&ctx, &family).await;
-    insert_job(&ctx.storage_handle, &finished(family.holder.public()))
+    insert_job(&ctx, &finished(family.holder.public()))
         .await
         .expect("run row written");
     let deleted = delete_owned_run(&ctx, &owner, job_id)
         .await
         .expect("delete runs");
     assert_eq!(deleted, RunDelete::Deleted);
-    let cancels = load_kind_complete(&ctx, family.family(), JobRecordKind::Cancel).await;
+    let cancels = drive(
+        LoadFamilyOperation::kind(family.family(), JobRecordKind::Cancel),
+        &ctx,
+    )
+    .await;
     assert_eq!(cancels.expect("cancel records load").len(), 1);
 }

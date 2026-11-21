@@ -5,38 +5,40 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, IterStart, JobRecordFrame, StorageEffect};
+use aruna_core::effects::{Effect, JobRecordFrame, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE, FAMILY_OUTBOX_KEYSPACE,
     FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE,
 };
-use aruna_core::operation::Operation;
-use aruna_core::structs::execution::job::{
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobFamilyRecord, JobRecordEnvelope, JobRecordKey, JobRecordKind, LocalExecution,
 };
+use aruna_core::structs::execution::job::identity::RETENTION_MS;
+use aruna_core::structs::execution::job::prune::{FamilyTombstone, TOMBSTONE_RETENTION_MS};
+use aruna_core::structs::execution::job::record_keys::{
+    alias_key, conflict_key, family_prefix, kind_prefix, prune_rows_at, record_key,
+};
+use aruna_core::structs::execution::job::record_rows::{
+    OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes,
+};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_core::types::{Effects, Key, TxnId, Value};
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key, Value};
 use tracing::debug;
 
 use super::admit::{
-    Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_append,
+    Admission, AppendPlan, FamilyState, MAX_PENDING_RECORDS, admitted_aliases, plan_bundle,
     relayable,
 };
-use super::keys::{alias_key, conflict_key, family_prefix, kind_prefix, record_key};
-use super::rows::{OutboxEntry, PendingRecord, ProjectionCache, from_bytes, to_bytes};
 use super::verify::{EvidencePlan, FamilyView};
 use super::{MAX_EVIDENCE_ROWS, RECORD_PAGE_SIZE, RecordStoreError};
 
-/// The rows a batch read found, dropping the keys that hold nothing.
-fn stored_rows(values: Vec<(Key, Option<Value>)>) -> impl Iterator<Item = (Key, Value)> {
-    values
-        .into_iter()
-        .filter_map(|(key, value)| value.map(|value| (key, value)))
-}
+type Step = Result<Next<AppendOutcome>, RecordStoreError>;
 
 /// Where one candidate record came from. The transport peer is authenticated
 /// separately from the envelope's publisher and is audit data only.
@@ -72,6 +74,8 @@ pub struct AppendOutcome {
     pub deferred: bool,
 }
 
+/// Reads the realm view outside any transaction; every family read and write runs in one write
+/// transaction, which the runner opens at the first row call and commits on success.
 #[derive(Debug, PartialEq)]
 pub struct AppendRecordOperation {
     config: AppendRecordConfig,
@@ -84,26 +88,25 @@ pub struct AppendRecordOperation {
     scans: VecDeque<JobRecordKind>,
     cursor: Option<Key>,
     scanned: usize,
+    /// The record rows of the pending batch read, in the order they were asked for.
+    asked: Vec<Key>,
+    outcome: Option<AppendOutcome>,
     state: AppendState,
-    outcome: Option<Result<AppendOutcome, RecordStoreError>>,
+    /// Records that travel with the candidate, such as the spec it binds.
+    attached: Vec<JobRecordEnvelope>,
+    tombstone: Option<FamilyTombstone>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppendState {
-    Init,
     ReadConfig,
-    Begin,
-    ReadRow { txn_id: TxnId },
-    ScanPending { txn_id: TxnId },
-    ReadPending { txn_id: TxnId },
-    ReadEvidence { txn_id: TxnId },
-    ScanKind { txn_id: TxnId },
-    Write { txn_id: TxnId },
-    Clear { txn_id: TxnId },
-    Commit { txn_id: TxnId },
-    Cancel { txn_id: TxnId },
-    Finish,
-    Error,
+    ReadRow,
+    ScanPending,
+    ReadPending,
+    ReadEvidence,
+    ScanKind,
+    Write,
+    Clear,
 }
 
 impl AppendRecordOperation {
@@ -118,9 +121,37 @@ impl AppendRecordOperation {
             scans: VecDeque::new(),
             cursor: None,
             scanned: 0,
-            state: AppendState::Init,
+            asked: Vec::new(),
             outcome: None,
+            state: AppendState::ReadConfig,
+            attached: Vec::new(),
+            tombstone: None,
         }
+    }
+
+    /// Adds the records a peer sent along with the candidate; they are admitted before it. A
+    /// record of another family is ignored.
+    pub fn attach(mut self, attached: Vec<JobRecordEnvelope>) -> Self {
+        let family = self.family();
+        self.attached = (attached.into_iter())
+            .filter(|envelope| envelope.family() == family)
+            .collect();
+        self
+    }
+
+    fn attached_spec(&self) -> Option<&JobRecordEnvelope> {
+        (self.attached.iter()).find(|envelope| matches!(envelope.record, JobFamilyRecord::Spec(_)))
+    }
+
+    /// The group of the spec this append may start the family with.
+    fn spec_group(&self) -> Option<GroupId> {
+        [Some(self.envelope()), self.attached_spec()]
+            .into_iter()
+            .flatten()
+            .find_map(|envelope| match &envelope.record {
+                JobFamilyRecord::Spec(spec) => Some(spec.group_id),
+                _ => None,
+            })
     }
 
     fn envelope(&self) -> &JobRecordEnvelope {
@@ -131,33 +162,20 @@ impl AppendRecordOperation {
         self.envelope().family()
     }
 
-    fn txn(&self) -> Option<TxnId> {
-        match self.state {
-            AppendState::ReadRow { txn_id }
-            | AppendState::ScanPending { txn_id }
-            | AppendState::ReadPending { txn_id }
-            | AppendState::ReadEvidence { txn_id }
-            | AppendState::ScanKind { txn_id }
-            | AppendState::Write { txn_id }
-            | AppendState::Clear { txn_id }
-            | AppendState::Commit { txn_id }
-            | AppendState::Cancel { txn_id } => Some(txn_id),
-            _ => None,
-        }
-    }
-
     /// The realm view is read outside the transaction: a config write is
     /// unrelated to this family and must not conflict every append.
-    fn read_config(&mut self) -> Effects {
+    fn read_config(&mut self) -> Step {
         self.state = AppendState::ReadConfig;
         let config = DocumentTarget::RealmConfig {
             realm_id: self.config.realm_id,
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: config.storage_keyspace().to_string(),
-            key: config.storage_key(),
-            txn_id: None,
-        })]
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+            StorageEffect::Read {
+                key_space: config.storage_keyspace().to_string(),
+                key: config.storage_key(),
+                txn_id: None,
+            },
+        )))))
     }
 
     fn keep_view(&mut self, value: Option<Value>) -> Result<(), RecordStoreError> {
@@ -169,8 +187,8 @@ impl AppendRecordOperation {
         Ok(())
     }
 
-    fn read_row(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AppendState::ReadRow { txn_id };
+    fn read_row(&mut self) -> Step {
+        self.state = AppendState::ReadRow;
         let mut reads = vec![
             (
                 FAMILY_RECORD_KEYSPACE.to_string(),
@@ -180,105 +198,139 @@ impl AppendRecordOperation {
                 FAMILY_PROJECTION_KEYSPACE.to_string(),
                 family_prefix(&self.family()),
             ),
+            // Read in this transaction, so the append after the last page sees the finished mark.
+            (
+                FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+                family_prefix(&self.family()),
+            ),
         ];
-        if let JobFamilyRecord::Spec(spec) = &self.envelope().record {
-            reads.push(crate::groups::fence::group_fence_key(spec.group_id));
+        if let Some(group_id) = self.spec_group() {
+            reads.push(crate::groups::fence::group_fence_key(group_id));
         }
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        Ok(Next::Call(IoCall::Read(reads)))
     }
 
-    fn scan_pending(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AppendState::ScanPending { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_PENDING_KEYSPACE.to_string(),
-            prefix: Some(family_prefix(&self.family())),
-            start: None,
+    /// Keeps the candidate's own row, the projection cache and the family tombstone, and checks
+    /// that a spec's group still accepts writes.
+    fn keep_row(&mut self, values: Vec<Option<Value>>) -> Result<(), RecordStoreError> {
+        let mut values = values.into_iter();
+        let row = values
+            .next()
+            .flatten()
+            .map(|value| (record_key(&self.envelope().key()), value));
+        if let Some(Some(value)) = values.next() {
+            self.cache = ProjectionCache::decode(&value);
+        }
+        if let Some(Some(value)) = values.next() {
+            self.tombstone = Some(from_bytes::<FamilyTombstone>(&value)?);
+        }
+        if self.spec_group().is_some() {
+            let Some(value) = values.next() else {
+                return Err(RecordStoreError::EvidenceIncomplete);
+            };
+            aruna_core::structs::identity::group_delete::check_group_write(value.as_deref())?;
+        }
+        self.keep_records(row)
+    }
+
+    fn scan_pending(&mut self) -> Step {
+        self.state = AppendState::ScanPending;
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_PENDING_KEYSPACE.to_string(),
+            prefix: family_prefix(&self.family()),
+            after: None,
             limit: MAX_PENDING_RECORDS,
-            txn_id: Some(txn_id),
-        })]
+        }))
+    }
+
+    /// Reads the record rows of `keys` this append has not loaded yet.
+    fn read_records(&mut self, state: AppendState, keys: Vec<Key>) -> Step {
+        self.state = state;
+        let reads = keys
+            .iter()
+            .map(|key| (FAMILY_RECORD_KEYSPACE.to_string(), key.clone()))
+            .collect();
+        self.asked = keys;
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// The rows the pending batch read found, dropping the keys that hold nothing.
+    fn found(&mut self, values: Vec<Option<Value>>) -> Vec<(Key, Value)> {
+        std::mem::take(&mut self.asked)
+            .into_iter()
+            .zip(values)
+            .filter_map(|(key, value)| value.map(|value| (key, value)))
+            .collect()
     }
 
     /// A pending record may already be stored under its own key by another
     /// path, so its row is read before it could ever be rewritten.
-    fn read_pending(&mut self, txn_id: TxnId) -> Effects {
-        let reads: Vec<(String, Key)> = self
+    fn read_pending(&mut self) -> Step {
+        let keys: Vec<Key> = self
             .retained
             .iter()
             .filter(|(key, _)| !self.stored.contains_key(key))
-            .map(|(key, _)| (FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
+            .map(|(key, _)| record_key(key))
             .collect();
-        if reads.is_empty() {
-            return self.read_evidence(txn_id);
-        }
-        self.state = AppendState::ReadPending { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        self.read_records(AppendState::ReadPending, keys)
     }
 
     /// The exact predecessors of every record this append judges: the candidate
     /// and each retained one. Retained records are re-judged here, so their
     /// evidence is read on every attempt, not only on first arrival.
-    fn read_evidence(&mut self, txn_id: TxnId) -> Effects {
+    fn read_evidence(&mut self) -> Step {
         let mut plan = EvidencePlan::default();
         plan.extend(&self.envelope().record);
+        for envelope in &self.attached {
+            plan.extend(&envelope.record);
+        }
+        // Whether this node holds an accepted spec decides the admission rules.
+        plan.kinds.insert(JobRecordKind::Spec);
         for (_, row) in &self.retained {
             plan.extend(&row.envelope.record);
         }
         self.scans = plan.kinds.into_iter().collect();
-        let reads: Vec<(String, Key)> = plan
+        let keys: Vec<Key> = plan
             .keys
             .iter()
             .filter(|key| !self.stored.contains_key(key))
-            .map(|key| (FAMILY_RECORD_KEYSPACE.to_string(), record_key(key)))
+            .map(record_key)
             .collect();
-        if reads.is_empty() {
-            return self.scan_kind(txn_id);
-        }
-        self.state = AppendState::ReadEvidence { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads,
-            txn_id: Some(txn_id),
-        })]
+        self.read_records(AppendState::ReadEvidence, keys)
     }
 
     /// Pages one whole record kind. A predecessor selected by digest or by an
     /// id no key carries is absent only once its kind has been read to the end,
     /// so this follows the continuation instead of stopping at one page.
-    fn scan_kind(&mut self, txn_id: TxnId) -> Effects {
+    fn scan_kind(&mut self) -> Step {
         let Some(kind) = self.scans.front().copied() else {
-            return self.plan_writes(txn_id);
+            return self.plan_writes();
         };
-        self.state = AppendState::ScanKind { txn_id };
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: FAMILY_RECORD_KEYSPACE.to_string(),
-            prefix: Some(kind_prefix(&self.family(), kind)),
-            start: self.cursor.clone().map(IterStart::After),
+        self.state = AppendState::ScanKind;
+        Ok(Next::Call(IoCall::Page {
+            space: FAMILY_RECORD_KEYSPACE.to_string(),
+            prefix: kind_prefix(&self.family(), kind),
+            after: self.cursor.clone(),
             limit: RECORD_PAGE_SIZE,
-            txn_id: Some(txn_id),
-        })]
+        }))
     }
 
     /// Continues the current kind, moves to the next one, or plans the writes.
     /// Reaching the row budget with pages left fails closed: a partial evidence
     /// set would read as a missing predecessor.
-    fn next_page(&mut self, txn_id: TxnId, next: Option<Key>) -> Effects {
+    fn next_page(&mut self, next: Option<Key>) -> Step {
         match next {
             Some(_) if self.scanned >= MAX_EVIDENCE_ROWS => {
-                self.fail(RecordStoreError::EvidenceIncomplete)
+                Err(RecordStoreError::EvidenceIncomplete)
             }
             Some(cursor) => {
                 self.cursor = Some(cursor);
-                self.scan_kind(txn_id)
+                self.scan_kind()
             }
             None => {
                 self.cursor = None;
                 self.scans.pop_front();
-                self.scan_kind(txn_id)
+                self.scan_kind()
             }
         }
     }
@@ -308,9 +360,9 @@ impl AppendRecordOperation {
         }
     }
 
-    /// Builds the plan and emits its writes. A no-op admission writes nothing
-    /// and aborts the transaction instead of committing an empty batch.
-    fn plan_writes(&mut self, txn_id: TxnId) -> Effects {
+    /// Builds the plan and emits its writes. A no-op admission writes nothing, so its
+    /// transaction commits only reads.
+    fn plan_writes(&mut self) -> Step {
         let relayed = match self.config.origin {
             RecordOrigin::Local => None,
             RecordOrigin::Peer(peer) => Some(peer),
@@ -320,23 +372,20 @@ impl AppendRecordOperation {
             stored: &self.stored,
             local: self.config.local.as_ref(),
             now_ms: self.config.now_ms,
+            tombstone: self.tombstone.as_ref(),
         };
+        let candidate = self.envelope().clone();
         let (admission, plan) =
-            plan_append(&state, &self.retained, self.envelope().clone(), relayed);
-        let writes = match self.batch_writes(&plan) {
-            Ok(writes) => writes,
-            Err(error) => return self.fail(error),
-        };
+            plan_bundle(&state, &self.retained, candidate, &self.attached, relayed);
+        let writes = self.batch_writes(&plan)?;
         self.plan = Some(plan);
-        self.settle(admission);
+        let outcome = self.settle(admission);
         if writes.is_empty() {
-            return self.cancel(txn_id);
+            return Ok(Next::Done(outcome));
         }
-        self.state = AppendState::Write { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes,
-            txn_id: Some(txn_id),
-        })]
+        self.outcome = Some(outcome);
+        self.state = AppendState::Write;
+        Ok(Next::Call(IoCall::Write(writes)))
     }
 
     fn batch_writes(
@@ -388,6 +437,19 @@ impl AppendRecordOperation {
                 Value::from(to_bytes(row)?.as_slice()),
             ));
         }
+        if !plan.admitted.is_empty() || !plan.pending.is_empty() {
+            // A pending row keeps its first sight across re-arrivals, so it bounds the due time.
+            let kept = (self.retained.iter())
+                .filter(|(key, _)| !plan.cleared.contains(key))
+                .chain(plan.pending.iter());
+            let expiry =
+                kept.map(|(_, row)| row.first_seen_ms.saturating_add(TOMBSTONE_RETENTION_MS));
+            let written = self.config.now_ms.saturating_add(RETENTION_MS);
+            writes.extend(prune_rows_at(
+                &self.family(),
+                expiry.fold(written, u64::min),
+            ));
+        }
         if !plan.admitted.is_empty() {
             writes.push((
                 FAMILY_PROJECTION_KEYSPACE.to_string(),
@@ -400,7 +462,7 @@ impl AppendRecordOperation {
         Ok(writes)
     }
 
-    fn clear_pending(&mut self, txn_id: TxnId) -> Effects {
+    fn clear_pending(&mut self) -> Step {
         let deletes: Vec<(String, Key)> = self
             .plan
             .as_ref()
@@ -411,27 +473,11 @@ impl AppendRecordOperation {
                     .collect()
             })
             .unwrap_or_default();
-        if deletes.is_empty() {
-            return self.commit(txn_id);
-        }
-        self.state = AppendState::Clear { txn_id };
-        smallvec![Effect::Storage(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: Some(txn_id),
-        })]
+        self.state = AppendState::Clear;
+        Ok(Next::Call(IoCall::Delete(deletes)))
     }
 
-    fn commit(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AppendState::Commit { txn_id };
-        smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-    }
-
-    fn cancel(&mut self, txn_id: TxnId) -> Effects {
-        self.state = AppendState::Cancel { txn_id };
-        smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-    }
-
-    fn settle(&mut self, admission: Admission) {
+    fn settle(&self, admission: Admission) -> AppendOutcome {
         let admitted = self.plan.as_ref().map_or(0, |plan| plan.admitted.len());
         let digest = self.envelope().digest().unwrap_or_default();
         debug!(
@@ -440,39 +486,22 @@ impl AppendRecordOperation {
             admitted,
             "Job record admission decided"
         );
-        self.outcome = Some(Ok(AppendOutcome {
+        AppendOutcome {
             key: self.envelope().key(),
             digest,
             deferred: matches!(
                 admission,
-                Admission::Pending(super::rows::PendingNeed::LocalView)
+                Admission::Pending(
+                    aruna_core::structs::execution::job::record_rows::PendingNeed::LocalView
+                )
             ),
             admission,
             admitted,
-        }));
+        }
     }
 
-    fn finish(&mut self) -> Effects {
-        self.state = match &self.outcome {
-            Some(Ok(_)) => AppendState::Finish,
-            _ => AppendState::Error,
-        };
-        smallvec![]
-    }
-
-    fn fail(&mut self, error: RecordStoreError) -> Effects {
-        self.outcome = Some(Err(error));
-        self.state = AppendState::Error;
-        smallvec![]
-    }
-
-    fn unexpected(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(RecordStoreError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+    fn unexpected(&self, expected: &'static str, got: &'static str) -> RecordStoreError {
+        RecordStoreError::unexpected(&self.state, expected, got)
     }
 }
 
@@ -480,145 +509,8 @@ impl Operation for AppendRecordOperation {
     type Output = AppendOutcome;
     type Error = RecordStoreError;
 
-    fn start(&mut self) -> Effects {
-        self.read_config()
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            AppendState::ReadConfig => match event {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-                    if let Err(error) = self.keep_view(value) {
-                        return self.fail(error);
-                    }
-                    self.state = AppendState::Begin;
-                    smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                        read: false
-                    })]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("realm config read", format!("{other:?}")),
-            },
-            AppendState::Begin => match event {
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }) => {
-                    self.read_row(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction start", format!("{other:?}")),
-            },
-            AppendState::ReadRow { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let mut values = values.into_iter();
-                    let row = values
-                        .next()
-                        .and_then(|(key, value)| value.map(|value| (key, value)));
-                    if let Some((_, Some(value))) = values.next() {
-                        self.cache = ProjectionCache::decode(&value);
-                    }
-                    if matches!(self.envelope().record, JobFamilyRecord::Spec(_)) {
-                        let Some((_, value)) = values.next() else {
-                            return self.fail(RecordStoreError::EvidenceIncomplete);
-                        };
-                        if let Err(error) =
-                            aruna_core::structs::identity::group_delete::check_group_write(
-                                value.as_deref(),
-                            )
-                        {
-                            return self.fail(error.into());
-                        }
-                    }
-                    if let Err(error) = self.keep_records(row) {
-                        return self.fail(error);
-                    }
-                    self.scan_pending(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record row read", format!("{other:?}")),
-            },
-            AppendState::ScanPending { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                    self.keep_pending(values);
-                    self.read_pending(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("pending scan", format!("{other:?}")),
-            },
-            AppendState::ReadPending { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if let Err(error) = self.keep_records(stored_rows(values)) {
-                        return self.fail(error);
-                    }
-                    self.read_evidence(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("pending row read", format!("{other:?}")),
-            },
-            AppendState::ReadEvidence { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    if let Err(error) = self.keep_records(stored_rows(values)) {
-                        return self.fail(error);
-                    }
-                    self.scan_kind(txn_id)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("evidence row read", format!("{other:?}")),
-            },
-            AppendState::ScanKind { txn_id } => match event {
-                Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) => {
-                    self.scanned = self.scanned.saturating_add(values.len());
-                    if let Err(error) = self.keep_records(values) {
-                        return self.fail(error);
-                    }
-                    self.next_page(txn_id, next_start_after)
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("evidence scan", format!("{other:?}")),
-            },
-            AppendState::Write { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchWriteResult { .. }) => self.clear_pending(txn_id),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("record write", format!("{other:?}")),
-            },
-            AppendState::Clear { txn_id } => match event {
-                Event::Storage(StorageEvent::BatchDeleteResult { .. }) => self.commit(txn_id),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("pending clear", format!("{other:?}")),
-            },
-            AppendState::Commit { .. } => match event {
-                Event::Storage(StorageEvent::TransactionCommitted { .. }) => self.finish(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction commit", format!("{other:?}")),
-            },
-            AppendState::Cancel { .. } => match event {
-                Event::Storage(StorageEvent::TransactionAborted { .. }) => self.finish(),
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected("transaction abort", format!("{other:?}")),
-            },
-            AppendState::Init | AppendState::Finish | AppendState::Error => smallvec![],
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, AppendState::Finish | AppendState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.outcome.unwrap_or(Err(RecordStoreError::NotFinished))
-    }
-
-    /// An open transaction is rolled back, so a partial append never becomes
-    /// visible.
-    fn abort(&mut self) -> Effects {
-        match self.txn() {
-            Some(txn_id) => {
-                self.state = AppendState::Error;
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            None => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
     fn expected_error(error: &Self::Error) -> bool {
@@ -626,5 +518,55 @@ impl Operation for AppendRecordOperation {
             error,
             RecordStoreError::RealmConfigMissing | RecordStoreError::UnknownAlias
         )
+    }
+
+    fn first(&mut self) -> Step {
+        self.read_config()
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match (self.state, result) {
+            (AppendState::ReadConfig, IoResult::Event(event)) => match *event {
+                Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+                    self.keep_view(value)?;
+                    self.read_row()
+                }
+                Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+                other => Err(self.unexpected("realm config read", other.label())),
+            },
+            (AppendState::ReadRow, IoResult::Values(values)) => {
+                self.keep_row(values)?;
+                self.scan_pending()
+            }
+            (AppendState::ScanPending, IoResult::Page { rows, .. }) => {
+                self.keep_pending(rows);
+                self.read_pending()
+            }
+            (AppendState::ReadPending, IoResult::Values(values)) => {
+                let rows = self.found(values);
+                self.keep_records(rows)?;
+                self.read_evidence()
+            }
+            (AppendState::ReadEvidence, IoResult::Values(values)) => {
+                let rows = self.found(values);
+                self.keep_records(rows)?;
+                self.scan_kind()
+            }
+            (AppendState::ScanKind, IoResult::Page { rows, next }) => {
+                self.scanned = self.scanned.saturating_add(rows.len());
+                self.keep_records(rows)?;
+                self.next_page(next)
+            }
+            (AppendState::Write, IoResult::Done) => self.clear_pending(),
+            (AppendState::Clear, IoResult::Done) => match self.outcome.take() {
+                Some(outcome) => Ok(Next::Done(outcome)),
+                None => Err(RecordStoreError::NotFinished),
+            },
+            (state, other) => Err(RecordStoreError::unexpected(
+                &state,
+                "a result of this step",
+                other.label(),
+            )),
+        }
     }
 }

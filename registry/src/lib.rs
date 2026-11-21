@@ -16,20 +16,20 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use aruna_blob::egress::EgressGuard;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{
     FederationError, RealmTotals, Registration, Signed, Withdrawal, valid_federation_url,
 };
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::time::unix_timestamp_secs;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use tracing::warn;
@@ -87,6 +87,8 @@ impl RegistryState {
 pub enum RegistryError {
     #[error("path is not a realm id")]
     BadRealm,
+    #[error("the listing cursor is not one this registry issued")]
+    BadCursor,
     #[error("descriptor URLs must be HTTPS, or HTTP to a loopback host")]
     BadUrl,
     #[error("invalid descriptor: {0}")]
@@ -104,9 +106,11 @@ pub enum RegistryError {
 impl IntoResponse for RegistryError {
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::BadRealm | Self::BadUrl | Self::BadDescriptor(_) | Self::BadTotals(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::BadRealm
+            | Self::BadCursor
+            | Self::BadUrl
+            | Self::BadDescriptor(_)
+            | Self::BadTotals(_) => StatusCode::BAD_REQUEST,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Store(StoreError::NotFound) => StatusCode::NOT_FOUND,
             Self::Signature(_) => StatusCode::FORBIDDEN,
@@ -215,20 +219,48 @@ fn check_registration(
         .map_err(RegistryError::BadDescriptor)
 }
 
-/// Listed and approved realms, approved first; hidden and retired ones are left out.
-async fn list_realms(State(state): State<Arc<RegistryState>>) -> Result<Response, RegistryError> {
+/// One page of the public listing.
+#[derive(Debug, Default, Deserialize)]
+pub struct RealmsQuery {
+    /// The `x-next-cursor` header of the previous page.
+    pub cursor: Option<String>,
+    /// Realms per page, 1 to 1000; 100 by default.
+    pub limit: Option<usize>,
+}
+
+/// The header that continues the public listing; absent on the last page.
+const NEXT_CURSOR: &str = "x-next-cursor";
+
+/// Listed and approved realms, approved first, a page at a time; hidden and retired ones are
+/// left out. The body stays a list, and the `x-next-cursor` header continues it.
+async fn list_realms(
+    State(state): State<Arc<RegistryState>>,
+    Query(query): Query<RealmsQuery>,
+) -> Result<Response, RegistryError> {
     let now = unix_timestamp_secs();
-    let mut listings = Vec::new();
-    for entry in state.store.entries(now)? {
-        let realm_id = entry.registration.payload.descriptor.payload.realm_id;
-        let admin = state.store.admin(&realm_id)?;
-        if admin.listed() {
-            let totals = state.store.totals(&realm_id)?;
-            listings.push(Listing::new(entry, now, admin.status, totals));
-        }
+    let after = (query.cursor.as_deref())
+        .map(aruna_core::cursor::decode)
+        .transpose()
+        .map_err(|_| RegistryError::BadCursor)?;
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    // The store reads block, so they run on the blocking pool instead of a request worker.
+    let page = move || state.store.listing_page(now, after.as_deref(), limit);
+    let (listed, next) = tokio::task::spawn_blocking(page)
+        .await
+        .map_err(|_| RegistryError::Store(StoreError::Poisoned))??;
+    let listings: Vec<_> = (listed.into_iter())
+        .map(|(entry, admin, totals)| Listing::new(entry, now, admin.status, totals))
+        .collect();
+    let mut response = public(listings);
+    if let Some(next) = next
+        && let Ok(value) = HeaderValue::from_str(&aruna_core::cursor::encode(next))
+    {
+        let headers = response.headers_mut();
+        headers.insert(NEXT_CURSOR, value);
+        let exposed = HeaderValue::from_static(NEXT_CURSOR);
+        headers.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, exposed);
     }
-    listings.sort_by_key(|listing| listing.status != RealmStatus::Approved);
-    Ok(public(listings))
+    Ok(response)
 }
 
 async fn get_realm(
@@ -548,7 +580,8 @@ mod tests {
             .await
             .unwrap();
         assert!(listing.totals.is_none());
-        let listed = body(list_realms(State(state)).await.unwrap()).await;
+        let none = Query(RealmsQuery::default());
+        let listed = body(list_realms(State(state), none).await.unwrap()).await;
         assert_eq!(listed[0]["totals"], serde_json::Value::Null);
     }
 
@@ -576,7 +609,8 @@ mod tests {
             .unwrap();
         let renewed = signed_totals(realm_id(), 12_345_678_900_000, now - 10);
         send_totals(&state, realm_id(), renewed).await.unwrap();
-        let listed = body(list_realms(State(state.clone())).await.unwrap()).await;
+        let none = Query(RealmsQuery::default());
+        let listed = body(list_realms(State(state.clone()), none).await.unwrap()).await;
         assert_eq!(listed[0]["totals"]["data_bytes"], 12_345_678_900_000_u64);
         assert_eq!(listed[0]["totals"]["observed_at"], now - 10);
         assert_eq!(listed[0]["status"], "listed");
@@ -737,7 +771,7 @@ mod tests {
         let bucket = format!("{realm}/01JMETADATA0123456789ABCDE/");
         assert_eq!(parse_tail(&bucket), Some((realm, bucket.clone())));
         let key = SigningKey::from_bytes(&[4; 32]).verifying_key();
-        let node = aruna_core::NodeId::from_bytes(key.as_bytes()).unwrap();
+        let node = aruna_core::id::NodeId::from_bytes(key.as_bytes()).unwrap();
         let arn = format!("arn:aruna:{realm}:{node}:s3/reads/a%20b@01JMETADATA0123456789ABCDE");
         assert_eq!(parse_tail(&arn), Some((realm, arn.clone())));
         for bad in [
@@ -872,7 +906,8 @@ mod tests {
             .store
             .register(&realm_id(), &entry(observed), now)
             .unwrap();
-        let listed = body(list_realms(State(state.clone())).await.unwrap()).await;
+        let none = Query(RealmsQuery::default());
+        let listed = body(list_realms(State(state.clone()), none).await.unwrap()).await;
         assert_eq!(listed[0]["stale"], true);
         let kpis = &listed[0]["registration"]["payload"]["kpis"];
         assert_eq!(kpis["groups"], serde_json::Value::Null);
@@ -882,7 +917,8 @@ mod tests {
         assert_eq!(one["stale"], true);
         // A renewal with fresh KPIs clears the mark.
         state.store.register(&realm_id(), &entry(now), now).unwrap();
-        let listed = body(list_realms(State(state)).await.unwrap()).await;
+        let none = Query(RealmsQuery::default());
+        let listed = body(list_realms(State(state), none).await.unwrap()).await;
         assert_eq!(listed[0]["stale"], false);
     }
 }

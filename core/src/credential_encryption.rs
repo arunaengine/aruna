@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::{Deserialize, Serialize};
@@ -27,8 +27,9 @@ impl CredentialEncryptionKey {
         Self(blake3::derive_key(KEY_CONTEXT, node_secret))
     }
 
-    /// Independent key with no issuing node; encryption stays self-consistent but
-    /// nothing derived from a real node secret can decrypt it.
+    /// Independent key with no issuing node, for tests: nothing derived from a real node secret
+    /// can decrypt what it seals.
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn random() -> Self {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes).expect("operating system random number generator failed");
@@ -94,13 +95,13 @@ impl EncryptedS3Secret {
         }
     }
 
+    /// Encrypts under `nonce`, which must never repeat under `key`.
     pub fn encrypt(
         key: &CredentialEncryptionKey,
         plaintext: &str,
         aad: &[u8],
+        nonce: [u8; 24],
     ) -> Result<Self, EncryptionError> {
-        let mut nonce = [0u8; 24];
-        getrandom::fill(&mut nonce).map_err(|_| EncryptionError::Encrypt)?;
         let ciphertext = key
             .cipher()
             .encrypt(
@@ -133,14 +134,14 @@ impl EncryptedS3Secret {
     }
 }
 
-/// Seals a stored secret row as `nonce || ciphertext`, bound to `aad`.
+/// Seals a stored secret row as `nonce || ciphertext`, bound to `aad`; `nonce` must never repeat
+/// under `key`.
 pub fn seal_bytes(
     key: &CredentialEncryptionKey,
     plaintext: &[u8],
     aad: &[u8],
+    nonce: [u8; 24],
 ) -> Result<Vec<u8>, EncryptionError> {
-    let mut nonce = [0u8; 24];
-    getrandom::fill(&mut nonce).map_err(|_| EncryptionError::Encrypt)?;
     let ciphertext = key
         .cipher()
         .encrypt(
@@ -218,7 +219,7 @@ mod tests {
     fn encrypt_open_roundtrip() {
         let key = CredentialEncryptionKey::derive(&[7u8; 32]);
         let aad = sample_aad();
-        let encrypted = EncryptedS3Secret::encrypt(&key, "top-secret", &aad).unwrap();
+        let encrypted = EncryptedS3Secret::encrypt(&key, "top-secret", &aad, [3; 24]).unwrap();
         assert_eq!(encrypted.open(&key, &aad).unwrap(), "top-secret");
     }
 
@@ -240,9 +241,13 @@ mod tests {
     fn wrong_key_fails() {
         // A copied record on a node with a different secret never yields plaintext.
         let aad = sample_aad();
-        let encrypted =
-            EncryptedS3Secret::encrypt(&CredentialEncryptionKey::derive(&[7u8; 32]), "s", &aad)
-                .unwrap();
+        let encrypted = EncryptedS3Secret::encrypt(
+            &CredentialEncryptionKey::derive(&[7u8; 32]),
+            "s",
+            &aad,
+            [3; 24],
+        )
+        .unwrap();
         let other = CredentialEncryptionKey::derive(&[8u8; 32]);
         assert_eq!(encrypted.open(&other, &aad), Err(EncryptionError::Open));
     }
@@ -251,7 +256,7 @@ mod tests {
     fn tampered_aad_fails() {
         // Rebinding any AAD field (here the group) fails the authentication tag.
         let key = CredentialEncryptionKey::derive(&[7u8; 32]);
-        let encrypted = EncryptedS3Secret::encrypt(&key, "s", &sample_aad()).unwrap();
+        let encrypted = EncryptedS3Secret::encrypt(&key, "s", &sample_aad(), [3; 24]).unwrap();
         let moved = credential_aad(
             "AKIA",
             UserId::local(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
@@ -265,9 +270,13 @@ mod tests {
     #[test]
     fn restart_reproduces_key() {
         // Restart re-derives the identical key from the same node secret.
-        let encrypted =
-            EncryptedS3Secret::encrypt(&CredentialEncryptionKey::derive(&[5u8; 32]), "s", &[])
-                .unwrap();
+        let encrypted = EncryptedS3Secret::encrypt(
+            &CredentialEncryptionKey::derive(&[5u8; 32]),
+            "s",
+            &[],
+            [3; 24],
+        )
+        .unwrap();
         assert_eq!(
             encrypted
                 .open(&CredentialEncryptionKey::derive(&[5u8; 32]), &[])
@@ -288,7 +297,7 @@ mod tests {
     #[test]
     fn sealed_rows_bind() {
         let key = CredentialEncryptionKey::derive(&[7u8; 32]);
-        let sealed = seal_bytes(&key, b"canary-4e2a", b"row-a").unwrap();
+        let sealed = seal_bytes(&key, b"canary-4e2a", b"row-a", [3; 24]).unwrap();
         assert!(!sealed.windows(11).any(|window| window == b"canary-4e2a"));
         assert_eq!(open_bytes(&key, &sealed, b"row-a").unwrap(), b"canary-4e2a");
         assert_eq!(

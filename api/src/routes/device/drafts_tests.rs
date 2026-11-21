@@ -3,23 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{DeviceDraft, preview_draft};
+use crate::auth::OwnerAuth;
 use crate::error::ServerError;
-use crate::metadata::ProfilePreviewRequest;
+use crate::metadata::model::ProfilePreviewRequest;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::device::publish_queue::{PublishEntry, PublishState};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use axum::Json;
 use axum::extract::State;
-use axum::{Extension, Json};
 use std::sync::Arc;
 use ulid::Ulid;
 
@@ -30,24 +30,25 @@ async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);
-    let metadata = MetadataHandle::new(
+    let graph = aruna_graph::GraphHandle::open(
         dir.path().join("metadata"),
         node_id,
-        storage.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    storage.install_metadata_indexes(dir.path().join("metadata"));
     let state = Arc::new(
         ServerState::new(
             Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: Some(metadata),
+                graph_handle: Some(graph),
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,
@@ -95,7 +96,7 @@ async fn preview_refuses_group() {
 
     let result = preview_draft(
         State(state),
-        Extension(Some(auth)),
+        OwnerAuth(auth),
         Json(ProfilePreviewRequest {
             rocrate: serde_json::json!({
                 "@context": "https://w3id.org/ro/crate/1.2/context",
@@ -115,7 +116,7 @@ async fn preview_marks_unchecked() {
     let (_dir, state, auth) = user_node().await;
     let file = format!("https://w3id.org/aruna/data/{}", "09".repeat(32));
     let (_, Json(preview)) = preview_draft(
-            State(state), Extension(Some(auth)), Json(ProfilePreviewRequest {
+            State(state), OwnerAuth(auth), Json(ProfilePreviewRequest {
                 rocrate: serde_json::json!({
                     "@context": "https://w3id.org/ro/crate/1.3/context",
                     "@graph": [
@@ -145,6 +146,7 @@ fn entry() -> PublishEntry {
         "/notes".to_string(),
         true,
         "{}".to_string(),
+        aruna_clock::unix_timestamp_millis(),
     )
 }
 

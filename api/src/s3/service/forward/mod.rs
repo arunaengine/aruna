@@ -8,40 +8,42 @@
 pub(super) mod copy;
 pub(super) mod list;
 pub(super) mod parts;
-pub(super) mod reads;
+pub(crate) mod reads;
 mod uploads;
 mod versions;
 
-use std::sync::{Arc, LazyLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use aruna_drivers::driver::drive;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use aruna_core::NodeId;
+use aruna_core::id::NodeId;
+use aruna_core::member_read::{MemberBody, MemberMethod, TrailerValue};
+use aruna_core::outbound::xml_field;
+use aruna_core::stream::BackendStream;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
-use aruna_core::structs::storage::distribution::RouteError;
 use aruna_core::structs::storage::distribution::delegation::{
-    COPY_CONTEXT_HEADER, COPY_READ_HEADER, CopyContext, DELEGATION_HEADER, Payload, TRAILER_BYTES,
-    body_digest, request_digest,
+    COPY_CONTEXT_HEADER, CopyContext, DIGEST_HEADERS, PASSED_HEADERS, Payload, bound_header,
+    request_digest,
 };
+use aruna_core::structs::storage::distribution::route::{ReadRoute, RouteError};
 use aruna_core::structs::storage::distribution::upload::UploadTag;
-use aruna_core::structs::storage::distribution::{ReadRoute, WriteRoute};
-use aruna_operations::distribution::delegate::{DelegationInput, issue_delegation, node_urls};
-use aruna_operations::distribution::guard::{
-    GuardError, route_read, route_upload, route_write, upload_route, upload_tag, upload_tags,
-};
-use aruna_operations::distribution::status::node_reach;
+use aruna_operations::distribution::guard::GuardError;
+use aruna_operations::distribution::routing::route_read;
+use aruna_operations::distribution::routing::{upload_route, upload_tag, upload_tags};
 use aruna_operations::s3::object::delete::bulk::BulkDeleteEntry;
-use bytes::Bytes;
+use aruna_operations::s3::object::member::read::MemberTarget as Forward;
+use aruna_operations::s3::object::member::read::{
+    MemberPayload as ForwardBody, MemberRequest as ForwardRequest, TrailerChecksum,
+};
+use aruna_operations::s3::object::member::write::{ForwardDeletesOperation, WriteTargetOperation};
 use http::{HeaderMap, Method};
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use s3s::dto::{
     DeleteObjectOutput, DeletedObject, ETag, Error as S3DeleteError, PutObjectOutput, StreamingBlob,
 };
 use s3s::{S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
-use tracing::warn;
 use ulid::Ulid;
 
 use super::ArunaS3Service;
-use super::payload::{ChecksumValue, frame_body};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::util::{map_checksum_algorithm, parse_checksum_algorithm, parse_upload_id};
@@ -49,95 +51,9 @@ use aruna_core::structs::checksum::ChecksumAlgorithm;
 use s3s::TrailingHeaders;
 use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Headers that describe the body.
-const DIGEST_HEADERS: &[&str] = &[
-    "content-length",
-    "content-md5",
-    "content-type",
-    "x-amz-checksum-crc32",
-    "x-amz-checksum-crc32c",
-    "x-amz-checksum-crc64nvme",
-    "x-amz-checksum-sha1",
-    "x-amz-checksum-sha256",
-];
-
-/// Further headers the coordinator needs to store the same object.
-const PASSED_HEADERS: &[&str] = &[
-    "cache-control",
-    "content-disposition",
-    "content-language",
-    "expires",
-    "if-match",
-    "if-modified-since",
-    "if-none-match",
-    "if-unmodified-since",
-    "range",
-    "x-amz-checksum-algorithm",
-    "x-amz-checksum-type",
-    "x-amz-mp-object-size",
-    "x-amz-tagging",
-    "x-amz-copy-source",
-    "x-amz-copy-source-range",
-    "x-amz-copy-source-if-match",
-    "x-amz-copy-source-if-none-match",
-    "x-amz-copy-source-if-modified-since",
-    "x-amz-copy-source-if-unmodified-since",
-    "x-amz-metadata-directive",
-    "x-amz-tagging-directive",
-    "x-amz-acl",
-    "x-amz-checksum-mode",
-];
-
-/// Characters a key keeps unescaped in a forwarded path; `/` separates its segments.
-const KEY_SET: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~')
-    .remove(b'/');
-
-static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .unwrap_or_default()
-});
-
-/// The coordinator a write goes to when this node does not coordinate the key's range.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Forward {
-    pub set_id: Ulid,
-    pub range_id: Ulid,
-    pub node_id: NodeId,
-}
-
-/// One forwarded request: what the coordinator receives besides the delegation.
-pub(super) struct ForwardRequest {
-    pub method: Method,
-    pub operation: &'static str,
-    pub bucket: String,
-    pub key: String,
-    pub query: Option<String>,
-    pub headers: Vec<(String, String)>,
-    pub body: ForwardBody,
-}
-
-/// The body of a forwarded request and how its delegation binds it.
-pub(super) enum ForwardBody {
-    Empty,
-    /// Streams with a trailer the issuer signs over its length and digest.
-    Stream(StreamingBlob, Option<TrailerChecksum>),
-    /// A small body known in advance, bound by its digest.
-    Known(Bytes),
-}
-
-/// The client's trailing checksum a forwarded body carries in its signed trailer: the S3
-/// algorithm name and the value the client's trailer named once the body ended.
-pub(super) struct TrailerChecksum {
-    pub algorithm: String,
-    pub value: ChecksumValue,
+/// A client's body as a forwarded one, ending with the trailer this node signs.
+pub(super) fn stream_body(body: StreamingBlob, checksum: Option<TrailerChecksum>) -> ForwardBody {
+    ForwardBody::Stream(BackendStream::new_from_boxed(body), checksum)
 }
 
 /// The client's trailing checksum to forward, read from its verified trailer once the body
@@ -149,14 +65,14 @@ pub(super) fn trailer_checksum(
     let (algorithm, trailing) = (algorithm?, trailing?);
     let name = map_checksum_algorithm(algorithm)?.as_str().to_string();
     let header = format!("x-amz-checksum-{}", name.to_ascii_lowercase());
-    let value: ChecksumValue = Arc::new(move || {
+    let value = TrailerValue(Arc::new(move || {
         trailing
             .read(|headers| {
                 let value = headers.get(&header)?.to_str().ok()?;
                 Some(value.to_string())
             })
             .flatten()
-    });
+    }));
     Some(TrailerChecksum {
         algorithm: name,
         value,
@@ -215,18 +131,6 @@ pub(super) fn copy_policies(
     http::HeaderValue::from_str(&context.encode().ok()?).ok()
 }
 
-/// Whether a header carries request semantics the delegation must bind; `accept` selects a
-/// folder index, which a forwarded read never asks for.
-fn semantic(name: &str) -> bool {
-    DIGEST_HEADERS.contains(&name)
-        || PASSED_HEADERS.contains(&name)
-        || name == COPY_CONTEXT_HEADER
-        || name == COPY_READ_HEADER
-        || name == "accept"
-        || name.starts_with("x-amz-meta-")
-        || name.starts_with("x-amz-checksum-")
-}
-
 /// The digest of a forwarded request as its target sees it.
 pub(crate) fn forwarded_digest(
     method: &Method,
@@ -238,7 +142,7 @@ pub(crate) fn forwarded_digest(
     // Every semantic header the target sees counts, so none can be added or changed.
     let pairs: Vec<(&str, &str)> = headers
         .iter()
-        .filter(|(name, _)| semantic(name.as_str()))
+        .filter(|(name, _)| bound_header(name.as_str()))
         .map(|(name, value)| {
             let value = value.to_str().unwrap_or("\u{fffd}");
             (name.as_str(), value)
@@ -335,35 +239,24 @@ fn unreachable_error(forward: &Forward, reach: &str) -> S3Error {
     error
 }
 
-/// The text between `<tag>` and `</tag>` of an S3 error body, with basic entities decoded.
-pub(super) fn xml_field(body: &str, tag: &str) -> Option<String> {
-    let start = body.find(&format!("<{tag}>"))? + tag.len() + 2;
-    let end = start + body.get(start..)?.find(&format!("</{tag}>"))?;
-    let text = body.get(start..end)?;
-    Some(
-        text.replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&"),
-    )
-}
-
-/// The coordinator's refusal as this node's answer; a denial says why node globs help.
-fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) -> S3Error {
-    let code = xml_field(body, "Code")
+/// A member's refusal, given its status and S3 error fields, as this node's answer.
+fn refused_error(
+    node_id: NodeId,
+    status: http::StatusCode,
+    code: Option<String>,
+    message: String,
+) -> S3Error {
+    let code = code
         .map(|code| {
             S3ErrorCode::from_bytes(code.as_bytes())
                 .unwrap_or_else(|| S3ErrorCode::Custom(code.into()))
         })
         .unwrap_or(S3ErrorCode::InternalError);
-    let message = xml_field(body, "Message").unwrap_or_default();
     let message = match status {
         http::StatusCode::FORBIDDEN => format!(
-            "The node {} denied the request: {message} Every member checks the \
+            "The node {node_id} denied the request: {message} Every member checks the \
              caller on its own path; grant the bucket with a node glob such as \
-             /{{realm}}/g/{{group}}/data/*/{{bucket}}/**.",
-            forward.node_id
+             /{{realm}}/g/{{group}}/data/*/{{bucket}}/**."
         ),
         _ => message,
     };
@@ -372,24 +265,8 @@ fn coordinator_error(forward: &Forward, status: http::StatusCode, body: &str) ->
     error
 }
 
-/// The body of a node's answer; a broken or oversized body is an error, never an empty answer.
-pub(super) async fn answer_text(response: reqwest::Response) -> S3Result<String> {
-    match crate::routes::storage::relay::capped_body(response).await {
-        Ok(body) => String::from_utf8(body)
-            .map_err(|_| s3_error!(ServiceUnavailable, "A member answered with invalid text")),
-        Err(error) => Err(s3_error!(
-            ServiceUnavailable,
-            "A member's answer broke off: {error}"
-        )),
-    }
-}
-
-pub(super) fn header(response: &reqwest::Response, name: &str) -> Option<String> {
-    response
-        .headers()
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
+pub(super) fn header(response: &MemberBody, name: &str) -> Option<String> {
+    response.header(name).map(str::to_string)
 }
 
 impl ArunaS3Service {
@@ -425,24 +302,9 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(None);
         };
-        if extensions.get::<DelegatedRequest>().is_some() {
-            return Ok(None);
-        }
-        let route = match upload {
-            true => route_upload(self.state.as_ref(), binding, key).await,
-            false => route_write(self.state.as_ref(), binding, key).await,
-        };
-        match route {
-            Ok(WriteRoute::Local { .. }) => Ok(None),
-            Ok(WriteRoute::Forward {
-                range_id, node_id, ..
-            }) => Ok(Some(Forward {
-                set_id: binding.set_id,
-                range_id,
-                node_id,
-            })),
-            Err(error) => Err(guard_error(&error)),
-        }
+        let delegated = extensions.get::<DelegatedRequest>().is_some();
+        let target = WriteTargetOperation::new(binding, key, upload, delegated);
+        (drive(target, self.state.as_ref()).await).map_err(|error| guard_error(&error))
     }
 
     /// Whether this member answers a read of `key`, or with `listing` of every key under it,
@@ -457,7 +319,7 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(false);
         };
-        match route_read(self.state.as_ref(), binding, key, listing).await {
+        match drive(route_read(binding, key, listing), self.state.as_ref()).await {
             Ok(ReadRoute::Local { catching_up }) if listing && catching_up => {
                 Err(catching_up_error(binding.set_id))
             }
@@ -478,119 +340,6 @@ impl ArunaS3Service {
         }
     }
 
-    /// Sends one request to the coordinator and returns its successful answer.
-    pub(super) async fn forward_write(
-        &self,
-        user: &UserAccess,
-        forward: &Forward,
-        request: ForwardRequest,
-    ) -> S3Result<reqwest::Response> {
-        let urls = node_urls(self.state.as_ref(), forward.node_id).await;
-        let Some(base) = urls.and_then(|urls| urls.s3) else {
-            return Err(unreachable_error(
-                forward,
-                &node_reach(self.state.as_ref(), forward.node_id).hint(),
-            ));
-        };
-        let (payload, extra) = match &request.body {
-            ForwardBody::Empty => (Payload::Empty, 0),
-            ForwardBody::Stream(_, checksum) => {
-                let checksum = checksum.as_ref().map(|checksum| checksum.algorithm.clone());
-                (Payload::Framed { checksum }, TRAILER_BYTES as i64)
-            }
-            ForwardBody::Known(bytes) => (Payload::Digest(body_digest(bytes)), 0),
-        };
-        let mut headers = HeaderMap::new();
-        for (name, value) in &request.headers {
-            // A framed body is longer by its trailer.
-            let value = match (name.as_str(), value.parse::<i64>()) {
-                ("content-length", Ok(length)) => (length + extra).to_string(),
-                _ => value.clone(),
-            };
-            let value = &value;
-            if let (Ok(name), Ok(value)) = (
-                http::HeaderName::from_bytes(name.as_bytes()),
-                http::HeaderValue::from_str(value),
-            ) {
-                headers.insert(name, value);
-            }
-        }
-        // Set here so the delegation binds it; a forwarded read never asks for a folder index.
-        (headers.entry(http::header::ACCEPT)).or_insert(http::HeaderValue::from_static("*/*"));
-        let query = request.query.as_deref();
-        let digest = forwarded_digest(
-            &request.method,
-            &request.bucket,
-            &request.key,
-            query,
-            &headers,
-        );
-        let input = DelegationInput {
-            set_id: forward.set_id,
-            range_id: forward.range_id,
-            target: forward.node_id,
-            user_id: user.user_identity,
-            group_id: user.group_id,
-            credential_id: user.access_key.clone(),
-            restrictions: user.path_restrictions.clone(),
-            credential_expiry: unix_secs(user.expiry),
-            operation: request.operation.to_string(),
-            bucket: request.bucket.clone(),
-            key: request.key.clone(),
-            copy_source: (request.headers.iter())
-                .find(|(name, _)| name == "x-amz-copy-source")
-                .map(|(_, value)| value.clone()),
-            request_digest: digest,
-            payload,
-        };
-        let refused = |error: &dyn std::fmt::Display| {
-            s3_error!(InternalError, "Could not delegate the write: {error}")
-        };
-        let signed = issue_delegation(self.state.as_ref(), input, unix_secs(SystemTime::now()))
-            .map_err(|error| refused(&error))?;
-        let delegation = signed.encode().map_err(|error| refused(&error))?;
-        let nonce = signed.delegation.nonce;
-        let path = utf8_percent_encode(&request.key, KEY_SET);
-        let mut url = format!("{}/{}/{path}", base.trim_end_matches('/'), request.bucket);
-        if let Some(query) = query {
-            url = format!("{url}?{query}");
-        }
-        let mut outgoing = CLIENT
-            .request(request.method.clone(), &url)
-            .headers(headers)
-            .header(DELEGATION_HEADER, delegation);
-        match request.body {
-            ForwardBody::Empty => {}
-            ForwardBody::Stream(body, checksum) => {
-                let checksum = checksum.map(|checksum| checksum.value);
-                let framed = frame_body(body, self.state.clone(), nonce, checksum);
-                outgoing = outgoing.body(reqwest::Body::wrap_stream(framed));
-            }
-            ForwardBody::Known(bytes) => outgoing = outgoing.body(bytes),
-        }
-        let response = match outgoing.send().await {
-            Ok(response) => response,
-            Err(error) => {
-                warn!(
-                    node_id = %forward.node_id,
-                    connect = error.is_connect(),
-                    error = %error,
-                    "A distributed bucket coordinator did not take a forwarded write"
-                );
-                return Err(unreachable_error(
-                    forward,
-                    &node_reach(self.state.as_ref(), forward.node_id).hint(),
-                ));
-            }
-        };
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        let body = response.text().await.unwrap_or_default();
-        Err(coordinator_error(forward, status, &body))
-    }
-
     /// Sends a new object `key` to its coordinator for a caller another surface verified;
     /// `If-None-Match: *` makes the coordinator keep a live key as it is.
     pub(crate) async fn member_put(
@@ -599,7 +348,7 @@ impl ArunaS3Service {
         forward: &Forward,
         (bucket, key): (&str, &str),
         (body, content_length, content_type): (StreamingBlob, Option<u64>, &str),
-    ) -> S3Result<reqwest::Response> {
+    ) -> S3Result<MemberBody> {
         let mut headers = vec![
             ("content-type".to_string(), content_type.to_string()),
             ("if-none-match".to_string(), "*".to_string()),
@@ -608,13 +357,13 @@ impl ArunaS3Service {
             content_length.map(|length| ("content-length".to_string(), length.to_string())),
         );
         let request = ForwardRequest {
-            method: Method::PUT,
+            method: MemberMethod::Put,
             operation: "PutObject",
             bucket: bucket.to_string(),
             key: key.to_string(),
             query: None,
             headers,
-            body: ForwardBody::Stream(body, None),
+            body: stream_body(body, None),
         };
         self.forward_write(user, forward, request).await
     }
@@ -632,7 +381,7 @@ impl ArunaS3Service {
         };
         let missing = || s3_error!(NoSuchUpload, "The specified upload does not exist.");
         let tag = UploadTag::parse(value).ok_or_else(missing)?;
-        match upload_route(self.state.as_ref(), binding, key, &tag).await {
+        match drive(upload_route(binding, key, &tag), self.state.as_ref()).await {
             Ok(()) => Ok(tag.upload_id),
             Err(GuardError::Route(RouteError::StaleRange(_))) => Err(s3_error!(
                 NoSuchUpload,
@@ -652,7 +401,7 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(upload_id.to_string());
         };
-        upload_tag(self.state.as_ref(), binding, key, upload_id)
+        drive(upload_tag(binding, key, upload_id), self.state.as_ref())
             .await
             .map(|tag| tag.encode())
             .map_err(|error| guard_error(&error))
@@ -667,7 +416,7 @@ impl ArunaS3Service {
         let Some(binding) = bucket.and_then(|bucket| bucket.distribution.as_ref()) else {
             return Ok(std::collections::HashMap::new());
         };
-        let tags = upload_tags(self.state.as_ref(), binding, uploads)
+        let tags = drive(upload_tags(binding, uploads), self.state.as_ref())
             .await
             .map_err(|error| guard_error(&error))?;
         Ok(tags
@@ -676,7 +425,7 @@ impl ArunaS3Service {
             .collect())
     }
 
-    pub(super) fn forwarded_put(response: &reqwest::Response) -> S3Response<PutObjectOutput> {
+    pub(super) fn forwarded_put(response: &MemberBody) -> S3Response<PutObjectOutput> {
         let e_tag = header(response, "etag")
             .and_then(|value| ETag::parse_http_header(value.as_bytes()).ok());
         S3Response::new(PutObjectOutput {
@@ -701,50 +450,51 @@ impl ArunaS3Service {
         entries: Vec<BulkDeleteEntry>,
     ) -> (Vec<BulkDeleteEntry>, Vec<DeletedObject>, Vec<S3DeleteError>) {
         let (name, info) = bucket;
-        let (mut local, mut deleted, mut errors) = (Vec::new(), Vec::new(), Vec::new());
-        for entry in entries {
-            if entry.version_id.is_some() {
-                local.push(entry);
-                continue;
-            }
-            let forwarded = match self.forward_target(extensions, info, &entry.key).await {
-                Ok(None) => {
-                    local.push(entry);
-                    continue;
-                }
-                Ok(Some(forward)) => {
-                    let request = ForwardRequest {
-                        method: Method::DELETE,
-                        operation: "DeleteObject",
-                        bucket: name.to_string(),
-                        key: entry.key.clone(),
-                        query: None,
-                        headers: Vec::new(),
-                        body: ForwardBody::Empty,
-                    };
-                    self.forward_write(user, &forward, request).await
-                }
-                Err(error) => Err(error),
-            };
-            match forwarded {
-                Ok(response) => deleted.push(DeletedObject {
+        let binding = info.and_then(|info| info.distribution.as_ref());
+        let delegated = extensions.get::<DelegatedRequest>().is_some();
+        let forward = ForwardDeletesOperation::new(
+            self.state.node_and_realm(),
+            reads::delegated_caller(user),
+            (name, binding, delegated),
+            entries.clone(),
+        );
+        let forwarded = match drive(forward, self.state.as_ref()).await {
+            Ok(forwarded) => forwarded,
+            Err(error) => {
+                let message = error.to_string();
+                let failed = entries.into_iter().map(|entry| S3DeleteError {
+                    code: Some("InternalError".to_string()),
                     key: Some(entry.key),
+                    version_id: None,
+                    message: Some(message.clone()),
+                });
+                return (Vec::new(), Vec::new(), failed.collect());
+            }
+        };
+        let (mut deleted, mut errors) = (Vec::new(), Vec::new());
+        for (key, answer) in forwarded.answers {
+            match answer {
+                Ok(response) => deleted.push(DeletedObject {
+                    key: Some(key),
                     delete_marker: header(&response, "x-amz-delete-marker").map(|v| v == "true"),
                     delete_marker_version_id: header(&response, "x-amz-version-id"),
                     ..Default::default()
                 }),
-                Err(error) => errors.push(S3DeleteError {
-                    code: Some(error.code().as_str().to_string()),
-                    key: Some(entry.key),
-                    version_id: None,
-                    message: error.message().map(str::to_string),
-                }),
+                Err(failure) => {
+                    let error = self.member_error(failure);
+                    errors.push(S3DeleteError {
+                        code: Some(error.code().as_str().to_string()),
+                        key: Some(key),
+                        version_id: None,
+                        message: error.message().map(str::to_string),
+                    });
+                }
             }
         }
-        (local, deleted, errors)
+        (forwarded.local, deleted, errors)
     }
 
-    pub(super) fn forwarded_delete(response: &reqwest::Response) -> S3Response<DeleteObjectOutput> {
+    pub(super) fn forwarded_delete(response: &MemberBody) -> S3Response<DeleteObjectOutput> {
         S3Response::new(DeleteObjectOutput {
             delete_marker: header(response, "x-amz-delete-marker").map(|value| value == "true"),
             version_id: header(response, "x-amz-version-id"),

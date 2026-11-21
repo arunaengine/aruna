@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::document::BATCH_TOPIC_LIMIT;
 
 impl DocumentSyncService {
     pub async fn sync_with_peers(
@@ -97,6 +98,42 @@ impl DocumentSyncService {
         let mut sync_peers = self.eligible_peers(candidates, None);
         sync_peers.remove(&self.node.peer_id());
         sync_peers
+    }
+
+    /// One sync round of `topic_id` with `peer`. `None` when the round stopped at its page budget;
+    /// otherwise the topic's stored clock after the round, the target the applied cursor must reach.
+    pub async fn sync_round(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peer: NodeId,
+    ) -> Result<Option<::irokle::ActorClock>> {
+        let peer = node_to_peer(&peer);
+        self.allow_sync_peers(&BTreeSet::from([peer]))?;
+        match timeout(PEER_SYNC_TIMEOUT, self.net.sync_peer_now(peer, topic_id)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Ok(Err(error)) => return Err(NetError::Bootstrap(error.to_string())),
+            Err(_) => return Err(NetError::Timeout(PEER_SYNC_TIMEOUT)),
+        }
+        let clock = (self.node.storage())
+            .actor_clock(&topic_id)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        Ok(Some(clock))
+    }
+
+    /// Whether this node applied `topic_id` up to every one of `targets`.
+    pub async fn applied_covers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        targets: &[::irokle::ActorClock],
+    ) -> Result<bool> {
+        let Some(genesis) = self.topic_genesis(topic_id)? else {
+            return Ok(false);
+        };
+        let key = topic_cursor_key(topic_id);
+        let stored = (self.storage_read(APPLIED_OPS_KEYSPACE.to_string(), key)).await?;
+        let cursor = applied_cursor_clock(self.node.storage(), topic_id, genesis, stored)?;
+        Ok(targets.iter().all(|target| cursor.dominates(target)))
     }
 
     pub(in crate::document_sync) fn topic_genesis(

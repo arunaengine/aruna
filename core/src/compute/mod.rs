@@ -11,23 +11,33 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use crate::NodeId;
-use crate::structs::execution::job::EffectiveResources;
+use crate::calls::{IoCall, IoError, IoResult};
+use crate::effects::{Effect, NetEffect};
+use crate::events::{Event, NetEvent};
+use crate::id::NodeId;
+use crate::stream::{BackendStream, StreamError};
+use crate::structs::execution::job::family::EffectiveResources;
 use crate::structs::placement::policy::{MAX_KIND_LEN, PlacementPolicyError, PlacementSubject};
 
+pub mod backend;
+pub mod effect;
+pub mod identity;
+pub mod offer;
 pub mod quota;
 pub mod runtimes;
 pub mod session;
 
 /// Maximum executor backends one node advertises.
 pub const MAX_ADVERTISED_EXECUTORS: usize = 8;
+/// Group ids one backend's allow-list may name (owner decision 2026-11-17).
+pub const MAX_BACKEND_GROUPS: usize = 64;
 
 /// Pattern characters of IEEE Std 1003.1-2017 (POSIX) 12.13, the only wildcards
 /// TES 1.1 allows in `tesOutput.path`.
@@ -55,8 +65,12 @@ pub enum AdvertisementError {
     ExecutorCount,
     #[error("executor kind must be 1..={MAX_KIND_LEN} bytes")]
     InvalidKind,
-    #[error("executor kind {kind} is advertised twice")]
-    DuplicateKind { kind: String },
+    #[error("compute backend name must be 1..={MAX_KIND_LEN} bytes")]
+    InvalidBackend,
+    #[error("compute backend {backend} is advertised twice")]
+    DuplicateBackend { backend: String },
+    #[error("a compute backend allows at most {MAX_BACKEND_GROUPS} groups")]
+    GroupCount,
     #[error("advertised subject belongs to node {node_id} instead of the publisher")]
     ForeignSubject { node_id: NodeId },
     #[error("advertised subject does not name executor kind {kind}")]
@@ -82,6 +96,8 @@ pub enum AdvertisementError {
 /// stale telemetry that may only rank.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutorCapability {
+    /// Node-local name of the backend; unique among this node's backends.
+    pub backend: String,
     pub kind: String,
     pub file_staging: bool,
     pub direct_s3: bool,
@@ -103,18 +119,34 @@ pub struct ExecutorCapability {
     pub availability: Option<ExecutorAvailability>,
     /// Operator ranking preference; higher ranks earlier and grants nothing.
     pub compute_priority: u32,
+    /// Digest of everything placement and admission read of this backend, home included.
+    pub config_digest: [u8; 32],
+    /// Advances only when `config_digest` changes on the publishing node.
+    pub config_generation: u64,
+    /// The longest run the operator allows here; `None` is unbounded.
+    pub max_walltime_ms: Option<u64>,
+    pub declared: backend::DeclaredCapabilities,
+    pub suitability: backend::WorkloadSuitability,
+    /// Groups allowed to run here; empty allows every group.
+    pub groups: Vec<crate::types::GroupId>,
 }
 
 impl ExecutorCapability {
-    /// Advertisement of one backend at `subject`. The subject's executor kind is
-    /// pinned to `kind` and its digest stored, so later drift is detectable.
-    pub fn new(kind: String, subject: PlacementSubject) -> Result<Self, PlacementPolicyError> {
+    /// Advertisement of backend `backend` at `subject`. The subject's executor kind
+    /// is pinned to `kind` and its digest stored, so later drift is detectable.
+    pub fn new(
+        backend: String,
+        kind: String,
+        subject: PlacementSubject,
+    ) -> Result<Self, PlacementPolicyError> {
         let subject = PlacementSubject {
             executor_kind: Some(kind.clone()),
             ..subject
         };
         let subject_digest = subject.digest()?;
+        let suitability = backend::WorkloadSuitability::of_kind(&ExecutorKind::from_wire(&kind));
         Ok(Self {
+            backend,
             kind,
             file_staging: false,
             direct_s3: false,
@@ -127,12 +159,19 @@ impl ExecutorCapability {
             limits: ResourceEnvelope::default(),
             availability: None,
             compute_priority: 0,
+            config_digest: [0u8; 32],
+            config_generation: 0,
+            max_walltime_ms: None,
+            declared: backend::DeclaredCapabilities::default(),
+            suitability,
+            groups: Vec::new(),
         })
     }
 
     pub fn target(&self, node_id: NodeId) -> ExecutionTargetId {
         ExecutionTargetId {
             node_id,
+            backend: self.backend.clone(),
             executor_kind: self.kind.clone(),
         }
     }
@@ -140,6 +179,13 @@ impl ExecutorCapability {
     /// Bounds and self-consistency of one advertised backend against the node
     /// that published it.
     pub fn validate(&self, node_id: NodeId) -> Result<(), AdvertisementError> {
+        let backend = &self.backend;
+        if backend.is_empty() || backend.len() > MAX_KIND_LEN || backend.trim() != backend {
+            return Err(AdvertisementError::InvalidBackend);
+        }
+        if self.groups.len() > MAX_BACKEND_GROUPS {
+            return Err(AdvertisementError::GroupCount);
+        }
         let kind = self.kind.trim();
         if kind.is_empty() || kind.len() > MAX_KIND_LEN {
             return Err(AdvertisementError::InvalidKind);
@@ -173,11 +219,12 @@ impl ExecutorCapability {
     }
 }
 
-/// One advertised execution target: a controller node plus the executor kind it
-/// exposes there.
+/// One advertised execution target: a controller node plus the named backend it
+/// exposes there. Targets order by node, then backend name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ExecutionTargetId {
     pub node_id: NodeId,
+    pub backend: String,
     pub executor_kind: String,
 }
 
@@ -486,6 +533,16 @@ impl TaskInput {
         }
     }
 
+    /// An input read from a backend stream, whose errors become I/O errors.
+    pub fn from_blob(
+        path: impl Into<String>,
+        size: u64,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    ) -> Self {
+        let stream = blob.map(|chunk| chunk.map_err(io::Error::other));
+        Self::from_stream(path, size, Box::pin(stream))
+    }
+
     pub fn from_bytes(path: impl Into<String>, bytes: impl Into<Bytes>) -> Self {
         let bytes = bytes.into();
         let size = bytes.len() as u64;
@@ -544,6 +601,22 @@ impl fmt::Debug for Secret {
 impl Drop for Secret {
     fn drop(&mut self) {
         self.0.zeroize();
+    }
+}
+
+/// The call that draws a secret of `length` letters and digits from the OS random source.
+pub fn draw_secret(length: usize) -> IoCall {
+    Effect::Net(NetEffect::DrawSecret(length)).into()
+}
+
+/// The secret a draw answered.
+pub fn drawn_secret(result: IoResult) -> Result<Secret, IoError> {
+    match result.event()? {
+        Event::Net(NetEvent::SecretDrawn(secret)) => Ok(secret),
+        other => Err(IoError::Unexpected {
+            expected: "NetEvent::SecretDrawn",
+            got: other.label(),
+        }),
     }
 }
 
@@ -633,6 +706,9 @@ pub struct TaskSpec {
     pub output_paths: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub secret_env: BTreeMap<String, Secret>,
+    /// Values released from the secret vault for this attempt, by env name; never stored and
+    /// delivered in every staging mode, apart from the S3 credential.
+    pub vault_env: BTreeMap<String, Secret>,
     pub resources: ResourceRequest,
     pub workspace: Option<WorkspaceBinding>,
     pub security: SecurityContext,
@@ -658,6 +734,7 @@ impl TaskSpec {
             output_paths: Vec::new(),
             env: BTreeMap::new(),
             secret_env: BTreeMap::new(),
+            vault_env: BTreeMap::new(),
             resources: ResourceRequest::default(),
             workspace: None,
             security: SecurityContext::default(),
@@ -692,7 +769,28 @@ impl TaskSpec {
                 env.insert(key.clone(), value.expose().to_string());
             }
         }
+        for (key, value) in &self.vault_env {
+            env.insert(key.clone(), value.expose().to_string());
+        }
         env
+    }
+
+    /// Refuses a released value whose env name is not a plain variable name or would shadow
+    /// the task's own env, its credential or a name Aruna or S3 tools read.
+    pub fn check_vault_env(&self) -> Result<(), String> {
+        for name in self.vault_env.keys() {
+            let plain = !name.is_empty()
+                && !name.as_bytes()[0].is_ascii_digit()
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            let reserved = name.starts_with("ARUNA_") || name.starts_with("AWS_");
+            let taken = self.env.contains_key(name) || self.secret_env.contains_key(name);
+            if !plain || reserved || taken {
+                return Err(format!("`{name}` cannot carry a released secret"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -965,6 +1063,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vault_env_checked() {
+        // A released value reaches the task in every staging mode, never under a taken name.
+        let spec = |name: &str| {
+            let mut spec = TaskSpec::new(AttemptRef::new("job", 0), "image");
+            spec.env.insert("MODE".to_string(), "fast".to_string());
+            spec.vault_env
+                .insert(name.to_string(), Secret::new("canary-5e1f"));
+            spec
+        };
+        let good = spec("WEBIN_PASSWORD");
+        assert_eq!(good.check_vault_env(), Ok(()));
+        assert_eq!(good.staging_mode, StagingMode::Files);
+        assert_eq!(good.effective_env()["WEBIN_PASSWORD"], "canary-5e1f");
+        assert!(!format!("{good:?}").contains("canary"));
+        for taken in [
+            "MODE",
+            "ARUNA_JOB_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "1PASS",
+            "A-B",
+            "",
+        ] {
+            assert!(spec(taken).check_vault_env().is_err(), "{taken}");
+        }
+    }
+
+    #[test]
     fn secret_bytes_redacted() {
         let secret = SecretBytes::new(b"canary-3c9d".to_vec());
         let rendered = format!("{secret:?} {:?}", Some(&secret));
@@ -1125,10 +1250,11 @@ mod tests {
     fn roundtrips_target_id() {
         let target = ExecutionTargetId {
             node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         };
         let encoded = postcard::to_allocvec(&target).unwrap();
-        assert_eq!(encoded.len(), 39);
+        assert_eq!(encoded.len(), 46);
         assert_eq!(
             postcard::from_bytes::<ExecutionTargetId>(&encoded).unwrap(),
             target
@@ -1171,8 +1297,9 @@ mod tests {
         // The advertised subject must name the backend it describes, otherwise a
         // policy that selects an executor kind would evaluate the wrong site.
         let node_id = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
-        let capability = ExecutorCapability::new("docker".to_string(), subject(node_id))
-            .expect("subject is valid");
+        let capability =
+            ExecutorCapability::new("docker".to_string(), "docker".to_string(), subject(node_id))
+                .expect("subject is valid");
 
         assert_eq!(capability.subject.executor_kind.as_deref(), Some("docker"));
         assert_eq!(capability.target(node_id).executor_kind, "docker");

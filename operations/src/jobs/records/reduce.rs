@@ -4,12 +4,13 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::structs::execution::job::{
-    ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate, JobFamilyId,
-    JobFamilyRecord, JobId, JobProjection, JobRecordBody, JobRecordEnvelope, JobRecordError,
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, ExecutionOutputRecord, ExecutionReceipt, ExecutionRole, ExecutionUpdate,
+    JobFamilyId, JobFamilyRecord, JobProjection, JobRecordBody, JobRecordEnvelope, JobRecordError,
     LogicalJobState, OutputSet, PhysicalExecutionState, ProjectedExecution, SubmissionClaim,
     canonical_execution_key, verify_update_chain,
 };
+use aruna_core::structs::execution::job::identity::JobId;
 use ulid::Ulid;
 
 /// One physical execution as its own records describe it.
@@ -29,6 +30,7 @@ pub fn reduce_family(
     let mut claims: Vec<SubmissionClaim> = Vec::new();
     let mut executions: BTreeMap<Ulid, ExecutionRecords> = BTreeMap::new();
     let mut cancelled = false;
+    let mut expiry_reason = None;
 
     for envelope in records.iter().filter(|record| record.family() == family) {
         match &envelope.record {
@@ -46,8 +48,17 @@ pub fn reduce_family(
                 executions.entry(output.execution_id).or_default().output =
                     Some(output.as_ref().clone());
             }
-            JobFamilyRecord::Cancel(_) => cancelled = true,
-            JobFamilyRecord::Spec(_) | JobFamilyRecord::Budget(_) | JobFamilyRecord::Launch(_) => {}
+            JobFamilyRecord::Cancel(cancel) => {
+                cancelled = true;
+                // Holders may name different reasons; the smallest is the same everywhere.
+                if let CancelAuthority::Expiry(reason) = cancel.authority {
+                    expiry_reason = Some(expiry_reason.map_or(reason, |first| reason.min(first)));
+                }
+            }
+            JobFamilyRecord::Spec(_)
+            | JobFamilyRecord::Budget(_)
+            | JobFamilyRecord::Launch(_)
+            | JobFamilyRecord::Stop(_) => {}
         }
     }
 
@@ -145,6 +156,7 @@ pub fn reduce_family(
         executions: projected,
         outputs,
         cancel_requested: cancelled,
+        expiry_reason,
     }))
 }
 

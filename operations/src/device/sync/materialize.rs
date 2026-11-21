@@ -3,34 +3,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::Arc;
-
-use aruna_core::effects::{Effect, LocalFileEffect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal, StorageEvent};
-use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, LocalFileEffect};
+use aruna_core::errors::ConversionError;
+use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::storage::replication::VersionedObjectArn;
-use aruna_core::structs::{
+use aruna_core::structs::synced_folder::{
     ActionOutcome, EntrySide, EntryState, PendingMark, ReplaceReason, SyncActionRecord, SyncBase,
     SyncedBytes, SyncedFolder, WriteGuard,
 };
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{Effects, Key, TxnId, Value};
+use aruna_core::types::{Key, Value};
 use bytes::Bytes;
-use smallvec::smallvec;
 use thiserror::Error;
-use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput, managed_read};
-use crate::replication::protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
-
-use super::reconcile::Download;
-use super::repository::{action_entry, base_entry, base_key, read_value, write_rows};
+use super::repository::{action_entry, base_entry};
 
 /// What one materialization did to the folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,40 +75,25 @@ impl std::fmt::Debug for MaterializeInput {
 #[derive(Debug, Error, PartialEq)]
 pub enum MaterializeError {
     #[error(transparent)]
-    Storage(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     Conversion(#[from] ConversionError),
-    #[error("writing the file failed: {0}")]
-    Write(String),
-    #[error("materializing the entry did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state}")]
-    UnexpectedEvent { state: String },
+    #[error("unexpected file answer {0}")]
+    UnexpectedEvent(&'static str),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum MaterializeState {
-    Init,
-    WriteFile,
-    StartTransaction,
-    WriteRows { txn_id: TxnId },
-    Commit,
-    Finish,
-    Error,
-}
-
+/// Writes the file, then commits the base row and the audit row in one transaction.
 #[derive(Debug)]
 pub struct MaterializeEntryOperation {
     input: MaterializeInput,
-    state: MaterializeState,
-    rows: Vec<(String, Key, Value)>,
+    /// The outcome of the file write, once it is known.
     outcome: Option<MaterializeOutcome>,
-    output: Option<Result<MaterializeOutcome, MaterializeError>>,
+    now_ms: u64,
 }
 
 impl PartialEq for MaterializeEntryOperation {
     fn eq(&self, other: &Self) -> bool {
-        self.state == other.state
+        self.outcome == other.outcome
             && self.input.relative == other.input.relative
             && self.input.remote_version == other.input.remote_version
     }
@@ -129,11 +102,9 @@ impl PartialEq for MaterializeEntryOperation {
 impl MaterializeEntryOperation {
     pub fn new(input: MaterializeInput) -> Self {
         Self {
+            now_ms: 0,
             input,
-            state: MaterializeState::Init,
-            rows: Vec::new(),
             outcome: None,
-            output: None,
         }
     }
 
@@ -144,7 +115,7 @@ impl MaterializeEntryOperation {
         outcome: &MaterializeOutcome,
         written: Option<(String, [u8; 32], u64)>,
     ) -> SyncBase {
-        let now = unix_timestamp_millis();
+        let now = self.now_ms;
         let mark = PendingMark {
             fingerprint: self.input.local_fingerprint.clone(),
             remote_version: Some(self.input.remote_version),
@@ -251,25 +222,57 @@ impl MaterializeEntryOperation {
         }
         Ok(rows)
     }
+
+    /// Turns the file answer into the outcome and the rows it commits.
+    fn written(&mut self, event: Event) -> Result<IoCall, MaterializeError> {
+        let Event::LocalFile(event) = event else {
+            return Err(MaterializeError::UnexpectedEvent(event.label()));
+        };
+        let (outcome, written) = match event {
+            LocalFileEvent::Written {
+                fingerprint,
+                blake3,
+                size,
+            } => (
+                MaterializeOutcome::Written,
+                Some((fingerprint, blake3, size)),
+            ),
+            LocalFileEvent::Copied { relative, .. } => {
+                (MaterializeOutcome::Copied { relative }, None)
+            }
+            LocalFileEvent::Refused { reason } => (MaterializeOutcome::Refused { reason }, None),
+            // A failed write is an outcome the owner has to see, not a
+            // silent retry: it is recorded on the entry.
+            LocalFileEvent::Error { message } => (MaterializeOutcome::Failed { message }, None),
+            other => {
+                return Err(MaterializeError::UnexpectedEvent(
+                    Event::LocalFile(other).label(),
+                ));
+            }
+        };
+        let rows = self.rows_for(&outcome, written)?;
+        self.outcome = Some(outcome);
+        Ok(IoCall::Write(rows))
+    }
 }
 
 impl Operation for MaterializeEntryOperation {
     type Output = MaterializeOutcome;
     type Error = MaterializeError;
 
-    fn start(&mut self) -> Effects {
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<MaterializeOutcome>, MaterializeError> {
         let root = self.input.folder.root.clone();
         let relative = self.input.relative.clone();
-        let blob = std::mem::replace(
-            &mut self.input.blob,
-            BackendStream(Box::pin(futures_util::stream::empty())),
-        );
-        self.state = MaterializeState::WriteFile;
+        let blob = std::mem::replace(&mut self.input.blob, BackendStream::empty());
         let effect = match self.input.conflicted {
             true => LocalFileEffect::WriteConflicted {
                 root,
                 relative,
-                at_ms: unix_timestamp_millis(),
+                at_ms: self.now_ms,
                 blob,
             },
             false => LocalFileEffect::Write {
@@ -279,253 +282,83 @@ impl Operation for MaterializeEntryOperation {
                 blob,
             },
         };
-        smallvec![Effect::LocalFile(effect)]
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::LocalFile(
+            effect,
+        )))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = event {
-            return fail(self, MaterializeError::Storage(error));
-        }
-        match (self.state, event) {
-            (MaterializeState::WriteFile, Event::LocalFile(event)) => {
-                let (outcome, written) = match event {
-                    LocalFileEvent::Written {
-                        fingerprint,
-                        blake3,
-                        size,
-                    } => (
-                        MaterializeOutcome::Written,
-                        Some((fingerprint, blake3, size)),
-                    ),
-                    LocalFileEvent::Copied { relative, .. } => {
-                        (MaterializeOutcome::Copied { relative }, None)
-                    }
-                    LocalFileEvent::Refused { reason } => {
-                        (MaterializeOutcome::Refused { reason }, None)
-                    }
-                    // A failed write is an outcome the owner has to see, not a
-                    // silent retry: it is recorded on the entry.
-                    LocalFileEvent::Error { message } => {
-                        (MaterializeOutcome::Failed { message }, None)
-                    }
-                    other => return unexpected(self, format!("{other:?}")),
-                };
-                self.rows = match self.rows_for(&outcome, written) {
-                    Ok(rows) => rows,
-                    Err(error) => return fail(self, MaterializeError::Conversion(error)),
-                };
-                self.outcome = Some(outcome);
-                self.state = MaterializeState::StartTransaction;
-                smallvec![Effect::Storage(StorageEffect::StartTransaction {
-                    read: false
-                })]
+    fn next(&mut self, result: IoResult) -> Result<Next<MaterializeOutcome>, MaterializeError> {
+        match self.outcome.take() {
+            None => Ok(Next::Call(self.written(result.event()?)?)),
+            Some(outcome) => {
+                result.done()?;
+                Ok(Next::Done(outcome))
             }
-            (
-                MaterializeState::StartTransaction,
-                Event::Storage(StorageEvent::TransactionStarted { txn_id }),
-            ) => {
-                self.state = MaterializeState::WriteRows { txn_id };
-                smallvec![Effect::Storage(StorageEffect::BatchWrite {
-                    writes: std::mem::take(&mut self.rows),
-                    txn_id: Some(txn_id),
-                })]
-            }
-            (
-                MaterializeState::WriteRows { txn_id },
-                Event::Storage(StorageEvent::BatchWriteResult { .. }),
-            ) => {
-                self.state = MaterializeState::Commit;
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            (
-                MaterializeState::Commit,
-                Event::Storage(StorageEvent::TransactionCommitted { .. }),
-            ) => {
-                self.state = MaterializeState::Finish;
-                self.output = Some(self.outcome.clone().ok_or(MaterializeError::NotFinished));
-                smallvec![]
-            }
-            (state, _) => unexpected(self, format!("{state:?}")),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            MaterializeState::Finish | MaterializeState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(MaterializeError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            MaterializeState::WriteRows { txn_id } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
-fn unexpected(operation: &mut MaterializeEntryOperation, state: String) -> Effects {
-    fail(operation, MaterializeError::UnexpectedEvent { state })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::sync::reconcile::pure_tests::folder;
 
-fn fail(operation: &mut MaterializeEntryOperation, error: MaterializeError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = MaterializeState::Error;
-    operation.output = Some(Err(error));
-    cleanup
-}
+    fn materialize() -> MaterializeEntryOperation {
+        MaterializeEntryOperation::new(MaterializeInput {
+            folder: folder(),
+            relative: "a.txt".to_string(),
+            remote_version: Ulid::from_bytes([9u8; 16]),
+            guard: WriteGuard::MustNotExist,
+            conflicted: false,
+            local_fingerprint: None,
+            local: None,
+            remote: None,
+            synced: None,
+            audit: None,
+            blob: BackendStream::empty(),
+        })
+    }
 
-/// Reads one remote version from the folder's realm node.
-pub(crate) async fn fetch_remote(
-    context: &Arc<DriverContext>,
-    folder: &SyncedFolder,
-    relative: &str,
-    version: Ulid,
-) -> Result<BackendStream<Result<Bytes, StreamError>>, String> {
-    let net_handle = context
-        .net_handle
-        .as_ref()
-        .ok_or_else(|| "the network handle is unavailable".to_string())?;
-    let realm_id = *net_handle.realm_id();
-    let source = VersionedObjectArn::new(
-        realm_id,
-        folder.remote.node_id,
-        folder.remote.bucket.clone(),
-        folder.remote.remote_key(relative),
-        version,
-    )
-    .map_err(|error| error.to_string())?;
-    let request = BaoReadRequest {
-        auth_context: AuthContext {
-            user_id: folder.created_by,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        realm_id,
-        target: BaoReadTarget::ExactVersion(source),
-        expected_blake3: None,
-        metadata_only: false,
-        destination: None,
-        known_refs: Vec::new(),
-        range: None,
-    };
-    let mut answer = managed_read(context, folder.remote.node_id, request.clone()).await;
-    // A member keeping only the record of a distributed version names a holder of its bytes.
-    if let Err(BaoReadError::Refused(BaoReadRefusal::HeldBy { holder, set_id })) = answer {
-        let held = BaoReadRequest {
-            target: BaoReadTarget::Version {
-                set_id,
-                version_id: version,
-            },
-            ..request
+    // The file is written first, then its base row is committed in the transaction.
+    #[test]
+    fn writes_then_commits() {
+        let mut materialize = materialize();
+        assert_eq!(
+            materialize.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
+        assert!(matches!(
+            materialize.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let refused = IoResult::Event(Box::new(Event::LocalFile(LocalFileEvent::Refused {
+            reason: LocalFileRefusal::Drifted,
+        })));
+        let Ok(Next::Call(IoCall::Write(rows))) = materialize.next(refused) else {
+            panic!("expected the base row");
         };
-        answer = managed_read(context, holder, held).await;
-    }
-    match answer {
-        Ok(BaoReadOutput::Stream { blob, .. }) => Ok(blob),
-        Ok(BaoReadOutput::Metadata { .. }) => {
-            Err("the remote version returned no bytes".to_string())
-        }
-        Err(error) => {
-            debug!(relative = %relative, error = %error, "Could not read the remote version");
-            Err(error.to_string())
-        }
-    }
-}
-
-/// Fetches every planned remote version and writes it under its guard. Answers
-/// how many entries reached the disk.
-pub async fn apply_downloads(
-    context: &Arc<DriverContext>,
-    folder: &SyncedFolder,
-    downloads: Vec<Download>,
-) -> usize {
-    let mut applied = 0usize;
-    for download in downloads {
-        let blob = match fetch_remote(context, folder, &download.relative, download.remote_version)
-            .await
-        {
-            Ok(blob) => blob,
-            Err(message) => {
-                record_fetch_error(context, folder, &download, message.clone()).await;
-                warn!(relative = %download.relative, message = %message, "Could not fetch the folder entry");
-                continue;
-            }
+        assert_eq!(rows.len(), 1);
+        let kept = MaterializeOutcome::Refused {
+            reason: LocalFileRefusal::Drifted,
         };
-        let outcome = drive(
-            MaterializeEntryOperation::new(MaterializeInput {
-                folder: folder.clone(),
-                relative: download.relative.clone(),
-                remote_version: download.remote_version,
-                guard: download.guard,
-                conflicted: download.conflicted,
-                local_fingerprint: download
-                    .local
-                    .as_ref()
-                    .and_then(|side| side.fingerprint.clone()),
-                local: download.local.clone(),
-                remote: None,
-                synced: download.synced.clone(),
-                audit: None,
-                blob,
-            }),
-            context,
-        )
-        .await;
-        match outcome {
-            Ok(MaterializeOutcome::Written | MaterializeOutcome::Copied { .. }) => applied += 1,
-            Ok(MaterializeOutcome::Refused { reason }) => {
-                debug!(relative = %download.relative, reason = ?reason, "Kept the local file");
-            }
-            Ok(MaterializeOutcome::Failed { message }) => {
-                warn!(relative = %download.relative, message = %message, "Could not write the folder entry");
-            }
-            Err(error) => {
-                warn!(relative = %download.relative, error = %error, "Could not write the folder entry");
-            }
-        }
+        assert_eq!(materialize.next(IoResult::Done), Ok(Next::Done(kept)));
     }
-    applied
-}
 
-async fn record_fetch_error(
-    context: &Arc<DriverContext>,
-    folder: &SyncedFolder,
-    download: &Download,
-    message: String,
-) {
-    let Some(bytes) = read_value(
-        context,
-        SYNC_BASE_KEYSPACE,
-        base_key(folder.folder_id, &download.relative),
-        None,
-    )
-    .await
-    else {
-        warn!(relative = %download.relative, "Could not read the failed download row");
-        return;
-    };
-    let Ok(base) = SyncBase::from_bytes(&bytes) else {
-        warn!(relative = %download.relative, "Could not decode the failed download row");
-        return;
-    };
-    let base = SyncBase {
-        entry: EntryState::Error { reason: message },
-        synced_at_ms: unix_timestamp_millis(),
-        ..base
-    };
-    let Ok(row) = base_entry(folder.folder_id, &download.relative, &base) else {
-        warn!(relative = %download.relative, "Could not encode the failed download row");
-        return;
-    };
-    if !write_rows(context, vec![row], None).await {
-        warn!(relative = %download.relative, "Could not store the failed download row");
+    // A file answer of another kind fails before any row is written.
+    #[test]
+    fn other_answer_fails() {
+        let mut materialize = materialize();
+        materialize.first().unwrap();
+        let moved = IoResult::Event(Box::new(Event::LocalFile(LocalFileEvent::Moved {
+            to: String::new(),
+        })));
+        assert!(matches!(
+            materialize.next(moved),
+            Err(MaterializeError::UnexpectedEvent(_))
+        ));
     }
 }

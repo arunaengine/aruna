@@ -4,32 +4,28 @@
 
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::compute::SecretBytes;
 use aruna_core::structs::execution::webhook::{WEBHOOK_EVENT, WebhookSubscription};
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::notifications::webhook::{self, WebhookError, read_webhook, remove_webhook};
+use aruna_drivers::driver::drive;
+use aruna_operations::notifications::webhook::{
+    ReadWebhookOperation, RemoveWebhookOperation, SetWebhookOperation, WebhookError,
+};
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::emails::{setting_error, settings_node};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct WebhooksApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(WebhooksApiDoc::openapi()).routes(routes!(
-        get_webhook,
-        set_webhook,
-        delete_webhook
-    ))
+    OpenApiRouter::new().routes(routes!(get_webhook, set_webhook, delete_webhook))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -74,7 +70,6 @@ subscription is read.
             "event": "share.upload",
             "created_at_ms": 1762160400000u64
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 404, description = "The caller has no webhook", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
@@ -84,11 +79,10 @@ subscription is read.
 )]
 pub async fn get_webhook(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<Json<WebhookResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
-    let subscription = read_webhook(&state.get_ctx(), auth.user_id)
+    let subscription = drive(ReadWebhookOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_error)?;
     let subscription = subscription.ok_or(ServerError::NotFound)?;
@@ -139,7 +133,6 @@ the caller.
             "secret": "<hex signing secret>"
         })),
         (status = 400, description = "Not an http or https URL, a URL with credentials, or longer than 2048 bytes", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
@@ -148,15 +141,19 @@ the caller.
 )]
 pub async fn set_webhook(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<WebhookRequest>,
 ) -> ServerResult<Json<WebhookResponse>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
-    let ctx = state.get_ctx();
-    let outcome = webhook::set_webhook(&ctx, state.get_node_id(), auth.user_id, request.url)
-        .await
-        .map_err(map_error)?;
+    let secret = SecretBytes::new(rand::random::<[u8; 32]>().to_vec());
+    let set = SetWebhookOperation::new(
+        auth.user_id,
+        state.get_node_id(),
+        request.url,
+        secret,
+        unix_timestamp_millis(),
+    );
+    let outcome = drive(set, &state.get_ctx()).await.map_err(map_error)?;
     Ok(Json(response(outcome.subscription, Some(outcome.secret))))
 }
 
@@ -180,7 +177,6 @@ pub async fn set_webhook(
 - 503 when the realm configuration cannot be read now."#,
     responses(
         (status = 204, description = "This node stored that the webhook is off"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "A path-restricted token", body = ErrorResponse),
         (status = 409, description = "This node is a user device", body = ErrorResponse),
         (status = 503, description = "The realm configuration cannot be read now; retry", body = ErrorResponse)
@@ -189,13 +185,12 @@ pub async fn set_webhook(
 )]
 pub async fn delete_webhook(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     settings_node(&state, &auth).await?;
-    remove_webhook(&state.get_ctx(), state.get_node_id(), auth.user_id)
-        .await
-        .map_err(map_error)?;
+    let remove =
+        RemoveWebhookOperation::new(auth.user_id, state.get_node_id(), unix_timestamp_millis());
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -213,7 +208,7 @@ fn map_error(error: WebhookError) -> ServerError {
     match error {
         WebhookError::InvalidUrl => ServerError::BadRequestReason(error.to_string()),
         WebhookError::Setting(error) => setting_error(error),
-        WebhookError::Conversion(_) => ServerError::InternalError(error.to_string()),
+        WebhookError::Conversion(_) => ServerError::InternalError(error.into()),
     }
 }
 

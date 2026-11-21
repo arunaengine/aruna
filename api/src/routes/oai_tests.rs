@@ -8,7 +8,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
@@ -18,7 +18,7 @@ use aruna_core::structs::storage::metadata_registry::{
 };
 use aruna_core::types::{Key, Value};
 use aruna_operations::metadata::repository::create_outbox_entries;
-use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, rebuild_index};
+use aruna_operations::metadata::visibility_index::{CANDIDATE_BUDGET, RebuildIndexOperation};
 use std::collections::{HashMap, HashSet};
 
 struct Fixture {
@@ -32,7 +32,7 @@ struct Fixture {
 fn actor(realm_id: RealmId) -> Actor {
     Actor {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-        user_id: aruna_core::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([4; 16]), realm_id),
         realm_id,
     }
 }
@@ -40,7 +40,7 @@ fn actor(realm_id: RealmId) -> Actor {
 async fn fixture(limits: RoCrateLimits) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let storage_handle =
-        aruna_storage::storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
     let realm_id = RealmId::from_bytes(
         *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()
@@ -51,9 +51,10 @@ async fn fixture(limits: RoCrateLimits) -> Fixture {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = ServerState::new(
         Arc::clone(&ctx),
@@ -62,7 +63,7 @@ async fn fixture(limits: RoCrateLimits) -> Fixture {
         aruna_core::structs::identity::auth::NodeCapabilities::user_node(realm_id).unwrap(),
         false,
         None,
-        aruna_operations::jobs::runtime::JobsRuntime::new(),
+        aruna_drivers::jobs::runtime::JobsRuntime::new(),
     )
     .await
     .with_rocrate_limits(limits);
@@ -210,7 +211,9 @@ async fn seed_records(fixture: &Fixture, count: u64, public: bool) {
     for index in 0..count {
         store_record(fixture, &registry_record(fixture, index, public)).await;
     }
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
 }
 
 fn list_params(token: Option<&str>) -> OaiParams {
@@ -289,7 +292,9 @@ async fn denied_prefix_continues() {
     for index in tail..tail + 3 {
         store_record(&fixture, &registry_record(&fixture, index, true)).await;
     }
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
     seed_group(&fixture, denied, vec![deny_read()]).await;
 
     let first = list_page(&fixture, None).await.unwrap();
@@ -313,7 +318,9 @@ async fn earliest_skips_denied() {
         store_record(&fixture, &record_in(&fixture, denied, index, true)).await;
     }
     store_record(&fixture, &registry_record(&fixture, tail, true)).await;
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
     seed_group(&fixture, denied, vec![deny_read()]).await;
 
     let body = identify(&fixture.ctx, "https://example.test/api/v1/oai")
@@ -340,7 +347,9 @@ async fn empty_continuation_terminates() {
         &registry_record(&fixture, PAGE_SIZE as u64, false),
     )
     .await;
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
 
     let second = list_page(&fixture, Some(&token)).await.unwrap();
     assert_eq!(
@@ -366,7 +375,9 @@ async fn frozen_window_ends() {
     let mut moved = registry_record(&fixture, 0, true);
     moved.updated_at_ms = later + 1;
     store_record(&fixture, &moved).await;
-    rebuild_index(&fixture.ctx).await.unwrap();
+    drive(RebuildIndexOperation::new(), &fixture.ctx)
+        .await
+        .unwrap();
 
     let second = list_page(&fixture, Some(&token)).await.unwrap();
     assert_eq!(second.matches("<header>").count(), 1);

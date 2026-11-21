@@ -6,10 +6,10 @@ use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::node_vault::VaultEntry;
+use aruna_core::node::vault::VaultEntry;
 use aruna_core::types::TxnId;
 
-use crate::storage_read::StorageReadError;
+use aruna_core::errors::StorageReadError;
 
 pub fn read_secret(entry: VaultEntry, txn_id: Option<TxnId>) -> Effect {
     Effect::Storage(StorageEffect::VaultRead { entry, txn_id })
@@ -50,7 +50,7 @@ pub fn parse_secret<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::node_vault::VaultPurpose;
+    use aruna_core::node::vault::VaultPurpose;
     use ulid::Ulid;
 
     #[test]

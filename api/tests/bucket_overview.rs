@@ -9,15 +9,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::shared::write_value;
+use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
-use aruna_api::routes::bucket_usage::{UsageQuery, get_bucket_usage};
+use aruna_api::routes::storage::bucket::usage::{UsageQuery, get_bucket_usage};
 use aruna_api::routes::storage::routing::{
     BucketRoutingRequest, get_bucket_routing, put_bucket_routing,
 };
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
@@ -32,10 +31,11 @@ use aruna_core::structs::storage::blob::{
     CurrentVersionPointer, VersionKey,
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::node::usage_stats::RebuildStatsOperation;
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_operations::node::usage_rebuild::RebuildStatsOperation;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -47,23 +47,6 @@ struct Fixture {
     _directory: TempDir,
     state: Arc<ServerState>,
     reader: AuthContext,
-}
-
-async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 /// An open multipart upload of `data`.
@@ -108,9 +91,10 @@ async fn setup() -> Fixture {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,
@@ -349,7 +333,7 @@ async fn reader_reads_routing() {
 
     let Json(routing) = get_bucket_routing(
         State(fixture.state.clone()),
-        Extension(Some(fixture.reader.clone())),
+        RealmAuth(fixture.reader.clone()),
         Path("data".to_string()),
     )
     .await
@@ -365,7 +349,7 @@ async fn reader_denied_write() {
 
     let denied = put_bucket_routing(
         State(fixture.state.clone()),
-        Extension(Some(fixture.reader.clone())),
+        RealmAuth(fixture.reader.clone()),
         Path("data".to_string()),
         Json(BucketRoutingRequest { rules: Vec::new() }),
     )

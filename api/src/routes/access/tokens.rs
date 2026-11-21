@@ -2,37 +2,33 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::user_origin;
 use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::auth::forward::forward_token_revoke;
+use aruna_drivers::driver::drive;
 use aruna_operations::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
-use aruna_operations::driver::drive;
-use aruna_operations::forward::routing::is_user_origin;
-use aruna_operations::metadata::api::forwarded_bearer;
+use aruna_operations::forward::token::ForwardRevokeOperation;
+use aruna_operations::metadata::api::MetadataApiError;
+use aruna_operations::metadata::api::fanout_types::forwarded_bearer;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/tokens", description = "Bearer token revocation"))
-)]
-pub struct TokensApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(TokensApiDoc::openapi()).routes(routes!(revoke_token))
+    OpenApiRouter::new().routes(routes!(revoke_token))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
@@ -80,15 +76,12 @@ WRITE on the token owner's `/{realm_id}/admin/u/{user_id}` path.
 )]
 pub async fn revoke_token(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Json(request): Json<RevokeTokenRequest>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_realm_auth(&state, auth)?;
     let ctx = state.get_ctx();
-    let user_origin = is_user_origin(&ctx, state.get_realm_id(), state.get_node_id())
-        .await
-        .map_err(map_api_error)?;
+    let user_origin = user_origin(&state).await?;
     // Trusted bearers may revoke only their own subject unless they are realm admins.
     let claims = claims_for_revocation(&state, &request.token)
         .await
@@ -122,13 +115,18 @@ pub async fn revoke_token(
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
             .map_err(map_api_error)?
             .ok_or(ServerError::Unauthorized)?;
-        forward_token_revoke(
+        drive(
+            ForwardRevokeOperation::new(
+                state.get_realm_id(),
+                ctx.node_and_realm().map(|(node_id, _)| node_id),
+                auth_token,
+                request.token.clone(),
+                ulid::Ulid::generate(),
+            ),
             &ctx,
-            state.get_realm_id(),
-            auth_token,
-            request.token.clone(),
         )
         .await
+        .map_err(MetadataApiError::from)
         .map_err(map_api_error)?;
         return Ok(StatusCode::NO_CONTENT);
     }
@@ -168,7 +166,7 @@ fn map_revoke_error(error: RevokeTokenError) -> ServerError {
             ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".to_string())
         }
         RevokeTokenError::InvalidTokenExpiry => ServerError::BadRequest,
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -177,16 +175,16 @@ mod tests {
     use super::*;
     use crate::auth::handle_token;
     use crate::error::TokenError;
-    use aruna_core::UserId;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::DriverContext;
+    use aruna_drivers::jobs::runtime::JobsRuntime;
     use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_operations::driver::DriverContext;
-    use aruna_operations::jobs::runtime::JobsRuntime;
+    use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetConfigOperation;
-    use aruna_storage::storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
@@ -205,9 +203,10 @@ mod tests {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let realm_signing_key: SigningKey = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
@@ -258,7 +257,9 @@ mod tests {
             &ctx,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
         (dir, state, realm_id, user_id, token)
     }
 
@@ -274,17 +275,9 @@ mod tests {
     #[tokio::test]
     async fn unauthorized_cannot_revoke() {
         let (_dir, state, _realm, _user, token) = state_with_token().await;
-        let error = revoke_token(
-            State(state.clone()),
-            Extension(None),
-            Extension(None),
-            Json(RevokeTokenRequest {
-                token: token.clone(),
-            }),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ServerError::Unauthorized));
+        // `revoke_token` takes `RealmAuth`, so the refusal is the extractor's.
+        let error = crate::auth::extract::<RealmAuth>(&state, None).await;
+        assert_eq!(error.err(), Some(StatusCode::UNAUTHORIZED));
         assert!(handle_token(&state, &token).await.is_ok());
     }
 
@@ -294,7 +287,7 @@ mod tests {
         for _ in 0..2 {
             let status = revoke_token(
                 State(state.clone()),
-                Extension(caller(realm_id, user_id)),
+                RealmAuth(caller(realm_id, user_id).expect("a signed-in caller")),
                 Extension(None),
                 Json(RevokeTokenRequest {
                     token: token.clone(),
@@ -317,7 +310,7 @@ mod tests {
         let (_dir, state, realm_id, user_id, token) = state_with_token().await;
         revoke_token(
             State(state.clone()),
-            Extension(caller(realm_id, user_id)),
+            RealmAuth(caller(realm_id, user_id).expect("a signed-in caller")),
             Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
@@ -429,7 +422,7 @@ mod tests {
         let stranger = UserId::local(Ulid::generate(), realm_id);
         let error = revoke_token(
             State(state.clone()),
-            Extension(caller(realm_id, stranger)),
+            RealmAuth(caller(realm_id, stranger).expect("a signed-in caller")),
             Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
@@ -451,7 +444,7 @@ mod tests {
         // A path-restricted delegation of a user must not retire that user's
         // unrestricted sessions, which its confinement does not cover.
         let (_dir, state, realm_id, user_id, token) = state_with_token().await;
-        let delegate = Some(AuthContext {
+        let delegate = AuthContext {
             user_id,
             realm_id,
             path_restrictions: Some(vec![PathRestriction {
@@ -459,11 +452,11 @@ mod tests {
                 permission: Permission::READ,
             }]),
             session: None,
-        });
+        };
 
         let error = revoke_token(
             State(state.clone()),
-            Extension(delegate),
+            RealmAuth(delegate),
             Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
@@ -486,7 +479,7 @@ mod tests {
 
         let status = revoke_token(
             State(state.clone()),
-            Extension(caller(realm_id, admin)),
+            RealmAuth(caller(realm_id, admin).expect("a signed-in caller")),
             Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),
@@ -525,7 +518,9 @@ mod tests {
             &state.get_ctx(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .expose()
+        .to_string();
         state.add_trusted_realm(foreign_realm_id).await;
         // Revocation lookups fail closed, so a trusted realm's token is only
         // usable here once that realm's replicated config is present.
@@ -543,7 +538,7 @@ mod tests {
         grant_realm_admin(state.get_ctx().as_ref(), realm_id, admin).await;
         let error = revoke_token(
             State(state.clone()),
-            Extension(caller(realm_id, admin)),
+            RealmAuth(caller(realm_id, admin).expect("a signed-in caller")),
             Extension(None),
             Json(RevokeTokenRequest {
                 token: foreign_token.clone(),
@@ -565,7 +560,7 @@ mod tests {
         let (_dir, state, realm_id, user_id, token) = state_with_token().await;
         revoke_token(
             State(state.clone()),
-            Extension(caller(realm_id, user_id)),
+            RealmAuth(caller(realm_id, user_id).expect("a signed-in caller")),
             Extension(None),
             Json(RevokeTokenRequest {
                 token: token.clone(),

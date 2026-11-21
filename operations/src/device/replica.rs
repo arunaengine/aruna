@@ -3,21 +3,21 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::{Arc, OnceLock};
-
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::StorageEffect;
 use aruna_core::errors::ConversionError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{DEVICE_GRAPH_KEYSPACE, DEVICE_REPLICA_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
 use byteview::ByteView;
 use craqle::VectorClock;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
-
-use crate::driver::DriverContext;
 
 use super::publish_queue::{PublishEntry, PublishState};
 
@@ -25,10 +25,8 @@ use super::publish_queue::{PublishEntry, PublishState};
 /// read, unless the owner set another budget.
 pub const DEFAULT_CACHE_BYTES: u64 = 2_000_000_000;
 
-static CACHE_BUDGET: OnceLock<u64> = OnceLock::new();
-
 /// Rows one scan reads at a time.
-pub const REPLICA_PAGE_SIZE: usize = 128;
+const REPLICA_PAGE_SIZE: usize = 128;
 
 /// How the document came to be on this device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,11 +177,31 @@ pub fn document_state(replica: &ReplicaRecord, entries: &[&PublishEntry]) -> Doc
     }
 }
 
-pub fn replica_key(document_id: Ulid) -> Key {
+pub(crate) fn replica_key(document_id: Ulid) -> Key {
     ByteView::from(document_id.to_bytes().to_vec())
 }
 
-pub fn replica_entry(replica: &ReplicaRecord) -> Result<(String, Key, Value), ConversionError> {
+pub(crate) fn replica_read(document_id: Ulid) -> StorageEffect {
+    StorageEffect::Read {
+        key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
+        key: replica_key(document_id),
+        txn_id: None,
+    }
+}
+
+/// The replica a read answer holds; an absent, unreadable or undecodable row is none.
+pub(crate) fn read_answer(event: &Event) -> Option<ReplicaRecord> {
+    match event {
+        Event::Storage(StorageEvent::ReadResult {
+            value: Some(bytes), ..
+        }) => ReplicaRecord::from_bytes(bytes).ok(),
+        _ => None,
+    }
+}
+
+pub(crate) fn replica_entry(
+    replica: &ReplicaRecord,
+) -> Result<(String, Key, Value), ConversionError> {
     Ok((
         DEVICE_REPLICA_KEYSPACE.to_string(),
         replica_key(replica.document_id),
@@ -191,166 +209,232 @@ pub fn replica_entry(replica: &ReplicaRecord) -> Result<(String, Key, Value), Co
     ))
 }
 
-pub fn scan_replicas(start_after: Option<Key>) -> Effect {
-    Effect::Storage(StorageEffect::Iter {
-        key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
-        prefix: None,
-        start: start_after.map(IterStart::After),
-        limit: REPLICA_PAGE_SIZE,
-        txn_id: None,
-    })
+#[derive(Debug, Error, PartialEq)]
+pub enum SelectionError {
+    #[error("the realm does not know this document")]
+    NotFound,
+    #[error("{0}")]
+    Refused(String),
+    #[error("the document has edits this device has not published yet")]
+    PendingEdits,
+    #[error("the device store is unavailable")]
+    Unavailable,
 }
 
-/// One replica, or `None` for both an absent row and an unreadable one: every
-/// caller treats an unreadable row as a document this device does not hold.
-pub async fn read_replica(
-    context: &Arc<DriverContext>,
+impl From<IoError> for SelectionError {
+    fn from(_: IoError) -> Self {
+        Self::Unavailable
+    }
+}
+
+fn read_call(document_id: Ulid) -> IoCall {
+    read_row(DEVICE_REPLICA_KEYSPACE, replica_key(document_id))
+}
+
+/// The replica a read holds; an absent or undecodable row is none.
+fn read_replica_row(result: IoResult) -> Result<Option<ReplicaRecord>, IoError> {
+    let value = result.values()?.into_iter().next().flatten();
+    Ok(value.and_then(|bytes| ReplicaRecord::from_bytes(&bytes).ok()))
+}
+
+/// Stops keeping one document offline by dropping its replica row. The local graph is left in
+/// place: it is an OR-Set replica, so selecting again joins onto it instead of resurrecting
+/// anything, and deleting it would tombstone the graph on this device.
+#[derive(Debug, PartialEq)]
+pub struct DeselectDocumentOperation {
     document_id: Ulid,
-) -> Option<ReplicaRecord> {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
-            key: replica_key(document_id),
-            txn_id: None,
+    replica: Option<ReplicaRecord>,
+}
+
+impl DeselectDocumentOperation {
+    pub fn new(document_id: Ulid) -> Self {
+        Self {
+            document_id,
+            replica: None,
+        }
+    }
+}
+
+impl Operation for DeselectDocumentOperation {
+    type Output = ReplicaRecord;
+    type Error = SelectionError;
+
+    fn first(&mut self) -> Result<Next<ReplicaRecord>, SelectionError> {
+        Ok(Next::Call(read_call(self.document_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ReplicaRecord>, SelectionError> {
+        if let Some(replica) = self.replica.take() {
+            result.done()?;
+            return Ok(Next::Done(ReplicaRecord {
+                selected: false,
+                ..replica
+            }));
+        }
+        let replica = read_replica_row(result)?.ok_or(SelectionError::NotFound)?;
+        if replica.pending_edits > 0 {
+            return Err(SelectionError::PendingEdits);
+        }
+        self.replica = Some(replica);
+        let row = (
+            DEVICE_REPLICA_KEYSPACE.to_string(),
+            replica_key(self.document_id),
+        );
+        Ok(Next::Call(IoCall::Delete(vec![row])))
+    }
+}
+
+/// Selects a document this device created, once the realm has accepted it, unless this device
+/// already holds a replica of it.
+#[derive(Debug, PartialEq)]
+pub struct TrackCreatedOperation {
+    replica: ReplicaRecord,
+    written: bool,
+}
+
+impl TrackCreatedOperation {
+    pub fn new(document_id: Ulid, group_id: GroupId, document_path: String) -> Self {
+        let mut replica =
+            ReplicaRecord::new(document_id, group_id, document_path, ReplicaOrigin::Device);
+        replica.state = ReplicaState::LocalOnly;
+        Self {
+            replica,
+            written: false,
+        }
+    }
+}
+
+impl Operation for TrackCreatedOperation {
+    type Output = ();
+    type Error = SelectionError;
+
+    fn first(&mut self) -> Result<Next<()>, SelectionError> {
+        Ok(Next::Call(read_call(self.replica.document_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, SelectionError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(()));
+        }
+        if read_replica_row(result)?.is_some() {
+            return Ok(Next::Done(()));
+        }
+        let Ok(row) = replica_entry(&self.replica) else {
+            warn!(document_id = %self.replica.document_id, "Failed to encode a device replica");
+            return Ok(Next::Done(()));
+        };
+        self.written = true;
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ReplicaScanError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
+fn scan_page(key_space: &str, after: Option<Key>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: Key::from(Vec::new()),
+        after,
+        limit: REPLICA_PAGE_SIZE,
+    }
+}
+
+/// Lists every replica this device holds, in document order. An undecodable row is skipped,
+/// as a document this device does not hold.
+#[derive(Debug, Default, PartialEq)]
+pub struct ListReplicasOperation {
+    replicas: Vec<ReplicaRecord>,
+}
+
+impl ListReplicasOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for ListReplicasOperation {
+    type Output = Vec<ReplicaRecord>;
+    type Error = ReplicaScanError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, ReplicaScanError> {
+        Ok(Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, None)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ReplicaScanError> {
+        let (rows, next) = result.page()?;
+        let decoded =
+            (rows.into_iter()).filter_map(|(_, bytes)| ReplicaRecord::from_bytes(&bytes).ok());
+        self.replicas.extend(decoded);
+        Ok(match next {
+            Some(next) => Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, Some(next))),
+            None => Next::Done(std::mem::take(&mut self.replicas)),
         })
-        .await
-    else {
-        return None;
-    };
-    ReplicaRecord::from_bytes(&bytes).ok()
+    }
 }
 
-pub async fn store_replica(context: &Arc<DriverContext>, replica: &ReplicaRecord) -> bool {
-    let Ok((key_space, key, value)) = replica_entry(replica) else {
-        warn!(document_id = %replica.document_id, "Failed to encode a device replica");
-        return false;
-    };
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                txn_id: None,
-            })
-            .await,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    )
+/// Measures the bytes this device's replica rows and installed graphs take. A graph whose
+/// replica row is gone still counts: nothing removes it locally yet.
+#[derive(Debug, Default, PartialEq)]
+pub struct CacheUsageOperation {
+    replicas: ListReplicasOperation,
+    /// The bytes counted so far, once the replica rows are counted.
+    graphs: Option<u64>,
 }
 
-pub async fn delete_replica(context: &Arc<DriverContext>, document_id: Ulid) -> bool {
-    matches!(
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Delete {
-                key_space: DEVICE_REPLICA_KEYSPACE.to_string(),
-                key: replica_key(document_id),
-                txn_id: None,
-            })
-            .await,
-        Event::Storage(StorageEvent::DeleteResult { .. })
-    )
+impl CacheUsageOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
-/// Sets the owner's cache budget once at startup.
-pub fn set_cache_budget(bytes: u64) {
-    let _ = CACHE_BUDGET.set(bytes);
-}
+impl Operation for CacheUsageOperation {
+    type Output = u64;
+    type Error = ReplicaScanError;
 
-pub fn cache_budget() -> u64 {
-    CACHE_BUDGET.get().copied().unwrap_or(DEFAULT_CACHE_BYTES)
+    fn first(&mut self) -> Result<Next<u64>, ReplicaScanError> {
+        self.replicas
+            .first()
+            .map(|_| Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, None)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<u64>, ReplicaScanError> {
+        let Some(counted) = self.graphs else {
+            return Ok(match self.replicas.next(result)? {
+                Next::Done(replicas)
+                | Next::Then {
+                    output: replicas, ..
+                } => {
+                    self.graphs = Some(replicas.iter().map(replica_size).sum());
+                    Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, None))
+                }
+                Next::Call(call) => Next::Call(call),
+                Next::Wait => Next::Wait,
+            });
+        };
+        let (rows, next) = result.page()?;
+        let sizes = (rows.iter())
+            .filter_map(|(_, value)| <[u8; 8]>::try_from(value.as_ref()).ok())
+            .map(u64::from_be_bytes);
+        let total = sizes.fold(counted, u64::saturating_add);
+        self.graphs = Some(total);
+        Ok(match next {
+            Some(next) => Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, Some(next))),
+            None => Next::Done(total),
+        })
+    }
 }
 
 /// The bytes one replica record takes, its render included.
-pub fn replica_size(replica: &ReplicaRecord) -> u64 {
+pub(crate) fn replica_size(replica: &ReplicaRecord) -> u64 {
     replica
         .to_bytes()
         .map(|bytes| bytes.len() as u64)
         .unwrap_or(0)
-}
-
-/// Records how many bytes the graph installed for one document takes.
-pub async fn record_graph(context: &Arc<DriverContext>, document_id: Ulid, bytes: u64) {
-    if let Event::Storage(StorageEvent::Error { error }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: DEVICE_GRAPH_KEYSPACE.to_string(),
-            key: replica_key(document_id),
-            value: ByteView::from(bytes.to_be_bytes().to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        warn!(%document_id, error = %error, "Failed to record a graph size");
-    }
-}
-
-/// The bytes this device's replicas and their installed graphs take. A graph whose replica
-/// row is gone still counts: nothing removes it locally yet. `None` means a scan failed.
-pub async fn cache_usage(context: &Arc<DriverContext>) -> Option<u64> {
-    let rows: u64 = list_replicas(context).await?.iter().map(replica_size).sum();
-    let mut graphs = 0u64;
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: DEVICE_GRAPH_KEYSPACE.to_string(),
-                prefix: None,
-                start: cursor.map(IterStart::After),
-                limit: REPLICA_PAGE_SIZE,
-                txn_id: None,
-            })
-            .await
-        else {
-            return None;
-        };
-        for (_, value) in values {
-            if let Ok(bytes) = <[u8; 8]>::try_from(value.as_ref()) {
-                graphs = graphs.saturating_add(u64::from_be_bytes(bytes));
-            }
-        }
-        match next_start_after {
-            Some(next) => cursor = Some(next),
-            None => return Some(rows.saturating_add(graphs)),
-        }
-    }
-}
-
-/// Every replica this device holds, in document order. `None` means the scan
-/// itself failed, which a caller must not read as an empty ledger.
-pub async fn list_replicas(context: &Arc<DriverContext>) -> Option<Vec<ReplicaRecord>> {
-    let mut replicas = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Effect::Storage(effect) = scan_replicas(cursor) else {
-            return None;
-        };
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = context.storage_handle.send_storage_effect(effect).await
-        else {
-            warn!("Failed to scan the device replica ledger");
-            return None;
-        };
-        replicas.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| ReplicaRecord::from_bytes(&bytes).ok()),
-        );
-        match next_start_after {
-            Some(next) => cursor = Some(next),
-            None => return Some(replicas),
-        }
-    }
 }
 
 /// Records that this device now holds an edit the realm has not seen.
@@ -363,8 +447,8 @@ pub fn mark_edited(replica: &mut ReplicaRecord, local_clock: VectorClock) {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
 
     fn replica() -> ReplicaRecord {
         ReplicaRecord::new(
@@ -383,6 +467,7 @@ mod pure_tests {
             "notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         entry.state = state;
         entry
@@ -454,21 +539,124 @@ mod pure_tests {
         assert_eq!(document_state(&replica, &[]), DocumentState::LocalOnly);
     }
 
-    // A graph stays counted after its replica row goes: nothing removes it locally yet.
-    #[tokio::test]
-    async fn counts_installed_graphs() {
-        let (_dir, context) = crate::tests::device::context().await;
-        let context = Arc::new(context);
-        let mut held = replica();
-        held.displayed_jsonld = "x".repeat(100);
-        assert!(store_replica(&context, &held).await);
-        record_graph(&context, held.document_id, 4_000).await;
+    fn page(values: Vec<(Key, Value)>, next: Option<&[u8]>) -> IoResult {
+        IoResult::Page {
+            rows: values,
+            next: next.map(|key| key.to_vec().into()),
+        }
+    }
+
+    fn row(replica: &ReplicaRecord) -> (Key, Value) {
+        let (_, key, value) = replica_entry(replica).unwrap();
+        (key, value)
+    }
+
+    // Pages are read until the cursor ends; an undecodable row is skipped.
+    #[test]
+    fn lists_every_page() {
+        let held = replica();
+        let mut list = ListReplicasOperation::new();
+        let first = scan_page(DEVICE_REPLICA_KEYSPACE, None);
+        assert_eq!(list.first(), Ok(Next::Call(first)));
+        let next = scan_page(DEVICE_REPLICA_KEYSPACE, Some(b"a".to_vec().into()));
+        let first_page = page(vec![row(&held)], Some(b"a".as_slice()));
+        assert_eq!(list.next(first_page), Ok(Next::Call(next)));
+        let garbage = page(vec![(b"b".to_vec().into(), Vec::new().into())], None);
+        assert_eq!(list.next(garbage), Ok(Next::Done(vec![held])));
+    }
+
+    // Replica rows count by their size and graphs by their stored size, over all pages.
+    #[test]
+    fn sums_cache_usage() {
+        let held = replica();
+        let graph = |size: u64| -> (Key, Value) {
+            (b"g".to_vec().into(), size.to_be_bytes().to_vec().into())
+        };
+        let mut usage = CacheUsageOperation::new();
+        let replicas = scan_page(DEVICE_REPLICA_KEYSPACE, None);
+        assert_eq!(usage.first(), Ok(Next::Call(replicas)));
+        let graphs = scan_page(DEVICE_GRAPH_KEYSPACE, None);
         assert_eq!(
-            cache_usage(&context).await,
-            Some(replica_size(&held) + 4_000)
+            usage.next(page(vec![row(&held)], None)),
+            Ok(Next::Call(graphs))
         );
-        assert!(delete_replica(&context, held.document_id).await);
-        assert_eq!(cache_usage(&context).await, Some(4_000));
+        let next = scan_page(DEVICE_GRAPH_KEYSPACE, Some(b"g".to_vec().into()));
+        let first = page(vec![graph(4_000)], Some(b"g".as_slice()));
+        assert_eq!(usage.next(first), Ok(Next::Call(next)));
+        let total = replica_size(&held) + 4_006;
+        assert_eq!(
+            usage.next(page(vec![graph(6)], None)),
+            Ok(Next::Done(total))
+        );
+    }
+
+    // A result that answers no page fails the scan.
+    #[test]
+    fn scan_failures_fail() {
+        let mut list = ListReplicasOperation::new();
+        list.first().unwrap();
+        assert!(list.next(IoResult::Done).is_err());
+        let mut usage = CacheUsageOperation::new();
+        usage.first().unwrap();
+        usage.next(page(Vec::new(), None)).unwrap();
+        assert!(usage.next(IoResult::Woke).is_err());
+    }
+
+    fn stored(replica: Option<&ReplicaRecord>) -> IoResult {
+        IoResult::Values(vec![
+            replica.map(|replica| replica.to_bytes().unwrap().into()),
+        ])
+    }
+
+    // A deselected replica row is deleted and answered unselected; pending edits keep it.
+    #[test]
+    fn deselect_drops_row() {
+        let held = replica();
+        let id = held.document_id;
+        let mut deselect = DeselectDocumentOperation::new(id);
+        assert_eq!(deselect.first(), Ok(Next::Call(read_call(id))));
+        let delete = IoCall::Delete(vec![(DEVICE_REPLICA_KEYSPACE.to_string(), replica_key(id))]);
+        assert_eq!(deselect.next(stored(Some(&held))), Ok(Next::Call(delete)));
+        let unselected = ReplicaRecord {
+            selected: false,
+            ..held.clone()
+        };
+        assert_eq!(deselect.next(IoResult::Done), Ok(Next::Done(unselected)));
+
+        let edited = ReplicaRecord {
+            pending_edits: 1,
+            ..held
+        };
+        let mut deselect = DeselectDocumentOperation::new(id);
+        deselect.first().unwrap();
+        let refused = deselect.next(stored(Some(&edited)));
+        assert_eq!(refused, Err(SelectionError::PendingEdits));
+        let mut deselect = DeselectDocumentOperation::new(id);
+        deselect.first().unwrap();
+        assert_eq!(deselect.next(stored(None)), Err(SelectionError::NotFound));
+        assert_eq!(
+            SelectionError::from(IoError::Conflict),
+            SelectionError::Unavailable
+        );
+    }
+
+    // A created document gets a local-only row, unless a replica row is already there.
+    #[test]
+    fn tracks_created_once() {
+        let group_id = Ulid::from_bytes([1u8; 16]);
+        let id = Ulid::from_bytes([2u8; 16]);
+        let make = || TrackCreatedOperation::new(id, group_id, "notes".into());
+        let mut expected = replica();
+        expected.origin = ReplicaOrigin::Device;
+        expected.state = ReplicaState::LocalOnly;
+        let mut track = make();
+        assert_eq!(track.first(), Ok(Next::Call(read_call(id))));
+        let write = IoCall::Write(vec![replica_entry(&expected).unwrap()]);
+        assert_eq!(track.next(stored(None)), Ok(Next::Call(write)));
+        assert_eq!(track.next(IoResult::Done), Ok(Next::Done(())));
+        let mut track = make();
+        track.first().unwrap();
+        assert_eq!(track.next(stored(Some(&expected))), Ok(Next::Done(())));
     }
 
     #[test]

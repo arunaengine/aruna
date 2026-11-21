@@ -3,14 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
-use crate::metadata::{CreateMetadataRequest, CreateScaffoldRequest};
+use crate::metadata::model::{CreateMetadataRequest, CreateScaffoldRequest};
 use crate::routes::metadata::documents::create_metadata_document;
-use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
+use crate::routes::metadata::tests::{TestState, setup_network_state};
+use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::s3::bucket::create::CreateBucketOperation;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
@@ -20,7 +22,7 @@ use ulid::Ulid;
 async fn create(test: &TestState, chosen: Option<StorageLocationRequest>) -> Ulid {
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::Scaffold(CreateScaffoldRequest {
             group_id: test.group_id.to_string(),
@@ -63,13 +65,9 @@ async fn read(
     auth: &AuthContext,
     id: Ulid,
 ) -> Result<StorageLocation, ServerError> {
-    get_location(
-        State(test.state.clone()),
-        Extension(Some(auth.clone())),
-        Path(id),
-    )
-    .await
-    .map(|Json(location)| location)
+    get_location(State(test.state.clone()), RealmAuth(auth.clone()), Path(id))
+        .await
+        .map(|Json(location)| location)
 }
 
 async fn choose(
@@ -84,7 +82,7 @@ async fn choose(
     };
     put_location(
         State(test.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(id),
         Json(request),
     )
@@ -113,7 +111,7 @@ async fn location_routes() {
     assert!(matches!(missing, Err(ServerError::NotFound)));
     let realm_id = test.state.get_realm_id();
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), realm_id),
         realm_id,
         path_restrictions: None,
         session: None,

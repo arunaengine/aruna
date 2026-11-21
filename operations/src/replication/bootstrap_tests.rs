@@ -5,8 +5,8 @@
 
 use super::*;
 use crate::distribution::test_store::{apply, context, get, install, open, range, write};
-use crate::driver::drive;
-use aruna_storage::storage::StorageHandle as Handle;
+use aruna_drivers::driver::drive;
+use aruna_storage::storage::handle::StorageHandle as Handle;
 
 fn set() -> Ulid {
     Ulid::from_bytes([9; 16])
@@ -130,86 +130,83 @@ async fn newer_intent_restarts() {
     );
 }
 
-/// Member 1 coordinates both shards; member 2 keeps a copy of each and catches up.
-fn catching_up() -> DistributionSnapshot {
-    use crate::distribution::test_record::{member, replicated};
-    use aruna_core::structs::storage::distribution::MemberState;
-    let (mut snapshot, _) = replicated(true, 1);
-    snapshot.config.ranges[1].coordinator = member(1);
-    snapshot.config.ranges[1].replicas = vec![member(2)];
-    let target = (snapshot.config.members.iter_mut()).find(|m| m.member_id == member(2));
-    target.unwrap().state = MemberState::CatchingUp;
-    snapshot
+fn cursor_row(value: Option<Vec<u8>>) -> IoResult {
+    IoResult::Values(vec![value.map(Into::into)])
 }
 
-fn walker(snapshot: &DistributionSnapshot) -> SetWalk {
-    SetWalk {
-        realm_id: RealmId::from_bytes([9; 32]),
-        local: iroh::SecretKey::from_bytes(&[1; 32]).public(),
-        set_id: snapshot.set_id(),
+#[test]
+fn reads_stored_cursor() {
+    let stored = BootstrapCursor::start([3; 32], 7);
+    let mut operation = ReadCursorOperation::new(b"cursor".to_vec());
+    let read = vec![(BOOTSTRAP_KEYSPACE.to_string(), b"cursor".to_vec().into())];
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(read))));
+    let answer = operation.next(cursor_row(Some(stored.to_bytes().unwrap())));
+    assert_eq!(answer, Ok(Next::Done(Some(stored))));
+}
+
+#[test]
+fn cursor_read_outcomes() {
+    let read = |result: IoResult| ReadCursorOperation::new(b"cursor".to_vec()).next(result);
+    assert_eq!(read(cursor_row(None)), Ok(Next::Done(None)));
+    assert!(matches!(
+        read(cursor_row(Some(vec![0xff]))),
+        Err(BootstrapError::Conversion(_))
+    ));
+    assert!(matches!(
+        read(IoResult::Done),
+        Err(BootstrapError::Io(IoError::Unexpected { .. }))
+    ));
+}
+
+/// A cursor row of `member` for the set of [`set`].
+fn cursor_key(member: u8) -> Key {
+    bootstrap_key(
+        set(),
+        Ulid::from_bytes([member; 16]),
+        Ulid::from_bytes([1; 16]),
+    )
+    .into()
+}
+
+fn cursor_page(members: &[u8]) -> IoResult {
+    IoResult::Page {
+        rows: (members.iter())
+            .map(|member| (cursor_key(*member), Vec::<u8>::new().into()))
+            .collect(),
+        next: None,
     }
 }
 
-#[tokio::test]
-async fn ranges_take_turns() {
-    // A drain whose budget ends before a range starts the next drain at that range.
-    use crate::distribution::test_record::member;
-    let (_dir, handle) = open();
-    let context = context(&handle);
-    let snapshot = catching_up();
-    let walk = walker(&snapshot);
-    let local = snapshot.member(member(1)).unwrap();
-    let target = snapshot.member(member(2)).unwrap();
-    let second = &snapshot.config.ranges[1];
-    let key = bootstrap_key(walk.set_id, target.member_id, second.range_id);
-    for _ in 0..2 {
-        let mut budget = 1;
-        let outcome = walk
-            .walk(&context, &snapshot, local, target, &mut budget)
-            .await;
-        assert_eq!(outcome.unwrap(), Outcome::Waiting);
-    }
-    assert!(
-        get(&handle, BOOTSTRAP_KEYSPACE, key).await.is_some(),
-        "the second range had its turn"
-    );
+fn deleted(members: &[u8]) -> Next<bool> {
+    Next::Call(IoCall::Delete(
+        (members.iter())
+            .map(|member| (BOOTSTRAP_KEYSPACE.to_string(), cursor_key(*member)))
+            .collect(),
+    ))
 }
 
-#[tokio::test]
-async fn child_keeps_cursor() {
-    // A split child with a cursor of its own is never seeded from its ancestor again.
-    use crate::distribution::test_record::member;
-    let (_dir, handle) = open();
-    let context = context(&handle);
-    let snapshot = catching_up();
-    let walk = walker(&snapshot);
-    let target = snapshot.member(member(2)).unwrap();
-    let parent = snapshot.config.ranges[0].clone();
-    let child = KeyRange {
-        range_id: Ulid::from_bytes([42; 16]),
-        lineage: Some(parent.range_id),
-        ..parent.clone()
+#[test]
+fn clears_set_cursors() {
+    let scan = IoCall::Page {
+        space: BOOTSTRAP_KEYSPACE.to_string(),
+        prefix: bootstrap_prefix(set()).into(),
+        after: None,
+        limit: 2,
     };
-    let store = |range_id: Ulid, cursor: BootstrapCursor| {
-        let key = bootstrap_key(walk.set_id, target.member_id, range_id);
-        let write = StorageEffect::Write {
-            key_space: BOOTSTRAP_KEYSPACE.to_string(),
-            key: key.into(),
-            value: cursor.to_bytes().unwrap().into(),
-            txn_id: None,
-        };
-        let handle = handle.clone();
-        async move { handle.send_storage_effect(write).await }
-    };
-    store(parent.range_id, BootstrapCursor::start(target.intent, 3)).await;
-    let seeded = walk.seed_child(&context, &snapshot, target, &child).await;
-    assert_eq!(seeded.unwrap().map(|c| c.watermark), Some(3));
-    let mut progressed = BootstrapCursor::start(target.intent, 3);
-    progressed.done = true;
-    store(child.range_id, progressed.clone()).await;
-    let again = walk.seed_child(&context, &snapshot, target, &child).await;
-    assert_eq!(again.unwrap(), None);
-    let key = bootstrap_key(walk.set_id, target.member_id, child.range_id);
-    let kept = get(&handle, BOOTSTRAP_KEYSPACE, key).await.unwrap();
-    assert_eq!(BootstrapCursor::from_bytes(&kept).unwrap(), progressed);
+    let mut operation = ClearCursorsOperation::new(set(), None, 2);
+    assert_eq!(operation.first(), Ok(Next::Call(scan)));
+    assert_eq!(operation.next(cursor_page(&[4])), Ok(deleted(&[4])));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+}
+
+#[test]
+fn keeps_walked_cursors() {
+    // Only the cursors of members no longer walked go; a full page is not all of them.
+    let walked = vec![Ulid::from_bytes([4; 16])];
+    let mut operation = ClearCursorsOperation::new(set(), Some(walked.clone()), 2);
+    assert_eq!(operation.next(cursor_page(&[4, 5])), Ok(deleted(&[5])));
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(false)));
+    let mut kept = ClearCursorsOperation::new(set(), Some(walked), 2);
+    assert_eq!(kept.next(cursor_page(&[4])), Ok(deleted(&[])));
+    assert_eq!(kept.next(IoResult::Done), Ok(Next::Done(true)));
 }

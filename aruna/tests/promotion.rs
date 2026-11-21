@@ -4,14 +4,12 @@
 
 use crate::shared;
 
-use std::time::Duration;
-
-use aruna::identity::IdentityStore;
+use aruna_config::identity::IdentityStore;
 use aruna_core::onboarding::OnboardingMode;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_operations::driver::drive;
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::GetConfigOperation;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;
 use shared::{
@@ -55,8 +53,7 @@ async fn promoted_node_signs() -> TestResult<()> {
         let joiner_config = drive(GetConfigOperation::new(realm_id), joiner.context.as_ref()).await;
         matches!((seed_config, joiner_config), (Ok(left), Ok(right)) if left.digest().ok() == right.digest().ok())
     };
-    let poll = Duration::from_millis(100);
-    wait_until("realm configuration agreement", WAIT_CAP, poll, agreed).await?;
+    wait_until("realm configuration agreement", WAIT_CAP, agreed).await?;
 
     let response = reqwest::Client::new()
         .post(format!(
@@ -80,7 +77,7 @@ async fn promoted_node_signs() -> TestResult<()> {
             })
         })
     };
-    wait_until("the joiner listing its promotion", WAIT_CAP, poll, listed).await?;
+    wait_until("the joiner listing its promotion", WAIT_CAP, listed).await?;
 
     // The harness cannot reopen a joiner; its next start runs exactly this step.
     let store = IdentityStore::from_storage(joiner.context.storage_handle.clone());

@@ -9,8 +9,10 @@ use aruna_core::permission_path::readable_roots;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_operations::auth::permission_rules::{PermissionRules, permission_rules};
-use aruna_operations::driver::DriverContext;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::permission_rules::PermissionRules;
+use aruna_operations::auth::request_authorization::rules_operation;
 use s3s::{S3Result, s3_error};
 
 /// Navigable key prefixes and the rules deciding each concrete key's access.
@@ -91,7 +93,7 @@ pub(super) async fn resolve_scope(
         path_restrictions: user_access.path_restrictions.clone(),
         session: None,
     };
-    let rules = match permission_rules(context, &auth_context, root).await {
+    let rules = match drive(rules_operation(&auth_context, root), context).await {
         Ok(rules) => rules,
         Err(
             AuthorizationError::DocNotFound

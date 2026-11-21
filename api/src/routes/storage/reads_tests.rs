@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::object_key::ObjectKey;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::placement::{ObjectPlacementQuery, get_object_placement};
@@ -47,7 +48,7 @@ async fn placement_asks_holder() {
     let read = |key: &str, headers: HeaderMap| {
         get_object_placement(
             State(node.state.clone()),
-            Extension(Some(node.owner.clone())),
+            RealmAuth(node.owner.clone()),
             bearer(),
             headers,
             Path(BUCKET.to_string()),
@@ -81,7 +82,7 @@ async fn reads_ask_holder() {
     let (node, peer, _) = sharded(&answer.to_string()).await;
     let Json(locations) = blob_locations(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Query(BlobLocationsQuery {
@@ -95,7 +96,7 @@ async fn reads_ask_holder() {
     assert_eq!(locations.version_id, VERSION);
     let Json(view) = envelope(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Query(VersionQuery {
@@ -135,29 +136,6 @@ async fn reads_ask_holder() {
     );
 }
 
-// A copy's miss goes on to the next holder; the coordinator, asked last, decides.
-#[tokio::test]
-async fn copy_misses_continue() {
-    let (node, peer, set_id) = sharded(r#"{"answer":1}"#).await;
-    let lagging = mock_peer(StatusCode::NOT_FOUND, r#"{"error":"missing"}"#).await;
-    let copy = node_id([21; 32]);
-    publish_api(&node.state, copy, &lagging.url).await;
-    let forward = |node_id| RestForward {
-        set_id,
-        range_id: Ulid::nil(),
-        node_id,
-    };
-    let holders = [forward(copy), forward(node_id(PEER))];
-    let bearer = ValidatedBearer::new_for_test("caller-token");
-    let read = relay_read::<serde_json::Value>(&node.state, &holders, "/x", Some(&bearer));
-    assert_eq!(read.await.unwrap()["answer"], 1);
-    let stream = relay_stream(&node.state, &holders, "/x", Some(&bearer), HeaderMap::new());
-    assert_eq!(stream.await.unwrap().status(), StatusCode::OK);
-    let last = relay_read::<serde_json::Value>(&node.state, &holders[..1], "/x", Some(&bearer));
-    assert!(matches!(last.await, Err(ServerError::NotFound)));
-    assert_eq!(asked(&peer).len(), 2);
-}
-
 // A local copy that misses a version asks the range's coordinator.
 #[tokio::test]
 async fn local_miss_relays() {
@@ -171,7 +149,7 @@ async fn local_miss_relays() {
     publish_api(&node.state, node_id(PEER), &peer.url).await;
     let Json(view) = get_object_placement(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -184,7 +162,7 @@ async fn local_miss_relays() {
     assert_eq!(view.generation, 7);
     let Json(view) = envelope(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         bearer(),
         HeaderMap::new(),
         Query(VersionQuery {

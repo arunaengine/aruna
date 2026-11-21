@@ -2,97 +2,35 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{
-    DOCUMENT_LIFECYCLE_KEYSPACE, EVENT_LOG_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
-    RAW_REVISION_KEYSPACE,
-};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::errors::ConversionError;
+use aruna_core::keyspaces::{EVENT_LOG_KEYSPACE, RAW_REVISION_KEYSPACE};
 use aruna_core::metadata::{
-    EVENT_LIMIT, GraphLifecycleRecord, MaterializationState, MetadataError, MetadataEventPayload,
-    MetadataEventRecord, MetadataLifecycleRecord, MetadataMergedRevision, MetadataRawRevision,
-    RAW_BYTES_LIMIT, apply_raw_event, raw_context_digest, resolve_raw_revision,
+    MetadataError, MetadataEventPayload, MetadataEventRecord, MetadataMergedRevision,
+    MetadataRawRevision, apply_raw_event, raw_context_digest, resolve_raw_revision,
 };
-use aruna_core::storage_entries::{
-    document_lifecycle_key, event_log_key, event_log_prefix, graph_lifecycle_key,
-    pending_projection_target, raw_revision_key,
-};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::types::{Key, TxnId};
+use aruna_core::operation::Operation;
+use aruna_core::storage_entries::{event_log_key, raw_revision_key};
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-use crate::metadata::repository::{parse_status_read, read_status_effect};
-
-const RAW_PAGE_SIZE: usize = 1;
-const RAW_EVENT_LIMIT: usize = EVENT_LIMIT as usize;
-const RAW_ENCODED_LIMIT: usize = RAW_BYTES_LIMIT as usize;
-
-#[derive(Debug, Default)]
-struct RawLoadBudget {
-    events: usize,
-    encoded_bytes: usize,
-}
-
-impl RawLoadBudget {
-    fn inspect(&mut self, encoded_bytes: usize) -> Result<(), RawReadError> {
-        self.encoded_bytes = self
-            .encoded_bytes
-            .checked_add(encoded_bytes)
-            .ok_or_else(|| budget_error("encoded bytes overflow"))?;
-        if self.encoded_bytes > RAW_ENCODED_LIMIT {
-            return Err(budget_error("encoded byte limit exceeded"));
-        }
-        Ok(())
-    }
-
-    fn accept(&mut self) -> Result<(), RawReadError> {
-        self.events = self
-            .events
-            .checked_add(1)
-            .ok_or_else(|| budget_error("event count overflow"))?;
-        if self.events > RAW_EVENT_LIMIT {
-            return Err(budget_error("event count limit exceeded"));
-        }
-        Ok(())
-    }
-}
-
-fn budget_error(message: &str) -> RawReadError {
-    RawReadError::LimitExceeded(message.to_string())
-}
+use crate::metadata::raw_events::{
+    RAW_ENCODED_LIMIT, RawBaseIdentity, RawEventsOperation, RawLoadBudget, RawReadError,
+    RawRevisionState, budget_error, validate_raw_entry,
+};
+use crate::metadata::revision_read::RawStateOperation;
 
 fn event_size(event: &MetadataEventRecord) -> Result<usize, RawReadError> {
     Ok(postcard::experimental::serialized_size(event).map_err(ConversionError::from)?)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct RawBaseIdentity {
-    updated_at_ms: u64,
-    event_id: Ulid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RawRevisionState {
-    base: Option<RawBaseIdentity>,
-    last_event_id: Ulid,
-    revision: Option<MetadataRawRevision>,
-    /// Set once a batch has merged into the graph. From then on the rendered
-    /// graph owns this document's revision and no text event rebuilds it.
-    merged: bool,
-}
-
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct RawStateCache {
     loaded: bool,
     state: Option<RawRevisionState>,
 }
 
+#[derive(Debug, PartialEq)]
 pub(crate) struct RawEventPlan {
     pub(crate) revision: Option<MetadataRawRevision>,
     pub(crate) rebuild: bool,
@@ -105,257 +43,253 @@ impl RawEventPlan {
         cache.loaded = true;
         cache.state = Some(self.state.clone());
     }
+
+    fn new(
+        event: &MetadataEventRecord,
+        state: RawRevisionState,
+        rebuild: bool,
+    ) -> Result<Self, RawReadError> {
+        let state_write = (
+            RAW_REVISION_KEYSPACE.to_string(),
+            raw_revision_key(event.record.document_id),
+            ByteView::from(postcard::to_allocvec(&state).map_err(ConversionError::from)?),
+        );
+        Ok(Self {
+            revision: state.revision.clone(),
+            rebuild,
+            state_write,
+            state,
+        })
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetadataRawView {
-    pub revision: MetadataRawRevision,
-    pub projection_state: MaterializationState,
-    pub projected_event_id: Option<Ulid>,
+type PlanTurn = Result<Next<RawEventPlan>, RawReadError>;
+
+#[derive(Debug, PartialEq)]
+enum PrepareStage {
+    State,
+    /// The events after the cached state up to this one.
+    Advance(RawRevisionState),
+    /// The base event an older event's rebuild starts at, and the newest event it covers.
+    Base(Ulid, Ulid),
+    /// The events after the base event, with the base event itself.
+    Rebuild(MetadataEventRecord),
+    /// Every event up to this one, for a document without cached state.
+    Initial,
 }
 
-#[derive(Debug, Error)]
-pub enum RawReadError {
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error(transparent)]
-    Conversion(#[from] ConversionError),
-    #[error(transparent)]
-    Metadata(#[from] MetadataError),
-    #[error("unexpected metadata raw-read event: {0}")]
-    UnexpectedEvent(String),
-    #[error("metadata raw-read limit exceeded: {0}")]
-    LimitExceeded(String),
-    /// The event log itself is inconsistent, so retrying the same read cannot
-    /// help. Kept apart from [`Self::UnexpectedEvent`], which is adapter noise.
-    #[error("inconsistent metadata raw event log: {0}")]
-    InconsistentLog(String),
+/// The raw state after `event` and whether the graph must be rebuilt from it. The state the
+/// group cached is reused; an older event rebuilds the state from its base event.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PrepareRawOperation {
+    event: MetadataEventRecord,
+    cache: RawStateCache,
+    stage: PrepareStage,
 }
 
-pub async fn load_raw_view(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Option<MetadataRawView>, RawReadError> {
-    let status = parse_status_read(
-        context
-            .storage_handle
-            .send_effect(read_status_effect(document_id, txn_id))
-            .await,
-    )
-    .map_err(|error| match error {
-        crate::metadata::repository::StorageReadError::Storage(error) => {
-            RawReadError::Storage(error)
+impl PrepareRawOperation {
+    pub(crate) fn new(event: MetadataEventRecord, cache: RawStateCache) -> Self {
+        Self {
+            event,
+            cache,
+            stage: PrepareStage::State,
         }
-        crate::metadata::repository::StorageReadError::Conversion(error) => {
-            RawReadError::Conversion(error)
-        }
-    })?;
-    let revision = load_raw_revision(context, document_id, txn_id).await?;
-    let Some(revision) = revision else {
-        return Ok(None);
-    };
-    let projection_state = status
-        .as_ref()
-        .map(|status| status.state)
-        .unwrap_or(MaterializationState::Pending);
-    let projected_event_id = status
-        .filter(|status| {
-            status.state == MaterializationState::Materialized
-                && status.event_id == revision.winning_event_id
-                && status.context_digest == Some(revision.context_digest)
-                && status.dataset_digest == revision.dataset_digest
-        })
-        .map(|status| status.event_id);
-    Ok(Some(MetadataRawView {
-        revision,
-        projection_state,
-        projected_event_id,
-    }))
-}
+    }
 
-pub async fn load_raw_revision(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Option<MetadataRawRevision>, RawReadError> {
-    if raw_deleted(context, document_id, txn_id).await? {
-        return Ok(None);
+    fn events(&self, after: Option<Ulid>, until: Ulid, budget: RawLoadBudget) -> IoCall {
+        let document_id = self.event.record.document_id;
+        let events = RawEventsOperation::new(document_id, after, Some(until), None, budget);
+        IoCall::child(events)
     }
-    // Once a batch has merged, the rendered graph is the document's revision;
-    // the authored-text replay only serves a document until then.
-    if let Some(state) = read_raw_state(context, document_id, txn_id).await?
-        && state.merged
-    {
-        return Ok(state.revision);
-    }
-    let events = load_raw_events(
-        context,
-        document_id,
-        None,
-        None,
-        txn_id,
-        RawLoadBudget::default(),
-    )
-    .await?;
-    resolve_raw_revision(&events).map_err(Into::into)
-}
 
-/// Digest of the displayed revision, read without replaying the event log.
-pub(crate) async fn load_raw_digest(
-    context: &DriverContext,
-    document_id: Ulid,
-) -> Result<Option<[u8; 32]>, RawReadError> {
-    Ok(read_raw_state(context, document_id, None)
-        .await?
-        .and_then(|state| state.revision)
-        .and_then(|revision| revision.dataset_digest))
-}
-
-async fn raw_deleted(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<bool, RawReadError> {
-    let document = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
-            key: document_lifecycle_key(document_id),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| {
-                postcard::from_bytes::<MetadataLifecycleRecord>(&value)
-                    .map(|record| matches!(record, MetadataLifecycleRecord::Delete { .. }))
-                    .map_err(ConversionError::from)
-            })
-            .transpose()?
-            .unwrap_or(false),
-        Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-        other => return Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
-    };
-    if document {
-        return Ok(true);
-    }
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: GRAPH_LIFECYCLE_KEYSPACE.to_string(),
-            key: graph_lifecycle_key(&MetadataRegistryRecord::graph_iri_for(document_id)),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|value| {
-                postcard::from_bytes::<GraphLifecycleRecord>(&value)
-                    .map(|record| record.is_deleted())
-                    .map_err(ConversionError::from)
-            })
-            .transpose()
-            .map(|deleted| deleted.unwrap_or(false))
-            .map_err(RawReadError::from),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-pub(crate) async fn prepare_raw_event(
-    context: &DriverContext,
-    event: &MetadataEventRecord,
-    cache: &mut RawStateCache,
-) -> Result<RawEventPlan, RawReadError> {
-    if !cache.loaded {
-        cache.state = read_raw_state(context, event.record.document_id, None).await?;
-        cache.loaded = true;
-    }
-    let (state, rebuild) = match cache.state.as_ref() {
-        // A merged document's revision comes from the graph, so a replayed text
-        // event must neither rebuild it nor overwrite it.
-        Some(state) if state.merged => (state.clone(), false),
-        Some(state) if event.event_id > state.last_event_id => {
-            let events = load_raw_events(
-                context,
-                event.record.document_id,
-                Some(state.last_event_id),
-                Some(event.event_id),
-                None,
-                RawLoadBudget::default(),
-            )
-            .await?;
-            if !events
-                .iter()
-                .any(|candidate| candidate.event_id == event.event_id)
-            {
-                return Err(RawReadError::InconsistentLog(format!(
-                    "raw event log is missing {}",
-                    event.event_id
-                )));
+    fn decide(&mut self, state: Option<RawRevisionState>) -> PlanTurn {
+        let event = &self.event;
+        match state {
+            // A merged document's revision comes from the graph, so a replayed text event must
+            // neither rebuild it nor overwrite it.
+            Some(state) if state.merged => Ok(Next::Done(RawEventPlan::new(event, state, false)?)),
+            Some(state) if event.event_id > state.last_event_id => {
+                let (after, until) = (state.last_event_id, event.event_id);
+                self.stage = PrepareStage::Advance(state);
+                Ok(Next::Call(self.events(
+                    Some(after),
+                    until,
+                    RawLoadBudget::default(),
+                )))
             }
-            let (next, base_changed) = advance_raw_state(state.clone(), &events)?;
-            let simple = events.len() == 1 && !base_changed;
-            let rebuild = if simple {
-                !event_matches_state(event, &next)
-            } else {
-                next.revision.is_some()
-            };
-            (next, rebuild)
+            Some(state) => {
+                let incoming_base = raw_base_identity(event);
+                let start = (state.base.map(|base| base.event_id).into_iter())
+                    .chain(incoming_base.map(|base| base.event_id))
+                    .min();
+                let Some(start) = start else {
+                    let rebuild = state.revision.is_some();
+                    return Ok(Next::Done(RawEventPlan::new(event, state, rebuild)?));
+                };
+                let end = state.last_event_id.max(event.event_id);
+                let document_id = event.record.document_id;
+                self.stage = PrepareStage::Base(start, end);
+                let read = (
+                    EVENT_LOG_KEYSPACE.to_string(),
+                    event_log_key(document_id, start),
+                );
+                Ok(Next::Call(IoCall::Read(vec![read])))
+            }
+            None => match &event.payload {
+                MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. } => {
+                    let mut budget = RawLoadBudget::default();
+                    budget.inspect(event_size(event)?)?;
+                    budget.accept()?;
+                    let events = vec![event.clone()];
+                    self.initial(&events)
+                }
+                _ => {
+                    self.stage = PrepareStage::Initial;
+                    let until = event.event_id;
+                    Ok(Next::Call(self.events(
+                        None,
+                        until,
+                        RawLoadBudget::default(),
+                    )))
+                }
+            },
         }
-        Some(state) => {
-            let next = rebuild_raw_state(context, state, event).await?;
-            let rebuild = next.revision.is_some();
-            (next, rebuild)
-        }
-        None => initial_raw_state(context, event).await?,
-    };
-    let state_write = (
-        RAW_REVISION_KEYSPACE.to_string(),
-        raw_revision_key(event.record.document_id),
-        ByteView::from(postcard::to_allocvec(&state).map_err(ConversionError::from)?),
-    );
-    Ok(RawEventPlan {
-        revision: state.revision.clone(),
-        rebuild,
-        state_write,
-        state,
-    })
+    }
+
+    fn initial(&self, events: &[MetadataEventRecord]) -> PlanTurn {
+        let event = &self.event;
+        let state = resolve_raw_state(events)?.ok_or_else(|| {
+            RawReadError::InconsistentLog(format!("raw event log is missing {}", event.event_id))
+        })?;
+        let rebuild = state.revision.is_some() && !event_matches_state(event, &state);
+        Ok(Next::Done(RawEventPlan::new(event, state, rebuild)?))
+    }
 }
 
-/// Raw state after `event`'s batch merged and the graph re-rendered.
-/// Out-of-order arrival needs no replay: the render describes every batch
-/// this node has merged.
-pub(crate) async fn prepare_merged_event(
-    context: &DriverContext,
-    event: &MetadataEventRecord,
+impl Operation for PrepareRawOperation {
+    type Output = RawEventPlan;
+    type Error = RawReadError;
+
+    fn first(&mut self) -> PlanTurn {
+        if self.cache.loaded {
+            let state = self.cache.state.clone();
+            return self.decide(state);
+        }
+        let read = RawStateOperation::new(self.event.record.document_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PlanTurn {
+        let document_id = self.event.record.document_id;
+        match std::mem::replace(&mut self.stage, PrepareStage::Initial) {
+            PrepareStage::State => {
+                let state = result.child::<Option<RawRevisionState>, RawReadError>()??;
+                self.decide(state)
+            }
+            PrepareStage::Advance(state) => {
+                let events = result.child::<Vec<MetadataEventRecord>, RawReadError>()??;
+                let event = &self.event;
+                if !events
+                    .iter()
+                    .any(|candidate| candidate.event_id == event.event_id)
+                {
+                    return Err(RawReadError::InconsistentLog(format!(
+                        "raw event log is missing {}",
+                        event.event_id
+                    )));
+                }
+                let (next, base_changed) = advance_raw_state(state, &events)?;
+                let simple = events.len() == 1 && !base_changed;
+                let rebuild = match simple {
+                    true => !event_matches_state(event, &next),
+                    false => next.revision.is_some(),
+                };
+                Ok(Next::Done(RawEventPlan::new(event, next, rebuild)?))
+            }
+            PrepareStage::Base(start, end) => {
+                let value = result.value()?;
+                let first = raw_event(document_id, start, value)?;
+                let mut budget = RawLoadBudget::default();
+                budget.inspect(event_size(&first)?)?;
+                budget.accept()?;
+                self.stage = PrepareStage::Rebuild(first);
+                Ok(Next::Call(self.events(Some(start), end, budget)))
+            }
+            PrepareStage::Rebuild(first) => {
+                let later = result.child::<Vec<MetadataEventRecord>, RawReadError>()??;
+                let mut events = vec![first];
+                events.extend(later);
+                let next = resolve_raw_state(&events)?.ok_or_else(|| {
+                    RawReadError::InconsistentLog(format!(
+                        "raw base event is missing for {document_id}"
+                    ))
+                })?;
+                let rebuild = next.revision.is_some();
+                Ok(Next::Done(RawEventPlan::new(&self.event, next, rebuild)?))
+            }
+            PrepareStage::Initial => {
+                let events = result.child::<Vec<MetadataEventRecord>, RawReadError>()??;
+                self.initial(&events)
+            }
+        }
+    }
+}
+
+/// Raw state after `event`'s batch merged and the graph re-rendered. Out-of-order arrival
+/// needs no replay: the render describes every batch this node has merged.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PrepareMergedOperation {
+    event: MetadataEventRecord,
     render: String,
     findings: u32,
-    cache: &mut RawStateCache,
-) -> Result<RawEventPlan, RawReadError> {
-    if !cache.loaded {
-        cache.state = read_raw_state(context, event.record.document_id, None).await?;
-        cache.loaded = true;
+    cache: RawStateCache,
+}
+
+impl PrepareMergedOperation {
+    pub(crate) fn new(
+        event: MetadataEventRecord,
+        (render, findings): (String, u32),
+        cache: RawStateCache,
+    ) -> Self {
+        Self {
+            event,
+            render,
+            findings,
+            cache,
+        }
     }
-    let previous = cache.state.clone().unwrap_or(RawRevisionState {
-        base: None,
-        last_event_id: event.event_id,
-        revision: None,
-        merged: true,
-    });
-    let state = merged_raw_state(previous, event, render, findings)?;
-    let state_write = (
-        RAW_REVISION_KEYSPACE.to_string(),
-        raw_revision_key(event.record.document_id),
-        ByteView::from(postcard::to_allocvec(&state).map_err(ConversionError::from)?),
-    );
-    Ok(RawEventPlan {
-        revision: state.revision.clone(),
-        rebuild: false,
-        state_write,
-        state,
-    })
+
+    fn merged(&mut self, cached: Option<RawRevisionState>) -> PlanTurn {
+        let event = &self.event;
+        let previous = cached.unwrap_or(RawRevisionState {
+            base: None,
+            last_event_id: event.event_id,
+            revision: None,
+            merged: true,
+        });
+        let render = std::mem::take(&mut self.render);
+        let state = merged_raw_state(previous, event, render, self.findings)?;
+        Ok(Next::Done(RawEventPlan::new(event, state, false)?))
+    }
+}
+
+impl Operation for PrepareMergedOperation {
+    type Output = RawEventPlan;
+    type Error = RawReadError;
+
+    fn first(&mut self) -> PlanTurn {
+        if self.cache.loaded {
+            let state = self.cache.state.clone();
+            return self.merged(state);
+        }
+        let read = RawStateOperation::new(self.event.record.document_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> PlanTurn {
+        let state = result.child::<Option<RawRevisionState>, RawReadError>()??;
+        self.merged(state)
+    }
 }
 
 /// Only a valid render is displayed: an invalid one is flagged beside the last
@@ -394,76 +328,6 @@ fn rendered_revision(
         context_digest,
         dataset_digest,
         merged: None,
-    })
-}
-
-async fn initial_raw_state(
-    context: &DriverContext,
-    event: &MetadataEventRecord,
-) -> Result<(RawRevisionState, bool), RawReadError> {
-    let events = match &event.payload {
-        MetadataEventPayload::Scaffold { .. } | MetadataEventPayload::RoCrate { .. } => {
-            let mut budget = RawLoadBudget::default();
-            budget.inspect(event_size(event)?)?;
-            budget.accept()?;
-            vec![event.clone()]
-        }
-        _ => {
-            load_raw_events(
-                context,
-                event.record.document_id,
-                None,
-                Some(event.event_id),
-                None,
-                RawLoadBudget::default(),
-            )
-            .await?
-        }
-    };
-    let state = resolve_raw_state(&events)?.ok_or_else(|| {
-        RawReadError::InconsistentLog(format!("raw event log is missing {}", event.event_id))
-    })?;
-    let rebuild = state.revision.is_some() && !event_matches_state(event, &state);
-    Ok((state, rebuild))
-}
-
-async fn rebuild_raw_state(
-    context: &DriverContext,
-    state: &RawRevisionState,
-    event: &MetadataEventRecord,
-) -> Result<RawRevisionState, RawReadError> {
-    let incoming_base = raw_base_identity(event);
-    let Some(start_event_id) = state
-        .base
-        .map(|base| base.event_id)
-        .into_iter()
-        .chain(incoming_base.map(|base| base.event_id))
-        .min()
-    else {
-        return Ok(state.clone());
-    };
-    let end_event_id = state.last_event_id.max(event.event_id);
-    let first = read_raw_event(context, event.record.document_id, start_event_id).await?;
-    let mut budget = RawLoadBudget::default();
-    budget.inspect(event_size(&first)?)?;
-    budget.accept()?;
-    let mut events = vec![first];
-    events.extend(
-        load_raw_events(
-            context,
-            event.record.document_id,
-            Some(start_event_id),
-            Some(end_event_id),
-            None,
-            budget,
-        )
-        .await?,
-    );
-    resolve_raw_state(&events)?.ok_or_else(|| {
-        RawReadError::InconsistentLog(format!(
-            "raw base event is missing for {}",
-            event.record.document_id
-        ))
     })
 }
 
@@ -552,171 +416,66 @@ fn event_matches_state(event: &MetadataEventRecord, state: &RawRevisionState) ->
     }
 }
 
-async fn read_raw_state(
-    context: &DriverContext,
-    document_id: Ulid,
-    txn_id: Option<TxnId>,
-) -> Result<Option<RawRevisionState>, RawReadError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: RAW_REVISION_KEYSPACE.to_string(),
-            key: raw_revision_key(document_id),
-            txn_id,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => Ok(Some(
-            postcard::from_bytes(&value).map_err(ConversionError::from)?,
-        )),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-async fn read_raw_event(
-    context: &DriverContext,
+/// The event a read of its event log row answered, checked as a raw event.
+fn raw_event(
     document_id: Ulid,
     event_id: Ulid,
+    value: Option<ByteView>,
 ) -> Result<MetadataEventRecord, RawReadError> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: EVENT_LOG_KEYSPACE.to_string(),
-            key: event_log_key(document_id, event_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => {
-            if value.len() > RAW_ENCODED_LIMIT {
-                return Err(budget_error("encoded byte limit exceeded"));
-            }
-            let event: MetadataEventRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            validate_raw_entry(document_id, &event_log_key(document_id, event_id), &event)?;
-            Ok(event)
-        }
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Err(
-            RawReadError::InconsistentLog(format!("raw event {event_id} is missing")),
-        ),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(RawReadError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-async fn load_raw_events(
-    context: &DriverContext,
-    document_id: Ulid,
-    start_after: Option<Ulid>,
-    event_cursor: Option<Ulid>,
-    txn_id: Option<TxnId>,
-    mut budget: RawLoadBudget,
-) -> Result<Vec<MetadataEventRecord>, RawReadError> {
-    let prefix = event_log_prefix(document_id);
-    let mut start: Option<Key> = start_after.map(|event_id| event_log_key(document_id, event_id));
-    let mut events = Vec::new();
-    loop {
-        let remaining = RAW_EVENT_LIMIT.saturating_sub(budget.events);
-        if remaining == 0 {
-            return Err(budget_error("event count limit exceeded"));
-        }
-        let page_limit = remaining.min(RAW_PAGE_SIZE);
-        let event = context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: EVENT_LOG_KEYSPACE.to_string(),
-                prefix: Some(prefix.clone()),
-                start: start.take().map(IterStart::After),
-                limit: page_limit,
-                txn_id,
-            })
-            .await;
-        let (values, next_start_after) = match event {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.into()),
-            other => {
-                return Err(RawReadError::UnexpectedEvent(format!("{other:?}")));
-            }
-        };
-        if values.len() > page_limit {
-            return Err(budget_error("page size limit exceeded"));
-        }
-        if values.is_empty() && next_start_after.is_some() {
-            return Err(budget_error("empty page has continuation"));
-        }
-        let mut reached_cursor = false;
-        for (key, value) in values {
-            budget.inspect(value.len())?;
-            let event: MetadataEventRecord =
-                postcard::from_bytes(&value).map_err(ConversionError::from)?;
-            validate_raw_entry(document_id, &key, &event)?;
-            if event_cursor.is_some_and(|cursor| event.event_id > cursor) {
-                reached_cursor = true;
-                break;
-            }
-            budget.accept()?;
-            events.push(event);
-        }
-        if reached_cursor {
-            break;
-        }
-        let Some(next) = next_start_after else {
-            break;
-        };
-        start = Some(next);
-    }
-    Ok(events)
-}
-
-fn validate_raw_entry(
-    document_id: Ulid,
-    key: &[u8],
-    event: &MetadataEventRecord,
-) -> Result<(), RawReadError> {
-    let Some((key_document_id, key_event_id)) = pending_projection_target(key) else {
-        return Err(RawReadError::InconsistentLog(
-            "raw event key has invalid identity".to_string(),
-        ));
+    let Some(value) = value else {
+        return Err(RawReadError::InconsistentLog(format!(
+            "raw event {event_id} is missing"
+        )));
     };
-    if key_document_id != document_id {
-        return Err(RawReadError::InconsistentLog(format!(
-            "raw event key belongs to document {key_document_id}"
-        )));
+    if value.len() > RAW_ENCODED_LIMIT {
+        return Err(budget_error("encoded byte limit exceeded"));
     }
-    if event.record.document_id != document_id {
-        return Err(RawReadError::InconsistentLog(format!(
-            "raw event belongs to document {}",
-            event.record.document_id
-        )));
-    }
-    if event.event_id != key_event_id {
-        return Err(RawReadError::InconsistentLog(format!(
-            "raw event key mismatch for {document_id}/{key_event_id}"
-        )));
-    }
-    Ok(())
+    let event: MetadataEventRecord = postcard::from_bytes(&value).map_err(ConversionError::from)?;
+    validate_raw_entry(document_id, &event_log_key(document_id, event_id), &event)?;
+    Ok(event)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use aruna_drivers::driver::{DriverContext, drive};
+
+    /// Prepares `event` as a materialization does, keeping the state in `cache` afterwards.
+    pub(crate) async fn prepare_raw_event(
+        context: &DriverContext,
+        event: &MetadataEventRecord,
+        cache: &mut RawStateCache,
+    ) -> Result<RawEventPlan, RawReadError> {
+        let prepare = PrepareRawOperation::new(event.clone(), cache.clone());
+        let plan = drive(prepare, context).await?;
+        plan.cache(cache);
+        Ok(plan)
+    }
+
+    /// Prepares a merged `event` as a materialization does, keeping the state in `cache`.
+    pub(crate) async fn prepare_merged_event(
+        context: &DriverContext,
+        event: &MetadataEventRecord,
+        render: String,
+        findings: u32,
+        cache: &mut RawStateCache,
+    ) -> Result<RawEventPlan, RawReadError> {
+        let prepare = PrepareMergedOperation::new(event.clone(), (render, findings), cache.clone());
+        let plan = drive(prepare, context).await?;
+        plan.cache(cache);
+        Ok(plan)
+    }
+    use crate::metadata::raw_events::{RAW_EVENT_LIMIT, RAW_PAGE_SIZE};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::storage_entries::create_event_entry;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
 
-    fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
+    pub(crate) fn test_event(event_id: Ulid, updated_at_ms: u64) -> MetadataEventRecord {
         let realm_id = RealmId::from_bytes([1; 32]);
         let group_id = Ulid::from_parts(1, 1);
         let document_id = Ulid::from_parts(1, 2);
@@ -743,7 +502,7 @@ mod tests {
                 establishing_event_id: event_id,
                 last_event_id: event_id,
             },
-            user_id: aruna_core::UserId::local(Ulid::from_parts(1, 3), realm_id),
+            user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 3), realm_id),
             node_id,
             payload: MetadataEventPayload::Scaffold {
                 name: "raw".to_string(),
@@ -919,9 +678,10 @@ mod tests {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let mut writes = [&base, &late, &latest]
             .into_iter()
@@ -953,5 +713,94 @@ mod tests {
         let jsonld = plan.revision.unwrap().jsonld;
         assert!(jsonld.contains("\"name\":\"latest\""));
         assert!(!jsonld.contains("\"name\":\"late\""));
+    }
+
+    fn render() -> String {
+        let MetadataEventPayload::RoCrate { jsonld } = crate_payload("merged") else {
+            unreachable!("the crate payload carries JSON-LD");
+        };
+        jsonld
+    }
+
+    fn state_read(state: Option<RawRevisionState>) -> IoResult {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(Ok::<_, RawReadError>(
+            state,
+        )))
+    }
+
+    fn planned(turn: PlanTurn) -> RawEventPlan {
+        match turn {
+            Ok(Next::Done(plan)) => plan,
+            other => panic!("expected a plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scaffold_starts_state() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let mut prepare = PrepareRawOperation::new(event.clone(), RawStateCache::default());
+        assert!(matches!(prepare.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let plan = planned(prepare.next(state_read(None)));
+        assert!(!plan.rebuild);
+        let key = raw_revision_key(event.record.document_id);
+        assert_eq!(plan.state_write.1, key);
+    }
+
+    #[test]
+    fn merged_cache_kept() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let state = RawRevisionState {
+            base: None,
+            last_event_id: Ulid::from_parts(4, 1),
+            revision: None,
+            merged: true,
+        };
+        let cache = RawStateCache {
+            loaded: true,
+            state: Some(state.clone()),
+        };
+        let plan = planned(PrepareRawOperation::new(event, cache).first());
+        assert!(!plan.rebuild);
+        assert_eq!(plan.state, state);
+    }
+
+    #[test]
+    fn newer_event_advances() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let state = RawRevisionState {
+            base: None,
+            last_event_id: Ulid::from_parts(4, 1),
+            revision: None,
+            merged: false,
+        };
+        let mut prepare = PrepareRawOperation::new(event, RawStateCache::default());
+        prepare.first().unwrap();
+        let read = prepare.next(state_read(Some(state.clone())));
+        assert!(matches!(read, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(prepare.stage, PrepareStage::Advance(state));
+    }
+
+    #[test]
+    fn merge_renders_cached() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let cache = RawStateCache {
+            loaded: true,
+            state: None,
+        };
+        let mut prepare = PrepareMergedOperation::new(event, (render(), 0), cache);
+        let plan = planned(prepare.first());
+        let revision = plan.revision.expect("a valid render becomes the revision");
+        assert_eq!(revision.jsonld, render());
+        assert!(plan.state.merged);
+    }
+
+    #[test]
+    fn merge_reads_state() {
+        let event = test_event(Ulid::from_parts(5, 1), 5);
+        let mut prepare =
+            PrepareMergedOperation::new(event, (render(), 0), RawStateCache::default());
+        assert!(matches!(prepare.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let plan = planned(prepare.next(state_read(None)));
+        assert!(plan.state.merged);
     }
 }

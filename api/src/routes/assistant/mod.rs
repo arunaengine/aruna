@@ -19,44 +19,40 @@ use chats::{
 };
 use proxy::{__path_proxy_get, __path_proxy_post, proxy_get, proxy_post};
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::compute::Secret;
 use aruna_core::credential_encryption::EncryptedS3Secret;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{
+use aruna_core::structs::assistant_provider::{
     AssistantHeaders, AssistantProvider, AssistantProviderKind, AssistantProviderSecret,
-    AssistantProviderStatus, CENTRAL_PROVIDER_ID,
+    AssistantProviderStatus,
 };
-use aruna_core::time::unix_timestamp_secs;
+use aruna_core::structs::central_assistant::CENTRAL_PROVIDER_ID;
+use aruna_drivers::driver::drive;
 use aruna_operations::assistant::provider::{
     CreateProviderOperation, DeleteProviderOperation, GetProviderOperation, ListProviderOperation,
     ProviderStoreError, UpdateProviderOperation,
 };
-use aruna_operations::driver::drive;
+use axum::Json;
 use axum::body::to_bytes;
 use axum::extract::Request;
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use ulid::Ulid;
 use url::{Host, Url};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 pub(super) const PROXY_BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "system/assistant", description = "Assistant provider operations")))]
-pub struct AssistantApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    let router = OpenApiRouter::with_openapi(AssistantApiDoc::openapi())
+    let router = OpenApiRouter::new()
         .routes(routes!(list_providers, create_provider))
         .routes(routes!(patch_provider, delete_provider))
         .routes(routes!(get_models))
@@ -320,7 +316,7 @@ pub(super) fn provider_summary(provider: &AssistantProvider) -> ProviderSummary 
 
 pub(super) async fn load_provider(
     state: &ServerState,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     provider_id: String,
 ) -> ServerResult<AssistantProvider> {
     drive(
@@ -334,7 +330,7 @@ pub(super) async fn load_provider(
 
 pub(super) async fn save_provider(
     state: &ServerState,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
     expected: AssistantProvider,
     provider: AssistantProvider,
 ) -> ServerResult<AssistantProvider> {
@@ -355,7 +351,7 @@ fn map_store_error(error: ProviderStoreError) -> ServerError {
         ProviderStoreError::Stale => {
             ServerError::Conflict("provider changed concurrently".to_string())
         }
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -412,7 +408,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                     "status": "ready"
                 }]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
@@ -420,10 +415,9 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn list_providers(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ListProvidersResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let providers = drive(ListProviderOperation::new(auth.user_id), &state.get_ctx())
         .await
         .map_err(map_store_error)?
@@ -482,7 +476,6 @@ refused. The provider is registered for the calling user alone.
                 "status": "ready"
             })),
         (status = 400, description = "Unknown kind, missing or invalid base URL, or a refused custom header", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "Assistant proxy disabled", body = ErrorResponse)
     ),
@@ -490,11 +483,10 @@ refused. The provider is registered for the calling user alone.
 )]
 pub async fn create_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     request: Request,
 ) -> ServerResult<(StatusCode, Json<ProviderSummary>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let request: CreateProviderRequest = parse_json(request).await?;
     let kind = parse_provider_kind(&request.kind)?;
     if kind == AssistantProviderKind::Chatgpt {
@@ -582,7 +574,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                 "status": "ready"
             })),
         (status = 400, description = "Invalid base URL or a refused custom header", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse)
@@ -591,12 +582,11 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn patch_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
     request: Request,
 ) -> ServerResult<(StatusCode, Json<ProviderSummary>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let request: PatchProviderRequest = parse_json(request).await?;
     let mut provider = load_provider(&state, auth.user_id, provider_id).await?;
     let expected = provider.clone();
@@ -614,7 +604,9 @@ pub async fn patch_provider(
     }
     let mut secret = provider
         .open_secret(state.credential_encryption_key())
-        .map_err(|_| ServerError::InternalError("provider secret unavailable".to_string()))?;
+        .map_err(|_| {
+            ServerError::InternalError("provider secret unavailable".to_string().into())
+        })?;
     if let Some(api_key) = request.api_key {
         secret.api_key = Some(Secret::new(api_key));
     }
@@ -622,12 +614,24 @@ pub async fn patch_provider(
         Some(headers) => headers_from_input(headers)?,
         None => provider
             .open_headers(state.credential_encryption_key())
-            .map_err(|_| ServerError::InternalError("provider headers unavailable".to_string()))?,
+            .map_err(|_| {
+                ServerError::InternalError("provider headers unavailable".to_string().into())
+            })?,
     };
     provider
-        .encrypt_secret(state.credential_encryption_key(), &secret)
-        .and_then(|_| provider.encrypt_headers(state.credential_encryption_key(), &headers))
-        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string()))?;
+        .encrypt_secret(
+            state.credential_encryption_key(),
+            &secret,
+            rand::random::<[u8; 24]>(),
+        )
+        .and_then(|_| {
+            provider.encrypt_headers(
+                state.credential_encryption_key(),
+                &headers,
+                rand::random::<[u8; 24]>(),
+            )
+        })
+        .map_err(|_| ServerError::InternalError("provider encryption failed".to_string().into()))?;
     let provider = save_provider(&state, auth.user_id, expected, provider).await?;
     Ok((StatusCode::OK, Json(provider_summary(&provider))))
 }
@@ -649,7 +653,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     params(("id" = String, Path, description = "Provider id, as a 26-character ULID")),
     responses(
         (status = 204, description = "Provider deleted"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),
@@ -657,11 +660,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn delete_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<StatusCode> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     drive(
         DeleteProviderOperation::new(provider_id, auth.user_id),
         &state.get_ctx(),
@@ -702,7 +704,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
                         "reasoning_efforts": ["low", "medium", "high"]}
                 ]
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse),
         (status = 409, description = "Provider changed concurrently", body = ErrorResponse),
@@ -712,11 +713,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn get_models(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProviderModelsResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     if provider_id == CENTRAL_PROVIDER_ID {
         let models = central::central_models(&state, &auth).await?;
         return Ok((StatusCode::OK, Json(ProviderModelsResponse { models })));
@@ -754,7 +754,6 @@ refused. Providers are self-scoped, so a caller reaches only their own.
     responses(
         (status = 200, description = "The verdict of the check, whether or not the provider answered", body = ProviderTestResponse,
             example = json!({"ok": true, "message": "Provider is ready"})),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token belongs to another realm or carries path restrictions", body = ErrorResponse),
         (status = 404, description = "No such provider for this user, or the assistant proxy is disabled", body = ErrorResponse)
     ),
@@ -762,11 +761,10 @@ refused. Providers are self-scoped, so a caller reaches only their own.
 )]
 pub async fn test_provider(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(provider_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProviderTestResponse>)> {
     ensure_enabled(&state)?;
-    let auth = require_unrestricted_auth(&state, auth)?;
     let provider = load_provider(&state, auth.user_id, provider_id).await?;
     let result = if provider.kind == AssistantProviderKind::Chatgpt {
         chatgpt::fresh_provider(&state, provider).await.map(|_| ())

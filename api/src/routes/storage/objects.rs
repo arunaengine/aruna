@@ -3,45 +3,43 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_drivers::driver::drive;
 use std::sync::Arc;
 
+use aruna_core::compute::{SecretBytes, SharedSecret};
+use aruna_core::outbound::{RangeEntry, RangeRefusal};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::structs::storage::distribution::KeyRange;
-use aruna_operations::distribution::guard::{copies_interval, lists_interval};
-use aruna_operations::s3::listing::common_prefix_of;
+use aruna_core::structs::storage::blob::{BucketInfo, common_prefix_of};
+use aruna_operations::distribution::routing::{copies_interval, lists_interval};
 use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::pages::{
-    self, ListRequest, ObjectPage, PageError, PageObject, PageScope, RangeCall, RangeRelay, Resume,
+    self, ListRequest, ObjectPage, ObjectPageOperation, PageError, PageNode, PageObject, Resume,
     encode_resume, listing_path,
 };
+use aruna_operations::s3::object::range_list::MemberAccess;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::mcp::data::{ObjectOutput, object_output};
+use crate::lookup::bucket_info;
+use crate::lookup::map_guard_error;
+use crate::lookup::{ObjectOutput, object_output};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::distributed::map_guard_error;
-use crate::routes::storage::relay::{RestForward, relay_get, relayed_set};
+use crate::routes::storage::relay::relayed_set;
 use crate::server::state::ServerState;
 
 /// Entries one page returns by default and at most.
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ObjectsDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ObjectsDoc::openapi()).routes(routes!(list_objects))
+    OpenApiRouter::new().routes(routes!(list_objects))
 }
 
 #[derive(Debug, Clone, Default, Deserialize, IntoParams)]
@@ -80,72 +78,28 @@ pub struct ObjectListResponse {
     pub stale_ranges: Vec<String>,
 }
 
-/// The relayed listing of one range on a holder, or with `copy` on a copy of it.
-fn range_path(
-    request: &ListRequest,
-    cursor: Option<&str>,
-    (range, copy): (&KeyRange, bool),
-) -> String {
-    let mut query = url::form_urlencoded::Serializer::new(String::new());
-    query.append_pair("limit", &request.limit.to_string());
-    for (name, value) in [
-        ("prefix", request.prefix.as_deref()),
-        ("delimiter", request.delimiter.as_deref()),
-        ("cursor", cursor),
-        ("lower", Some(range.lower.as_str())),
-        ("upper", range.upper.as_deref()),
-        ("copy", copy.then_some("true")),
-    ] {
-        if let Some(value) = value {
-            query.append_pair(name, value);
-        }
-    }
-    format!(
-        "/data/buckets/{}/objects?{}",
-        request.bucket,
-        query.finish()
-    )
-}
-
-/// Lists the ranges other members keep with the caller's bearer token.
-pub(crate) struct BearerRelay<'a> {
-    pub state: &'a ServerState,
-    pub bearer: Option<&'a ValidatedBearer>,
-}
-
-impl RangeRelay for BearerRelay<'_> {
-    type Object = ObjectOutput;
-    type Error = ServerError;
-
-    async fn list_range(
-        &self,
-        call: RangeCall<'_>,
-    ) -> ServerResult<Option<ObjectPage<ObjectOutput>>> {
-        let path = range_path(call.request, call.cursor, (call.range, call.copy));
-        let forward = RestForward {
-            set_id: call.set_id,
-            range_id: call.range.range_id,
-            node_id: call.node_id,
-        };
-        let page: Option<ObjectListResponse> =
-            relay_get(self.state, &forward, &path, self.bearer, HeaderMap::new()).await?;
-        Ok(page.map(|page| ObjectPage {
-            objects: page.objects,
-            prefixes: page.prefixes,
-            next_cursor: page.next_cursor,
-            stale_ranges: page.stale_ranges,
-            unavailable_ranges: Vec::new(),
-        }))
-    }
-
-    fn is_fault(error: &ServerError) -> bool {
-        error.status_code().is_server_error()
-    }
-}
-
 impl From<&ListedObject> for ObjectOutput {
     fn from(object: &ListedObject) -> Self {
         object_output(object)
+    }
+}
+
+/// An entry another member listed; its time reads like a time listed here.
+impl From<RangeEntry> for ObjectOutput {
+    fn from(entry: RangeEntry) -> Self {
+        Self {
+            key: entry.key,
+            version_id: entry.version_id,
+            size: entry.size,
+            etag: entry.etag,
+            last_modified: (entry.last_modified)
+                .and_then(|time| chrono::DateTime::parse_from_rfc3339(&time).ok())
+                .map(|time| time.with_timezone(&chrono::Utc).to_rfc3339()),
+            content_type: entry.content_type,
+            referenced: entry.referenced,
+            content_id: entry.content_id,
+            link: None,
+        }
     }
 }
 
@@ -155,13 +109,34 @@ impl PageObject for ObjectOutput {
     }
 }
 
-pub(crate) fn page_error(error: PageError<ServerError>) -> ServerError {
+/// A holder's refusal as this node's answer.
+fn refusal_error(refusal: RangeRefusal) -> ServerError {
+    let RangeRefusal {
+        node_id,
+        status,
+        message,
+        ..
+    } = refusal;
+    match status {
+        400 => ServerError::BadRequestMessage(message),
+        401 => ServerError::Unauthorized,
+        403 => ServerError::Forbidden,
+        404 => ServerError::NotFound,
+        409 => ServerError::Conflict(message),
+        503 => ServerError::ServiceUnavailableReason(message),
+        _ => ServerError::BadGatewayReason(format!(
+            "coordinator node {node_id} answered {status}: {message}"
+        )),
+    }
+}
+
+pub(crate) fn page_error(error: PageError) -> ServerError {
     match error {
         PageError::Cursor => ServerError::BadRequestReason(error.to_string()),
         PageError::Unanswered { .. } => ServerError::ServiceUnavailableReason(error.to_string()),
         PageError::Guard(error) => map_guard_error(error),
-        PageError::Internal(error) => ServerError::InternalError(error),
-        PageError::Relay(error) => error,
+        PageError::Internal(error) => ServerError::InternalError(error.into()),
+        PageError::Relay(refusal) => refusal_error(refusal),
     }
 }
 
@@ -175,6 +150,23 @@ fn listed(bucket: String, page: ObjectPage<ObjectOutput>) -> ObjectListResponse 
     }
 }
 
+/// This node as a listing needs it.
+pub(crate) fn page_node(state: &ServerState) -> PageNode {
+    PageNode {
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        ids: state.get_ctx().node_and_realm(),
+    }
+}
+
+/// The caller's bearer token, which other members check themselves.
+pub(crate) fn bearer_access(bearer: Option<&ValidatedBearer>) -> MemberAccess {
+    let secret = |bearer: &ValidatedBearer| {
+        SharedSecret::new(SecretBytes::new(bearer.as_str().as_bytes().to_vec()))
+    };
+    MemberAccess::Bearer(bearer.map(secret))
+}
+
 /// One page of `info`'s objects on this node: local for an ordinary bucket, merged across the
 /// key ranges of a distributed one. With a caller, only what that caller may read shows.
 pub(crate) async fn object_page(
@@ -183,16 +175,11 @@ pub(crate) async fn object_page(
     (bearer, caller): (Option<&ValidatedBearer>, Option<pages::Caller<'_>>),
     request: ListRequest,
 ) -> ServerResult<ObjectListResponse> {
-    let relay = BearerRelay { state, bearer };
-    let context = state.get_ctx();
-    let scope = PageScope {
-        context: context.as_ref(),
-        realm_id: state.get_realm_id(),
-        node_id: state.get_node_id(),
-        relay: &relay,
-    };
     let bucket = request.bucket.clone();
-    let page = pages::object_page(&scope, info, caller, request).await;
+    let access = bearer_access(bearer);
+    let node = page_node(state);
+    let list = ObjectPageOperation::<ObjectOutput>::new(node, access, info, caller, request);
+    let page = drive(list, &state.get_ctx()).await;
     Ok(listed(bucket, page.map_err(page_error)?))
 }
 
@@ -222,9 +209,18 @@ async fn relayed_bounds(
     }
     let upper = query.upper.clone();
     let context = state.get_ctx();
-    let held = match lists_interval(context.as_ref(), binding, &lower, upper.as_deref()).await {
+    let held = match drive(
+        lists_interval(binding, &lower, upper.as_deref()),
+        context.as_ref(),
+    )
+    .await
+    {
         Ok(false) if query.copy == Some(true) => {
-            copies_interval(context.as_ref(), binding, &lower, upper.as_deref()).await
+            drive(
+                copies_interval(binding, &lower, upper.as_deref()),
+                context.as_ref(),
+            )
+            .await
         }
         held => held,
     };
@@ -338,57 +334,16 @@ pub async fn list_objects(
     };
     let caller = Some((&auth, expiry));
     if let Some(bounds) = relayed_bounds(&state, &info, &headers, &query).await? {
-        let relay = BearerRelay {
-            state: &state,
-            bearer: bearer.as_ref(),
-        };
-        let context = state.get_ctx();
-        let scope = PageScope {
-            context: context.as_ref(),
-            realm_id,
-            node_id,
-            relay: &relay,
-        };
-        let page = pages::range_page(&scope, (&info, caller), &request, query.start_after, bounds);
         let bucket = request.bucket.clone();
-        return Ok(Json(listed(bucket, page.await.map_err(page_error)?)));
+        let access = bearer_access(bearer.as_ref());
+        let node = page_node(&state);
+        let list = ObjectPageOperation::<ObjectOutput>::new(node, access, &info, caller, request);
+        let list = list.for_range(query.start_after, bounds);
+        let page = drive(list, &state.get_ctx()).await;
+        return Ok(Json(listed(bucket, page.map_err(page_error)?)));
     }
     let page = object_page(&state, &info, (bearer.as_ref(), caller), request).await?;
     Ok(Json(page))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_names_bounds() {
-        let request = ListRequest {
-            bucket: "b".to_string(),
-            prefix: Some("a b/".to_string()),
-            delimiter: None,
-            cursor: None,
-            limit: 5,
-            partial: false,
-        };
-        let range = KeyRange {
-            range_id: ulid::Ulid::from_bytes([1; 16]),
-            lower: "m".to_string(),
-            upper: None,
-            lineage: None,
-            coordinator: ulid::Ulid::from_bytes([2; 16]),
-            epoch: 1,
-            replicas: Vec::new(),
-        };
-        assert_eq!(
-            range_path(&request, Some("q&r"), (&range, false)),
-            "/data/buckets/b/objects?limit=5&prefix=a+b%2F&cursor=q%26r&lower=m"
-        );
-        assert_eq!(
-            range_path(&request, None, (&range, true)),
-            "/data/buckets/b/objects?limit=5&prefix=a+b%2F&lower=m&copy=true"
-        );
-    }
 }
 
 #[cfg(test)]

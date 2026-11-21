@@ -5,36 +5,34 @@
 use std::sync::Arc;
 
 use aruna_core::errors::StorageError;
-use aruna_core::plugins::{MAX_ARTIFACT, PublishedPlugin};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use aruna_core::plugins::{MAX_ARTIFACT, MemoryPermit, PublishedPlugin};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::plugins::artifacts::ArtifactError;
-use aruna_operations::plugins::copies::{MemoryPermit, reserve};
-use aruna_operations::plugins::publish::{EntryError, PublishError, publish_plugin};
-use aruna_operations::realm::get_config::GetConfigOperation;
+use aruna_operations::plugins::copies::ReserveMemory;
+use aruna_operations::plugins::publish::{EntryError, PublishError, PublishPlugin};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{StatusCode, header};
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "plugins", description = "WASM plugins published to the realm")))]
-pub struct PluginsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(PluginsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(publish, list_plugins))
         .layer(DefaultBodyLimit::max(MAX_ARTIFACT))
 }
@@ -125,7 +123,6 @@ management node serves the call and every other node relays it to one.
         (status = 201, description = "The published version", body = PluginView,
             example = json!({"name": "dataset-announcer", "version": "0.1.0", "title": "Announce new datasets", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "size": 98304, "published_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "published_at_ms": 1762700000000u64})),
         (status = 400, description = "The artifact is not a valid plugin", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
         (status = 409, description = "The version is published with other bytes, or another realm configuration update won the race", body = ErrorResponse),
         (status = 413, description = "The artifact exceeds 64 MiB", body = ErrorResponse),
@@ -140,12 +137,9 @@ pub async fn publish(
     request: Request,
 ) -> ServerResult<(StatusCode, Json<PluginView>)> {
     let (auth, body, _memory) = read_upload(&state, auth, request).await?;
-    let actor = Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
-    };
-    let published = publish_plugin(&state.get_ctx(), actor, auth, Vec::from(body))
+    let actor = actor(&state, &auth);
+    let publish = PublishPlugin::new(actor, auth, body);
+    let published = drive(publish, &state.get_ctx())
         .await
         .map_err(map_publish_error)?;
     Ok((StatusCode::CREATED, Json(published.into())))
@@ -174,7 +168,9 @@ pub(crate) async fn read_upload(
             "artifact uploads use this node's memory; retry later".into(),
         )
     };
-    let memory = reserve(declared.unwrap_or(MAX_ARTIFACT)).ok_or_else(busy)?;
+    let reserve = ReserveMemory::new(declared.unwrap_or(MAX_ARTIFACT) as u64);
+    let reserved = drive(reserve, state.get_ctx().as_ref()).await;
+    let memory = reserved.ok().flatten().ok_or_else(busy)?;
     let limit = declared.unwrap_or(MAX_ARTIFACT);
     let body = axum::body::to_bytes(request.into_body(), limit)
         .await
@@ -200,17 +196,15 @@ pub(crate) async fn read_upload(
         (status = 200, description = "One page of published versions", body = PluginPage,
             example = json!({"plugins": [{"name": "dataset-announcer", "version": "0.1.0", "title": "Announce new datasets", "digest": "sha256:0131fc5a684b331710fa6b96517c67a15aef0881f5ef481ad0230e23cfab64d1", "size": 98304, "published_by": "01JBX7Y3S5M3Q8Y1V9K2T4R6P1@realm", "published_at_ms": 1762700000000u64}], "next": null})),
         (status = 400, description = "The limit is outside 1 to 1000", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_plugins(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Query(query): Query<PluginQuery>,
 ) -> ServerResult<Json<PluginPage>> {
-    require_realm_auth(&state, auth)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(ServerError::BadRequestReason(
@@ -257,7 +251,7 @@ fn map_publish_error(error: PublishError) -> ServerError {
             ServerError::Conflict(error.to_string())
         }
         PublishError::Entry(EntryError::StorageError(StorageError::TransactionConflict)) => {
-            ServerError::Conflict("concurrent realm configuration update conflict; retry".into())
+            ServerError::config_conflict()
         }
         PublishError::Entry(EntryError::Unauthorized | EntryError::NotManagementNode) => {
             ServerError::Forbidden
@@ -269,18 +263,19 @@ fn map_publish_error(error: PublishError) -> ServerError {
         PublishError::Artifact(ArtifactError::Unavailable(_)) => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::routes::{test_context, test_state, test_storage};
-    use aruna_core::UserId;
+    use crate::tests::routes::{test_state, test_storage};
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::testing::test_context;
     use ulid::Ulid;
 
     /// An upload whose body fails the test as soon as anything reads it.

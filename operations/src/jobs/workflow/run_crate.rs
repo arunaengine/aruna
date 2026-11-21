@@ -2,17 +2,22 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use aruna_core::StructuredId;
-use aruna_core::UserId;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::id::NodeId;
-use aruna_core::structs::ORIGIN_DEVICE_TAG;
-use aruna_core::structs::execution::job::{
-    CapturedInput, ExecutionSpec, InputContent, InputSource, JobError, JobId, JobPayload,
-    JobRecord, JobResultPayload, JobState, LaunchRecord, LocalCrate, RunCrateStatus, RunLink,
+use aruna_core::metadata::CRATE_PROFILE_IRI;
+use aruna_core::rows::{outside_answer, outside_call};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ExecutionSpec, InputContent, InputSource, JobPayload,
+};
+use aruna_core::structs::execution::job::launch::{LaunchRecord, LocalCrate};
+use aruna_core::structs::execution::job::local::{
+    JobError, JobRecord, JobResultPayload, RunCrateStatus, RunLink,
+};
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, schedule_watch_drain, watch_event_entry,
 };
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
@@ -22,9 +27,11 @@ use aruna_core::structs::storage::data::identity::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_core::structs::synced_folder::ORIGIN_DEVICE_TAG;
+use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
-use crate::metadata::provenance::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
+use aruna_core::structs::storage::release::{RELEASE_INCOMPLETE, RELEASE_MEMBERSHIP};
 use serde_json::json;
 use ulid::Ulid;
 
@@ -32,462 +39,661 @@ use ulid::Ulid;
 const CRATE_CONTEXT: &str = "https://w3id.org/ro/crate/1.2/context";
 const WORKFLOW_RUN_CONTEXT: &str = "https://w3id.org/ro/terms/workflow-run/context";
 const CRATE_PROFILE: &str = "https://w3id.org/ro/crate/1.2";
-pub(crate) const PROCESS_PROFILE: &str = "https://w3id.org/ro/wfrun/process/0.5";
 const TERMS: &str = "https://w3id.org/aruna/terms/";
 const WORKSPACE_PROPERTY: &str = "https://w3id.org/aruna/terms/workspace-bucket";
 const LINK_PROPERTY: &str = "https://w3id.org/aruna/terms/link";
 
-use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{
+use super::super::records::pages::ServingNode;
+use super::super::store::mutation_error::JobMutationError;
+use super::super::store::row_calls::{
     put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_job_record,
     read_launch_record, read_run_link,
 };
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::driver::{DriverContext, drive};
-use crate::forward::transport::MetadataWriteError;
-use crate::metadata::AuthToken;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentPayload, mint_job_document,
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
 };
-use crate::metadata::forward::route_metadata_create;
-use crate::metadata::get_document::load_document_record;
-use crate::notifications::watch::emit::emit_metadata_created;
-use crate::realm::get_config::GetConfigOperation;
+use crate::metadata::create_entry::DocumentMintOperation;
+use crate::metadata::forward::route_create::RouteCreateOperation;
+use crate::metadata::forward::write::MetadataWriteError;
+use crate::metadata::record_reads::DocumentRecordOperation;
 use crate::realm::mutate_placement::node_kind;
-use crate::replication::locations::{LocationSummaryError, RemoteLocationOperation};
-use crate::replication::protocol::LocationSummaryRequest;
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use crate::replication::locations::LocationSummaryError;
+use crate::replication::locations::remote::RemoteLocationOperation;
+use crate::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::errors::StorageReadError;
+use aruna_core::jobs::JobRunOutcome;
+use aruna_core::metadata::AuthToken;
+use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::operation::Operation;
+use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use tracing::warn;
 
-/// Run the follow-on run-crate obligation for a finished execution job. A failure
-/// records a durable status and never fails the parent; this internal job succeeds
-/// once the outcome is recorded so it is not retried forever on a permanent error.
-pub async fn write_run_crate(ctx: &JobContext, for_job: JobId) -> JobRunOutcome {
-    let context = ctx.driver.as_ref();
-    let storage = &context.storage_handle;
-
-    // A re-driven crate job returns a previously recorded outcome without recreating it.
-    let saved_id = match read_crate_status(storage, for_job).await {
-        Ok(Some(RunCrateStatus::Written { resource })) => {
-            return JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource });
-        }
-        Ok(Some(RunCrateStatus::Pending)) | Ok(None) => None,
-        Ok(Some(RunCrateStatus::Minted { document_id })) => Some(document_id),
-        Ok(Some(status)) => {
-            return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-                resource: status.name().to_string(),
-            });
-        }
-        Err(error) => {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate read status failed: {error}"
-            )));
-        }
-    };
-
-    let parent = match read_job_record(storage, for_job, None).await {
-        Ok(Some(record)) => record,
-        Ok(None) => {
-            // Parent pruned before the crate ran; nothing to write.
-            return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-                resource: "parent-gone".to_string(),
-            });
-        }
-        Err(error) => {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate read parent failed: {error}"
-            )));
-        }
-    };
-
-    let JobPayload::Execution(spec) = &parent.payload else {
-        return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-            resource: "not-execution".to_string(),
-        });
-    };
-    // A device run stays local: its crate is written when the owner publishes it.
-    let device = match node_owner(
-        context,
-        ctx.driver.serving_realm(parent.created_by.realm_id),
-    )
-    .await
-    {
-        Ok(owner) => owner.is_some(),
-        Err(reason) => return JobRunOutcome::Deferred(JobError::retryable(reason)),
-    };
-    if device {
-        if saved_id.is_none()
-            && let Err(error) = keep_local_crate(ctx, &parent, spec).await
-        {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "local run crate write failed: {error}"
-            )));
-        }
-        return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-            resource: RunCrateStatus::Local.name().to_string(),
-        });
-    }
-    record_crate(&ctx.driver, for_job, &parent, spec, saved_id).await
+/// How a run-crate job ended.
+#[derive(Debug, PartialEq)]
+pub enum CrateRun {
+    /// The outcome is on record, under this resource name.
+    Recorded(String),
+    /// A dependency is not there yet; the job runs again without spending an attempt.
+    NotReady(JobError),
 }
 
-/// Builds the crate of a device run and keeps it here with the `Local` status; it names this
-/// device's own versions and leaves the device only through publication.
-async fn keep_local_crate(
-    ctx: &JobContext,
-    parent: &JobRecord,
-    spec: &ExecutionSpec,
-) -> Result<(), String> {
-    let context = ctx.driver.as_ref();
-    let storage = &context.storage_handle;
-    let launch = read_launch_record(storage, parent).await?;
-    let realm_id = ctx.driver.serving_realm(parent.created_by.realm_id);
-    let jsonld = build_crate_jsonld(
-        parent,
-        spec,
-        (realm_id, None),
-        &BTreeMap::new(),
-        launch.as_ref(),
-    );
-    let local = LocalCrate {
-        owner: parent.created_by,
-        jsonld,
-    };
-    put_local_crate(storage, parent.job_id, &local).await
+/// How the job runtime takes the end of a run-crate job.
+pub fn crate_outcome(result: Result<CrateRun, JobError>) -> JobRunOutcome {
+    match result {
+        Ok(CrateRun::Recorded(resource)) => {
+            JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
+        }
+        Ok(CrateRun::NotReady(error)) => JobRunOutcome::Deferred(error),
+        Err(error) => JobRunOutcome::Failed(error),
+    }
 }
 
-/// The owner this node is bound to, `None` for realm infrastructure. A node the stored realm
-/// configuration does not name is undecided, so no crate leaves it before that is known.
-async fn node_owner(context: &DriverContext, realm_id: RealmId) -> Result<Option<UserId>, String> {
-    // Without a net handle nothing can be forwarded; the crate write fails retryably instead.
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return Ok(None);
-    };
-    let config = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_err(|error| format!("run crate needs the realm configuration: {error}"))?;
-    node_kind(&config, net_handle.node_id())
-        .map(|kind| kind.owner())
-        .ok_or_else(|| "the realm configuration does not name this node yet".to_string())
-}
-
-/// Mints, authorizes and writes the crate of one finished execution, then records the outcome.
-pub(crate) async fn record_crate(
-    driver: &Arc<DriverContext>,
-    for_job: JobId,
-    parent: &JobRecord,
-    spec: &ExecutionSpec,
-    saved_id: Option<Ulid>,
-) -> JobRunOutcome {
-    let context = driver.as_ref();
-    let storage = &context.storage_handle;
-    let Some(net_handle) = context.net_handle.as_ref() else {
-        return JobRunOutcome::Failed(JobError::retryable("run crate needs a net handle"));
-    };
-    let document_path = format!("runs/{for_job}");
-    let node_id = net_handle.node_id();
-    let actor = Actor {
-        node_id,
-        user_id: parent.created_by,
-        realm_id: driver.serving_realm(parent.created_by.realm_id),
-    };
-    // Persist the first minted id before create so retries survive policy changes.
-    let document_id = match saved_id {
-        Some(document_id) => document_id,
-        None => match mint_job_document(context, &actor, spec.group_id, &document_path).await {
-            Ok(id) => id.as_ulid(),
-            Err(error) => {
-                return JobRunOutcome::Failed(JobError::retryable(format!(
-                    "run crate mint document id failed: {error}"
-                )));
-            }
-        },
-    };
-    if saved_id.is_none()
-        && let Err(error) =
-            put_crate_status(storage, for_job, &RunCrateStatus::Minted { document_id }).await
-    {
-        return JobRunOutcome::Failed(JobError::retryable(format!(
-            "run crate status write failed: {error}"
-        )));
-    }
-    // A re-driven job whose create already committed records it instead of importing again.
-    if saved_id.is_some() {
-        match load_document_record(context, document_id).await {
-            Ok(Some(record)) => {
-                let event_id = record.establishing_event_id;
-                return record_written(driver, (for_job, parent, spec), record, event_id).await;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                return JobRunOutcome::Failed(JobError::retryable(format!(
-                    "run crate registry read failed: {error}"
-                )));
-            }
-        }
-    }
-    let denied = match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: AuthContext {
-                user_id: parent.created_by,
-                realm_id: driver.serving_realm(parent.created_by.realm_id),
-                path_restrictions: None,
-                session: None,
-            },
-            path: MetadataRegistryRecord::permission_path_for(
-                &driver.serving_realm(parent.created_by.realm_id),
-                spec.group_id,
-                &document_path,
-                document_id,
-            ),
-            required_permission: Permission::WRITE,
-        }),
-        context,
-    )
-    .await
-    {
-        Ok(allowed) => !allowed,
-        Err(
-            AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId
-            | AuthorizationError::GroupNotFound
-            | AuthorizationError::DocNotFound,
-        ) => true,
-        Err(error) => {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate authorization failed: {error}"
-            )));
-        }
-    };
-    if denied {
-        let status = RunCrateStatus::Denied {
-            message: "metadata write access denied".to_string(),
-        };
-        if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate status write failed: {error}"
-            )));
-        }
-        return JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-            resource: status.name().to_string(),
-        });
-    }
-
-    let devices = match input_devices(context, parent, spec, node_id).await {
-        Ok(devices) => devices,
-        Err(error) => {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate input provenance read failed: {error}"
-            )));
-        }
-    };
-    let realm_id = driver.serving_realm(parent.created_by.realm_id);
-    let launch = match read_launch_record(storage, parent).await {
-        Ok(launch) => launch,
-        Err(error) => {
-            return JobRunOutcome::Failed(JobError::retryable(format!(
-                "run crate launch record read failed: {error}"
-            )));
-        }
-    };
-    let jsonld = build_crate_jsonld(
-        parent,
-        spec,
-        (realm_id, Some(document_id)),
-        &devices,
-        launch.as_ref(),
-    );
-
-    let status = match route_metadata_create(
-        CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
-            actor,
-            group_id: spec.group_id,
-            document_id,
-            document_path,
-            public: false,
-            payload: CreateDocumentPayload::RoCrate { jsonld },
-        }),
-        driver.clone(),
-        Some(AuthToken::internal(AuthContext {
-            user_id: parent.created_by,
-            realm_id: driver.serving_realm(parent.created_by.realm_id),
-            path_restrictions: None,
-            session: None,
-        })),
-    )
-    .await
-    {
-        Ok(result) => {
-            let job = (for_job, parent, spec);
-            return record_written(driver, job, result.record, result.event_id).await;
-        }
-        // An invalid crate is permanent: record it and discharge the
-        // obligation so it is not retried forever. Transient errors retry.
-        Err(error) => {
-            if is_transient(&error) {
-                return JobRunOutcome::Failed(JobError::retryable(format!(
-                    "run crate write failed: {error}"
-                )));
-            }
-            RunCrateStatus::Failed {
-                message: error.to_string(),
-            }
-        }
-    };
-    if let Err(error) = put_outcome(storage, for_job, parent, spec, &status, None).await {
-        return JobRunOutcome::Failed(JobError::retryable(format!(
-            "run crate status write failed: {error}"
-        )));
-    }
-    JobRunOutcome::Succeeded(JobResultPayload::RunCrate {
-        resource: status.name().to_string(),
-    })
-}
-
-/// Announces the created crate document and records it as the run's written crate.
-async fn record_written(
-    driver: &Arc<DriverContext>,
-    (for_job, parent, spec): (JobId, &JobRecord, &ExecutionSpec),
-    record: MetadataRegistryRecord,
-    event_id: Ulid,
-) -> JobRunOutcome {
-    let realm_id = driver.serving_realm(parent.created_by.realm_id);
-    let (group_id, document_id) = (record.group_id, record.document_id);
-    let path = &record.document_path;
-    emit_metadata_created(
-        driver,
-        realm_id,
-        parent.created_by,
-        group_id,
-        document_id,
-        path,
-        event_id,
-    )
-    .await;
-    let resource = document_id.to_string();
-    let status = RunCrateStatus::Written {
-        resource: resource.clone(),
-    };
-    let storage = &driver.storage_handle;
-    if let Err(error) =
-        put_outcome(storage, for_job, parent, spec, &status, Some(document_id)).await
-    {
-        return JobRunOutcome::Failed(JobError::retryable(format!(
-            "run crate status write failed: {error}"
-        )));
-    }
-    JobRunOutcome::Succeeded(JobResultPayload::RunCrate { resource })
-}
-
-/// Records the final crate status with the run link; a link the receipt wrote keeps its family.
-async fn put_outcome(
-    storage: &aruna_storage::storage::StorageHandle,
-    for_job: JobId,
-    parent: &JobRecord,
-    spec: &ExecutionSpec,
-    status: &RunCrateStatus,
-    run_crate: Option<Ulid>,
-) -> Result<(), String> {
-    let known = read_run_link(storage, for_job).await?;
-    let link = RunLink {
-        family: known.as_ref().and_then(|link| link.family),
-        logical_job_id: known.and_then(|link| link.logical_job_id),
-        group_id: spec.group_id,
-        created_by: parent.created_by,
-        run_crate,
-    };
-    put_crate_outcome(storage, for_job, status, &link).await
+fn retry(context: &str, error: impl std::fmt::Display) -> JobError {
+    JobError::retryable(format!("{context}: {error}"))
 }
 
 fn is_transient(error: &MetadataWriteError) -> bool {
     crate::jobs::metadata_class::metadata_is_transient(error)
 }
 
-/// The device each input version was published from, by input destination key. A version on
-/// another node is asked of that node as the job owner. A version that is gone or not readable
-/// names no device; any other read failure retries the crate.
-async fn input_devices(
-    context: &DriverContext,
-    record: &JobRecord,
-    spec: &ExecutionSpec,
-    node_id: NodeId,
-) -> Result<BTreeMap<String, String>, String> {
-    let mut devices = BTreeMap::new();
-    for input in &spec.inputs {
-        let InputSource::S3 { bucket, key, .. } = &input.source;
-        let Some(captured) = record
-            .captured_inputs
-            .iter()
-            .find(|captured| captured.destination_key == input.dest_key)
-        else {
-            continue;
-        };
-        let device = match captured.source_node_id == node_id {
-            true => local_device(context, bucket, key, captured.version_id).await?,
-            false => remote_device(context, record, bucket, key, captured).await?,
-        };
-        if let Some(device) = device {
-            devices.insert(input.dest_key.clone(), device);
+#[derive(Debug, PartialEq)]
+enum WriteStep {
+    Status,
+    Parent {
+        saved_id: Option<Ulid>,
+    },
+    Config {
+        saved_id: Option<Ulid>,
+        parent: Box<JobRecord>,
+    },
+    Launch {
+        parent: Box<JobRecord>,
+    },
+    Local,
+    Record,
+}
+
+/// Runs the follow-on run-crate obligation of a finished execution job. A failure records a
+/// durable status and never fails the parent; this job succeeds once the outcome is recorded,
+/// so it is not retried forever on a permanent error.
+#[derive(Debug, PartialEq)]
+pub struct WriteCrateOperation {
+    for_job: JobId,
+    serving: ServingNode,
+    step: WriteStep,
+}
+
+type WriteNext = Result<Next<CrateRun>, JobError>;
+
+fn recorded(resource: impl Into<String>) -> WriteNext {
+    Ok(Next::Done(CrateRun::Recorded(resource.into())))
+}
+
+fn execution_spec(record: &JobRecord) -> Option<&ExecutionSpec> {
+    match &record.payload {
+        JobPayload::Execution(spec) => Some(spec),
+        _ => None,
+    }
+}
+
+impl WriteCrateOperation {
+    pub fn new(for_job: JobId, serving: ServingNode) -> Self {
+        Self {
+            for_job,
+            serving,
+            step: WriteStep::Status,
         }
     }
-    Ok(devices)
-}
 
-async fn local_device(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-) -> Result<Option<String>, String> {
-    let head = HeadObjectOperation::new(HeadObjectInput {
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        version_id: Some(version_id),
-    });
-    match drive(head, context).await {
-        Ok(head) => Ok(head.metadata.get(ORIGIN_DEVICE_TAG).cloned()),
-        Err(
-            HeadObjectError::NoSuchKey
-            | HeadObjectError::NoSuchVersion
-            | HeadObjectError::DeleteMarker,
-        ) => Ok(None),
-        Err(error) => Err(error.to_string()),
+    fn call(&mut self, step: WriteStep, call: IoCall) -> WriteNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn record(&mut self, parent: &JobRecord, saved_id: Option<Ulid>) -> WriteNext {
+        let Some(spec) = execution_spec(parent) else {
+            return recorded("not-execution");
+        };
+        let record = RecordCrateOperation::new(self.for_job, parent, spec, saved_id, self.serving);
+        self.call(WriteStep::Record, IoCall::child(record))
+    }
+
+    /// A device run stays local: its crate is written when the owner publishes it. A node the
+    /// stored realm configuration does not name is undecided, so no crate leaves it yet.
+    fn configured(
+        &mut self,
+        config: Result<RealmConfigDocument, GetConfigError>,
+        saved_id: Option<Ulid>,
+        parent: Box<JobRecord>,
+    ) -> WriteNext {
+        let config = match config {
+            Ok(config) => config,
+            Err(error) => {
+                let reason = format!("run crate needs the realm configuration: {error}");
+                return Ok(Next::Done(CrateRun::NotReady(JobError::retryable(reason))));
+            }
+        };
+        let node = self.serving.map(|(node, _)| node);
+        let Some(kind) = node.and_then(|node| node_kind(&config, node)) else {
+            let reason = "the realm configuration does not name this node yet";
+            return Ok(Next::Done(CrateRun::NotReady(JobError::retryable(reason))));
+        };
+        if kind.owner().is_none() {
+            return self.record(&parent, saved_id);
+        }
+        if saved_id.is_some() {
+            return recorded(RunCrateStatus::Local.name());
+        }
+        let launch = read_launch_record(&parent);
+        self.call(WriteStep::Launch { parent }, IoCall::child(launch))
+    }
+
+    /// Keeps the crate of a device run here with the `Local` status; it names this device's own
+    /// versions and leaves the device only through publication.
+    fn keep_local(&mut self, parent: &JobRecord, launch: Option<LaunchRecord>) -> WriteNext {
+        let Some(spec) = execution_spec(parent) else {
+            return recorded("not-execution");
+        };
+        let realm_id = self
+            .serving
+            .map_or(parent.created_by.realm_id, |(_, realm_id)| realm_id);
+        let jsonld = build_crate_jsonld(
+            parent,
+            spec,
+            (realm_id, None),
+            &BTreeMap::new(),
+            launch.as_ref(),
+        );
+        let local = LocalCrate {
+            owner: parent.created_by,
+            jsonld,
+        };
+        let put = put_local_crate(parent.job_id, &local);
+        self.call(WriteStep::Local, IoCall::child(put))
     }
 }
 
-/// Asks the node an input was captured from, under the owner's own READ, which device its
-/// exact version came from.
-async fn remote_device(
-    context: &DriverContext,
-    record: &JobRecord,
-    bucket: &str,
-    key: &str,
-    captured: &CapturedInput,
-) -> Result<Option<String>, String> {
-    let realm_id = context.serving_realm(record.created_by.realm_id);
-    let summary = drive(
-        RemoteLocationOperation::new(
-            captured.source_node_id,
-            LocationSummaryRequest {
-                realm_id,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                version_id: Some(captured.version_id),
-                auth_context: AuthContext {
-                    user_id: record.created_by,
+impl Operation for WriteCrateOperation {
+    type Output = CrateRun;
+    type Error = JobError;
+
+    fn first(&mut self) -> WriteNext {
+        // A re-driven crate job returns a recorded outcome without recreating it.
+        Ok(Next::Call(IoCall::child(read_crate_status(self.for_job))))
+    }
+
+    fn next(&mut self, result: IoResult) -> WriteNext {
+        const LOCAL_FAILED: &str = "local run crate write failed";
+        match std::mem::replace(&mut self.step, WriteStep::Record) {
+            WriteStep::Status => {
+                let status = result
+                    .child::<Option<RunCrateStatus>, JobMutationError>()?
+                    .map_err(|error| retry("run crate read status failed", error))?;
+                let saved_id = match status {
+                    Some(RunCrateStatus::Written { resource }) => return recorded(resource),
+                    Some(RunCrateStatus::Pending) | None => None,
+                    Some(RunCrateStatus::Minted { document_id }) => Some(document_id),
+                    Some(status) => return recorded(status.name()),
+                };
+                let read = read_job_record(self.for_job);
+                self.call(WriteStep::Parent { saved_id }, IoCall::child(read))
+            }
+            WriteStep::Parent { saved_id } => {
+                let parent = result
+                    .child::<Option<JobRecord>, JobMutationError>()?
+                    .map_err(|error| retry("run crate read parent failed", error))?;
+                // A parent pruned before the crate ran leaves nothing to write.
+                let Some(parent) = parent else {
+                    return recorded("parent-gone");
+                };
+                if execution_spec(&parent).is_none() {
+                    return recorded("not-execution");
+                }
+                // Without a net handle nothing can be forwarded; the write fails retryably.
+                let Some((_, realm_id)) = self.serving else {
+                    return self.record(&parent, saved_id);
+                };
+                let parent = Box::new(parent);
+                let step = WriteStep::Config { saved_id, parent };
+                self.call(step, IoCall::child(GetConfigOperation::new(realm_id)))
+            }
+            WriteStep::Config { saved_id, parent } => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                self.configured(config, saved_id, parent)
+            }
+            WriteStep::Launch { parent } => {
+                let launch = result
+                    .child::<Option<LaunchRecord>, JobMutationError>()?
+                    .map_err(|error| retry(LOCAL_FAILED, error))?;
+                self.keep_local(&parent, launch)
+            }
+            WriteStep::Local => {
+                result
+                    .child::<(), JobMutationError>()?
+                    .map_err(|error| retry(LOCAL_FAILED, error))?;
+                recorded(RunCrateStatus::Local.name())
+            }
+            WriteStep::Record => {
+                let resource = result.child::<String, JobError>()??;
+                recorded(resource)
+            }
+        }
+    }
+}
+
+/// One input whose provenance the crate records.
+#[derive(Debug, PartialEq)]
+struct CrateInput {
+    dest_key: String,
+    bucket: String,
+    key: String,
+    captured: CapturedInput,
+}
+
+#[derive(Debug, PartialEq)]
+enum RecordStep {
+    Mint,
+    PutMinted,
+    Registry,
+    Allowed,
+    Device(String),
+    Launch,
+    Create,
+    Emitted {
+        status: RunCrateStatus,
+        document_id: Ulid,
+    },
+    Armed {
+        status: RunCrateStatus,
+        document_id: Ulid,
+    },
+    Link {
+        status: RunCrateStatus,
+        run_crate: Option<Ulid>,
+    },
+    Outcome(String),
+}
+
+type RecordNext = Result<Next<String>, JobError>;
+
+/// Mints, authorizes and writes the crate of one finished execution, then records the outcome.
+/// The output names the recorded resource.
+#[derive(Debug, PartialEq)]
+pub struct RecordCrateOperation {
+    for_job: JobId,
+    parent: Box<JobRecord>,
+    spec: Box<ExecutionSpec>,
+    saved_id: Option<Ulid>,
+    serving: ServingNode,
+    document_id: Ulid,
+    inputs: VecDeque<CrateInput>,
+    devices: BTreeMap<String, String>,
+    /// The version a remote holder is asked about; `None` while a local head runs.
+    expect_remote: Option<Ulid>,
+    step: RecordStep,
+}
+
+impl RecordCrateOperation {
+    pub fn new(
+        for_job: JobId,
+        parent: &JobRecord,
+        spec: &ExecutionSpec,
+        saved_id: Option<Ulid>,
+        serving: ServingNode,
+    ) -> Self {
+        let inputs = (spec.inputs.iter())
+            .filter_map(|input| {
+                let InputSource::S3 { bucket, key, .. } = &input.source else {
+                    return None;
+                };
+                let captured = (parent.captured_inputs.iter())
+                    .find(|captured| captured.destination_key == input.dest_key)?;
+                Some(CrateInput {
+                    dest_key: input.dest_key.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    captured: captured.clone(),
+                })
+            })
+            .collect();
+        Self {
+            for_job,
+            parent: Box::new(parent.clone()),
+            spec: Box::new(spec.clone()),
+            saved_id,
+            serving,
+            document_id: saved_id.unwrap_or_else(Ulid::nil),
+            inputs,
+            devices: BTreeMap::new(),
+            expect_remote: None,
+            step: RecordStep::Mint,
+        }
+    }
+
+    fn place(&self) -> Result<(NodeId, RealmId), JobError> {
+        self.serving
+            .ok_or_else(|| JobError::retryable("run crate needs a net handle"))
+    }
+
+    fn document_path(&self) -> String {
+        format!("runs/{}", self.for_job)
+    }
+
+    fn auth(&self, realm_id: RealmId) -> AuthContext {
+        AuthContext {
+            user_id: self.parent.created_by,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn actor(&self) -> Result<Actor, JobError> {
+        let (node_id, realm_id) = self.place()?;
+        Ok(Actor {
+            node_id,
+            user_id: self.parent.created_by,
+            realm_id,
+        })
+    }
+
+    fn call(&mut self, step: RecordStep, call: IoCall) -> RecordNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn check(&mut self) -> RecordNext {
+        let (_, realm_id) = self.place()?;
+        let check = CheckPermissionsOperation::new(CheckPermissionsConfig {
+            auth_context: self.auth(realm_id),
+            path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                self.spec.group_id,
+                &self.document_path(),
+                self.document_id,
+            ),
+            required_permission: Permission::WRITE,
+        });
+        self.call(RecordStep::Allowed, IoCall::child(check))
+    }
+
+    /// Asks where the next input came from. A version on another node is asked of that node as
+    /// the job owner, under the owner's own READ.
+    fn next_device(&mut self) -> RecordNext {
+        let (node_id, realm_id) = self.place()?;
+        let Some(input) = self.inputs.pop_front() else {
+            let launch = read_launch_record(&self.parent);
+            return self.call(RecordStep::Launch, IoCall::child(launch));
+        };
+        let version_id = input.captured.version_id;
+        let call = match input.captured.source_node_id == node_id {
+            true => IoCall::child(HeadObjectOperation::new(HeadObjectInput {
+                bucket: input.bucket,
+                key: input.key,
+                version_id: Some(version_id),
+            })),
+            false => IoCall::child(RemoteLocationOperation::new(
+                input.captured.source_node_id,
+                LocationSummaryRequest {
                     realm_id,
-                    path_restrictions: None,
-                    session: None,
+                    bucket: input.bucket,
+                    key: input.key,
+                    version_id: Some(version_id),
+                    auth_context: self.auth(realm_id),
                 },
-            },
-        ),
-        context,
-    )
-    .await;
-    match summary {
-        Ok(summary) if summary.version_id == Some(captured.version_id) => Ok(summary.origin_device),
-        Ok(_) | Err(LocationSummaryError::Denied | LocationSummaryError::BucketNotFound) => {
-            Ok(None)
+            )),
+        };
+        let remote = input.captured.source_node_id != node_id;
+        self.step = RecordStep::Device(input.dest_key);
+        self.expect_remote = remote.then_some(version_id);
+        Ok(Next::Call(call))
+    }
+
+    /// The device one input version was published from. A version that is gone or not readable
+    /// names no device; any other read failure retries the crate.
+    fn device_of(&self, result: IoResult) -> Result<Option<String>, JobError> {
+        const FAILED: &str = "run crate input provenance read failed";
+        let Some(version_id) = self.expect_remote else {
+            return match result.child::<HeadObjectResult, HeadObjectError>()? {
+                Ok(head) => Ok(head.metadata.get(ORIGIN_DEVICE_TAG).cloned()),
+                Err(
+                    HeadObjectError::NoSuchKey
+                    | HeadObjectError::NoSuchVersion
+                    | HeadObjectError::DeleteMarker,
+                ) => Ok(None),
+                Err(error) => Err(retry(FAILED, error)),
+            };
+        };
+        match result.child::<LocationSummary, LocationSummaryError>()? {
+            Ok(summary) if summary.version_id == Some(version_id) => Ok(summary.origin_device),
+            Ok(_) | Err(LocationSummaryError::Denied | LocationSummaryError::BucketNotFound) => {
+                Ok(None)
+            }
+            Err(error) => Err(retry(FAILED, error)),
         }
-        Err(error) => Err(error.to_string()),
+    }
+
+    fn create(&mut self, launch: Option<LaunchRecord>) -> RecordNext {
+        let (node_id, realm_id) = self.place()?;
+        let jsonld = build_crate_jsonld(
+            &self.parent,
+            &self.spec,
+            (realm_id, Some(self.document_id)),
+            &self.devices,
+            launch.as_ref(),
+        );
+        let create = RouteCreateOperation::new(
+            CreateDocumentOperation::new_generated_id(CreateDocumentConfig {
+                actor: self.actor()?,
+                group_id: self.spec.group_id,
+                document_id: self.document_id,
+                document_path: self.document_path(),
+                public: false,
+                payload: CreateDocumentPayload::RoCrate { jsonld },
+            }),
+            Some(node_id),
+            Some(AuthToken::internal(self.auth(realm_id))),
+        );
+        self.call(RecordStep::Create, IoCall::child(create))
+    }
+
+    /// Queues the watch event of the created crate document, then records it as the run's
+    /// written crate.
+    fn written(&mut self, record: MetadataRegistryRecord, event_id: Ulid) -> RecordNext {
+        let (_, realm_id) = self.place()?;
+        let event = WatchEvent::metadata_created(
+            realm_id,
+            self.parent.created_by,
+            record.group_id,
+            record.document_id,
+            &record.document_path,
+            event_id,
+        );
+        let status = RunCrateStatus::Written {
+            resource: record.document_id.to_string(),
+        };
+        let document_id = record.document_id;
+        match watch_event_entry(&event) {
+            Ok(entry) => {
+                let step = RecordStep::Emitted {
+                    status,
+                    document_id,
+                };
+                self.call(step, outside_call(IoCall::Write(vec![entry])))
+            }
+            Err(error) => {
+                warn!(job_id = %self.for_job, %error, "Run crate watch event failed");
+                self.finish(status, Some(document_id))
+            }
+        }
+    }
+
+    /// Records the final status with the run link; a link the receipt wrote keeps its family.
+    fn finish(&mut self, status: RunCrateStatus, run_crate: Option<Ulid>) -> RecordNext {
+        let read = read_run_link(self.for_job);
+        let step = RecordStep::Link { status, run_crate };
+        self.call(step, IoCall::child(read))
+    }
+
+    fn put_outcome(
+        &mut self,
+        known: Option<RunLink>,
+        status: RunCrateStatus,
+        run_crate: Option<Ulid>,
+    ) -> RecordNext {
+        let link = RunLink {
+            family: known.as_ref().and_then(|link| link.family),
+            logical_job_id: known.and_then(|link| link.logical_job_id),
+            group_id: self.spec.group_id,
+            created_by: self.parent.created_by,
+            run_crate,
+        };
+        let resource = match &status {
+            RunCrateStatus::Written { resource } => resource.clone(),
+            other => other.name().to_string(),
+        };
+        let put = put_crate_outcome(self.for_job, &status, &link);
+        self.call(RecordStep::Outcome(resource), IoCall::child(put))
+    }
+}
+
+impl Operation for RecordCrateOperation {
+    type Output = String;
+    type Error = JobError;
+
+    fn first(&mut self) -> RecordNext {
+        let actor = self.actor()?;
+        // A re-driven job whose create already committed records it instead of importing again.
+        if let Some(document_id) = self.saved_id {
+            let read = DocumentRecordOperation::new(document_id);
+            return self.call(RecordStep::Registry, IoCall::child(read));
+        }
+        let mint = DocumentMintOperation::job(actor, self.spec.group_id, self.document_path());
+        self.call(RecordStep::Mint, IoCall::child(mint))
+    }
+
+    fn next(&mut self, result: IoResult) -> RecordNext {
+        const STATUS_FAILED: &str = "run crate status write failed";
+        match std::mem::replace(&mut self.step, RecordStep::Mint) {
+            RecordStep::Mint => {
+                let id = result
+                    .child::<MetaResourceId, CreateDocumentError>()?
+                    .map_err(|error| retry("run crate mint document id failed", error))?;
+                self.document_id = id.as_ulid();
+                // The first minted id is kept before the create, so retries survive policy
+                // changes.
+                let status = RunCrateStatus::Minted {
+                    document_id: self.document_id,
+                };
+                let put = put_crate_status(self.for_job, &status);
+                self.call(RecordStep::PutMinted, IoCall::child(put))
+            }
+            RecordStep::PutMinted => {
+                result
+                    .child::<(), JobMutationError>()?
+                    .map_err(|error| retry(STATUS_FAILED, error))?;
+                self.check()
+            }
+            RecordStep::Registry => {
+                let record = result
+                    .child::<Option<MetadataRegistryRecord>, StorageReadError>()?
+                    .map_err(|error| retry("run crate registry read failed", error))?;
+                match record {
+                    Some(record) => {
+                        let event_id = record.establishing_event_id;
+                        self.written(record, event_id)
+                    }
+                    None => self.check(),
+                }
+            }
+            RecordStep::Allowed => {
+                let denied = match result.child::<bool, AuthorizationError>()? {
+                    Ok(allowed) => !allowed,
+                    Err(
+                        AuthorizationError::InvalidRealmId
+                        | AuthorizationError::InvalidGroupId
+                        | AuthorizationError::GroupNotFound
+                        | AuthorizationError::DocNotFound,
+                    ) => true,
+                    Err(error) => return Err(retry("run crate authorization failed", error)),
+                };
+                if denied {
+                    let status = RunCrateStatus::Denied {
+                        message: "metadata write access denied".to_string(),
+                    };
+                    return self.finish(status, None);
+                }
+                self.next_device()
+            }
+            RecordStep::Device(dest_key) => {
+                if let Some(device) = self.device_of(result)? {
+                    self.devices.insert(dest_key, device);
+                }
+                self.next_device()
+            }
+            RecordStep::Launch => {
+                let launch = result
+                    .child::<Option<LaunchRecord>, JobMutationError>()?
+                    .map_err(|error| retry("run crate launch record read failed", error))?;
+                self.create(launch)
+            }
+            RecordStep::Create => match result
+                .child::<CreateDocumentResult, MetadataWriteError>()?
+            {
+                Ok(created) => self.written(created.record, created.event_id),
+                // Transient errors retry. An invalid crate is permanent: it is recorded and
+                // the obligation discharged, so it is not retried forever.
+                Err(error) if is_transient(&error) => Err(retry("run crate write failed", error)),
+                Err(error) => {
+                    let status = RunCrateStatus::Failed {
+                        message: error.to_string(),
+                    };
+                    self.finish(status, None)
+                }
+            },
+            RecordStep::Emitted {
+                status,
+                document_id,
+            } => {
+                if let Err(error) = outside_answer(result).and_then(IoResult::done) {
+                    warn!(job_id = %self.for_job, %error, "Run crate watch event failed");
+                    return self.finish(status, Some(document_id));
+                }
+                let step = RecordStep::Armed {
+                    status,
+                    document_id,
+                };
+                self.call(step, IoCall::from(schedule_watch_drain()))
+            }
+            // The drain also runs on its next arming, so a timer that is not armed only warns.
+            RecordStep::Armed {
+                status,
+                document_id,
+            } => {
+                if let Err(error) = result.event() {
+                    warn!(job_id = %self.for_job, %error, "Run crate watch drain not armed");
+                }
+                self.finish(status, Some(document_id))
+            }
+            RecordStep::Link { status, run_crate } => {
+                let known = result
+                    .child::<Option<RunLink>, JobMutationError>()?
+                    .map_err(|error| retry(STATUS_FAILED, error))?;
+                self.put_outcome(known, status, run_crate)
+            }
+            RecordStep::Outcome(resource) => {
+                result
+                    .child::<(), JobMutationError>()?
+                    .map_err(|error| retry(STATUS_FAILED, error))?;
+                Ok(Next::Done(resource))
+            }
+        }
     }
 }
 
@@ -498,7 +704,8 @@ fn env_entity(name: &str) -> String {
     format!("#env-{}", utf8_percent_encode(name, NON_ALPHANUMERIC))
 }
 
-/// Granted limits and the working directory as PropertyValues; unbounded dimensions are omitted.
+/// Granted limits, the working directory and the compute backend as PropertyValues; unbounded
+/// dimensions are omitted.
 fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
     let resources = &launch.resources;
     let cores = resources
@@ -530,6 +737,11 @@ fn launch_properties(launch: &LaunchRecord) -> Vec<serde_json::Value> {
             "working-directory",
             "Working directory",
             launch.workdir.clone(),
+        ),
+        (
+            "compute-backend",
+            "Compute backend",
+            Some(launch.backend.clone()).filter(|backend| !backend.is_empty()),
         ),
     ];
     values
@@ -787,7 +999,9 @@ fn build_crate_jsonld(
     let mut part_ids = Vec::new();
     let mut files = Vec::new();
     for input in &spec.inputs {
-        let InputSource::S3 { bucket, key, .. } = &input.source;
+        let InputSource::S3 { bucket, key, .. } = &input.source else {
+            continue;
+        };
         let name = input.name.clone().unwrap_or_else(|| input.dest_key.clone());
         let captured = record
             .captured_inputs
@@ -989,7 +1203,7 @@ fn build_crate_jsonld(
             "description": run_description,
             "datePublished": rfc3339(record.created_at_ms),
             "license": {"@id": "https://creativecommons.org/licenses/by/4.0/"},
-            "conformsTo": {"@id": PROCESS_PROFILE},
+            "conformsTo": {"@id": CRATE_PROFILE_IRI},
             "hasPart": has_part,
             "mentions": {"@id": action_id}
         }),
@@ -1002,7 +1216,7 @@ fn build_crate_jsonld(
         software,
         container,
         json!({
-            "@id": PROCESS_PROFILE,
+            "@id": CRATE_PROFILE_IRI,
             "@type": ["CreativeWork", "http://www.w3.org/ns/dx/prof/Profile"],
             "name": "Process Run Crate",
             "version": "0.5"
@@ -1140,6 +1354,10 @@ fn rfc3339(ms: u64) -> String {
 }
 
 #[cfg(test)]
+#[path = "crate_run_tests.rs"]
+mod run_tests;
+
+#[cfg(test)]
 mod pure_tests {
     use super::*;
     use crate::metadata::create_document::CreateDocumentError;
@@ -1170,11 +1388,10 @@ mod pure_tests {
         assert!(is_transient(&profile_rejection("validator_unavailable")));
     }
 
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{
-        AttemptIntent, CapturedInput, InputMode, InputSelection, OutputObject,
-    };
+    use aruna_core::structs::execution::job::input::{CapturedInput, InputMode, InputSelection};
+    use aruna_core::structs::execution::job::local::{AttemptIntent, OutputObject};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
     use serde_json::Value;
 
     pub(super) fn execution_record() -> (JobRecord, ExecutionSpec) {
@@ -1198,6 +1415,7 @@ mod pure_tests {
             env: Default::default(),
             resources: Default::default(),
             executor_constraint: None,
+            backend: None,
             inputs: vec![InputSelection {
                 source: InputSource::S3 {
                     bucket: "src".to_string(),
@@ -1235,6 +1453,9 @@ mod pure_tests {
             executor_kind: "kubernetes".to_string(),
             pinned_image: format!("docker.io/aruna/tool@sha256:{}", "a".repeat(64)),
             attempt_epoch: 7,
+            backend: "kubernetes".to_string(),
+            config_generation: 0,
+            home_digest: aruna_core::compute::identity::home_digest("kubernetes", None),
         });
         record.workspace_bucket = Some("workspace-sample-one".to_string());
         record.result = Some(JobResultPayload::Execution {
@@ -1292,8 +1513,8 @@ mod pure_tests {
         assert_eq!(descriptor["conformsTo"]["@id"], CRATE_PROFILE);
         let root_id = descriptor["about"]["@id"].as_str().unwrap().to_string();
         let root = by_id(&root_id);
-        assert_eq!(root["conformsTo"]["@id"], PROCESS_PROFILE);
-        let profile = by_id(PROCESS_PROFILE);
+        assert_eq!(root["conformsTo"]["@id"], CRATE_PROFILE_IRI);
+        let profile = by_id(CRATE_PROFILE_IRI);
         assert_eq!(profile["@type"][0], "CreativeWork");
         assert_eq!(profile["@type"][1], "http://www.w3.org/ns/dx/prof/Profile");
         assert_eq!(profile["name"], "Process Run Crate");
@@ -1374,7 +1595,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: group,
@@ -1701,7 +1922,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -1731,7 +1952,7 @@ mod pure_tests {
             destination_key: "inputs/in.txt".to_string(),
             source_node_id: record.owner_node_id,
             version_id: Ulid::from_bytes([13; 16]),
-            content: aruna_core::structs::execution::job::InputContent::Blake3([9; 32]),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3([9; 32]),
             bytes: 3,
             policies: Vec::new(),
             source_group_id: Default::default(),
@@ -1934,7 +2155,7 @@ mod tests {
             _ => false,
         };
         let root = by_id(&root_id);
-        assert_eq!(entity_id(&root["conformsTo"]), Some(PROCESS_PROFILE));
+        assert_eq!(entity_id(&root["conformsTo"]), Some(CRATE_PROFILE_IRI));
         let action = graph
             .iter()
             .find(|entity| has_type(entity, "CreateAction"))
@@ -1954,7 +2175,7 @@ mod tests {
         ));
         assert_eq!(container["registry"], "docker.io");
         assert_eq!(container["sha256"], "a".repeat(64));
-        let profile = by_id(PROCESS_PROFILE);
+        let profile = by_id(CRATE_PROFILE_IRI);
         assert!(has_type(profile, "http://www.w3.org/ns/dx/prof/Profile"));
         assert!(graph.iter().any(|entity| {
             entity["propertyID"] == WORKSPACE_PROPERTY && entity["value"] == "workspace-sample-one"
@@ -2007,6 +2228,7 @@ mod tests {
         LaunchRecord {
             node_id: iroh::SecretKey::from_bytes(&[9; 32]).public(),
             executor_kind: "kubernetes".to_string(),
+            backend: "default".to_string(),
             location: "giessen".to_string(),
             resources: aruna_core::compute::GrantedResources {
                 nano_cpus: Some(1_500_000_000),
@@ -2070,7 +2292,8 @@ mod tests {
     fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
         use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
-        use crate::metadata::profile::shacl::{ProfileShaclEngine, ProfileShapes};
+        use aruna_core::profile_shapes::ProfileShapes;
+        use aruna_graph::shacl::ProfileShaclEngine;
 
         let (record, spec) = execution_record();
         // An input from a device carries its provenance entity, which the shapes must accept.
@@ -2088,8 +2311,8 @@ mod tests {
         let report = engine
             .evaluate(
                 &ProfileShapes {
-                    graph_iri: format!("{PROCESS_PROFILE}#shapes/{BUILTIN_REVISION}"),
-                    sources: builtin_shapes(PROCESS_PROFILE)
+                    graph_iri: format!("{CRATE_PROFILE_IRI}#shapes/{BUILTIN_REVISION}"),
+                    sources: builtin_shapes(CRATE_PROFILE_IRI)
                         .unwrap()
                         .iter()
                         .map(|shapes| shapes.to_string())

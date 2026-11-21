@@ -3,14 +3,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod commands;
+pub(crate) mod commands;
 mod decode;
 mod present;
-
-pub use commands::{
-    explore_entries, explore_keyspaces, print_node_state, print_topic_placements,
-    print_topic_status, print_topics_list, scan_locations,
-};
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum ExplorerError {
@@ -24,6 +19,8 @@ pub(super) enum ExplorerError {
     Craqle(Box<craqle::CraqleError>),
     #[error("keyspace not found: {0}")]
     KeyspaceNotFound(String),
+    #[error("no database at {0}: name the folder of a node's database")]
+    MissingDatabase(String),
     #[error("decode failed: {0}")]
     Decode(String),
     #[error("migration refused: {0}")]

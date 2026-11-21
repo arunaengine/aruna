@@ -4,52 +4,32 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::str::FromStr;
-use std::time::Duration;
 
-use aruna_blob::blob::BlobHandle;
-use aruna_core::NodeId;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::federation::{
-    FederationError, RealmDescriptor, RealmKpis, Registration, RegistrationMode, Signed, Withdrawal,
-};
-use aruna_core::handle::Handle;
+use aruna_core::effects::Effect;
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
+use aruna_core::federation::{PUBLISH_SOON, RealmDescriptor, RegistrationMode, Signed};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FEDERATION_KEYSPACE;
 use aruna_core::operation::Operation;
-use aruna_core::structs::identity::auth::NodeCapabilities;
+use aruna_core::rows::{encoded_row, read_row, values};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_core::task::{TaskEffect, TaskKey};
-use aruna_core::time::unix_timestamp_secs;
-use aruna_core::types::Effects;
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::types::Key;
 use serde::{Deserialize, Serialize};
-use smallvec::smallvec;
 use thiserror::Error;
-use tracing::warn;
 use url::Url;
 
-use crate::driver::{DriverContext, drive};
-use crate::federation::totals::realm_totals;
-use crate::metadata::stats::{count_realm_documents, count_realm_groups};
-use crate::realm::get_config::GetConfigOperation;
-use crate::tasks::task_persistence::persist_task_effect;
-
-/// How often the reporting node renews its registration.
-pub const PUBLISH_INTERVAL: Duration = Duration::from_secs(6 * 3600);
-/// Delay of the first publication after a settings change, so renames reach the registry at once.
-pub const PUBLISH_SOON: Duration = Duration::from_secs(5);
 /// Withdrawals sent while registration is disabled and the registry URL is kept.
-pub const MAX_WITHDRAWALS: u8 = 3;
+const MAX_WITHDRAWALS: u8 = 3;
 const STATE_KEY: &[u8] = b"publication";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Local withdrawal count of one disable cycle, named by the disabled descriptor's issue time
 /// and the registry URL, so each cycle gets its own budget.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublicationState {
+struct PublicationState {
     pub cycle: Option<(u64, Url)>,
     pub withdrawals: u8,
 }
@@ -127,7 +107,11 @@ fn decide(
 
 /// Whether a captured publication still matches the current settings: this node still
 /// reports, and the mode, registry URL and descriptor issue time are unchanged.
-fn still_due(config: &RealmConfigDocument, node_id: NodeId, publication: &Publication) -> bool {
+pub(crate) fn still_due(
+    config: &RealmConfigDocument,
+    node_id: NodeId,
+    publication: &Publication,
+) -> bool {
     let Some(settings) = config.federation.as_ref() else {
         return false;
     };
@@ -156,36 +140,29 @@ fn still_due(config: &RealmConfigDocument, node_id: NodeId, publication: &Public
 #[derive(Debug, Error, PartialEq)]
 pub enum PublishError {
     #[error(transparent)]
-    StorageError(#[from] StorageError),
+    Io(#[from] IoError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("operation did not finish")]
-    NotFinished,
-    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
-    UnexpectedEvent {
-        state: String,
-        expected: &'static str,
-        got: String,
-    },
+    #[error("the realm config is missing")]
+    ConfigMissing,
+    #[error("the publication timer was not armed: {0}")]
+    Timer(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-enum PublishState {
-    Init,
-    Read,
-    Write,
-    Finish,
-    Error,
+/// The realm config row of `realm_id`.
+fn config_read(realm_id: RealmId) -> (String, Key) {
+    let config = DocumentTarget::RealmConfig { realm_id };
+    (config.storage_keyspace().to_string(), config.storage_key())
 }
 
 /// Decides the publication and records the attempt before any request is sent, so a crash
 /// cannot repeat withdrawals beyond the bound.
 #[derive(Debug, PartialEq)]
-pub struct PublishOperation {
+pub(crate) struct PublishOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    state: PublishState,
-    output: Option<Result<Publication, PublishError>>,
+    /// The decided publication while its state write runs.
+    decided: Option<Publication>,
 }
 
 impl PublishOperation {
@@ -193,30 +170,13 @@ impl PublishOperation {
         Self {
             realm_id,
             node_id,
-            state: PublishState::Init,
-            output: None,
+            decided: None,
         }
     }
 
-    fn fail(&mut self, error: PublishError) -> Effects {
-        self.state = PublishState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn finish(&mut self, publication: Publication) -> Effects {
-        self.state = PublishState::Finish;
-        self.output = Some(Ok(publication));
-        smallvec![]
-    }
-
-    fn on_read(
-        &mut self,
-        config: Option<&[u8]>,
-        stored: Option<&[u8]>,
-    ) -> Result<Effects, PublishError> {
+    fn on_read(&mut self, config: Option<&[u8]>, stored: Option<&[u8]>) -> PublishTurn {
         let Some(config) = config else {
-            return Ok(self.finish(Publication::Nothing));
+            return Ok(Next::Done(Publication::Nothing));
         };
         let config = RealmConfigDocument::from_bytes(config)?;
         let previous: PublicationState = stored
@@ -226,238 +186,40 @@ impl PublishOperation {
             .unwrap_or_default();
         let (publication, next) = decide(&config, self.node_id, previous.clone());
         if next == previous {
-            return Ok(self.finish(publication));
+            return Ok(Next::Done(publication));
         }
-        self.state = PublishState::Write;
-        self.output = Some(Ok(publication));
-        Ok(smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: FEDERATION_KEYSPACE.to_string(),
-            key: STATE_KEY.into(),
-            value: postcard::to_allocvec(&next)
-                .map_err(ConversionError::from)?
-                .into(),
-            txn_id: None,
-        })])
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, got: String) -> Effects {
-        let state = format!("{:?}", self.state);
-        self.fail(PublishError::UnexpectedEvent {
-            state,
-            expected,
-            got,
-        })
+        self.decided = Some(publication);
+        let row = encoded_row(FEDERATION_KEYSPACE, STATE_KEY, &next)?;
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
+
+type PublishTurn = Result<Next<Publication>, PublishError>;
 
 impl Operation for PublishOperation {
     type Output = Publication;
     type Error = PublishError;
 
-    fn start(&mut self) -> Effects {
-        self.state = PublishState::Read;
-        let config = DocumentTarget::RealmConfig {
-            realm_id: self.realm_id,
-        };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: vec![
-                (config.storage_keyspace().to_string(), config.storage_key()),
-                (FEDERATION_KEYSPACE.to_string(), STATE_KEY.into()),
-            ],
-            txn_id: None,
-        })]
+    fn first(&mut self) -> PublishTurn {
+        let state = (FEDERATION_KEYSPACE.to_string(), STATE_KEY.into());
+        Ok(Next::Call(IoCall::Read(vec![
+            config_read(self.realm_id),
+            state,
+        ])))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            PublishState::Read => match event {
-                Event::Storage(StorageEvent::BatchReadResult { values }) => {
-                    let [(_, config), (_, stored)] = values.as_slice() else {
-                        return self.unexpected_event(
-                            "realm config and publication state",
-                            format!("{values:?}"),
-                        );
-                    };
-                    match self.on_read(config.as_deref(), stored.as_deref()) {
-                        Ok(effects) => effects,
-                        Err(error) => self.fail(error),
-                    }
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage batch read result", format!("{other:?}")),
-            },
-            PublishState::Write => match event {
-                Event::Storage(StorageEvent::WriteResult { .. }) => {
-                    self.state = PublishState::Finish;
-                    smallvec![]
-                }
-                Event::Storage(StorageEvent::Error { error }) => self.fail(error.into()),
-                other => self.unexpected_event("storage write result", format!("{other:?}")),
-            },
-            PublishState::Init | PublishState::Finish | PublishState::Error => smallvec![],
+    fn next(&mut self, result: IoResult) -> PublishTurn {
+        match self.decided.take() {
+            None => {
+                let [config, stored] = values::<2>(result)?;
+                self.on_read(config.as_deref(), stored.as_deref())
+            }
+            Some(publication) => {
+                result.done()?;
+                Ok(Next::Done(publication))
+            }
         }
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(self.state, PublishState::Finish | PublishState::Error)
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(PublishError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
-    }
-}
-
-/// Runs the decision and sends the signed request through the screened egress client.
-pub async fn publish_registration(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    capabilities: &NodeCapabilities,
-) -> Result<(), String> {
-    let publication = drive(PublishOperation::new(realm_id, node_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    let now = unix_timestamp_secs();
-    let sign_error = |error: FederationError| error.to_string();
-    let captured = publication.clone();
-    let (method, registry_url, body, totals) = match publication {
-        Publication::Nothing => return Ok(()),
-        Publication::Register {
-            registry_url,
-            descriptor,
-            nodes_configured,
-        } => {
-            let kpis = realm_kpis(context, realm_id, nodes_configured).await;
-            let registration = Registration {
-                descriptor,
-                kpis,
-                observed_at: now,
-                issued_at: now,
-            };
-            let signed = Signed::sign(registration, capabilities).map_err(sign_error)?;
-            let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
-            let totals = signed_totals(context, realm_id, node_id, capabilities).await;
-            (reqwest::Method::PUT, registry_url, body, totals)
-        }
-        Publication::Withdraw { registry_url, .. } => {
-            let withdrawal = Withdrawal {
-                realm_id,
-                issued_at: now,
-            };
-            let signed = Signed::sign(withdrawal, capabilities).map_err(sign_error)?;
-            let body = serde_json::to_vec(&signed).map_err(|error| error.to_string())?;
-            (reqwest::Method::DELETE, registry_url, body, None)
-        }
-    };
-    let blob = context
-        .blob_handle
-        .as_ref()
-        .ok_or("no blob handle for registry egress")?;
-    let url = realm_url(&registry_url, &realm_id)?;
-    // The KPI counts take time; settings may have changed since the decision.
-    let current = drive(GetConfigOperation::new(realm_id), context)
-        .await
-        .map_err(|error| error.to_string())?;
-    if !still_due(&current, node_id, &captured) {
-        return Ok(());
-    }
-    send(blob, method, url.clone(), body).await?;
-    // Best effort: a registry from before the totals route keeps the registration.
-    if let Some(body) = totals {
-        let sent = async { send(blob, reqwest::Method::PUT, totals_url(url)?, body).await };
-        if let Err(error) = sent.await {
-            warn!(error = %error, "Registry refused the realm totals");
-        }
-    }
-    Ok(())
-}
-
-/// The signed realm totals as a request body; `None` when a total is unknown.
-async fn signed_totals(
-    context: &DriverContext,
-    realm_id: RealmId,
-    node_id: NodeId,
-    capabilities: &NodeCapabilities,
-) -> Option<Vec<u8>> {
-    let totals = realm_totals(context, realm_id, node_id)
-        .await
-        .inspect_err(|error| warn!(error = %error, "Realm totals unavailable"))
-        .ok()?;
-    let signed = Signed::sign(totals, capabilities)
-        .inspect_err(|error| warn!(error = %error, "Signing realm totals failed"))
-        .ok()?;
-    serde_json::to_vec(&signed).ok()
-}
-
-/// Sends one signed JSON body through the screened egress client.
-async fn send(
-    blob: &BlobHandle,
-    method: reqwest::Method,
-    url: Url,
-    body: Vec<u8>,
-) -> Result<(), String> {
-    let response = blob
-        .repository_request(method, url)
-        .map_err(|error| error.to_string())?
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .timeout(REQUEST_TIMEOUT)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("registry answered {}", response.status()));
-    }
-    Ok(())
-}
-
-/// The totals route below a realm's registry route.
-fn totals_url(mut realm_url: Url) -> Result<Url, String> {
-    realm_url
-        .path_segments_mut()
-        .map_err(|()| "registry URL cannot take a path".to_string())?
-        .push("totals");
-    Ok(realm_url)
-}
-
-/// The realm's totals; a count that fails is unknown (`None`), never zero.
-async fn realm_kpis(
-    context: &DriverContext,
-    realm_id: RealmId,
-    nodes_configured: Option<u64>,
-) -> RealmKpis {
-    RealmKpis {
-        live_datasets: count_realm_documents(context, realm_id)
-            .await
-            .inspect_err(|error| warn!(error = %error, "Dataset count unavailable"))
-            .ok()
-            .flatten(),
-        groups: count_realm_groups(context, realm_id)
-            .await
-            .inspect_err(|error| warn!(error = %error, "Group count unavailable"))
-            .ok(),
-        nodes_configured,
-    }
-}
-
-/// The registry route of one realm below the configured registry base URL.
-fn realm_url(registry_url: &Url, realm_id: &RealmId) -> Result<Url, String> {
-    let mut base = registry_url.clone();
-    if !base.path().ends_with('/') {
-        base.set_path(&format!("{}/", base.path()));
-    }
-    base.join(&format!("v1/realms/{realm_id}"))
-        .map_err(|error| error.to_string())
-}
-
-/// Arms the registration timer at startup without postponing a restored due time. The due
-/// time is persisted, so repeated restarts do not keep moving the first publication.
-pub async fn restore_publish_timer(storage: &StorageHandle, task_handle: &TaskHandle) {
-    shorten_timer(storage, Some(task_handle), PUBLISH_INTERVAL).await;
 }
 
 /// Whether this node reports and the settings name a registry.
@@ -467,46 +229,82 @@ fn publishes_soon(config: &RealmConfigDocument, node_id: NodeId) -> bool {
         && is_reporting(config, node_id)
 }
 
-/// Publishes soon on the reporting node after replicated realm settings materialize here,
-/// also when another management node served the change.
-pub async fn publish_soon(context: &DriverContext, realm_id: RealmId, node_id: NodeId) {
-    match drive(GetConfigOperation::new(realm_id), context).await {
-        Ok(config) if publishes_soon(&config, node_id) => {}
-        Ok(_) => return,
-        Err(error) => {
-            warn!(error = %error, "Realm config unavailable for registry publication");
-            return;
-        }
-    }
-    let task_handle = context.task_handle.as_ref();
-    shorten_timer(&context.storage_handle, task_handle, PUBLISH_SOON).await;
+/// Moves the registry publication up on the reporting node after replicated realm settings
+/// materialize here, also when another management node served the change. True when armed.
+#[derive(Debug, PartialEq)]
+pub struct PublishSoonOperation {
+    realm_id: RealmId,
+    node_id: NodeId,
+    arming: bool,
 }
 
-async fn shorten_timer(storage: &StorageHandle, task_handle: Option<&TaskHandle>, after: Duration) {
-    let effect = TaskEffect::ShortenTimer {
-        key: TaskKey::PublishRegistration,
-        after,
-    };
-    if let Err(message) = persist_task_effect(storage, &effect).await {
-        warn!(message = %message, "Failed to persist registry publication timer");
+impl PublishSoonOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId) -> Self {
+        Self {
+            realm_id,
+            node_id,
+            arming: false,
+        }
     }
-    let Some(task_handle) = task_handle else {
-        return;
-    };
-    if let Event::Task(aruna_core::task::TaskEvent::Error { message, .. }) =
-        task_handle.send_effect(Effect::Task(effect)).await
-    {
-        warn!(message = %message, "Failed to arm registry publication timer");
+
+    fn arm(&mut self, result: IoResult) -> Result<Next<bool>, PublishError> {
+        let [bytes] = values::<1>(result)?;
+        let config = RealmConfigDocument::from_bytes(&bytes.ok_or(PublishError::ConfigMissing)?)?;
+        if !publishes_soon(&config, self.node_id) {
+            return Ok(Next::Done(false));
+        }
+        self.arming = true;
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(timer))))
+    }
+}
+
+impl Operation for PublishSoonOperation {
+    type Output = bool;
+    type Error = PublishError;
+
+    fn first(&mut self) -> Result<Next<bool>, PublishError> {
+        let (space, key) = config_read(self.realm_id);
+        Ok(Next::Call(read_row(&space, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, PublishError> {
+        if !self.arming {
+            return self.arm(result);
+        }
+        let IoResult::Event(event) = result else {
+            let got = result.label();
+            return Err(IoError::Unexpected {
+                expected: "a task timer result",
+                got,
+            }
+            .into());
+        };
+        match *event {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => Ok(Next::Done(true)),
+            Event::Task(TaskEvent::Error { message, .. }) => Err(PublishError::Timer(message)),
+            event => Err(IoError::Unexpected {
+                expected: "a task timer result",
+                got: event.label(),
+            }
+            .into()),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::task_persistence::read_timer;
-    use aruna_core::UserId;
+    use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings};
-    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
+    use aruna_core::time::unix_timestamp_secs;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::task_timers::read_timer;
     use ed25519_dalek::SigningKey;
     use tempfile::tempdir;
     use ulid::Ulid;
@@ -663,24 +461,6 @@ mod tests {
     }
 
     #[test]
-    fn realm_url_joins() {
-        let realm_id = RealmId::from_bytes([1; 32]);
-        let url = realm_url(
-            &Url::parse("https://r.example.org/base").unwrap(),
-            &realm_id,
-        );
-        let url = url.unwrap();
-        assert_eq!(
-            url.as_str(),
-            format!("https://r.example.org/base/v1/realms/{realm_id}")
-        );
-        assert_eq!(
-            totals_url(url).unwrap().as_str(),
-            format!("https://r.example.org/base/v1/realms/{realm_id}/totals")
-        );
-    }
-
-    #[test]
     fn reporter_publishes_soon() {
         // The management node that served the change may not report; the reporter acts.
         let unset = config(RegistrationMode::Enabled, false);
@@ -695,13 +475,16 @@ mod tests {
         // Replicated settings arriving at the reporter persist a due time a few seconds away.
         let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let config = config(RegistrationMode::Enabled, true);
         let target = DocumentTarget::RealmConfig {
@@ -723,9 +506,29 @@ mod tests {
             .await;
         let key = TaskKey::PublishRegistration;
         let storage = &context.storage_handle;
-        publish_soon(&context, config.realm_id, lower(node(1), node(2)).1).await;
+        let other = lower(node(1), node(2)).1;
+        let skipped = drive(PublishSoonOperation::new(config.realm_id, other), &context).await;
+        assert_eq!(skipped, Ok(false));
         assert_eq!(read_timer(storage, &key).await.unwrap(), None);
-        publish_soon(&context, config.realm_id, reporter()).await;
+        // Without a task handle no admission arms the wake, so the run errs and writes no row.
+        let refused = drive(
+            PublishSoonOperation::new(config.realm_id, reporter()),
+            &context,
+        )
+        .await;
+        assert!(matches!(refused, Err(PublishError::Timer(_))));
+        assert_eq!(read_timer(storage, &key).await.unwrap(), None);
+        // With one, the shorten arms a new wake and persists its due time.
+        let scheduled = DriverContext {
+            task_handle: Some(aruna_tasks::TaskHandle::new()),
+            ..context.clone()
+        };
+        let armed = drive(
+            PublishSoonOperation::new(config.realm_id, reporter()),
+            &scheduled,
+        )
+        .await;
+        assert_eq!(armed, Ok(true));
         let due = read_timer(storage, &key).await.unwrap().unwrap();
         let limit = (unix_timestamp_secs() + PUBLISH_SOON.as_secs() + 1) * 1000;
         assert!(due.due_unix_millis <= limit);
@@ -736,13 +539,16 @@ mod tests {
         // The attempt count is stored, so a restarted node does not withdraw again.
         let dir = tempdir().unwrap();
         let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let config = config(RegistrationMode::Disabled, true);
         let target = DocumentTarget::RealmConfig {
@@ -774,37 +580,71 @@ mod tests {
         assert_eq!(sent, MAX_WITHDRAWALS);
     }
 
-    #[tokio::test]
-    async fn failed_count_unknown() {
-        // A count that fails is reported as `null`; a count that works reports zero as zero.
-        let dir = tempdir().unwrap();
-        let context = DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: None,
-            compute_handle: None,
-        };
-        let realm_id = RealmId::from_bytes([7; 32]);
-        let kpis = realm_kpis(&context, realm_id, Some(2)).await;
-        assert_eq!(kpis.groups, Some(0));
-        context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Write {
-                key_space: aruna_core::keyspaces::GROUP_KEYSPACE.to_string(),
-                key: b"broken".to_vec().into(),
-                value: b"not a group".to_vec().into(),
-                txn_id: None,
-            })
-            .await;
-        let kpis = realm_kpis(&context, realm_id, Some(2)).await;
-        let expected = serde_json::json!({
-            "live_datasets": null,
-            "groups": null,
-            "nodes_configured": 2
+    fn soon_read(realm_id: RealmId) -> Result<Next<bool>, PublishError> {
+        let target = DocumentTarget::RealmConfig { realm_id };
+        let read = read_row(target.storage_keyspace(), target.storage_key());
+        Ok(Next::Call(read))
+    }
+
+    fn soon_config(config: &RealmConfigDocument) -> IoResult {
+        IoResult::Values(vec![Some(postcard::to_allocvec(config).unwrap().into())])
+    }
+
+    fn soon_timer() -> Result<Next<bool>, PublishError> {
+        let timer = Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
         });
-        assert_eq!(serde_json::to_value(kpis).unwrap(), expected);
+        Ok(Next::Call(IoCall::Effect(Box::new(timer))))
+    }
+
+    fn task(event: TaskEvent) -> IoResult {
+        IoResult::Event(Box::new(Event::Task(event)))
+    }
+
+    #[test]
+    fn soon_arms_reporter() {
+        let config = config(RegistrationMode::Enabled, true);
+        let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
+        assert_eq!(operation.first(), soon_read(config.realm_id));
+        assert_eq!(operation.next(soon_config(&config)), soon_timer());
+        let scheduled = task(TaskEvent::TimerScheduled {
+            key: TaskKey::PublishRegistration,
+            after: PUBLISH_SOON,
+        });
+        assert_eq!(operation.next(scheduled), Ok(Next::Done(true)));
+
+        // Another node, or settings without a registry, arm nothing.
+        let other = lower(node(1), node(2)).1;
+        for (config, node_id) in [
+            (config.clone(), other),
+            (self::config(RegistrationMode::Enabled, false), reporter()),
+        ] {
+            let mut operation = PublishSoonOperation::new(config.realm_id, node_id);
+            operation.first().unwrap();
+            assert_eq!(operation.next(soon_config(&config)), Ok(Next::Done(false)));
+        }
+    }
+
+    #[test]
+    fn soon_failures_end() {
+        let config = config(RegistrationMode::Enabled, true);
+        let started = || {
+            let mut operation = PublishSoonOperation::new(config.realm_id, reporter());
+            operation.first().unwrap();
+            operation
+        };
+        let missing = started().next(IoResult::Values(vec![None]));
+        assert_eq!(missing, Err(PublishError::ConfigMissing));
+        let mut refused = started();
+        refused.next(soon_config(&config)).unwrap();
+        let error = task(TaskEvent::Error {
+            key: Some(TaskKey::PublishRegistration),
+            message: "full".to_string(),
+        });
+        assert_eq!(
+            refused.next(error),
+            Err(PublishError::Timer("full".to_string()))
+        );
     }
 }

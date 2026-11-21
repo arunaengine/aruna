@@ -5,54 +5,57 @@
 use std::time::Duration;
 
 pub mod backend_import;
+pub mod backend_record;
 pub mod command;
 pub mod copy;
+pub mod demand;
+pub mod device_admission;
+pub mod discard;
 pub mod drain;
-pub mod executor;
 pub mod export;
+pub mod fence;
+pub mod handed_imports;
 pub mod harvest;
 pub mod import;
+mod import_listing;
+pub mod job;
+pub mod key_locks;
 pub mod key_wake;
 pub mod lifecycle;
+pub mod local_run;
 pub mod metadata_class;
+pub mod node_inputs;
 pub mod output_record;
+pub(crate) mod page_intents;
 pub mod persistent_id;
-pub mod plugin_work;
-pub(crate) mod protocol;
+pub mod protocol;
 pub mod prune;
 pub mod quota;
 pub mod recent;
-pub mod reconcile;
 pub mod records;
 pub mod remote_key;
 pub mod repository;
 mod rocrate_jsonld;
-mod route;
+pub mod route;
+pub(crate) mod run_rows;
 pub mod runs;
-pub mod runtime;
-pub mod service;
-pub mod source_read;
+pub mod runtime_steps;
+pub mod session;
 pub mod staging;
 pub mod store;
+#[cfg(test)]
+mod submission_tests;
 pub mod submit;
-mod transfers;
 pub mod workflow;
-
-pub use protocol::JobRouteError;
 
 /// Claim lease; fenced by `claim_token` so a lapsed holder's writes are rejected.
 pub const JOB_LEASE_MS: u64 = 60_000;
 /// Heartbeat interval (renew + progress flush); must stay well under the lease.
 pub const JOB_HEARTBEAT_MS: u64 = 20_000;
-/// Maximum in-process jobs executing locally at once; excess stays queued.
-pub const JOB_CONCURRENCY_CAP: usize = 8;
-/// External-attempt supervision slots. Supervising a remote container is IO-trivial,
-/// so it gets its own bounded budget and never starves in-process jobs (or vice versa).
-pub const EXTERNAL_CONCURRENCY_CAP: usize = 64;
 /// Attempts before a retryable failure becomes terminal `Failed`.
 pub const JOB_MAX_ATTEMPTS: u32 = 5;
 /// Default terminal-state retention before pruning.
-pub const JOB_RETENTION_MS: u64 = aruna_core::structs::execution::job::RETENTION_MS;
+pub const JOB_RETENTION_MS: u64 = aruna_core::structs::execution::job::identity::RETENTION_MS;
 /// Minimum spacing between throttled progress flushes.
 pub const FLUSH_INTERVAL_MS: u64 = 500;
 /// Bounded OCC retries when a job mutation transaction conflicts.
@@ -73,3 +76,29 @@ pub const JOB_RECONCILE_REARM: Duration = Duration::from_millis(JOB_HEARTBEAT_MS
 pub const JOB_PRUNE_PAGE: usize = 512;
 pub const PRUNE_POLL_AFTER: Duration = Duration::from_secs(60 * 60);
 pub const PRUNE_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// Converts call failures into the storage, codec, unexpected and unfinished variants of an error.
+macro_rules! io_failure {
+    ($error:ty) => {
+        impl From<aruna_core::calls::IoError> for $error {
+            fn from(error: aruna_core::calls::IoError) -> Self {
+                use aruna_core::calls::IoError;
+                use aruna_core::errors::StorageError;
+                match error {
+                    IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+                    IoError::Storage(error) => Self::Storage(error),
+                    IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                        state: "call".to_string(),
+                        expected,
+                        got,
+                    },
+                    IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => {
+                        Self::NotFinished
+                    }
+                    IoError::Codec(error) => Self::Codec(error),
+                }
+            }
+        }
+    };
+}
+pub(crate) use io_failure;

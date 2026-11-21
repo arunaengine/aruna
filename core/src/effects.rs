@@ -2,26 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::structs::placement::record::PlacementRef;
+use crate::structs::placement::transition::ProofClaim;
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
-use crate::UserId;
 use crate::alpn::Alpn;
-use crate::audit::AuditPageRequest;
-use crate::compute::{ExecutionTargetId, SharedSecret};
+use crate::compute::SharedSecret;
 use crate::document::DocumentEffect;
 use crate::id::{DhtKeyId, NodeId};
 use crate::jobs::JobRequest;
-use crate::metadata::{AuthToken, MetadataEffect};
-use crate::node_vault::VaultEntry;
+use crate::metadata::AuthToken;
+use crate::metadata::MetadataEffect;
+use crate::node::vault::VaultEntry;
 use crate::operation::SubOperation;
 use crate::stream::{BackendStream, StreamError};
-use crate::structs::WriteGuard;
-use crate::structs::execution::job::{JobRecordEnvelope, JobRecordKind, SubmissionId};
+use crate::structs::execution::job::family::{JobRecordEnvelope, JobRecordKind};
 use crate::structs::execution::source_access::{ListRequest, ResolvedSourceAccess, SourceMetadata};
 use crate::structs::identity::realm::RealmId;
 use crate::structs::placement::policy::PlacementPolicyRef;
 use crate::structs::placement::policy::document::PolicyPublicationClaim;
-use crate::structs::placement::record::PlacementRef;
 use crate::structs::storage::backend_import::PlainPath;
 use crate::structs::storage::blob::{
     ArchiveKey, BackendLocation, BackendRef, HiddenBlobKey, ResolvedBackend,
@@ -32,8 +32,10 @@ use crate::structs::storage::format::Compression;
 use crate::structs::storage::group_backend::{GroupStorage, GroupStorageSecret};
 use crate::structs::storage::multipart::{BackendUpload, MultipartPart, WorkingShare};
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
+use crate::structs::synced_folder::WriteGuard;
 use crate::task::TaskEffect;
 use crate::types::{Key, KeySpace, TxnId, Value};
+use crate::user::id::UserId;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -49,9 +51,49 @@ pub enum Effect {
     Net(NetEffect),
     Metadata(MetadataEffect),
     SubOperation(Box<dyn SubOperation>),
+    /// Starts a child beside the caller while a background slot is free; answered at once by
+    /// `TaskEvent::BackgroundStarted`. The child's result goes nowhere.
+    Background(Box<dyn SubOperation>),
     Task(TaskEffect),
     Search(),
     Stream(),
+    Index(Box<crate::key_index::IndexEffect>),
+    /// Independent effects the runner runs at the same time; never persisted.
+    Group(EffectGroup),
+    Session(Box<crate::compute::session::SessionEffect>),
+    Outbound(crate::outbound::OutboundEffect),
+    /// The plugin host's node-wide state: call rates, the copy memory budget, unnamed accounts.
+    Plugin(crate::plugins::PluginEffect),
+    /// Wakes the operation with `Event::Delayed` after this long on the runner's clock; never
+    /// persisted. A run deadline that passes first cuts it off like any other effect.
+    Delay(Duration),
+    /// One call to an executor backend of this node; never persisted.
+    Compute(Box<crate::compute::effect::ComputeEffect>),
+    /// A request to the host of a running job; never persisted.
+    Job(crate::jobs::JobEffect),
+    /// One call to this node's Git store; never persisted.
+    Git(Box<crate::git::GitCall>),
+}
+
+/// Independent effects or sub operations the runner runs at the same time, at most `limit` at
+/// once (0 counts as 1). Storage transaction effects and nested groups are refused as members.
+#[derive(Debug, PartialEq)]
+pub struct EffectGroup {
+    pub members: Vec<Effect>,
+    pub limit: usize,
+    pub form: GroupForm,
+}
+
+/// How the results of an [`EffectGroup`] come back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupForm {
+    /// One `GroupEvent::Finished` with every result in emission order. A member that has not
+    /// finished `deadline` after the group started reports `GroupResult::Unfinished`.
+    All { deadline: Option<Duration> },
+    /// Each result comes back as its own `GroupEvent::Member` as soon as it finishes. Effects
+    /// the operation returns while the window is open join it as new members, and
+    /// `GroupEvent::Closed` follows once no member runs or waits.
+    Window,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,6 +168,26 @@ pub enum BlobEffect {
     },
     ReleaseReservation {
         id: Ulid,
+    },
+    /// Reads a stream to its end; answered by `StreamCollected`. With a `limit` the read stops
+    /// once more bytes came and answers `StreamTooLarge`, so a longer stream never fills memory.
+    CollectStream {
+        blob: BackendStream<Result<Bytes, StreamError>>,
+        limit: Option<u64>,
+    },
+    /// Settles the reservation a write left behind; answered by `ReservationReconciled`.
+    ReconcileReservation {
+        location: BackendLocation,
+    },
+    /// Removes an in-place target no upload record or version owns any more; answered by
+    /// `DeleteFinished`.
+    DiscardTarget {
+        location: BackendLocation,
+    },
+    /// Aborts the provider uploads of an in-place target and keeps its object; answered by
+    /// `UploadAborted`.
+    AbortTarget {
+        location: BackendLocation,
     },
     SpoolHidden {
         namespace: Ulid,
@@ -435,6 +497,19 @@ pub enum BlobEffect {
         backend: BackendRef,
         bucket: String,
     },
+    /// Holds the kept copy at `backend_path` while `blob` streams, so eviction leaves its bytes
+    /// to the hidden sweep; answered by `BlobEvent::PinnedRead`.
+    PinRead {
+        backend_path: String,
+        blob: BackendStream<Result<Bytes, StreamError>>,
+    },
+    /// Whether a read holds the kept copy at `backend_path`; answered by `BlobEvent::ReadHeld`.
+    ReadHeld {
+        backend_path: String,
+    },
+    /// One repository, provider or stored artifact call of a job or link; answers
+    /// `BlobEvent::Remote`.
+    Remote(Box<crate::repository::remote::RemoteRequest>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -662,6 +737,32 @@ pub enum StorageEffect {
     FinishUsageRebuild {
         key_space: KeySpace,
     },
+    /// Opens a secret sealed to the realm keys. Only a node that holds them answers with it.
+    RealmOpen(Box<crate::realm_vault::RealmSealed>),
+    /// Compiles each request policy set, a set of the same content once. Answers
+    /// `PoliciesCompiled` in the same order.
+    CompilePolicies(Vec<Vec<crate::request_policy::RequestPolicy>>),
+}
+
+impl StorageEffect {
+    /// The transaction id of an effect that can run in a caller's transaction.
+    pub fn txn_slot(&mut self) -> Option<&mut Option<TxnId>> {
+        match self {
+            Self::Read { txn_id, .. }
+            | Self::BatchRead { txn_id, .. }
+            | Self::Write { txn_id, .. }
+            | Self::BatchWrite { txn_id, .. }
+            | Self::Delete { txn_id, .. }
+            | Self::BatchDelete { txn_id, .. }
+            | Self::Iter { txn_id, .. }
+            | Self::IterRange { txn_id, .. }
+            | Self::Last { txn_id, .. }
+            | Self::VaultWrite { txn_id, .. }
+            | Self::VaultRead { txn_id, .. }
+            | Self::VaultDelete { txn_id, .. } => Some(txn_id),
+            _ => None,
+        }
+    }
 }
 
 /// Dispatch lane for a storage effect. Foreground is always served before Bulk,
@@ -707,28 +808,259 @@ impl IterEnd {
     }
 }
 
+/// The realm config catch-up a node runs after every start, one step at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchUpEffect {
+    /// One sync round of the realm config topic with one management node.
+    Round {
+        topic: irokle::TopicId,
+        peer: NodeId,
+    },
+    /// Whether this node applied the topic up to every round target.
+    Applied {
+        topic: irokle::TopicId,
+        targets: Vec<irokle::ActorClock>,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
     Dht(DhtEffect),
     DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
-    AuditPage(Box<AuditPageEffect>),
-    PolicyFetch(Box<PolicyFetchEffect>),
-    JobRecord(Box<JobRecordEffect>),
-    LaunchOffer(Box<LaunchOfferEffect>),
     /// Signs one policy publication claim with this node's key, after the
     /// operation checked the authorizing user's realm-admin permission.
     PolicySign(Box<PolicyPublicationClaim>),
-    VaultFetch(Box<VaultFetchEffect>),
     /// Signs vault or key records with this node's key; each must name this node.
     VaultSign(Box<crate::structs::identity::user::vault::VaultRecords>),
     /// Signs a distribution snapshot; only a snapshot naming this node as publisher.
     SnapshotSign(Box<crate::structs::storage::distribution::snapshot::SnapshotClaim>),
     /// Signs a member statement; only a claim naming this node as signer.
-    StatementSign(Box<crate::structs::storage::distribution::StatementClaim>),
-    /// Reads a release crate version or asks a range holder about releases.
-    Release(Box<crate::structs::storage::release::ReleaseEffect>),
+    StatementSign(Box<crate::structs::storage::distribution::statement::StatementClaim>),
+    /// Signs one job record of an execution; only a claim naming this node as publisher.
+    ExecutionSign(Box<crate::structs::execution::job::family::ExecutionClaim>),
+    /// Sends one notification request frame to a holder and reads its answer frame.
+    Notification(Box<crate::structs::execution::notification::NotificationRequest>),
+    /// Wakes the live inbox streams of these local recipients.
+    WakeInbox(Vec<crate::user::id::UserId>),
+    /// Records, sends or keeps a heartbeat; the runner carries it out with the net handle.
+    Heartbeat(Box<crate::heartbeat::HeartbeatEffect>),
+    /// Sends one encoded metadata protocol request to one peer and reads its answer.
+    MetadataRequest(Box<MetadataRequestEffect>),
+    /// Applies a realm configuration to this node's peer set; answers
+    /// `NetEvent::DocumentPeers`.
+    RefreshDocumentPeers(Box<crate::structs::identity::realm::RealmConfigDocument>),
+    /// Reads one version from another node under a read grant; answers
+    /// `NetEvent::GrantedRead`.
+    GrantedRead(Box<crate::native_reference::GrantedReadEffect>),
+    /// Reads one version from another node under a delegation; answers
+    /// `NetEvent::DelegatedRead`.
+    DelegatedRead(Box<crate::native_reference::DelegatedReadEffect>),
+    /// Signs a read grant; only a grant naming this node as issuer. Answers
+    /// `NetEvent::GrantSign`.
+    GrantSign(Box<crate::structs::storage::read_grant::ReadGrant>),
+    /// Signs a delegation; only one naming this node as issuer. Answers
+    /// `NetEvent::DelegationSign`.
+    DelegationSign(Box<crate::structs::storage::distribution::delegation::Delegation>),
+    /// Skips a holder that failed in holder choices for a while; answers
+    /// `NetEvent::HolderAvoided`.
+    AvoidHolder {
+        node_id: crate::id::NodeId,
+        now_ms: u64,
+    },
+    /// Signs the signing bytes of a search cursor; only a cursor naming this node as signer.
+    /// Answers `NetEvent::CursorSigned`.
+    CursorSign(Vec<u8>),
+    /// Signs the domain-tagged bytes of a federation payload with this node's realm or issuer
+    /// key, which only the adapter holds. Answers `NetEvent::FederationSigned`.
+    FederationSign(Vec<u8>),
+    /// Opens a sealed repository token with this node's credential key, which only the adapter
+    /// holds. Answers `NetEvent::CredentialOpened`.
+    OpenCredential(Box<crate::repository::credential::CredentialOpen>),
+    /// Signs an admin event this node originated over its placement-bound bytes, so a holder can
+    /// take it in relay; answers `NetEvent::AdminSigned`.
+    AdminSign {
+        event: Box<crate::admin_documents::AdminDocumentEvent>,
+        placement: PlacementRef,
+    },
+    /// Seals a search or listing position with this process's key, so it names no key;
+    /// answers `NetEvent::PositionSealed`.
+    SealPosition(Vec<u8>),
+    /// Opens a position this process sealed; answers `NetEvent::PositionOpened`.
+    OpenPosition(Vec<u8>),
+    /// Draws a secret of this many letters and digits from the OS random source; answers
+    /// `NetEvent::SecretDrawn`.
+    DrawSecret(usize),
+    /// Refreshes the last-contact time of a peer whose request was just accepted; answers
+    /// `NetEvent::PeerContact`.
+    PeerContact(NodeId),
+    /// Asks how long each node has been silent; answers `NetEvent::HeartbeatSilence`.
+    HeartbeatSilence(Vec<NodeId>),
+    /// Works on this node's shard topics; answers `NetEvent::Shard`.
+    Shard(Box<ShardNetEffect>),
+    /// Creates shared sync topics with these peers; answers `NetEvent::TopicPeers`.
+    EnsureTopics {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Lets these peers into existing sync topics; answers `NetEvent::TopicPeers`.
+    AllowTopicPeers {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Syncs one topic with these peers; answers `NetEvent::TopicPeers`.
+    SyncTopic {
+        topic: irokle::TopicId,
+        peers: Vec<NodeId>,
+    },
+    /// The peers of `peers` that one topic does not have as members; answers
+    /// `NetEvent::MissingTopicPeers`.
+    MissingTopicPeers {
+        topic: irokle::TopicId,
+        peers: Vec<NodeId>,
+    },
+    /// One step of catching up with the realm config after a start; answers
+    /// `NetEvent::ConfigCatchUp`.
+    ConfigCatchUp(Box<CatchUpEffect>),
+    /// Signs this node's statement that it is ready for a group deletion plan; answers
+    /// `NetEvent::DeletePlanSigned`.
+    SignDeletePlan(Box<crate::structs::identity::group_delete::GroupDeletePlan>),
+    /// Signs this node's start of a count run on the other members of a distributed bucket;
+    /// answers `NetEvent::CountRelaySigned`.
+    SignCountRelay(Box<crate::structs::placement::coverage::CountRelay>),
+    /// Tells this node's dashboard streams that job state changed; answers `NetEvent::Recorded`.
+    DashboardChanged,
+    /// Records one suppressed watch delivery in this node's watch metrics.
+    RecordSuppression(crate::metrics::WatchMetricReason),
+    /// Asks when this node last saw each of `peers`; answers `NetEvent::PeerContacts`.
+    PeerContacts {
+        peers: Vec<NodeId>,
+    },
+    /// Asks for this node's id; answers `NetEvent::LocalNode`.
+    LocalNode,
+    /// Asks for the realm this node serves; answers `NetEvent::LocalRealm`.
+    LocalRealm,
+    /// Asks whether a trusted issuer's public key is one this node checked; answers
+    /// `NetEvent::IssuerKey`.
+    IssuerKey {
+        key: [u8; 32],
+    },
+    /// Asks which holders this node's watch interest matches; answers `NetEvent::WatchHolders`.
+    WatchHolders {
+        realm_id: crate::structs::identity::realm::RealmId,
+        path: String,
+        kind: crate::structs::execution::notification_watch::WatchEventKind,
+    },
+    /// Notes a watch a local user just created on `holder`, so events reach the holder before
+    /// its interest digest arrives.
+    RegisterInterest {
+        watch_id: ulid::Ulid,
+        realm_id: crate::structs::identity::realm::RealmId,
+        holder: NodeId,
+        entry: crate::structs::execution::notification_watch::WatchInterestEntry,
+    },
+    /// Removes a watch a local user just deleted from this node's watch interest.
+    RetractInterest(ulid::Ulid),
+    /// Replaces this node's whole watch interest cache with a rebuilt table.
+    ReplaceInterest(Box<crate::structs::execution::notification_watch::WatchInterestTable>),
+    /// Replaces one realm's node map in this node's watch interest cache.
+    UpdateRealmInterest {
+        realm_id: crate::structs::identity::realm::RealmId,
+        nodes: std::collections::HashMap<
+            NodeId,
+            Vec<crate::structs::execution::notification_watch::WatchInterestEntry>,
+        >,
+    },
+}
+
+/// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
+/// sends it to `peer`, waits at most `timeout`, and never routes or retries.
+/// The exact membership a set of shard topics should have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardMembership {
+    pub topics: Vec<irokle::TopicId>,
+    pub members: Vec<NodeId>,
+    pub publishers: Vec<NodeId>,
+    pub retained: BTreeSet<NodeId>,
+    pub verified: BTreeSet<irokle::TopicId>,
+}
+
+/// Shard topic work the network side of this node carries out.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ShardNetEffect {
+    /// Which of these topics have a local genesis.
+    Existing(Vec<irokle::TopicId>),
+    /// Reopens topics this node holds again.
+    Reopen(Vec<irokle::TopicId>),
+    /// Closes a topic this node left; says whether a sync still runs on it.
+    Close(irokle::TopicId),
+    Membership(ShardMembership),
+    /// Asks peers which of these topics they already hold.
+    Probe {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Fetches these topics from peers; the caller reconciles and applies what arrived.
+    Pull {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Creates topics held by this node alone.
+    EnsureLocal(Vec<irokle::TopicId>),
+    /// Creates topics shared with these peers.
+    EnsureShared {
+        topics: Vec<irokle::TopicId>,
+        peers: Vec<NodeId>,
+    },
+    /// Whether an eviction hand-off for this bucket is still journalled.
+    EvictionPending(PlacementRef),
+    /// The topic's fingerprint and clock.
+    TopicFacts(irokle::TopicId),
+    /// The hash binding a topic's genesis and the operations at a frontier.
+    FrontierRoot {
+        topic: irokle::TopicId,
+        frontier: irokle::ActorClock,
+    },
+    SignProof(ProofClaim),
+    FetchManifest {
+        peer: NodeId,
+        realm_id: RealmId,
+        placement: PlacementRef,
+    },
+}
+
+/// One encoded metadata peer request with the bounds its answer is read within; no shape marks
+/// a frame its operation could not read back, which is never sent.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MetadataRequestEffect {
+    pub peer: NodeId,
+    pub frame: Vec<u8>,
+    pub timeout: Duration,
+    pub shape: Option<FrameShape>,
+}
+
+/// How one peer request travels: the frame class it is sent in, how long stream I/O and the
+/// answer may take, how large the answer frame may be, and the cap of a body read after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameShape {
+    pub class: u8,
+    pub io_wait: Duration,
+    pub answer_wait: Duration,
+    pub answer_cap: usize,
+    pub body_cap: Option<u64>,
+}
+
+/// Shows the frame size only: a frame can carry credentials or the realm key.
+impl std::fmt::Debug for MetadataRequestEffect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataRequestEffect")
+            .field("peer", &self.peer)
+            .field("frame_bytes", &self.frame.len())
+            .field("timeout", &self.timeout)
+            .field("shape", &self.shape)
+            .finish()
+    }
 }
 
 /// Holders one policy fetch may consult. The operation resolves them from its
@@ -966,7 +1298,7 @@ impl TryFrom<JobRecordEnvelope> for ReceiptFrame {
 }
 
 /// Fetch of one immutable placement-policy document from the holders the
-/// operation resolved. The adapter tries them in order and never routes; the
+/// operation resolved. The fetch tries them in order and never routes; the
 /// operation verifies id, realm, and digest before it caches anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyFetchEffect {
@@ -987,48 +1319,12 @@ pub enum VaultQuery {
 }
 
 /// Fetch of one user's vault heads or key records from the holders the
-/// operation resolved. The adapter tries them in order and never routes.
+/// operation resolved. The fetch tries them in order and never routes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VaultFetchEffect {
     pub holders: HolderList<MAX_FETCH_HOLDERS>,
     pub user_id: UserId,
     pub query: VaultQuery,
-    pub deadline: Duration,
-}
-
-/// Replication of the append-only job-family records: publish one immutable
-/// record to the family holders, or read a bounded page back from them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JobRecordEffect {
-    Publish {
-        realm_id: RealmId,
-        /// Family placement derived from the submission id, never from an alias.
-        placement: PlacementRef,
-        holders: HolderList<MAX_RECORD_HOLDERS>,
-        record: Box<JobRecordFrame>,
-        deadline: Duration,
-    },
-    Fetch {
-        realm_id: RealmId,
-        placement: PlacementRef,
-        holders: HolderList<MAX_RECORD_HOLDERS>,
-        submission_id: SubmissionId,
-        /// `None` reads every request family under this submission.
-        request_digest: Option<[u8; 32]>,
-        /// Opaque holder cursor returned by the previous page.
-        cursor: Option<FetchCursor>,
-        limit: PageLimit,
-        deadline: Duration,
-    },
-}
-
-/// One scheduler's launch offer to an execution target. It carries no caller
-/// token: the target verifies the signed launch and fetches the stored spec.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LaunchOfferEffect {
-    pub realm_id: RealmId,
-    pub target: ExecutionTargetId,
-    pub launch: Box<LaunchFrame>,
     pub deadline: Duration,
 }
 
@@ -1038,15 +1334,6 @@ pub struct LaunchOfferEffect {
 pub struct JobControlEffect {
     pub owner: NodeId,
     pub request: JobRequest,
-}
-
-/// The audit fan-out: one page request asked of every listed node. The adapter
-/// performs the frame round-trips concurrently and answers with one aggregated
-/// event, so an unreachable node cannot delay the others.
-#[derive(Debug, Clone, PartialEq)]
-pub struct AuditPageEffect {
-    pub nodes: Vec<NodeId>,
-    pub request: AuditPageRequest,
 }
 
 /// Default wall-clock budget for a DHT read whose caller has no tighter
@@ -1133,6 +1420,15 @@ pub enum DhtEffect {
 pub enum StreamEffect {
     Open { node_id: NodeId, alpn: Alpn },
     Close { stream_id: u64 },
+}
+
+/// The abort of an open storage transaction, which `take` leaves closed; none without one.
+pub fn abort_effects(txn_id: &mut Option<crate::types::TxnId>) -> crate::types::Effects {
+    txn_id
+        .take()
+        .map_or_else(smallvec::SmallVec::new, |txn_id| {
+            smallvec::smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
+        })
 }
 
 #[cfg(test)]

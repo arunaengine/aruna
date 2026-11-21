@@ -2,19 +2,16 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod check;
+mod access;
+pub mod check;
 mod commit;
-mod coordinator;
+pub mod coordinator;
 mod onboarding;
-mod peer;
+pub(crate) mod peer;
 mod prepare;
 mod resources;
 
-pub use check::check_group;
-pub use coordinator::delete_group;
-pub(crate) use coordinator::sync_decision;
-pub use onboarding::install_onboarding;
-pub(crate) use peer::apply_request;
+use aruna_core::structs::identity::group_delete::GroupDeletionError;
 
 #[cfg(test)]
 mod barrier_tests;
@@ -24,5 +21,10 @@ mod check_tests;
 mod recovery_tests;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod transport_tests;
+
+/// The reads of the permission rules on `path`.
+fn auth_call(path: &str) -> Result<aruna_core::calls::IoCall, GroupDeletionError> {
+    crate::auth::permission_rules::rule_reads(path)
+        .map(aruna_core::calls::IoCall::Read)
+        .map_err(|error| GroupDeletionError::Unavailable(error.to_string()))
+}

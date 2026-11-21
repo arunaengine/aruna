@@ -2,29 +2,72 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::tasks::runner::recover_until_stopped;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::tasks::incoming::TaskQueues;
+use crate::tasks::metadata_sweeps::spawn_metadata_warmup;
 use aruna_api::monitoring::Readiness;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::document::DocumentTarget;
-use aruna_core::shutdown::Shutdown;
-use aruna_operations::distribution::index_feed::spawn_index_feed;
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::drain::restore_drain_timer;
-use aruna_operations::jobs::lifecycle::restore_lifecycle_timers;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_operations::metadata::spawn_metadata_warmup;
-use aruna_operations::node::startup::{RecoveryConfig, RecoveryStatus};
-use aruna_operations::plugins::artifacts::spawn_repair;
-use aruna_operations::plugins::worker::spawn_worker;
-use aruna_operations::s3::access::cutoff::spawn_cutoff_sweep;
-use aruna_operations::s3::session::spawn_session_sweep;
-use aruna_operations::tasks::incoming::TaskQueues;
+use aruna_core::events::Event;
+use aruna_core::handle::Handle;
+use aruna_core::task::TaskEvent;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_operations::jobs::drain::DrainTimerOperation;
+use aruna_operations::jobs::lifecycle::outbox::timers::{
+    LifecycleTimersOperation, lifecycle_timers,
+};
+use aruna_operations::node::recovery_run::RecoveryConfig;
+use aruna_operations::shard::recovery::RecoveryStatus;
+use aruna_operations::transfer::feed_walks::{FeedCursors, FeedLimits, FeedPassOperation};
 use aruna_tasks::TaskHandle;
-use tracing::warn;
+use aruna_tasks::shutdown::Shutdown;
+use tracing::{error, warn};
 
 use crate::application::{Service, ServiceExit};
+use crate::plugin_host::repair::spawn_repair;
+use crate::plugin_host::worker::spawn_worker;
 use crate::startup::realm::CoreAnnouncement;
+use crate::startup::sweeps::{spawn_cutoff_sweep, spawn_session_sweep};
 use crate::startup::test_hooks;
+
+const FEED_IDLE: Duration = Duration::from_secs(2);
+const FEED_BUSY: Duration = Duration::from_millis(50);
+
+/// Runs the range index feeder of this node until shutdown on the bulk storage lane; nodes
+/// without range indexes feed none.
+fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
+    if context.storage_handle.range_indexes().is_none() {
+        return;
+    }
+    let mut bulk = (*context).clone();
+    bulk.storage_handle = context.storage_handle.bulk();
+    let limits = FeedLimits::default();
+    let mut cursors = FeedCursors::default();
+    let token = shutdown.token();
+    shutdown.spawn(async move {
+        loop {
+            let pass = FeedPassOperation::new(limits, std::mem::take(&mut cursors));
+            let wait = match drive(pass, &bulk).await {
+                Ok(pass) => {
+                    cursors = pass.cursors;
+                    if pass.busy { FEED_BUSY } else { FEED_IDLE }
+                }
+                Err(error) => {
+                    warn!(%error, "Range search index pass failed");
+                    FEED_IDLE
+                }
+            };
+            tokio::select! {
+                _ = token.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
+}
 
 pub(crate) struct Background {
     pub(crate) realm_id: aruna_core::structs::identity::realm::RealmId,
@@ -95,6 +138,8 @@ pub(crate) enum BackgroundOutcome {
     Cancelled,
     /// A listener whose loss stops the node exited; the sequence stopped.
     RequiredListenerFailed(Service),
+    /// Stale execution state could not be discarded; no job work started.
+    DiscardFailed,
 }
 
 /// Runs the background start, applying steady-state supervision to any
@@ -127,6 +172,14 @@ pub(crate) async fn start(
     let mut core_documents = Some(documents);
     let mut task_queues = Some(task_queues);
     let mut completed_all_phases = true;
+    // A node offline longer than the job retention ends its executions before any job work. A
+    // failed discard stops the start, so the next one decides again from the same contact row.
+    let discard =
+        aruna_operations::jobs::discard::DiscardOperation::new(driver_ctx.node_and_realm());
+    if let Err(error) = drive(discard, &driver_ctx).await {
+        error!(error = %error, "Failed to discard stale execution state; the start stops");
+        return BackgroundOutcome::DiscardFailed;
+    }
 
     for phase in STARTUP_PHASES {
         // The supervision policy applies here exactly as it does in steady
@@ -174,11 +227,10 @@ pub(crate) async fn start(
                 });
             }
             StartupPhase::RecoverStaleJobs => {
-                if let Err(error) = jobs_runtime
-                    .recover_until_stopped(&driver_ctx.storage_handle, stop, || {
-                        matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
-                    })
-                    .await
+                if let Err(error) = recover_until_stopped(&jobs_runtime, &driver_ctx, stop, || {
+                    matches!(observed_exit(), Some((_, ServiceExit::StopsNode)))
+                })
+                .await
                 {
                     warn!(error = %error, "Failed to recover stale jobs at startup");
                 }
@@ -193,10 +245,22 @@ pub(crate) async fn start(
                     .await;
             }
             StartupPhase::RestoreDrainTimer => {
-                restore_drain_timer(&driver_ctx.storage_handle, &task_handle).await;
+                let timer = DrainTimerOperation::new(unix_timestamp_millis());
+                if let Err(error) = drive(timer, &driver_ctx).await {
+                    warn!(error = %error, "Failed to restore job drain timer");
+                }
             }
             StartupPhase::RestoreLifecycleTimers => {
-                restore_lifecycle_timers(&driver_ctx.storage_handle, &task_handle).await;
+                let timers = drive(LifecycleTimersOperation, &driver_ctx)
+                    .await
+                    .unwrap_or_else(|_| lifecycle_timers(false));
+                for timer in timers {
+                    if let Event::Task(TaskEvent::Error { message, .. }) =
+                        task_handle.send_effect(timer).await
+                    {
+                        warn!(message = %message, "Failed to restore a job lifecycle timer");
+                    }
+                }
             }
             StartupPhase::WarmMetadata => spawn_metadata_warmup(driver_ctx.clone(), &shutdown),
             StartupPhase::SweepSessions => spawn_session_sweep(driver_ctx.clone(), &shutdown),
@@ -204,7 +268,7 @@ pub(crate) async fn start(
                 spawn_cutoff_sweep(driver_ctx.clone(), &shutdown, realm_id, node_id)
             }
             StartupPhase::DrainGitMerges => {
-                aruna_operations::git::pending::spawn_drain(driver_ctx.clone(), &shutdown)
+                crate::tasks::incoming::git_drain::spawn_drain(driver_ctx.clone(), &shutdown)
             }
             StartupPhase::RecoverChild => {
                 let recovery_config = RecoveryConfig {
@@ -261,19 +325,22 @@ async fn publish_core(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_operations::tasks::incoming::install_task_queues;
+    use crate::tasks::incoming::restore::install_task_queues;
 
     async fn test_background() -> (Background, tempfile::TempDir) {
         let temp = tempfile::tempdir().expect("temp dir");
-        let storage = aruna_storage::FjallStorage::open(temp.path().to_str().expect("utf8 path"))
-            .expect("storage opens");
+        let storage = aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().expect("utf8 path"),
+        )
+        .expect("storage opens");
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let task_handle = TaskHandle::new();
         let jobs_runtime = JobsRuntime::new_paused();
@@ -281,8 +348,7 @@ mod tests {
             driver_ctx.clone(),
             task_handle.clone(),
             jobs_runtime.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
-            None,
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         )
         .await;
         let background = Background {
@@ -318,6 +384,41 @@ mod tests {
         let outcome = start(background, &stop, || None, |phase| executed.push(phase)).await;
 
         assert_eq!(outcome, BackgroundOutcome::Cancelled);
+        assert!(executed.is_empty());
+        assert!(!readiness.is_ready());
+    }
+
+    // A discard that fails stops the start before any phase, so neither job recovery nor the
+    // catch-up runs and the next start discards from the same contact row.
+    #[tokio::test]
+    async fn failed_discard_stops() {
+        use aruna_core::effects::StorageEffect;
+        use aruna_core::events::StorageEvent;
+        let (background, _temp) = test_background().await;
+        let readiness = background.readiness.clone();
+        let written = (background.driver_ctx.storage_handle)
+            .send_storage_effect(StorageEffect::Write {
+                key_space: aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE.to_string(),
+                key: byteview::ByteView::from(&b"unreadable"[..]),
+                value: byteview::ByteView::from(&b"not a reservation"[..]),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            written,
+            Event::Storage(StorageEvent::WriteResult { .. })
+        ));
+        let mut executed = Vec::new();
+
+        let outcome = start(
+            background,
+            &tokio_util::sync::CancellationToken::new(),
+            || None,
+            |phase| executed.push(phase),
+        )
+        .await;
+
+        assert_eq!(outcome, BackgroundOutcome::DiscardFailed);
         assert!(executed.is_empty());
         assert!(!readiness.is_ready());
     }

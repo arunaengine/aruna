@@ -3,25 +3,29 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::group::{BackendClaim, GroupHold};
-use super::{BackendRegistry, BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
+use super::registry::BackendRegistry;
+use super::{BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
 use crate::egress::EgressGuard;
 use crate::error::BlobLibError;
+use crate::native;
 use crate::opendal::init_operator;
-use aruna_core::NodeId;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::errors::{BlobError, StagingSourceError};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
 use aruna_core::handle::Handle;
+use aruna_core::id::NodeId;
+use aruna_core::native_reference::is_native;
 use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::info::{BackendState, BlobState, Status};
 use aruna_core::structs::storage::blob::BackendConfig;
-use aruna_core::structs::storage::encryption::{generate_key, seal_copies};
+use aruna_core::structs::storage::encryption::{BucketKeyError, generate_key, seal_copies};
 use aruna_core::structs::storage::multipart::MultipartPartKey;
-use aruna_core::structs::{BackendState, BlobState, Status};
 use aruna_net::NetHandle;
 use aruna_net::streams::BiStream;
-use aruna_storage::storage::StorageHandle;
+use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
@@ -84,6 +88,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::CompleteUpload { .. } => (EffectClass::Transfer, "complete_upload"),
         BlobEffect::AbortUpload { .. } => (EffectClass::Control, "abort_upload"),
         BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
+        // Its streams and spool take their own slots through nested effects.
+        BlobEffect::Remote(_) => (EffectClass::Control, "remote"),
         BlobEffect::SpoolLocal { .. } => (EffectClass::Spool, "spool_local"),
         BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
         BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
@@ -95,10 +101,14 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::ReadMessage { .. } => (EffectClass::Control, "read_message"),
         BlobEffect::CloseConnection { .. } => (EffectClass::Control, "close_connection"),
         BlobEffect::Read { .. } => (EffectClass::Read, "read"),
+        BlobEffect::CollectStream { .. } => (EffectClass::Read, "collect_stream"),
         BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
         BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
         BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
         BlobEffect::ReleaseReservation { .. } => (EffectClass::Local, "release_reservation"),
+        BlobEffect::ReconcileReservation { .. } => (EffectClass::Local, "reconcile_reservation"),
+        BlobEffect::DiscardTarget { .. } => (EffectClass::Local, "discard_target"),
+        BlobEffect::AbortTarget { .. } => (EffectClass::Local, "abort_target"),
         BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
         BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
         BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
@@ -134,6 +144,8 @@ fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
         BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
         BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
         BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
+        BlobEffect::PinRead { .. } => (EffectClass::Control, "pin_read"),
+        BlobEffect::ReadHeld { .. } => (EffectClass::Control, "read_held"),
     }
 }
 
@@ -156,6 +168,9 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::HandleReplication { .. }
             | BlobEffect::ReceiveRead { .. }
             | BlobEffect::Delete { .. }
+            | BlobEffect::ReconcileReservation { .. }
+            | BlobEffect::DiscardTarget { .. }
+            | BlobEffect::AbortTarget { .. }
             | BlobEffect::DeleteHidden { .. }
             | BlobEffect::RewriteCopy { .. }
             | BlobEffect::WritePiece { .. }
@@ -167,6 +182,30 @@ fn blob_effect_mutates(effect: &BlobEffect) -> bool {
             | BlobEffect::DeletePlain { .. }
             | BlobEffect::DropReservation { .. }
     )
+}
+
+/// The bytes of `blob`, read to its end. A chunk past `limit` is refused before it is copied.
+async fn collect_stream(
+    mut blob: BackendStream<Result<Bytes, StreamError>>,
+    limit: Option<u64>,
+) -> BlobEvent {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut blob).await {
+        match chunk {
+            Ok(chunk) => {
+                let size = bytes.len().saturating_add(chunk.len()) as u64;
+                if let Some(limit) = limit.filter(|limit| size > *limit) {
+                    return BlobEvent::StreamTooLarge { limit };
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Err(error) => {
+                let bytes = Err(error.to_string());
+                return BlobEvent::StreamCollected { bytes };
+            }
+        }
+    }
+    BlobEvent::StreamCollected { bytes: Ok(bytes) }
 }
 
 /// Tracks one in-flight blob mutation so `drain_writes` can wait for it.
@@ -252,6 +291,20 @@ impl Handle for BlobHandle {
 impl BlobHandle {
     pub fn new(handler: BlobHandler) -> Self {
         BlobHandle { handler }
+    }
+
+    /// Installs the Git store on first call; later calls get the installed one.
+    pub fn install_git(&self, store: Arc<crate::git::GitStore>) -> Arc<crate::git::GitStore> {
+        self.handler.git.get_or_init(|| store).clone()
+    }
+
+    pub fn git(&self) -> Option<&crate::git::GitStore> {
+        self.handler.git.get().map(Arc::as_ref)
+    }
+
+    /// The installed Git store, shared with holders that outlive this handle.
+    pub fn git_store(&self) -> Option<Arc<crate::git::GitStore>> {
+        self.handler.git.get().cloned()
     }
 
     /// Closes the blob write path before storage is closed. Mutations that
@@ -379,48 +432,6 @@ impl BlobHandle {
         Event::Blob(blob_event)
     }
 
-    pub async fn reconcile_reservation(
-        &self,
-        location: aruna_core::structs::storage::blob::BackendLocation,
-    ) -> Result<bool, BlobError> {
-        let effect = BlobEffect::Delete {
-            location: location.clone(),
-        };
-        let _hold = self.handler.hold_backends(&effect)?;
-        let handler = self.handler.with_group_backends(&effect).await?;
-        handler.reconcile_reservation(location).await
-    }
-
-    /// Removes an in-place target no upload record or version owns any more.
-    pub async fn discard_target(
-        &self,
-        location: aruna_core::structs::storage::blob::BackendLocation,
-    ) -> Result<(), BlobError> {
-        let effect = BlobEffect::Delete {
-            location: location.clone(),
-        };
-        let _hold = self.handler.hold_backends(&effect)?;
-        let handler = self.handler.with_group_backends(&effect).await?;
-        handler.discard_target(&location).await
-    }
-
-    /// Aborts the provider uploads of an in-place target and keeps its object.
-    pub async fn abort_target(
-        &self,
-        location: aruna_core::structs::storage::blob::BackendLocation,
-    ) -> Result<(), BlobError> {
-        let effect = BlobEffect::Delete {
-            location: location.clone(),
-        };
-        let _hold = self.handler.hold_backends(&effect)?;
-        let handler = self.handler.with_group_backends(&effect).await?;
-        handler.abort_target(&location).await
-    }
-
-    pub fn clear_reservation(&self, id: Ulid) {
-        self.handler.clear_active(id);
-    }
-
     /// Executes one write into a folder the owner bound on this machine. The
     /// adapter enforces the jail and the guard; the policy is the operation's.
     pub async fn send_file_effect(&self, effect: LocalFileEffect) -> Event {
@@ -450,6 +461,24 @@ impl BlobHandle {
 
     pub async fn send_staging_effect(&self, effect: StagingSourceEffect) -> Event {
         let staging_source_event = match effect {
+            // A native source is another node's object, read through the reference protocol.
+            StagingSourceEffect::Head { access } if is_native(&access) => {
+                native::head(&self.handler.net, access)
+                    .await
+                    .unwrap_or_else(source_error)
+            }
+            StagingSourceEffect::Read { access, range, .. } if is_native(&access) => {
+                native::read(&self.handler.net, access, range)
+                    .await
+                    .unwrap_or_else(source_error)
+            }
+            StagingSourceEffect::Check { access } | StagingSourceEffect::List { access, .. }
+                if is_native(&access) =>
+            {
+                source_error(StagingSourceError::UnsupportedKind(
+                    SourceConnectorKind::ArunaNative.to_string(),
+                ))
+            }
             StagingSourceEffect::Check { access } => {
                 self.handler.check_staging_source(access).await
             }
@@ -496,6 +525,11 @@ impl BlobHandle {
         url: reqwest::Url,
     ) -> Result<reqwest::RequestBuilder, aruna_core::egress::EgressError> {
         self.handler.egress.repository_request(method, url)
+    }
+
+    /// The screened repository client and its egress policy, for the outbound backend.
+    pub fn repository_client(&self) -> (reqwest::Client, EgressPolicy) {
+        self.handler.egress.repository_client()
     }
 
     /// Holds every tenant backend an effect names for as long as the guard
@@ -614,6 +648,7 @@ impl BlobHandler {
             group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
             frame_indexes: Arc::new(std::sync::Mutex::new(super::frames::IndexCache::new())),
             source_stats: Default::default(),
+            read_pins: Default::default(),
             reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             part_chains: Arc::default(),
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -630,6 +665,7 @@ impl BlobHandler {
             spool_dir: spool_dir.map(Arc::new),
             spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
             spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
+            git: Arc::default(),
         };
         blob_handler.ensure_multipart_bucket().await?;
         if let Err(error) = blob_handler.backfill_free_index().await {
@@ -822,10 +858,41 @@ impl BlobHandler {
             BlobEffect::ReadRange { location, range } => {
                 Box::pin(self.read_blob_range(location, range)).await
             }
+            BlobEffect::Remote(request) => {
+                let handle = BlobHandle {
+                    handler: self.clone(),
+                };
+                BlobEvent::Remote(Box::pin(handle.run_remote(*request)).await)
+            }
             BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
             BlobEffect::ReleaseReservation { id } => {
                 self.clear_active(id);
                 BlobEvent::ReservationReleased { id }
+            }
+            BlobEffect::PinRead { backend_path, blob } => BlobEvent::PinnedRead {
+                blob: self.read_pins.pin(backend_path, blob),
+            },
+            BlobEffect::ReadHeld { backend_path } => BlobEvent::ReadHeld {
+                held: self.read_pins.held(&backend_path),
+            },
+            BlobEffect::CollectStream { blob, limit } => collect_stream(blob, limit).await,
+            BlobEffect::ReconcileReservation { location } => {
+                match Box::pin(self.reconcile_reservation(location)).await {
+                    Ok(done) => BlobEvent::ReservationReconciled { done },
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::DiscardTarget { location } => {
+                match Box::pin(self.discard_target(&location)).await {
+                    Ok(()) => BlobEvent::DeleteFinished,
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::AbortTarget { location } => {
+                match Box::pin(self.abort_target(&location)).await {
+                    Ok(()) => BlobEvent::UploadAborted,
+                    Err(error) => BlobEvent::Error(error),
+                }
             }
             BlobEffect::SpoolHidden {
                 namespace,
@@ -855,7 +922,10 @@ impl BlobHandler {
             BlobEffect::CheckGroupBackend { record, secret } => {
                 Box::pin(self.check_group_backend(record, secret)).await
             }
-            BlobEffect::GenerateBucketKey => match generate_key() {
+            BlobEffect::GenerateBucketKey => match (super::abe::fresh_rng())
+                .ok_or(BucketKeyError::Seal)
+                .and_then(|mut rng| generate_key(&mut rng))
+            {
                 Ok((public_key, private_key)) => BlobEvent::BucketKeyGenerated {
                     public_key,
                     private_key,
@@ -870,16 +940,20 @@ impl BlobHandler {
                 node_id,
                 holders,
             } => {
-                let now_ms = aruna_core::time::unix_timestamp_millis();
+                let now_ms = aruna_clock::unix_timestamp_millis();
                 let origin = (realm_id, node_id);
-                let sealed = seal_copies(
-                    key,
-                    &public_key,
-                    private_key.bytes(),
-                    origin,
-                    &holders,
-                    now_ms,
-                );
+                let sealed =
+                    (super::abe::fresh_rng().ok_or(BucketKeyError::Seal)).and_then(|mut rng| {
+                        seal_copies(
+                            key,
+                            &public_key,
+                            private_key.bytes(),
+                            origin,
+                            &holders,
+                            now_ms,
+                            &mut rng,
+                        )
+                    });
                 match sealed {
                     Ok(copies) => BlobEvent::CopiesSealed { copies },
                     Err(error) => BlobEvent::Error(error.into()),
@@ -1324,5 +1398,36 @@ impl BlobHandler {
             .timeouts()
             .control_io_timeout
             .min(Duration::from_secs(5))
+    }
+}
+
+fn source_error(error: StagingSourceError) -> StagingSourceEvent {
+    StagingSourceEvent::Error { error }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunks(sizes: &[usize]) -> BackendStream<Result<Bytes, StreamError>> {
+        let parts: Vec<Result<Bytes, std::io::Error>> = (sizes.iter())
+            .map(|size| Ok(Bytes::from(vec![7u8; *size])))
+            .collect();
+        BackendStream::new(futures::stream::iter(parts))
+    }
+
+    #[tokio::test]
+    async fn collect_stops_early() {
+        let whole = collect_stream(chunks(&[3, 3]), Some(6)).await;
+        let bytes = Ok(vec![7u8; 6]);
+        assert_eq!(whole, BlobEvent::StreamCollected { bytes });
+        let cut = collect_stream(chunks(&[3, 3, 3]), Some(5)).await;
+        assert_eq!(cut, BlobEvent::StreamTooLarge { limit: 5 });
+        let open = collect_stream(chunks(&[4, 4]), None).await;
+        let bytes = Ok(vec![7u8; 8]);
+        assert_eq!(open, BlobEvent::StreamCollected { bytes });
+        // One chunk far past the limit is refused as it arrives.
+        let large = collect_stream(chunks(&[2, 1 << 20]), Some(5)).await;
+        assert_eq!(large, BlobEvent::StreamTooLarge { limit: 5 });
     }
 }

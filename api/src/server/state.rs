@@ -6,43 +6,40 @@ use crate::auth::{OidcTokenSelector, OidcValidator};
 use crate::error::OidcError;
 use crate::openapi::ApiDoc;
 use crate::routes::management_relay::ManagementUrlCache;
-use aruna_core::NodeId;
-use aruna_core::UserId;
-use aruna_core::auth::REALMS_LIST_KEY;
+use aruna_core::auth::{ADMIN_CLAIMED_KEY, REALMS_LIST_KEY};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::device_wipe::DeviceWipe;
 use aruna_core::errors::StorageError;
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::API_STATE_KEYSPACE;
+use aruna_core::id::NodeId;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::onboarding::{OnboardingSecretError, OnboardingTicket};
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::structs::storage::backends::ImportRoot;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, IssuerKeyCache, realm_linked_owner,
-    realm_token_revoked, realm_user_cutoff,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
-use aruna_operations::device::wipe::DeviceWipe;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::jobs::runtime::JobsRuntime;
+use aruna_operations::auth::error::ArunaBearerError;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::metadata::api::node_fanout::DiscoveryOperation;
+use aruna_operations::node::api_state::{LoadStateOperation, SaveStateOperation, StateError};
 use aruna_operations::onboarding::issue_ticket::{
     IssueSyncInput, IssueSyncOperation, TICKET_TTL_SECS,
 };
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
-use async_trait::async_trait;
-use byteview::ByteView;
+use aruna_wire::address::client_host_url;
+use aruna_wire::info::PortalStatus;
 use ed25519_dalek::Signer;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use iroh::EndpointAddr;
-use jsonwebtoken::DecodingKey;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -52,14 +49,11 @@ use std::time::{Instant, SystemTime};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
-use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 
-pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
-pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
 pub(crate) const ROCRATE_UPLOAD_SLOTS: usize = 32;
 
-/// Identity, realm trust roots, and the shared issuer-key cache. The `Arc`
+/// Identity and realm trust roots. The `Arc`
 /// fields are the node's shared owners: cloning the state clones these handles
 /// and never recreates the guarded contents.
 #[derive(Clone, Debug)]
@@ -75,9 +69,6 @@ struct IdentityState {
     credential_encryption_key: CredentialEncryptionKey,
     // Contains OIDC config and Client.
     oidc_validator: Option<Arc<OidcValidator>>,
-    // Bounded TTL + LRU cache of trusted issuer decoding keys. One cache per
-    // node: every state clone must observe the same cache identity.
-    issuer_keys: Arc<IssuerKeyCache>,
     // Contains trusted realms. A mutation inserts under the write guard and
     // persists the snapshot after the guard drops, so no lock crosses I/O.
     trusted_realms_list: Arc<RwLock<HashSet<RealmId, ahash::RandomState>>>,
@@ -94,7 +85,7 @@ impl IdentityState {
 
     async fn persist_trusted_realms(&self, driver_ctx: &DriverContext) {
         let trusted_realms = self.trusted_realms_list.read().await.clone();
-        persist_state(driver_ctx, REALMS_LIST_KEY, &trusted_realms).await;
+        save_state(driver_ctx, REALMS_LIST_KEY, &trusted_realms).await;
     }
 
     async fn claim_initial_admin(
@@ -153,7 +144,7 @@ impl IdentityState {
             return;
         };
         let claimed = initial_admin_claim.load(Ordering::Acquire);
-        persist_state(driver_ctx, ADMIN_CLAIMED_KEY, &claimed).await;
+        save_state(driver_ctx, ADMIN_CLAIMED_KEY, &claimed).await;
     }
 }
 
@@ -208,7 +199,6 @@ struct AssistantConnections {
 /// (driver context, semaphores, locks, caches) rather than duplicating them.
 #[derive(Clone, Debug)]
 pub struct ServerState {
-    git: Option<Arc<aruna_blob::git::GitStore>>,
     // Contains necessary drivers for request handling.
     driver_ctx: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -222,33 +212,6 @@ pub struct ServerState {
     import_roots: Arc<BTreeMap<String, ImportRoot>>,
     started: (SystemTime, Instant),
     archive_links: Arc<crate::routes::storage::archive::ArchiveLinks>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PortalStatus {
-    pub installed: bool,
-    pub mode: String,
-    pub version: Option<String>,
-    pub source: Option<String>,
-    pub url: Option<String>,
-    pub checksum: Option<String>,
-    pub fetched_at: Option<String>,
-    pub last_error: Option<String>,
-}
-
-impl Default for PortalStatus {
-    fn default() -> Self {
-        Self {
-            installed: false,
-            mode: "disabled".to_string(),
-            version: None,
-            source: None,
-            url: None,
-            checksum: None,
-            fetched_at: None,
-            last_error: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -295,17 +258,20 @@ impl ServerState {
         oidc_validator: Option<Arc<OidcValidator>>,
         jobs_runtime: Arc<JobsRuntime>,
     ) -> Self {
-        let mut trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
-            driver_ctx.as_ref(),
-            REALMS_LIST_KEY,
-        )
-        .await
-        .unwrap_or_default();
+        let realms =
+            LoadStateOperation::<HashSet<RealmId, ahash::RandomState>>::new(REALMS_LIST_KEY);
+        let mut trusted_realms =
+            loaded(drive(realms, driver_ctx.as_ref()).await).unwrap_or_default();
         let initial_admin_claim = if claim_initial_admin {
             Some(Arc::new(AtomicBool::new(
-                load_persisted_state::<bool>(driver_ctx.as_ref(), ADMIN_CLAIMED_KEY)
-                    .await
-                    .unwrap_or(false),
+                loaded(
+                    drive(
+                        LoadStateOperation::new(ADMIN_CLAIMED_KEY),
+                        driver_ctx.as_ref(),
+                    )
+                    .await,
+                )
+                .unwrap_or(false),
             )))
         } else {
             None
@@ -315,7 +281,7 @@ impl ServerState {
             .net_handle
             .as_ref()
             .map(|net| net.credential_encryption_key())
-            .unwrap_or_else(CredentialEncryptionKey::random);
+            .unwrap_or_else(|| CredentialEncryptionKey::derive(&rand::random()));
         let assistant_client =
             crate::routes::assistant::egress::outbound_client(&node_capabilities);
         let download_slots = driver_ctx
@@ -323,7 +289,6 @@ impl ServerState {
             .as_ref()
             .map_or_else(Default::default, |net| net.download_gauge().clone());
         let state = Self {
-            git: None,
             driver_ctx,
             jobs_runtime,
             metrics: Arc::new(NodeMetrics::new()),
@@ -333,7 +298,6 @@ impl ServerState {
                 node_capabilities,
                 credential_encryption_key,
                 oidc_validator,
-                issuer_keys: Arc::new(IssuerKeyCache::new()),
                 trusted_realms_list: Arc::new(RwLock::new(trusted_realms)),
                 initial_admin_claim,
             },
@@ -393,19 +357,6 @@ impl ServerState {
         self.driver_ctx.clone()
     }
 
-    pub fn with_git(mut self, root: PathBuf, helper: PathBuf) -> Self {
-        let store = Arc::new(aruna_blob::git::GitStore::new(root, helper));
-        self.git = Some(match &self.driver_ctx.metadata_handle {
-            Some(handle) => handle.install_git(store),
-            None => store,
-        });
-        self
-    }
-
-    pub fn git(&self) -> Option<&aruna_blob::git::GitStore> {
-        self.git.as_deref()
-    }
-
     pub fn metrics(&self) -> Arc<NodeMetrics> {
         self.metrics.clone()
     }
@@ -458,7 +409,7 @@ impl ServerState {
             .ok()
     }
 
-    pub(crate) fn try_acquire_download(&self) -> Option<OwnedSemaphorePermit> {
+    pub(crate) fn try_acquire_download(&self) -> Option<aruna_core::download_slots::SlotPermit> {
         self.limits.download_slots.try_acquire()
     }
 
@@ -604,12 +555,12 @@ impl ServerState {
     }
 
     pub async fn load_realm_nodes(&self) -> Vec<NodeId> {
-        aruna_operations::metadata::api::load_realm_nodes(
-            self.driver_ctx.as_ref(),
-            self.identity.realm_id,
-            self.identity.node_id,
-        )
-        .await
+        let (realm_id, node_id) = (self.identity.realm_id, self.identity.node_id);
+        let discovery = DiscoveryOperation::new(realm_id, node_id);
+        match drive(discovery, self.driver_ctx.as_ref()).await {
+            Ok(discovery) => discovery.nodes,
+            Err(_) => vec![node_id],
+        }
     }
 
     pub async fn get_oidc_provider(
@@ -629,15 +580,6 @@ impl ServerState {
                 provider.issuer == selector.issuer && selector.matches_audience(&provider.audience)
             })
             .ok_or(OidcError::ProviderNotFound)
-    }
-
-    /// Peer contacts from the metadata plane; empty while it is not wired.
-    pub fn peer_contacts(&self) -> aruna_operations::metadata::PeerContacts {
-        self.get_ctx()
-            .metadata_handle
-            .as_ref()
-            .map(aruna_operations::metadata::MetadataHandle::peer_contacts)
-            .unwrap_or_default()
     }
 
     pub fn is_management_node(&self) -> bool {
@@ -714,8 +656,26 @@ impl ServerState {
         }
     }
 
-    pub async fn issuer_cache_len(&self) -> usize {
-        self.identity.issuer_keys.len().await
+    async fn token_checks(&self, revocation: RevocationCheck) -> TokenChecks {
+        let trusted = self.identity.trusted_realms_list.read().await;
+        TokenChecks {
+            trust: IssuerTrust::Listed(trusted.iter().copied().collect()),
+            revocation,
+            linked_realm: Some(self.get_realm_id()),
+            keys: IssuerKeys::Net,
+        }
+    }
+
+    /// Verifies a bearer token against this node's realms and the issuer's revocations.
+    pub async fn decode_token(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = self.token_checks(RevocationCheck::Realm).await;
+        drive(DecodeTokenOperation::new(token, checks), &self.driver_ctx).await
+    }
+
+    /// Verifies a token that may already be revoked, so revoking it again is authorized.
+    pub async fn decode_revoked(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = self.token_checks(RevocationCheck::Skipped).await;
+        drive(DecodeTokenOperation::new(token, checks), &self.driver_ctx).await
     }
 
     pub async fn add_trusted_realm(&self, realm_id: RealmId) {
@@ -740,102 +700,21 @@ impl ServerState {
     }
 }
 
-#[async_trait]
-impl ArunaValidationState for ServerState {
-    async fn is_token_revoked(
-        &self,
-        realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        // The issuing realm's replicated config is the only revocation
-        // authority; it is expiry-bounded, so the durable set stays limited.
-        realm_token_revoked(&self.driver_ctx.storage_handle, *realm_id, token_hash).await
-    }
-
-    async fn user_cutoff(
-        &self,
-        realm_id: &RealmId,
-        user_id: &UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        realm_user_cutoff(&self.driver_ctx.storage_handle, *realm_id, user_id).await
-    }
-
-    async fn linked_owner(
-        &self,
-        realm_id: &RealmId,
-        via: &UserId,
-    ) -> Result<Option<UserId>, ArunaBearerError> {
-        if *realm_id != self.get_realm_id() {
-            return Ok(None);
-        }
-        realm_linked_owner(&self.driver_ctx.storage_handle, via).await
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.identity
-            .trusted_realms_list
-            .read()
-            .await
-            .contains(realm_id)
-    }
-
-    async fn issuer_decoding_key(
-        &self,
-        issuer_pubkey: &str,
-    ) -> Result<DecodingKey, ArunaBearerError> {
-        self.identity.issuer_keys.get_or_insert(issuer_pubkey).await
-    }
+/// A loaded API state row; a failed load counts as absent.
+fn loaded<T>(result: Result<Option<T>, StateError>) -> Option<T> {
+    result.unwrap_or_else(|error| {
+        warn!(error = %error, "Failed to load persisted API state");
+        None
+    })
 }
 
-pub async fn load_persisted_state<T>(driver_ctx: &DriverContext, key: &[u8]) -> Option<T>
-where
-    T: DeserializeOwned,
-{
-    match driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Read {
-            key_space: API_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            txn_id: None,
-        }))
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(bytes), ..
-        }) => match postcard::from_bytes(&bytes) {
-            Ok(value) => Some(value),
-            Err(error) => {
-                warn!(error = %error, "Failed to decode persisted API state");
-                None
-            }
-        },
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to load persisted API state");
-            None
-        }
-        _ => None,
-    }
-}
-
-pub async fn persist_state<T>(driver_ctx: &DriverContext, key: &[u8], value: &T)
-where
-    T: Serialize,
-{
-    let Ok(bytes) = postcard::to_allocvec(value) else {
-        warn!("Failed to serialize API state for persistence");
-        return;
+/// Saves one API state row; a failure only warns, as the state is rebuilt on change.
+async fn save_state<T: Serialize>(driver_ctx: &DriverContext, key: &[u8], value: &T) {
+    let saved = match SaveStateOperation::new(key, value) {
+        Ok(operation) => drive(operation, driver_ctx).await,
+        Err(error) => Err(error),
     };
-
-    if let Event::Storage(StorageEvent::Error { error }) = driver_ctx
-        .storage_handle
-        .send_effect(Effect::Storage(StorageEffect::Write {
-            key_space: API_STATE_KEYSPACE.to_string(),
-            key: ByteView::from(key),
-            value: ByteView::from(bytes),
-            txn_id: None,
-        }))
-        .await
-    {
+    if let Err(error) = saved {
         warn!(error = %error, "Failed to persist API state");
     }
 }
@@ -856,50 +735,6 @@ impl RestInterfaceRuntime {
             swagger_ui_url: format!("{base_url}/swagger-ui"),
             base_url,
         }
-    }
-}
-
-pub fn client_bind_url(bind_address: SocketAddr) -> String {
-    format!(
-        "http://{}:{}",
-        host_for_ip(bind_address.ip()),
-        bind_address.port()
-    )
-}
-
-pub fn client_host_url(advertised_host: &str, bind_address: SocketAddr) -> String {
-    let host = match advertised_host.trim() {
-        "" => return client_bind_url(bind_address),
-        host => {
-            if host.contains("://") {
-                return host.trim_end_matches('/').to_string();
-            }
-
-            if let Ok(addr) = host.parse::<SocketAddr>() {
-                return format!("http://{}:{}", host_for_ip(addr.ip()), addr.port());
-            }
-
-            if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                return format!("http://{}:{}", host_for_ip(ip), bind_address.port());
-            }
-
-            host
-        }
-    };
-
-    format!("http://{host}")
-}
-
-fn host_for_ip(ip: std::net::IpAddr) -> String {
-    match ip {
-        std::net::IpAddr::V4(ip) if ip.is_unspecified() => {
-            std::net::Ipv4Addr::LOCALHOST.to_string()
-        }
-        std::net::IpAddr::V6(ip) if ip.is_unspecified() => {
-            format!("[{}]", std::net::Ipv6Addr::LOCALHOST)
-        }
-        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
-        std::net::IpAddr::V4(ip) => ip.to_string(),
     }
 }
 

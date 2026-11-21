@@ -3,7 +3,13 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::distribution::routing::{
+    copies_interval, copy_readers, delegated_range, delegated_read, lists_interval,
+    read_coordinator, upload_route, upload_tag,
+};
 use crate::distribution::test_record::{binding, record, secret};
+use aruna_core::structs::storage::distribution::upload::UploadTag;
+use aruna_drivers::driver::drive;
 
 #[test]
 fn coordinator_stamps_epoch() {
@@ -174,60 +180,82 @@ fn reads_held_only() {
 
 #[tokio::test]
 async fn uploads_follow_authority() {
-    use crate::distribution::test_record::store_record;
     use crate::distribution::test_store::{context, open};
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = record(true);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let own = binding(&snapshot, 1, 5);
     let upload = Ulid::from_bytes([4; 16]);
-    let tag = upload_tag(&context, &own, "a", upload).await.unwrap();
+    let tag = drive(upload_tag(&own, "a", upload), &context)
+        .await
+        .unwrap();
     assert_eq!(tag.range_id, snapshot.config.ranges[0].range_id);
-    assert_eq!(upload_route(&context, &own, "a", &tag).await, Ok(()));
+    assert_eq!(drive(upload_route(&own, "a", &tag), &context).await, Ok(()));
     assert!(matches!(
-        upload_tag(&context, &own, "x", upload).await,
+        drive(upload_tag(&own, "x", upload), &context).await,
         Err(GuardError::NotCoordinator { .. })
     ));
     let moved = UploadTag { epoch: 2, ..tag };
     assert_eq!(
-        upload_route(&context, &own, "a", &moved).await,
+        drive(upload_route(&own, "a", &moved), &context).await,
         Err(GuardError::Route(RouteError::StaleRange(tag.range_id)))
     );
     assert_eq!(
-        delegated_range(&context, &own, tag.range_id, "a").await,
+        drive(delegated_range(&own, tag.range_id, "a"), &context).await,
         Ok(())
     );
     let upper = snapshot.config.ranges[1].range_id;
     assert_eq!(
-        delegated_range(&context, &own, upper, "a").await,
+        drive(delegated_range(&own, upper, "a"), &context).await,
         Err(GuardError::Route(RouteError::StaleRange(upper)))
     );
 }
 
 #[tokio::test]
 async fn replicas_take_reads() {
-    use crate::distribution::test_record::{replicated, store_record};
+    use crate::distribution::test_record::replicated;
     use crate::distribution::test_store::{context, open};
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = replicated(true, 1);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let replica = binding(&snapshot, 2, 5);
     let lower = snapshot.config.ranges[0].range_id;
-    assert_eq!(delegated_read(&context, &replica, lower, "a").await, Ok(()));
+    assert_eq!(
+        drive(delegated_read(&replica, lower, "a"), &context).await,
+        Ok(())
+    );
     assert!(matches!(
-        delegated_range(&context, &replica, lower, "a").await,
+        drive(delegated_range(&replica, lower, "a"), &context).await,
         Err(GuardError::NotCoordinator { .. })
     ));
     let (_dir, handle) = open();
     let context = crate::distribution::test_store::context(&handle);
     let (snapshot, bytes) = record(true);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let stranger = binding(&snapshot, 2, 5);
     let lower = snapshot.config.ranges[0].range_id;
     assert_eq!(
-        delegated_read(&context, &stranger, lower, "a").await,
+        drive(delegated_read(&stranger, lower, "a"), &context).await,
         Err(GuardError::Route(RouteError::StaleRange(lower)))
     );
 }
@@ -235,17 +263,22 @@ async fn replicas_take_reads() {
 // A coordinator that fenced its range for a transfer neither lists it nor reads it as final.
 #[tokio::test]
 async fn fenced_coordinator_refuses() {
-    use crate::distribution::test_record::store_record;
     use crate::distribution::test_store::{context, open, send};
     use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = record(true);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let own = binding(&snapshot, 1, 5);
-    assert_eq!(read_coordinator(&context, &own, "a").await, Ok(None));
+    assert_eq!(drive(read_coordinator(&own, "a"), &context).await, Ok(None));
     assert_eq!(
-        lists_interval(&context, &own, "", Some("m")).await,
+        drive(lists_interval(&own, "", Some("m")), &context).await,
         Ok(true)
     );
     let range_id = snapshot.config.ranges[0].range_id;
@@ -265,42 +298,51 @@ async fn fenced_coordinator_refuses() {
     };
     send(&handle, Effect::Storage(write)).await;
     assert_eq!(
-        read_coordinator(&context, &own, "a").await,
+        drive(read_coordinator(&own, "a"), &context).await,
         Err(GuardError::Route(RouteError::Moving(range_id)))
     );
     assert_eq!(
-        lists_interval(&context, &own, "", Some("m")).await,
+        drive(lists_interval(&own, "", Some("m")), &context).await,
         Ok(false)
     );
     let upper = Some((snapshot.config.ranges[1].range_id, secret(2).public()));
-    assert_eq!(read_coordinator(&context, &own, "x").await, Ok(upper));
+    assert_eq!(
+        drive(read_coordinator(&own, "x"), &context).await,
+        Ok(upper)
+    );
 }
 
 // A replica answers reads and listings of a range its coordinator cannot serve.
 #[tokio::test]
 async fn copies_answer_reads() {
-    use crate::distribution::test_record::{replicated, store_record};
+    use crate::distribution::test_record::replicated;
     use crate::distribution::test_store::{context, open};
     let (_dir, handle) = open();
     let context = context(&handle);
     let (snapshot, bytes) = replicated(true, 1);
-    store_record(&handle, snapshot.set_id(), bytes).await;
+    aruna_drivers::testing::write_value(
+        &handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
     let (coordinator, copy) = (binding(&snapshot, 1, 5), binding(&snapshot, 2, 5));
     let lower = snapshot.config.ranges[0].range_id;
     assert_eq!(
-        copy_readers(&context, &copy, "a").await,
+        drive(copy_readers(&copy, "a"), &context).await,
         Ok((lower, true, Vec::new()))
     );
     assert_eq!(
-        copy_readers(&context, &coordinator, "a").await,
+        drive(copy_readers(&coordinator, "a"), &context).await,
         Ok((lower, true, vec![secret(2).public()]))
     );
     assert_eq!(
-        copies_interval(&context, &copy, "", Some("m")).await,
+        drive(copies_interval(&copy, "", Some("m")), &context).await,
         Ok(true)
     );
     assert_eq!(
-        copies_interval(&context, &coordinator, "", Some("m")).await,
+        drive(copies_interval(&coordinator, "", Some("m")), &context).await,
         Ok(false)
     );
 }

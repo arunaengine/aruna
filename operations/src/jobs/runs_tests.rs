@@ -4,40 +4,117 @@
 
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::StorageEffect;
-use aruna_core::structs::execution::job::{RunCrateStatus, RunLink};
+use aruna_core::structs::execution::job::local::{RunCrateStatus, RunLink};
 use aruna_core::structs::identity::auth::{Actor, PathRestriction, Role};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmConfigDocument};
+use aruna_core::user::id::UserId;
 
 use super::*;
-use crate::jobs::store::put_crate_outcome;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_test_support::jobs::put_crate_outcome;
+
+async fn read_run(
+    context: &DriverContext,
+    realm_id: RealmId,
+    auth: &AuthContext,
+    run_id: JobId,
+) -> Result<RunView, RunReadError> {
+    drive(ReadRunOperation::new(realm_id, auth, run_id), context).await
+}
+
+fn link(created_by: UserId, run_crate: Option<Ulid>) -> RunLink {
+    RunLink {
+        family: None,
+        created_by,
+        group_id: Ulid::from_bytes([7u8; 16]),
+        logical_job_id: Some(JobId::from_bytes([8u8; 16])),
+        run_crate,
+    }
+}
+
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+}
+
+fn linked(found: Option<RunLink>) -> IoResult {
+    child(Ok::<_, JobMutationError>(found))
+}
+
+// An unknown run reads as absent, and the submitter goes on to the crate status.
+#[test]
+fn submitter_sees_status() {
+    let realm_id = RealmId([1u8; 32]);
+    let owner = user(1, realm_id);
+    let run_id = JobId::from_bytes([2u8; 16]);
+    let mut read = ReadRunOperation::new(realm_id, &auth(owner, realm_id), run_id);
+    assert!(matches!(read.first(), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(read.next(linked(None)), Err(RunReadError::NotFound));
+
+    let mut read = ReadRunOperation::new(realm_id, &auth(owner, realm_id), run_id);
+    let found = linked(Some(link(owner, None)));
+    assert!(matches!(read.next(found), Ok(Next::Call(IoCall::Child(_)))));
+    let status = child(Ok::<_, JobMutationError>(Some(RunCrateStatus::Pending)));
+    let Next::Done(view) = read.next(status).unwrap() else {
+        panic!("expected the view");
+    };
+    assert!(view.logical_job_id.is_some() && view.run_crate_status.is_some());
+}
+
+// Another user needs a run crate and READ on it, and sees no submitter details.
+#[test]
+fn others_need_read() {
+    let realm_id = RealmId([1u8; 32]);
+    let (owner, other) = (user(1, realm_id), user(3, realm_id));
+    let run_id = JobId::from_bytes([2u8; 16]);
+    let start = || ReadRunOperation::new(realm_id, &auth(other, realm_id), run_id);
+    let mut read = start();
+    assert_eq!(
+        read.next(linked(Some(link(owner, None)))),
+        Err(RunReadError::NotFound)
+    );
+    let found = || linked(Some(link(owner, Some(Ulid::from_bytes([9u8; 16])))));
+    let mut read = start();
+    read.next(found()).unwrap();
+    let allowed = child(Ok::<_, AuthorizeError>(()));
+    let Next::Done(view) = read.next(allowed).unwrap() else {
+        panic!("expected the view");
+    };
+    assert!(view.logical_job_id.is_none() && view.run_crate_status.is_none());
+    let mut read = start();
+    read.next(found()).unwrap();
+    let denied = child(Err::<(), _>(AuthorizeError::PermissionDenied));
+    assert_eq!(read.next(denied), Err(RunReadError::NotFound));
+}
 
 fn user(seed: u8, realm_id: RealmId) -> UserId {
     UserId::local(Ulid::from_bytes([seed; 16]), realm_id)
 }
 
 fn auth(user_id: UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 #[tokio::test]
 async fn run_read_rights() {
     let temp = tempfile::tempdir().unwrap();
     let context = DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+            temp.path().to_str().unwrap(),
+        )
+        .unwrap(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1; 32]);
     let (submitter, reader, other) = (user(2, realm_id), user(3, realm_id), user(4, realm_id));
@@ -117,7 +194,7 @@ async fn run_read_rights() {
     let status = RunCrateStatus::Written {
         resource: document_id.to_string(),
     };
-    put_crate_outcome(&context.storage_handle, run_id, &status, &link)
+    put_crate_outcome(&context, run_id, &status, &link)
         .await
         .unwrap();
     let read = |auth: AuthContext, run_id| {
@@ -159,7 +236,7 @@ async fn run_read_rights() {
         run_crate: None,
         ..link.clone()
     };
-    put_crate_outcome(&context.storage_handle, denied_run, &denied, &missing)
+    put_crate_outcome(&context, denied_run, &denied, &missing)
         .await
         .unwrap();
     let own = read(auth(submitter, realm_id), denied_run).await.unwrap();

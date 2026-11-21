@@ -5,25 +5,30 @@
 use aruna_core::compute::ResourceEnvelope;
 use aruna_core::effects::JobRecordFrame;
 use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
-use aruna_core::structs::execution::job::{
-    AttemptIntent, EffectiveResources, ExecutionReceipt, JobClaim, JobFamilyRecord, JobId,
-    JobPayload, JobRecord, JobResultPayload, JobState, LogicalJobState, OutputObject,
-    PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    ExecutionReceipt, JobFamilyRecord, LogicalJobState, PhysicalExecutionState,
 };
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobRecord, JobResultPayload, OutputObject,
+};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use super::resources;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
 use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
-use crate::jobs::lifecycle::updates::{execution_chain, publish_state, publish_terminal};
-use crate::jobs::output_record::store_outputs;
+use crate::jobs::lifecycle::updates::{PublishStateOperation, PublishTerminalOperation};
+use crate::jobs::output_record::StoreOutputsOperation;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
 use crate::jobs::records::reduce::reduce_family;
-use crate::jobs::records::{
-    AppendRecordConfig, AppendRecordOperation, RecordOrigin, load_family_complete,
-};
-use crate::jobs::store::{iter_prefix_page, record_attempt_intent, reserve_output_commits};
 use crate::tests::records::{Family, REALM, context};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_storage::scan::iter_prefix_page;
 
 const TOKEN: Ulid = Ulid(0x7E12);
 
@@ -31,16 +36,6 @@ const TOKEN: Ulid = Ulid(0x7E12);
 /// the logical job id the family records are keyed by.
 pub(super) fn physical() -> JobId {
     JobId::from_bytes([31u8; 16])
-}
-
-fn resources() -> EffectiveResources {
-    EffectiveResources {
-        cpu_cores: 1,
-        ram_bytes: 1024,
-        disk_bytes: 2048,
-        max_walltime_ms: 60_000,
-        preemptible: false,
-    }
 }
 
 /// One node of the family with a live net handle, so it can sign the records
@@ -144,8 +139,11 @@ pub(super) async fn reserve_execution(
             resources: resources(),
             subject_generation: receipt.subject_generation,
             subject_digest: receipt.subject_digest,
+            config_generation: receipt.config_generation,
+            config_digest: receipt.config_digest,
             record: Box::new(record.clone()),
             now_ms: 4_000,
+            fence: None,
         }),
         ctx,
     )
@@ -168,25 +166,33 @@ async fn publishes_terminal_success() {
         executor_kind: "docker".to_string(),
         pinned_image: "alpine@sha256:0".to_string(),
         attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
     };
-    let commit = record_attempt_intent(
-        &ctx.storage_handle,
-        physical(),
-        TOKEN,
-        intent,
-        Some(receipt.execution_id),
-        None,
-        4_100,
+    let commit = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            physical(),
+            TOKEN,
+            intent,
+            Some(receipt.execution_id),
+            None,
+            4_100,
+        ),
+        &ctx,
     )
     .await
     .expect("attempt intent commits");
     let executor = family.target.public();
-    let destinations = vec![(executor, "ws".to_string(), "out.txt".to_string())];
-    let control = reserve_output_commits(
-        &ctx.storage_handle,
-        physical(),
-        &destinations,
-        &Default::default(),
+    let destinations = [(executor, "ws".to_string(), "out.txt".to_string())];
+    let control = aruna_drivers::driver::drive(
+        crate::jobs::store::job_calls::reserve_output_commits(
+            physical(),
+            destinations.to_vec(),
+            Default::default(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        &ctx,
     )
     .await
     .expect("output commits reserved");
@@ -201,7 +207,14 @@ async fn publishes_terminal_success() {
         digest: None,
     }];
 
-    let output_digest = store_outputs(&ctx, &commit.record, &control, &outputs)
+    let store = StoreOutputsOperation::new(
+        &commit.record,
+        &control,
+        &outputs,
+        ctx.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    let output_digest = aruna_drivers::driver::drive(store, &ctx)
         .await
         .expect("outputs stored");
     let mut terminal = record;
@@ -217,7 +230,7 @@ async fn publishes_terminal_success() {
     });
     assert!(publish_terminal(&ctx, &terminal).await);
 
-    let records = load_family_complete(&ctx, family.family())
+    let records = drive(LoadFamilyOperation::family(family.family()), &ctx)
         .await
         .expect("family read completes");
     assert!(records.iter().any(|envelope| matches!(
@@ -255,8 +268,9 @@ async fn bumps_dashboard_once() {
     let (_dir, ctx) = node_context(&family, &family.target).await;
     let receipt = seed_family(&ctx, &family).await;
     let mut terminal = reserve_execution(&ctx, &family, &receipt).await;
-    let chain = execution_chain(&ctx, physical())
+    let chain = drive(ExecutionChainOperation::of_job(physical()), &ctx)
         .await
+        .expect("chain read")
         .expect("chain resolves");
     let mut changes = ctx
         .net_handle
@@ -270,6 +284,26 @@ async fn bumps_dashboard_once() {
     assert!(publish_terminal(&ctx, &terminal).await);
     assert_eq!(*changes.borrow_and_update(), before + 1);
 
-    assert!(publish_state(&ctx, &chain, PhysicalExecutionState::Cancelled, None, 5_000).await);
+    let publish = PublishStateOperation::new(
+        chain,
+        (PhysicalExecutionState::Cancelled, None, 5_000),
+        ctx.node_and_realm(),
+        5_000,
+    );
+    assert!(aruna_drivers::driver::drive(publish, &ctx).await.unwrap());
     assert_eq!(*changes.borrow_and_update(), before + 1);
+}
+
+async fn publish_terminal(
+    ctx: &aruna_drivers::driver::DriverContext,
+    record: &aruna_core::structs::execution::job::local::JobRecord,
+) -> bool {
+    let publish = PublishTerminalOperation::new(
+        record.clone(),
+        ctx.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    aruna_drivers::driver::drive(publish, ctx)
+        .await
+        .unwrap_or(false)
 }

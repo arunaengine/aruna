@@ -6,35 +6,36 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::jobs::family_report;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::id::NodeId;
-use aruna_core::structs::execution::job::{JobFamilyId, JobFamilyRecord, JobId, JobRecordEnvelope};
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_operations::jobs::lifecycle::{
-    AuditPaging, AuditRange, audit_endpoints, family_audit, family_report,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_drivers::driver::drive;
+use aruna_operations::jobs::lifecycle::family_reads::{
+    AuditEndpointsOperation, FamilyLogOperation,
+};
+use aruna_operations::jobs::lifecycle::report::{AuditPaging, AuditRange};
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
-use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::jobs::{JobOutputResponse, map_job_request, map_job_route, output_response};
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::jobs::JobOutputResponse;
 use crate::jobs::hex32;
+use crate::jobs::map_job_route;
+use crate::jobs::output_response;
 use crate::server::state::ServerState;
 
-/// The audit route joins the `jobs` tag the jobs module already declares.
-#[derive(OpenApi)]
-#[openapi()]
-pub struct JobAuditDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(JobAuditDoc::openapi()).routes(routes!(get_job_audit))
+    OpenApiRouter::new().routes(routes!(get_job_audit))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
@@ -48,8 +49,8 @@ pub struct AuditQuery {
 /// identities it names.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct JobAuditRecord {
-    /// `spec`, `claim`, `budget`, `launch`, `receipt`, `update`, `output` or
-    /// `cancel`.
+    /// `spec`, `claim`, `budget`, `launch`, `receipt`, `update`, `output`, `cancel` or
+    /// `stop`.
     pub kind: String,
     /// Digest of the canonical record bytes.
     pub digest: String,
@@ -120,7 +121,7 @@ fn parse_paging(query: &AuditQuery) -> ServerResult<AuditPaging> {
     let cursor = query
         .cursor
         .as_deref()
-        .map(|cursor| URL_SAFE_NO_PAD.decode(cursor))
+        .map(aruna_core::cursor::decode)
         .transpose()
         .map_err(|_| ServerError::BadRequest)?;
     AuditPaging::new(cursor, query.limit)
@@ -204,6 +205,11 @@ fn audit_record(
             record.spec_digest = Some(hex32(&cancel.spec_digest));
             record.at_ms = cancel.requested_at_ms;
         }
+        JobFamilyRecord::Stop(stop) => {
+            record.execution_id = Some(stop.execution_id.to_string());
+            record.sequence = Some(stop.update_sequence);
+            record.at_ms = stop.stopped_at_ms;
+        }
     }
     Some(record)
 }
@@ -218,6 +224,7 @@ fn kind_name(record: &JobFamilyRecord) -> &'static str {
         JobFamilyRecord::Update(_) => "update",
         JobFamilyRecord::Output(_) => "output",
         JobFamilyRecord::Cancel(_) => "cancel",
+        JobFamilyRecord::Stop(_) => "stop",
     }
 }
 
@@ -308,7 +315,6 @@ surface never confirms that somebody else's job exists.
             })
         ),
         (status = 400, description = "Unknown `scope`, a cursor that is not a record key of this log, or a `limit` outside 1..=64", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The token is path-restricted or belongs to another realm", body = ErrorResponse),
         (status = 404, description = "Unknown, unparseable or foreign job id, or a responder that never held the family; page the node that accepted the submission", body = ErrorResponse),
         (status = 503, description = "The log could not be reduced here; retryable, the caller may page again", body = ErrorResponse)
@@ -317,12 +323,11 @@ surface never confirms that somebody else's job exists.
 )]
 pub async fn get_job_audit(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Query(query): Query<AuditQuery>,
 ) -> ServerResult<(StatusCode, Json<JobAuditResponse>)> {
-    let auth: AuthContext = require_unrestricted_auth(&state, auth)?;
-    let job_id = crate::jobs::parse_job_id(&job_id).map_err(map_job_request)?;
+    let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let (range, scope) = parse_range(query.scope.as_deref())?;
     let paging = parse_paging(&query)?;
     let context = state.get_ctx();
@@ -340,13 +345,15 @@ pub async fn get_job_audit(
             },
         )
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
-    let page = family_audit(&context, &auth, job_id, range, paging)
+    let read = FamilyLogOperation::new(&auth, job_id, (range, paging), unix_timestamp_millis());
+    let page = drive(read, context.as_ref())
         .await
-        .ok_or(ServerError::NotFound)?
-        .map_err(map_job_route)?;
+        .map_err(map_job_route)?
+        .ok_or(ServerError::NotFound)?;
 
-    let output_endpoints =
-        audit_endpoints(&context, &page.records, report.output_endpoints.clone()).await;
+    let known = report.output_endpoints.clone();
+    let read = AuditEndpointsOperation::new(&page.records, known.clone());
+    let output_endpoints = drive(read, context.as_ref()).await.unwrap_or(known);
     let mut records = Vec::new();
     for envelope in &page.records {
         if let Some(record) = audit_record(
@@ -381,7 +388,7 @@ pub async fn get_job_audit(
             next_cursor: page
                 .next
                 .as_ref()
-                .map(|cursor| URL_SAFE_NO_PAD.encode(cursor.as_slice())),
+                .map(|cursor| aruna_core::cursor::encode(cursor.as_slice())),
             projection_digest: hex32(&report.digest),
             responder_node_id: report.responder.map(|node| node.to_string()),
             partial: report.partial,
@@ -392,7 +399,7 @@ pub async fn get_job_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_operations::jobs::lifecycle::MAX_AUDIT_PAGE;
+    use aruna_operations::jobs::lifecycle::report::MAX_AUDIT_PAGE;
 
     fn query(cursor: Option<&str>, limit: Option<usize>) -> AuditQuery {
         AuditQuery {
@@ -406,11 +413,11 @@ mod tests {
     fn rejects_bad_paging() {
         // A cursor must be a bounded record key and a limit must fit the page.
         assert!(parse_paging(&query(Some("not base64 !"), None)).is_err());
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 200])), None)).is_err());
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode([1u8; 32])), None)).is_err());
-        let mut key = [0u8; aruna_core::structs::execution::job::RECORD_KEY_BYTES];
-        key[64] = aruna_core::structs::execution::job::JobRecordKind::Spec.as_byte();
-        assert!(parse_paging(&query(Some(&URL_SAFE_NO_PAD.encode(key)), None)).is_ok());
+        assert!(parse_paging(&query(Some(&aruna_core::cursor::encode([1u8; 200])), None)).is_err());
+        assert!(parse_paging(&query(Some(&aruna_core::cursor::encode([1u8; 32])), None)).is_err());
+        let mut key = [0u8; aruna_core::structs::execution::job::family::RECORD_KEY_BYTES];
+        key[64] = aruna_core::structs::execution::job::family::JobRecordKind::Spec.as_byte();
+        assert!(parse_paging(&query(Some(&aruna_core::cursor::encode(key)), None)).is_ok());
         assert!(parse_paging(&query(None, Some(0))).is_err());
         assert!(parse_paging(&query(None, Some(MAX_AUDIT_PAGE + 1))).is_err());
         assert!(parse_paging(&query(None, None)).is_ok());

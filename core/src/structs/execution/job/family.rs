@@ -2,6 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::identity::JobId;
+use super::input::{CapturedInput, ExecutionSpec};
+use super::local::OutputObject;
+use super::pages::PageManifest;
 use super::*;
 
 const SUBMISSION_KEYED_DOMAIN: &[u8] = b"aruna-submission-id-v1";
@@ -45,6 +49,7 @@ pub const JOB_RECEIPT_DOMAIN: &[u8] = b"aruna-job-receipt-v1";
 pub const JOB_UPDATE_DOMAIN: &[u8] = b"aruna-job-update-v1";
 pub const JOB_OUTPUT_DOMAIN: &[u8] = b"aruna-job-output-v1";
 pub const JOB_CANCEL_DOMAIN: &[u8] = b"aruna-job-cancel-v1";
+pub const JOB_STOP_DOMAIN: &[u8] = b"aruna-job-stop-v1";
 pub const JOB_ENVELOPE_DOMAIN: &[u8] = b"aruna-job-envelope-v1";
 
 /// Objects one execution may publish in its immutable output record.
@@ -294,6 +299,28 @@ pub struct LaunchIntent {
     pub plan_digest: [u8; 32],
     pub spec_digest: [u8; 32],
     pub created_at_ms: u64,
+    /// The scheduler's realm config clock when it created the launch.
+    pub config_clock: crate::admin_documents::AdminDocumentClock,
+}
+
+/// How long after its creation a target may still accept a launch, counted on the target's clock.
+pub const LAUNCH_WINDOW_MS: u64 = 60 * 60 * 1000;
+
+/// Extra time a holder waits after the launch window before it asks the target, for clock skew.
+pub const CLOCK_MARGIN_MS: u64 = 10 * 60 * 1000;
+
+impl LaunchIntent {
+    /// Whether the launch window passed at `now_ms` on the clock of the node that decides.
+    pub fn expired(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.created_at_ms) > LAUNCH_WINDOW_MS
+    }
+
+    /// The time from which a holder asks the target whether it ever accepted this launch.
+    pub fn closure_due(&self) -> u64 {
+        (self.created_at_ms)
+            .saturating_add(LAUNCH_WINDOW_MS)
+            .saturating_add(CLOCK_MARGIN_MS)
+    }
 }
 
 /// The target's acceptance of one exact launch, authenticated by the executor's
@@ -315,6 +342,11 @@ pub struct ExecutionReceipt {
     pub subject_generation: u64,
     pub subject_digest: [u8; 32],
     pub accepted_at_ms: u64,
+    /// The executor's realm config clock when it accepted, which names its membership interval.
+    pub config_clock: crate::admin_documents::AdminDocumentClock,
+    /// Config of the backend the launch was accepted on; a change fences the start.
+    pub config_generation: u64,
+    pub config_digest: [u8; 32],
 }
 
 /// State of one physical execution. Terminal here means terminal for this
@@ -406,7 +438,7 @@ impl TryFrom<String> for ResultMessage {
 }
 
 /// Ordering of one output inside a canonical set.
-fn output_order(object: &OutputObject) -> (crate::NodeId, &str, &str, Ulid) {
+fn output_order(object: &OutputObject) -> (crate::id::NodeId, &str, &str, Ulid) {
     (
         object.node_id,
         &object.bucket,
@@ -509,6 +541,32 @@ pub struct ExecutionOutputRecord {
     pub committed_at_ms: u64,
 }
 
+/// How the executor knows that one execution stopped for good.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopEvidence {
+    /// The terminal cleanup removed the backend attempt and recorded its tombstone.
+    Tombstoned,
+    /// No attempt intent was written, and the intent comes before any submit.
+    NothingSubmitted,
+}
+
+/// The executor's signed statement that one receipted execution stopped and runs no
+/// more. It follows the receipt and the terminal update it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionStop {
+    pub execution_id: Ulid,
+    pub submission_id: SubmissionId,
+    pub request_digest: [u8; 32],
+    pub executor_node_id: NodeId,
+    pub receipt_digest: [u8; 32],
+    /// Sequence of the terminal update, so a holder reads it by its key.
+    pub update_sequence: u64,
+    pub update_digest: [u8; 32],
+    pub output_digest: Option<[u8; 32]>,
+    pub evidence: StopEvidence,
+    pub stopped_at_ms: u64,
+}
+
 /// Token-free evidence of how the publishing node authorized the caller against
 /// the stored spec. Bearer tokens never replicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -521,6 +579,31 @@ pub enum CancelAuthority {
     /// The stored submitter deleted the finished run; every holder rechecks this and then
     /// answers the run as absent.
     Deletion,
+    /// A holder saw the plugin install of a task removed; its signature is that statement.
+    InstallRemoved,
+    /// A holder ended a family that has no outcome; it names the submitter, not a caller.
+    Expiry(ExpiryReason),
+}
+
+/// Why a family without an outcome was cancelled. It is no failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ExpiryReason {
+    /// Every execution stopped, every launch closed, and retention passed.
+    Retention,
+    /// The origin's own spec was refused as older than the horizon.
+    StaleSpec,
+    /// The holder's launch budget is used up and its launches are settled.
+    BudgetUsed,
+}
+
+impl ExpiryReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::StaleSpec => "stale_spec",
+            Self::BudgetUsed => "budget_used",
+        }
+    }
 }
 
 /// Replicated cancellation intent for one `(submission_id, request_digest)`
@@ -582,6 +665,7 @@ pub enum JobRecordKind {
     Update,
     Output,
     Cancel,
+    Stop,
 }
 
 impl JobRecordKind {
@@ -595,6 +679,7 @@ impl JobRecordKind {
             JobRecordKind::Update => 5,
             JobRecordKind::Output => 6,
             JobRecordKind::Cancel => 7,
+            JobRecordKind::Stop => 8,
         }
     }
 
@@ -608,6 +693,7 @@ impl JobRecordKind {
             5 => Ok(JobRecordKind::Update),
             6 => Ok(JobRecordKind::Output),
             7 => Ok(JobRecordKind::Cancel),
+            8 => Ok(JobRecordKind::Stop),
             _ => Err(JobRecordError::MalformedKey),
         }
     }
@@ -838,6 +924,22 @@ impl JobRecordBody for JobCancelRecord {
     }
 }
 
+impl JobRecordBody for ExecutionStop {
+    const DOMAIN: &'static [u8] = JOB_STOP_DOMAIN;
+    const KIND: JobRecordKind = JobRecordKind::Stop;
+
+    fn family(&self) -> JobFamilyId {
+        JobFamilyId {
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+        }
+    }
+
+    fn subject(&self) -> [u8; 32] {
+        subject_bytes(self.execution_id.to_bytes())
+    }
+}
+
 /// One immutable record of a job family. Every variant has exactly one permitted
 /// author and is never rewritten under the same key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,9 +952,26 @@ pub enum JobFamilyRecord {
     Update(Box<ExecutionUpdate>),
     Output(Box<ExecutionOutputRecord>),
     Cancel(JobCancelRecord),
+    Stop(Box<ExecutionStop>),
 }
 
 impl JobFamilyRecord {
+    /// The digest of the spec this record names. A spec names none, and an update or a stop
+    /// reaches its spec only through the receipt it extends.
+    pub fn bound_spec_digest(&self) -> Option<[u8; 32]> {
+        match self {
+            JobFamilyRecord::Claim(claim) => Some(claim.spec_digest),
+            JobFamilyRecord::Budget(budget) => Some(budget.source_spec_digest),
+            JobFamilyRecord::Launch(launch) => Some(launch.spec_digest),
+            JobFamilyRecord::Receipt(receipt) => Some(receipt.spec_digest),
+            JobFamilyRecord::Output(output) => Some(output.spec_digest),
+            JobFamilyRecord::Cancel(cancel) => Some(cancel.spec_digest),
+            JobFamilyRecord::Spec(_) | JobFamilyRecord::Update(_) | JobFamilyRecord::Stop(_) => {
+                None
+            }
+        }
+    }
+
     pub fn kind(&self) -> JobRecordKind {
         match self {
             JobFamilyRecord::Spec(_) => JobRecordKind::Spec,
@@ -863,6 +982,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(_) => JobRecordKind::Update,
             JobFamilyRecord::Output(_) => JobRecordKind::Output,
             JobFamilyRecord::Cancel(_) => JobRecordKind::Cancel,
+            JobFamilyRecord::Stop(_) => JobRecordKind::Stop,
         }
     }
 
@@ -878,6 +998,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(update) => update.family(),
             JobFamilyRecord::Output(output) => output.family(),
             JobFamilyRecord::Cancel(cancel) => cancel.family(),
+            JobFamilyRecord::Stop(stop) => stop.family(),
         }
     }
 
@@ -891,6 +1012,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(update) => update.canonical_bytes(),
             JobFamilyRecord::Output(output) => output.canonical_bytes(),
             JobFamilyRecord::Cancel(cancel) => cancel.canonical_bytes(),
+            JobFamilyRecord::Stop(stop) => stop.canonical_bytes(),
         }
     }
 
@@ -908,6 +1030,7 @@ impl JobFamilyRecord {
             JobFamilyRecord::Update(update) => (update.subject(), update.sequence()),
             JobFamilyRecord::Output(output) => (output.subject(), output.sequence()),
             JobFamilyRecord::Cancel(cancel) => (cancel.subject(), cancel.sequence()),
+            JobFamilyRecord::Stop(stop) => (stop.subject(), stop.sequence()),
         };
         JobRecordKey {
             family: self.family(),
@@ -964,6 +1087,7 @@ pub struct JobRecordContext<'a> {
     pub launch: Option<&'a LaunchIntent>,
     pub receipt: Option<&'a ExecutionReceipt>,
     pub previous_update: Option<&'a ExecutionUpdate>,
+    pub output: Option<&'a ExecutionOutputRecord>,
     pub local: Option<&'a LocalExecution>,
 }
 
@@ -981,6 +1105,7 @@ impl<'a> JobRecordContext<'a> {
             launch: None,
             receipt: None,
             previous_update: None,
+            output: None,
             local: None,
         }
     }
@@ -998,6 +1123,14 @@ pub enum RecordVerdict {
     /// The named predecessor is not verified locally yet. The record is neither
     /// authentic nor forged, so it is retained pending, never projected.
     MissingEvidence(JobRecordKind),
+}
+
+/// A job record this node is asked to sign as its publisher; see `NetEffect::ExecutionSign`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecutionClaim {
+    pub realm_id: RealmId,
+    pub record: JobFamilyRecord,
+    pub publisher: NodeId,
 }
 
 /// The authenticated envelope every replicated job record travels in, kept
@@ -1091,6 +1224,7 @@ impl JobRecordEnvelope {
             JobFamilyRecord::Update(update) => self.verify_update(update, context),
             JobFamilyRecord::Output(output) => self.verify_output(output, context),
             JobFamilyRecord::Cancel(cancel) => self.verify_cancel(cancel, context),
+            JobFamilyRecord::Stop(stop) => self.verify_stop(stop, context),
         }
     }
 
@@ -1170,7 +1304,18 @@ impl JobRecordEnvelope {
         context: &JobRecordContext<'_>,
     ) -> Result<RecordVerdict, JobRecordError> {
         self.author(budget.scheduler_node_id, JobRecordKind::Budget)?;
-        self.holder(JobRecordKind::Budget, context)?;
+        // A target's receipt of a launch this budget admits is its historical authority.
+        let receipted = match (context.launch, context.receipt) {
+            (Some(launch), Some(receipt)) => {
+                receipt.launch_id == launch.launch_id
+                    && receipt.launch_digest == launch.digest()?
+                    && budget.admits(launch).is_ok()
+            }
+            _ => false,
+        };
+        if !receipted {
+            self.holder(JobRecordKind::Budget, context)?;
+        }
         if budget.max_launches == 0 {
             return Err(JobRecordError::Contract(JobContractError::EmptyRetry));
         }
@@ -1344,15 +1489,65 @@ impl JobRecordEnvelope {
             return Err(JobRecordError::Unauthorized);
         }
         match cancel.authority {
-            CancelAuthority::Submitter | CancelAuthority::Deletion => {
+            CancelAuthority::Submitter | CancelAuthority::Deletion | CancelAuthority::Expiry(_) => {
                 match cancel.requested_by == spec.created_by {
                     true => Ok(RecordVerdict::Authentic),
                     false => Err(JobRecordError::Unauthorized),
                 }
             }
             // The publishing holder's signature is its statement that it checked
-            // group cancel permission; the payload field alone grants nothing.
-            CancelAuthority::GroupAdmin => Ok(RecordVerdict::Authentic),
+            // group cancel permission, or the install's removal; the field alone grants nothing.
+            CancelAuthority::GroupAdmin | CancelAuthority::InstallRemoved => {
+                Ok(RecordVerdict::Authentic)
+            }
+        }
+    }
+}
+
+impl JobRecordEnvelope {
+    /// Only the receipted executor states a stop, and only after this node holds the receipt,
+    /// the terminal update and the output record it names.
+    fn verify_stop(
+        &self,
+        stop: &ExecutionStop,
+        context: &JobRecordContext<'_>,
+    ) -> Result<RecordVerdict, JobRecordError> {
+        self.author(stop.executor_node_id, JobRecordKind::Stop)?;
+        let Some(receipt) = context.receipt else {
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Receipt));
+        };
+        if stop.execution_id != receipt.execution_id
+            || stop.executor_node_id != receipt.executor_node_id
+            || stop.receipt_digest != receipt.digest()?
+        {
+            return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Receipt));
+        }
+        let Some(update) = context.previous_update else {
+            return Ok(RecordVerdict::MissingEvidence(JobRecordKind::Update));
+        };
+        let named = update
+            .result
+            .as_ref()
+            .and_then(|result| result.output_digest);
+        if update.execution_id != stop.execution_id
+            || update.sequence != stop.update_sequence
+            || update.digest()? != stop.update_digest
+            || !update.state.is_terminal()
+            || named != stop.output_digest
+        {
+            return Err(JobRecordError::EvidenceMismatch(JobRecordKind::Update));
+        }
+        let Some(digest) = stop.output_digest else {
+            return Ok(RecordVerdict::Authentic);
+        };
+        match context.output {
+            None => Ok(RecordVerdict::MissingEvidence(JobRecordKind::Output)),
+            Some(output)
+                if output.execution_id == stop.execution_id && output.digest()? == digest =>
+            {
+                Ok(RecordVerdict::Authentic)
+            }
+            Some(_) => Err(JobRecordError::EvidenceMismatch(JobRecordKind::Output)),
         }
     }
 }
@@ -1412,6 +1607,9 @@ pub enum LogicalJobState {
     Succeeded,
     Cancelled,
     Failed,
+    /// Every open execution and launch belongs to a node that left the realm. Derived at read
+    /// time from this node's membership view; never stored in a cached projection.
+    NotRun,
 }
 
 impl LogicalJobState {
@@ -1424,6 +1622,7 @@ impl LogicalJobState {
             LogicalJobState::Succeeded => "succeeded",
             LogicalJobState::Cancelled => "cancelled",
             LogicalJobState::Failed => "failed",
+            LogicalJobState::NotRun => "not_run",
         }
     }
 }
@@ -1467,6 +1666,8 @@ pub struct JobProjection {
     /// Outputs of the canonical execution, in their one canonical order.
     pub outputs: OutputSet,
     pub cancel_requested: bool,
+    /// Set when a holder cancelled the family because it expired without an outcome.
+    pub expiry_reason: Option<ExpiryReason>,
 }
 
 impl JobProjection {

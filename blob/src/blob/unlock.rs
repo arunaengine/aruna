@@ -3,23 +3,38 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
 use aruna_core::compute::SharedSecret;
 use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::BlobEvent;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::ArchiveKey;
 use aruna_core::structs::storage::encryption::{
     BucketKeyError, BucketKeyRef, CopyTarget, KeyTicket, ReadLease, UnlockStatus, deadline_after,
     key_matches, seal_copies,
 };
-use aruna_core::structs::storage::key_audit::next_event_id;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use ulid::Ulid;
+use ulid::{Generator, Ulid};
+
+/// Event ids of this process in issue order, so the records of one bucket sort as they happened
+/// even within one millisecond.
+static EVENT_IDS: StdMutex<Generator> = StdMutex::new(Generator::new());
+
+/// The next audit event id at `at_ms`; it sorts after every id issued before it.
+fn next_event_id(at_ms: u64) -> Ulid {
+    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms);
+    let Ok(mut ids) = EVENT_IDS.lock() else {
+        return Ulid::from_datetime(at);
+    };
+    match ids.generate_from_datetime(at) {
+        Ok(id) => id,
+        Err(overflow) => overflow.commit_overflow_increment(),
+    }
+}
 
 /// Buckets that may be unlocked at once on one node.
 pub(super) const UNLOCKED_BUCKETS: usize = 1024;
@@ -359,10 +374,7 @@ impl UnlockRegistry {
             false
         });
         locked.sort_by_key(|ticket| ticket.key.generation);
-        (
-            locked,
-            next_event_id(aruna_core::time::unix_timestamp_millis()),
-        )
+        (locked, next_event_id(aruna_clock::unix_timestamp_millis()))
     }
 
     /// A lease for one plaintext read of `archive`, while its key generation is unlocked.
@@ -491,7 +503,7 @@ impl UnlockRegistry {
                 if ended && session.active {
                     expired.insert(
                         (*key, session.session_id),
-                        next_event_id(aruna_core::time::unix_timestamp_millis()),
+                        next_event_id(aruna_clock::unix_timestamp_millis()),
                     );
                 }
                 !ended
@@ -644,9 +656,18 @@ impl super::BlobHandler {
             Ok(mut registry) => registry.unlocked_key(key, Instant::now()),
             Err(_) => Err(BucketKeyError::Locked(key.bucket_id)),
         };
-        let now_ms = aruna_core::time::unix_timestamp_millis();
+        let now_ms = aruna_clock::unix_timestamp_millis();
         let sealed = unlocked.and_then(|(secret, public_key)| {
-            seal_copies(key, &public_key, secret.bytes(), origin, holders, now_ms)
+            let mut rng = super::abe::fresh_rng().ok_or(BucketKeyError::Seal)?;
+            seal_copies(
+                key,
+                &public_key,
+                secret.bytes(),
+                origin,
+                holders,
+                now_ms,
+                &mut rng,
+            )
         });
         match sealed {
             Ok(copies) => BlobEvent::CopiesSealed { copies },

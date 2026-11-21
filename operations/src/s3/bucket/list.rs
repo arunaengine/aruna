@@ -2,24 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::cursor;
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BucketInfo;
-use aruna_core::types::{Effects, GroupId, Key};
-use base64::Engine;
-use smallvec::smallvec;
+use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ListBucketsState {
-    Init,
-    ReadBuckets,
-    Finish,
-    Error,
-}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ListBucketsError {
@@ -27,17 +17,22 @@ pub enum ListBucketsError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("State [{state:?}] invalid: expected [{expected:?}] - received [{received:?}]")]
-    InvalidStateEvent {
-        state: ListBucketsState,
-        expected: &'static str,
-        received: Event,
-    },
     #[error("ListBuckets failed")]
     ListBucketsFailed,
-    #[error("operation did not finish")]
-    NotFinished,
+    #[error("could not list buckets: {0}")]
+    Io(IoError),
 }
+
+impl From<IoError> for ListBucketsError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::StorageError(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<ListBucketsResult>, ListBucketsError>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ListBucketsInput {
@@ -56,11 +51,9 @@ pub struct ListBucketsResult {
 #[derive(Debug, PartialEq)]
 pub struct ListBucketsOperation {
     input: ListBucketsInput,
-    state: ListBucketsState,
     matches: Vec<(String, BucketInfo)>,
     storage_start_after: Option<Key>,
     scanned_rows: usize,
-    output: Option<Result<ListBucketsResult, ListBucketsError>>,
 }
 
 impl ListBucketsOperation {
@@ -72,11 +65,9 @@ impl ListBucketsOperation {
     pub fn new(input: ListBucketsInput) -> Self {
         Self {
             input,
-            state: ListBucketsState::Init,
             matches: Vec::new(),
             storage_start_after: None,
             scanned_rows: 0,
-            output: None,
         }
     }
 
@@ -88,75 +79,41 @@ impl ListBucketsOperation {
             .min(Self::MAX_BUCKETS)
     }
 
-    fn emit_error(&mut self, error: ListBucketsError) -> Effects {
-        self.state = ListBucketsState::Error;
-        self.output = Some(Err(error));
-        smallvec![]
-    }
-
-    fn emit_scan(&mut self) -> Effects {
-        self.state = ListBucketsState::ReadBuckets;
-        let start = if let Some(key) = &self.storage_start_after {
-            Some(IterStart::After(key.clone()))
-        } else if let Some(token) = self.input.continuation_token.as_deref() {
-            match decode_cursor(token) {
-                Ok(key) => Some(IterStart::After(key)),
-                Err(error) => return self.emit_error(error.into()),
-            }
-        } else {
-            None
+    fn emit_scan(&mut self) -> Step {
+        let after = match (&self.storage_start_after, &self.input.continuation_token) {
+            (Some(key), _) => Some(key.clone()),
+            (None, Some(token)) => Some(decode_cursor(token)?),
+            (None, None) => None,
         };
         let remaining = Self::MAX_SCAN_ROWS.saturating_sub(self.scanned_rows);
         if remaining == 0 {
-            return self.emit_error(ListBucketsError::ListBucketsFailed);
+            return Err(ListBucketsError::ListBucketsFailed);
         }
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: S3_BUCKET_KEYSPACE.to_string(),
-            prefix: self.input.prefix.clone().map(Into::into),
-            start,
+        let prefix = self.input.prefix.clone().unwrap_or_default().into_bytes();
+        Ok(Next::Call(IoCall::Page {
+            space: S3_BUCKET_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after,
             limit: Self::SCAN_LIMIT.min(remaining),
-            txn_id: None,
-        })]
+        }))
     }
 
-    fn handle_init(&mut self) -> Effects {
-        self.emit_scan()
-    }
-
-    fn handle_bucket_list(&mut self, event: Event) -> Effects {
-        let Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) = event
-        else {
-            return self.emit_error(ListBucketsError::InvalidStateEvent {
-                state: self.state.clone(),
-                expected: "Event::Storage(StorageEvent::IterResult)",
-                received: event,
-            });
-        };
-
+    fn handle_bucket_list(&mut self, result: IoResult) -> Step {
+        let (values, next_start_after) = result.page()?;
         let remaining = Self::MAX_SCAN_ROWS.saturating_sub(self.scanned_rows);
         if values.len() > remaining {
-            return self.emit_error(ListBucketsError::ListBucketsFailed);
+            return Err(ListBucketsError::ListBucketsFailed);
         }
         self.scanned_rows += values.len();
         let max_buckets = self.max_buckets();
 
         for (key, value) in values {
-            let bucket_info = match BucketInfo::from_bytes(value.as_ref()) {
-                Ok(bucket_info) => bucket_info,
-                Err(err) => return self.emit_error(err.into()),
-            };
-
+            let bucket_info = BucketInfo::from_bytes(value.as_ref())?;
             if bucket_info.group_id != self.input.group_id {
                 continue;
             }
-
-            let bucket_name = match String::from_utf8(key.to_vec()) {
-                Ok(bucket_name) => bucket_name,
-                Err(err) => return self.emit_error(ListBucketsError::ConversionError(err.into())),
-            };
+            let bucket_name = String::from_utf8(key.to_vec())
+                .map_err(|err| ListBucketsError::ConversionError(err.into()))?;
             self.matches.push((bucket_name, bucket_info));
         }
 
@@ -180,23 +137,19 @@ impl ListBucketsOperation {
             return self.emit_scan();
         }
 
-        self.finish(None)
+        Ok(self.finish(None))
     }
 
-    fn finish(&mut self, continuation_token: Option<String>) -> Effects {
-        self.state = ListBucketsState::Finish;
-        self.output = Some(Ok(ListBucketsResult {
+    fn finish(&mut self, continuation_token: Option<String>) -> Next<ListBucketsResult> {
+        Next::Done(ListBucketsResult {
             buckets: std::mem::take(&mut self.matches),
             continuation_token,
-        }));
-        smallvec![]
+        })
     }
 
-    fn finish_cursor(&mut self, key: Option<&Key>) -> Effects {
-        match key.map(encode_cursor).transpose() {
-            Ok(token) => self.finish(token),
-            Err(error) => self.emit_error(error.into()),
-        }
+    fn finish_cursor(&mut self, key: Option<&Key>) -> Step {
+        let token = key.map(encode_cursor).transpose()?;
+        Ok(self.finish(token))
     }
 }
 
@@ -206,61 +159,32 @@ pub fn bucket_cursor(bucket: &str) -> Result<String, ConversionError> {
 }
 
 fn encode_cursor(key: &Key) -> Result<String, ConversionError> {
-    let bytes = postcard::to_allocvec(&key.to_vec())?;
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+    Ok(cursor::encode_value(&key.to_vec())?)
 }
 
 fn decode_cursor(token: &str) -> Result<Key, ConversionError> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token)?;
-    let key = postcard::from_bytes::<Vec<u8>>(&bytes)?;
-    Ok(key.into())
+    Ok(cursor::decode_value::<Vec<u8>>(token)?.into())
 }
 
 impl Operation for ListBucketsOperation {
     type Output = ListBucketsResult;
     type Error = ListBucketsError;
 
-    fn start(&mut self) -> Effects {
-        self.handle_init()
+    fn first(&mut self) -> Step {
+        self.emit_scan()
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        if let Event::Storage(StorageEvent::Error { error }) = &event {
-            return self.emit_error(error.clone().into());
-        }
-        match self.state {
-            ListBucketsState::Init => self.handle_init(),
-            ListBucketsState::ReadBuckets => self.handle_bucket_list(event),
-            ListBucketsState::Finish => smallvec![],
-            ListBucketsState::Error => self.abort(),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ListBucketsState::Finish | ListBucketsState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        match self.output {
-            Some(Ok(value)) => Ok(value),
-            Some(Err(error)) => Err(error),
-            None => Err(ListBucketsError::NotFinished),
-        }
-    }
-
-    fn abort(&mut self) -> Effects {
-        smallvec![]
+    fn next(&mut self, result: IoResult) -> Step {
+        self.handle_bucket_list(result)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::driver::{DriverContext, drive};
+    use aruna_core::effects::StorageEffect;
     use aruna_core::structs::storage::format::Compression;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -270,14 +194,15 @@ mod test {
     async fn test_list_buckets() {
         let temp_handle = tempdir().unwrap();
         let storage_handle =
-            storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+            storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
         let driver_ctx = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let group_id = Ulid::generate();
@@ -389,32 +314,35 @@ mod test {
             continuation_token: None,
             max_buckets: Some(10),
         });
-        op.start();
+        let _ = op.first();
 
         let cursor: super::Key = "beta".as_bytes().to_vec().into();
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry("alpha", group_id), entry("beta", other)],
-            next_start_after: Some(cursor.clone()),
-        }));
-        match effects.first().unwrap() {
-            Effect::Storage(StorageEffect::Iter {
-                start: Some(IterStart::After(key)),
-                ..
-            }) => assert_eq!(key, &cursor),
-            other => panic!("unexpected effect: {other:?}"),
+        let next = op.next(IoResult::Page {
+            rows: vec![entry("alpha", group_id), entry("beta", other)],
+            next: Some(cursor.clone()),
+        });
+        match next {
+            Ok(Next::Call(IoCall::Page {
+                after: Some(key), ..
+            })) => assert_eq!(key, cursor),
+            other => panic!("unexpected call: {other:?}"),
         }
-        assert!(!op.is_complete());
 
-        let effects = op.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry("gamma", group_id)],
-            next_start_after: None,
-        }));
-        assert!(effects.is_empty());
-
-        let result = op.finalize().unwrap();
+        let done = op.next(IoResult::Page {
+            rows: vec![entry("gamma", group_id)],
+            next: None,
+        });
+        let result = listed(done);
         let names: Vec<_> = result.buckets.into_iter().map(|(name, _)| name).collect();
         assert_eq!(names, vec!["alpha".to_string(), "gamma".to_string()]);
         assert_eq!(result.continuation_token, None);
+    }
+
+    fn listed(done: Step) -> ListBucketsResult {
+        match done {
+            Ok(Next::Done(result)) => result,
+            other => panic!("expected the listing, got {other:?}"),
+        }
     }
 
     #[test]
@@ -455,13 +383,11 @@ mod test {
             continuation_token: None,
             max_buckets: Some(1),
         });
-        operation.start();
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry("alpha", group_id), entry("beta", group_id)],
-            next_start_after: Some(Key::from(b"beta".to_vec())),
+        let _ = operation.first();
+        let first = listed(operation.next(IoResult::Page {
+            rows: vec![entry("alpha", group_id), entry("beta", group_id)],
+            next: Some(Key::from(b"beta".to_vec())),
         }));
-
-        let first = operation.finalize().unwrap();
         assert_eq!(first.buckets.len(), 1);
         let token = first.continuation_token.unwrap();
         assert_eq!(decode_cursor(&token).unwrap(), Key::from(b"alpha".to_vec()));
@@ -472,12 +398,11 @@ mod test {
             continuation_token: Some(token),
             max_buckets: Some(1),
         });
-        next.start();
-        next.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![entry("beta", group_id)],
-            next_start_after: None,
+        let _ = next.first();
+        let second = listed(next.next(IoResult::Page {
+            rows: vec![entry("beta", group_id)],
+            next: None,
         }));
-        let second = next.finalize().unwrap();
         assert_eq!(
             second
                 .buckets
@@ -499,13 +424,12 @@ mod test {
             max_buckets: Some(1),
         });
         operation.scanned_rows = ListBucketsOperation::MAX_SCAN_ROWS - 1;
-        let effects = operation.start();
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Iter { limit: 1, .. })]
+            operation.first(),
+            Ok(Next::Call(IoCall::Page { limit: 1, .. }))
         ));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: vec![(
+        let done = operation.next(IoResult::Page {
+            rows: vec![(
                 Key::from(b"foreign".to_vec()),
                 BucketInfo {
                     group_id: Ulid::from_bytes([6u8; 16]),
@@ -522,10 +446,10 @@ mod test {
                 .unwrap()
                 .into(),
             )],
-            next_start_after: Some(Key::from(b"foreign".to_vec())),
-        }));
+            next: Some(Key::from(b"foreign".to_vec())),
+        });
 
-        let result = operation.finalize().unwrap();
+        let result = listed(done);
         assert!(result.buckets.is_empty());
         let token = result.continuation_token.unwrap();
         assert_ne!(token, "foreign");

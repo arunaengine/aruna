@@ -1,0 +1,634 @@
+//! Runs a metadata document update under this node's per-document hold, after its revision
+//! and Profile checks, and keeps the registry cache in step.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::Event;
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{
+    DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    PENDING_PROJECTION_KEYSPACE,
+};
+use aruna_core::metadata::{
+    MaterializationState, MaterializationStatusRecord, MetadataEffect, MetadataError,
+    MetadataEvent, MetadataEventPayload, MetadataEventRecord,
+};
+use aruna_core::operation::{HoldScope, Operation};
+use aruna_core::rows::read_row;
+use aruna_core::storage_entries::{
+    document_job_prefix, event_log_prefix, materialization_status_key,
+};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::types::Key;
+use ulid::Ulid;
+
+use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::profile::rules::stale_status;
+use crate::metadata::profile::validation::{
+    MetadataProfilePreview, ProfileAssessOperation, submission_verdict,
+};
+use crate::metadata::update_document::{UpdateDocumentError, UpdateDocumentOperation};
+use aruna_core::metadata::api::UpdateDocumentMutation;
+
+/// Pending projection markers read per page while looking for an unapplied event.
+const MARKER_PAGE: usize = 100;
+
+/// Whether a mutation is planned against this holder's graph, so its expected revision must be
+/// applied here first.
+fn plans_on_graph(mutation: &UpdateDocumentMutation) -> bool {
+    matches!(
+        mutation,
+        UpdateDocumentMutation::ReplaceRoCrate { .. }
+            | UpdateDocumentMutation::UpsertDataEntity { .. }
+            | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
+            | UpdateDocumentMutation::RemoveDataEntity { .. }
+    )
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum BaseStage {
+    /// Reading the newest event of the document's log.
+    Newest,
+    /// Reading the materialization status.
+    Status,
+    /// Paging the pending projection markers, after the given key.
+    Markers,
+    /// Reading the logged event of one marker; the rest of the page waits.
+    Marker(Vec<Key>, Option<Key>),
+    /// Asking the graph whether one marker's batch is applied.
+    Dot(Vec<Key>, Option<Key>),
+    /// Looking for a queued materialization job.
+    Jobs,
+}
+
+/// Refuses a revision-checked change this holder cannot plan yet: a base other than its newest
+/// event conflicts; one its graph has not applied (status short of it, event not handed on, job
+/// queued) is retryable. The transactional revision check still runs later.
+#[derive(Debug, PartialEq)]
+pub struct ReadyBaseOperation {
+    document_id: Ulid,
+    expected: Ulid,
+    stage: BaseStage,
+}
+
+type BaseTurn = Result<Next<()>, UpdateDocumentError>;
+
+impl ReadyBaseOperation {
+    pub fn new(document_id: Ulid, expected: Ulid) -> Self {
+        Self {
+            document_id,
+            expected,
+            stage: BaseStage::Newest,
+        }
+    }
+
+    fn pending(&self) -> UpdateDocumentError {
+        UpdateDocumentError::GraphPending {
+            expected: self.expected,
+        }
+    }
+
+    fn newest_read(&mut self, result: IoResult) -> BaseTurn {
+        let (rows, _) = result.page()?;
+        let current = (rows.first())
+            .and_then(|(key, _)| <[u8; 16]>::try_from(key.get(16..32)?).ok())
+            .map_or(Ulid::nil(), Ulid::from_bytes);
+        if current != self.expected {
+            return Err(UpdateDocumentError::RevisionConflict {
+                expected: self.expected,
+                current,
+            });
+        }
+        self.stage = BaseStage::Status;
+        let key = materialization_status_key(self.document_id);
+        Ok(Next::Call(read_row(MATERIALIZATION_STATUS_KEYSPACE, key)))
+    }
+
+    fn status_read(&mut self, result: IoResult) -> BaseTurn {
+        let status = result
+            .value()?
+            .and_then(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok());
+        let applied = status.is_some_and(|status| {
+            status.state == MaterializationState::Materialized && status.event_id >= self.expected
+        });
+        if !applied {
+            return Err(self.pending());
+        }
+        self.markers(None)
+    }
+
+    /// A received event keeps its projection marker until the projector has written its
+    /// materialization job, so markers read before jobs miss no event moving between them.
+    fn markers(&mut self, after: Option<Key>) -> BaseTurn {
+        self.stage = BaseStage::Markers;
+        Ok(Next::Call(IoCall::Page {
+            space: PENDING_PROJECTION_KEYSPACE.to_string(),
+            prefix: event_log_prefix(self.document_id),
+            after,
+            limit: MARKER_PAGE,
+        }))
+    }
+
+    fn markers_read(&mut self, result: IoResult) -> BaseTurn {
+        let (rows, next) = result.page()?;
+        let keys = rows.into_iter().map(|(key, _)| key).collect();
+        self.next_marker(keys, next)
+    }
+
+    fn next_marker(&mut self, mut keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
+        if keys.is_empty() {
+            return match next {
+                Some(after) => self.markers(Some(after)),
+                None => self.jobs(),
+            };
+        }
+        let key = keys.remove(0);
+        self.stage = BaseStage::Marker(keys, next);
+        Ok(Next::Call(read_row(EVENT_LOG_KEYSPACE, key)))
+    }
+
+    /// A marker of an applied batch is only a deferred lifecycle mint; any other one is a
+    /// received change the graph has not applied.
+    fn marker_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
+        let event = result
+            .value()?
+            .and_then(|bytes| postcard::from_bytes::<MetadataEventRecord>(&bytes).ok());
+        let Some(MetadataEventPayload::ApplyBatch { batch, .. }) = event.map(|event| event.payload)
+        else {
+            return Err(self.pending());
+        };
+        self.stage = BaseStage::Dot(keys, next);
+        let contains = MetadataEffect::ContainsDot {
+            graph_iri: batch.graph_iri.clone(),
+            actor: batch.actor,
+            counter: batch.counter,
+        };
+        Ok(Next::Call(metadata_call(contains)))
+    }
+
+    fn dot_read(&mut self, result: IoResult, keys: Vec<Key>, next: Option<Key>) -> BaseTurn {
+        match result.event()? {
+            Event::Metadata(MetadataEvent::ContainsDotResult { contains: true, .. })
+            // A node without the graph store has nothing to wait for.
+            | Event::Metadata(MetadataEvent::Error {
+                error: MetadataError::HandleMissing,
+                ..
+            }) => self.next_marker(keys, next),
+            Event::Metadata(MetadataEvent::ContainsDotResult { contains: false, .. }) => {
+                Err(self.pending())
+            }
+            Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                Err(MetadataError::Backend(error.to_string()).into())
+            }
+            other => Err(MetadataError::Backend(format!(
+                "unexpected dot check answer: {}",
+                other.label()
+            ))
+            .into()),
+        }
+    }
+
+    fn jobs(&mut self) -> BaseTurn {
+        self.stage = BaseStage::Jobs;
+        Ok(Next::Call(IoCall::Page {
+            space: DOCUMENT_JOB_KEYSPACE.to_string(),
+            prefix: document_job_prefix(self.document_id),
+            after: None,
+            limit: 1,
+        }))
+    }
+}
+
+impl Operation for ReadyBaseOperation {
+    type Output = ();
+    type Error = UpdateDocumentError;
+
+    fn first(&mut self) -> BaseTurn {
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Storage(
+            StorageEffect::Last {
+                key_space: EVENT_LOG_KEYSPACE.to_string(),
+                prefix: Some(event_log_prefix(self.document_id)),
+                txn_id: None,
+            },
+        )))))
+    }
+
+    fn next(&mut self, result: IoResult) -> BaseTurn {
+        match std::mem::replace(&mut self.stage, BaseStage::Newest) {
+            BaseStage::Newest => self.newest_read(result),
+            BaseStage::Status => self.status_read(result),
+            BaseStage::Markers => self.markers_read(result),
+            BaseStage::Marker(keys, next) => self.marker_read(result, keys, next),
+            BaseStage::Dot(keys, next) => self.dot_read(result, keys, next),
+            BaseStage::Jobs => {
+                let (queued, _) = result.page()?;
+                match queued.is_empty() {
+                    true => Ok(Next::Done(())),
+                    false => Err(self.pending()),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EntryStage {
+    Ready,
+    Validate,
+    Generation,
+    Update,
+    Cache,
+}
+
+/// A metadata document update from its entry. It holds this node's writes to the document, so
+/// its actor's dots stay in order, checks a revision-checked base and the Profile verdict, and
+/// caches the updated row unless the registry cache changed meanwhile.
+#[derive(Debug, PartialEq)]
+pub struct UpdateEntryOperation {
+    operation: Option<UpdateDocumentOperation>,
+    local_node: Option<NodeId>,
+    stage: EntryStage,
+    generation: Option<u64>,
+    updated: Option<MetadataRegistryRecord>,
+}
+
+type EntryTurn = Result<Next<MetadataRegistryRecord>, UpdateDocumentError>;
+
+impl UpdateEntryOperation {
+    /// `local_node` is this node on the network, which a Profile fetch needs.
+    pub fn new(operation: UpdateDocumentOperation, local_node: Option<NodeId>) -> Self {
+        Self {
+            operation: Some(operation),
+            local_node,
+            stage: EntryStage::Ready,
+            generation: None,
+            updated: None,
+        }
+    }
+
+    fn update(&mut self) -> Result<&mut UpdateDocumentOperation, UpdateDocumentError> {
+        self.operation
+            .as_mut()
+            .ok_or_else(|| MetadataError::Backend("the update was already started".into()).into())
+    }
+
+    fn validate(&mut self) -> EntryTurn {
+        let local_node = self.local_node;
+        let operation = self.update()?;
+        let document_id = operation.config.document_id;
+        match &operation.config.mutation {
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld } => {
+                let assess = ProfileAssessOperation::write(
+                    local_node,
+                    document_id,
+                    operation.config.group_id,
+                    jsonld.clone(),
+                );
+                self.stage = EntryStage::Validate;
+                Ok(Next::Call(IoCall::child(assess)))
+            }
+            UpdateDocumentMutation::UpsertDataEntity { .. }
+            | UpdateDocumentMutation::UpsertContextualEntity { .. }
+            | UpdateDocumentMutation::ReplaceDataEntity { .. }
+            | UpdateDocumentMutation::RemoveDataEntity { .. }
+            | UpdateDocumentMutation::ApplyBatch { .. }
+            | UpdateDocumentMutation::Checkpoint => {
+                operation.route_profile_status =
+                    Some(stale_status(document_id, "dataset_revision_changed"));
+                self.read_generation()
+            }
+        }
+    }
+
+    fn validated(&mut self, result: IoResult) -> EntryTurn {
+        let assessed = result.child::<MetadataProfilePreview, MetadataError>()?;
+        let operation = self.update()?;
+        let jsonld = match &operation.config.mutation {
+            UpdateDocumentMutation::ReplaceRoCrate { jsonld } => jsonld.as_str(),
+            _ => "",
+        };
+        let status = submission_verdict(assessed, operation.config.document_id, jsonld)?;
+        operation.route_profile_status = Some(status);
+        self.read_generation()
+    }
+
+    /// The cache generation before the update, so a fill that started meanwhile wins.
+    fn read_generation(&mut self) -> EntryTurn {
+        self.stage = EntryStage::Generation;
+        Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)))
+    }
+
+    fn generation_read(&mut self, result: IoResult) -> EntryTurn {
+        // A node without the metadata handle keeps no cache.
+        if let Event::Metadata(MetadataEvent::CacheGeneration { generation }) = result.event()? {
+            self.generation = Some(generation);
+        }
+        let operation = self
+            .operation
+            .take()
+            .ok_or_else(|| MetadataError::Backend("the update was already started".into()))?;
+        self.stage = EntryStage::Update;
+        Ok(Next::Call(IoCall::child(operation)))
+    }
+
+    fn updated(&mut self, result: IoResult) -> EntryTurn {
+        let updated = result.child::<MetadataRegistryRecord, UpdateDocumentError>()??;
+        let Some(generation) = self.generation else {
+            return Ok(Next::Done(updated));
+        };
+        let cache = MetadataEffect::CacheRecords {
+            records: vec![updated.clone()],
+            generation: Some(generation),
+        };
+        self.updated = Some(updated);
+        self.stage = EntryStage::Cache;
+        Ok(Next::Call(metadata_call(cache)))
+    }
+}
+
+impl Operation for UpdateEntryOperation {
+    type Output = MetadataRegistryRecord;
+    type Error = UpdateDocumentError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        let operation = self.operation.as_ref()?;
+        Some(HoldScope::DocumentWrite(operation.config.document_id))
+    }
+
+    fn first(&mut self) -> EntryTurn {
+        let operation = self.update()?;
+        let ready = (operation.config.expected_revision)
+            .filter(|_| plans_on_graph(&operation.config.mutation))
+            .map(|expected| ReadyBaseOperation::new(operation.config.document_id, expected));
+        match ready {
+            Some(ready) => Ok(Next::Call(IoCall::child(ready))),
+            None => self.validate(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> EntryTurn {
+        match self.stage {
+            EntryStage::Ready => {
+                result.child::<(), UpdateDocumentError>()??;
+                self.validate()
+            }
+            EntryStage::Validate => self.validated(result),
+            EntryStage::Generation => self.generation_read(result),
+            EntryStage::Update => self.updated(result),
+            EntryStage::Cache => {
+                // The row is committed; a cache that missed it refills from storage.
+                let _ = result.event();
+                let updated = self
+                    .updated
+                    .take()
+                    .ok_or_else(|| MetadataError::Backend("the updated row is missing".into()))?;
+                Ok(Next::Done(updated))
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Drives the update entry and its readiness check through their calls without I/O.
+
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::storage_entries::event_log_key;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
+
+    use crate::metadata::update_document::UpdateDocumentConfig;
+
+    fn document() -> Ulid {
+        Ulid::from_parts(3, 3)
+    }
+
+    fn expected() -> Ulid {
+        Ulid::from_parts(4, 4)
+    }
+
+    fn event(event: Event) -> IoResult {
+        IoResult::Event(Box::new(event))
+    }
+
+    fn newest(event_id: Ulid) -> IoResult {
+        let key = event_log_key(document(), event_id);
+        event(Event::Storage(StorageEvent::IterResult {
+            values: vec![(key, Vec::new().into())],
+            next_start_after: None,
+        }))
+    }
+
+    fn status(event_id: Ulid, state: MaterializationState) -> IoResult {
+        let status = MaterializationStatusRecord {
+            document_id: document(),
+            event_id,
+            graph_iri: String::new(),
+            context_digest: None,
+            dataset_digest: None,
+            state,
+            attempts: 0,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        IoResult::Values(vec![Some(postcard::to_allocvec(&status).unwrap().into())])
+    }
+
+    fn page(keys: Vec<Key>) -> IoResult {
+        IoResult::Page {
+            rows: keys
+                .into_iter()
+                .map(|key| (key, Vec::new().into()))
+                .collect(),
+            next: None,
+        }
+    }
+
+    fn ready_at_markers() -> ReadyBaseOperation {
+        let mut ready = ReadyBaseOperation::new(document(), expected());
+        ready.first().unwrap();
+        ready.next(newest(expected())).unwrap();
+        let Ok(Next::Call(IoCall::Page { space, .. })) =
+            ready.next(status(expected(), MaterializationState::Materialized))
+        else {
+            panic!("expected the marker page");
+        };
+        assert_eq!(space, PENDING_PROJECTION_KEYSPACE);
+        ready
+    }
+
+    #[test]
+    fn stale_base_conflicts() {
+        let mut ready = ReadyBaseOperation::new(document(), expected());
+        assert!(matches!(ready.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let newer = Ulid::from_parts(5, 5);
+        assert_eq!(
+            ready.next(newest(newer)),
+            Err(UpdateDocumentError::RevisionConflict {
+                expected: expected(),
+                current: newer,
+            })
+        );
+    }
+
+    #[test]
+    fn unapplied_base_pends() {
+        let mut ready = ReadyBaseOperation::new(document(), expected());
+        ready.first().unwrap();
+        ready.next(newest(expected())).unwrap();
+        assert_eq!(
+            ready.next(status(expected(), MaterializationState::Pending)),
+            Err(UpdateDocumentError::GraphPending {
+                expected: expected()
+            })
+        );
+    }
+
+    #[test]
+    fn applied_base_ready() {
+        let mut ready = ready_at_markers();
+        let Ok(Next::Call(IoCall::Page { space, limit, .. })) = ready.next(page(Vec::new())) else {
+            panic!("expected the job page");
+        };
+        assert_eq!((space.as_str(), limit), (DOCUMENT_JOB_KEYSPACE, 1));
+        assert_eq!(ready.next(page(Vec::new())), Ok(Next::Done(())));
+
+        let mut queued = ready_at_markers();
+        queued.next(page(Vec::new())).unwrap();
+        assert_eq!(
+            queued.next(page(vec![Key::from(vec![1])])),
+            Err(UpdateDocumentError::GraphPending {
+                expected: expected()
+            })
+        );
+    }
+
+    #[test]
+    fn unprojected_marker_pends() {
+        // A marker whose event is no applied batch is a received change not handed on yet.
+        let mut ready = ready_at_markers();
+        let marker = event_log_key(document(), Ulid::from_parts(6, 6));
+        assert_eq!(
+            ready.next(page(vec![marker.clone()])),
+            Ok(Next::Call(read_row(EVENT_LOG_KEYSPACE, marker)))
+        );
+        assert_eq!(
+            ready.next(IoResult::Values(vec![None])),
+            Err(UpdateDocumentError::GraphPending {
+                expected: expected()
+            })
+        );
+    }
+
+    fn update(
+        mutation: UpdateDocumentMutation,
+        expected_revision: Option<Ulid>,
+    ) -> UpdateEntryOperation {
+        let realm_id = RealmId::from_bytes([1; 32]);
+        let operation = UpdateDocumentOperation::new(UpdateDocumentConfig {
+            actor: Actor {
+                node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+                user_id: aruna_core::user::id::UserId::local(Ulid::from_parts(1, 1), realm_id),
+                realm_id,
+            },
+            group_id: Ulid::from_parts(2, 2),
+            document_id: document(),
+            public: false,
+            mutation,
+            expected_revision,
+        });
+        UpdateEntryOperation::new(operation, None)
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(ChildOutcome::new(result))
+    }
+
+    fn record() -> MetadataRegistryRecord {
+        MetadataRegistryRecord {
+            realm_id: RealmId::from_bytes([1; 32]),
+            group_id: Ulid::from_parts(2, 2),
+            document_id: document(),
+            document_path: "datasets/entry".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document()),
+            public: false,
+            permission_path: String::new(),
+            placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+            holder_node_ids: Vec::new(),
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_parts(1, 1),
+            last_event_id: expected(),
+        }
+    }
+
+    #[test]
+    fn update_holds_document() {
+        let mut entry = update(UpdateDocumentMutation::Checkpoint, None);
+        assert_eq!(
+            entry.hold_scope(),
+            Some(HoldScope::DocumentWrite(document()))
+        );
+        // A checkpoint plans on no base and carries no Profile verdict.
+        assert_eq!(
+            entry.first(),
+            Ok(Next::Call(metadata_call(MetadataEffect::CacheGeneration)))
+        );
+        let generation = event(Event::Metadata(MetadataEvent::CacheGeneration {
+            generation: 7,
+        }));
+        assert!(matches!(
+            entry.next(generation),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let updated = child(Ok::<_, UpdateDocumentError>(record()));
+        assert_eq!(
+            entry.next(updated),
+            Ok(Next::Call(metadata_call(MetadataEffect::CacheRecords {
+                records: vec![record()],
+                generation: Some(7),
+            })))
+        );
+        let cached = event(Event::Metadata(MetadataEvent::CacheGeneration {
+            generation: 8,
+        }));
+        assert_eq!(entry.next(cached), Ok(Next::Done(record())));
+    }
+
+    #[test]
+    fn uncached_update_done() {
+        let mut entry = update(UpdateDocumentMutation::Checkpoint, None);
+        entry.first().unwrap();
+        let missing = event(Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        }));
+        entry.next(missing).unwrap();
+        let updated = child(Ok::<_, UpdateDocumentError>(record()));
+        assert_eq!(entry.next(updated), Ok(Next::Done(record())));
+    }
+
+    #[test]
+    fn checked_base_first() {
+        let jsonld = r#"{"@id":"./data/file.txt","@type":"File"}"#.to_string();
+        let mut entry = update(
+            UpdateDocumentMutation::UpsertDataEntity { jsonld },
+            Some(expected()),
+        );
+        assert!(matches!(entry.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let pending = || UpdateDocumentError::GraphPending {
+            expected: expected(),
+        };
+        assert_eq!(entry.next(child(Err::<(), _>(pending()))), Err(pending()));
+    }
+}

@@ -11,65 +11,43 @@ use aruna_core::structs::storage::abe::{
     AbeError, AbeParameters, EnvelopeArchive, EnvelopePlan, ObjectEnvelope, envelope_charge,
 };
 use aruna_core::structs::storage::encryption::BucketKeyRef;
-use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::types::{Key, KeySpace, Value};
 
 impl PutObjectOperation {
-    pub(super) fn read_abe(&mut self, fence: bool) -> Effects {
-        let Some(plan) = self.seal_plan else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
+    pub(super) fn read_abe(&mut self, fence: bool) -> Turn {
+        let plan = self.seal_plan;
+        let plan = plan.ok_or(PutObjectError::InvalidOperationState)?;
+        let state = match fence {
+            true => PutObjectState::FenceAbe,
+            false => PutObjectState::ReadAbe,
         };
-        self.state = if fence {
-            PutObjectState::FenceAbe
-        } else {
-            PutObjectState::ReadAbe
-        };
-        let txn_id = if fence { self.txn_id } else { None };
-        smallvec![Effect::Storage(StorageEffect::BatchRead {
-            reads: abe_reads(plan.key),
-            txn_id
-        })]
+        self.call(state, IoCall::Read(abe_reads(plan.key)))
     }
-    pub(super) fn abe_read(&mut self, event: Event, fence: bool) -> Effects {
-        let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-            return self.emit_error(PutObjectError::InvalidOperationState);
-        };
-        let parsed = (|| {
-            let plan = self.seal_plan.ok_or(AbeError::Context)?;
-            let (parameters, epoch) = parse_abe(&values, plan.key)?;
-            if parameters.realm_id != self.config.realm_id
-                || parameters.node_id != self.config.node_id
-            {
-                return Err(AbeError::Context);
-            }
-            Ok((parameters, epoch))
-        })();
-        let (parameters, epoch) = match parsed {
-            Ok(value) => value,
-            Err(error) => {
-                return self.emit_error(PutObjectError::BlobWriteFailed(BlobError::from(error)));
-            }
-        };
+
+    pub(super) fn abe_read(&mut self, values: Vec<Option<Value>>, fence: bool) -> Turn {
+        let failed = |error: AbeError| PutObjectError::BlobWriteFailed(BlobError::from(error));
+        let plan = self.seal_plan.ok_or(AbeError::Context).map_err(failed)?;
+        let (parameters, epoch) = parse_abe(&keyed(&values), plan.key).map_err(failed)?;
+        if parameters.realm_id != self.config.realm_id || parameters.node_id != self.config.node_id
+        {
+            return Err(failed(AbeError::Context));
+        }
         if fence {
-            let Some(envelope) = &self.envelope else {
-                return self.emit_error(PutObjectError::BlobWriteFailed(BlobError::from(
-                    AbeError::Context,
-                )));
-            };
-            if let Err(error) = envelope.anchored(&parameters, epoch) {
-                return self.emit_error(PutObjectError::BlobWriteFailed(BlobError::from(error)));
-            }
+            let envelope = self.envelope.as_ref().ok_or(failed(AbeError::Context))?;
+            envelope.anchored(&parameters, epoch).map_err(failed)?;
             return self.start_fence();
         }
         self.envelope_plan = Some(EnvelopePlan {
             parameters,
             epoch,
-            write_id: Ulid::generate(),
+            write_id: self.ids.mint(self.now_ms),
             object_key: self.config.request.key.clone(),
-            bucket_public: self.seal_plan.map(|p| p.public_key).unwrap_or_default(),
+            bucket_public: plan.public_key,
         });
         self.write_blob()
     }
-    pub(super) fn store_envelope(&mut self) -> Effects {
+
+    pub(super) fn store_envelope(&mut self) -> Turn {
         let Some(envelope) = &self.envelope else {
             return self.write_copy_owner();
         };
@@ -78,17 +56,12 @@ impl PutObjectOperation {
             let location = self.get_output().ok_or(AbeError::Context)?;
             let version = self.version_key(version_id);
             let limit = self.rocrate_limits.metadata_bytes;
-            let rows = (&self.metadata, limit, self.txn_id);
-            envelope_write(envelope, &version, location, rows)
+            located_rows(envelope, &version, location, (&self.metadata, limit))
         })();
-        match result {
-            Ok((effect, charge)) => {
-                self.envelope_bytes = charge;
-                self.state = PutObjectState::WriteEnvelope;
-                smallvec![effect]
-            }
-            Err(error) => self.emit_error(PutObjectError::BlobWriteFailed(BlobError::from(error))),
-        }
+        let (rows, charge) =
+            result.map_err(|error| PutObjectError::BlobWriteFailed(BlobError::from(error)))?;
+        self.envelope_bytes = charge;
+        self.call(PutObjectState::WriteEnvelope, IoCall::Write(rows))
     }
 }
 
@@ -101,6 +74,13 @@ pub(crate) fn abe_reads(key: BucketKeyRef) -> Vec<(String, Key)> {
             key.bucket_id.to_bytes().to_vec().into(),
         ),
     ]
+}
+
+/// The values of a read as the keyed rows `parse_abe` takes.
+pub(crate) fn keyed(values: &[Option<Value>]) -> Vec<(Key, Option<Value>)> {
+    (values.iter())
+        .map(|value| (Key::from(Vec::new()), value.clone()))
+        .collect()
 }
 
 /// Parses the answer to `abe_reads(key)`; the parameters must belong to `key`.
@@ -120,13 +100,16 @@ pub(crate) fn parse_abe(
     Ok((parameters, epoch))
 }
 
-/// The write publishing `envelope` for `version` stored at `location`, with its usage charge.
-pub(crate) fn envelope_write(
+/// The rows of a write and the usage charge they add.
+pub(crate) type ChargedRows = (Vec<(KeySpace, Key, Value)>, u64);
+
+/// The rows publishing `envelope` for `version` stored at `location`, with its usage charge.
+pub(crate) fn located_rows(
     envelope: &ObjectEnvelope,
     version: &VersionKey,
     location: &BackendLocation,
-    rows: (&HashMap<String, String>, u64, Option<TxnId>),
-) -> Result<(Effect, u64), AbeError> {
+    rows: (&HashMap<String, String>, u64),
+) -> Result<ChargedRows, AbeError> {
     // A pending multipart archive has no location key until it is hashed.
     let location_key = location.location_key().map(|key| key.to_bytes());
     let archive = EnvelopeArchive {
@@ -141,8 +124,8 @@ pub(crate) fn envelope_rows(
     envelope: &ObjectEnvelope,
     version: &VersionKey,
     archive: &EnvelopeArchive,
-    (metadata, limit, txn_id): (&HashMap<String, String>, u64, Option<TxnId>),
-) -> Result<(Effect, u64), AbeError> {
+    (metadata, limit): (&HashMap<String, String>, u64),
+) -> Result<ChargedRows, AbeError> {
     let version = version.to_bytes().map_err(|_| AbeError::Context)?;
     let id = envelope.context.write_id.to_bytes().to_vec();
     let bytes = envelope.to_bytes()?;
@@ -169,8 +152,5 @@ pub(crate) fn envelope_rows(
             archive_bytes.into(),
         ),
     ];
-    Ok((
-        Effect::Storage(StorageEffect::BatchWrite { writes, txn_id }),
-        charge,
-    ))
+    Ok((writes, charge))
 }

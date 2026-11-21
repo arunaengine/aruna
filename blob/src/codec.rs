@@ -466,11 +466,11 @@ pub(crate) fn decode_frame(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Seeded xorshift bytes, so random samples are the same on every run.
-    fn random(len: usize, mut seed: u64) -> Vec<u8> {
+    pub(crate) fn random(len: usize, mut seed: u64) -> Vec<u8> {
         (0..len)
             .map(|_| {
                 seed ^= seed << 13;
@@ -626,8 +626,11 @@ mod tests {
         let digest = *blake3::hash(&large).as_bytes();
         let result = decode_frame(FRAME_SIZE, &digest, Bytes::from(large));
         assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));
-        // A frame without a declared size is refused too.
-        let open = zstd::stream::encode_all(&vec![0u8; 1024][..], 3).unwrap();
+        // A frame without a declared size is refused too; zstd declares it unless told not to.
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.include_contentsize(false).unwrap();
+        std::io::Write::write_all(&mut encoder, &vec![0u8; 1024]).unwrap();
+        let open = encoder.finish().unwrap();
         let digest = *blake3::hash(&open).as_bytes();
         let result = decode_frame(1024, &digest, Bytes::from(open));
         assert!(matches!(result, Err(BlobError::IntegrityCheckFailed(_))));

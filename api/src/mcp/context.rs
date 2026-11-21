@@ -6,13 +6,13 @@ use super::{
     JsonPayload, McpServer, empty_extras, explained, internal_error, parse_ulid, request_auth,
     server_error, tool_extras,
 };
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission, Role};
 use aruna_core::structs::identity::group::Group;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
-use aruna_operations::groups::get_group::{GetGroupConfig, GetGroupOperation};
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::{GetGroupConfig, GetGroupOperation};
 use aruna_operations::groups::list_groups::ListGroupOperation;
-use aruna_operations::metadata::stats::count_group_purpose;
+use aruna_operations::metadata::stats::GroupPurposeOperation;
 use aruna_operations::realm::read_authorization::ReadAuthorizationOperation;
 use aruna_operations::users::read_document::{ReadUserError, ReadUserOperation};
 use rmcp::Json;
@@ -173,7 +173,8 @@ impl McpServer {
         };
         let mut groups = Vec::new();
         for group in member_groups(self, &auth).await? {
-            let counts = count_group_purpose(&self.state.get_ctx(), realm_id, group.group_id)
+            let count = GroupPurposeOperation::new(realm_id, group.group_id);
+            let counts = drive(count, self.state.get_ctx().as_ref())
                 .await
                 .map_err(internal_error)?
                 .ok_or_else(|| {
@@ -214,7 +215,7 @@ impl McpServer {
         authorize_read(self, &auth, tool_extras("get_group", &input)?).await?;
         group_argument(&input.group_id)?;
         let response =
-            crate::routes::groups::run_get_group(&self.state, Some(auth), &input.group_id)
+            crate::routes::access::groups::run_get_group(&self.state, Some(auth), &input.group_id)
                 .await
                 .map_err(group_error)?;
         json_output(response)
@@ -236,10 +237,13 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         authorize_read(self, &auth, tool_extras("list_group_members", &input)?).await?;
         group_argument(&input.group_id)?;
-        let response =
-            crate::routes::groups::run_group_members(&self.state, Some(auth), &input.group_id)
-                .await
-                .map_err(group_error)?;
+        let response = crate::routes::access::groups::run_group_members(
+            &self.state,
+            Some(auth),
+            &input.group_id,
+        )
+        .await
+        .map_err(group_error)?;
         json_output(response)
     }
 
@@ -259,10 +263,13 @@ impl McpServer {
         let auth = request_auth(&parts)?;
         authorize_read(self, &auth, tool_extras("get_group_usage", &input)?).await?;
         group_argument(&input.group_id)?;
-        let response =
-            crate::routes::groups::run_group_usage(&self.state, Some(auth), &input.group_id)
-                .await
-                .map_err(group_error)?;
+        let response = crate::routes::access::groups::run_group_usage(
+            &self.state,
+            Some(auth),
+            &input.group_id,
+        )
+        .await
+        .map_err(group_error)?;
         json_output(response)
     }
 

@@ -3,14 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub(crate) mod documents;
+pub mod documents;
 pub(crate) mod harvests;
 pub(crate) mod links;
-pub(crate) mod query;
-pub(crate) mod references;
+pub mod query;
+pub mod references;
 pub(crate) mod repositories;
-pub(crate) mod rocrate;
-pub(crate) mod validation;
+pub mod rocrate;
+pub mod validation;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -22,20 +22,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 #[derive(OpenApi)]
-#[openapi(
-    tags(
-        (name = "metadata/documents", description = "Metadata document lifecycle"),
-        (name = "metadata/query", description = "Metadata search and SPARQL"),
-        (name = "metadata/references", description = "Metadata reference resolution"),
-        (name = "metadata/rocrate", description = "RO-Crate document operations"),
-        (name = "metadata/repository", description = "Repository search, import, publication and requirement checks"),
-        (name = "metadata/repositories", description = "Invenio and OAI-PMH repository connectors"),
-        (name = "metadata/git", description = "Native ARC repositories and Git LFS transfers"),
-        (name = "metadata/versions", description = "Dataset versions, branches, tags and merges as plain JSON"),
-        (name = "metadata/validation", description = "Metadata profile validation")
-    ),
-    components(schemas(crate::metadata::MetadataRoCrateView))
-)]
+#[openapi(components(schemas(crate::metadata::model::MetadataRoCrateView)))]
 pub struct MetadataApiDoc;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {

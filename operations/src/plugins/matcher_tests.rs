@@ -4,35 +4,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{SourceKind, journal_entries};
+use aruna_core::plugin_runs::SourceKind;
 use aruna_core::structs::identity::realm::RealmId;
 
 use super::*;
-use crate::plugins::install::read_config;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::lifecycle::set_grants;
-use crate::plugins::worker::tests::{created, installed, scoped, synced};
-
-/// Journals `event` on this node as a committing transaction would.
-pub(crate) async fn journal(fixture: &Fixture, event: &SourceEvent) {
-    let rows = (journal_entries(event).unwrap().into_iter())
-        .map(|(_, key, value)| (key.to_vec(), value.to_vec()))
-        .collect();
-    (Txn::direct(&fixture.ctx))
-        .write(EVENT_JOURNAL_KEYSPACE, rows)
-        .await
-        .unwrap();
-}
-
-/// The forward rows of `install` on this node, in journal order.
-pub(crate) async fn forwarded(fixture: &Fixture, install: &PluginInstall) -> Vec<String> {
-    let txn = Txn::direct(&fixture.ctx);
-    let prefix = install.install_id.to_bytes();
-    let rows = txn.scan(PLUGIN_OUTBOX_KEYSPACE, &prefix).await.unwrap();
-    (rows.into_iter())
-        .map(|(_, value)| decode::<ForwardRow>(&value).unwrap().event.resource)
-        .collect()
-}
+use crate::plugins::calls::*;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
+use aruna_core::plugin_runs::EVENTS_QUEUED;
+use aruna_core::plugin_runs::journal_key;
+use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+#[allow(unused_imports)]
+use aruna_test_support::plugins::flows::matcher::{config, forwarded, journal};
+use aruna_test_support::plugins::rows::Txn;
+use aruna_test_support::plugins::{created, scoped, synced};
 
 pub(crate) async fn gap(
     fixture: &Fixture,
@@ -51,12 +38,6 @@ async fn pending(fixture: &Fixture) -> usize {
         .await
         .unwrap()
         .len()
-}
-
-pub(crate) async fn config(fixture: &Fixture) -> RealmConfigDocument {
-    read_config(&fixture.ctx, fixture.actor.realm_id)
-        .await
-        .unwrap()
 }
 
 #[tokio::test]
@@ -79,7 +60,13 @@ async fn narrowed_grants() {
     journal(&fixture, &inside).await;
     journal(&fixture, &outside).await;
     let local = fixture.actor.node_id;
-    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/one"]);
     assert_eq!(pending(&fixture).await, 0);
@@ -104,7 +91,13 @@ async fn narrowed_sync() {
         journal(&fixture, event).await;
     }
     let local = fixture.actor.node_id;
-    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
 }
@@ -116,12 +109,21 @@ async fn rows_commit_once() {
     let install = installed(&fixture).await;
     let (local, config) = (fixture.actor.node_id, config(&fixture).await);
     journal(&fixture, &created(&install, "D1").0).await;
-    match_pending(&fixture.ctx, &config, local, 10)
+    match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED))
         .await
         .unwrap();
-    journal(&fixture, &created(&install, "D2").0).await;
-    assert_eq!(match_pending(&fixture.ctx, &config, local, 10).await, Ok(1));
-    assert_eq!(match_pending(&fixture.ctx, &config, local, 10).await, Ok(0));
+    // Rows of one millisecond have no set order, so the later event gets a later time.
+    let mut later = created(&install, "D2").0;
+    (later.journaled_ms, later.anchor_ms) = (2, 2);
+    journal(&fixture, &later).await;
+    assert_eq!(
+        match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await,
+        Ok(1)
+    );
+    assert_eq!(
+        match_journal(&fixture.ctx, &config, local, (10, EVENTS_QUEUED)).await,
+        Ok(0)
+    );
     assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2"]);
 }
 
@@ -136,7 +138,7 @@ async fn bound_and_stale() {
         (event.journaled_ms, event.anchor_ms) = (journaled_ms, journaled_ms);
         journal(&fixture, &event).await;
     }
-    let read = match_bounded(&fixture.ctx, &config, local, now, 2).await;
+    let read = match_journal(&fixture.ctx, &config, local, (now, 2)).await;
     assert_eq!(read.unwrap(), 4);
     assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2"]);
     let full = gap(&fixture, &install, GapReason::Full).await.unwrap();
@@ -156,7 +158,13 @@ async fn user_node_clears() {
         owner: fixture.actor.user_id,
     };
     journal(&fixture, &created(&install, "D1").0).await;
-    let read = match_pending(&fixture.ctx, &config, fixture.actor.node_id, 10).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config,
+        fixture.actor.node_id,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 1);
     assert!(forwarded(&fixture, &install).await.is_empty());
     let txn = Txn::direct(&fixture.ctx);
@@ -211,7 +219,156 @@ async fn own_changes_skipped() {
     journal(&fixture, &own).await;
     journal(&fixture, &other).await;
     let local = fixture.actor.node_id;
-    let read = match_pending(&fixture.ctx, &config(&fixture).await, local, 10).await;
+    let read = match_journal(
+        &fixture.ctx,
+        &config(&fixture).await,
+        local,
+        (10, EVENTS_QUEUED),
+    )
+    .await;
     assert_eq!(read.unwrap(), 2);
     assert_eq!(forwarded(&fixture, &install).await, ["A/other"]);
+}
+
+/// A created dataset event of a fixed group at `anchor_ms`.
+fn plain_event(anchor_ms: u64) -> SourceEvent {
+    SourceEvent {
+        kind: SourceKind::DatasetCreated,
+        group_id: Ulid::from_parts(1, 9),
+        path: "/r/g/x/meta/a@d".into(),
+        resource: "d".into(),
+        revision: "e".into(),
+        source: format!("dataset_created/{anchor_ms}"),
+        actor: None,
+        anchor_ms,
+        journaled_ms: anchor_ms,
+    }
+}
+
+#[test]
+fn outbox_counts_gaps() {
+    let install = Ulid::from_parts(1, 1);
+    let mut outbox = Outbox::new(9, BTreeMap::from([(install, 1)]));
+    outbox
+        .offer((install, 1), b"j1", &plain_event(5), false, 2)
+        .unwrap();
+    // The bound is reached, then a stale row counts too.
+    outbox
+        .offer((install, 1), b"j2", &plain_event(6), false, 2)
+        .unwrap();
+    outbox
+        .offer((install, 1), b"j3", &plain_event(4), true, 2)
+        .unwrap();
+    outbox.lost_range(
+        install,
+        (SourceKind::DataUploaded, GapReason::Pruned),
+        (1, 3),
+    );
+    let IoCall::Read(reads) = outbox.gap_ask() else {
+        panic!("gap rows are read once each");
+    };
+    assert_eq!(reads.len(), 3);
+    let full = gap_key(install, SourceKind::DatasetCreated, GapReason::Full);
+    let mut kept = GapRow::new(SourceKind::DatasetCreated, GapReason::Full);
+    kept.add(1);
+    let values: Vec<_> = (reads.iter())
+        .map(|(_, key)| (**key == *full).then(|| encode(&kept).unwrap()))
+        .collect();
+    let rows = outbox.rows(values).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].0, PLUGIN_OUTBOX_KEYSPACE);
+    let counted: GapRow = (rows.iter())
+        .find(|(_, key, _)| key.to_vec() == full)
+        .map(|(_, _, value)| decode(value).unwrap())
+        .unwrap();
+    assert_eq!(
+        (counted.count, counted.earliest_ms, counted.latest_ms),
+        (2, 1, 6)
+    );
+    let short = Outbox::new(9, BTreeMap::new());
+    assert!(Outbox::new(9, BTreeMap::new()).rows(vec![None]).is_err());
+    assert_eq!(short.rows(Vec::new()).unwrap(), Vec::new());
+}
+
+#[test]
+fn counting_pages() {
+    let (first, second) = (Ulid::from_parts(1, 1), Ulid::from_parts(1, 2));
+    let mut counting = Counting::new(BTreeSet::from([first, second]), 5);
+    let Some(IoCall::Page { prefix, limit, .. }) = counting.ask() else {
+        panic!("each install's queue is counted");
+    };
+    assert_eq!((prefix.to_vec(), limit), (first.to_bytes().to_vec(), 5));
+    counting
+        .take(page_result(vec![(vec![1], Vec::new())], None))
+        .unwrap();
+    counting.take(page_result(Vec::new(), None)).unwrap();
+    assert_eq!(counting.ask(), None);
+    assert!(counting.take(page_result(Vec::new(), None)).is_err());
+    assert_eq!(
+        counting.counted(),
+        BTreeMap::from([(first, 1), (second, 0)])
+    );
+}
+
+#[test]
+fn user_pending_dropped() {
+    let mut plan = MatchPage {
+        targets: Vec::new(),
+        keep: false,
+        now_ms: 9,
+        bound: 2,
+        phase: MatchPhase::Reading,
+    };
+    assert!(matches!(
+        plan.first().unwrap(),
+        Next::Call(IoCall::Page { .. })
+    ));
+    let event = plain_event(5);
+    let pending = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 3));
+    let rows = vec![(pending.clone(), event.to_bytes().unwrap())];
+    // A user node keeps no journal: nothing to count, no gap to read.
+    assert_eq!(
+        plan.next(page_result(rows, None)).unwrap(),
+        Next::Call(read_call(Vec::new()))
+    );
+    let Next::Call(IoCall::Write(written)) = plan.next(values_result(Vec::new())).unwrap() else {
+        panic!("the page writes no forward row");
+    };
+    assert!(written.is_empty());
+    let Next::Call(IoCall::Delete(keys)) = plan.next(IoResult::Done).unwrap() else {
+        panic!("the pending, kept and source rows go");
+    };
+    assert_eq!(keys.len(), 3);
+    assert_eq!(
+        keys[0],
+        (EVENT_JOURNAL_KEYSPACE.to_string(), pending.into())
+    );
+    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(1));
+    // An empty page reads nothing more.
+    let mut empty = MatchPage {
+        targets: Vec::new(),
+        keep: true,
+        now_ms: 9,
+        bound: 2,
+        phase: MatchPhase::Reading,
+    };
+    assert_eq!(
+        empty.next(page_result(Vec::new(), None)).unwrap(),
+        Next::Done(0)
+    );
+}
+
+#[test]
+fn journal_reads_pages() {
+    let mut matching = MatchJournal::new((Vec::new(), true), 5, 9);
+    assert!(matches!(matching.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let full = child_result(Ok::<usize, StoreError>(JOURNAL_PAGE));
+    let again = matching.next(full);
+    assert!(matches!(again, Ok(Next::Call(IoCall::Child(_)))));
+    let last = child_result(Ok::<usize, StoreError>(3));
+    assert_eq!(matching.next(last), Ok(Next::Done(JOURNAL_PAGE + 3)));
+    let mut failed = MatchJournal::new((Vec::new(), true), 5, 9);
+    let error = StoreError("down".into());
+    let refused = failed.next(child_result(Err::<usize, _>(error.clone())));
+    assert_eq!(refused, Err(error));
 }

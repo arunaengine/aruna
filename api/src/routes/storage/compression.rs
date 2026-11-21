@@ -3,25 +3,26 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::errors::StorageError;
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
-use aruna_operations::driver::{drive, now_ms};
+use aruna_drivers::driver::drive;
+use aruna_operations::replication::plaintext::EncryptionCheckOperation;
 use aruna_operations::s3::bucket::compression::{
     MigrationStatusOperation, PutCompressionError, PutCompressionOperation,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::key_status::bucket_settings;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -31,13 +32,8 @@ const DEFAULT_LEVEL: u8 = 3;
 /// Saves at most this often for one request; the migration task updates the record a save reads.
 const PUT_ATTEMPTS: usize = 5;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageCompressionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageCompressionDoc::openapi())
-        .routes(routes!(get_bucket_compression, put_bucket_compression))
+    OpenApiRouter::new().routes(routes!(get_bucket_compression, put_bucket_compression))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
@@ -179,7 +175,6 @@ impl TryFrom<BucketCompressionRequest> for Compression {
                 }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse)
     ),
@@ -187,15 +182,14 @@ impl TryFrom<BucketCompressionRequest> for Compression {
 )]
 pub async fn get_bucket_compression(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<BucketCompressionResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = drive(GetBucketOperation::new(bucket.clone()), &state.get_ctx())
         .await
         .map_err(|error| match error {
             GetBucketError::NotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?;
     crate::auth::ensure_permission(
         &state,
@@ -214,12 +208,14 @@ pub async fn get_bucket_compression(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let migration = migration.filter(|migration| migration.target == info.compression);
-    let encrypted = bucket_settings(&state.get_ctx(), &bucket)
-        .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
-        .is_encrypted();
+    let encrypted = drive(
+        EncryptionCheckOperation::new(&bucket, false),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
     let mut response = BucketCompressionResponse::new(bucket, info.compression, migration);
     response.effective_level = info.compression.pithos_level().filter(|_| encrypted);
     Ok(Json(response))
@@ -266,7 +262,6 @@ pub async fn get_bucket_compression(
             example = json!({ "bucket": "research-raw", "mode": "zstd", "level": 9 })
         ),
         (status = 400, description = "Unknown mode, a level outside 1 to 22, or a level with `off`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node, or no longer owned by the authorized group", body = ErrorResponse),
         (status = 409, description = "`transition_running`: an encryption transition of the bucket is unfinished; `bucket_busy`: the save kept conflicting with the running re-encoding", body = ErrorResponse)
@@ -275,24 +270,27 @@ pub async fn get_bucket_compression(
 )]
 pub async fn put_bucket_compression(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<BucketCompressionRequest>,
 ) -> ServerResult<Json<BucketCompressionResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let compression = Compression::try_from(request)?;
     let group_id = drive(GetBucketOperation::new(bucket.clone()), &state.get_ctx())
         .await
         .map_err(|error| match error {
             GetBucketError::NotFound => ServerError::NotFound,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })?
         .group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let mut attempts = 1;
     let migration = loop {
-        let operation =
-            PutCompressionOperation::new(bucket.clone(), group_id, compression, now_ms());
+        let operation = PutCompressionOperation::new(
+            bucket.clone(),
+            group_id,
+            compression,
+            unix_timestamp_millis(),
+        );
         match drive(operation, &state.get_ctx()).await {
             // A refused commit wrote nothing, so the save runs again.
             Err(PutCompressionError::StorageError(StorageError::TransactionConflict))
@@ -336,7 +334,7 @@ fn put_refusal(error: PutCompressionError) -> ServerError {
                     .to_string(),
             )
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 

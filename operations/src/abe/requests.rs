@@ -3,16 +3,19 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::notifications::outbox::new_outbox_record;
 use aruna_core::request_policy::CompiledPolicySet;
 use aruna_core::storage_entries::outbox_write_entry;
 use aruna_core::structs::execution::notification::{
-    NotificationClass, NotificationKind, NotificationRecord,
+    NotificationClass, NotificationKind, NotificationRecord, new_outbox_record,
 };
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketHolder, HolderOrigin};
+use aruna_core::user::id::UserId;
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
+
+/// Bucket holders read per page before the pending request is announced to them.
+pub(super) const HOLDER_PAGE: usize = 256;
 
 impl KeyOperation {
     /// Checks the bucket-wide request bindings that do not depend on the recipient.
@@ -97,7 +100,7 @@ impl KeyOperation {
     }
     /// Continues only while the token's credential is live, the recipient's, in the bucket's
     /// group and issued by this node; reading it here makes a revocation conflict.
-    pub(super) fn credential_read(&mut self, value: Option<Value>) -> Effects {
+    pub(super) fn credential_read(&mut self, value: Option<Value>) -> KeyTurn {
         let now = SystemTime::UNIX_EPOCH + Duration::from_millis(self.now);
         let live = value
             .and_then(|v| UserAccess::from_bytes(&v).ok())
@@ -121,13 +124,11 @@ impl KeyOperation {
             _ => None,
         }
     }
-    pub(super) fn records_read(&mut self, event: Event) -> Effects {
+    pub(super) fn records_read(&mut self, result: IoResult) -> KeyTurn {
         let action = self.action.clone();
-        match (action, event) {
-            (
-                KeyAction::Publish(submitted),
-                Event::Storage(StorageEvent::ReadResult { value, .. }),
-            ) => {
+        match (action, result) {
+            (KeyAction::Publish(submitted), IoResult::Values(read)) => {
+                let value = read.into_iter().next().flatten();
                 if !self.snapshot.as_ref().is_some_and(|s| s.holder)
                     || self.auth.path_restrictions.is_some()
                     || submitted.context.issuer != KeyIssuer::User(self.auth.user_id)
@@ -146,13 +147,12 @@ impl KeyOperation {
                     Err(error) => self.fail(error),
                 }
             }
-            (
-                KeyAction::Request(scope),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
-            ) => self.request_read(scope, values),
+            (KeyAction::Request(scope), IoResult::Page { rows: values, .. }) => {
+                self.request_read(scope, values)
+            }
             (
                 KeyAction::Member(_) | KeyAction::Token { .. } | KeyAction::Writes(_),
-                Event::Storage(StorageEvent::IterResult { values, .. }),
+                IoResult::Page { rows: values, .. },
             ) => match self.scopes.pop() {
                 Some(scope) => {
                     self.group_epoch = self.groups.pop();
@@ -160,7 +160,7 @@ impl KeyOperation {
                 }
                 None => self.fail(AbeError::Context),
             },
-            (KeyAction::Open(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            (KeyAction::Open(_), IoResult::Page { rows: values, .. }) => {
                 let next = page_end(&values);
                 let mut requests = Vec::new();
                 for (key, value) in values.into_iter().take(MAX_REQUESTS) {
@@ -177,7 +177,7 @@ impl KeyOperation {
                 self.result = Some(KeyResult::Requests(requests, next));
                 self.flush()
             }
-            (KeyAction::Grants(_), Event::Storage(StorageEvent::IterResult { values, .. })) => {
+            (KeyAction::Grants(_), IoResult::Page { rows: values, .. }) => {
                 let next = page_end(&values);
                 let mut grants = Vec::new();
                 for (key, value) in values.into_iter().take(MAX_REQUESTS) {
@@ -204,7 +204,7 @@ impl KeyOperation {
             _ => self.fail(AbeError::Context),
         }
     }
-    fn request_read(&mut self, scope: KeyScope, values: Vec<(Key, Value)>) -> Effects {
+    fn request_read(&mut self, scope: KeyScope, values: Vec<(Key, Value)>) -> KeyTurn {
         if let Err(error) = self.scope_allowed(&scope) {
             return self.fail(error);
         }
@@ -260,7 +260,7 @@ impl KeyOperation {
                         .map(|k| (k.record_id, k.public_key, k.fingerprint)),
                 };
                 KeyRequest {
-                    request_id: Ulid::generate(),
+                    request_id: self.ids.mint(self.now),
                     requesting_user: self.recipient(),
                     recipient_user: self.recipient(),
                     recipient_record: key.map(|k| k.0),
@@ -281,17 +281,16 @@ impl KeyOperation {
             let prefix = request.prefix();
             self.request = Some(request);
             self.state = State::Reuse;
-            return smallvec![Effect::Storage(StorageEffect::Iter {
-                key_space: ABE_GRANT_KEYSPACE.to_string(),
-                prefix: Some(prefix.into()),
-                start: None,
+            return Ok(Next::Call(IoCall::Page {
+                space: ABE_GRANT_KEYSPACE.to_string(),
+                prefix: prefix.into(),
+                after: None,
                 limit: MAX_REQUESTS + 1,
-                txn_id: self.txn
-            })];
+            }));
         }
         self.issue(request)
     }
-    pub(super) fn reuse_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    pub(super) fn reuse_read(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
         let (Some(mut request), Some(snapshot)) = (self.request.take(), self.snapshot.as_ref())
         else {
             return self.fail(KeyError::Missing);
@@ -385,7 +384,7 @@ impl KeyOperation {
         }
         self.issue(request)
     }
-    fn issue(&mut self, request: KeyRequest) -> Effects {
+    fn issue(&mut self, request: KeyRequest) -> KeyTurn {
         if let Err(error) = request.to_bytes() {
             return self.fail(error);
         }
@@ -397,27 +396,25 @@ impl KeyOperation {
         self.state = State::Issue;
         let issuer = KeyIssuer::Node(self.node);
         let context = GrantContext { request, issuer };
-        smallvec![Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Issue(
-            context
-        ))))]
+        let issue = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Issue(context))));
+        Ok(Next::Call(IoCall::Effect(Box::new(issue))))
     }
-    pub(super) fn publish_grant(&mut self, grant: KeyGrant) -> Effects {
+    pub(super) fn publish_grant(&mut self, grant: KeyGrant) -> KeyTurn {
         if let Err(error) = self.current_request(&grant.context.request) {
             return self.fail(error);
         }
         let prefix = grant.context.request.prefix();
         self.result = Some(KeyResult::Grant(grant));
         self.state = State::Count;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ABE_GRANT_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        Ok(Next::Call(IoCall::Page {
+            space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: MAX_REQUESTS + 1,
-            txn_id: self.txn
-        })]
+        }))
     }
     /// Writes the grant only while the recipient stores fewer than `MAX_REQUESTS` grants.
-    pub(super) fn count_read(&mut self, values: Vec<(Key, Value)>) -> Effects {
+    pub(super) fn count_read(&mut self, values: Vec<(Key, Value)>) -> KeyTurn {
         let Some(KeyResult::Grant(grant)) = self.result.take() else {
             return self.fail(AbeError::Context);
         };
@@ -460,21 +457,20 @@ impl KeyOperation {
         self.flush()
     }
     /// Scans the recipient's grants again for the next batch of `request`'s scope.
-    pub(super) fn next_batch(&mut self, mut request: KeyRequest) -> Effects {
-        request.request_id = Ulid::generate();
+    pub(super) fn next_batch(&mut self, mut request: KeyRequest) -> KeyTurn {
+        request.request_id = self.ids.mint(self.now);
         request.created_at_ms = self.now;
         let prefix = request.prefix();
         self.request = Some(request);
         self.state = State::Reuse;
-        smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: ABE_GRANT_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
+        Ok(Next::Call(IoCall::Page {
+            space: ABE_GRANT_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after: None,
             limit: MAX_REQUESTS + 1,
-            txn_id: self.txn
-        })]
+        }))
     }
-    pub(super) fn write_request(&mut self, request: KeyRequest) -> Effects {
+    pub(super) fn write_request(&mut self, request: KeyRequest) -> KeyTurn {
         let bytes = match request.to_bytes() {
             Ok(v) => v,
             Err(error) => return self.fail(error),
@@ -502,7 +498,7 @@ impl KeyOperation {
 
 impl KeyOperation {
     /// Records the finished scope, then starts the next or notifies holders of new requests.
-    pub(super) fn next_scope(&mut self) -> Effects {
+    pub(super) fn next_scope(&mut self) -> KeyTurn {
         if let Some(KeyResult::Request(request)) = self.result.take() {
             self.opened.push(request.request_id);
             self.fresh |= !self.reused;
@@ -521,53 +517,109 @@ impl KeyOperation {
         self.flush()
     }
     /// Reads the bucket holders, including a caller who holds the bucket key.
-    pub(super) fn holders(&mut self) -> Option<Effects> {
+    pub(super) fn holders(&mut self) -> Option<KeyTurn> {
+        let snapshot = self.snapshot.as_ref()?;
+        self.role_holders = snapshot.holders.iter().copied().collect();
+        self.explicit_started = false;
+        Some(self.role_batch())
+    }
+    /// Tells the role holders in chunks of `HOLDER_PAGE`, then reads the explicit holders.
+    fn role_batch(&mut self) -> KeyTurn {
+        while !self.role_holders.is_empty() {
+            let take = self.role_holders.len().min(HOLDER_PAGE);
+            let chunk: Vec<UserId> = self.role_holders.drain(..take).collect();
+            let notices = match self.notices(chunk) {
+                Ok(notices) => notices,
+                Err(error) => return self.fail(error),
+            };
+            if !notices.is_empty() {
+                self.notify = true;
+                self.state = State::HolderWrite;
+                return Ok(Next::Call(IoCall::Write(notices)));
+            }
+        }
+        self.explicit_started = true;
+        match self.holder_page(None) {
+            Some(turn) => turn,
+            None => self.flush(),
+        }
+    }
+    /// One page of bucket holders after the holder key `after`.
+    fn holder_page(&mut self, after: Option<Key>) -> Option<KeyTurn> {
         let snapshot = self.snapshot.as_ref()?;
         let prefix = snapshot.parameters.key.bucket_id.to_bytes().to_vec();
         self.state = State::Holders;
-        Some(smallvec![Effect::Storage(StorageEffect::Iter {
-            key_space: BUCKET_HOLDER_KEYSPACE.to_string(),
-            prefix: Some(prefix.into()),
-            start: None,
-            limit: usize::MAX,
-            txn_id: self.txn
-        })])
+        Some(Ok(Next::Call(IoCall::Page {
+            space: BUCKET_HOLDER_KEYSPACE.to_string(),
+            prefix: prefix.into(),
+            after,
+            limit: HOLDER_PAGE,
+        })))
     }
-    /// Tells every current holder except the member that the member waits for keys.
-    pub(super) fn notify_holders(&mut self, values: Vec<(Key, Value)>) -> Effects {
-        let (Some(info), Some(snapshot)) = (&self.info, &self.snapshot) else {
-            return self.fail(KeyError::Missing);
-        };
-        let mut holders = snapshot.holders.clone();
+    /// Tells the explicit holders of one page that the member waits for keys; each page's
+    /// notices are written before the next page is read, and the told set keeps users apart.
+    pub(super) fn holders_read(&mut self, page: (Vec<(Key, Value)>, Option<Key>)) -> KeyTurn {
+        let (values, next) = page;
+        self.explicit_started = true;
+        let mut holders = Vec::new();
         for (_, value) in values {
             match BucketHolder::from_bytes(&value) {
                 Ok(holder) if holder.origin == HolderOrigin::Explicit => {
-                    holders.insert(holder.user_id);
+                    holders.push(holder.user_id);
                 }
                 Ok(_) => {}
                 Err(_) => return self.fail(AbeError::Context),
             }
         }
+        let notices = match self.notices(holders) {
+            Ok(notices) => notices,
+            Err(error) => return self.fail(error),
+        };
+        self.holder_next = next;
+        if notices.is_empty() {
+            return self.holders_written();
+        }
+        self.notify = true;
+        self.state = State::HolderWrite;
+        Ok(Next::Call(IoCall::Write(notices)))
+    }
+    /// The next role holder chunk or holder page, or the remaining writes once all were told.
+    pub(super) fn holders_written(&mut self) -> KeyTurn {
+        if !self.explicit_started {
+            return self.role_batch();
+        }
+        match (self.holder_next.take()).and_then(|after| self.holder_page(Some(after))) {
+            Some(turn) => turn,
+            None => self.flush(),
+        }
+    }
+    /// The outbox rows telling `holders` the member waits: each user once, never the member or
+    /// a user of another realm, who has no inbox here and sees requests on the bucket page.
+    fn notices(&mut self, holders: Vec<UserId>) -> Result<Vec<(String, Key, Value)>, KeyError> {
         let member = self.recipient();
-        holders.remove(&member);
-        // Users of another realm have no inbox here; they see requests on the bucket page.
-        holders.retain(|holder| holder.realm_id == self.auth.realm_id);
+        let info = self.info.as_ref().ok_or(KeyError::Missing)?;
         let kind = NotificationKind::BucketKeyPending {
             bucket: self.bucket.clone(),
             node_id: self.node,
             group_id: info.group_id,
             member_user_id: member,
         };
+        let mut rows = Vec::new();
         for holder in holders {
-            let class = NotificationClass::Direct;
-            let record = NotificationRecord::new(holder, class, kind.clone(), self.now);
-            match outbox_write_entry(&new_outbox_record(record)) {
-                Ok(entry) => self.writes.push(entry),
-                Err(_) => return self.fail(KeyError::Storage),
+            if holder == member
+                || holder.realm_id != self.auth.realm_id
+                || !self.notified.insert(holder)
+            {
+                continue;
             }
+            let class = NotificationClass::Direct;
+            let id = self.ids.mint(self.now);
+            let record = NotificationRecord::new(id, holder, class, kind.clone(), self.now);
+            let outbox_id = self.ids.mint(self.now);
+            let entry = outbox_write_entry(&new_outbox_record(outbox_id, record));
+            rows.push(entry.map_err(|_| KeyError::Storage)?);
         }
-        self.notify = !self.writes.is_empty();
-        self.flush()
+        Ok(rows)
     }
 }
 

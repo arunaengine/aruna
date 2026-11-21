@@ -9,13 +9,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use crate::shared::write_value;
+use aruna_api::auth::RealmAuth;
 use aruna_api::error::ServerError;
 use aruna_api::routes::storage::deletion::{
     DeleteImpactRequest, DeletionPreflightRequest, PurgeScopeRequest, SubmitPurgeRequest,
     delete_preview, deletion_preflight, submit_purge,
 };
 use aruna_api::server::state::ServerState;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -31,9 +32,10 @@ use aruna_core::structs::storage::blob::{
     BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, BucketInfo,
     CurrentVersionPointer, VersionKey,
 };
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -46,23 +48,6 @@ struct Fixture {
     _directory: TempDir,
     state: Arc<ServerState>,
     auth: AuthContext,
-}
-
-async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let event = state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
 }
 
 async fn setup() -> Fixture {
@@ -82,9 +67,10 @@ async fn setup() -> Fixture {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: Some(TaskHandle::new()),
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id,
@@ -251,7 +237,7 @@ async fn preflight_counts_versions() {
     let fixture = setup().await;
     let (status, Json(file)) = deletion_preflight(
         State(fixture.state.clone()),
-        Extension(Some(fixture.auth.clone())),
+        RealmAuth(fixture.auth.clone()),
         Extension(None),
         Json(DeletionPreflightRequest {
             scope: PurgeScopeRequest::File {
@@ -278,7 +264,7 @@ async fn preflight_counts_versions() {
 
     let (_, Json(bucket)) = deletion_preflight(
         State(fixture.state.clone()),
-        Extension(Some(fixture.auth.clone())),
+        RealmAuth(fixture.auth.clone()),
         Extension(None),
         Json(DeletionPreflightRequest {
             scope: PurgeScopeRequest::Bucket {
@@ -311,7 +297,7 @@ async fn submission_is_idempotent() {
     };
     let (status, Json(first)) = submit_purge(
         State(fixture.state.clone()),
-        Extension(Some(fixture.auth.clone())),
+        RealmAuth(fixture.auth.clone()),
         Json(request.clone()),
     )
     .await
@@ -323,13 +309,10 @@ async fn submission_is_idempotent() {
         format!("https://node.test/api/v1/compute/jobs/{}", first.job_id)
     );
 
-    let (status, Json(replayed)) = submit_purge(
-        State(fixture.state),
-        Extension(Some(fixture.auth)),
-        Json(request),
-    )
-    .await
-    .unwrap();
+    let (status, Json(replayed)) =
+        submit_purge(State(fixture.state), RealmAuth(fixture.auth), Json(request))
+            .await
+            .unwrap();
     assert_eq!(status, StatusCode::OK);
     assert!(!replayed.created);
     assert_eq!(replayed.job_id, first.job_id);
@@ -347,7 +330,7 @@ async fn storage_files_confirmed() {
         confirm: confirm.map(str::to_string),
     };
     let state = || State(fixture.state.clone());
-    let auth = || Extension(Some(fixture.auth.clone()));
+    let auth = || RealmAuth(fixture.auth.clone());
     // The bucket's storage files go only with the bucket name typed back.
     for confirm in [None, Some("other")] {
         let refused = submit_purge(state(), auth(), Json(request(confirm))).await;
@@ -356,11 +339,7 @@ async fn storage_files_confirmed() {
     // A token limited to some paths may not delete files other keys could read.
     let mut restricted = fixture.auth.clone();
     restricted.path_restrictions = Some(Vec::new());
-    let refused = submit_purge(
-        state(),
-        Extension(Some(restricted)),
-        Json(request(Some("data"))),
-    );
+    let refused = submit_purge(state(), RealmAuth(restricted), Json(request(Some("data"))));
     assert!(matches!(refused.await, Err(ServerError::Forbidden)));
     let (status, _) = submit_purge(state(), auth(), Json(request(Some("data"))))
         .await
@@ -433,7 +412,7 @@ async fn previews_storage_files() {
         filter: None,
     };
     let state = || State(fixture.state.clone());
-    let auth = || Extension(Some(fixture.auth.clone()));
+    let auth = || RealmAuth(fixture.auth.clone());
     let bucket = || axum::extract::Path("data".to_string());
     let Json(first) = delete_preview(state(), auth(), bucket(), Json(request(None)))
         .await
@@ -481,7 +460,7 @@ async fn previews_storage_files() {
         limit: Some(10),
         ..request(None)
     };
-    let Json(seen) = delete_preview(state(), Extension(Some(limited)), bucket(), Json(whole))
+    let Json(seen) = delete_preview(state(), RealmAuth(limited), bucket(), Json(whole))
         .await
         .unwrap();
     let keys: Vec<_> = seen.items.iter().map(|item| item.key.as_str()).collect();
@@ -534,7 +513,7 @@ async fn bounds_filtered_preview() {
     };
     let Json(page) = delete_preview(
         State(fixture.state.clone()),
-        Extension(Some(fixture.auth.clone())),
+        RealmAuth(fixture.auth.clone()),
         axum::extract::Path("data".to_string()),
         Json(request),
     )
@@ -558,20 +537,22 @@ async fn shows_purge_pause() {
         confirm: None,
     };
     let state = || State(fixture.state.clone());
-    let auth = || Extension(Some(fixture.auth.clone()));
+    let auth = || RealmAuth(fixture.auth.clone());
     let (_, Json(job)) = submit_purge(state(), auth(), Json(request)).await.unwrap();
     let path = |action: &str| axum::extract::Path((job.job_id.clone(), action.to_string()));
     // A restricted token steers no purge of storage files.
     let mut restricted = fixture.auth.clone();
     restricted.path_restrictions = Some(Vec::new());
-    let refused = control_purge(state(), Extension(Some(restricted)), path("pause")).await;
+    let refused = control_purge(state(), RealmAuth(restricted), path("pause")).await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
-    let Json(paused) = control_purge(state(), auth(), path("pause")).await.unwrap();
+    let Json(paused) = control_purge(state(), RealmAuth(fixture.auth.clone()), path("pause"))
+        .await
+        .unwrap();
     assert_eq!((paused.state.as_str(), paused.paused), ("paused", true));
     let id = || axum::extract::Path(job.job_id.clone());
     let Json(shown) = get_purge(state(), auth(), id()).await.unwrap();
     assert!(shown.paused && shown.delete_storage_files);
-    let Json(resumed) = control_purge(state(), auth(), path("resume"))
+    let Json(resumed) = control_purge(state(), RealmAuth(fixture.auth.clone()), path("resume"))
         .await
         .unwrap();
     assert!(!resumed.paused);

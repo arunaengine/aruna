@@ -3,29 +3,34 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::ResourceEnvelope;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::keyspaces::{FAMILY_RECORD_KEYSPACE, JOB_RESERVATION_KEYSPACE};
 use aruna_core::scheduling::PlannedInput;
-use aruna_core::structs::execution::job::{
-    CapturedInput, EffectiveResources, JobFamilyRecord, JobPayload, JobRecord, JobRecordBody,
-    LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, JobRecordBody, LaunchIntent, LogicalJobSpec, PhysicalExecutionState,
 };
+use aruna_core::structs::execution::job::input::{CapturedInput, JobPayload};
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use super::resources;
 use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::lifecycle::held::HeldReservations;
+use crate::jobs::lifecycle::launch_admit::{already_running, existing_receipt};
+use crate::jobs::lifecycle::launch_checks::pin_matches;
 use crate::jobs::lifecycle::reservation::{
-    ExecutionReservation, MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
-    ReserveExecutionOperation, fits, held_reservations, job_reservation,
+    MAX_RESERVATION_SCAN, ReleaseExecutionOperation, ReserveExecutionConfig,
+    ReserveExecutionOperation, fits,
 };
 use crate::jobs::lifecycle::stage::read_targets;
-use crate::jobs::lifecycle::target::{already_running, existing_receipt, pin_matches};
-use crate::jobs::lifecycle::updates::chain_for;
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::jobs::store::iter_prefix_page;
-use crate::replication::protocol::BaoReadTarget;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
 use crate::tests::records::{Family, REALM, context, node};
+use aruna_core::replication_protocol::BaoReadTarget;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_storage::scan::iter_prefix_page;
 
 fn envelope(max_concurrent: u32) -> ResourceEnvelope {
     ResourceEnvelope {
@@ -33,16 +38,6 @@ fn envelope(max_concurrent: u32) -> ResourceEnvelope {
         max_ram_bytes: Some(8_192),
         max_disk_bytes: Some(16_384),
         max_concurrent: Some(max_concurrent),
-    }
-}
-
-fn resources() -> EffectiveResources {
-    EffectiveResources {
-        cpu_cores: 1,
-        ram_bytes: 1024,
-        disk_bytes: 2048,
-        max_walltime_ms: 60_000,
-        preemptible: false,
     }
 }
 
@@ -113,8 +108,11 @@ async fn reserve(
             resources: resources(),
             subject_generation: receipt.subject_generation,
             subject_digest: receipt.subject_digest,
+            config_generation: receipt.config_generation,
+            config_digest: receipt.config_digest,
             record: Box::new(record),
             now_ms: 4_000,
+            fence: None,
         }),
         ctx,
     )
@@ -125,20 +123,32 @@ async fn reserve(
 fn holds_static_ceilings() {
     // An unmeasured ceiling never filters; a measured one is exact and a zero
     // concurrency ceiling admits nothing at all.
-    let held = vec![ExecutionReservation {
+    let held = vec![JobReservationRecord {
         execution_id: Ulid::from_bytes([1u8; 16]),
-        job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
-        logical_job_id: aruna_core::structs::execution::job::JobId::from_bytes([2u8; 16]),
+        job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([2u8; 16]),
+        logical_job_id: aruna_core::structs::execution::job::identity::JobId::from_bytes([2u8; 16]),
         resources: resources(),
         created_at_ms: 1,
         subject_generation: 1,
         subject_digest: [0u8; 32],
+        config_clock: Default::default(),
+        backend: "default".to_string(),
+        config_generation: 0,
+        config_digest: [0; 32],
     }];
-    assert!(fits(&held, &resources(), &envelope(2)));
-    assert!(!fits(&held, &resources(), &envelope(1)));
-    assert!(fits(&held, &resources(), &ResourceEnvelope::default()));
+    assert!(fits(&held, "default", &resources(), &envelope(2)));
+    assert!(!fits(&held, "default", &resources(), &envelope(1)));
+    assert!(fits(
+        &held,
+        "default",
+        &resources(),
+        &ResourceEnvelope::default()
+    ));
+    // Another backend's reservations take nothing from this one's ceilings.
+    assert!(fits(&held, "lab", &resources(), &envelope(1)));
     assert!(!fits(
         &[],
+        "default",
         &resources(),
         &ResourceEnvelope {
             max_ram_bytes: Some(512),
@@ -155,7 +165,7 @@ async fn pages_reservations() {
     let writes = (0..=MAX_RESERVATION_SCAN)
         .map(|index| {
             let execution_id = Ulid::from(index as u128 + 1);
-            let reservation = ExecutionReservation {
+            let reservation = JobReservationRecord {
                 execution_id,
                 job_id: family.job_id,
                 logical_job_id: family.job_id,
@@ -163,6 +173,10 @@ async fn pages_reservations() {
                 created_at_ms: index as u64,
                 subject_generation: 1,
                 subject_digest: [0u8; 32],
+                config_clock: Default::default(),
+                backend: "default".to_string(),
+                config_generation: 0,
+                config_digest: [0; 32],
             };
             (
                 JOB_RESERVATION_KEYSPACE.to_string(),
@@ -181,7 +195,7 @@ async fn pages_reservations() {
         .await;
 
     assert_eq!(
-        held_reservations(&ctx)
+        drive(HeldReservations::all(), &ctx)
             .await
             .expect("reservation scan")
             .len(),
@@ -206,7 +220,7 @@ async fn reserves_exact_capacity() {
 
     assert_eq!(refused, LifecycleError::Capacity);
     assert_eq!(
-        held_reservations(&ctx)
+        drive(HeldReservations::all(), &ctx)
             .await
             .expect("reservation scan")
             .len(),
@@ -225,13 +239,14 @@ async fn persists_receipt_first() {
         .await
         .expect("offer is admitted");
 
-    let reservation = job_reservation(&ctx, spec.job_id)
+    let reservation = drive(HeldReservations::of_job(spec.job_id), &ctx)
         .await
         .expect("reservation scan")
+        .pop()
         .expect("reservation is durable");
     assert_eq!(reservation.execution_id, execution_id);
     assert!(
-        crate::jobs::store::read_job_record(&ctx.storage_handle, spec.job_id, None)
+        aruna_test_support::jobs::read_job_record(&ctx, spec.job_id, None)
             .await
             .expect("physical row read")
             .is_some()
@@ -294,9 +309,13 @@ async fn output_binds_receipt() {
         .await
         .expect("offer is admitted");
 
-    let chain = chain_for(&ctx, spec.job_id, execution_id)
-        .await
-        .expect("chain resolves");
+    let chain = drive(
+        ExecutionChainOperation::of_execution(spec.job_id, execution_id),
+        &ctx,
+    )
+    .await
+    .expect("chain read")
+    .expect("chain resolves");
     let receipt = family.receipt(&launch, 1);
     assert_eq!(chain.family, family.family());
     assert_eq!(chain.spec_digest, spec.spec_digest);
@@ -345,7 +364,7 @@ fn accepts_copy_pin() {
         destination_key: "in/reads.fastq".to_string(),
         source_node_id: ingress,
         version_id: Ulid::from_bytes([4u8; 16]),
-        content: aruna_core::structs::execution::job::InputContent::Blake3([5u8; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([5u8; 32]),
         bytes: 128,
         policies: Vec::new(),
         source_group_id: Default::default(),
@@ -374,7 +393,8 @@ fn accepts_copy_pin() {
     here.source_node_id = Some(local);
     assert!(!pin_matches(&captured, &here, ingress, local));
     let mut other_bytes = pin.clone();
-    other_bytes.content = aruna_core::structs::execution::job::InputContent::Blake3([6u8; 32]);
+    other_bytes.content =
+        aruna_core::structs::execution::job::input::InputContent::Blake3([6u8; 32]);
     assert!(!pin_matches(&captured, &other_bytes, ingress, local));
 }
 

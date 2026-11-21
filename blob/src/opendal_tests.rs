@@ -4,6 +4,7 @@
 
 use super::*;
 use aruna_core::egress::EgressPolicy;
+use aruna_core::testing::EnvGuard;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -37,37 +38,8 @@ fn env_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-/// Restores every swapped variable on drop, so a test that panics first
-/// still hands the process environment back unchanged.
-struct EnvGuard {
-    previous: Vec<(String, Option<String>)>,
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.previous.drain(..) {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-}
-
 fn swap_env(entries: &[(&str, Option<String>)]) -> EnvGuard {
-    EnvGuard {
-        previous: entries
-            .iter()
-            .map(|(key, value)| {
-                let previous = std::env::var(key).ok();
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
-                ((*key).to_string(), previous)
-            })
-            .collect(),
-    }
+    EnvGuard::swap(entries)
 }
 
 /// Loopback endpoint that counts inbound connections and answers 404, so a
@@ -87,6 +59,16 @@ impl CountingListener {
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
+                // Answering before the request is read resets the connection, which a client
+                // retries; a real server reads the head first.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < 65536 {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => head.extend_from_slice(&buf[..read]),
+                    }
+                }
                 let _ = socket
                     .write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -742,7 +724,7 @@ async fn list_applies_limit() {
 
     assert_eq!(entries.len(), 1);
     assert!(entries[0].path.starts_with("prefix/"));
-    assert_eq!(cursor, Some(ListCursor::Offset(1)));
+    assert_eq!(cursor, Some(ListCursor::Walk("prefix/a.txt".to_string())));
 
     request.cursor = cursor;
     let (entries, cursor) = list_operator(&operator, "prefix/", &request).await.unwrap();
@@ -809,11 +791,11 @@ async fn recursive_list_truncates() {
         entries[0].kind,
         aruna_core::structs::execution::source_access::SourceEntryKind::File
     );
-    assert_eq!(cursor, Some(ListCursor::Offset(1)));
+    assert_eq!(cursor, Some(ListCursor::Walk("prefix/a.txt".to_string())));
 }
 
-// A source without a provider cursor is walked from its start, so a page that reads too many
-// entries, directories included, fails instead of walking on.
+// A source without a provider cursor lists the directories on the cursor path again for every
+// page, so a page that reads too many entries, directories included, fails instead.
 #[tokio::test]
 async fn fallback_walk_bounded() {
     let dir = tempdir().unwrap();
@@ -832,12 +814,13 @@ async fn fallback_walk_bounded() {
     .unwrap();
     let request = list_request(1, true, true);
 
-    let refused = list_skipping(&operator, "prefix/", &request, (0, 3)).await;
+    let walk = || Walk::new("prefix/", Vec::new(), true);
+    let refused = list_walking(&operator, walk(), &request, 3).await;
     assert!(matches!(
         refused,
         Err(StagingSourceError::InvalidListing(_))
     ));
-    let (entries, _) = list_skipping(&operator, "prefix/", &request, (0, 100))
+    let (entries, _) = list_walking(&operator, walk(), &request, 100)
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
@@ -1183,9 +1166,9 @@ fn native_signs_alike() {
     );
 }
 
-// Local listings re-walk from the start as well, so they are capped like remote ones.
+// A local listing continues after a walked path, so a provider key cursor is refused.
 #[tokio::test]
-async fn local_skip_capped() {
+async fn local_key_refused() {
     use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_ROOT;
     let dir = tempdir().unwrap();
     tokio::fs::write(dir.path().join("a.txt"), b"a")
@@ -1206,7 +1189,7 @@ async fn local_skip_capped() {
         .await
         .unwrap();
     assert_eq!(entries.len(), 1);
-    request.cursor = Some(ListCursor::Offset(FALLBACK_SKIP_LIMIT as u64 + 1));
+    request.cursor = Some(ListCursor::After("a.txt".to_string()));
     let refused = list_staging_source(&test_guard(), &access, &request).await;
     assert!(matches!(
         refused,

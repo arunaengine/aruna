@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna_api::routes::info::InfoResponse;
-use aruna_api::server::state::client_bind_url;
 use aruna_core::structs::storage::backends::BackendsFile;
+use aruna_wire::address::client_bind_url;
+use aruna_wire::info::InfoResponse;
 use reqwest::Client;
 use serde::Serialize;
 use std::net::SocketAddr;
@@ -284,21 +284,23 @@ fn env_key(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
-    use crate::tests::fixtures::{TestEnvGuard, env_lock};
-    use aruna::config::load;
+    use crate::tests::fixtures::env_lock;
+    use aruna::inbound::initialize_net_holder;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
+    use aruna_config::load;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_core::testing::EnvGuard;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::sync::incoming::initialize_net_holder;
-    use aruna_operations::tasks::incoming::start_task_queues;
     use aruna_tasks::TaskHandle;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -307,7 +309,7 @@ mod tests {
 
     struct TestNode {
         _temp_dir: tempfile::TempDir,
-        _env_guard: TestEnvGuard,
+        _env_guard: EnvGuard,
         http_addr: std::net::SocketAddr,
         server_task: tokio::task::JoinHandle<()>,
         net: NetHandle,
@@ -327,7 +329,7 @@ mod tests {
         let blob_root = temp_dir.path().join("blobstore");
         std::fs::create_dir_all(&blob_root).unwrap();
 
-        let env_guard = TestEnvGuard::set(&[
+        let env_guard = EnvGuard::set(&[
             ("DATABASE_DIR", storage_path.to_str().unwrap().to_string()),
             ("CONTENT_DIR", blob_root.to_str().unwrap().to_string()),
             ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
@@ -358,15 +360,16 @@ mod tests {
             storage_handle,
             net_handle: Some(net.clone()),
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
-        let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-        let shutdown = aruna_core::shutdown::Shutdown::new();
+        let jobs_runtime = aruna_drivers::jobs::runtime::JobsRuntime::new();
+        let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );
@@ -375,7 +378,7 @@ mod tests {
         let realm_signing_key = generate_signing_key();
         let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
         let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
-        let bootstrap_user = aruna_core::UserId::local(Ulid::generate(), realm_id);
+        let bootstrap_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
         drive(
             CreateRealmOperation::new(CreateRealmConfig {
                 actor: aruna_core::structs::identity::auth::Actor {
@@ -412,7 +415,7 @@ mod tests {
                 capabilities,
                 false,
                 None,
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -423,7 +426,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         );
@@ -458,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn onboarding_secret() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("DATABASE_DIR", "/tmp/storage".to_string()),
             ("ONBOARDING_SECRET", "secret".to_string()),
         ]);
@@ -471,7 +474,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_matches_defaults() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("DATABASE_DIR", "/tmp/aruna-doctor-defaults".to_string()),
             (
                 "CONTENT_DIR",
@@ -479,10 +482,10 @@ mod tests {
             ),
             ("METADATA_REPLICATION_FACTOR", "0".to_string()),
         ]);
-        let _unset = TestEnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
+        let _unset = EnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::settings::read_settings().unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_bucket_size, Some(100_000));
         assert_eq!(
@@ -507,14 +510,14 @@ mod tests {
         let _env_lock = env_lock().lock().await;
         // Load the `.env` file first, so it cannot restore CONTENT_DIR after the removal.
         let _ = dotenvy::var("CONTENT_DIR");
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("DATABASE_DIR", "/tmp/aruna-doctor-content".to_string()),
             ("METADATA_REPLICATION_FACTOR", "0".to_string()),
         ]);
-        let _unset = TestEnvGuard::remove(&["CONTENT_DIR"]);
+        let _unset = EnvGuard::remove(&["CONTENT_DIR"]);
 
         let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
-        let settings = aruna::settings::read_settings().unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
 
         assert_eq!(view.blob_root, "/tmp/aruna-doctor-content/blobstore");
         assert_eq!(view.blob_root, settings.blob_root);
@@ -523,7 +526,7 @@ mod tests {
     #[tokio::test]
     async fn doctor_relays() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[(
+        let _guard = EnvGuard::set(&[(
             "P2P_ADDITIONAL_RELAY_URLS",
             "https://relay-a.example,https://relay-b.example".to_string(),
         )]);
@@ -542,7 +545,7 @@ mod tests {
     #[tokio::test]
     async fn reports_public_urls() {
         let _env_lock = env_lock().lock().await;
-        let _guard = TestEnvGuard::set(&[
+        let _guard = EnvGuard::set(&[
             ("API_PUBLIC_URL", "https://api.example.test".to_string()),
             ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
         ]);
@@ -568,14 +571,11 @@ mod tests {
 
         let info = fetch_info(node.http_addr, None).await.unwrap();
 
-        assert_eq!(
-            info.node.status,
-            aruna_api::routes::info::ServiceStatus::Available
-        );
+        assert_eq!(info.node.status, aruna_wire::info::ServiceStatus::Available);
         assert!(!info.api_version.is_empty());
         assert_eq!(
             info.services.interfaces.rest.status,
-            aruna_api::routes::info::ServiceStatus::Available
+            aruna_wire::info::ServiceStatus::Available
         );
         let api_url = format!("http://{}/api/v1", node.http_addr);
         assert_eq!(

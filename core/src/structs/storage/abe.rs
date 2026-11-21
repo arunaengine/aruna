@@ -4,11 +4,14 @@
 
 use super::blob::ArchiveKey;
 use super::encryption::{BucketKeyRef, generate_key, public_key_of};
-use crate::NodeId;
 use crate::compute::{SecretBytes, SharedSecret};
-use crate::key_seal::{SealedSecret, open_sealed, seal_to};
+use crate::id::NodeId;
+use crate::key_seal::{SealedSecret, SeedRng, open_sealed, seal_to};
 use crate::structs::identity::realm::RealmId;
-use aruna_kpabe::{Attribute, MasterSecret, PublicParameters, frame_context, setup_from_seed};
+use aruna_kpabe::frame_context;
+use aruna_kpabe::policy::Attribute;
+use aruna_kpabe::scheme::{MasterSecret, PublicParameters, setup_from_seed};
+use hpke::rand_core::CryptoRng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ulid::Ulid;
@@ -53,6 +56,19 @@ pub enum AbeError {
 impl From<aruna_kpabe::Error> for AbeError {
     fn from(_: aruna_kpabe::Error) -> Self {
         Self::Crypto
+    }
+}
+
+/// A storage fault or conflict leaves the record unavailable; any other runner failure means
+/// the stored rows did not fit together.
+impl From<crate::calls::IoError> for AbeError {
+    fn from(error: crate::calls::IoError) -> Self {
+        match error {
+            crate::calls::IoError::Conflict | crate::calls::IoError::Storage(_) => {
+                Self::Unavailable
+            }
+            _ => Self::Context,
+        }
     }
 }
 
@@ -197,12 +213,22 @@ impl EnvelopeContext {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObjectEnvelope {
     pub context: EnvelopeContext,
     pub abe: Vec<u8>,
     pub recovery_enc: [u8; 32],
     pub recovery_ciphertext: Vec<u8>,
+}
+
+impl std::fmt::Debug for ObjectEnvelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ObjectEnvelope")
+            .field("context", &self.context)
+            .field("abe_len", &self.abe.len())
+            .field("recovery_len", &self.recovery_ciphertext.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ObjectEnvelope {
@@ -220,7 +246,10 @@ impl ObjectEnvelope {
         }
         let value: Self = postcard::from_bytes(bytes).map_err(|_| AbeError::Context)?;
         value.context.bytes()?;
-        aruna_kpabe::Envelope::from_bytes(&value.context.parameters.public()?, &value.abe)?;
+        aruna_kpabe::envelope::Envelope::from_bytes(
+            &value.context.parameters.public()?,
+            &value.abe,
+        )?;
         if value.recovery_ciphertext.len() != 48 {
             return Err(AbeError::Context);
         }
@@ -247,9 +276,13 @@ pub struct EnvelopePlan {
     pub bucket_public: [u8; 32],
 }
 
-pub fn create_envelope(plan: EnvelopePlan) -> Result<(ObjectEnvelope, SharedSecret), AbeError> {
-    let (public_key, private) = generate_key().map_err(|_| AbeError::Crypto)?;
-    Ok((seal_envelope(plan, public_key, &private)?, private))
+/// A new envelope for `plan` around a fresh object key; `rng` must be secret.
+pub fn create_envelope(
+    plan: EnvelopePlan,
+    rng: &mut impl CryptoRng,
+) -> Result<(ObjectEnvelope, SharedSecret), AbeError> {
+    let (public_key, private) = generate_key(rng).map_err(|_| AbeError::Crypto)?;
+    Ok((seal_envelope(plan, public_key, &private, rng)?, private))
 }
 
 /// A new envelope for `plan` around the object key that `source`'s recovery wrap opens.
@@ -257,6 +290,7 @@ pub fn copy_envelope(
     source: &ObjectEnvelope,
     bucket: &SecretBytes,
     plan: EnvelopePlan,
+    rng: &mut impl CryptoRng,
 ) -> Result<ObjectEnvelope, AbeError> {
     let bucket: &[u8; 32] = bucket.expose().try_into().map_err(|_| AbeError::Crypto)?;
     let sealed = SealedSecret {
@@ -267,25 +301,27 @@ pub fn copy_envelope(
         .map_err(|_| AbeError::WrongKey)?;
     let private = SharedSecret::new(SecretBytes::new(opened.to_vec()));
     check_object(private.bytes(), source)?;
-    seal_envelope(plan, source.context.public_key, &private)
+    seal_envelope(plan, source.context.public_key, &private, rng)
 }
 
 /// Fails if no envelope for a copy of `source` to `object_key` fits, even at the widest epoch.
+/// The trial envelope is dropped, so a fixed write id and seed serve it.
 pub fn check_copy(source: &ObjectEnvelope, object_key: String) -> Result<(), AbeError> {
     let plan = EnvelopePlan {
         parameters: source.context.parameters.clone(),
         epoch: u64::MAX,
-        write_id: Ulid::generate(),
+        write_id: Ulid::from_parts(1, 1),
         object_key,
         bucket_public: source.context.public_key,
     };
-    create_envelope(plan).map(drop)
+    create_envelope(plan, &mut SeedRng::new(&[0; 32])).map(drop)
 }
 
 fn seal_envelope(
     plan: EnvelopePlan,
     public_key: [u8; 32],
     private: &SharedSecret,
+    rng: &mut impl CryptoRng,
 ) -> Result<ObjectEnvelope, AbeError> {
     let context = EnvelopeContext {
         parameters: plan.parameters,
@@ -300,15 +336,15 @@ fn seal_envelope(
         .expose()
         .try_into()
         .map_err(|_| AbeError::Crypto)?;
-    let abe = aruna_kpabe::seal(
+    let abe = aruna_kpabe::envelope::seal(
         &context.parameters.public()?,
         &context.attributes()?,
         scalar,
         &bytes,
-        &mut SysRng,
+        rng,
     )?
     .to_bytes()?;
-    let recovery = seal_to(&plan.bucket_public, RECOVERY_PURPOSE, &bytes, scalar)
+    let recovery = seal_to(&plan.bucket_public, RECOVERY_PURPOSE, &bytes, scalar, rng)
         .map_err(|_| AbeError::Crypto)?;
     let envelope = ObjectEnvelope {
         context,
@@ -380,8 +416,6 @@ impl EnvelopeArchive {
     }
 }
 
-pub use getrandom::SysRng;
-
 #[derive(Debug, PartialEq)]
 pub enum AbeEffect {
     Issue(super::abe_access::GrantContext),
@@ -396,7 +430,7 @@ pub enum AbeEffect {
         resolved: super::blob::ResolvedBackend,
         bucket: String,
         key: String,
-        created_by: crate::UserId,
+        created_by: crate::user::id::UserId,
         blob: crate::stream::BackendStream<Result<bytes::Bytes, crate::stream::StreamError>>,
         size: Option<u64>,
     },

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::config::NetConfig;
 use crate::test_support::make_secret;
 use crate::tests::test_net_handle;
 use aruna_core::events::StorageEvent;
@@ -88,7 +89,18 @@ async fn reload_waits_turn() -> Result<()> {
     store_config(&handle, encoded(&handle, &config_with(&handle, peer_a))).await;
     assert_eq!(handle.reload_if_changed().await?, Some(vec![peer_a]));
 
+    // An unchanged config needs no lock, even while another reload holds it.
+    let guard = handle.inner.config_applied.lock().await;
+    let mut unchanged = Box::pin(handle.reload_if_changed());
+    assert!(matches!(
+        poll_once(&mut unchanged).await,
+        Poll::Ready(Ok(None))
+    ));
+    drop(unchanged);
+    drop(guard);
+
     // A reload cancelled while it waits leaves nothing behind.
+    store_config(&handle, encoded(&handle, &config_with(&handle, peer_a))).await;
     let guard = handle.inner.config_applied.lock().await;
     let mut cancelled = Box::pin(handle.reload_if_changed());
     assert!(poll_once(&mut cancelled).await.is_pending());
@@ -113,7 +125,7 @@ async fn poll_once<F: Future + Unpin>(future: &mut F) -> Poll<F::Output> {
 #[tokio::test]
 async fn stale_read_repaired() -> Result<()> {
     let dir = tempfile::tempdir().map_err(|e| NetError::Io(e.to_string()))?;
-    let real = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
+    let real = aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
         .map_err(|e| NetError::Io(e.to_string()))?;
     // The proxy shares the real worker's change count and holds one realm config reply.
     let (proxy, receivers) = real.proxy_channels();

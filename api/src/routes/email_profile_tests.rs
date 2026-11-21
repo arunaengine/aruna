@@ -3,61 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::routes::{test_context, test_state, test_storage};
-use aruna_core::UserId;
-use aruna_core::keys::generate_signing_key;
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use tempfile::TempDir;
+use crate::auth::UnrestrictedAuth;
+use crate::tests::realms::{admin_state, state_auth};
+use aruna_core::user::id::UserId;
 
 const PASSWORD: &str = "canary-route-77";
-
-/// A management node state with one realm admin; returns the admin's id.
-async fn setup_state() -> (TempDir, Arc<ServerState>, UserId) {
-    let (dir, storage) = test_storage();
-    let context = Arc::new(test_context(storage));
-    let signing_key = generate_signing_key();
-    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-    let actor = Actor {
-        node_id: iroh::SecretKey::generate().public(),
-        user_id: UserId::local(Ulid::generate(), realm_id),
-        realm_id,
-    };
-    drive(
-        CreateRealmOperation::new(CreateRealmConfig {
-            actor: actor.clone(),
-            realm_description: "Realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        }),
-        &context,
-    )
-    .await
-    .unwrap();
-    drive(
-        ClaimInitialOperation::new(ClaimInitialInput {
-            actor: actor.clone(),
-        }),
-        &context,
-    )
-    .await
-    .unwrap();
-    let capabilities = NodeCapabilities::management_node(signing_key).unwrap();
-    let state = Arc::new(test_state(context, realm_id, actor.node_id, capabilities).await);
-    (dir, state, actor.user_id)
-}
-
-fn auth(state: &ServerState, user_id: UserId) -> Option<AuthContext> {
-    Some(AuthContext {
-        user_id,
-        realm_id: state.get_realm_id(),
-        path_restrictions: None,
-        session: None,
-    })
-}
 
 fn body(password: Option<&str>) -> Json<EmailProfileRequest> {
     Json(EmailProfileRequest {
@@ -72,9 +22,14 @@ fn body(password: Option<&str>) -> Json<EmailProfileRequest> {
 
 #[tokio::test]
 async fn admin_sets_profile() {
-    let (_dir, state, admin) = setup_state().await;
+    let (_dir, state, admin) = admin_state().await;
     let member = UserId::local(Ulid::generate(), state.get_realm_id());
-    let get = |user_id| get_email_profile(State(state.clone()), Extension(auth(&state, user_id)));
+    let get = |user_id| {
+        get_email_profile(
+            State(state.clone()),
+            UnrestrictedAuth(state_auth(&state, user_id).expect("a signed-in caller")),
+        )
+    };
     let Json(empty) = get(member).await.unwrap();
     assert_eq!(
         empty,
@@ -86,14 +41,14 @@ async fn admin_sets_profile() {
 
     let refused = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, member)),
+        UnrestrictedAuth(state_auth(&state, member).expect("a signed-in caller")),
         body(Some(PASSWORD)),
     )
     .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
     let Json(stored) = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        UnrestrictedAuth(state_auth(&state, admin).expect("a signed-in caller")),
         body(Some(PASSWORD)),
     )
     .await
@@ -118,7 +73,7 @@ async fn admin_sets_profile() {
     });
     let refused = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        UnrestrictedAuth(state_auth(&state, admin).expect("a signed-in caller")),
         renamed,
     );
     assert!(matches!(
@@ -131,7 +86,7 @@ async fn admin_sets_profile() {
     });
     let refused = set_email_profile(
         State(state.clone()),
-        Extension(auth(&state, admin)),
+        UnrestrictedAuth(state_auth(&state, admin).expect("a signed-in caller")),
         bad_sender,
     );
     assert!(matches!(
@@ -139,7 +94,11 @@ async fn admin_sets_profile() {
         Err(ServerError::BadRequestReason(_))
     ));
 
-    let removed = delete_email_profile(State(state.clone()), Extension(auth(&state, admin))).await;
+    let removed = delete_email_profile(
+        State(state.clone()),
+        UnrestrictedAuth(state_auth(&state, admin).expect("a signed-in caller")),
+    )
+    .await;
     assert_eq!(removed.unwrap(), StatusCode::NO_CONTENT);
     let Json(gone) = get(admin).await.unwrap();
     assert!(!gone.configured);

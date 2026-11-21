@@ -3,44 +3,46 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 
-use crate::metadata::{SubmitExportResponse, load_document_record, parse_document_id};
-use crate::routes::execution::jobs::{job_urls, map_submit_error};
+use crate::job_service::{read_artifact_routed, read_owned_job, submit_export_job};
+use crate::jobs::job_urls;
+use crate::metadata::model::SubmitExportResponse;
+use crate::metadata::{load_document_record, parse_document_id};
+use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
-use aruna_core::structs::execution::job::{
-    ExportRoCrateSpec, ExportSelection, JobId, JobPayload, JobState,
-};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExportRoCrateSpec, ExportSelection, JobPayload};
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::unix_timestamp_secs;
-use aruna_core::transfer::{ExportGrant, ImportIntent, TransferError, check_remote, intent_digest};
-use aruna_operations::federation::export::{
-    GrantError, GrantRequest, admit_grant, authorize_export, check_holder, issue_grant,
-    read_record, revoke_grant,
+use aruna_core::transfer::{
+    ExportGrant, GrantError, ImportIntent, TransferError, check_remote, intent_digest,
 };
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::federation::import::header_value;
-use aruna_operations::jobs::service::{read_artifact_routed, read_owned_job, submit_export_job};
+use aruna_operations::jobs::export::consent::UnheldBucketOperation;
+use aruna_operations::jobs::export::grant::{
+    AdmitGrantOperation, IssueExportOperation, IssueGrantConfig, ReadGrantOperation,
+    RevokeGrantOperation, export_access,
+};
+use aruna_operations::jobs::export::snapshot::CrateJsonOperation;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct ExportApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ExportApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_export))
         .routes(routes!(create_grant, delete_grant))
         .routes(routes!(push_export))
@@ -70,13 +72,13 @@ pub struct FederatedExportRequest {
     pub files: Vec<String>,
 }
 
-pub(crate) use aruna_operations::federation::import::GRANT_HEADER;
+use aruna_operations::federation::import::GRANT_HEADER;
 /// Header carrying a signed import intent as unpadded base64url JSON.
 pub(crate) const INTENT_HEADER: &str = "x-aruna-import-intent";
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 pub(crate) fn encode_header<T: Serialize>(value: &T) -> ServerResult<String> {
-    header_value(value).map_err(|e| ServerError::InternalError(e.to_string()))
+    header_value(value).map_err(|e| ServerError::InternalError(e.into()))
 }
 
 pub(crate) fn decode_header<T: DeserializeOwned>(
@@ -121,7 +123,7 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
         }
         GrantError::Transfer(error) => transfer_refused(error),
         GrantError::Storage(_) => ServerError::ServiceUnavailableReason(message),
-        GrantError::Sign(_) => ServerError::InternalError(message),
+        GrantError::Sign(_) => ServerError::InternalError(message.into()),
     }
 }
 
@@ -167,7 +169,6 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
                 "artifact_url": "https://a.example.org/api/v1/compute/jobs/01JJ0B0123456789ABCDEFGHJK/artifacts/rocrate"
             })),
         (status = 400, description = "A malformed document id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The intent or descriptor was refused (code `transfer_rejected`), READ or a policy denied the export (code `export_denied`), or every copy of a selected file needs a bucket key the caller lacks (code `key_holder_required`)", body = ErrorResponse),
         (status = 404, description = "No such document on this node", body = ErrorResponse),
         (status = 409, description = "The caller's active RO-Crate job limit is reached", body = ErrorResponse),
@@ -177,10 +178,9 @@ pub(crate) fn grant_refused(error: GrantError) -> ServerError {
 )]
 pub async fn create_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<FederatedExportRequest>,
 ) -> ServerResult<(StatusCode, Json<SubmitExportResponse>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let local = state.get_realm_id();
     check_remote(
         &request.intent,
@@ -195,9 +195,15 @@ pub async fn create_export(
     let with_files = !request.files.is_empty();
     let path = &record.permission_path;
     let context = state.get_ctx();
-    authorize_export(&context, &auth, path, audience, with_files)
-        .await
-        .map_err(grant_refused)?;
+    match drive(
+        export_access(&auth, path, audience, with_files),
+        context.as_ref(),
+    )
+    .await
+    {
+        Ok(true) => {}
+        Ok(false) | Err(_) => return Err(grant_refused(GrantError::Denied)),
+    }
     let digest = intent_digest(&request.intent)
         .map_err(|error| transfer_refused(TransferError::Signature(error)))?;
     let key = format!("federation-{digest}");
@@ -247,7 +253,7 @@ pub(crate) async fn owned_export(
     let job_id = crate::jobs::parse_job_id(job_id).map_err(|_| ServerError::NotFound)?;
     let record = read_owned_job(&state.get_ctx(), auth.user_id, job_id)
         .await
-        .map_err(ServerError::InternalError)?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
     let JobPayload::ExportRoCrate(spec) = record.payload else {
         return Err(ServerError::NotFound);
@@ -284,7 +290,6 @@ that owns the job.
     responses(
         (status = 200, description = "The signed export grant", body = serde_json::Value,
             example = json!({ "payload": { "source": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], "audience": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "intent_digest": "<hex>", "export_job_id": "<ulid>", "document_id": "<ulid>", "source_revision": "<ulid>", "dataset_digest": "<hex>", "selection_digest": "<hex>", "artifact_url": "https://a.example.org/api/v1/compute/jobs/<job id>/artifacts/rocrate", "artifact_blake3": "<hex>", "artifact_size": 2048, "issued_at": 1791000000, "expires_at": 1791086400 }, "signer": "Realm", "signature": "<hex>" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The export is no longer allowed (code `export_denied`) or its grant expired (code `transfer_rejected`)", body = ErrorResponse),
         (status = 404, description = "No such export into another realm of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded or left out a selected file (code `export_unfinished`)", body = ErrorResponse),
@@ -294,10 +299,9 @@ that owns the job.
 )]
 pub async fn create_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<Json<Signed<ExportGrant>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, spec) = owned_export(&state, &auth, &job_id).await?;
     let Some(selection) = spec.selection.as_ref() else {
         return Err(ServerError::NotFound);
@@ -307,18 +311,20 @@ pub async fn create_grant(
     let artifact_url = urls
         .artifact_url
         .parse()
-        .map_err(|_| ServerError::InternalError("artifact URL is invalid".to_string()))?;
-    let request = GrantRequest {
-        auth: &auth,
+        .map_err(|_| ServerError::InternalError("artifact URL is invalid".to_string().into()))?;
+    let config = IssueGrantConfig {
+        realm_id: auth.realm_id,
+        principal: auth.user_id,
         job_id,
         document_id: spec.document_id,
         document_path: record.permission_path,
-        selection,
+        selection: selection.clone(),
         artifact_url,
-        capabilities: state.node_capabilities(),
+        capabilities: state.node_capabilities().clone(),
         now: unix_timestamp_secs(),
     };
-    let grant = issue_grant(&state.get_ctx(), request)
+    let issue = IssueExportOperation::new(auth.clone(), config);
+    let grant = drive(issue, state.get_ctx().as_ref())
         .await
         .map_err(grant_refused)?;
     Ok(Json(grant))
@@ -340,7 +346,6 @@ that owns the job.
     params(("job_id" = String, Path, description = "Export job id")),
     responses(
         (status = 204, description = "The grant is revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "No grant for an export of the caller on this node", body = ErrorResponse),
         (status = 409, description = "The export has not succeeded (code `export_unfinished`)", body = ErrorResponse)
     ),
@@ -348,15 +353,35 @@ that owns the job.
 )]
 pub async fn delete_grant(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
-    match revoke_grant(&state.get_ctx(), job_id).await {
+    match drive(RevokeGrantOperation::new(job_id), state.get_ctx().as_ref()).await {
         Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err(ServerError::NotFound),
         Err(error) => Err(grant_refused(error)),
+    }
+}
+
+/// Refuses a file export at consent when a selected file has copies on this node and each needs
+/// a bucket key the caller does not hold now. The export job applies the same rule.
+async fn check_holder(
+    context: &Arc<DriverContext>,
+    spec: &ExportRoCrateSpec,
+    node_id: aruna_core::id::NodeId,
+) -> Result<(), GrantError> {
+    let (auth, limit) = (&spec.auth_context, spec.limits.metadata_bytes);
+    let local = context.net_handle.as_ref().map(|net| net.node_id());
+    let read = CrateJsonOperation::new(local, auth.clone(), spec.document_id, limit);
+    let (jsonld, _) = drive(read, context)
+        .await
+        .map_err(|error| GrantError::Storage(error.to_string()))?;
+    let check = UnheldBucketOperation::new(spec.clone(), node_id, jsonld);
+    match drive(check, context).await {
+        Ok(None) => Ok(()),
+        Ok(Some(bucket)) => Err(GrantError::NotHolder(bucket)),
+        Err(error) => Err(GrantError::Storage(error.0)),
     }
 }
 
@@ -391,7 +416,6 @@ that owns the job.
     responses(
         (status = 200, description = "The destination's upload answer, unverified", body = serde_json::Value,
             example = json!({ "upload_id": "01JABCDEF0123456789ABCDEFG", "blake3": "<hex>", "size": 2048, "expires_at": "2026-04-10T14:23:11.123+00:00", "owner_node_url": "https://b.example.org/api/v1" })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "The intent was refused (code `transfer_rejected`) or the export is no longer allowed (code `export_denied`)", body = ErrorResponse),
         (status = 404, description = "No grant for an export of the caller on this node", body = ErrorResponse),
         (status = 410, description = "The grant was revoked (code `grant_revoked`)", body = ErrorResponse),
@@ -401,21 +425,21 @@ that owns the job.
 )]
 pub async fn push_export(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(job_id): Path<String>,
     Json(request): Json<PushExportRequest>,
 ) -> ServerResult<Json<serde_json::Value>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let (job_id, _) = owned_export(&state, &auth, &job_id).await?;
     let (local, now) = (state.get_realm_id(), unix_timestamp_secs());
     let context = state.get_ctx();
     check_remote(&request.intent, &request.descriptor, &local, now).map_err(transfer_refused)?;
-    let grant = read_record(&context, job_id)
+    let grant = drive(ReadGrantOperation::new(job_id), context.as_ref())
         .await
         .map_err(grant_refused)?
         .ok_or(ServerError::NotFound)?
         .grant;
-    admit_grant(&context, local, job_id, &grant, now)
+    let admit = AdmitGrantOperation::new(local, job_id, grant.clone(), now);
+    drive(admit, context.as_ref())
         .await
         .map_err(grant_refused)?;
     let digest = intent_digest(&request.intent)
@@ -424,7 +448,7 @@ pub async fn push_export(
         return Err(transfer_refused(TransferError::Unbound));
     }
     let size = grant.payload.artifact_size;
-    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let now_ms = aruna_clock::unix_timestamp_millis();
     let (_, read) =
         read_artifact_routed(&context, auth.user_id, job_id, now_ms, Some(0..size), None)
             .await
@@ -436,7 +460,7 @@ pub async fn push_export(
     }
     let url = url
         .join("metadata/rocrate/uploads")
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let blob = context
         .blob_handle
         .as_ref()
@@ -471,10 +495,12 @@ pub async fn push_export(
 mod tests {
     use super::*;
     use crate::routes::execution::jobs::get_job_artifact;
-    use crate::tests::routes::{test_context, test_state, test_storage};
+    use crate::tests::routes::{test_state, test_storage};
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::transfer::MAX_TRANSFER_SECS;
+    use aruna_drivers::testing::test_context;
+    use axum::Extension;
     use axum::http::HeaderValue;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;

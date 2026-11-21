@@ -5,28 +5,28 @@
 
 // Entries of ordinary buckets and of other nodes stay as they are.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
-use aruna_core::NodeId;
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{
-    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE,
-};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{DISTRIBUTION_KEYSPACE, VERSION_INDEX_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{
-    BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
-};
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::data::identity::{CONTENT_URL, ObjectLocation, text_values};
+use aruna_core::structs::storage::distribution::hint::SetHint;
 use aruna_core::structs::storage::distribution::inventory::{IndexEntry, Position, index_key};
-use aruna_core::structs::storage::distribution::{DistributionView, SetHint};
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, VersionedObjectArn};
+use aruna_core::types::{Key, Value as RowValue};
 use serde_json::Value;
+use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::s3::bucket::get::{GetBucketError, GetBucketOperation};
+use crate::metadata::object_version::{ObjectVersion, ObjectVersionError, ObjectVersionOperation};
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 
 /// At most this many entities are looked at per save.
 const MAX_ENTITIES: usize = 10_000;
@@ -56,80 +56,150 @@ fn local_object(
     }
 }
 
-/// Rewrites every entity of `document` (a crate with `@graph`, or one entity) whose `@id` or
-/// `contentUrl` names a version of a local distributed member bucket. Returns how many values
-/// it rewrote; a value it cannot resolve stays unchanged.
-pub async fn normalize_entries(
-    context: &DriverContext,
+/// Why a dataset's entries could not be normalized.
+#[derive(Debug, Error, PartialEq)]
+#[error("{0}")]
+pub struct NormalizeError(String);
+
+impl From<IoError> for NormalizeError {
+    fn from(error: IoError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum NormalizeStage {
+    Bucket,
+    Version,
+}
+
+/// Rewrites every entity of a document (a crate with `@graph`, or one entity) whose `@id` or
+/// `contentUrl` names a version of a local distributed member bucket. The output is the
+/// document and how many values were rewritten; a value that cannot be resolved stays.
+#[derive(Debug, PartialEq)]
+pub struct NormalizeEntriesOperation {
     realm_id: RealmId,
     node_id: NodeId,
-    document: &mut Value,
-) -> Result<usize, String> {
-    let candidates = {
+    document: Value,
+    candidates: VecDeque<String>,
+    current: Option<(String, String, String, Option<Ulid>)>,
+    buckets: HashMap<String, Option<BucketInfo>>,
+    rewrites: BTreeMap<String, String>,
+    stage: NormalizeStage,
+}
+
+impl NormalizeEntriesOperation {
+    pub fn new(realm_id: RealmId, node_id: NodeId, document: Value) -> Self {
         let entities: Vec<&Value> = match document.get("@graph").and_then(Value::as_array) {
             Some(graph) => graph.iter().take(MAX_ENTITIES).collect(),
-            None => vec![&*document],
+            None => vec![&document],
         };
-        let mut values = Vec::new();
+        let mut candidates = VecDeque::new();
         for entity in entities {
-            values.extend(
+            candidates.extend(
                 entity
                     .get("@id")
                     .and_then(Value::as_str)
                     .map(str::to_string),
             );
-            values.extend(text_values(entity.get(CONTENT_URL)));
+            candidates.extend(text_values(entity.get(CONTENT_URL)));
         }
-        values
-    };
-    let mut buckets = HashMap::<String, Option<BucketInfo>>::new();
-    let mut rewrites = BTreeMap::<String, String>::new();
-    for value in candidates {
-        if rewrites.contains_key(&value) {
-            continue;
+        Self {
+            realm_id,
+            node_id,
+            document,
+            candidates,
+            current: None,
+            buckets: HashMap::new(),
+            rewrites: BTreeMap::new(),
+            stage: NormalizeStage::Bucket,
         }
-        let Some((bucket, key, version)) = local_object(&value, realm_id, node_id) else {
-            continue;
-        };
-        if !buckets.contains_key(&bucket) {
-            let info = match drive(GetBucketOperation::new(bucket.clone()), context).await {
-                Ok(info) => Some(info),
-                Err(GetBucketError::NotFound) => None,
-                Err(error) => return Err(error.to_string()),
+    }
+
+    /// The next candidate that names a local object of a distributed member bucket.
+    fn next_candidate(&mut self) -> Result<Next<(Value, usize)>, NormalizeError> {
+        while let Some(value) = self.candidates.pop_front() {
+            if self.rewrites.contains_key(&value) {
+                continue;
+            }
+            let Some((bucket, key, version)) = local_object(&value, self.realm_id, self.node_id)
+            else {
+                continue;
             };
-            buckets.insert(bucket.clone(), info);
+            let known = self.buckets.contains_key(&bucket);
+            self.current = Some((value, bucket.clone(), key, version));
+            if !known {
+                self.stage = NormalizeStage::Bucket;
+                return Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))));
+            }
+            if let Some(call) = self.version_call() {
+                return Ok(Next::Call(call));
+            }
         }
-        let bound = buckets
-            .get(&bucket)
+        let count = self.rewrites.len();
+        let mut document = std::mem::take(&mut self.document);
+        if count > 0 {
+            rewrite(&mut document, &self.rewrites, false);
+        }
+        Ok(Next::Done((document, count)))
+    }
+
+    /// The version read of the current candidate, when its bucket is a distributed member.
+    fn version_call(&mut self) -> Option<IoCall> {
+        let (_, bucket, key, version) = self.current.as_ref()?;
+        let bound = (self.buckets.get(bucket))
             .and_then(Option::as_ref)
             .is_some_and(|info| info.distribution.is_some());
         if !bound {
-            continue;
+            return None;
         }
-        let version_id = match version {
-            Some(version_id) => Some(version_id),
-            None => read_head(context, &bucket, &key).await?,
-        };
-        let Some(version_id) = version_id else {
-            continue;
-        };
-        if read_version(context, &bucket, &key, version_id)
-            .await?
-            .is_none_or(|version| version.is_deleted())
-        {
-            continue;
+        self.stage = NormalizeStage::Version;
+        Some(IoCall::child(ObjectVersionOperation::new(
+            bucket, key, *version,
+        )))
+    }
+}
+
+impl Operation for NormalizeEntriesOperation {
+    type Output = (Value, usize);
+    type Error = NormalizeError;
+
+    fn first(&mut self) -> Result<Next<(Value, usize)>, NormalizeError> {
+        self.next_candidate()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<(Value, usize)>, NormalizeError> {
+        match self.stage {
+            NormalizeStage::Bucket => {
+                let info = match result.child::<BucketInfo, GetBucketError>()? {
+                    Ok(info) => Some(info),
+                    Err(GetBucketError::NotFound) => None,
+                    Err(error) => return Err(NormalizeError(error.to_string())),
+                };
+                let bucket = (self.current.as_ref()).map(|(_, bucket, _, _)| bucket.clone());
+                self.buckets.insert(bucket.unwrap_or_default(), info);
+                match self.version_call() {
+                    Some(call) => Ok(Next::Call(call)),
+                    None => self.next_candidate(),
+                }
+            }
+            NormalizeStage::Version => {
+                let object = result.child::<ObjectVersion, ObjectVersionError>()?;
+                let object = object.map_err(|error| NormalizeError(error.to_string()))?;
+                let value = self.current.take().map(|(value, ..)| value);
+                if let (Some(value), Some(version_id)) = (value, object.version_id)
+                    && object.version.is_some_and(|version| !version.is_deleted())
+                {
+                    let global = GlobalId::Version {
+                        realm_id: self.realm_id,
+                        version_id,
+                    };
+                    self.rewrites.insert(value, global.to_url());
+                }
+                self.next_candidate()
+            }
         }
-        let global = GlobalId::Version {
-            realm_id,
-            version_id,
-        };
-        rewrites.insert(value, global.to_url());
     }
-    let count = rewrites.len();
-    if count > 0 {
-        rewrite(document, &rewrites, false);
-    }
-    Ok(count)
 }
 
 /// Replaces every identifier equal to a rewritten value: ids, references and `contentUrl`
@@ -156,37 +226,61 @@ fn rewrite(value: &mut Value, rewrites: &BTreeMap<String, String>, identifier: b
 /// At most this many distribution records are read to find a version's candidate sets.
 const MAX_SETS: usize = 4096;
 
+#[derive(Debug, Error, PartialEq)]
+pub enum LocalVersionError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+    #[error("{0}")]
+    Failed(String),
+}
+
+#[derive(Debug, PartialEq)]
+enum VersionStep {
+    Page,
+    Bucket(Ulid, String),
+    Entry(String),
+}
+
 /// The local member bucket and key of a distributed version: a set whose hint the id carries,
 /// whose local member bucket is bound here, and whose version id index holds it. `None` on a
 /// node that holds no member of such a set.
-pub async fn local_version(
-    context: &DriverContext,
+#[derive(Debug, PartialEq)]
+pub struct LocalVersionOperation {
     version_id: Ulid,
-) -> Result<Option<(String, String)>, String> {
-    let hint = SetHint::of_version(version_id);
-    let mut start = None;
-    let mut seen = 0usize;
-    loop {
-        let (values, next) = match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: DISTRIBUTION_KEYSPACE.to_string(),
-                prefix: None,
-                start: start.take().map(IterStart::After),
-                limit: 256,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => (values, next_start_after),
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected storage answer {other:?}")),
-        };
-        for (_, value) in values {
-            seen += 1;
+    rows: VecDeque<RowValue>,
+    after: Option<Key>,
+    seen: usize,
+    step: VersionStep,
+}
+
+type VersionTurn = Result<Next<Option<(String, String)>>, LocalVersionError>;
+
+impl LocalVersionOperation {
+    pub fn new(version_id: Ulid) -> Self {
+        Self {
+            version_id,
+            rows: VecDeque::new(),
+            after: None,
+            seen: 0,
+            step: VersionStep::Page,
+        }
+    }
+
+    fn page(&mut self) -> VersionTurn {
+        self.step = VersionStep::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: DISTRIBUTION_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::<u8>::new()),
+            after: self.after.take(),
+            limit: 256,
+        }))
+    }
+
+    /// The next record of a set the id's hint names, or the next page while sets remain.
+    fn advance(&mut self) -> VersionTurn {
+        let hint = SetHint::of_version(self.version_id);
+        while let Some(value) = self.rows.pop_front() {
+            self.seen += 1;
             let Ok(view) = DistributionView::from_bytes(&value) else {
                 continue;
             };
@@ -195,109 +289,70 @@ pub async fn local_version(
             if SetHint::of_set(set_id) != hint {
                 continue;
             }
-            if let Some(found) =
-                member_version(context, set_id, &snapshot.config.bucket, version_id).await?
-            {
-                return Ok(Some(found));
+            let bucket = snapshot.config.bucket.to_string();
+            self.step = VersionStep::Bucket(set_id, bucket.clone());
+            return Ok(Next::Call(IoCall::child(GetBucketOperation::new(bucket))));
+        }
+        match self.after.is_some() && self.seen < MAX_SETS {
+            true => self.page(),
+            false => Ok(Next::Done(None)),
+        }
+    }
+}
+
+impl Operation for LocalVersionOperation {
+    type Output = Option<(String, String)>;
+    type Error = LocalVersionError;
+
+    fn first(&mut self) -> VersionTurn {
+        self.page()
+    }
+
+    fn next(&mut self, result: IoResult) -> VersionTurn {
+        match std::mem::replace(&mut self.step, VersionStep::Page) {
+            VersionStep::Page => {
+                let (rows, next) = result.page()?;
+                self.rows = rows.into_iter().map(|(_, value)| value).collect();
+                self.after = next;
+                self.advance()
+            }
+            VersionStep::Bucket(set_id, bucket) => {
+                let info = match result.child::<BucketInfo, GetBucketError>()? {
+                    Ok(info) => info,
+                    Err(GetBucketError::NotFound) => return self.advance(),
+                    Err(error) => return Err(LocalVersionError::Failed(error.to_string())),
+                };
+                if info.distribution.as_ref().map(|binding| binding.set_id) != Some(set_id) {
+                    return self.advance();
+                }
+                self.step = VersionStep::Entry(bucket);
+                let key = index_key(set_id, self.version_id);
+                Ok(Next::Call(read_row(VERSION_INDEX_KEYSPACE, key)))
+            }
+            VersionStep::Entry(bucket) => {
+                let Some(entry) = result.value()? else {
+                    return self.advance();
+                };
+                let failed = |error: String| LocalVersionError::Failed(error);
+                let entry = IndexEntry::from_bytes(&entry).map_err(|e| failed(e.to_string()))?;
+                let position =
+                    Position::decode(&entry.position).map_err(|e| failed(e.to_string()))?;
+                Ok(Next::Done(Some((bucket, position.key))))
             }
         }
-        match next {
-            Some(next) if seen < MAX_SETS => start = Some(next),
-            _ => return Ok(None),
-        }
-    }
-}
-
-async fn member_version(
-    context: &DriverContext,
-    set_id: Ulid,
-    bucket: &str,
-    version_id: Ulid,
-) -> Result<Option<(String, String)>, String> {
-    let info = match drive(GetBucketOperation::new(bucket.to_string()), context).await {
-        Ok(info) => info,
-        Err(GetBucketError::NotFound) => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    if info.distribution.as_ref().map(|binding| binding.set_id) != Some(set_id) {
-        return Ok(None);
-    }
-    let Some(entry) = read_row(
-        context,
-        VERSION_INDEX_KEYSPACE,
-        index_key(set_id, version_id),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    let entry = IndexEntry::from_bytes(&entry).map_err(|error| error.to_string())?;
-    let position = Position::decode(&entry.position).map_err(|error| error.to_string())?;
-    Ok(Some((bucket.to_string(), position.key)))
-}
-
-async fn read_head(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<Ulid>, String> {
-    let head = BlobHeadKey::new(bucket, key)
-        .to_bytes()
-        .map_err(|error| error.to_string())?;
-    read_row(context, BLOB_HEAD_KEYSPACE, head)
-        .await?
-        .map(|value| CurrentVersionPointer::from_bytes(&value).map(|pointer| pointer.version_id))
-        .transpose()
-        .map_err(|error| error.to_string())
-}
-
-async fn read_version(
-    context: &DriverContext,
-    bucket: &str,
-    key: &str,
-    version_id: Ulid,
-) -> Result<Option<BlobVersion>, String> {
-    let row = VersionKey::new(bucket, key, version_id)
-        .to_bytes()
-        .map_err(|error| error.to_string())?;
-    read_row(context, BLOB_VERSIONS_KEYSPACE, row)
-        .await?
-        .map(|value| BlobVersion::from_bytes(&value))
-        .transpose()
-        .map_err(|error| error.to_string())
-}
-
-async fn read_row(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.map(|value| value.to_vec()))
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage answer {other:?}")),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{IoCall, IoResult, LocalVersionOperation, Next, Operation};
     use super::{local_object, rewrite};
     use aruna_core::structs::identity::realm::RealmId;
     use serde_json::json;
     use std::collections::BTreeMap;
     use ulid::Ulid;
 
-    fn node(seed: u8) -> aruna_core::NodeId {
+    fn node(seed: u8) -> aruna_core::id::NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
@@ -326,7 +381,11 @@ mod tests {
         );
     }
 
-    async fn seed(context: &crate::driver::DriverContext, bucket: &str, bound: bool) -> Ulid {
+    async fn seed(
+        context: &aruna_drivers::driver::DriverContext,
+        bucket: &str,
+        bound: bool,
+    ) -> Ulid {
         use aruna_core::effects::StorageEffect;
         use aruna_core::keyspaces::{
             BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -340,7 +399,7 @@ mod tests {
         let info = BucketInfo {
             group_id: Ulid::from_bytes([3; 16]),
             created_at: std::time::SystemTime::UNIX_EPOCH,
-            created_by: aruna_core::UserId::local(Ulid::from_bytes([5; 16]), realm),
+            created_by: aruna_core::user::id::UserId::local(Ulid::from_bytes([5; 16]), realm),
             cors_configuration: None,
             storage_routing: Vec::new(),
             placement_policies: Vec::new(),
@@ -398,23 +457,27 @@ mod tests {
     #[tokio::test]
     async fn bound_entries_globalized() {
         let dir = tempfile::tempdir().unwrap();
-        let context = crate::driver::DriverContext {
-            storage_handle: aruna_storage::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap(),
+        let context = aruna_drivers::driver::DriverContext {
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(
+                dir.path().to_str().unwrap(),
+            )
+            .unwrap(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let realm = RealmId::from_bytes([1; 32]);
         let version_id = seed(&context, "shared", true).await;
         seed(&context, "plain", false).await;
-        let mut crate_value = json!({"@graph": [
+        let crate_value = json!({"@graph": [
             {"@id": "s3://shared/a.txt", "contentUrl": "s3://shared/a.txt"},
             {"@id": "s3://plain/a.txt", "contentUrl": "s3://plain/a.txt"}
         ]});
-        let rewritten = super::normalize_entries(&context, realm, node(3), &mut crate_value)
+        let normalize = super::NormalizeEntriesOperation::new(realm, node(3), crate_value);
+        let (crate_value, rewritten) = aruna_drivers::driver::drive(normalize, &context)
             .await
             .unwrap();
         assert_eq!(rewritten, 1);
@@ -448,5 +511,63 @@ mod tests {
         // Free text that happens to equal the location keeps its wording.
         assert_eq!(crate_value["@graph"][1]["description"], old);
         assert_eq!(crate_value["@graph"][1]["keywords"][0], old);
+    }
+
+    #[test]
+    fn no_sets_found() {
+        let mut lookup = LocalVersionOperation::new(Ulid::from_bytes([1; 16]));
+        assert!(matches!(
+            lookup.first(),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(lookup.next(page), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn broken_record_skipped() {
+        let mut lookup = LocalVersionOperation::new(Ulid::from_bytes([1; 16]));
+        lookup.first().unwrap();
+        let page = IoResult::Page {
+            rows: vec![(vec![1u8].into(), vec![0xffu8].into())],
+            next: Some(vec![1u8].into()),
+        };
+        assert!(matches!(
+            lookup.next(page),
+            Ok(Next::Call(IoCall::Page { .. }))
+        ));
+    }
+
+    #[test]
+    fn foreign_values_untouched() {
+        // A value that names no local object needs no read and the document stays as it is.
+        let document = json!({"@id": "urn:example:x"});
+        let realm = RealmId::from_bytes([1; 32]);
+        let mut normalize = super::NormalizeEntriesOperation::new(realm, node(3), document.clone());
+        assert_eq!(normalize.first(), Ok(Next::Done((document, 0))));
+    }
+
+    #[test]
+    fn object_reads_bucket() {
+        let realm = RealmId::from_bytes([1; 32]);
+        let document = json!({"@id": "s3://shared/a.txt"});
+        let mut normalize = super::NormalizeEntriesOperation::new(realm, node(3), document);
+        assert!(matches!(
+            normalize.first(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let missing = IoResult::Child(aruna_core::calls::ChildOutcome::new(Err::<
+            aruna_core::structs::storage::blob::BucketInfo,
+            _,
+        >(
+            aruna_core::bucket_read::GetBucketError::NotFound,
+        )));
+        let Ok(Next::Done((_, count))) = normalize.next(missing) else {
+            panic!("expected the unchanged document");
+        };
+        assert_eq!(count, 0);
     }
 }

@@ -1,629 +1,739 @@
-//! Adopts a lost external attempt by name and resolves it from backend evidence.
+//! Adopts a lost external attempt by name and resolves it from backend evidence. It never
+//! submits a new attempt name, so a container is never run twice.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::offer::ExecutorOffer;
+use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::compute::{
-    AttemptPhase, AttemptRef, ExecutorKind, FenceContext, ReconcileEvidence,
+    AttemptPhase, AttemptRef, AttemptStatus, BackendError, FenceContext, ReconcileEvidence,
 };
-use aruna_core::structs::execution::job::{
-    ExecutionSpec, JobError, JobErrorKind, JobPayload, JobRecord, JobState,
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobRecord,
 };
-use aruna_core::time::unix_timestamp_millis;
-use aruna_storage::StorageHandle;
-use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use ulid::Ulid;
 
-use super::super::reconcile::ExternalReconciler;
-use super::super::runtime::JobsRuntime;
-use super::super::store::{
-    AdoptOutcome, adopt_external_attempt, begin_external_running, handoff_external_attempt,
-    read_job_record, record_attempt_started, record_attempt_tombstone, release_job,
-};
 use super::DEFAULT_WALLTIME;
-use super::finalize::{fail_and_crate, finalize_attempt, finalize_cancel};
-use super::prepare::{build_task_spec, job_bucket, prepare_attempt};
-use super::recovery::{park_attempt, requeue_after_tombstone};
-use super::supervise::{supervise_and_finalize, with_execution_heartbeat};
-use crate::driver::DriverContext;
+use super::attempt::{AttemptScope, RunWiring};
+use super::compute::{compute_answer, compute_call};
+use super::finalize::{FinalizeGoal, FinalizeOperation};
+use super::prepare::{PrepareAttemptOperation, PreparedTask, build_task_spec, job_bucket};
+use super::settle::{
+    EndRunOperation, ParkAttemptOperation, RunEnding, SubmitFailureOperation, execution_result,
+};
+use super::supervise::SuperviseOperation;
+use crate::jobs::device_admission::{RecheckAdmission, backend_refusal};
+use crate::jobs::fence::{fence_read, fence_up};
+use crate::jobs::lifecycle::LifecycleError;
+use crate::jobs::lifecycle::held::HeldReservations;
+use crate::jobs::store::job_calls::{
+    AdoptOutcome, ReleaseOutcome, adopt_external_attempt, begin_external_running,
+    handoff_external_attempt, record_attempt_started, record_attempt_tombstone, release_job,
+};
+use crate::jobs::store::mutation_error::JobMutationError;
+use crate::jobs::store::row_calls::read_job_record;
 
-/// The real Stage-0 reconcile seam: a lost external attempt is adopted by name and
-/// resolved by evidence (adopt-and-resume, terminalize, or Indeterminate). It never
-/// submits a new attempt name, so a container is never double-run.
-pub struct ComputeReconciler {
-    context: Arc<DriverContext>,
-    runtime: Weak<JobsRuntime>,
+/// What taking over a lost attempt left to do.
+#[derive(Debug, PartialEq)]
+pub enum Adoption {
+    /// Nothing runs here: the attempt is held elsewhere, terminal, or was handed back.
+    Done,
+    Adopted {
+        scope: Arc<AttemptScope>,
+        record: Arc<JobRecord>,
+    },
 }
 
-impl ComputeReconciler {
-    pub fn new(context: Arc<DriverContext>, runtime: Weak<JobsRuntime>) -> Arc<Self> {
-        Arc::new(Self { context, runtime })
+#[derive(Debug, PartialEq)]
+enum AdoptStep {
+    Adopt,
+    Facts(Box<(JobRecord, AttemptControl, AttemptIntent, Ulid)>),
+    Released,
+    HandedBack,
+}
+
+type AdoptNext = Result<Next<Adoption>, IoError>;
+
+/// Takes over a lost attempt with a fresh claim token, but only if the old holder is really
+/// gone, and finds the executor its intent names.
+#[derive(Debug, PartialEq)]
+pub struct AdoptAttemptOperation {
+    job_id: JobId,
+    holder: NodeId,
+    wiring: RunWiring,
+    now_ms: u64,
+    step: AdoptStep,
+}
+
+impl AdoptAttemptOperation {
+    pub fn new(job_id: JobId, holder: NodeId, wiring: RunWiring) -> Self {
+        Self {
+            job_id,
+            holder,
+            wiring,
+            now_ms: 0,
+            step: AdoptStep::Adopt,
+        }
+    }
+
+    fn call(&mut self, step: AdoptStep, call: IoCall) -> AdoptNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn adopted(&mut self, record: JobRecord, control: AttemptControl) -> AdoptNext {
+        let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+            return Ok(Next::Done(Adoption::Done));
+        };
+        // No durable attempt intent means the attempt was never submitted; the adopted lease
+        // goes back without charging an attempt.
+        let Some(intent) = record.attempt_intent.clone() else {
+            let release = release_job(self.job_id, token, self.now_ms);
+            return self.call(AdoptStep::Released, IoCall::child(release));
+        };
+        // The executor persisted in the intent: a fresh selection could ask the wrong backend
+        // and park a live attempt as absent.
+        let backend = intent.backend.clone();
+        let call = compute_call(ComputeEffect::Facts { backend });
+        let held = Box::new((record, control, intent, token));
+        self.call(AdoptStep::Facts(held), call)
+    }
+
+    fn scope_of(
+        &self,
+        (record, control, intent, token): (JobRecord, AttemptControl, AttemptIntent, Ulid),
+        run_as: aruna_core::compute::UserSpec,
+    ) -> Next<Adoption> {
+        let JobPayload::Execution(mut spec) = record.payload.clone() else {
+            return Next::Done(Adoption::Done);
+        };
+        let bucket = job_bucket(&record);
+        if !bucket.is_empty() {
+            spec.resolve_outputs(&bucket, record.owner_node_id);
+        }
+        let attempt = AttemptRef::new(self.job_id.to_string().to_lowercase(), intent.attempt_no);
+        let scope = AttemptScope {
+            job_id: self.job_id,
+            token,
+            backend: intent.backend.clone(),
+            fence: FenceContext {
+                attempt,
+                attempt_epoch: intent.attempt_epoch,
+                controller_generation: control.controller_generation,
+            },
+            spec: Arc::new(spec),
+            bucket,
+            run_as,
+            wiring: self.wiring.clone(),
+        };
+        Next::Done(Adoption::Adopted {
+            scope: Arc::new(scope),
+            record: Arc::new(record),
+        })
     }
 }
 
-#[async_trait::async_trait]
-impl ExternalReconciler for ComputeReconciler {
-    async fn reconcile_lost_attempt(&self, storage: &StorageHandle, record: JobRecord) {
-        let job_id = record.job_id;
-        let JobPayload::Execution(mut spec) = record.payload.clone() else {
-            return;
-        };
+impl Operation for AdoptAttemptOperation {
+    type Output = Adoption;
+    type Error = IoError;
 
-        // Take over with a fresh claim token, but only if the old holder is really gone.
-        let (adopted, control) = match adopt_external_attempt(
-            storage,
-            job_id,
-            holder(&self.context),
-            unix_timestamp_millis(),
-        )
-        .await
-        {
-            Ok(AdoptOutcome::Adopted(record, control)) => (record, control),
-            Ok(AdoptOutcome::Skipped) => {
-                info!(job_id = %job_id, "Attempt is terminal or still held; not adopting");
-                return;
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> AdoptNext {
+        let adopt = adopt_external_attempt(self.job_id, self.holder, self.now_ms);
+        Ok(Next::Call(IoCall::child(adopt)))
+    }
+
+    fn next(&mut self, result: IoResult) -> AdoptNext {
+        let job_id = self.job_id;
+        match std::mem::replace(&mut self.step, AdoptStep::Released) {
+            AdoptStep::Adopt => match result.child::<AdoptOutcome, JobMutationError>()? {
+                Ok(AdoptOutcome::Adopted(record, control)) => self.adopted(record, control),
+                Ok(AdoptOutcome::Skipped) => {
+                    info!(job_id = %job_id, "Attempt is terminal or still held; not adopting");
+                    Ok(Next::Done(Adoption::Done))
+                }
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "Adoption failed");
+                    Ok(Next::Done(Adoption::Done))
+                }
+            },
+            // A backend that moved to another home cannot observe the attempt either.
+            AdoptStep::Facts(held) => match compute_answer(result)? {
+                ComputeAnswer::Facts(facts) if facts.home_digest == held.2.home_digest => {
+                    Ok(self.scope_of(*held, facts.run_as))
+                }
+                // A node without this backend cannot observe the attempt, so charging would
+                // terminalize a healthy container: it goes back with an expired lease.
+                _ => {
+                    let (_, _, intent, token) = *held;
+                    warn!(job_id = %job_id, backend = %intent.backend, "Reconcile backend unavailable; handing back");
+                    let handoff = handoff_external_attempt(job_id, token, self.now_ms);
+                    self.call(AdoptStep::HandedBack, IoCall::child(handoff))
+                }
+            },
+            AdoptStep::Released => {
+                let _ = result.child::<ReleaseOutcome, JobMutationError>()?;
+                Ok(Next::Done(Adoption::Done))
             }
-            Err(error) => {
-                warn!(job_id = %job_id, error = %error, "Adoption failed");
-                return;
+            AdoptStep::HandedBack => {
+                if let Err(error) = result.child::<ReleaseOutcome, JobMutationError>()? {
+                    warn!(job_id = %job_id, error = %error, "Failed to hand back an unreconciled attempt");
+                }
+                Ok(Next::Done(Adoption::Done))
             }
-        };
-        let Some(token) = adopted.claim.as_ref().map(|claim| claim.claim_token) else {
-            return;
-        };
-
-        // No durable attempt intent means the attempt was never submitted; release
-        // the adopted lease without charging an attempt.
-        let Some(intent) = adopted.attempt_intent.clone() else {
-            let _ = release_job(storage, job_id, token, unix_timestamp_millis()).await;
-            return;
-        };
-
-        // Query the executor persisted in the intent: registry-first selection
-        // could ask the wrong backend and park a live attempt as absent.
-        let kind = ExecutorKind::from_wire(&intent.executor_kind);
-        let Some(backend) = self
-            .context
-            .compute_handle
-            .as_ref()
-            .and_then(|registry| registry.get(&kind))
-            .cloned()
-        else {
-            // A node without this backend cannot observe the attempt, so charging would
-            // terminalize a healthy container: hand it back with an expired lease instead.
-            warn!(job_id = %job_id, kind = %intent.executor_kind, "Reconcile backend unavailable; handing back");
-            if let Err(error) =
-                handoff_external_attempt(storage, job_id, token, unix_timestamp_millis()).await
-            {
-                warn!(job_id = %job_id, error = %error, "Failed to hand back an unreconciled attempt");
-            }
-            return;
-        };
-
-        let bucket = job_bucket(&adopted);
-        if !bucket.is_empty() {
-            spec.resolve_outputs(&bucket, adopted.owner_node_id);
         }
-        let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), intent.attempt_no);
-        let fence = FenceContext {
-            attempt: attempt.clone(),
-            attempt_epoch: intent.attempt_epoch,
-            controller_generation: control.controller_generation,
-        };
-        // Every unresolved exit below parks: the sweep that routed us here spends no
-        // attempt, so the park is what bounds a condition that never resolves.
-        if let Err(error) = backend.fence(&fence).await {
-            warn!(job_id = %job_id, error = %error, "Backend fence failed");
-            park_attempt(
-                &self.context,
-                job_id,
-                token,
-                JobError::retryable(format!("reconcile fence failed: {error}")),
-            )
-            .await;
-            return;
-        }
+    }
+}
 
-        if adopted.cancel_requested {
-            let _ = with_execution_heartbeat(
-                storage.clone(),
-                job_id,
-                token,
-                CancellationToken::new(),
-                Box::pin(finalize_cancel(
-                    &self.context,
-                    job_id,
-                    token,
-                    &backend,
-                    &fence,
-                    &spec,
-                    &bucket,
-                )),
-            )
-            .await;
-            return;
-        }
+/// What the evidence about an adopted attempt asks for next.
+#[derive(Debug, PartialEq)]
+pub enum AdoptedEnd {
+    Settled,
+    /// The attempt lives on, or must be submitted again under its name: a supervisor takes it.
+    Resume(AttemptPhase),
+}
 
-        let outcome = backend.reconcile(&fence).await;
-        let started_at_ms = match &outcome {
+#[derive(Debug, PartialEq)]
+enum SettleStep {
+    Fence,
+    Reconcile,
+    /// The start fence, read before an attempt is submitted again under its name.
+    StartFence,
+    HandedBack,
+    Started(Box<ReconcileEvidence>),
+    Running(Box<ReconcileEvidence>),
+    StopThenPark,
+    Tombstone,
+    Last,
+}
+
+type SettleNext = Result<Next<AdoptedEnd>, IoError>;
+
+/// Resolves an adopted attempt from what its backend says. Every unresolved exit parks: the
+/// sweep that routed it here spends no attempt, so the park bounds what never resolves.
+#[derive(Debug, PartialEq)]
+pub struct SettleAdoptedOperation {
+    scope: Arc<AttemptScope>,
+    record: Arc<JobRecord>,
+    now_ms: u64,
+    step: SettleStep,
+}
+
+impl SettleAdoptedOperation {
+    pub fn new(scope: Arc<AttemptScope>, record: Arc<JobRecord>) -> Self {
+        Self {
+            scope,
+            record,
+            now_ms: 0,
+            step: SettleStep::Fence,
+        }
+    }
+
+    fn call(&mut self, step: SettleStep, call: IoCall) -> SettleNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn park(&mut self, error: JobError) -> SettleNext {
+        let scope = &self.scope;
+        let settle = scope.settle(self.now_ms);
+        let park = ParkAttemptOperation::new(scope.job_id, scope.token, error, settle);
+        self.call(SettleStep::Last, IoCall::child(park))
+    }
+
+    fn finalize(&mut self, goal: FinalizeGoal) -> SettleNext {
+        let finalize = FinalizeOperation::new(self.scope.clone(), goal);
+        self.call(SettleStep::Last, IoCall::child(finalize))
+    }
+
+    fn start_known(&mut self, evidence: ReconcileEvidence) -> SettleNext {
+        let scope = self.scope.clone();
+        let started = match &evidence {
             ReconcileEvidence::Adoptable(evidence) => evidence.status.started_at_ms,
             _ => None,
         };
-        if let Some(started_at_ms) = started_at_ms
-            && let Err(error) = record_attempt_started(storage, job_id, token, started_at_ms).await
-        {
-            warn!(job_id = %job_id, error = %error, "Attempt start evidence write failed during adoption");
-            park_attempt(
-                &self.context,
-                job_id,
-                token,
-                JobError::retryable(format!("start evidence write failed: {error}")),
-            )
-            .await;
-            return;
+        if let Some(started_at_ms) = started {
+            let write = record_attempt_started(scope.job_id, scope.token, started_at_ms);
+            return self.call(
+                SettleStep::Started(Box::new(evidence)),
+                IoCall::child(write),
+            );
         }
-        if matches!(
-            &outcome,
-            ReconcileEvidence::Adoptable(evidence)
-                if !matches!(evidence.status.phase, AttemptPhase::Submitted)
-        ) && matches!(adopted.state, JobState::Indeterminate | JobState::Ready)
-        {
-            let running = match begin_external_running(
-                storage,
-                job_id,
-                token,
-                started_at_ms,
-                unix_timestamp_millis(),
-            )
-            .await
-            {
-                Ok(record) => record,
-                Err(error) => {
-                    park_attempt(
-                        &self.context,
-                        job_id,
-                        token,
-                        JobError::retryable(format!("adopted attempt cannot run: {error}")),
-                    )
-                    .await;
-                    return;
-                }
-            };
-            if running.cancel_requested {
-                let _ = with_execution_heartbeat(
-                    storage.clone(),
-                    job_id,
-                    token,
-                    CancellationToken::new(),
-                    Box::pin(finalize_cancel(
-                        &self.context,
-                        job_id,
-                        token,
-                        &backend,
-                        &fence,
-                        &spec,
-                        &bucket,
-                    )),
-                )
-                .await;
-                return;
-            }
-        }
+        self.mark_running(evidence)
+    }
 
-        match outcome {
+    fn mark_running(&mut self, evidence: ReconcileEvidence) -> SettleNext {
+        let scope = self.scope.clone();
+        let (adoptable, started) = match &evidence {
+            ReconcileEvidence::Adoptable(evidence) => (
+                !matches!(evidence.status.phase, AttemptPhase::Submitted),
+                evidence.status.started_at_ms,
+            ),
+            _ => (false, None),
+        };
+        if adoptable && matches!(self.record.state, JobState::Indeterminate | JobState::Ready) {
+            let write = begin_external_running(scope.job_id, scope.token, started, self.now_ms);
+            return self.call(
+                SettleStep::Running(Box::new(evidence)),
+                IoCall::child(write),
+            );
+        }
+        self.resolve(evidence)
+    }
+
+    /// Behind the start fence an attempt is not submitted again; it is handed back free.
+    fn resume(&mut self, phase: AttemptPhase) -> SettleNext {
+        match phase {
+            AttemptPhase::Submitted => self.call(SettleStep::StartFence, fence_read()),
+            phase => Ok(Next::Done(AdoptedEnd::Resume(phase))),
+        }
+    }
+
+    fn resolve(&mut self, evidence: ReconcileEvidence) -> SettleNext {
+        let scope = self.scope.clone();
+        match evidence {
             ReconcileEvidence::Adoptable(evidence) if !evidence.status.is_terminal() => {
-                self.resume(
-                    job_id,
-                    token,
-                    backend,
-                    fence,
-                    evidence.status.phase,
-                    spec,
-                    bucket,
-                    adopted,
-                )
-                .await;
+                self.resume(evidence.status.phase)
             }
-            // Terminal evidence: commit it now (correlates the cancel intent).
+            // Terminal evidence is committed now, which correlates the cancel intent.
             ReconcileEvidence::Adoptable(evidence) => {
-                let mut status = evidence.status;
-                let max_walltime_ms = spec
-                    .resources
-                    .max_walltime_ms
-                    .unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
-                if status.started_at_ms.zip(status.finished_at_ms).is_some_and(
-                    |(started, finished)| finished.saturating_sub(started) > max_walltime_ms,
-                ) {
-                    status.phase = AttemptPhase::Failed {
-                        reason: "walltime limit exceeded while unobserved".to_string(),
-                    };
-                }
-                let cancel = CancellationToken::new();
-                let finalized = with_execution_heartbeat(
-                    storage.clone(),
-                    job_id,
-                    token,
-                    cancel.clone(),
-                    Box::pin(finalize_attempt(
-                        &self.context,
-                        job_id,
-                        token,
-                        &backend,
-                        &fence,
-                        &spec,
-                        &bucket,
-                        Ok(status),
-                        &cancel,
-                    )),
-                )
-                .await;
-                if finalized.is_none() {
-                    info!(job_id = %job_id, "Reconcile finalizer superseded; abandoning");
-                }
+                let status = over_walltime(evidence.status, &scope.spec);
+                self.finalize(FinalizeGoal::Attempt(Ok(status)))
             }
-            // Post-submit absence retries the same attempt name.
-            ReconcileEvidence::Absent => {
-                self.resume(
-                    job_id,
-                    token,
-                    backend,
-                    fence,
-                    AttemptPhase::Submitted,
-                    spec,
-                    bucket,
-                    adopted,
-                )
-                .await;
-            }
+            // Absence after a submit retries the same attempt name.
+            ReconcileEvidence::Absent => self.resume(AttemptPhase::Submitted),
             ReconcileEvidence::Unavailable(error) => {
-                park_attempt(
-                    &self.context,
-                    job_id,
-                    token,
-                    JobError::retryable(format!("backend unavailable: {error}")),
-                )
-                .await;
+                self.park(JobError::retryable(format!("backend unavailable: {error}")))
             }
-            ReconcileEvidence::Unadoptable(artifact) => {
-                if artifact.exact_identity {
-                    let _ = backend.cancel(&fence).await;
-                }
-                park_attempt(
-                    &self.context,
-                    job_id,
-                    token,
-                    JobError::retryable("backend artifact is not adoptable"),
-                )
-                .await;
+            ReconcileEvidence::Unadoptable(artifact) if artifact.exact_identity => {
+                let call = scope.backend(ComputeRequest::Cancel);
+                self.call(SettleStep::StopThenPark, call)
+            }
+            ReconcileEvidence::Unadoptable(_) => {
+                self.park(JobError::retryable("backend artifact is not adoptable"))
             }
             ReconcileEvidence::Tombstoned(tombstone) => {
-                if record_attempt_tombstone(
-                    storage,
-                    job_id,
-                    token,
-                    fence.attempt_epoch,
+                let write = record_attempt_tombstone(
+                    scope.job_id,
+                    scope.token,
+                    scope.fence.attempt_epoch,
                     tombstone.backend_ref,
-                )
-                .await
-                .is_ok()
-                {
-                    requeue_after_tombstone(
-                        &self.context,
-                        job_id,
-                        token,
-                        &adopted,
-                        &aruna_core::compute::BackendError::Unavailable(
-                            "attempt tombstoned".to_string(),
-                        ),
-                    )
-                    .await;
-                }
+                );
+                self.call(SettleStep::Tombstone, IoCall::child(write))
             }
         }
     }
 }
 
-impl ComputeReconciler {
-    /// Adopt a live container without blocking the drain loop, registering its
-    /// supervisor with `JobsRuntime` for caps, cancellation, and shutdown.
-    #[allow(clippy::too_many_arguments)]
-    async fn resume(
-        &self,
-        job_id: aruna_core::structs::execution::job::JobId,
-        token: ulid::Ulid,
-        backend: Arc<dyn aruna_compute::ExecutorBackend>,
-        fence: FenceContext,
-        phase: AttemptPhase,
-        spec: ExecutionSpec,
-        bucket: String,
-        record: JobRecord,
-    ) {
-        let context = self.context.clone();
-        let supervisor_record = record.clone();
-        let supervisor = move |cancel| {
-            resume_attempt(
-                context,
-                job_id,
-                token,
-                backend,
-                fence,
-                phase,
-                spec,
-                bucket,
-                supervisor_record,
-                cancel,
-            )
+/// An attempt that ran past its walltime while nobody watched it counts as failed.
+fn over_walltime(mut status: AttemptStatus, spec: &ExecutionSpec) -> AttemptStatus {
+    let max_walltime_ms =
+        (spec.resources.max_walltime_ms).unwrap_or(DEFAULT_WALLTIME.as_millis() as u64);
+    let overran = (status.started_at_ms.zip(status.finished_at_ms))
+        .is_some_and(|(started, finished)| finished.saturating_sub(started) > max_walltime_ms);
+    if overran {
+        status.phase = AttemptPhase::Failed {
+            reason: "walltime limit exceeded while unobserved".to_string(),
         };
-        if !self.runtime.upgrade().is_some_and(|runtime| {
-            runtime.spawn_recovered(self.context.clone(), &record, supervisor)
-        }) && let Err(error) = handoff_external_attempt(
-            &self.context.storage_handle,
-            job_id,
-            token,
-            unix_timestamp_millis(),
-        )
-        .await
-        {
-            warn!(job_id = %job_id, error = %error, "Failed to hand off unregistered recovered attempt");
-        }
     }
+    status
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) async fn resume_attempt(
-    context: Arc<DriverContext>,
-    job_id: aruna_core::structs::execution::job::JobId,
-    token: ulid::Ulid,
-    backend: Arc<dyn aruna_compute::ExecutorBackend>,
-    fence: FenceContext,
-    phase: AttemptPhase,
-    spec: ExecutionSpec,
-    bucket: String,
-    record: JobRecord,
-    cancel: CancellationToken,
-) {
-    let current = match read_job_record(&context.storage_handle, job_id, None).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return,
-        Err(error) => {
-            warn!(job_id = %job_id, error = %error, "Recovered job lookup failed");
-            return;
-        }
-    };
-    if current.cancel_requested {
-        let _ = with_execution_heartbeat(
-            context.storage_handle.clone(),
-            job_id,
-            token,
-            cancel,
-            Box::pin(finalize_cancel(
-                &context, job_id, token, &backend, &fence, &spec, &bucket,
-            )),
-        )
-        .await;
-        return;
+impl Operation for SettleAdoptedOperation {
+    type Output = AdoptedEnd;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
-    if matches!(phase, AttemptPhase::Submitted) {
-        let resumed = with_execution_heartbeat(
-            context.storage_handle.clone(),
-            job_id,
-            token,
-            cancel.clone(),
-            Box::pin(async {
-                let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-                    Box::pin(fail_or_park(
-                        &context,
-                        job_id,
-                        token,
-                        &record,
-                        JobError::permanent("execution needs a net handle"),
-                    ))
-                    .await;
-                    return false;
-                };
-                let prepared =
-                    Box::pin(prepare_attempt(&context, &spec, &record, node_id, &bucket));
-                let prepared = match prepared.await {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;
-                        return false;
+
+    fn first(&mut self) -> SettleNext {
+        Ok(Next::Call(self.scope.backend(ComputeRequest::Fence)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SettleNext {
+        let scope = self.scope.clone();
+        match std::mem::replace(&mut self.step, SettleStep::Last) {
+            SettleStep::StartFence => match fence_up(result) {
+                false => Ok(Next::Done(AdoptedEnd::Resume(AttemptPhase::Submitted))),
+                true => {
+                    let handoff = handoff_external_attempt(scope.job_id, scope.token, self.now_ms);
+                    self.call(SettleStep::HandedBack, IoCall::child(handoff))
+                }
+            },
+            SettleStep::HandedBack => {
+                if let Err(error) = result.child::<ReleaseOutcome, JobMutationError>()? {
+                    warn!(job_id = %scope.job_id, error = %error, "Fenced attempt was not handed back");
+                }
+                Ok(Next::Done(AdoptedEnd::Settled))
+            }
+            SettleStep::Fence => match compute_answer(result)? {
+                ComputeAnswer::Done(Ok(())) => {
+                    if self.record.cancel_requested {
+                        return self.finalize(FinalizeGoal::Cancel);
                     }
-                };
-                let Some(pinned_image) = record
-                    .attempt_intent
-                    .as_ref()
-                    .filter(|intent| intent.attempt_epoch == fence.attempt_epoch)
-                    .map(|intent| intent.pinned_image.as_str())
-                else {
-                    Box::pin(park_attempt(
-                        &context,
-                        job_id,
-                        token,
-                        JobError::retryable("attempt intent mismatch"),
-                    ))
-                    .await;
-                    return false;
-                };
-                let task_spec = build_task_spec(
-                    &spec,
-                    &fence.attempt,
-                    pinned_image,
-                    prepared,
-                    backend.run_identity(),
+                    let call = scope.backend(ComputeRequest::Reconcile);
+                    self.call(SettleStep::Reconcile, call)
+                }
+                answer => {
+                    let error = match answer {
+                        ComputeAnswer::Done(Err(error)) => error,
+                        _ => BackendError::Unavailable("no backend".to_string()),
+                    };
+                    warn!(job_id = %scope.job_id, error = %error, "Backend fence failed");
+                    let message = format!("reconcile fence failed: {error}");
+                    self.park(JobError::retryable(message))
+                }
+            },
+            SettleStep::Reconcile => match compute_answer(result)? {
+                ComputeAnswer::Reconciled(evidence) => self.start_known(evidence),
+                _ => self.park(JobError::retryable("backend unavailable: no backend")),
+            },
+            SettleStep::Started(evidence) => match result.child::<JobRecord, JobMutationError>()? {
+                Ok(_) => self.mark_running(*evidence),
+                Err(error) => {
+                    warn!(job_id = %scope.job_id, error = %error, "Attempt start evidence write failed during adoption");
+                    let message = format!("start evidence write failed: {error}");
+                    self.park(JobError::retryable(message))
+                }
+            },
+            SettleStep::Running(evidence) => match result.child::<JobRecord, JobMutationError>()? {
+                Ok(running) if running.cancel_requested => self.finalize(FinalizeGoal::Cancel),
+                Ok(_) => self.resolve(*evidence),
+                Err(error) => {
+                    let message = format!("adopted attempt cannot run: {error}");
+                    self.park(JobError::retryable(message))
+                }
+            },
+            SettleStep::StopThenPark => {
+                let _ = compute_answer(result)?;
+                self.park(JobError::retryable("backend artifact is not adoptable"))
+            }
+            SettleStep::Tombstone => {
+                if result.child::<AttemptControl, JobMutationError>()?.is_err() {
+                    return Ok(Next::Done(AdoptedEnd::Settled));
+                }
+                let error = JobError::retryable(format!(
+                    "submit failed: {}",
+                    BackendError::Unavailable("attempt tombstoned".to_string())
+                ));
+                let failure = SubmitFailureOperation::new(
+                    &self.record,
+                    scope.token,
+                    error,
+                    false,
+                    scope.settle(self.now_ms),
                 );
-                let status = match backend.submit(&fence, &task_spec, &cancel).await {
-                    Ok(status) => status,
-                    Err(aruna_core::compute::BackendError::Cancelled) => {
-                        Box::pin(finalize_cancel(
-                            &context, job_id, token, &backend, &fence, &spec, &bucket,
-                        ))
-                        .await;
-                        return false;
-                    }
-                    Err(error) => {
-                        let error = if error.retryable() {
-                            JobError::retryable(format!("resubmit failed: {error}"))
-                        } else {
-                            JobError::permanent(format!("resubmit failed: {error}"))
-                        };
-                        Box::pin(fail_or_park(&context, job_id, token, &record, error)).await;
-                        return false;
-                    }
-                };
-                if let Some(started_at_ms) = status.started_at_ms
-                    && record_attempt_started(&context.storage_handle, job_id, token, started_at_ms)
-                        .await
-                        .is_err()
-                {
-                    return false;
+                self.call(SettleStep::Last, IoCall::child(failure))
+            }
+            SettleStep::Last => {
+                if let Err(error) = result.child::<(), IoError>()? {
+                    warn!(job_id = %scope.job_id, %error, "Adopted attempt failed to settle");
                 }
-                let running = match begin_external_running(
-                    &context.storage_handle,
-                    job_id,
-                    token,
-                    status.started_at_ms,
-                    unix_timestamp_millis(),
-                )
-                .await
-                {
-                    Ok(record) => record,
-                    Err(_) => return false,
-                };
-                if running.cancel_requested {
-                    Box::pin(finalize_cancel(
-                        &context, job_id, token, &backend, &fence, &spec, &bucket,
-                    ))
-                    .await;
-                    return false;
-                }
-                true
-            }),
-        )
-        .await;
-        if resumed != Some(true) {
-            return;
+                Ok(Next::Done(AdoptedEnd::Settled))
+            }
         }
     }
-    Box::pin(supervise_and_finalize(
-        context, job_id, token, backend, fence, spec, bucket, cancel,
-    ))
-    .await;
 }
 
-async fn fail_or_park(
-    context: &Arc<DriverContext>,
-    job_id: aruna_core::structs::execution::job::JobId,
-    token: ulid::Ulid,
-    record: &JobRecord,
-    error: JobError,
-) {
-    if error.kind == JobErrorKind::Permanent {
-        fail_and_crate(context, job_id, token, record, error).await;
-    } else {
-        park_attempt(context, job_id, token, error).await;
+#[derive(Debug, PartialEq)]
+enum FenceStep {
+    Offers,
+    Held(Box<ExecutorOffer>),
+}
+
+/// The fences a start applies, before recovery creates or starts work again: the config digest
+/// a receipt was accepted under, then the rules the backend admits work by.
+#[derive(Debug, PartialEq)]
+pub struct RecoveryFence {
+    job_id: JobId,
+    backend: String,
+    spec: Arc<ExecutionSpec>,
+    step: FenceStep,
+}
+
+impl RecoveryFence {
+    pub fn new(scope: &AttemptScope) -> Self {
+        Self {
+            job_id: scope.job_id,
+            backend: scope.backend.clone(),
+            spec: scope.spec.clone(),
+            step: FenceStep::Offers,
+        }
+    }
+
+    fn held(&self, offer: &ExecutorOffer, held: Vec<JobReservationRecord>) -> Result<(), JobError> {
+        let name = &self.backend;
+        if let Some(stored) = held.first()
+            && stored.config_digest != offer.config_digest()
+        {
+            let stored = stored.config_generation;
+            return Err(JobError::retryable(format!(
+                "compute backend {name} changed its config since the receipt (stored generation {stored})"
+            )));
+        }
+        match backend_refusal(offer, &self.spec) {
+            Some(verdict) => Err(JobError::retryable(format!(
+                "compute backend {name} no longer takes the job: {}",
+                verdict.reason()
+            ))),
+            None => Ok(()),
+        }
     }
 }
 
-fn holder(context: &DriverContext) -> aruna_core::id::NodeId {
-    context
-        .net_handle
-        .as_ref()
-        .map(|net| net.node_id())
-        .unwrap_or_else(|| iroh::SecretKey::from_bytes(&[0u8; 32]).public())
+impl Operation for RecoveryFence {
+    type Output = ();
+    type Error = JobError;
+
+    fn first(&mut self) -> Result<Next<()>, JobError> {
+        Ok(Next::Call(compute_call(ComputeEffect::Offers)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobError> {
+        let retryable = |error: String| JobError::retryable(error);
+        match std::mem::replace(&mut self.step, FenceStep::Offers) {
+            FenceStep::Offers => {
+                let answer =
+                    compute_answer(result).map_err(|error| retryable(error.to_string()))?;
+                let ComputeAnswer::Offers(offers) = answer else {
+                    return Err(retryable("no compute backend configured".to_string()));
+                };
+                let name = &self.backend;
+                let Some(offer) = offers.into_iter().find(|offer| offer.name() == name) else {
+                    return Err(retryable(format!(
+                        "compute backend {name} is not available here"
+                    )));
+                };
+                self.step = FenceStep::Held(Box::new(offer));
+                let held = HeldReservations::of_job(self.job_id);
+                Ok(Next::Call(IoCall::child(held)))
+            }
+            FenceStep::Held(offer) => {
+                let held = result.child::<Vec<JobReservationRecord>, LifecycleError>();
+                let held = held.map_err(|error| retryable(error.to_string()))?;
+                let held = held.map_err(|error| retryable(error.to_string()))?;
+                self.held(&offer, held)?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ResumeStep {
+    Current,
+    Fence,
+    Prepare,
+    Submit,
+    Started(Box<AttemptStatus>),
+    Running,
+    Supervise,
+    Last,
+}
+
+type ResumeNext = Result<Next<()>, IoError>;
+
+/// Supervises an adopted attempt, submitting it again under its name when it never ran.
+#[derive(Debug, PartialEq)]
+pub struct ResumeAttemptOperation {
+    scope: Arc<AttemptScope>,
+    record: Arc<JobRecord>,
+    phase: AttemptPhase,
+    now_ms: u64,
+    step: ResumeStep,
+}
+
+impl ResumeAttemptOperation {
+    pub fn new(scope: Arc<AttemptScope>, record: Arc<JobRecord>, phase: AttemptPhase) -> Self {
+        Self {
+            scope,
+            record,
+            phase,
+            now_ms: 0,
+            step: ResumeStep::Current,
+        }
+    }
+
+    fn call(&mut self, step: ResumeStep, call: IoCall) -> ResumeNext {
+        self.step = step;
+        Ok(Next::Call(call))
+    }
+
+    fn supervise(&mut self) -> ResumeNext {
+        let supervise = SuperviseOperation::new(self.scope.clone());
+        self.call(ResumeStep::Supervise, IoCall::child(supervise))
+    }
+
+    fn cancel(&mut self) -> ResumeNext {
+        let finalize = FinalizeOperation::new(self.scope.clone(), FinalizeGoal::Cancel);
+        self.call(ResumeStep::Last, IoCall::child(finalize))
+    }
+
+    fn park(&mut self, error: JobError) -> ResumeNext {
+        let scope = &self.scope;
+        let settle = scope.settle(self.now_ms);
+        let park = ParkAttemptOperation::new(scope.job_id, scope.token, error, settle);
+        self.call(ResumeStep::Last, IoCall::child(park))
+    }
+
+    fn fail_or_park(&mut self, error: JobError) -> ResumeNext {
+        if error.kind != JobErrorKind::Permanent {
+            return self.park(error);
+        }
+        let scope = &self.scope;
+        let bucket = job_bucket(&self.record);
+        let result = execution_result(&bucket, None, Vec::new(), Default::default());
+        let ending = RunEnding::Fail { error, result };
+        let settle = scope.settle(self.now_ms);
+        let end = EndRunOperation::new(scope.job_id, scope.token, ending, settle);
+        self.call(ResumeStep::Last, IoCall::child(end))
+    }
+
+    /// Recovery may create or start work, so the backend must still take it.
+    fn fence(&mut self, current: &JobRecord) -> ResumeNext {
+        let scope = &self.scope;
+        let call = match RecheckAdmission::of_job(current, scope.token, scope.spec.clone()) {
+            Some(recheck) => IoCall::child(recheck),
+            None => IoCall::child(RecoveryFence::new(scope)),
+        };
+        self.call(ResumeStep::Fence, call)
+    }
+
+    fn prepare(&mut self) -> ResumeNext {
+        let scope = self.scope.clone();
+        let Some(run) = scope.run(&self.record) else {
+            return self.fail_or_park(JobError::permanent("execution needs a net handle"));
+        };
+        let prepare = PrepareAttemptOperation::new(
+            run,
+            (scope.spec.clone(), self.record.clone()),
+            &scope.bucket,
+            scope.wiring.encryption_key.clone(),
+            false,
+        );
+        self.call(ResumeStep::Prepare, IoCall::child(prepare))
+    }
+
+    fn submit(&mut self, prepared: PreparedTask) -> ResumeNext {
+        let scope = self.scope.clone();
+        let pinned = (self.record.attempt_intent.as_ref())
+            .filter(|intent| intent.attempt_epoch == scope.fence.attempt_epoch)
+            .map(|intent| intent.pinned_image.clone());
+        let Some(pinned) = pinned else {
+            return self.park(JobError::retryable("attempt intent mismatch"));
+        };
+        let task = build_task_spec(
+            &scope.spec,
+            &scope.fence.attempt,
+            &pinned,
+            prepared,
+            scope.run_as,
+        );
+        let call = scope.backend(ComputeRequest::Submit(Box::new(task)));
+        self.call(ResumeStep::Submit, call)
+    }
+
+    fn submitted(&mut self, status: AttemptStatus) -> ResumeNext {
+        let scope = self.scope.clone();
+        if let Some(started_at_ms) = status.started_at_ms {
+            let write = record_attempt_started(scope.job_id, scope.token, started_at_ms);
+            let step = ResumeStep::Started(Box::new(status));
+            return self.call(step, IoCall::child(write));
+        }
+        self.running(&status)
+    }
+
+    fn running(&mut self, status: &AttemptStatus) -> ResumeNext {
+        let scope = &self.scope;
+        let write =
+            begin_external_running(scope.job_id, scope.token, status.started_at_ms, self.now_ms);
+        self.call(ResumeStep::Running, IoCall::child(write))
+    }
+}
+
+impl Operation for ResumeAttemptOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> ResumeNext {
+        let read = read_job_record(self.scope.job_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> ResumeNext {
+        let job_id = self.scope.job_id;
+        match std::mem::replace(&mut self.step, ResumeStep::Last) {
+            ResumeStep::Current => match result.child::<Option<JobRecord>, JobMutationError>()? {
+                Ok(Some(current)) if current.cancel_requested => self.cancel(),
+                Ok(Some(current)) if matches!(self.phase, AttemptPhase::Submitted) => {
+                    self.fence(&current)
+                }
+                Ok(Some(_)) => self.supervise(),
+                Ok(None) => Ok(Next::Done(())),
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error, "Recovered job lookup failed");
+                    Ok(Next::Done(()))
+                }
+            },
+            ResumeStep::Fence => match result.child::<(), JobError>()? {
+                Ok(()) => self.prepare(),
+                Err(error) => {
+                    warn!(job_id = %job_id, error = %error.message, "Recovery refused by its backend");
+                    self.park(error)
+                }
+            },
+            ResumeStep::Prepare => match result.child::<PreparedTask, JobError>()? {
+                Ok(prepared) => self.submit(prepared),
+                Err(error) => self.fail_or_park(error),
+            },
+            ResumeStep::Submit => match compute_answer(result)? {
+                ComputeAnswer::Submitted(Ok(status)) => self.submitted(status),
+                ComputeAnswer::Submitted(Err(BackendError::Cancelled)) => self.cancel(),
+                ComputeAnswer::Submitted(Err(error)) => {
+                    let message = format!("resubmit failed: {error}");
+                    self.fail_or_park(match error.retryable() {
+                        true => JobError::retryable(message),
+                        false => JobError::permanent(message),
+                    })
+                }
+                _ => self.park(JobError::retryable("resubmit failed: no backend")),
+            },
+            ResumeStep::Started(status) => match result.child::<JobRecord, JobMutationError>()? {
+                Ok(_) => self.running(&status),
+                Err(_) => Ok(Next::Done(())),
+            },
+            ResumeStep::Running => match result.child::<JobRecord, JobMutationError>()? {
+                Ok(running) if running.cancel_requested => self.cancel(),
+                Ok(_) => self.supervise(),
+                Err(_) => Ok(Next::Done(())),
+            },
+            ResumeStep::Supervise | ResumeStep::Last => {
+                if let Err(error) = result.child::<(), IoError>()? {
+                    warn!(job_id = %job_id, %error, "Adopted attempt failed to settle");
+                }
+                Ok(Next::Done(()))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::jobs::JOB_MAX_ATTEMPTS;
-    use crate::jobs::store::{insert_job, record_attempt_intent};
-    use crate::tests::workflow::{execution_spec, node_id};
-    use aruna_compute::ExecutorRegistry;
-    use aruna_core::UserId;
-    use aruna_core::structs::execution::job::{AttemptIntent, JobClaim, JobId};
-    use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
-    use aruna_core::structured_id::{BucketId, PlacementHandle};
-    use aruna_storage::FjallStorage;
-    use aruna_tasks::TaskHandle;
-    use tempfile::tempdir;
-    use ulid::Ulid;
-
-    fn job_id() -> JobId {
-        crate::jobs::submit::mint_job_id(
-            PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
-            BucketId::new(0).unwrap(),
-        )
-        .unwrap()
-    }
-
-    // A node whose registry lacks the executor cannot observe the container, so no
-    // number of sweeps by it may spend an attempt or terminalize the job.
-    #[tokio::test]
-    async fn missing_backend_spares() {
-        let dir = tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let context = Arc::new(DriverContext {
-            storage_handle: storage.clone(),
-            net_handle: None,
-            blob_handle: None,
-            metadata_handle: None,
-            task_handle: Some(TaskHandle::new()),
-            compute_handle: Some(Arc::new(ExecutorRegistry::new())),
-        });
-        let job_id = job_id();
-        let token = Ulid::generate();
-        let mut record = JobRecord::new(
-            job_id,
-            JobPayload::Execution(execution_spec()),
-            UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
-            node_id(7),
-            1,
-            1,
-            None,
-        );
-        record.state = JobState::Running;
-        record.claim = Some(JobClaim {
-            holder_node_id: node_id(7),
-            claim_token: token,
-            lease_expires_ms: 1,
-        });
-        insert_job(&storage, &record).await.unwrap();
-        record_attempt_intent(
-            &storage,
-            job_id,
-            token,
-            AttemptIntent {
-                attempt_no: 1,
-                external_name: job_id.to_string().to_lowercase(),
-                executor_kind: "kubernetes".to_string(),
-                pinned_image: "alpine@sha256:digest".to_string(),
-                attempt_epoch: 0,
-            },
-            None,
-            None,
-            unix_timestamp_millis(),
-        )
-        .await
-        .unwrap();
-
-        let runtime = JobsRuntime::new();
-        let reconciler = ComputeReconciler::new(context, Arc::downgrade(&runtime));
-        for sweep in 0..(JOB_MAX_ATTEMPTS + 2) {
-            let lost = read_job_record(&storage, job_id, None)
-                .await
-                .unwrap()
-                .unwrap();
-            reconciler.reconcile_lost_attempt(&storage, lost).await;
-            let after = read_job_record(&storage, job_id, None)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(after.state, JobState::Running, "sweep {sweep}");
-            assert_eq!(after.attempts, 0, "sweep {sweep}");
-            assert!(after.attempt_intent.is_some(), "sweep {sweep}");
-        }
-    }
-}
+#[path = "reconcile_tests.rs"]
+mod call_tests;

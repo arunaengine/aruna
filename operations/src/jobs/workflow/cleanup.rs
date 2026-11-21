@@ -2,98 +2,326 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::compute::{BackendError, ExecutorKind, TombstoneSpec};
-use aruna_core::structs::execution::job::{
-    AttemptIntent, JobError, JobErrorKind, JobId, JobResultPayload,
+use std::time::Duration;
+
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::compute::effect::{ComputeAnswer, ComputeEffect, ComputeRequest};
+use aruna_core::compute::{BackendError, FenceContext, TombstoneSpec};
+use aruna_core::id::NodeId;
+use aruna_core::operation::Operation;
+use aruna_core::structs::execution::job::family::StopEvidence;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobErrorKind, JobResultPayload,
 };
+use aruna_core::structs::execution::job::rows::JobWrites;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::UserAccess;
+use ulid::Ulid;
 
-use super::super::executor::{JobContext, JobRunOutcome};
-use super::super::store::{JobMutationError, authorize_cleanup, record_attempt_tombstone};
-use crate::driver::drive;
+use super::super::lifecycle::outbox::schedule_outbox_drain;
+use super::super::store::job_calls::{authorize_cleanup, record_stop_tombstone};
+use super::super::store::mutation_error::JobMutationError;
+use super::compute::{attempt_call, compute_answer, compute_call};
+use super::stop_record::StopRecordOperation;
 use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use aruna_core::jobs::JobRunOutcome;
 
-pub async fn run_terminal_cleanup(
-    ctx: &JobContext,
-    for_job: JobId,
-    intent: Option<&AttemptIntent>,
-    access_key: &str,
-) -> JobRunOutcome {
-    let backend_error = cleanup_attempt(ctx, for_job, intent).await.err();
-    let revoke_error = revoke_credential(ctx, access_key).await.err();
-    match cleanup_error([revoke_error, backend_error]) {
-        Some(error) => JobRunOutcome::Failed(error),
-        None => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
-    }
+#[derive(Debug, PartialEq)]
+enum CleanupStep {
+    Stop,
+    StopWrite,
+    Authorize,
+    Home(FenceContext),
+    Fence(FenceContext),
+    Cleanup(FenceContext),
+    Tombstone(FenceContext),
+    Record,
+    Revoke,
 }
 
-async fn revoke_credential(ctx: &JobContext, access_key: &str) -> Result<(), JobError> {
-    match drive(
-        RevokeUserOperation::new(access_key.to_string()),
-        &ctx.driver,
-    )
-    .await
-    {
-        Ok(_) | Err(RevokeUserError::NotFound) => Ok(()),
-        Err(error) => Err(revoke_error(error)),
-    }
+/// Removes a finished attempt from its backend and revokes the run's credential. The revoke runs
+/// even when the backend work failed, so one failure cannot strand a live workspace key. On a
+/// node with a network the stop record of the execution lands with the attempt tombstone.
+#[derive(Debug, PartialEq)]
+pub struct TerminalCleanupOperation {
+    for_job: JobId,
+    token: Ulid,
+    intent: Option<AttemptIntent>,
+    access_key: String,
+    serving: Option<(NodeId, RealmId)>,
+    /// The stop record rows; `stopped` once they are stored.
+    stop: JobWrites,
+    stopped: bool,
+    backend_error: Option<JobError>,
+    step: CleanupStep,
 }
 
-async fn cleanup_attempt(
-    ctx: &JobContext,
-    for_job: JobId,
-    intent: Option<&AttemptIntent>,
-) -> Result<(), JobError> {
-    let Some(intent) = intent else {
-        return Ok(());
-    };
-    let fence = authorize_cleanup(&ctx.driver.storage_handle, for_job, intent, ctx.claim_token)
-        .await
-        .map_err(|error| match error {
-            JobMutationError::NotFound => JobError::permanent("cleanup parent no longer exists"),
-            error => JobError::retryable(format!("cleanup fence claim failed: {error}")),
-        })?;
-    if fence.attempt.external_name() != intent.external_name {
-        return Err(JobError::permanent("cleanup attempt identity mismatch"));
-    }
-    let Some(registry) = ctx.driver.compute_handle.as_ref() else {
-        return Err(JobError::retryable("cleanup needs a compute backend"));
-    };
-    let kind = ExecutorKind::from_wire(&intent.executor_kind);
-    let Some(backend) = registry.get(&kind) else {
-        return Err(JobError::retryable(format!(
-            "cleanup backend {} is unavailable",
-            intent.executor_kind
-        )));
-    };
-    backend
-        .fence(&fence)
-        .await
-        .map_err(|error| JobError::retryable(format!("backend fence failed: {error}")))?;
-    match backend.cleanup(&fence).await {
-        Ok(()) | Err(BackendError::NotFound(_)) => {
-            let tombstone = backend
-                .tombstone(&fence, &TombstoneSpec { terminal_ref: None })
-                .await
-                .map_err(|error| {
-                    JobError::retryable(format!("backend tombstone failed: {error}"))
-                })?;
-            record_attempt_tombstone(
-                &ctx.driver.storage_handle,
-                for_job,
-                ctx.claim_token,
-                intent.attempt_epoch,
-                tombstone.backend_ref,
-            )
-            .await
-            .map_err(|error| JobError::retryable(format!("tombstone record failed: {error}")))?;
-            Ok(())
+impl TerminalCleanupOperation {
+    pub fn new(
+        for_job: JobId,
+        token: Ulid,
+        (intent, access_key): (Option<AttemptIntent>, &str),
+        serving: Option<(NodeId, RealmId)>,
+    ) -> Self {
+        Self {
+            for_job,
+            token,
+            intent,
+            access_key: access_key.to_string(),
+            serving,
+            stop: Vec::new(),
+            stopped: false,
+            backend_error: None,
+            step: CleanupStep::Authorize,
         }
-        Err(error) if error.retryable() => Err(JobError::retryable(format!(
-            "backend cleanup failed: {error}"
-        ))),
-        Err(error) => Err(JobError::permanent(format!(
-            "backend cleanup failed: {error}"
-        ))),
+    }
+
+    /// Goes on to the backend work with the stop rows, or writes them alone without an attempt.
+    fn stop_built(&mut self, stop: JobWrites) -> Next<()> {
+        self.stop = stop;
+        let Some(intent) = self.intent.clone() else {
+            if self.stop.is_empty() {
+                return self.revoke();
+            }
+            self.step = CleanupStep::StopWrite;
+            return Next::Call(IoCall::Write(self.stop.clone()));
+        };
+        self.step = CleanupStep::Authorize;
+        Next::Call(IoCall::child(authorize_cleanup(
+            self.for_job,
+            intent,
+            self.token,
+        )))
+    }
+
+    fn revoke(&mut self) -> Next<()> {
+        self.step = CleanupStep::Revoke;
+        let revoke = RevokeUserOperation::new(self.access_key.clone());
+        Next::Call(IoCall::child(revoke))
+    }
+
+    /// Keeps the failure of the backend work and goes on to the revoke.
+    fn failed(&mut self, error: JobError) -> Next<()> {
+        self.backend_error = Some(error);
+        self.revoke()
+    }
+
+    fn backend_name(&self) -> &str {
+        self.intent.as_ref().map_or("", |intent| &intent.backend)
+    }
+
+    fn backend_call(&self, fence: &FenceContext, request: ComputeRequest) -> Next<()> {
+        Next::Call(attempt_call(self.backend_name(), fence, request))
+    }
+
+    /// The error of an answer that names no usable backend.
+    fn no_backend(&self, answer: &ComputeAnswer) -> Option<JobError> {
+        let kind = self.backend_name();
+        match answer {
+            ComputeAnswer::NoCompute => {
+                Some(JobError::retryable("cleanup needs a compute backend"))
+            }
+            ComputeAnswer::NoBackend => Some(JobError::retryable(format!(
+                "cleanup backend {kind} is unavailable"
+            ))),
+            _ => None,
+        }
+    }
+
+    fn authorized(&mut self, fence: Result<FenceContext, JobMutationError>) -> Next<()> {
+        let fence = match fence {
+            Ok(fence) => fence,
+            Err(JobMutationError::NotFound) => {
+                return self.failed(JobError::permanent("cleanup parent no longer exists"));
+            }
+            Err(error) => {
+                let message = format!("cleanup fence claim failed: {error}");
+                return self.failed(JobError::retryable(message));
+            }
+        };
+        let expected = self
+            .intent
+            .as_ref()
+            .map(|intent| intent.external_name.as_str());
+        if expected != Some(fence.attempt.external_name().as_str()) {
+            return self.failed(JobError::permanent("cleanup attempt identity mismatch"));
+        }
+        let backend = self.backend_name().to_string();
+        self.step = CleanupStep::Home(fence);
+        Next::Call(compute_call(ComputeEffect::Facts { backend }))
+    }
+
+    /// The attempt lives where the backend kept its home; one that moved cannot remove it.
+    fn homed(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        let home = self.intent.as_ref().map(|intent| intent.home_digest);
+        match answer {
+            ComputeAnswer::Facts(facts) if Some(facts.home_digest) == home => {
+                let call = self.backend_call(&fence, ComputeRequest::Fence);
+                self.step = CleanupStep::Fence(fence);
+                call
+            }
+            ComputeAnswer::Facts(_) => self.failed(JobError::retryable(format!(
+                "cleanup backend {} moved to another home since the attempt",
+                self.backend_name()
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+
+    fn fenced(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        match answer {
+            ComputeAnswer::Done(Ok(())) => {
+                let call = self.backend_call(&fence, ComputeRequest::Cleanup);
+                self.step = CleanupStep::Cleanup(fence);
+                call
+            }
+            ComputeAnswer::Done(Err(error)) => self.failed(JobError::retryable(format!(
+                "backend fence failed: {error}"
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+
+    fn cleaned(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        match answer {
+            ComputeAnswer::Done(Ok(())) | ComputeAnswer::Done(Err(BackendError::NotFound(_))) => {
+                let spec = TombstoneSpec { terminal_ref: None };
+                let call = self.backend_call(&fence, ComputeRequest::Tombstone(spec));
+                self.step = CleanupStep::Tombstone(fence);
+                call
+            }
+            ComputeAnswer::Done(Err(error)) if error.retryable() => self.failed(
+                JobError::retryable(format!("backend cleanup failed: {error}")),
+            ),
+            ComputeAnswer::Done(Err(error)) => self.failed(JobError::permanent(format!(
+                "backend cleanup failed: {error}"
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+
+    fn tombstoned(&mut self, fence: FenceContext, answer: ComputeAnswer) -> Next<()> {
+        if let Some(error) = self.no_backend(&answer) {
+            return self.failed(error);
+        }
+        match answer {
+            ComputeAnswer::Tombstone(Ok(tombstone)) => {
+                self.step = CleanupStep::Record;
+                let tombstone = (fence.attempt_epoch, tombstone.backend_ref);
+                let stop = self.stop.clone();
+                let record = record_stop_tombstone(self.for_job, self.token, tombstone, stop);
+                Next::Call(IoCall::child(record))
+            }
+            ComputeAnswer::Tombstone(Err(error)) => self.failed(JobError::retryable(format!(
+                "backend tombstone failed: {error}"
+            ))),
+            _ => self.failed(unexpected_answer()),
+        }
+    }
+}
+
+fn unexpected_answer() -> JobError {
+    JobError::retryable("the compute backend gave an unexpected answer")
+}
+
+impl Operation for TerminalCleanupOperation {
+    type Output = ();
+    type Error = JobError;
+
+    fn first(&mut self) -> Result<Next<()>, JobError> {
+        let Some(serving) = self.serving else {
+            return Ok(self.stop_built(Vec::new()));
+        };
+        let evidence = match self.intent {
+            Some(_) => StopEvidence::Tombstoned,
+            None => StopEvidence::NothingSubmitted,
+        };
+        self.step = CleanupStep::Stop;
+        let stop = StopRecordOperation::new(self.for_job, evidence, serving);
+        Ok(Next::Call(IoCall::child(stop)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, JobError> {
+        match std::mem::replace(&mut self.step, CleanupStep::Revoke) {
+            CleanupStep::Stop => match result.child::<JobWrites, JobError>()? {
+                Ok(stop) => Ok(self.stop_built(stop)),
+                Err(error) => Ok(self.failed(error)),
+            },
+            CleanupStep::StopWrite => match result.done() {
+                Ok(()) => {
+                    self.stopped = true;
+                    Ok(self.revoke())
+                }
+                Err(error) => {
+                    let message = format!("stop record write failed: {error}");
+                    Ok(self.failed(JobError::retryable(message)))
+                }
+            },
+            CleanupStep::Authorize => {
+                let fence = result.child::<FenceContext, JobMutationError>()?;
+                Ok(self.authorized(fence))
+            }
+            CleanupStep::Home(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.homed(fence, answer))
+            }
+            CleanupStep::Fence(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.fenced(fence, answer))
+            }
+            CleanupStep::Cleanup(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.cleaned(fence, answer))
+            }
+            CleanupStep::Tombstone(fence) => {
+                let answer = compute_answer(result)?;
+                Ok(self.tombstoned(fence, answer))
+            }
+            CleanupStep::Record => match result.child::<AttemptControl, JobMutationError>()? {
+                Ok(_) => {
+                    self.stopped = !self.stop.is_empty();
+                    Ok(self.revoke())
+                }
+                Err(error) => Ok(self.failed(JobError::retryable(format!(
+                    "tombstone record failed: {error}"
+                )))),
+            },
+            CleanupStep::Revoke => {
+                let revoke_error = match result.child::<UserAccess, RevokeUserError>()? {
+                    Ok(_) | Err(RevokeUserError::NotFound) => None,
+                    Err(error) => Some(revoke_error(error)),
+                };
+                match cleanup_error([revoke_error, self.backend_error.take()]) {
+                    Some(error) => Err(error),
+                    // A stored stop record is offered to the holders at once.
+                    None if self.stopped => Ok(Next::Then {
+                        output: (),
+                        calls: vec![IoCall::Effect(Box::new(schedule_outbox_drain(
+                            Duration::ZERO,
+                        )))],
+                    }),
+                    None => Ok(Next::Done(())),
+                }
+            }
+        }
+    }
+}
+
+/// How the job runtime takes the end of a cleanup run.
+pub fn cleanup_outcome(result: Result<(), JobError>) -> JobRunOutcome {
+    match result {
+        Ok(()) => JobRunOutcome::Succeeded(JobResultPayload::Cleanup),
+        Err(error) => JobRunOutcome::Failed(error),
     }
 }
 
@@ -124,6 +352,10 @@ fn cleanup_error(errors: [Option<JobError>; 2]) -> Option<JobError> {
 }
 
 #[cfg(test)]
+#[path = "cleanup_tests.rs"]
+mod call_tests;
+
+#[cfg(test)]
 mod tests {
     use aruna_core::structs::storage::format::Compression;
     use std::collections::VecDeque;
@@ -131,35 +363,51 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime};
 
-    use aruna_compute::ExecutorBackend;
-    use aruna_compute::ExecutorRegistry;
-    use aruna_core::UserId;
+    use aruna_compute::executor::ExecutorBackend;
+    use aruna_compute::registry::ExecutorRegistry;
+    use aruna_core::compute::identity::home_digest;
     use aruna_core::compute::{
-        AttemptRef, AttemptStatus, CancelEvidence, FenceContext, LogLimits, LogTails, NOBODY,
-        ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
+        AttemptRef, AttemptStatus, CancelEvidence, ExecutorKind, FenceContext, LogLimits, LogTails,
+        NOBODY, ReconcileEvidence, TaskOutput, TaskSpec, TombstoneEvidence, UserSpec,
     };
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, USER_ACCESS_KEYSPACE};
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobClaim, JobPayload, JobProgress, JobRecord, JobState,
-        WorkspaceMode,
+    use aruna_core::structs::execution::job::identity::JobState;
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{
+        JobClaim, JobProgress, JobRecord, WorkspaceMode,
     };
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{
         BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, UserAccess, VersionKey,
     };
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_core::user::id::UserId;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
     use ulid::Ulid;
 
     use super::*;
-    use crate::driver::DriverContext;
-    use crate::jobs::executor::ProgressReporter;
-    use crate::jobs::store::{insert_job, record_attempt_intent};
     use crate::s3::access::get::GetAccessOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
-    use crate::s3::bucket::get::GetBucketOperation;
+    use aruna_core::bucket_read::GetBucketOperation;
+    use aruna_core::jobs::ProgressReporter;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_drivers::jobs::context::JobContext;
+    use aruna_test_support::jobs::insert_job;
+
+    async fn run_terminal_cleanup(
+        ctx: &JobContext,
+        for_job: JobId,
+        intent: Option<&AttemptIntent>,
+        access_key: &str,
+    ) -> JobRunOutcome {
+        let serving = ctx.driver.node_and_realm();
+        let attempt = (intent.cloned(), access_key);
+        let cleanup = TerminalCleanupOperation::new(for_job, ctx.claim_token, attempt, serving);
+        cleanup_outcome(drive(cleanup, &ctx.driver).await)
+    }
 
     struct StubBackend {
         kind: ExecutorKind,
@@ -258,18 +506,30 @@ mod tests {
     }
 
     fn job_context(storage: StorageHandle, backends: &[Arc<StubBackend>]) -> JobContext {
+        let names: Vec<String> = (backends.iter())
+            .map(|backend| backend.kind.as_wire())
+            .collect();
+        let named: Vec<(&str, &Arc<StubBackend>)> =
+            names.iter().map(String::as_str).zip(backends).collect();
+        named_context(storage, &named)
+    }
+
+    fn named_context(storage: StorageHandle, backends: &[(&str, &Arc<StubBackend>)]) -> JobContext {
         let mut registry = ExecutorRegistry::new();
-        for backend in backends {
-            registry.register(backend.clone());
+        for (name, backend) in backends {
+            let backend = Arc::clone(*backend) as Arc<dyn ExecutorBackend>;
+            let workspace = aruna_compute::registry::WorkspaceEndpoint::default();
+            registry.register(*name, backend, workspace);
         }
         JobContext {
             driver: Arc::new(DriverContext {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: Some(Arc::new(registry)),
+                outbound_handle: None,
             }),
             job_id: JobId::from_bytes([0xCB; 16]),
             owner_node_id: iroh::SecretKey::from_bytes(&[0xCD; 32]).public(),
@@ -279,25 +539,27 @@ mod tests {
             shutdown: CancellationToken::new(),
             progress: ProgressReporter::from_progress(&JobProgress::new("steps")),
             range_turns: Default::default(),
-            mail: Default::default(),
         }
     }
 
-    fn intent(job_id: JobId, kind: &str) -> AttemptIntent {
+    fn intent(job_id: JobId, name: &str) -> AttemptIntent {
         let attempt = AttemptRef::new(job_id.to_string().to_lowercase(), 1);
         AttemptIntent {
             attempt_no: 1,
             external_name: attempt.external_name(),
-            executor_kind: kind.to_string(),
+            executor_kind: "docker".to_string(),
             pinned_image:
                 "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
                     .to_string(),
             attempt_epoch: 1,
+            backend: name.to_string(),
+            config_generation: 0,
+            home_digest: home_digest("docker", None),
         }
     }
 
     async fn seed_attempt(
-        storage: &StorageHandle,
+        context: &DriverContext,
         job_id: JobId,
         kind: &str,
         token: Ulid,
@@ -317,6 +579,7 @@ mod tests {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
@@ -335,13 +598,23 @@ mod tests {
             claim_token: token,
             lease_expires_ms: 10_000,
         });
-        insert_job(storage, &record).await.unwrap();
-        record_attempt_intent(storage, job_id, token, intent(job_id, kind), None, None, 2)
-            .await
-            .unwrap()
-            .record
-            .attempt_intent
-            .unwrap()
+        insert_job(context, &record).await.unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::store::job_calls::record_attempt_intent(
+                job_id,
+                token,
+                intent(job_id, kind),
+                None,
+                None,
+                2,
+            ),
+            context,
+        )
+        .await
+        .unwrap()
+        .record
+        .attempt_intent
+        .unwrap()
     }
 
     async fn seed_workspace(
@@ -369,6 +642,7 @@ mod tests {
                 env: Default::default(),
                 resources: ComputeResources::default(),
                 executor_constraint: None,
+                backend: None,
                 inputs: Vec::new(),
                 file_outputs: Vec::new(),
                 workspace_outputs: Vec::new(),
@@ -384,9 +658,7 @@ mod tests {
         record.state = state;
         record.workspace_mode = mode;
         record.workspace_bucket = Some(bucket.to_string());
-        insert_job(&ctx.driver.storage_handle, &record)
-            .await
-            .unwrap();
+        insert_job(&ctx.driver, &record).await.unwrap();
         drive(
             CreateBucketOperation::new(
                 bucket.to_string(),
@@ -444,8 +716,9 @@ mod tests {
             .is_ok()
     }
 
-    async fn write_access(storage: &StorageHandle, access: &UserAccess) {
-        let _ = storage
+    async fn write_access(context: &DriverContext, access: &UserAccess) {
+        let _ = context
+            .storage_handle
             .send_storage_effect(StorageEffect::Write {
                 key_space: USER_ACCESS_KEYSPACE.to_string(),
                 key: access.access_key.as_bytes().into(),
@@ -472,6 +745,7 @@ mod tests {
     async fn revoke_failure_cleans() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let access_key = "malformed-access";
         let _ = storage
             .send_storage_effect(StorageEffect::Write {
@@ -484,7 +758,7 @@ mod tests {
         let backend = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
         let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
         let job_id = JobId::from_bytes([5; 16]);
-        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "docker", ctx.claim_token).await;
 
         let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), access_key).await;
 
@@ -537,10 +811,11 @@ mod tests {
     async fn revoked_revoke_stable() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let mut access = user_access("revoked-access");
         let revoked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         access.revoked_at = Some(revoked_at);
-        write_access(&storage, &access).await;
+        write_access(&context, &access).await;
         let ctx = job_context(storage, &[]);
 
         for _ in 0..2 {
@@ -558,14 +833,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_uses_kind() {
+    async fn cleanup_uses_name() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let docker = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
-        let slurm = StubBackend::new(ExecutorKind::Slurm, vec![Ok(())]);
-        let ctx = job_context(storage.clone(), &[docker.clone(), slurm.clone()]);
+        let context = aruna_drivers::testing::test_context(storage.clone());
+        let first = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
+        let second = StubBackend::new(ExecutorKind::Docker, vec![Ok(())]);
+        let ctx = named_context(storage.clone(), &[("docker", &first), ("lab", &second)]);
         let job_id = JobId::from_bytes([8; 16]);
-        let intent = seed_attempt(&storage, job_id, "slurm", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "lab", ctx.claim_token).await;
 
         let outcome = run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await;
 
@@ -573,21 +849,47 @@ mod tests {
             outcome,
             JobRunOutcome::Succeeded(JobResultPayload::Cleanup)
         ));
-        assert_eq!(docker.calls.load(Ordering::Relaxed), 0);
-        assert_eq!(slurm.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(first.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+
+        // A backend that moved to another home, or one that is gone, is retried later.
+        let moved = JobId::from_bytes([11; 16]);
+        let mut intent = seed_attempt(&context, moved, "lab", ctx.claim_token).await;
+        intent.home_digest = [9u8; 32];
+        let outcome = run_terminal_cleanup(&ctx, moved, Some(&intent), "missing-access").await;
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Failed(JobError {
+                kind: JobErrorKind::Retryable,
+                ..
+            })
+        ));
+        assert_eq!(second.calls.load(Ordering::Relaxed), 1);
+        let gone = JobId::from_bytes([10; 16]);
+        let intent = seed_attempt(&context, gone, "gone", ctx.claim_token).await;
+        let outcome = run_terminal_cleanup(&ctx, gone, Some(&intent), "missing-access").await;
+        assert!(matches!(
+            outcome,
+            JobRunOutcome::Failed(JobError {
+                kind: JobErrorKind::Retryable,
+                ..
+            })
+        ));
+        assert_eq!(first.calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn cleanup_retry_succeeds() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let backend = StubBackend::new(
             ExecutorKind::Docker,
             vec![Err(BackendError::Unavailable("down".to_string())), Ok(())],
         );
         let ctx = job_context(storage.clone(), std::slice::from_ref(&backend));
         let job_id = JobId::from_bytes([9; 16]);
-        let intent = seed_attempt(&storage, job_id, "docker", ctx.claim_token).await;
+        let intent = seed_attempt(&context, job_id, "docker", ctx.claim_token).await;
 
         assert!(matches!(
             run_terminal_cleanup(&ctx, job_id, Some(&intent), "missing-access").await,

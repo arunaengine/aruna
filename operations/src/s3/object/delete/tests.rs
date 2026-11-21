@@ -3,11 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::driver::{DriverContext, drive};
 use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
 use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_blob::blob::BlobHandler;
-use aruna_core::effects::StorageEffect;
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, NODE_STATS_KEYSPACE, PATHS_INDEX_KEYSPACE,
@@ -25,7 +24,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
-use aruna_net::{NetConfig, NetHandle};
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_net::NetHandle;
 use aruna_storage::storage;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -33,12 +33,36 @@ use std::fs::exists;
 use tempfile::tempdir;
 use ulid::Ulid;
 
-fn test_node_id() -> aruna_core::NodeId {
+type Stepper = crate::stepper::Stepper<DeleteObjectResult, DeleteObjectError>;
+
+/// The call a step asks for.
+fn call(turn: Turn) -> IoCall {
+    match turn {
+        Ok(Next::Call(call)) => call,
+        other => panic!("expected a call, got {other:?}"),
+    }
+}
+
+/// The key space of the first row a step reads, writes or deletes.
+fn space(turn: &Turn) -> &str {
+    match turn {
+        Ok(Next::Call(IoCall::Read(rows) | IoCall::Delete(rows))) => &rows[0].0,
+        Ok(Next::Call(IoCall::Write(rows))) => &rows[0].0,
+        Ok(Next::Call(IoCall::Page { space, .. })) => space,
+        other => panic!("expected a storage call, got {other:?}"),
+    }
+}
+
+fn read(value: Option<aruna_core::types::Value>) -> IoResult {
+    IoResult::Values(vec![value])
+}
+
+fn test_node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[7; 32]).public()
 }
 
-fn test_user_id() -> aruna_core::UserId {
-    aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
+fn test_user_id() -> aruna_core::user::id::UserId {
+    aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]))
 }
 
 #[test]
@@ -61,13 +85,18 @@ fn obligation_keeps_restrictions() {
     .with_restrictions(Some(restrictions.clone()));
     operation.version_id = Some(Ulid::generate());
 
-    let effects = operation.write_obligation();
+    let written = call(operation.write_obligation());
 
-    let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
-        panic!("expected one obligation write, got {effects:?}")
+    let IoCall::Write(rows) = &written else {
+        panic!("expected one obligation write, got {written:?}")
     };
-    let record = crate::replication::queue::LiveObligationRecord::from_bytes(value.as_ref())
-        .expect("obligation decodes");
+    let [(_, _, value)] = rows.as_slice() else {
+        panic!("expected one obligation row, got {rows:?}")
+    };
+    let record = aruna_core::structs::storage::replication_queue::LiveObligationRecord::from_bytes(
+        value.as_ref(),
+    )
+    .expect("obligation decodes");
     assert_eq!(record.auth_context.path_restrictions, Some(restrictions));
 }
 
@@ -81,16 +110,15 @@ fn audit_op(version_id: Option<Ulid>) -> DeleteObjectOperation {
         node_id: test_node_id(),
         deleted_by: test_user_id(),
     });
-    operation.txn_id = Some(Ulid::generate());
     operation.incarnation = Some(INCARNATION);
     operation
 }
 
 const INCARNATION: u128 = 9;
 
-fn audit_record(effects: &[Effect]) -> aruna_core::structs::storage::delete_audit::BlobAuditRecord {
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects else {
-        panic!("expected one audit write, got {effects:?}")
+fn audit_record(written: &IoCall) -> aruna_core::structs::storage::delete_audit::BlobAuditRecord {
+    let IoCall::Write(writes) = written else {
+        panic!("expected one audit write, got {written:?}")
     };
     let [(audit_space, _, value), (trail_space, trail, indexed)] = writes.as_slice() else {
         panic!("expected the audit row and its trail entry, got {writes:?}")
@@ -118,24 +146,15 @@ fn reads_audit_bucket() {
     let mut operation = audit_op(None);
     operation.version_id = Some(Ulid::generate());
     operation.incarnation = None;
-    let effects = operation.write_delete_audit();
-    let [
-        Effect::Storage(StorageEffect::Read {
-            key_space, txn_id, ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected the bucket read, got {effects:?}")
-    };
-    assert_eq!(key_space, aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE);
-    assert_eq!(*txn_id, operation.txn_id);
+    let turn = operation.write_delete_audit();
+    assert_eq!(
+        space(&turn),
+        aruna_core::keyspaces::BUCKET_CREATION_KEYSPACE
+    );
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
     assert_eq!(operation.state, DeleteObjectState::ReadAuditBucket);
     let value = Some(INCARNATION.to_be_bytes().to_vec().into());
-    let effects = operation.audit_bucket_read(Event::Storage(StorageEvent::ReadResult {
-        key: vec![0].into(),
-        value,
-    }));
-    audit_record(&effects);
+    audit_record(&call(operation.audit_bucket_read(value)));
 }
 
 #[test]
@@ -144,7 +163,7 @@ fn audits_delete_marker() {
     let mut operation = audit_op(None);
     operation.version_id = Some(marker);
 
-    let record = audit_record(&operation.write_delete_audit());
+    let record = audit_record(&call(operation.write_delete_audit()));
     assert_eq!(
         record.kind,
         aruna_core::structs::storage::delete_audit::BlobAuditKind::DeleteMarker
@@ -167,45 +186,26 @@ fn fence_refuses_marker() {
             vec![(space.clone(), receipt.clone())],
         );
         operation.version_id = Some(marker);
-        operation.write_delete_audit();
+        operation.write_delete_audit().unwrap();
         operation
     };
-    let audited = || {
-        Event::Storage(StorageEvent::BatchWriteResult {
-            entries: Vec::new(),
-        })
-    };
-    let read = |value| {
-        Event::Storage(StorageEvent::BatchReadResult {
-            values: vec![(receipt.clone(), value)],
-        })
-    };
-
     let mut free = fenced();
-    let txn_id = free.txn_id;
-    assert!(matches!(
-        free.step(audited()).as_slice(),
-        [Effect::Storage(StorageEffect::BatchRead { txn_id: observed, .. })] if *observed == txn_id
-    ));
-    let effects = free.step(read(None));
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the receipt write, got {effects:?}")
+    let turn = free.next(IoResult::Done);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
+    let written = call(free.next(read(None)));
+    let IoCall::Write(writes) = &written else {
+        panic!("expected the receipt write, got {written:?}")
     };
     assert_eq!(writes[0].2.as_ref(), marker.to_bytes());
-    assert!(matches!(
-        free.step(audited()).as_slice(),
-        [Effect::Storage(StorageEffect::CommitTransaction { .. })]
-    ));
+    assert!(matches!(free.next(IoResult::Done), Ok(Next::Then { .. })));
 
     let mut taken = fenced();
-    taken.step(audited());
+    taken.next(IoResult::Done).unwrap();
     let winner: aruna_core::types::Value = Ulid::generate().to_bytes().to_vec().into();
-    let effects = taken.step(read(Some(winner)));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(taken.finalize(), Err(DeleteObjectError::FenceTaken));
+    assert_eq!(
+        taken.next(read(Some(winner))).err(),
+        Some(DeleteObjectError::FenceTaken)
+    );
 }
 
 #[test]
@@ -213,7 +213,7 @@ fn audits_version_delete() {
     let version_id = Ulid::generate();
     let mut operation = audit_op(Some(version_id));
 
-    let record = audit_record(&operation.write_delete_audit());
+    let record = audit_record(&call(operation.write_delete_audit()));
     assert_eq!(
         record.kind,
         aruna_core::structs::storage::delete_audit::BlobAuditKind::DeleteVersion
@@ -221,9 +221,8 @@ fn audits_version_delete() {
     assert_eq!(record.version_id, Some(version_id));
 }
 
-#[test]
-fn typed_storage_failure() {
-    let mut operation = DeleteObjectOperation::new(DeleteObjectInput {
+fn marker_input() -> DeleteObjectInput {
+    DeleteObjectInput {
         bucket: "bucket".to_string(),
         key: "reports/a.csv".to_string(),
         version_id: None,
@@ -231,8 +230,12 @@ fn typed_storage_failure() {
         realm_id: RealmId::from_bytes([1u8; 32]),
         node_id: test_node_id(),
         deleted_by: test_user_id(),
-    });
-    operation.start();
+    }
+}
+
+#[test]
+fn typed_storage_failure() {
+    let (mut operation, _) = Stepper::new(DeleteObjectOperation::new(marker_input()));
 
     operation.step(Event::Storage(StorageEvent::Error {
         error: StorageError::CommitFailed,
@@ -240,7 +243,7 @@ fn typed_storage_failure() {
 
     assert!(operation.is_complete());
     assert_eq!(
-        operation.finalize(),
+        operation.finish(),
         Err(DeleteObjectError::StorageError(StorageError::CommitFailed))
     );
 }
@@ -250,16 +253,7 @@ fn begun_storage_failure() {
     // A failure after the transaction began must roll it back exactly once
     // and still report the typed storage error.
     let txn_id = Ulid::from_bytes([9u8; 16]);
-    let mut operation = DeleteObjectOperation::new(DeleteObjectInput {
-        bucket: "bucket".to_string(),
-        key: "reports/a.csv".to_string(),
-        version_id: None,
-        group_id: Ulid::from_bytes([2u8; 16]),
-        realm_id: RealmId::from_bytes([1u8; 32]),
-        node_id: test_node_id(),
-        deleted_by: test_user_id(),
-    });
-    operation.start();
+    let (mut operation, _) = Stepper::new(DeleteObjectOperation::new(marker_input()));
     operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
 
     let effects = operation.step(Event::Storage(StorageEvent::Error {
@@ -270,14 +264,13 @@ fn begun_storage_failure() {
         effects.as_slice(),
         [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
     );
-    assert!(operation.abort().is_empty());
     assert_eq!(
-        operation.finalize(),
+        operation.finish(),
         Err(DeleteObjectError::StorageError(StorageError::CommitFailed))
     );
 }
 
-fn deleted_version_value(user_id: aruna_core::UserId) -> aruna_core::types::Value {
+fn deleted_version_value(user_id: aruna_core::user::id::UserId) -> aruna_core::types::Value {
     BlobVersion::deleted(SystemTime::UNIX_EPOCH, user_id)
         .to_bytes()
         .unwrap()
@@ -288,7 +281,7 @@ fn deleted_version_entry(
     bucket: &str,
     key: &str,
     version_id: Ulid,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
 ) -> (aruna_core::types::Key, aruna_core::types::Value) {
     (
         VersionKey::new(bucket, key, version_id)
@@ -348,7 +341,6 @@ fn sized_delete_op() -> DeleteObjectOperation {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
         deleted_by: test_user_id(),
     });
-    op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
     op.incarnation = Some(INCARNATION);
     op.target_version = Some(VersionSummary {
         version_id,
@@ -367,9 +359,9 @@ fn sized_delete_op() -> DeleteObjectOperation {
 fn delete_stages_debit() {
     // Storage applies the debit at commit and clamps a drifted counter there.
     let mut op = sized_delete_op();
-    let effects = op.start_usage_update();
-    let [Effect::Storage(StorageEffect::AddUsage { deltas, .. })] = effects.as_slice() else {
-        panic!("expected the counter deltas, got {effects:?}")
+    let staged = call(op.start_usage_update());
+    let IoCall::AddUsage { deltas, .. } = &staged else {
+        panic!("expected the counter deltas, got {staged:?}")
     };
     let debit = UsageDelta {
         objects: -1,
@@ -379,27 +371,19 @@ fn delete_stages_debit() {
     assert_eq!(deltas.len(), 2);
     assert!(deltas.iter().all(|(_, delta)| *delta == debit));
 
-    let effects = op.handle_usage_update(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, .. })] = effects.as_slice() else {
-        panic!("expected the dirty marker write, got {effects:?}")
+    let marked = call(op.usage_updated(IoResult::Done));
+    let IoCall::Write(writes) = &marked else {
+        panic!("expected the dirty marker write, got {marked:?}")
     };
-    assert_ne!(op.state, DeleteObjectState::Error);
     assert!(
         writes
             .iter()
             .all(|(key_space, ..)| key_space == NODE_STATS_KEYSPACE)
     );
 
-    let effects = op.handle_usage_update(Event::Storage(StorageEvent::BatchWriteResult {
-        entries: Vec::new(),
-    }));
+    let turn = op.usage_updated(IoResult::Done);
     assert_eq!(op.state, DeleteObjectState::WriteDeleteAudit);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::BatchWrite { .. })]
-    ));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
 }
 
 fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
@@ -412,7 +396,6 @@ fn candidate_op(location: Option<BlobLocationKey>) -> DeleteObjectOperation {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
         deleted_by: test_user_id(),
     });
-    op.txn_id = Some(Ulid::from_bytes([7u8; 16]));
     op.incarnation = Some(INCARNATION);
     op.target_location = location;
     op
@@ -428,23 +411,17 @@ fn queues_deleted_copy() {
     );
     let mut op = candidate_op(Some(key.clone()));
 
-    let effects = op.write_reclaim_candidate();
+    let written = call(op.write_reclaim_candidate());
 
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space,
-            key: written,
-            txn_id,
-            ..
-        }),
-    ] = effects.as_slice()
-    else {
-        panic!("expected candidate write, got {effects:?}")
+    let IoCall::Write(rows) = &written else {
+        panic!("expected candidate write, got {written:?}")
+    };
+    let [(key_space, key_written, _)] = rows.as_slice() else {
+        panic!("expected one candidate row, got {rows:?}")
     };
     assert_eq!(key_space, BLOB_RECLAIM_KEYSPACE);
-    assert_eq!(*txn_id, op.txn_id);
     assert_eq!(
-        written.as_ref(),
+        key_written.as_ref(),
         ReclaimCandidateKey::new(key.backend, key.encoding, key.blake3_hash)
             .to_bytes()
             .as_slice()
@@ -457,13 +434,10 @@ fn marker_queues_nothing() {
     // the same transaction.
     let mut op = candidate_op(None);
 
-    let effects = op.write_reclaim_candidate();
+    let turn = op.write_reclaim_candidate();
 
-    let [Effect::Storage(StorageEffect::BatchWrite { writes, txn_id })] = effects.as_slice() else {
-        panic!("expected the audit write, got {effects:?}")
-    };
-    assert_eq!(writes[0].0, DELETE_AUDIT_KEYSPACE);
-    assert_eq!(*txn_id, op.txn_id);
+    assert_eq!(space(&turn), DELETE_AUDIT_KEYSPACE);
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Write(_)))));
 }
 
 async fn read_value(
@@ -486,10 +460,10 @@ async fn read_value(
     value
 }
 
+/// A delete of `target_version_id` up to its head read, which comes before any version scan.
 fn delete_until_lookup(
     target_version_id: Ulid,
-    all_version_ids: Vec<Ulid>,
-    user_id: aruna_core::UserId,
+    user_id: aruna_core::user::id::UserId,
 ) -> DeleteObjectOperation {
     let mut op = DeleteObjectOperation::new(DeleteObjectInput {
         bucket: "bucket".to_string(),
@@ -500,58 +474,32 @@ fn delete_until_lookup(
         node_id: iroh::SecretKey::generate().public(),
         deleted_by: user_id,
     });
-
-    let effects = op.start();
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::StartTransaction {
-            read: false
-        })]
-    ));
-
-    let effects = op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::generate(),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == S3_BUCKET_KEYSPACE
-    ));
+    assert_eq!(space(&op.first()), S3_BUCKET_KEYSPACE);
     // An ordinary bucket goes on to the version.
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: None,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
-    ));
-
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![1u8].into(),
-        value: Some(deleted_version_value(user_id)),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Iter { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
-    ));
-
-    let effects = op.step(Event::Storage(StorageEvent::IterResult {
-        values: all_version_ids
-            .into_iter()
-            .map(|version_id| deleted_version_entry("bucket", "key", version_id, user_id))
-            .collect(),
-        next_start_after: None,
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_HEAD_KEYSPACE
-    ));
-
+    assert_eq!(space(&op.next(read(None))), BLOB_VERSIONS_KEYSPACE);
+    let turn = op.next(read(Some(deleted_version_value(user_id))));
+    assert_eq!(space(&turn), BLOB_HEAD_KEYSPACE);
     op
+}
+
+/// A head pointer naming `version_id`, as the head read answers it.
+fn head_answer(version_id: Ulid) -> IoResult {
+    let pointer = CurrentVersionPointer::new_with_generation(version_id, 20);
+    read(Some(pointer.to_bytes().unwrap().into()))
+}
+
+/// One page of versions of the key, then the version key to continue after.
+fn versions_page(
+    version_ids: &[Ulid],
+    next: Option<Ulid>,
+    user_id: aruna_core::user::id::UserId,
+) -> IoResult {
+    let rows = (version_ids.iter())
+        .map(|version_id| deleted_version_entry("bucket", "key", *version_id, user_id))
+        .collect();
+    let next = next.map(|version_id| VersionKey::new("bucket", "key", version_id));
+    let next = next.map(|key| key.to_bytes().unwrap().into());
+    IoResult::Page { rows, next }
 }
 
 #[test]
@@ -559,25 +507,14 @@ fn preserves_noncurrent_pointer() {
     let user_id = test_user_id();
     let current_version_id = Ulid::from_bytes([1u8; 16]);
     let target_version_id = Ulid::from_bytes([2u8; 16]);
-    let newer_version_id = Ulid::from_bytes([9u8; 16]);
-    let mut op = delete_until_lookup(
-        target_version_id,
-        vec![current_version_id, target_version_id, newer_version_id],
-        user_id,
-    );
-    let current_pointer = CurrentVersionPointer::new_with_generation(current_version_id, 20);
+    let mut op = delete_until_lookup(target_version_id, user_id);
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![2u8].into(),
-        value: Some(current_pointer.to_bytes().unwrap().into()),
-    }));
+    // A version that is not the head is deleted without reading the other versions.
+    let turn = op.next(head_answer(current_version_id));
 
     assert_eq!(op.state, DeleteObjectState::DeleteTargetVersion);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-            if key_space == BLOB_VERSIONS_KEYSPACE
-    ));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
+    assert_eq!(space(&turn), BLOB_VERSIONS_KEYSPACE);
 }
 
 #[test]
@@ -585,25 +522,36 @@ fn rewrites_current_pointer() {
     let user_id = test_user_id();
     let target_version_id = Ulid::from_bytes([1u8; 16]);
     let fallback_version_id = Ulid::from_bytes([9u8; 16]);
-    let mut op = delete_until_lookup(
-        target_version_id,
-        vec![target_version_id, fallback_version_id],
-        user_id,
-    );
-    let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
+    let mut op = delete_until_lookup(target_version_id, user_id);
+    let scan = op.next(head_answer(target_version_id));
+    assert!(matches!(
+        scan,
+        Ok(Next::Call(IoCall::Page {
+            limit: VERSION_PAGE,
+            ..
+        }))
+    ));
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![2u8].into(),
-        value: Some(current_pointer.to_bytes().unwrap().into()),
-    }));
-
-    let [
-        Effect::Storage(StorageEffect::Write {
-            key_space, value, ..
-        }),
-    ] = effects.as_slice()
+    // The newest version on an earlier page wins over the versions of the last page.
+    let first = versions_page(&[fallback_version_id], Some(fallback_version_id), user_id);
+    let next = op.next(first);
+    let after = VersionKey::new("bucket", "key", fallback_version_id);
+    let after = Some(after.to_bytes().unwrap().into());
+    let Ok(Next::Call(IoCall::Page {
+        after: page_after, ..
+    })) = &next
     else {
-        panic!("expected blob head write");
+        panic!("expected the next version page, got {next:?}");
+    };
+    assert_eq!(*page_after, after);
+    let older = Ulid::from_bytes([5u8; 16]);
+    let written = call(op.next(versions_page(&[older, target_version_id], None, user_id)));
+
+    let IoCall::Write(rows) = &written else {
+        panic!("expected blob head write, got {written:?}");
+    };
+    let [(key_space, _, value)] = rows.as_slice() else {
+        panic!("expected only the head row, got {rows:?}");
     };
     assert_eq!(key_space, BLOB_HEAD_KEYSPACE);
     assert_eq!(
@@ -613,24 +561,47 @@ fn rewrites_current_pointer() {
 }
 
 #[test]
+fn unreadable_version_stops() {
+    // A newer version that does not decode stops the delete before the head is read or changed.
+    let user_id = test_user_id();
+    let target_version_id = Ulid::from_bytes([1u8; 16]);
+    let mut op = DeleteObjectOperation::new(DeleteObjectInput {
+        bucket: "bucket".to_string(),
+        key: "key".to_string(),
+        version_id: Some(target_version_id),
+        group_id: Ulid::generate(),
+        realm_id: RealmId::from_bytes([1u8; 32]),
+        node_id: iroh::SecretKey::generate().public(),
+        deleted_by: user_id,
+    });
+    op.first().unwrap();
+    op.next(read(None)).unwrap();
+    op.next(read(Some(deleted_version_value(user_id)))).unwrap();
+    op.next(head_answer(target_version_id)).unwrap();
+    let newer = VersionKey::new("bucket", "key", Ulid::from_bytes([9u8; 16]));
+    let rows = vec![
+        deleted_version_entry("bucket", "key", target_version_id, user_id),
+        (newer.to_bytes().unwrap().into(), vec![0xffu8].into()),
+    ];
+    let turn = op.next(IoResult::Page { rows, next: None });
+    assert!(
+        matches!(turn, Err(DeleteObjectError::ConversionError(_))),
+        "{turn:?}"
+    );
+}
+
+#[test]
 fn removes_final_pointer() {
     let user_id = test_user_id();
     let target_version_id = Ulid::from_bytes([1u8; 16]);
-    let mut op = delete_until_lookup(target_version_id, vec![target_version_id], user_id);
-    let current_pointer = CurrentVersionPointer::new_with_generation(target_version_id, 20);
+    let mut op = delete_until_lookup(target_version_id, user_id);
+    op.next(head_answer(target_version_id)).unwrap();
 
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![2u8].into(),
-        value: Some(current_pointer.to_bytes().unwrap().into()),
-    }));
+    let turn = op.next(versions_page(&[target_version_id], None, user_id));
 
-    assert_eq!(op.state, DeleteObjectState::ApplyHeadTransition);
-    assert_eq!(effects.len(), 1);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-            if key_space == BLOB_HEAD_KEYSPACE
-    ));
+    assert_eq!(op.state, DeleteObjectState::WriteHead);
+    assert!(matches!(&turn, Ok(Next::Call(IoCall::Delete(rows))) if rows.len() == 1));
+    assert_eq!(space(&turn), BLOB_HEAD_KEYSPACE);
 }
 
 #[test]
@@ -654,10 +625,7 @@ fn purge_skips_history() {
         deleted_by: user_id,
     })
     .purging(binding.clone());
-    op.start();
-    op.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::generate(),
-    }));
+    op.first().unwrap();
     let info = BucketInfo {
         group_id: Ulid::generate(),
         created_at: std::time::SystemTime::UNIX_EPOCH,
@@ -669,45 +637,32 @@ fn purge_skips_history() {
         compression: Default::default(),
         distribution: Some(binding),
     };
-    op.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(info.to_bytes().unwrap().into()),
-    }));
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![1u8].into(),
-        value: Some(deleted_version_value(user_id)),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })]
-            if key_space == BLOB_HEAD_KEYSPACE
-    ));
+    op.next(read(Some(info.to_bytes().unwrap().into())))
+        .unwrap();
+    let turn = op.next(read(Some(deleted_version_value(user_id))));
+    assert_eq!(space(&turn), BLOB_HEAD_KEYSPACE);
     let pointer = CurrentVersionPointer::new_with_generation(version_id, 20);
-    let effects = op.step(Event::Storage(StorageEvent::ReadResult {
-        key: vec![2u8].into(),
-        value: Some(pointer.to_bytes().unwrap().into()),
-    }));
+    let turn = op.next(read(Some(pointer.to_bytes().unwrap().into())));
     assert!(
-        matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-                if key_space == BLOB_HEAD_KEYSPACE
-        ),
+        matches!(turn, Ok(Next::Call(IoCall::Delete(_)))),
         "the purged head is removed, not moved to an older version"
     );
+    assert_eq!(space(&turn), BLOB_HEAD_KEYSPACE);
 }
 
 #[tokio::test]
 async fn missing_version_rejected() {
     let temp_handle = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let result = drive(
@@ -734,8 +689,8 @@ async fn creates_tombstone() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -758,12 +713,14 @@ async fn creates_tombstone() {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
-    let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+    let user_id =
+        aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
     let group_id = Ulid::generate();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = context.net_handle.as_ref().unwrap().node_id();
@@ -886,8 +843,8 @@ async fn deletes_version() {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -910,12 +867,14 @@ async fn deletes_version() {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
 
-    let user_id = aruna_core::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
+    let user_id =
+        aruna_core::user::id::UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32]));
     let group_id = Ulid::generate();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = context.net_handle.as_ref().unwrap().node_id();
@@ -1155,8 +1114,11 @@ async fn deletes_version() {
 }
 
 /// Seeds versions of `sealed` that share one pending archive, the last one current.
-async fn seed_pending(storage: &storage::StorageHandle, versions: &[Ulid]) -> BackendLocation {
-    use crate::blob::records::owner_write_effect;
+async fn seed_pending(
+    storage: &storage::handle::StorageHandle,
+    versions: &[Ulid],
+) -> BackendLocation {
+    use aruna_core::blob_records::owner_write_effect;
     use aruna_core::structs::storage::blob::BackendRef;
     use aruna_core::structs::storage::encryption::BucketKeyRef;
     use aruna_core::structs::storage::format::{PithosLayout, StoredFormat};
@@ -1218,7 +1180,7 @@ async fn seed_pending(storage: &storage::StorageHandle, versions: &[Ulid]) -> Ba
             txn_id: None,
         });
         let owner = CopyOwner::new(archive.clone(), version_key);
-        let Effect::Storage(effect) = owner_write_effect(&owner, None).unwrap() else {
+        let Effect::Storage(effect) = owner_write_effect(&owner).unwrap() else {
             panic!("owner rows are storage writes");
         };
         effects.push(effect);
@@ -1241,22 +1203,38 @@ fn delete_pending(group_id: Ulid, version_id: Ulid) -> DeleteObjectOperation {
     })
 }
 
-/// Commits one counter update, as the publication of the seeded versions would.
-async fn apply_usage(storage: &storage::StorageHandle, mut update: UsageCounterUpdate) {
-    let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    else {
-        panic!("no transaction");
-    };
-    let mut effects = update.start(txn_id);
-    while let Some(Effect::Storage(effect)) = effects.pop() {
-        let event = storage.send_storage_effect(effect).await;
-        effects = update.step(event, txn_id).unwrap().unwrap_or_default();
+/// Commits one counter update in its own transaction, as a writer's commit would.
+#[derive(Debug, PartialEq)]
+struct ApplyUsage(UsageCounterUpdate);
+
+impl aruna_core::operation::Operation for ApplyUsage {
+    type Output = ();
+    type Error = crate::s3::usage::UsageUpdateError;
+
+    fn first(&mut self) -> Result<aruna_core::calls::Next<()>, Self::Error> {
+        let call = self.0.start_calls(Ulid::from_parts(1, 1)).into_call();
+        Ok(aruna_core::calls::Next::Call(call))
     }
-    storage
-        .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
-        .await;
+
+    fn next(
+        &mut self,
+        result: aruna_core::calls::IoResult,
+    ) -> Result<aruna_core::calls::Next<()>, Self::Error> {
+        Ok(match self.0.step_calls(result)? {
+            Some(call) => aruna_core::calls::Next::Call(call.into_call()),
+            None => aruna_core::calls::Next::Done(()),
+        })
+    }
+
+    fn transaction(&self) -> aruna_core::operation::TransactionMode {
+        aruna_core::operation::TransactionMode::Write
+    }
+}
+
+/// Commits one counter update, as the publication of the seeded versions would.
+async fn apply_usage(storage: &storage::handle::StorageHandle, update: UsageCounterUpdate) {
+    let context = aruna_drivers::testing::test_context(storage.clone());
+    drive(ApplyUsage(update), &context).await.unwrap();
 }
 
 async fn read_counters(
@@ -1271,7 +1249,7 @@ async fn read_counters(
 
 #[tokio::test]
 async fn pending_archive_shared() {
-    use crate::node::usage_stats::StoredDelta;
+    use crate::s3::usage::StoredDelta;
     use aruna_core::keyspaces::{BLOB_CLEANUP_KEYSPACE, COPY_OWNER_KEYSPACE};
     use aruna_core::structs::storage::blob::BlobCleanupWork;
     use aruna_core::structs::storage::usage::{
@@ -1279,14 +1257,16 @@ async fn pending_archive_shared() {
     };
 
     let temp_handle = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     // Two versions of one key share the archive, as a same-bucket copy does.
     let (first, second) = (Ulid::generate(), Ulid::generate());
@@ -1360,14 +1340,16 @@ async fn malformed_owner_aborts() {
     use aruna_core::keyspaces::COPY_OWNER_KEYSPACE;
 
     let temp_handle = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1402,21 +1384,23 @@ async fn malformed_owner_aborts() {
 
 #[tokio::test]
 async fn removes_envelope_rows() {
-    use crate::node::usage_stats::StoredDelta;
+    use crate::s3::usage::StoredDelta;
     use aruna_core::keyspaces::{
         ABE_ARCHIVE_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     };
     use aruna_core::structs::storage::usage::usage_group_key;
 
     let temp_handle = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_handle.path().to_str().unwrap()).unwrap();
     let context = DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let version_id = Ulid::generate();
     let location = seed_pending(&storage_handle, &[version_id]).await;
@@ -1467,7 +1451,7 @@ async fn removes_envelope_rows() {
 async fn removes_pending_copy() {
     // Deleting a copy that waits for its envelope deletes its pending row and its charge, also
     // after a key rotation or with encryption off.
-    use crate::node::usage_stats::StoredDelta;
+    use crate::s3::usage::StoredDelta;
     use aruna_core::keyspaces::{ABE_COPY_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE};
     use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
     use aruna_core::structs::storage::usage::usage_group_key;
@@ -1475,20 +1459,21 @@ async fn removes_pending_copy() {
     for mode in [EncryptionMode::VaultLocked, EncryptionMode::Off] {
         let temp_handle = tempdir().unwrap();
         let path = temp_handle.path().to_str().unwrap();
-        let storage_handle = storage::FjallStorage::open(path).unwrap();
+        let storage_handle = storage::worker::FjallStorage::open(path).unwrap();
         let context = DriverContext {
             storage_handle: storage_handle.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
         let version_id = Ulid::generate();
         let location = seed_pending(&storage_handle, &[version_id]).await;
         let version = VersionKey::new("bucket", "sealed", version_id);
         let bucket_id = location.format.bucket_key().unwrap().bucket_id;
-        let version = crate::abe::copies::copy_row(bucket_id, &version).unwrap();
+        let version = crate::s3::abe_copies::copy_row(bucket_id, &version).unwrap();
         let settings = BucketEncryption {
             mode,
             bucket_id: Some(bucket_id),
@@ -1545,9 +1530,8 @@ async fn offered_history(
     context: &DriverContext,
     withdraw: bool,
 ) -> (crate::staging::offered_directory::OfferDirectoryInput, Ulid) {
-    use crate::staging::offered_directory::{
-        OfferDirectoryInput, WithdrawOfferInput, offer_directory, withdraw_offer,
-    };
+    use crate::staging::offer::run::{offer_directory, withdraw_offer};
+    use crate::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
 
     let root = tempdir().unwrap();
     let file = root.path().join("data.bin");
@@ -1558,12 +1542,16 @@ async fn offered_history(
         group_id: Ulid::generate(),
         realm_id,
         node_id: test_node_id(),
-        user_id: aruna_core::UserId::new(Ulid::generate(), realm_id),
+        user_id: aruna_core::user::id::UserId::new(Ulid::generate(), realm_id),
     };
     std::fs::write(&file, b"one").unwrap();
-    let first = offer_directory(context, offer.clone()).await.unwrap();
+    let first = drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     std::fs::write(&file, b"one-changed").unwrap();
-    offer_directory(context, offer.clone()).await.unwrap();
+    drive(offer_directory(offer.clone()), context)
+        .await
+        .unwrap();
     if withdraw {
         let input = WithdrawOfferInput {
             bucket: offer.bucket.clone(),
@@ -1571,7 +1559,7 @@ async fn offered_history(
             node_id: offer.node_id,
             user_id: offer.user_id,
         };
-        withdraw_offer(context, input).await.unwrap();
+        drive(withdraw_offer(input), context).await.unwrap();
     }
     (offer, first.observed[0].version_id)
 }
@@ -1598,7 +1586,7 @@ async fn delete_then_recount(
         .unwrap();
     let counters = read_counters(context, usage_group_key(offer.group_id)).await;
     drive(
-        crate::node::usage_stats::RebuildStatsOperation::new(),
+        crate::node::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await
@@ -1622,7 +1610,7 @@ async fn head_id(context: &DriverContext, bucket: &str) -> Ulid {
 // deleting its row must not release it a second time.
 #[tokio::test]
 async fn stale_observation_uncharged() {
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let (offer, stale) = offered_history(context, false).await;
 
@@ -1636,7 +1624,7 @@ async fn stale_observation_uncharged() {
 // is charged again.
 #[tokio::test]
 async fn promoted_observation_charged() {
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let (offer, _) = offered_history(context, true).await;
     let marker = head_id(context, &offer.bucket).await;
@@ -1650,7 +1638,7 @@ async fn promoted_observation_charged() {
 // A delete marker over a head observation releases it, as a withdrawal does.
 #[tokio::test]
 async fn marker_releases_observation() {
-    let fixture = crate::tests::staging::setup_driver_context().await;
+    let fixture = aruna_test_support::staging::setup_driver_context().await;
     let context = &fixture.driver_context;
     let (offer, _) = offered_history(context, true).await;
     let marker = head_id(context, &offer.bucket).await;
@@ -1676,16 +1664,9 @@ fn changed_version_kept() {
         .insert("note".to_string(), "edited".to_string());
     let mut op = sized_delete_op().with_expected(seen);
 
-    let effects = op.target_version_read(Event::Storage(StorageEvent::ReadResult {
-        key: Vec::new().into(),
-        value: Some(changed.to_bytes().unwrap().into()),
-    }));
+    let turn = op.target_version_read(Some(changed.to_bytes().unwrap().into()));
 
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::AbortTransaction { .. })]
-    ));
-    assert_eq!(op.finalize(), Err(DeleteObjectError::VersionChanged));
+    assert_eq!(turn.err(), Some(DeleteObjectError::VersionChanged));
 }
 
 #[test]
@@ -1696,26 +1677,19 @@ fn marker_needs_head() {
         operation.state = DeleteObjectState::ReadCurrentLookup;
         operation.pending_version_id = Some(Ulid::generate());
         let pointer = CurrentVersionPointer::new(current).to_bytes().unwrap();
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: Some(pointer.into()),
-        }));
-        operation.output
+        operation.next(read(Some(pointer.into())))
     };
     // A head written meanwhile is never covered by the marker.
     let moved = marked(Ulid::from_parts(6, 6));
-    assert!(matches!(
-        moved,
-        Some(Err(DeleteObjectError::VersionChanged))
-    ));
-    assert!(marked(head).is_none());
+    assert_eq!(moved.err(), Some(DeleteObjectError::VersionChanged));
+    assert!(marked(head).is_ok());
 }
 
 /// Puts, an overwrite, a delete marker and a version delete in two buckets keep each bucket row
 /// exact and the group row their sum, and a rebuild finds the same rows.
 #[tokio::test]
 async fn bucket_rows_sum() {
-    use crate::node::usage_stats::RebuildStatsOperation;
+    use crate::node::usage_rebuild::RebuildStatsOperation;
     use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
@@ -1725,8 +1699,8 @@ async fn bucket_rows_sum() {
     let temp_root = temp_handle.path().to_str().unwrap();
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::FjallStorage::open(temp_root).unwrap();
-    let net_handle = NetHandle::new(NetConfig::default(), storage_handle.clone())
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let net_handle = NetHandle::new(aruna_drivers::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();
     let blob_handle = BlobHandler::new(
@@ -1749,12 +1723,13 @@ async fn bucket_rows_sum() {
         storage_handle,
         net_handle: Some(net_handle),
         blob_handle: Some(blob_handle),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     };
     let realm_id = RealmId::from_bytes([1u8; 32]);
-    let user_id = aruna_core::UserId::local(Ulid::generate(), realm_id);
+    let user_id = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
     let group_id = Ulid::generate();
     for bucket in ["one", "two"] {
         let info = BucketInfo {
@@ -1861,21 +1836,14 @@ async fn bucket_rows_sum() {
 
 #[test]
 fn marker_carries_hint() {
-    use aruna_core::structs::storage::distribution::{DistributionBinding, SetHint};
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::distribution::hint::SetHint;
     use aruna_core::structs::storage::format::Compression;
 
     let marker = |binding: Option<DistributionBinding>, record: Option<Vec<u8>>| {
         let mut operation = audit_op(None);
         operation.state = DeleteObjectState::CheckPurgeFence;
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: vec![1u8].into(),
-            value: None,
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Read { key_space, .. })]
-                if key_space == S3_BUCKET_KEYSPACE
-        ));
+        assert_eq!(space(&operation.next(read(None))), S3_BUCKET_KEYSPACE);
         let info = BucketInfo {
             group_id: Ulid::from_bytes([2u8; 16]),
             created_at: SystemTime::UNIX_EPOCH,
@@ -1887,16 +1855,12 @@ fn marker_carries_hint() {
             compression: Compression::Off,
             distribution: binding,
         };
-        operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(info.to_bytes().unwrap().into()),
-        }));
+        let mut turn = operation.next(read(Some(info.to_bytes().unwrap().into())));
         if let Some(record) = record {
             assert_eq!(operation.state, DeleteObjectState::ReadRecord);
-            let answer = crate::distribution::test_record::authority_rows(Some(record), None);
-            operation.step(answer);
+            turn = operation.next(IoResult::Values(vec![Some(record.into()), None]));
         }
-        assert_ne!(operation.state, DeleteObjectState::Error);
+        assert!(turn.is_ok(), "{turn:?}");
         (
             operation.version_id.expect("marker id minted"),
             operation.set_hint,
@@ -1918,12 +1882,9 @@ fn member_marker_refused() {
     let mut operation = audit_op(None);
     operation.binding = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
     operation.state = DeleteObjectState::ReadRecord;
-    operation.step(crate::distribution::test_record::authority_rows(
-        Some(bytes),
-        None,
-    ));
+    let turn = operation.next(IoResult::Values(vec![Some(bytes.into()), None]));
     assert!(matches!(
-        operation.finalize(),
+        turn,
         Err(DeleteObjectError::Distribution(
             crate::distribution::guard::GuardError::NotCoordinator { .. }
         ))
@@ -1935,14 +1896,7 @@ fn distributed_version_refused() {
     use aruna_core::structs::storage::format::Compression;
     let (snapshot, _) = crate::distribution::test_record::record(true);
     let mut operation = audit_op(Some(Ulid::from_bytes([3u8; 16])));
-    operation.state = DeleteObjectState::StartTransaction;
-    let effects = operation.step(Event::Storage(StorageEvent::TransactionStarted {
-        txn_id: Ulid::from_bytes([4u8; 16]),
-    }));
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == S3_BUCKET_KEYSPACE
-    ));
+    assert_eq!(space(&operation.first()), S3_BUCKET_KEYSPACE);
     let info = BucketInfo {
         group_id: Ulid::from_bytes([2u8; 16]),
         created_at: SystemTime::UNIX_EPOCH,
@@ -1954,14 +1908,8 @@ fn distributed_version_refused() {
         compression: Compression::Off,
         distribution: Some(crate::distribution::test_record::binding(&snapshot, 1, 5)),
     };
-    operation.step(Event::Storage(StorageEvent::ReadResult {
-        key: b"bucket".to_vec().into(),
-        value: Some(info.to_bytes().unwrap().into()),
-    }));
-    assert_eq!(
-        operation.finalize(),
-        Err(DeleteObjectError::DistributedVersion)
-    );
+    let turn = operation.next(read(Some(info.to_bytes().unwrap().into())));
+    assert_eq!(turn.err(), Some(DeleteObjectError::DistributedVersion));
 }
 
 #[test]
@@ -1982,25 +1930,16 @@ fn purge_bound_only() {
     };
     let run = |purge: DistributionBinding| {
         let mut operation = audit_op(Some(Ulid::from_bytes([3u8; 16]))).purging(purge);
-        operation.state = DeleteObjectState::StartTransaction;
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: Ulid::from_bytes([4u8; 16]),
-        }));
-        let effects = operation.step(Event::Storage(StorageEvent::ReadResult {
-            key: b"bucket".to_vec().into(),
-            value: Some(info.to_bytes().unwrap().into()),
-        }));
-        (operation, effects)
+        operation.first().unwrap();
+        let turn = operation.next(read(Some(info.to_bytes().unwrap().into())));
+        (operation, turn)
     };
     // The purge of the bound member deletes the version like in an ordinary bucket.
-    let (operation, effects) = run(bound.clone());
+    let (operation, turn) = run(bound.clone());
     assert_eq!(operation.state, DeleteObjectState::ReadTargetVersion);
-    assert!(matches!(
-        effects.as_slice(),
-        [Effect::Storage(StorageEffect::Read { key_space, .. })] if key_space == BLOB_VERSIONS_KEYSPACE
-    ));
+    assert_eq!(space(&turn), BLOB_VERSIONS_KEYSPACE);
     // A purge recorded for an earlier incarnation of the name deletes nothing.
     let replaced = crate::distribution::test_record::binding(&snapshot, 1, 6);
-    let (operation, _) = run(replaced);
-    assert_eq!(operation.finalize(), Err(DeleteObjectError::NoSuchVersion));
+    let (_, turn) = run(replaced);
+    assert_eq!(turn.err(), Some(DeleteObjectError::NoSuchVersion));
 }

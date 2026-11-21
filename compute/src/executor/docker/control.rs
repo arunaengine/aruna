@@ -5,6 +5,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_core::compute::{BackendError, FenceContext, TombstoneEvidence};
 use serde::{Deserialize, Serialize};
@@ -66,12 +67,24 @@ impl DaemonLock {
     }
 
     pub fn verify(&self) -> Result<(), BackendError> {
-        let path = self.root.join("health.tmp");
-        let mut file = File::create(&path).map_err(api_error)?;
+        let path = self.probe_path();
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(api_error)?;
         file.write_all(b"ok").map_err(api_error)?;
         file.sync_all().map_err(api_error)?;
         std::fs::remove_file(path).map_err(api_error)?;
         sync_dir(&self.root)
+    }
+
+    /// A probe file of its own, so overlapping probes never remove each other's file.
+    fn probe_path(&self) -> PathBuf {
+        static PROBES: AtomicU64 = AtomicU64::new(0);
+        let probe = PROBES.fetch_add(1, Ordering::Relaxed);
+        let name = format!("health.{}.{probe}.tmp", std::process::id());
+        self.root.join(name)
     }
 }
 
@@ -107,13 +120,19 @@ impl ControlGuard {
 
     /// Fences the start request before the daemon is asked to start: from here
     /// on an absent container is lost evidence, never a licence to create one.
-    pub fn mark_start(&mut self) -> Result<(), BackendError> {
+    /// The durable write runs on the blocking pool while this guard keeps the lock.
+    pub async fn mark_start(&mut self) -> Result<(), BackendError> {
+        let path = self.0.path().to_path_buf();
         let record = self.0.record_mut().ok_or_else(missing_record)?;
         if record.started {
             return Ok(());
         }
         record.started = true;
-        self.0.persist().map_err(control_error)
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || control_store::write_json(&path, &record))
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
+            .map_err(control_error)
     }
 
     pub fn tombstone(&self) -> Option<TombstoneEvidence> {
@@ -192,16 +211,33 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn records_start_durably() {
+    #[tokio::test]
+    async fn records_start_durably() {
         // A recorded start must survive the guard so a resubmit cannot re-create.
         let directory = tempdir().unwrap();
         let daemon = DaemonLock::acquire(directory.path()).unwrap();
         let mut control = daemon.control(&fence(1)).unwrap();
         assert!(!control.started());
-        control.mark_start().unwrap();
+        control.mark_start().await.unwrap();
         drop(control);
         assert!(daemon.control(&fence(2)).unwrap().started());
+    }
+
+    #[test]
+    fn probes_stay_apart() {
+        // Each probe has a file of its own and removes it again.
+        let directory = tempdir().unwrap();
+        let daemon = DaemonLock::acquire(directory.path()).unwrap();
+        assert_ne!(daemon.probe_path(), daemon.probe_path());
+        daemon.verify().unwrap();
+        daemon.verify().unwrap();
+        let left = std::fs::read_dir(&daemon.root).unwrap();
+        let names: Vec<_> = left.map(|entry| entry.unwrap().file_name()).collect();
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.to_string_lossy().starts_with("health"))
+        );
     }
 
     #[test]

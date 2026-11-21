@@ -4,12 +4,14 @@
 
 use std::sync::Arc;
 
+use aruna_core::metadata::api::{LinkDocument, LinkNodeRequest, LinkQuery};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
-use aruna_operations::metadata::api::{
-    LINKS_MAX_LIMIT, LinkDocument, LinkNodeRequest, LinkPage, LinkQuery, file_queries,
-    links_distributed, part_of, resolve_part,
+use aruna_drivers::driver::drive;
+use aruna_operations::metadata::api::links::types::{LINKS_MAX_LIMIT, LinkPage};
+use aruna_operations::metadata::api::links::{
+    file_queries, links_distributed, part_of, resolve_part,
 };
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -17,10 +19,11 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
+use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
-use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::relay::{node_read, query_path};
 use crate::server::state::ServerState;
 
@@ -176,7 +179,6 @@ permission; unreadable matches only set `hidden_references_exist`.
     responses(
         (status = 200, description = "Readable documents that link the identifier", body = DataLinksResponse, example = json!(example())),
         (status = 400, description = "`id` names no Aruna data", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
     ),
@@ -184,11 +186,10 @@ permission; unreadable matches only set `hidden_references_exist`.
 )]
 pub async fn data_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Query(params): Query<DataLinksParams>,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let link = DataLink::parse(params.id.trim()).ok_or_else(|| {
         ServerError::BadRequestReason("id names no Aruna data identifier".to_string())
     })?;
@@ -231,7 +232,6 @@ pub async fn data_links(
     responses(
         (status = 200, description = "Readable documents that link the file, folder or bucket", body = DataLinksResponse, example = json!(example())),
         (status = 400, description = "Neither or both of `key` and `prefix`", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file or bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
@@ -240,28 +240,21 @@ pub async fn data_links(
 )]
 pub async fn bucket_links(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     Query(params): Query<BucketLinksParams>,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let queries = match (params.key, params.prefix) {
         (Some(key), None) => {
             let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &key);
             ensure_permission(&state, &auth, path, Permission::READ).await?;
-            file_queries(
-                state.get_ctx().as_ref(),
-                realm_id,
-                node_id,
-                &bucket,
-                &key,
-                params.version_id,
-            )
-            .await
-            .map_err(map_api_error)?
+            let queries = file_queries((realm_id, node_id), &bucket, &key, params.version_id);
+            drive(queries, state.get_ctx().as_ref())
+                .await
+                .map_err(map_api_error)?
         }
         (None, Some(prefix)) => {
             let path = bucket_permission_path(realm_id, info.group_id, node_id, &bucket);
@@ -305,16 +298,11 @@ async fn run(
     bearer_token: Option<ValidatedBearer>,
     request: LinkNodeRequest,
 ) -> ServerResult<Json<DataLinksResponse>> {
-    let page = links_distributed(
-        state.get_ctx().as_ref(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        Some(auth),
-        bearer_token_string(bearer_token),
-        request,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let node = (state.get_realm_id(), state.get_node_id());
+    let links = links_distributed(node, Some(auth), bearer_token_string(bearer_token), request);
+    let page = drive(links, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     Ok(Json(page.into()))
 }
 
@@ -382,7 +370,6 @@ caller's READ permission; unreadable ones only set `hidden_references_exist`.
             "hidden_references_exist": false,
             "more_datasets": "/api/v1/data/buckets/lab-raw-data/links?key=raw%2F2026%2Freef-07%2Freads_R1.fastq.gz&parts_only=true"
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the file", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "No metadata node could answer", body = ErrorResponse)
@@ -391,27 +378,20 @@ caller's READ permission; unreadable ones only set `hidden_references_exist`.
 )]
 pub async fn file_part_of(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
     Query(params): Query<PartOfParams>,
 ) -> ServerResult<Json<PartOfResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm_id, info.group_id, node_id, &bucket, &params.key);
     ensure_permission(&state, &auth, path, Permission::READ).await?;
-    let found = part_of(
-        state.get_ctx().as_ref(),
-        realm_id,
-        node_id,
-        Some(auth),
-        bearer_token_string(bearer_token),
-        &bucket,
-        &params.key,
-    )
-    .await
-    .map_err(map_api_error)?;
+    let caller = (Some(auth), bearer_token_string(bearer_token));
+    let found = part_of((realm_id, node_id), caller, &bucket, &params.key);
+    let found = drive(found, state.get_ctx().as_ref())
+        .await
+        .map_err(map_api_error)?;
     let encoded: String = url::form_urlencoded::byte_serialize(params.key.as_bytes()).collect();
     Ok(Json(PartOfResponse {
         datasets: found
@@ -509,9 +489,12 @@ pub async fn part_target(
     let link = DataLink::parse(params.id.trim())
         .filter(|link| link.scope().is_some())
         .ok_or_else(|| ServerError::BadRequestReason("id names no bucket or prefix".to_string()))?;
-    let target = resolve_part(state.get_ctx().as_ref(), state.get_node_id(), link)
-        .await
-        .map_err(map_api_error)?;
+    let target = drive(
+        resolve_part(state.get_node_id(), link),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(map_api_error)?;
     // Signed out, a part of another node's bucket resolves only as that node answers.
     if let Some(owner) = target.node_id.filter(|owner| *owner != state.get_node_id())
         && signed_out

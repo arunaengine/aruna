@@ -10,17 +10,25 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Shared operation test helpers; only other crates' dev-dependencies enable it.
+test-hooks = ["dep:getrandom"]
+
 [dependencies]
 aruna-kpabe = { workspace = true }
 bytes = { workspace = true }
 smallvec = { workspace = true }
 ulid = { workspace = true }
+unicode-normalization = { workspace = true }
 thiserror = { workspace = true }
 craqle = { workspace = true }
 byteview = { workspace = true }
 async-trait = { workspace = true }
 aes-gcm = { workspace = true }
 blake3 = { workspace = true }
+crc-fast = { workspace = true }
+md5 = { workspace = true }
+sha1 = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
 flate2 = { workspace = true }
@@ -38,17 +46,17 @@ futures = { workspace = true }
 prometheus-client = { workspace = true }
 ed25519-dalek = { workspace = true }
 url = { workspace = true, features = ["serde"] }
-getrandom = { workspace = true }
+getrandom = { workspace = true, optional = true }
 cel-interpreter = { workspace = true }
 globset = { workspace = true }
 opentelemetry = { workspace = true }
 oxrdf = { workspace = true }
+parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
 subtle = { workspace = true }
 tokio = { workspace = true }
-tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
@@ -58,8 +66,7 @@ pbkdf2 = { workspace = true }
 argon2 = { workspace = true }
 x25519-dalek = { workspace = true }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-nix = { workspace = true }
-
 [dev-dependencies]
+getrandom = { workspace = true }
 proptest = { workspace = true }
+tracing-subscriber = { workspace = true }

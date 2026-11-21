@@ -2,6 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::compute::backend::ComputeEntry;
 use crate::errors::ConversionError;
 use crate::structs::storage::blob::{Backend, BackendConfig, BackendRef, BlobTimeoutConfig};
 use crate::structs::storage::cleanup::CleanupStrategy;
@@ -29,6 +30,9 @@ pub struct BackendsFile {
     pub egress: EgressEntry,
     #[serde(default)]
     pub import_root: BTreeMap<String, ImportRoot>,
+    /// Named compute backends, checked by `compute::backend::resolve`.
+    #[serde(default)]
+    pub compute: BTreeMap<String, ComputeEntry>,
 }
 
 /// A folder the operator lets the listed groups import in place as `fs` group backends.

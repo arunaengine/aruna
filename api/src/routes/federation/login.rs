@@ -3,20 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::require_unrestricted_auth;
+use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::routes::access::sessions::{CreateSessionResponse, map_create_error, unix_rfc3339};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
 use aruna_core::handoff::{HandoffError, LoginHandoff};
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::time::unix_timestamp_secs;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
+use aruna_operations::document_repository::GetConfigError;
 use aruna_operations::federation::login::{
     FederatedLoginConfig, FederatedLoginError, FederatedLoginOperation, IssueHandoffConfig,
     IssueHandoffError, IssueHandoffOperation,
 };
-use aruna_operations::realm::get_config::GetConfigError;
 use aruna_operations::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -27,7 +26,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::{Arc, LazyLock};
 use tracing::info;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -44,12 +43,8 @@ fn login_limiter() -> DefaultKeyedRateLimiter<IpAddr> {
     RateLimiter::keyed(Quota::per_minute(rate))
 }
 
-#[derive(OpenApi)]
-#[openapi(tags((name = "federation", description = "Native login across realms")))]
-pub struct LoginApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(LoginApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(create_login_handoff))
         .routes(routes!(create_federated_session))
 }
@@ -157,17 +152,15 @@ sessions and other session kinds are refused, so a login cannot chain to a third
         "signature": "<hex ed25519 signature>"
     })),
         (status = 400, description = "A malformed nonce, or a descriptor that does not verify", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Not an unrestricted portal session of a local user, or the user is deactivated", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn create_login_handoff(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Json(request): Json<LoginHandoffRequest>,
 ) -> ServerResult<Json<Signed<LoginHandoff>>> {
-    let auth = require_unrestricted_auth(&state, auth)?;
     let nonce_valid = hex::decode(&request.nonce).is_ok_and(|bytes| bytes.len() == SECRET_LEN);
     if !nonce_valid {
         return Err(ServerError::BadRequestReason(
@@ -186,7 +179,7 @@ pub async fn create_login_handoff(
         .map_err(|error| match error {
             IssueHandoffError::Refused | IssueHandoffError::Deactivated => ServerError::Forbidden,
             IssueHandoffError::Invalid(error) => ServerError::BadRequestReason(error.to_string()),
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.into()),
         })?;
     Ok(Json(signed))
 }
@@ -296,7 +289,7 @@ pub async fn create_federated_session(
                 ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", error.to_string())
             }
             FederatedLoginError::Session(error) => map_create_error(error),
-            error => ServerError::InternalError(error.to_string()),
+            error => ServerError::InternalError(error.into()),
         })?;
     let account = created.session.user_id;
     info!(%handoff_id, %user_id, %account, "Federated login accepted");
@@ -332,30 +325,32 @@ async fn name_hint(state: &ServerState, name: &str) -> ServerResult<bool> {
     });
     let found = drive(search, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(!found.users.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::RealmAuth;
     use crate::auth::handle_token;
     use crate::routes::access::sessions::{CreateSessionRequest, create_session};
-    use crate::tests::routes::{test_context, test_state, test_storage};
-    use aruna_core::UserId;
+    use crate::tests::routes::{test_state, test_storage};
     use aruna_core::auth::{REVOCATION_GRACE_SECS, user_cutoff_expiry, user_cutoff_hash};
     use aruna_core::document::DocumentTarget;
     use aruna_core::effects::StorageEffect;
     use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMode};
     use aruna_core::handoff::secret_nonce;
     use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind, SessionRef};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
-    use aruna_operations::auth::bearer_token::{
-        ArunaBearerError, ArunaValidationState, validate_bearer_claims,
-    };
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::testing::test_context;
+    use aruna_operations::auth::bearer_token::validate_bearer_claims;
+    use aruna_operations::auth::error::ArunaBearerError;
+    use aruna_operations::document_repository::GetConfigOperation;
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::realm::get_config::GetConfigOperation;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use tempfile::TempDir;
@@ -450,6 +445,7 @@ mod tests {
             secret_nonce(&SECRET),
             Some("Ada".to_string()),
             unix_timestamp_secs(),
+            ulid::Ulid::from_bytes([7; 16]),
         )
         .unwrap();
         Signed::sign(payload, &home).unwrap()
@@ -516,7 +512,7 @@ mod tests {
 
         let child = create_session(
             State(state.clone()),
-            Extension(Some(auth)),
+            RealmAuth(auth),
             Extension(Some(crate::auth::ValidatedBearer::new_for_test(
                 created.session.token,
             ))),
@@ -588,7 +584,7 @@ mod tests {
         };
         let error = create_login_handoff(
             State(state.clone()),
-            Extension(Some(federated)),
+            UnrestrictedAuth(federated),
             Json(request()),
         )
         .await
@@ -602,7 +598,7 @@ mod tests {
         };
         let Json(signed) = create_login_handoff(
             State(state.clone()),
-            Extension(Some(local)),
+            UnrestrictedAuth(local),
             Json(request()),
         )
         .await
@@ -678,32 +674,6 @@ mod tests {
         ));
     }
 
-    /// Judges claims at a fixed instant and trusts every realm.
-    struct FixedClock(u64);
-
-    #[async_trait::async_trait]
-    impl ArunaValidationState for FixedClock {
-        async fn is_token_revoked(&self, _: &RealmId, _: &str) -> Result<bool, ArunaBearerError> {
-            Ok(false)
-        }
-
-        async fn user_cutoff(
-            &self,
-            _: &RealmId,
-            _: &UserId,
-        ) -> Result<Option<u64>, ArunaBearerError> {
-            Ok(None)
-        }
-
-        async fn is_trusted_realm(&self, _: &RealmId) -> bool {
-            true
-        }
-
-        fn now_secs(&self) -> u64 {
-            self.0
-        }
-    }
-
     #[tokio::test]
     async fn session_lasts_hours() {
         // With an injected clock a federated session ends 8 hours after the login, not later.
@@ -723,9 +693,10 @@ mod tests {
         assert_eq!(created.session.expires_at, now + 8 * 3600);
         let claims = handle_token(&state, created.token.expose()).await.unwrap();
         assert_eq!((claims.iat, claims.exp), (now, now + 8 * 3600));
-        let last = validate_bearer_claims(&FixedClock(claims.exp), &claims).await;
+        let trusted = std::collections::HashSet::from([state.get_realm_id()]);
+        let last = validate_bearer_claims(&trusted, claims.exp, &claims);
         assert!(last.is_ok());
-        let after = validate_bearer_claims(&FixedClock(claims.exp + 1), &claims).await;
+        let after = validate_bearer_claims(&trusted, claims.exp + 1, &claims);
         assert!(matches!(after, Err(ArunaBearerError::Expired)));
     }
 }

@@ -3,17 +3,23 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::extract;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::routes::metadata::repositories::{
     ApiRepositoryKind, RepositoryRequest, create_repository,
 };
 use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state, test_storage,
+    seed_group_docs, seed_realm_auth, seed_realm_config, test_state, test_storage,
 };
-use aruna_core::UserId;
-use aruna_core::structs::execution::job::JobState;
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
+use aruna_core::user::id::UserId;
+use aruna_drivers::testing::test_context;
 use aruna_operations::harvest::create_source::source_id;
-use aruna_operations::jobs::store::{JobMutation, mutate_job};
+use aruna_operations::jobs::store::JobMutation;
+use aruna_test_support::jobs::mutate_job;
+use axum::http::StatusCode;
 use tempfile::TempDir;
 
 struct Setup {
@@ -77,7 +83,7 @@ async fn connector(setup: &Setup, kind: ApiRepositoryKind) -> String {
     };
     let (_, Json(created)) = create_repository(
         State(setup.state.clone()),
-        Extension(Some(setup.owner.clone())),
+        RealmAuth(setup.owner.clone()),
         Path(setup.group_id.to_string()),
         Json(RepositoryRequest {
             name: "zenodo".into(),
@@ -110,7 +116,7 @@ async fn submit(
 ) -> ServerResult<HarvestResponse> {
     submit_harvest(
         State(setup.state.clone()),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Path((setup.group_id.to_string(), connector_id.to_string())),
         Json(body),
     )
@@ -164,7 +170,7 @@ async fn submit_reuses_source() {
     assert!(matches!(running, Err(ServerError::Conflict(_))));
     let job_id = first.job_id.parse().unwrap();
     let context = setup.state.get_ctx();
-    mutate_job(&context.storage_handle, job_id, |record| {
+    mutate_job(&context, job_id, |record| {
         record.state = JobState::Cancelled;
         Ok(JobMutation::Persist)
     })
@@ -234,23 +240,12 @@ async fn submit_checks_access() {
         }]),
         ..setup.owner.clone()
     };
-    let delegated = submit(
-        &setup,
-        restricted,
-        &connector_id,
-        request("imported/zenodo", None),
-    )
-    .await;
-    assert!(matches!(delegated, Err(ServerError::Forbidden)));
+    // `submit_harvest` takes `UnrestrictedAuth`, so these refusals are the extractor's.
+    let delegated = extract::<UnrestrictedAuth>(&setup.state, Some(restricted)).await;
+    assert_eq!(delegated.err(), Some(StatusCode::FORBIDDEN));
 
-    let anonymous = submit_harvest(
-        State(setup.state.clone()),
-        Extension(None),
-        Path((setup.group_id.to_string(), connector_id)),
-        Json(request("imported/zenodo", None)),
-    )
-    .await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    let anonymous = extract::<UnrestrictedAuth>(&setup.state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]

@@ -6,13 +6,13 @@ use super::{
     BlobCopyCompliance, BlobCopyOrigin, BlobCopyState, BlobCopyStorage, BlobLocationsQuery,
     blob_locations, copy_response, pending_copy,
 };
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::server::state::ServerState;
-use aruna_core::UserId;
-use aruna_core::effects::StorageEffect;
-use aruna_core::events::{Event, StorageEvent};
+use crate::tests::routes::write_fixture;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::replication_protocol::{CopyCompliance, LocationCopyStorage, LocationSummary};
 use aruna_core::request_policy::{PolicyKind, RequestPolicy};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
@@ -22,11 +22,10 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::CopyOrigin;
 use aruna_core::structs::storage::format::Compression;
-use aruna_operations::driver::DriverContext;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
 use aruna_operations::replication::locations::LocationSummaryError;
-use aruna_operations::replication::protocol::CopyCompliance;
-use aruna_operations::replication::protocol::{LocationCopyStorage, LocationSummary};
-use aruna_storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use axum::Extension;
 use axum::extract::{Query, State};
 use byteview::ByteView;
@@ -35,7 +34,7 @@ use std::time::SystemTime;
 use tempfile::TempDir;
 use ulid::Ulid;
 
-fn node_id() -> aruna_core::NodeId {
+fn node_id() -> aruna_core::id::NodeId {
     iroh::SecretKey::from_bytes(&[3u8; 32]).public()
 }
 
@@ -309,23 +308,6 @@ fn realm_for(seed: u8) -> RealmId {
     )
 }
 
-async fn write_fixture(state: &ServerState, key_space: &str, key: ByteView, value: ByteView) {
-    match state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key,
-            value,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => {}
-        other => panic!("unexpected fixture write event: {other:?}"),
-    }
-}
-
 /// A realm holding one group whose owner may read `TEST_BUCKET`.
 async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerState>) {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -337,16 +319,17 @@ async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerS
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             }),
             realm_id,
             node_id(),
             NodeCapabilities::user_node(realm_id).expect("capabilities"),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -461,12 +444,7 @@ fn locations_query() -> Query<BlobLocationsQuery> {
 }
 
 fn auth_for(user_id: UserId, realm_id: RealmId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 #[tokio::test]
@@ -480,7 +458,7 @@ async fn locations_require_read() {
 
     let denied = blob_locations(
         State(state.clone()),
-        Extension(Some(auth_for(stranger, realm_id))),
+        RealmAuth(auth_for(stranger, realm_id)),
         Extension(None),
         axum::http::HeaderMap::new(),
         locations_query(),
@@ -490,7 +468,7 @@ async fn locations_require_read() {
 
     let allowed = blob_locations(
         State(state),
-        Extension(Some(auth_for(owner, realm_id))),
+        RealmAuth(auth_for(owner, realm_id)),
         Extension(None),
         axum::http::HeaderMap::new(),
         locations_query(),
@@ -510,7 +488,7 @@ async fn policy_denies_locations() {
 
     let denied = blob_locations(
         State(state),
-        Extension(Some(auth_for(owner, realm_id))),
+        RealmAuth(auth_for(owner, realm_id)),
         Extension(None),
         axum::http::HeaderMap::new(),
         locations_query(),

@@ -2,21 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, parse_group_id};
 use crate::error::{ErrorResponse, ServerResult};
-use crate::metadata::{
+use crate::metadata::model::{
     ProfileCapabilitiesResponse, ProfilePreviewRequest, ProfilePreviewResponse,
-    ProfileValidationResponse, ensure_metadata_scope, forwarded_auth_token, map_api_error,
-    map_metadata_error, parse_document_id, serialize_jsonld_object,
+    ProfileValidationResponse,
+};
+use crate::metadata::{
+    ensure_metadata_scope, forwarded_auth_token, map_api_error, map_metadata_error,
+    parse_document_id, serialize_jsonld_object,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_operations::metadata::api::GetVisibleRequest;
-use aruna_operations::metadata::forward::route_profile_status as run_profile_validation_status;
+use aruna_drivers::driver::drive;
+use aruna_operations::metadata::api::export_types::GetVisibleRequest;
+use aruna_operations::metadata::forward::routed::status::RoutedStatusOperation;
 use aruna_operations::metadata::profile::validation::{
-    SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name, preview_submission as run_preview_submission,
+    ProfileAssessOperation, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };
-use aruna_operations::metadata::public_preview::restricted_files as run_restricted_files;
+use aruna_operations::metadata::public_preview::RestrictedFilesOperation;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -185,7 +190,6 @@ metadata path, because the group's own Profiles resolve for it.
                 "restricted_files_complete": true
             })),
         (status = 400, description = "The body is not a parseable RO-Crate JSON-LD document", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or READ is denied on the named group's metadata", body = ErrorResponse),
         (status = 503, description = "The Profile or the evaluator is temporarily unavailable; retryable", body = ErrorResponse)
     ),
@@ -193,10 +197,9 @@ metadata path, because the group's own Profiles resolve for it.
 )]
 pub async fn preview_profile_validation(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Json(request): Json<ProfilePreviewRequest>,
 ) -> ServerResult<(StatusCode, Json<ProfilePreviewResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = request
         .group_id
         .as_deref()
@@ -209,21 +212,17 @@ pub async fn preview_profile_validation(
     }
     let jsonld = serialize_jsonld_object(&request.rocrate)?;
     let context = state.get_ctx();
-    let preview = run_preview_submission(&context, group_id, &jsonld)
-        .await
-        .map_err(map_metadata_error)?;
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
+    let preview = drive(preview, &context).await.map_err(map_metadata_error)?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
+        let node = (state.get_realm_id(), state.get_node_id());
+        let restricted = RestrictedFilesOperation::new(node, auth.clone(), &request.rocrate);
         response.set_restricted(
-            run_restricted_files(
-                &context,
-                state.get_realm_id(),
-                state.get_node_id(),
-                &auth,
-                &request.rocrate,
-            )
-            .await
-            .map_err(map_metadata_error)?,
+            drive(restricted, &context)
+                .await
+                .map_err(map_metadata_error)?,
         );
     }
     Ok((StatusCode::OK, Json(response)))
@@ -285,12 +284,17 @@ pub async fn get_validation_status(
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
     let document_id = parse_document_id(&document_id)?;
-    let status = run_profile_validation_status(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        GetVisibleRequest { document_id, auth },
-        forwarded_auth_token(bearer_token)?,
-        false,
+    let status = drive(
+        RoutedStatusOperation::new(
+            (
+                state.get_ctx().net_handle.as_ref().map(|net| net.node_id()),
+                state.get_realm_id(),
+            ),
+            GetVisibleRequest { document_id, auth },
+            forwarded_auth_token(bearer_token)?,
+            false,
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;
@@ -327,7 +331,6 @@ pub async fn get_validation_status(
                 "stale_reason": null
             })),
         (status = 400, description = "Document id or Profile tag is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller lacks READ on the document", body = ErrorResponse),
         (status = 404, description = "The document does not exist or is not readable", body = ErrorResponse),
         (status = 503, description = "The Profile, evaluator, Dataset revision or a holder is temporarily unavailable; retryable", body = ErrorResponse)
@@ -336,21 +339,25 @@ pub async fn get_validation_status(
 )]
 pub async fn revalidate_profile(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer_token): Extension<Option<ValidatedBearer>>,
     Path(document_id): Path<String>,
 ) -> ServerResult<(StatusCode, Json<ProfileValidationResponse>)> {
-    let auth = require_realm_auth(&state, auth)?;
     let document_id = parse_document_id(&document_id)?;
-    let status = run_profile_validation_status(
-        &state.get_ctx(),
-        state.get_realm_id(),
-        GetVisibleRequest {
-            document_id,
-            auth: Some(auth),
-        },
-        forwarded_auth_token(bearer_token)?,
-        true,
+    let status = drive(
+        RoutedStatusOperation::new(
+            (
+                state.get_ctx().net_handle.as_ref().map(|net| net.node_id()),
+                state.get_realm_id(),
+            ),
+            GetVisibleRequest {
+                document_id,
+                auth: Some(auth),
+            },
+            forwarded_auth_token(bearer_token)?,
+            true,
+        ),
+        state.get_ctx().as_ref(),
     )
     .await
     .map_err(map_api_error)?;

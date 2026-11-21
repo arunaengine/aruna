@@ -9,7 +9,7 @@ use aruna_core::structs::storage::group_backend::{
     BUCKET_DELETE, GroupBackendKind, GroupStorage, plain_folder,
 };
 use aruna_core::types::GroupId;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use thiserror::Error;
 
@@ -72,10 +72,21 @@ pub enum GroupBackendError {
 
 /// The normalized, storable configs: keys lowercased so the record matches what
 /// opendal will actually read.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct NormalizedConfig {
     pub public: HashMap<String, String>,
     pub secret: HashMap<String, String>,
+}
+
+/// Shows the names of the secret settings, never their values.
+impl std::fmt::Debug for NormalizedConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: BTreeSet<_> = self.secret.keys().collect();
+        f.debug_struct("NormalizedConfig")
+            .field("public", &self.public)
+            .field("secret_names", &names)
+            .finish()
+    }
 }
 
 /// Keys that name the physical store. Stored locations record the path below
@@ -329,6 +340,15 @@ mod pure_tests {
 
     fn s3_secret() -> HashMap<String, String> {
         config(&[("access_key_id", "id"), ("secret_access_key", "key")])
+    }
+
+    #[test]
+    fn config_debug_hidden() {
+        let normalized = super::NormalizedConfig {
+            public: s3_public(),
+            secret: config(&[("secret_access_key", "hidden-value")]),
+        };
+        assert!(!format!("{normalized:?}").contains("hidden-value"));
     }
 
     #[test]

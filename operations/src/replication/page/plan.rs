@@ -4,11 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::plugin_runs::{SourceEvent, journal_entries};
-use aruna_core::time::unix_timestamp_millis;
 use std::collections::{BTreeMap, BTreeSet};
 
-use aruna_core::NodeId;
+use aruna_core::calls::IoError;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_KEYSPACE, PURGE_FENCE_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -18,26 +18,26 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{
     BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::delivery::AdmissionError;
 use aruna_core::structs::storage::distribution::fence::LocalFence;
+use aruna_core::structs::storage::distribution::snapshot::DistributionView;
 use aruna_core::structs::storage::distribution::source_root::{RootEntry, SourceRoot};
-use aruna_core::structs::storage::distribution::{
-    AdmissionError, DistributionBinding, DistributionView,
-};
 use aruna_core::structs::storage::encryption::BucketEncryption;
 use aruna_core::structs::storage::storage_purge::StoragePurgeFence;
 use aruna_core::structs::storage::usage::UsageDelta;
-use aruna_core::structs::tagged_receipt;
+use aruna_core::structs::synced_folder::tagged_receipt;
 use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use super::{PAGE_RECORDS, PageAnswer, ReferencePage};
+use super::PAGE_RECORDS;
+use crate::connectors::root_record::{compact_version, root_write};
 use crate::distribution::inventory::{AddedVersion, InventoryChange, entry_of, version_written};
-use crate::node::usage_stats::UsageUpdateError;
 use crate::replication::incoming::{IncomingVersionError, member_reference, same_reference};
-use crate::replication::protocol::VersionReplicationManifest;
 use crate::s3::purge_fence::{PurgeFenceError, check_decoded_fence, fence_key};
-use crate::staging::root_record::{compact_version, root_write};
+use crate::s3::usage::UsageUpdateError;
+use aruna_core::replication_protocol::{PageAnswer, ReferencePage, VersionReplicationManifest};
 
 /// Rows read ahead of the records: bucket, encryption, purge fence, record and member fence.
 pub(super) const GUARD_READS: usize = 5;
@@ -66,20 +66,27 @@ pub enum PageError {
     Encrypted,
     #[error("the version a head names is missing")]
     HeadMissing,
-    #[error("unexpected event in state {state}: {received}")]
-    UnexpectedEvent {
-        state: &'static str,
-        received: String,
-    },
     #[error("operation did not finish")]
     NotFinished,
+    #[error("page storage failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for PageError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            other => Self::Io(other),
+        }
+    }
 }
 
 impl PageError {
     /// Whether the same page may pass later, after a conflict or a newer record.
     pub fn retryable(&self) -> bool {
         match self {
-            Self::Storage(_) | Self::Usage(_) | Self::RecordMissing => true,
+            Self::Storage(_) | Self::Usage(_) | Self::RecordMissing | Self::Io(_) => true,
             Self::Admission(error) => error.retryable(),
             Self::Purge(error) => matches!(error, PurgeFenceError::Suspended),
             Self::Conversion(_)
@@ -88,7 +95,6 @@ impl PageError {
             | Self::ForeignPublication
             | Self::Encrypted
             | Self::HeadMissing
-            | Self::UnexpectedEvent { .. }
             | Self::NotFinished => false,
         }
     }
@@ -339,7 +345,7 @@ pub(super) fn page_rows(
     items: &[PageItem],
     plans: &[Plan],
     (guards, previous): (&PageGuards, Vec<Option<BlobVersion>>),
-    (realm_id, local): (RealmId, NodeId),
+    (realm_id, local, now_ms): (RealmId, NodeId, u64),
 ) -> Result<PageRows, PageError> {
     let mut previous = previous.into_iter();
     let mut rows = PageRows {
@@ -391,7 +397,7 @@ pub(super) fn page_rows(
             (realm_id, guards.group_id, local),
             (&page.bucket, key),
             manifest.version_id,
-            unix_timestamp_millis(),
+            now_ms,
         );
         rows.writes.extend(journal_entries(&uploaded)?);
         if let Some(root) = &item.root {

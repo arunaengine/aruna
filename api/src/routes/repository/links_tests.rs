@@ -3,17 +3,22 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::metadata::{CreateMetadataRequest, CreateRoCrateRequest};
+use crate::auth::extract;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
+use crate::metadata::model::{CreateMetadataRequest, CreateRoCrateRequest};
 use crate::routes::link_routes::*;
 use crate::routes::metadata::documents::create_metadata_document;
 use crate::routes::metadata::repositories::delete_repository;
-use crate::routes::metadata::tests::{TestState, drain_metadata_background, setup_network_state};
+use crate::routes::metadata::tests::{TestState, setup_network_state};
+use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{LINK_SECRET_KEYSPACE, REPOSITORY_LINK_KEYSPACE};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
-use aruna_operations::driver::drive;
+use aruna_drivers::driver::drive;
 use aruna_operations::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
+use axum::Extension;
+use axum::http::StatusCode;
 use std::collections::HashMap;
 
 const TOKEN: &str = "personal-link-token";
@@ -40,7 +45,7 @@ pub(crate) async fn setup_crate(root: serde_json::Value, endpoint: &str) -> Link
         .await;
     let (_, Json(created)) = create_metadata_document(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Extension(None),
         Json(CreateMetadataRequest::RoCrate(CreateRoCrateRequest {
             group_id: test.group_id.to_string(),
@@ -103,7 +108,10 @@ async fn create(
 ) -> ServerResult<RepositoryLinkResponse> {
     Box::pin(create_link(
         State(linked.test.state.clone()),
-        Extension(auth),
+        UnrestrictedAuth(crate::auth::require_unrestricted_auth(
+            &linked.test.state,
+            auth,
+        )?),
         Path(linked.document_id.clone()),
         Json(request(linked)),
     ))
@@ -116,7 +124,7 @@ async fn create(
 
 fn stranger(linked: &Linked) -> AuthContext {
     AuthContext {
-        user_id: aruna_core::UserId::local(Ulid::generate(), linked.test.auth.realm_id),
+        user_id: aruna_core::user::id::UserId::local(Ulid::generate(), linked.test.auth.realm_id),
         ..linked.test.auth.clone()
     }
 }
@@ -153,7 +161,7 @@ fn requests_hide_token() {
 async fn link_routes_authorize() {
     let linked = setup().await;
     let state = || State(linked.test.state.clone());
-    let owner = || Extension(Some(linked.test.auth.clone()));
+    let owner = || linked.test.auth.clone();
     assert!(matches!(
         create(&linked, None).await,
         Err(ServerError::Unauthorized)
@@ -174,7 +182,7 @@ async fn link_routes_authorize() {
     for (key_space, key) in [
         (
             REPOSITORY_LINK_KEYSPACE,
-            aruna_core::repository::link_key(document_id, link_id),
+            aruna_core::repository::link::link_key(document_id, link_id),
         ),
         (LINK_SECRET_KEYSPACE, link_id.to_bytes().to_vec()),
     ] {
@@ -194,12 +202,16 @@ async fn link_routes_authorize() {
         assert!(!String::from_utf8_lossy(&value).contains(TOKEN));
     }
 
-    let listed =
-        list_repository_links(state(), Extension(None), Path(linked.document_id.clone())).await;
-    assert!(matches!(listed, Err(ServerError::Unauthorized)));
-    let Json(listed) = list_repository_links(state(), owner(), Path(linked.document_id.clone()))
-        .await
-        .unwrap();
+    // `list_repository_links` takes `UnrestrictedAuth`, so the refusal is the extractor's.
+    let listed = extract::<UnrestrictedAuth>(&linked.test.state, None).await;
+    assert_eq!(listed.err(), Some(StatusCode::UNAUTHORIZED));
+    let Json(listed) = list_repository_links(
+        state(),
+        UnrestrictedAuth(owner()),
+        Path(linked.document_id.clone()),
+    )
+    .await
+    .unwrap();
     assert_eq!(listed.len(), 1);
 
     let pause = || {
@@ -210,19 +222,24 @@ async fn link_routes_authorize() {
     };
     let denied = patch_link(
         state(),
-        Extension(Some(stranger(&linked))),
+        UnrestrictedAuth(stranger(&linked)),
         paths(&linked, &link),
         pause(),
     )
     .await;
     assert!(denied.is_err());
-    let Json(paused) = patch_link(state(), owner(), paths(&linked, &link), pause())
-        .await
-        .unwrap();
+    let Json(paused) = patch_link(
+        state(),
+        UnrestrictedAuth(owner()),
+        paths(&linked, &link),
+        pause(),
+    )
+    .await
+    .unwrap();
     assert_eq!(paused.status, "paused");
-    let pushed = push_link(state(), owner(), paths(&linked, &link)).await;
+    let pushed = push_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link)).await;
     assert!(matches!(pushed, Err(ServerError::Conflict(_))));
-    let published = publish_link(state(), owner(), paths(&linked, &link)).await;
+    let published = publish_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link)).await;
     assert!(matches!(published, Err(ServerError::Conflict(_))));
     let rotate = || {
         Json(RotateTokenRequest {
@@ -231,46 +248,57 @@ async fn link_routes_authorize() {
     };
     let refused = rotate_token(
         state(),
-        Extension(Some(stranger(&linked))),
+        UnrestrictedAuth(stranger(&linked)),
         paths(&linked, &link),
         rotate(),
     )
     .await;
     assert!(refused.is_err());
     assert_eq!(
-        rotate_token(state(), owner(), paths(&linked, &link), rotate())
-            .await
-            .unwrap(),
+        rotate_token(
+            state(),
+            UnrestrictedAuth(owner()),
+            paths(&linked, &link),
+            rotate()
+        )
+        .await
+        .unwrap(),
         StatusCode::NO_CONTENT
     );
     let resume = Json(PatchLinkRequest {
         paused: Some(false),
         ..PatchLinkRequest::default()
     });
-    let _ = patch_link(state(), owner(), paths(&linked, &link), resume)
-        .await
-        .unwrap();
-    let (status, Json(first)) = push_link(state(), owner(), paths(&linked, &link))
-        .await
-        .unwrap();
+    let _ = patch_link(
+        state(),
+        UnrestrictedAuth(owner()),
+        paths(&linked, &link),
+        resume,
+    )
+    .await
+    .unwrap();
+    let (status, Json(first)) =
+        push_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link))
+            .await
+            .unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert!(first.status_url.ends_with(&first.job_id));
-    let (_, Json(again)) = push_link(state(), owner(), paths(&linked, &link))
+    let (_, Json(again)) = push_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link))
         .await
         .unwrap();
     assert_eq!(again.job_id, first.job_id);
-    let Json(running) = get_link(state(), owner(), paths(&linked, &link))
+    let Json(running) = get_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link))
         .await
         .unwrap();
     assert!(running.pending);
 
     assert_eq!(
-        delete_link(state(), owner(), paths(&linked, &link))
+        delete_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link))
             .await
             .unwrap(),
         StatusCode::NO_CONTENT
     );
-    let gone = get_link(state(), owner(), paths(&linked, &link)).await;
+    let gone = get_link(state(), UnrestrictedAuth(owner()), paths(&linked, &link)).await;
     assert!(matches!(gone, Err(ServerError::NotFound)));
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
         .storage_handle
@@ -295,7 +323,7 @@ async fn connector_delete_conflicts() {
     let remove_connector = || {
         delete_repository(
             State(linked.test.state.clone()),
-            Extension(Some(linked.test.auth.clone())),
+            RealmAuth(linked.test.auth.clone()),
             Path((
                 linked.test.group_id.to_string(),
                 linked.connector_id.to_string(),
@@ -308,7 +336,7 @@ async fn connector_delete_conflicts() {
     ));
     delete_link(
         State(linked.test.state.clone()),
-        Extension(Some(linked.test.auth.clone())),
+        UnrestrictedAuth(linked.test.auth.clone()),
         paths(&linked, &link),
     )
     .await
@@ -320,7 +348,7 @@ async fn connector_delete_conflicts() {
 async fn holder_copy_refuses() {
     let linked = setup().await;
     let state = || State(linked.test.state.clone());
-    let owner = || Extension(Some(linked.test.auth.clone()));
+    let owner = || linked.test.auth.clone();
     let document_id = parse_document_id(&linked.document_id).unwrap();
     // A replicated copy of a link another node owns; that node is not a holder of the dataset.
     let now = std::time::SystemTime::now();
@@ -341,12 +369,12 @@ async fn holder_copy_refuses() {
         last_push: None,
         active_job: None,
         sequence: 0,
-        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        limits: aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
         generation: 1,
         warning: None,
-        direction: aruna_core::repository::LinkDirection::Push,
+        direction: aruna_core::repository::link::LinkDirection::Push,
         kind: aruna_core::structs::execution::harvest::RepositoryConnectorKind::Invenio,
     };
     let written = linked
@@ -366,9 +394,13 @@ async fn holder_copy_refuses() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
 
-    let Json(listed) = list_repository_links(state(), owner(), Path(linked.document_id.clone()))
-        .await
-        .unwrap();
+    let Json(listed) = list_repository_links(
+        state(),
+        UnrestrictedAuth(owner()),
+        Path(linked.document_id.clone()),
+    )
+    .await
+    .unwrap();
     let [shown] = &listed[..] else {
         panic!("the holder lists the copy");
     };
@@ -379,7 +411,14 @@ async fn holder_copy_refuses() {
         paused: Some(true),
         ..PatchLinkRequest::default()
     });
-    match patch_link(state(), owner(), paths(&linked, shown), pause).await {
+    match patch_link(
+        state(),
+        UnrestrictedAuth(owner()),
+        paths(&linked, shown),
+        pause,
+    )
+    .await
+    {
         Err(ServerError::Conflict(message)) => {
             assert!(
                 message.contains("https://owner.example/api/v1"),
@@ -388,7 +427,7 @@ async fn holder_copy_refuses() {
         }
         other => panic!("a copy must be managed on its owner node: {other:?}"),
     }
-    let pushed = push_link(state(), owner(), paths(&linked, shown)).await;
+    let pushed = push_link(state(), UnrestrictedAuth(owner()), paths(&linked, shown)).await;
     assert!(matches!(pushed, Err(ServerError::Conflict(_))));
 }
 
@@ -403,7 +442,7 @@ async fn requirements_refuse_links() {
         {"person_or_org": {"type": "personal", "family_name": "Doe"}}]}));
     let refused = create_link(
         State(linked.test.state.clone()),
-        Extension(Some(linked.test.auth.clone())),
+        UnrestrictedAuth(linked.test.auth.clone()),
         Path(linked.document_id.clone()),
         Json(request),
     )
@@ -453,7 +492,7 @@ async fn unsupported_kinds_refused() {
         };
         create_link(
             State(linked.test.state.clone()),
-            Extension(Some(linked.test.auth.clone())),
+            UnrestrictedAuth(linked.test.auth.clone()),
             Path(linked.document_id.clone()),
             Json(request),
         )
@@ -472,7 +511,7 @@ async fn unsupported_kinds_refused() {
     ));
     let search = crate::routes::repository::search_records(
         State(linked.test.state.clone()),
-        Extension(Some(linked.test.auth.clone())),
+        UnrestrictedAuth(linked.test.auth.clone()),
         Path((linked.test.group_id.to_string(), oai.to_string())),
         axum::extract::Query(crate::routes::repository::RepositorySearch {
             q: String::new(),
@@ -486,7 +525,7 @@ async fn unsupported_kinds_refused() {
     let import = |connector_id: Ulid, doi: Option<&str>| {
         crate::routes::repository::import_record(
             State(linked.test.state.clone()),
-            Extension(Some(linked.test.auth.clone())),
+            UnrestrictedAuth(linked.test.auth.clone()),
             Json(crate::routes::repository::RepositoryImportRequest {
                 group_id: linked.test.group_id.to_string(),
                 connector_id: connector_id.to_string(),
@@ -553,10 +592,12 @@ async fn unmet_link_findings() {
     let link = create(&linked, Some(linked.test.auth.clone()))
         .await
         .unwrap();
-    let mut stored = aruna_operations::jobs::repository::links::read_link(
-        &linked.test.state.get_ctx().storage_handle,
-        parse_document_id(&linked.document_id).unwrap(),
-        Ulid::from_string(&link.link_id).unwrap(),
+    let mut stored = aruna_drivers::driver::drive(
+        aruna_operations::jobs::repository::link_store::ReadLinkOperation::new(
+            parse_document_id(&linked.document_id).unwrap(),
+            Ulid::from_string(&link.link_id).unwrap(),
+        ),
+        linked.test.state.get_ctx().as_ref(),
     )
     .await
     .unwrap()
@@ -588,7 +629,7 @@ async fn unmet_link_findings() {
 async fn admin_rights_limited() {
     let linked = setup().await;
     let state = || State(linked.test.state.clone());
-    let admin = || Extension(Some(linked.test.auth.clone()));
+    let admin = || linked.test.auth.clone();
     let link = create(&linked, Some(linked.test.auth.clone()))
         .await
         .unwrap();
@@ -596,10 +637,12 @@ async fn admin_rights_limited() {
     let document_id = parse_document_id(&linked.document_id).unwrap();
     let link_id = Ulid::from_string(&link.link_id).unwrap();
     let context = linked.test.state.get_ctx();
-    let mut stored = aruna_operations::jobs::repository::links::read_link(
-        &context.storage_handle,
-        document_id,
-        link_id,
+    let mut stored = aruna_drivers::driver::drive(
+        aruna_operations::jobs::repository::link_store::ReadLinkOperation::new(
+            document_id,
+            link_id,
+        ),
+        context.as_ref(),
     )
     .await
     .unwrap()
@@ -609,7 +652,7 @@ async fn admin_rights_limited() {
         .storage_handle
         .send_storage_effect(StorageEffect::Write {
             key_space: REPOSITORY_LINK_KEYSPACE.into(),
-            key: aruna_core::repository::link_key(document_id, link_id).into(),
+            key: aruna_core::repository::link::link_key(document_id, link_id).into(),
             value: stored.to_bytes().unwrap().into(),
             txn_id: None,
         })
@@ -618,20 +661,31 @@ async fn admin_rights_limited() {
         auto_publish: Some(true),
         ..PatchLinkRequest::default()
     });
-    let refused = patch_link(state(), admin(), paths(&linked, &link), settings).await;
+    let refused = patch_link(
+        state(),
+        UnrestrictedAuth(admin()),
+        paths(&linked, &link),
+        settings,
+    )
+    .await;
     assert!(matches!(refused, Err(ServerError::Forbidden)));
-    let published = publish_link(state(), admin(), paths(&linked, &link)).await;
+    let published = publish_link(state(), UnrestrictedAuth(admin()), paths(&linked, &link)).await;
     assert!(matches!(published, Err(ServerError::Forbidden)));
     let pause = Json(PatchLinkRequest {
         paused: Some(true),
         ..PatchLinkRequest::default()
     });
-    let Json(paused) = patch_link(state(), admin(), paths(&linked, &link), pause)
-        .await
-        .unwrap();
+    let Json(paused) = patch_link(
+        state(),
+        UnrestrictedAuth(admin()),
+        paths(&linked, &link),
+        pause,
+    )
+    .await
+    .unwrap();
     assert_eq!(paused.status, "paused");
     assert_eq!(
-        delete_link(state(), admin(), paths(&linked, &link))
+        delete_link(state(), UnrestrictedAuth(admin()), paths(&linked, &link))
             .await
             .unwrap(),
         StatusCode::NO_CONTENT
@@ -640,7 +694,8 @@ async fn admin_rights_limited() {
 
 /// Stores a pull link on the dataset the way a keep_updated import creates it.
 async fn pull_link_for(linked: &Linked) -> RepositoryLink {
-    use aruna_core::repository::{LinkDirection, LinkPull, RepositoryRecord};
+    use aruna_core::repository::RepositoryRecord;
+    use aruna_core::repository::link::{LinkDirection, LinkPull};
     let now = std::time::SystemTime::now();
     let mut link = RepositoryLink {
         link_id: Ulid::generate(),
@@ -659,7 +714,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         last_push: None,
         active_job: None,
         sequence: 0,
-        limits: aruna_core::structs::execution::job::RoCrateLimits::default(),
+        limits: aruna_core::structs::execution::job::input::RoCrateLimits::default(),
         created_at: now,
         updated_at: now,
         generation: 0,
@@ -668,7 +723,7 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         direction: LinkDirection::Pull(Box::new(LinkPull {
             auto_update: false,
             options: Default::default(),
-            target: aruna_core::structs::execution::job::ImportRoCrateTarget {
+            target: aruna_core::structs::execution::job::input::ImportRoCrateTarget {
                 bucket: "research".into(),
                 prefix: "zenodo".into(),
             },
@@ -699,20 +754,21 @@ async fn pull_link_for(linked: &Linked) -> RepositoryLink {
         link: Box::new(link.clone()),
         secret: None,
     };
-    change_link(linked.test.state.get_ctx().as_ref(), &link, change)
-        .await
-        .unwrap()
-        .unwrap()
+    let context = linked.test.state.get_ctx();
+    let operation = ApplyChangeOperation::new(context.node_scope(), link, change);
+    drive(operation, context.as_ref()).await.unwrap().unwrap()
 }
 
 #[tokio::test]
 async fn pull_link_routes() {
     let linked = setup().await;
     let state = || State(linked.test.state.clone());
-    let owner = || Extension(Some(linked.test.auth.clone()));
+    let owner = || linked.test.auth.clone();
     let link = pull_link_for(&linked).await;
     let path = || Path((linked.document_id.clone(), link.link_id.to_string()));
-    let Json(view) = get_link(state(), owner(), path()).await.unwrap();
+    let Json(view) = get_link(state(), UnrestrictedAuth(owner()), path())
+        .await
+        .unwrap();
     assert_eq!(view.direction, "pull");
     assert_eq!(view.auto_update, Some(false));
     assert_eq!(view.remote.record_id.as_deref(), Some("v1"));
@@ -721,14 +777,16 @@ async fn pull_link_routes() {
     assert_eq!((view.reason, view.pending), (None, false));
     // Push actions and push settings do not apply to a pull link.
     assert!(matches!(
-        push_link(state(), owner(), path()).await,
+        push_link(state(), UnrestrictedAuth(owner()), path()).await,
         Err(ServerError::Conflict(_))
     ));
     assert!(matches!(
-        accept_remote(state(), owner(), path()).await,
+        accept_remote(state(), UnrestrictedAuth(owner()), path()).await,
         Err(ServerError::Conflict(_))
     ));
-    let settings = |request: PatchLinkRequest| patch_link(state(), owner(), path(), Json(request));
+    let settings = |request: PatchLinkRequest| {
+        patch_link(state(), UnrestrictedAuth(owner()), path(), Json(request))
+    };
     let push_settings = PatchLinkRequest {
         auto_publish: Some(true),
         ..PatchLinkRequest::default()
@@ -755,7 +813,7 @@ async fn pull_link_routes() {
     let Json(paused) = settings(pause).await.unwrap();
     assert_eq!(paused.status, "paused");
     assert!(matches!(
-        pull_link(state(), owner(), path()).await,
+        pull_link(state(), UnrestrictedAuth(owner()), path()).await,
         Err(ServerError::Conflict(_))
     ));
     let push = create(&linked, Some(linked.test.auth.clone()))
@@ -776,12 +834,12 @@ async fn pull_link_routes() {
 #[tokio::test]
 async fn link_requests_checked() {
     let linked = setup().await;
-    let owner = || Extension(Some(linked.test.auth.clone()));
+    let owner = || linked.test.auth.clone();
     let mut unknown = request(&linked);
     unknown.connector_id = Ulid::generate().to_string();
     let missing = Box::pin(create_link(
         State(linked.test.state.clone()),
-        owner(),
+        UnrestrictedAuth(owner()),
         Path(linked.document_id.clone()),
         Json(unknown),
     ))
@@ -799,7 +857,7 @@ async fn link_requests_checked() {
     });
     let refused = patch_link(
         State(linked.test.state.clone()),
-        owner(),
+        UnrestrictedAuth(owner()),
         paths(&linked, &link),
         mixed,
     )
@@ -854,14 +912,14 @@ async fn viewer(linked: &Linked) -> AuthContext {
 
 #[tokio::test]
 async fn readers_cannot_push() {
-    use crate::metadata::RepositoryExportRequest;
+    use crate::metadata::model::RepositoryExportRequest;
     use crate::routes::repository::{SubmitRepositoryExport, export_record};
     let linked = setup().await;
     let reader = viewer(&linked).await;
     // The reader sees the dataset's links, so only the missing WRITE refuses the pushes below.
     let listed = list_repository_links(
         State(linked.test.state.clone()),
-        Extension(Some(reader.clone())),
+        UnrestrictedAuth(reader.clone()),
         Path(linked.document_id.clone()),
     )
     .await;
@@ -883,7 +941,7 @@ async fn readers_cannot_push() {
     };
     let exported = export_record(
         State(linked.test.state.clone()),
-        Extension(Some(reader)),
+        UnrestrictedAuth(reader),
         Path(linked.document_id.clone()),
         Json(export),
     )

@@ -207,16 +207,17 @@ async fn metrics_s3_label() -> TestResult<()> {
 /// by hand, so only launching the real binary can observe `main`'s startup
 /// order, its serving gate, and its restart outbox delta.
 mod process {
+    use aruna_clock::testing::poll_until;
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::SYNC_OUTBOX_KEYSPACE;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::io::{Read, Seek, SeekFrom};
     use std::net::{TcpListener, UdpSocket};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::Duration;
-    use tokio::time::Instant;
 
     /// Deadlock guard only: a breach means the process never reached the gate.
     /// Never a speed assertion.
@@ -422,17 +423,19 @@ mod process {
         pub async fn open_storage(&self) -> StorageHandle {
             let path = self.storage_path();
             let path = path.to_str().expect("utf8 storage path");
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
+            let mut last = String::new();
+            let opened = poll_until(Duration::from_secs(30), async || {
                 match FjallStorage::open(path) {
-                    Ok(storage) => return storage,
-                    Err(error) if Instant::now() < deadline => {
+                    Ok(storage) => Some(storage),
+                    Err(error) => {
                         tracing::debug!(%error, "waiting for the node store lock");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        last = error.to_string();
+                        None
                     }
-                    Err(error) => panic!("could not open the stopped node store: {error}"),
                 }
-            }
+            })
+            .await;
+            opened.unwrap_or_else(|| panic!("could not open the stopped node store: {last}"))
         }
 
         /// Exact document-sync outbox rows of the stopped node.
@@ -556,9 +559,8 @@ mod process {
         /// between degraded and running, so its report has to be awaited.
         pub async fn wait_body(&mut self, path: &str, expect: StatusCode, needle: &str) -> String {
             let client = probe_client();
-            let deadline = Instant::now() + HANG_GUARD;
             let mut last = String::from("no response yet");
-            while Instant::now() < deadline {
+            let found = poll_until(HANG_GUARD, async || {
                 if !self.is_running() {
                     panic!(
                         "process exited before {path} returned {expect}\n{}",
@@ -570,13 +572,17 @@ mod process {
                         let status = response.status();
                         let body = response.text().await.unwrap_or_default();
                         if status == expect && body.contains(needle) {
-                            return body;
+                            return Some(body);
                         }
                         last = format!("status {status}: {body}");
                     }
                     Err(error) => last = error.to_string(),
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                None
+            })
+            .await;
+            if let Some(body) = found {
+                return body;
             }
             panic!(
                 "{path} never returned {expect} with {needle:?} (last {last})\n{}",
@@ -586,13 +592,12 @@ mod process {
 
         /// Waits until `needle` appears in this launch's own log output.
         pub async fn wait_log(&mut self, needle: &str) {
-            let deadline = Instant::now() + HANG_GUARD;
             let mut offset = self.log_start as u64;
             let mut pending = String::new();
-            while Instant::now() < deadline {
+            let logged = poll_until(HANG_GUARD, async || {
                 pending.push_str(&self.own_log_chunk(&mut offset));
                 if pending.contains(needle) {
-                    return;
+                    return Some(());
                 }
                 if let Some(index) = pending.rfind('\n') {
                     pending = pending.split_off(index + 1);
@@ -600,9 +605,10 @@ mod process {
                 if !self.is_running() {
                     panic!("process exited before logging {needle}\n{}", self.logs());
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            panic!("never logged {needle}\n{}", self.logs());
+                None
+            })
+            .await;
+            assert!(logged.is_some(), "never logged {needle}\n{}", self.logs());
         }
 
         /// Waits for the tracked core publication barrier to reach `expected`.
@@ -649,15 +655,14 @@ mod process {
         }
 
         async fn wait_path(&mut self, path: PathBuf, expected: &str) {
-            let deadline = Instant::now() + HANG_GUARD;
             let reached = |path: &PathBuf| {
                 std::fs::read_to_string(path)
                     .map(|value| value.trim() == expected)
                     .unwrap_or(false)
             };
-            while Instant::now() < deadline {
+            let met = poll_until(HANG_GUARD, async || {
                 if reached(&path) {
-                    return;
+                    return Some(());
                 }
                 if !self.is_running() {
                     // The exit check races the write, so the file decides: an
@@ -667,20 +672,24 @@ mod process {
                         "process exited before test barrier reached {expected}\n{}",
                         self.logs()
                     );
-                    return;
+                    return Some(());
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            panic!("test barrier never reached {expected}\n{}", self.logs());
+                None
+            })
+            .await;
+            assert!(
+                met.is_some(),
+                "test barrier never reached {expected}\n{}",
+                self.logs()
+            );
         }
 
         /// Waits for a complete drain invocation before sampling the store.
         pub async fn wait_drain_quiet(&mut self) {
-            let deadline = Instant::now() + HANG_GUARD;
             let mut offset = self.log_start as u64;
             let mut pending = String::new();
             let mut summary_seen = false;
-            while Instant::now() < deadline {
+            let quiet = poll_until(HANG_GUARD, async || {
                 if !self.is_running() {
                     panic!("process exited before a quiescent drain\n{}", self.logs());
                 }
@@ -690,15 +699,20 @@ mod process {
                         && line.contains("rotation_complete=true")
                         && line.contains("has_unvisited=false");
                     if summary_seen && line.contains("pipeline.drain.rotation") {
-                        return;
+                        return Some(());
                     }
                 }
                 if let Some(index) = pending.rfind('\n') {
                     pending = pending.split_off(index + 1);
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            panic!("never reached a quiescent drain\n{}", self.logs());
+                None
+            })
+            .await;
+            assert!(
+                quiet.is_some(),
+                "never reached a quiescent drain\n{}",
+                self.logs()
+            );
         }
 
         pub fn signal(&self, name: &str) {
@@ -735,18 +749,16 @@ mod process {
 
         /// Waits for this launch to exit inside the deadlock guard.
         pub async fn wait_exit(&mut self) -> std::process::ExitStatus {
-            let deadline = Instant::now() + HANG_GUARD;
-            loop {
-                match self.child.try_wait().expect("wait for exit") {
-                    Some(status) => return status,
-                    None if Instant::now() >= deadline => {
-                        let logs = self.logs();
-                        let _ = self.child.kill();
-                        panic!("process did not exit after SIGTERM\n{logs}");
-                    }
-                    None => tokio::time::sleep(Duration::from_millis(50)).await,
-                }
+            let exited = poll_until(HANG_GUARD, async || {
+                self.child.try_wait().expect("wait for exit")
+            })
+            .await;
+            if let Some(status) = exited {
+                return status;
             }
+            let logs = self.logs();
+            let _ = self.child.kill();
+            panic!("process did not exit after SIGTERM\n{logs}");
         }
     }
 
@@ -836,8 +848,8 @@ async fn inject_offline_peers(env: &process::NodeEnv, count: u8) -> TestResult<(
 }
 
 async fn load_state(
-    storage: &aruna_storage::StorageHandle,
-) -> TestResult<aruna::identity::PersistedNodeState> {
+    storage: &aruna_storage::storage::handle::StorageHandle,
+) -> TestResult<aruna_core::structs::identity::node_state::PersistedNodeState> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
@@ -852,15 +864,15 @@ async fn load_state(
     {
         Event::Storage(StorageEvent::ReadResult {
             value: Some(value), ..
-        }) => Ok(postcard::from_bytes::<aruna::identity::PersistedNodeState>(
-            &value,
-        )?),
+        }) => Ok(postcard::from_bytes::<
+            aruna_core::structs::identity::node_state::PersistedNodeState,
+        >(&value)?),
         other => Err(format!("unexpected node state event: {other:?}").into()),
     }
 }
 
 async fn load_realm(
-    storage: &aruna_storage::StorageHandle,
+    storage: &aruna_storage::storage::handle::StorageHandle,
 ) -> TestResult<aruna_core::structs::identity::realm::RealmConfigDocument> {
     use aruna_core::effects::{IterStart, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
@@ -885,7 +897,10 @@ async fn load_realm(
     }
 }
 
-async fn clear_space(storage: &aruna_storage::StorageHandle, key_space: &str) -> TestResult<()> {
+async fn clear_space(
+    storage: &aruna_storage::storage::handle::StorageHandle,
+    key_space: &str,
+) -> TestResult<()> {
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
 
@@ -935,7 +950,7 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{SYNC_OUTBOX_KEYSPACE, TASK_TIMER_KEYSPACE};
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_operations::sync::document_outbox::{new_outbox_record, outbox_write_entry};
+    use aruna_operations::sync::outbox::record::{new_identified_record, outbox_write_entry};
 
     let storage = env.open_storage().await;
     clear_space(&storage, SYNC_OUTBOX_KEYSPACE).await?;
@@ -944,7 +959,8 @@ async fn inject_outbox(env: &process::NodeEnv) -> TestResult<Vec<u8>> {
     let config = load_realm(&storage).await?;
     let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
     let placement = PlacementRef::NIL;
-    let record = new_outbox_record(
+    let record = new_identified_record(
+        ulid::Ulid::generate(),
         node_id,
         DocumentTarget::NodeInfo {
             realm_id: config.realm_id,

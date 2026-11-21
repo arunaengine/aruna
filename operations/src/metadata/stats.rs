@@ -1,28 +1,31 @@
-//! Counts realm documents and groups and classifies documents by purpose.
+//! Counts a group's documents by their purpose.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
 use std::collections::HashSet;
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::GROUP_KEYSPACE;
-use aruna_core::structs::identity::group::Group;
+use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::metadata::{
+    MetadataEffect, MetadataError, MetadataEvent, REGISTRY_CANDIDATE_LIMIT,
+};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
-use futures_util::{StreamExt, stream};
 use serde_json::Value;
 
 use super::api::MetadataApiError;
-use super::repository::StorageReadError;
-use crate::driver::DriverContext;
-use crate::jobs::workflow::run_crate::PROCESS_PROFILE;
-use crate::metadata::get_document::record_materialized_read;
+use super::api::list::{GroupRecordsOperation, RecordSummaryOperation};
+use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::profile::rules::{
+    PROFILE_TYPE_IRI, collect_conforms_terms, jsonld_contains_iri,
+};
+use aruna_core::metadata::CRATE_PROFILE_IRI;
 
-const COUNT_PAGE_SIZE: usize = 1_000;
 const SUMMARY_FANOUT_LIMIT: usize = 8;
-const PROFILE_TYPE_IRI: &str = "http://www.w3.org/ns/dx/prof/Profile";
-const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct GroupDocumentCounts {
@@ -31,172 +34,125 @@ pub struct GroupDocumentCounts {
     pub process_run_count: u64,
 }
 
-/// Realm-wide count of live metadata documents, unfiltered by readability and
-/// excluding lifecycle-deleted ones. `None` without a metadata subsystem. Only
-/// document volume is disclosed, never a per-caller glob evaluation.
-pub async fn count_realm_documents(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<Option<u64>, MetadataApiError> {
-    let Some(metadata_handle) = context.metadata_handle.as_ref() else {
-        return Ok(None);
-    };
-    let records = metadata_handle
-        .list_cached_records()
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records =
-        super::api::filter_live_records(&context.storage_handle, records.as_ref()).await?;
-    Ok(Some(
-        records
-            .iter()
-            .filter(|record| record.realm_id == realm_id)
-            .count() as u64,
-    ))
+#[derive(Debug, PartialEq)]
+enum PurposeStage {
+    Probe,
+    Records,
+    Summaries(Vec<String>),
 }
 
-/// Number of stored groups belonging to one realm. Bounded pages under one
-/// read transaction yield a consistent snapshot, not the default page
-/// `ListGroupOperation` exposes.
-pub async fn count_realm_groups(
-    context: &DriverContext,
-    realm_id: RealmId,
-) -> Result<u64, MetadataApiError> {
-    let txn_id = match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: true })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(MetadataApiError::Internal(error.to_string()));
-        }
-        other => return Err(MetadataApiError::Internal(format!("{other:?}"))),
-    };
-
-    let mut count = 0_u64;
-    let mut start_after = None;
-    let scan = 'scan: loop {
-        match context
-            .storage_handle
-            .send_storage_effect(StorageEffect::Iter {
-                key_space: GROUP_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.map(IterStart::After),
-                limit: COUNT_PAGE_SIZE,
-                txn_id: Some(txn_id),
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult {
-                values,
-                next_start_after,
-            }) => {
-                for (_, value) in values {
-                    let group = match Group::from_bytes(value.as_ref()) {
-                        Ok(group) => group,
-                        Err(error) => {
-                            break 'scan Err(MetadataApiError::Internal(error.to_string()));
-                        }
-                    };
-                    if group.realm_id == realm_id {
-                        count = match count.checked_add(1) {
-                            Some(count) => count,
-                            None => {
-                                break 'scan Err(MetadataApiError::Internal(
-                                    "realm group count overflow".to_string(),
-                                ));
-                            }
-                        };
-                    }
-                }
-                match next_start_after {
-                    Some(next) => start_after = Some(next),
-                    None => break Ok(count),
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                break Err(MetadataApiError::Internal(error.to_string()));
-            }
-            other => break Err(MetadataApiError::Internal(format!("{other:?}"))),
-        }
-    };
-
-    let completion = if scan.is_ok() {
-        StorageEffect::CommitTransaction { txn_id }
-    } else {
-        StorageEffect::AbortTransaction { txn_id }
-    };
-    let completion_event = context.storage_handle.send_storage_effect(completion).await;
-    match scan {
-        Err(error) => Err(error),
-        Ok(count) => match completion_event {
-            Event::Storage(StorageEvent::TransactionCommitted { .. }) => Ok(count),
-            Event::Storage(StorageEvent::Error { error }) => {
-                Err(MetadataApiError::Internal(error.to_string()))
-            }
-            other => Err(MetadataApiError::Internal(format!("{other:?}"))),
-        },
-    }
-}
-
-/// Exact lifecycle-live metadata-document counts for one group, classified
-/// solely from each document's root RO-Crate entity via bounded root-summary
-/// reads; full paths never load. `None` without a metadata subsystem.
-pub async fn count_group_purpose(
-    context: &DriverContext,
+/// Exact lifecycle-live metadata-document counts for one group, classified solely from each
+/// document's root RO-Crate entity via bounded root-summary reads; full paths never load.
+/// `None` without a metadata subsystem.
+#[derive(Debug, PartialEq)]
+pub struct GroupPurposeOperation {
     realm_id: RealmId,
     group_id: GroupId,
-) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
-    let Some(metadata_handle) = context.metadata_handle.clone() else {
-        return Ok(None);
-    };
-    let records = metadata_handle
-        .list_cached_group(group_id)
-        .await
-        .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-    let records = super::api::filter_live_records(&context.storage_handle, records.as_ref())
-        .await?
-        .into_iter()
-        .filter(|record| record.realm_id == realm_id && record.group_id == group_id)
-        .collect::<Vec<_>>();
+    stage: PurposeStage,
+}
 
-    let classifications = stream::iter(records.into_iter().map(|record| {
-        let metadata_handle = metadata_handle.clone();
-        async move {
-            if !record_materialized_read(context, &record)
-                .await
-                .map_err(|error| match error {
-                    StorageReadError::Storage(error) => {
-                        MetadataApiError::Internal(error.to_string())
-                    }
-                    StorageReadError::Conversion(error) => {
-                        MetadataApiError::Internal(error.to_string())
-                    }
-                })?
-            {
-                return Err(MetadataApiError::ServiceUnavailable);
-            }
-            let summary = metadata_handle
-                .export_summary_jsonld(record.graph_iri.clone())
-                .await
-                .map_err(|error| MetadataApiError::Internal(error.to_string()))?;
-            classify_root_summary(&summary, &record.graph_iri)
-        }
-    }))
-    .buffered(SUMMARY_FANOUT_LIMIT)
-    .collect::<Vec<_>>()
-    .await;
-
-    let mut counts = GroupDocumentCounts::default();
-    for classification in classifications {
-        match classification? {
-            DocumentPurpose::Profile => counts.profile_count += 1,
-            DocumentPurpose::ProcessRun => counts.process_run_count += 1,
-            DocumentPurpose::Dataset => counts.dataset_count += 1,
+impl GroupPurposeOperation {
+    pub fn new(realm_id: RealmId, group_id: GroupId) -> Self {
+        Self {
+            realm_id,
+            group_id,
+            stage: PurposeStage::Probe,
         }
     }
-    Ok(Some(counts))
+
+    fn summaries(
+        &mut self,
+        records: Vec<MetadataRegistryRecord>,
+    ) -> Next<Option<GroupDocumentCounts>> {
+        let records: Vec<_> = (records.into_iter())
+            .filter(|record| record.realm_id == self.realm_id && record.group_id == self.group_id)
+            .collect();
+        if records.is_empty() {
+            return Next::Done(Some(GroupDocumentCounts::default()));
+        }
+        let graphs = records
+            .iter()
+            .map(|record| record.graph_iri.clone())
+            .collect();
+        let members = (records.into_iter())
+            .map(|record| {
+                Effect::SubOperation(boxed_suboperation(
+                    RecordSummaryOperation::new(record),
+                    |result| Event::Child(ChildOutcome::new(result)),
+                ))
+            })
+            .collect();
+        self.stage = PurposeStage::Summaries(graphs);
+        Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: SUMMARY_FANOUT_LIMIT,
+            form: GroupForm::All { deadline: None },
+        }))
+    }
+
+    fn counted(
+        graphs: Vec<String>,
+        result: IoResult,
+    ) -> Result<GroupDocumentCounts, MetadataApiError> {
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
+            return Err(MetadataApiError::ServiceUnavailable);
+        };
+        let mut counts = GroupDocumentCounts::default();
+        for (graph_iri, member) in graphs.iter().zip(results) {
+            let GroupResult::Done(event) = member else {
+                return Err(MetadataApiError::ServiceUnavailable);
+            };
+            let Event::Child(outcome) = *event else {
+                return Err(MetadataApiError::ServiceUnavailable);
+            };
+            let summary = outcome.take::<String, MetadataApiError>();
+            let summary = summary.ok_or(MetadataApiError::ServiceUnavailable)??;
+            match classify_root_summary(&summary, graph_iri)? {
+                DocumentPurpose::Profile => counts.profile_count += 1,
+                DocumentPurpose::ProcessRun => counts.process_run_count += 1,
+                DocumentPurpose::Dataset => counts.dataset_count += 1,
+            }
+        }
+        Ok(counts)
+    }
+}
+
+impl Operation for GroupPurposeOperation {
+    type Output = Option<GroupDocumentCounts>;
+    type Error = MetadataApiError;
+
+    fn first(&mut self) -> Result<Next<Option<GroupDocumentCounts>>, MetadataApiError> {
+        // The cache probe tells a node without a metadata subsystem apart.
+        let probe = MetadataEffect::CachedGroup {
+            group_id: self.group_id,
+        };
+        Ok(Next::Call(metadata_call(probe)))
+    }
+
+    fn next(
+        &mut self,
+        result: IoResult,
+    ) -> Result<Next<Option<GroupDocumentCounts>>, MetadataApiError> {
+        match std::mem::replace(&mut self.stage, PurposeStage::Records) {
+            PurposeStage::Probe => {
+                if let Event::Metadata(MetadataEvent::Error {
+                    error: MetadataError::HandleMissing,
+                    ..
+                }) = result.event()?
+                {
+                    return Ok(Next::Done(None));
+                }
+                self.stage = PurposeStage::Records;
+                let records = GroupRecordsOperation::new(self.group_id, REGISTRY_CANDIDATE_LIMIT);
+                Ok(Next::Call(IoCall::child(records)))
+            }
+            PurposeStage::Records => {
+                let records = result.child::<Vec<MetadataRegistryRecord>, MetadataApiError>()??;
+                Ok(self.summaries(records))
+            }
+            PurposeStage::Summaries(graphs) => Ok(Next::Done(Some(Self::counted(graphs, result)?))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,7 +188,7 @@ pub(crate) fn classify_root_summary(
     collect_conforms_terms(document.get("@context"), &mut conforms_to_keys);
     if root.as_object().is_some_and(|root| {
         root.iter().any(|(key, value)| {
-            conforms_to_keys.contains(key) && jsonld_contains_iri(Some(value), PROCESS_PROFILE)
+            conforms_to_keys.contains(key) && jsonld_contains_iri(Some(value), CRATE_PROFILE_IRI)
         })
     }) {
         return Ok(DocumentPurpose::ProcessRun);
@@ -241,89 +197,13 @@ pub(crate) fn classify_root_summary(
     Ok(DocumentPurpose::Dataset)
 }
 
-/// Classifies the validated create payload before projection. Imported crates
-/// may still name their root as `./`, so fall back to the descriptor's `about`
-/// target when the final graph IRI is not present yet.
-pub(crate) fn rocrate_is_profile(jsonld: &str, graph_iri: &str) -> Result<bool, String> {
-    let document: Value = serde_json::from_str(jsonld).map_err(|error| error.to_string())?;
-    let graph = document
-        .get("@graph")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "RO-Crate has no @graph".to_string())?;
-    let descriptor_root = graph
-        .iter()
-        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some("ro-crate-metadata.json"))
-        .and_then(|descriptor| {
-            [
-                "about",
-                "http://schema.org/about",
-                "https://schema.org/about",
-            ]
-            .into_iter()
-            .find_map(|key| descriptor.get(key))
-        })
-        .and_then(|about| about.get("@id"))
-        .and_then(Value::as_str);
-    let root = graph
-        .iter()
-        .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(graph_iri))
-        .or_else(|| {
-            descriptor_root.and_then(|root_id| {
-                graph
-                    .iter()
-                    .find(|entity| entity.get("@id").and_then(Value::as_str) == Some(root_id))
-            })
-        })
-        .ok_or_else(|| "RO-Crate has no root entity".to_string())?;
-    Ok(jsonld_contains_iri(root.get("@type"), PROFILE_TYPE_IRI))
-}
-
-fn collect_conforms_terms(value: Option<&Value>, terms: &mut HashSet<String>) {
-    match value {
-        Some(Value::Array(values)) => {
-            for value in values {
-                collect_conforms_terms(Some(value), terms);
-            }
-        }
-        Some(Value::Object(entries)) => {
-            for (term, definition) in entries {
-                let iri = match definition {
-                    Value::String(iri) => Some(iri.as_str()),
-                    Value::Object(definition) => definition.get("@id").and_then(Value::as_str),
-                    _ => None,
-                };
-                if iri == Some(DCTERMS_CONFORMS_IRI) {
-                    terms.insert(term.clone());
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-fn jsonld_contains_iri(value: Option<&Value>, expected: &str) -> bool {
-    match value {
-        Some(Value::String(value)) => value == expected,
-        Some(Value::Array(values)) => values
-            .iter()
-            .any(|value| jsonld_contains_iri(Some(value), expected)),
-        Some(Value::Object(value)) => {
-            value
-                .get("@id")
-                .or_else(|| value.get("id"))
-                .and_then(Value::as_str)
-                == Some(expected)
-        }
-        _ => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use aruna_drivers::testing::write_entries;
     use std::sync::Arc;
 
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::Event;
+    use aruna_core::keyspaces::GROUP_KEYSPACE;
     use aruna_core::metadata::{
         ApplyRoCrateRequest, GraphLifecycleRecord, MetadataEffect, MetadataEvent,
         MetadataGraphPolicy, MetadataRequestDurability,
@@ -334,15 +214,57 @@ mod tests {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
     use aruna_core::types::GroupId;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
     use byteview::ByteView;
     use tempfile::{TempDir, tempdir};
     use ulid::Ulid;
 
     use super::*;
-    use crate::metadata::MetadataHandle;
+    use crate::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
 
     const REALM_SEED: [u8; 32] = [7u8; 32];
+
+    async fn count_group_purpose(
+        context: &DriverContext,
+        realm_id: RealmId,
+        group_id: GroupId,
+    ) -> Result<Option<GroupDocumentCounts>, MetadataApiError> {
+        drive(GroupPurposeOperation::new(realm_id, group_id), context).await
+    }
+
+    #[test]
+    fn missing_subsystem_empty() {
+        let mut count = GroupPurposeOperation::new(RealmId::from_bytes(REALM_SEED), Ulid::nil());
+        assert!(matches!(count.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let missing = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::HandleMissing,
+        })));
+        assert_eq!(count.next(missing), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn empty_group_zero() {
+        let mut count = GroupPurposeOperation::new(RealmId::from_bytes(REALM_SEED), Ulid::nil());
+        count.first().unwrap();
+        let cached = IoResult::Event(Box::new(Event::Metadata(MetadataEvent::CachedGroup {
+            records: None,
+        })));
+        assert!(matches!(
+            count.next(cached),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let none = IoResult::Child(ChildOutcome::new(Ok::<
+            Vec<MetadataRegistryRecord>,
+            MetadataApiError,
+        >(Vec::new())));
+        assert_eq!(
+            count.next(none),
+            Ok(Next::Done(Some(GroupDocumentCounts::default())))
+        );
+    }
 
     struct Fixture {
         _storage_dir: TempDir,
@@ -358,22 +280,23 @@ mod tests {
         let storage = FjallStorage::open(storage_dir.path().to_str().expect("utf-8 path"))
             .expect("storage opens");
         let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
-        let metadata_handle = MetadataHandle::new(
+        let graph_handle = aruna_graph::GraphHandle::open(
             metadata_dir.path(),
             node_id,
-            storage.clone(),
             None,
             None,
-            None,
+            aruna_graph::GraphOptions::default(),
         )
         .expect("metadata handle opens");
+        storage.install_metadata_indexes(metadata_dir.path());
         let context = Arc::new(DriverContext {
             storage_handle: storage.clone(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: Some(metadata_handle),
+            graph_handle: Some(graph_handle),
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         Fixture {
             _storage_dir: storage_dir,
@@ -424,19 +347,6 @@ mod tests {
         }
     }
 
-    async fn write_entries(storage: &StorageHandle, writes: Vec<(String, ByteView, ByteView)>) {
-        match storage
-            .send_storage_effect(StorageEffect::BatchWrite {
-                writes,
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
-            other => panic!("unexpected storage event: {other:?}"),
-        }
-    }
-
     async fn write_record(fixture: &Fixture, record: &MetadataRegistryRecord) {
         write_entries(
             &fixture.storage,
@@ -480,9 +390,9 @@ mod tests {
                 root
             ]
         });
-        let handle = fixture.context.metadata_handle.as_ref().unwrap();
-        match handle
-            .send_metadata_effect(MetadataEffect::ApplyRoCrate {
+        match aruna_drivers::testing::send_metadata_effect(
+            &fixture.context,
+            MetadataEffect::ApplyRoCrate {
                 request: ApplyRoCrateRequest {
                     graph_iri: record.graph_iri.clone(),
                     jsonld: jsonld.to_string(),
@@ -493,8 +403,9 @@ mod tests {
                     durability: MetadataRequestDurability::Durable,
                     deterministic_actor: None,
                 },
-            })
-            .await
+            },
+        )
+        .await
         {
             Event::Metadata(MetadataEvent::ApplyRoCrateResult { .. }) => {}
             other => panic!("unexpected metadata event: {other:?}"),
@@ -517,9 +428,12 @@ mod tests {
         }
 
         assert_eq!(
-            count_realm_documents(&fixture.context, fixture.realm_id)
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("count succeeds"),
             Some(3)
         );
     }
@@ -536,9 +450,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_documents(&fixture.context, fixture.realm_id)
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("count succeeds"),
             Some(1)
         );
     }
@@ -567,9 +484,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_documents(&fixture.context, fixture.realm_id)
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("count succeeds"),
             Some(1)
         );
     }
@@ -577,7 +497,7 @@ mod tests {
     #[tokio::test]
     async fn counts_realm_groups() {
         let fixture = setup_fixture();
-        let owner = aruna_core::UserId::nil(fixture.realm_id);
+        let owner = aruna_core::user::id::UserId::nil(fixture.realm_id);
         let actor = Actor {
             node_id: iroh::SecretKey::from_bytes(&[8u8; 32]).public(),
             user_id: owner,
@@ -596,7 +516,7 @@ mod tests {
             group_id: Ulid::generate(),
             realm_id: foreign_realm,
             roles: Default::default(),
-            owner: aruna_core::UserId::nil(foreign_realm),
+            owner: aruna_core::user::id::UserId::nil(foreign_realm),
         };
         write_entries(
             &fixture.storage,
@@ -616,9 +536,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            count_realm_groups(&fixture.context, fixture.realm_id)
-                .await
-                .expect("group count succeeds"),
+            drive(
+                RealmGroupsOperation::new(fixture.realm_id),
+                &fixture.context
+            )
+            .await
+            .expect("group count succeeds"),
             1
         );
     }
@@ -647,14 +570,14 @@ mod tests {
             &fixture,
             &profile,
             serde_json::json!(["Dataset", PROFILE_TYPE_IRI]),
-            Some(PROCESS_PROFILE),
+            Some(CRATE_PROFILE_IRI),
         )
         .await;
         write_rocrate(
             &fixture,
             &process_run,
             serde_json::json!("Dataset"),
-            Some(PROCESS_PROFILE),
+            Some(CRATE_PROFILE_IRI),
         )
         .await;
         write_rocrate(&fixture, &dataset, serde_json::json!("Dataset"), None).await;
@@ -680,15 +603,19 @@ mod tests {
                 .expect("storage opens"),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         assert_eq!(
-            count_realm_documents(&context, RealmId::from_bytes(REALM_SEED))
-                .await
-                .expect("count succeeds"),
+            drive(
+                RealmDocumentsOperation::new(RealmId::from_bytes(REALM_SEED)),
+                &context
+            )
+            .await
+            .expect("count succeeds"),
             None
         );
         assert_eq!(

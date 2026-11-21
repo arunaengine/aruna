@@ -2,22 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-mod cost;
-mod digest;
-mod eligibility;
-mod inputs;
+pub mod cost;
+pub mod digest;
+pub mod eligibility;
+pub mod inputs;
 mod rank;
-mod scan;
+pub mod scan;
 
-pub use cost::{InputRoute, UNKNOWN_PERMILLE};
-pub use digest::{PLAN_DIGEST_DOMAIN, plan_digest};
-pub use eligibility::{PolicyVerdict, RejectionVerdict};
-pub use inputs::{
-    InputHolder, MAX_INPUT_HOLDERS, MAX_PLAN_ALTERNATIVES, MAX_PLAN_CANDIDATES,
-    MAX_PLAN_REJECTIONS, MAX_TARGET_SCAN, PlanError, PlanRequest, ResolvedInput, TargetCandidate,
-    TargetScore,
-};
-pub use scan::Planner;
+use cost::InputRoute;
+use eligibility::RejectionVerdict;
+use inputs::{MAX_TARGET_SCAN, PlanError, PlanRequest, TargetCandidate, TargetScore};
+use scan::Planner;
 
 use crate::compute::ExecutionTargetId;
 use crate::structs::placement::compute_config::RealmComputeConfig;
@@ -29,11 +24,11 @@ use ulid::Ulid;
 pub struct PlannedInput {
     pub destination_key: String,
     pub version_id: Ulid,
-    pub content: crate::structs::execution::job::InputContent,
+    pub content: crate::structs::execution::job::input::InputContent,
     pub bytes: u64,
     pub policies: Vec<crate::structs::placement::policy::PlacementPolicyRef>,
     /// `None` when the target already holds the exact compliant copy.
-    pub source_node_id: Option<crate::NodeId>,
+    pub source_node_id: Option<crate::id::NodeId>,
     pub transfer_ms: u64,
     pub known_link: bool,
 }
@@ -99,7 +94,8 @@ impl CandidateVerdict {
 /// One target of a planning round as an external report shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanCandidate {
-    pub node_id: crate::NodeId,
+    pub node_id: crate::id::NodeId,
+    pub backend: Option<String>,
     pub executor_kind: Option<String>,
     pub verdict: CandidateVerdict,
     /// Place among the alternatives, counted from one. Absent for the selected
@@ -115,6 +111,7 @@ impl ExecutionPlan {
     pub fn candidates(&self) -> Vec<PlanCandidate> {
         let selected = self.selected.iter().map(|selection| PlanCandidate {
             node_id: selection.target.node_id,
+            backend: Some(selection.target.backend.clone()),
             executor_kind: Some(selection.target.executor_kind.clone()),
             verdict: CandidateVerdict::Selected,
             rank: None,
@@ -126,6 +123,7 @@ impl ExecutionPlan {
             .enumerate()
             .map(|(index, ranked)| PlanCandidate {
                 node_id: ranked.target.node_id,
+                backend: Some(ranked.target.backend.clone()),
                 executor_kind: Some(ranked.target.executor_kind.clone()),
                 verdict: CandidateVerdict::Ranked,
                 rank: Some(index as u32 + 1),
@@ -133,6 +131,7 @@ impl ExecutionPlan {
             });
         let rejected = self.rejected.iter().map(|rejected| PlanCandidate {
             node_id: rejected.target.node_id,
+            backend: Some(rejected.target.backend.clone()),
             executor_kind: Some(rejected.target.executor_kind.clone()),
             verdict: CandidateVerdict::Rejected,
             rank: None,

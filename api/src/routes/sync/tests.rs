@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::tests::routes::{
-    seed_group_docs, seed_realm_auth, seed_realm_config, test_context, test_state as build_state,
-    test_storage, write_doc,
+    seed_group_docs, seed_realm_auth, seed_realm_config, test_state as build_state, test_storage,
+    write_doc,
 };
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -18,13 +18,17 @@ use aruna_core::keyspaces::{
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::GroupAuthorizationDocument;
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, VersionKey};
 use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketKeyRecord, BucketKeyRef, KeyState,
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_operations::sync::mirror_repair::{SyncMirrorRecord, process_mirror_repairs};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
+use aruna_core::user::id::UserId;
+use aruna_drivers::testing::test_context;
+use aruna_operations::replication::mirror_repair::drain::DrainRepairsOperation;
 use tempfile::TempDir;
 
 fn test_node(seed: u8) -> NodeId {
@@ -184,13 +188,14 @@ async fn decrypting_source(state: &ServerState, user: UserId) {
 #[tokio::test]
 async fn decrypting_copy_consent() {
     use crate::routes::storage::blobs::{ReplicateBlobRequest, replicate_blob};
-    use aruna_operations::jobs::store::iter_prefix_page;
-    use aruna_operations::replication::plaintext::{job_consent, read_consent};
+    use aruna_drivers::driver::drive;
+    use aruna_operations::replication::plaintext::{ConsentReadOperation, job_consent};
+    use aruna_storage::scan::iter_prefix_page;
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;
     let (status, _) = replicate_blob(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Json(ReplicateBlobRequest {
             bucket: "source".to_string(),
             path: Some("old".to_string()),
@@ -214,23 +219,27 @@ async fn decrypting_copy_consent() {
     .unwrap();
     assert_eq!(jobs.len(), 1);
     assert_eq!(
-        read_consent(&state.get_ctx(), job_consent(&jobs[0].0))
-            .await
-            .unwrap(),
+        drive(
+            ConsentReadOperation::new(job_consent(&jobs[0].0)),
+            &state.get_ctx()
+        )
+        .await
+        .unwrap(),
         Some(auth.user_id)
     );
 }
 
 #[tokio::test]
 async fn decrypting_sync_consent() {
-    use aruna_operations::replication::plaintext::read_consent;
+    use aruna_drivers::driver::drive;
+    use aruna_operations::replication::plaintext::ConsentReadOperation;
     let (_dir, state, auth, _) = test_state().await;
     decrypting_source(&state, auth.user_id).await;
     let mut request = create_request(state.get_node_id());
     request.plaintext = true;
     let (status, Json(response)) = create_sync(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Json(request),
     )
@@ -240,9 +249,12 @@ async fn decrypting_sync_consent() {
     assert!(response.plaintext);
     let id = Ulid::from_string(&response.id).unwrap();
     assert_eq!(
-        read_consent(&state.get_ctx(), relationship_consent(id))
-            .await
-            .unwrap(),
+        drive(
+            ConsentReadOperation::new(relationship_consent(id)),
+            &state.get_ctx()
+        )
+        .await
+        .unwrap(),
         Some(auth.user_id)
     );
 }
@@ -311,7 +323,7 @@ async fn lists_stored_relationship() {
 
     let Json(response) = list_sync(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Query(SyncListParams::default()),
     )
     .await
@@ -359,7 +371,7 @@ async fn refuses_foreign_pause() {
 
     let error = update_sync(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Path(relationship.id.to_string()),
         Json(UpdateSyncRequest {
@@ -399,7 +411,7 @@ async fn patch(
 ) -> ServerResult<Json<SyncRelationshipResponse>> {
     update_sync(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Path(relationship.id.to_string()),
         Json(request),
@@ -462,7 +474,7 @@ async fn rejects_invalid_id() {
     let (_storage_dir, state, auth, _) = test_state().await;
     let error = get_sync(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Path("invalid".to_string()),
     )
     .await
@@ -480,16 +492,11 @@ async fn rejects_restricted_run() {
         }]),
         Some(Vec::new()),
     ] {
-        let (_storage_dir, state, mut auth, relationship) = test_state().await;
+        let (_storage_dir, state, mut auth, _) = test_state().await;
         auth.path_restrictions = restrictions;
-        let error = run_sync(
-            State(state),
-            Extension(Some(auth)),
-            Path(relationship.id.to_string()),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
+        // `run_sync` and `create_sync` take `UnrestrictedAuth`, so the refusal is its check.
+        let error = crate::auth::require_unrestricted_auth(&state, Some(auth));
+        assert!(matches!(error, Err(ServerError::Forbidden)));
     }
 }
 
@@ -505,70 +512,11 @@ async fn rejects_restricted_control() {
         let (_storage_dir, state, mut auth, _) = test_state().await;
         auth.path_restrictions = restrictions;
 
+        // The sync control routes take `UnrestrictedAuth`, so the refusal is its check.
         assert!(matches!(
-            list_sync(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Query(SyncListParams::default()),
-            )
-            .await,
+            crate::auth::require_unrestricted_auth(&state, Some(auth)),
             Err(ServerError::Forbidden)
         ));
-        assert!(matches!(
-            get_sync(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Path("invalid".to_string()),
-            )
-            .await,
-            Err(ServerError::Forbidden)
-        ));
-        assert!(matches!(
-            update_sync(
-                State(state.clone()),
-                Extension(Some(auth.clone())),
-                Extension(None),
-                Path("invalid".to_string()),
-                Json(UpdateSyncRequest {
-                    reference_handling: Some(ApiReferenceHandling::Materialize),
-                    state: None,
-                }),
-            )
-            .await,
-            Err(ServerError::Forbidden)
-        ));
-        assert!(matches!(
-            delete_sync(
-                State(state),
-                Extension(Some(auth)),
-                Path("invalid".to_string()),
-            )
-            .await,
-            Err(ServerError::Forbidden)
-        ));
-    }
-}
-
-#[tokio::test]
-async fn rejects_restricted_create() {
-    for restrictions in [
-        Some(vec![PathRestriction {
-            pattern: "/restricted/**".to_string(),
-            permission: Permission::READ,
-        }]),
-        Some(Vec::new()),
-    ] {
-        let (_storage_dir, state, mut auth, _) = test_state().await;
-        auth.path_restrictions = restrictions;
-        let error = create_sync(
-            State(state.clone()),
-            Extension(Some(auth)),
-            Extension(None),
-            Json(create_request(test_node(3))),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ServerError::Forbidden));
     }
 }
 
@@ -577,7 +525,7 @@ async fn accepts_unrestricted_create() {
     let (_storage_dir, state, auth, _) = test_state().await;
     let (status, _) = create_sync(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Json(create_request(test_node(3))),
     )
@@ -619,7 +567,7 @@ async fn mirror_denies_create() {
 
     let error = create_sync(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Json(create_request(test_node(3))),
     )
@@ -643,7 +591,7 @@ async fn delete_preserve_detaches() {
     assert_eq!(
         delete_sync(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Path(relationship.id.to_string()),
         )
         .await
@@ -664,7 +612,7 @@ async fn delete_preserve_detaches() {
     assert!(matches!(
         get_sync(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            UnrestrictedAuth(auth.clone()),
             Path(relationship.id.to_string()),
         )
         .await,
@@ -672,7 +620,7 @@ async fn delete_preserve_detaches() {
     ));
     let Json(listed) = list_sync(
         State(state),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Query(SyncListParams::default()),
     )
     .await
@@ -693,7 +641,7 @@ async fn delete_stages_repair() {
     assert_eq!(
         delete_sync(
             State(state.clone()),
-            Extension(Some(auth)),
+            UnrestrictedAuth(auth),
             Path(relationship.id.to_string()),
         )
         .await
@@ -760,7 +708,7 @@ async fn delete_respects_policy() {
 
     let error = delete_sync(
         State(state.clone()),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Path(relationship.id.to_string()),
     )
     .await
@@ -824,7 +772,7 @@ async fn claimed_create(state: &ServerState) -> SyncRelationship {
         postcard::to_allocvec(&record).unwrap().into(),
     )
     .await;
-    process_mirror_repairs(&context, state.get_node_id())
+    drive(DrainRepairsOperation::new(state.get_node_id()), &context)
         .await
         .unwrap();
     assert!(
@@ -877,7 +825,7 @@ async fn retry_create(state: Arc<ServerState>, auth: AuthContext) {
     request.mode = ApiSyncMode::Reference;
     let (status, _) = create_sync(
         State(state.clone()),
-        Extension(Some(auth)),
+        UnrestrictedAuth(auth),
         Extension(Some(ValidatedBearer::new_for_test("sync-test-token"))),
         Json(request),
     )
@@ -892,9 +840,12 @@ async fn rollback_before_cleanup() {
     // Repair finished the rollback before the route saw its refused activation.
     let (_storage_dir, state, auth, _) = test_state().await;
     let relationship = claimed_create(&state).await;
-    process_mirror_repairs(&state.get_ctx(), state.get_node_id())
-        .await
-        .unwrap();
+    drive(
+        DrainRepairsOperation::new(state.get_node_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .unwrap();
     assert!(repair_record(&state, &relationship).await.is_none());
 
     let error = activate_sync(&state, &relationship).await.unwrap_err();
@@ -921,9 +872,12 @@ async fn claim_during_cleanup() {
             .await
             .is_some_and(|record| record.rollback)
     );
-    process_mirror_repairs(&state.get_ctx(), state.get_node_id())
-        .await
-        .unwrap();
+    drive(
+        DrainRepairsOperation::new(state.get_node_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .unwrap();
     assert!(repair_record(&state, &relationship).await.is_none());
     assert_eq!(row_count(&state, RELATIONSHIP_OUT_KEYSPACE).await, 0);
     assert_eq!(row_count(&state, RELATIONSHIP_IN_KEYSPACE).await, 0);

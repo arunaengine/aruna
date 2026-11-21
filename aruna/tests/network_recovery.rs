@@ -4,16 +4,17 @@
 
 use crate::shared;
 
+use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
+use aruna_clock::testing::poll_until;
 use aruna_core::alpn::Alpn;
 use aruna_core::effects::{DhtEffect, Effect, NetEffect};
 use aruna_core::events::{DhtEvent, Event, NetEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keys::realm_presence_key;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::metadata::MetadataHandle;
-use aruna_operations::sync::incoming::initialize_incoming_fixture;
+use aruna_drivers::driver::DriverContext;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_tasks::TaskHandle;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -59,7 +60,10 @@ async fn metadata_query(base_url: &str, token: &str) -> TestResult<Value> {
     Ok(response.json().await?)
 }
 
-fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net::PoolCounts {
+fn metadata_counts(
+    seed: &shared::SeedNode,
+    peer: iroh::PublicKey,
+) -> aruna_net::connection_pool::PoolCounts {
     seed.net.pool_counts_for(peer, Alpn::Metadata)
 }
 
@@ -68,8 +72,8 @@ fn metadata_counts(seed: &shared::SeedNode, peer: iroh::PublicKey) -> aruna_net:
 async fn pool_settled(
     seed: &shared::SeedNode,
     peer: iroh::PublicKey,
-    before: &aruna_net::PoolCounts,
-) -> TestResult<aruna_net::PoolCounts> {
+    before: &aruna_net::connection_pool::PoolCounts,
+) -> TestResult<aruna_net::connection_pool::PoolCounts> {
     // Hang guard only; the pool answers within its connect timeout.
     handled(seed, peer, before, Duration::from_secs(60))
         .await?
@@ -79,20 +83,16 @@ async fn pool_settled(
 async fn handled(
     seed: &shared::SeedNode,
     peer: iroh::PublicKey,
-    before: &aruna_net::PoolCounts,
+    before: &aruna_net::connection_pool::PoolCounts,
     wait: Duration,
-) -> TestResult<Option<aruna_net::PoolCounts>> {
-    let cap = tokio::time::Instant::now() + wait;
-    loop {
+) -> TestResult<Option<aruna_net::connection_pool::PoolCounts>> {
+    let found = poll_until(wait, async || {
         let counts = metadata_counts(seed, peer);
-        if counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits {
-            return Ok(Some(counts));
-        }
-        if tokio::time::Instant::now() >= cap {
-            return Ok(None);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        let moved = counts.dials > before.dials || counts.cooldown_hits > before.cooldown_hits;
+        moved.then_some(counts)
+    })
+    .await;
+    Ok(found)
 }
 
 /// Queries the stopped peer until the pool handles a query. A query can fail on the
@@ -102,8 +102,8 @@ async fn outage_query(
     seed: &shared::SeedNode,
     peer: iroh::PublicKey,
     token: &str,
-    before: &aruna_net::PoolCounts,
-) -> TestResult<(Value, aruna_net::PoolCounts)> {
+    before: &aruna_net::connection_pool::PoolCounts,
+) -> TestResult<(Value, aruna_net::connection_pool::PoolCounts)> {
     for _ in 0..6 {
         let query = metadata_query(&seed.base_url, token).await?;
         if let Some(counts) = handled(seed, peer, before, Duration::from_secs(10)).await? {
@@ -135,13 +135,12 @@ async fn rejoin_peer(
         fjall_persist_policy: joiner.config.fjall_persist_policy,
     };
     let peer = NetHandle::new(config, context_storage.clone()).await?;
-    let metadata = match MetadataHandle::new(
+    let graph = match aruna_graph::GraphHandle::open(
         directory.path().join("metadata"),
         peer.node_id(),
-        context_storage.clone(),
-        Some(peer.clone()),
         Some(peer.document_sync_node()),
         Some(peer.document_sync_database()),
+        aruna_graph::GraphOptions::default(),
     ) {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -149,21 +148,24 @@ async fn rejoin_peer(
             return Err(error.into());
         }
     };
+    context_storage.install_metadata_indexes(directory.path().join("metadata"));
     let context = Arc::new(DriverContext {
         storage_handle: context_storage,
         net_handle: Some(peer.clone()),
         blob_handle: None,
-        metadata_handle: Some(metadata),
+        graph_handle: Some(graph),
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
-    initialize_incoming_fixture(context.clone());
+    let incoming = initialize_incoming_fixture(context.clone());
     peer.add_peer_addr(seed.net.endpoint_addr()).await;
     seed.net.add_peer_addr(peer.endpoint_addr()).await;
     Ok(RejoinedPeer {
         net: peer,
         _directory: directory,
         _context: context,
+        _incoming: incoming,
     })
 }
 
@@ -171,6 +173,8 @@ struct RejoinedPeer {
     net: NetHandle,
     _directory: tempfile::TempDir,
     _context: Arc<DriverContext>,
+    /// Keeps the test inbound handler installed while the node lives.
+    _incoming: Option<IncomingFixture>,
 }
 
 async fn announce_peer(peer: &NetHandle, realm_id: RealmId) -> TestResult<()> {
@@ -249,20 +253,15 @@ async fn check_recovery(
     let before = metadata_counts(seed, joiner.config.node_id);
     let result = async {
         announce_peer(&peer.net, seed.realm_id).await?;
-        wait_until(
-            "metadata fan-out recovery",
-            shared::WAIT_CAP,
-            Duration::from_millis(100),
-            || {
-                let seed_url = seed.base_url.clone();
-                let token = token.to_string();
-                async move {
-                    metadata_query(&seed_url, &token).await.is_ok_and(|result| {
-                        result["complete"] == true && result["nodes_failed"] == 0
-                    })
-                }
-            },
-        )
+        wait_until("metadata fan-out recovery", shared::WAIT_CAP, || {
+            let seed_url = seed.base_url.clone();
+            let token = token.to_string();
+            async move {
+                metadata_query(&seed_url, &token)
+                    .await
+                    .is_ok_and(|result| result["complete"] == true && result["nodes_failed"] == 0)
+            }
+        })
         .await?;
         let info = realm_info(&seed.base_url, token).await?;
         assert!(

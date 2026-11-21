@@ -5,47 +5,48 @@
 // Rows are keyed object first, so a backlink lookup is a seek, and each document keeps its
 // own rows, so a materialization replaces exactly its own postings.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
-    DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, METADATA_INDEX_KEYSPACE, prefix_upper_bound,
+    DOCUMENT_IRI_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_STATUS_KEYSPACE,
+    METADATA_INDEX_KEYSPACE, prefix_upper_bound,
 };
 use aruna_core::metadata::{
-    IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataError,
+    IriIndexRecord, MaterializationState, MaterializationStatusRecord, MetadataEffect,
+    MetadataError, MetadataEvent,
 };
-use aruna_core::storage_entries::{iri_object_prefix, iri_reference_entry, iri_reference_prefix};
-use aruna_core::structs::storage::data::link::document_key;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::storage_entries::{
+    iri_object_prefix, iri_reference_entry, iri_reference_prefix, materialization_status_key,
+};
+use aruna_core::structs::storage::data::link::{DataLink, LinkPosting, document_key};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_storage::StorageHandle;
+use aruna_core::types::Key;
 use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
+use crate::metadata::api::access::{child_results, children};
+use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::live_records::{LiveRecordsError, LiveRecordsOperation};
+use crate::metadata::record_reads::DocumentRecordOperation;
 
-use super::data_links::{DataLinkError, LinkBudget, LinkRows, document_rows, iter_page};
-use super::queue_storage::{
-    MetadataQueueError, abort_storage_transaction, commit_storage_transaction,
-    start_write_transaction,
+use super::data_links::{
+    AssociateVersionsOperation, DataLinkError, DocumentRowsOperation, LinkBudget, LinkRows,
+    LinkRowsOperation,
 };
-use super::repository::{
-    StorageReadError, parse_registry_iter, parse_registry_read, parse_status_read,
-    read_status_effect,
-};
+use aruna_core::errors::StorageReadError;
 
 const INDEX_PAGE_SIZE: usize = 128;
-const INDEX_BATCH_SIZE: usize = 128;
-
-pub(crate) const DCTERMS_CONFORMS_IRI: &str = "http://purl.org/dc/terms/conformsTo";
 
 /// Keeps the storage cause intact so callers can tell an overloaded backend
 /// apart from a genuine index or document problem.
-#[derive(Debug, Error)]
-pub(crate) enum MetadataIriError {
+#[derive(Debug, Error, PartialEq)]
+pub enum MetadataIriError {
     #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
@@ -54,8 +55,15 @@ pub(crate) enum MetadataIriError {
     DataLink(#[from] DataLinkError),
     #[error("unexpected metadata IRI reference index event: {0}")]
     UnexpectedEvent(String),
-    #[error("metadata IRI backlink lookup exceeded its budget")]
-    BudgetExhausted,
+}
+
+impl From<IoError> for MetadataIriError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            error => Self::UnexpectedEvent(error.to_string()),
+        }
+    }
 }
 
 impl From<MetadataIriError> for MetadataError {
@@ -91,159 +99,187 @@ pub(crate) fn project_iri_references(
         .collect()
 }
 
-/// Replaces the document's IRI postings: writes the projection and deletes every older row
-/// of the document that the projection does not write again.
-pub(crate) async fn plan_iri_rows(
-    storage: &StorageHandle,
-    document_id: Ulid,
-    records: &[IriIndexRecord],
-) -> Result<LinkRows, MetadataIriError> {
-    let mut rows = LinkRows::default();
-    let mut written = HashSet::new();
-    for record in records {
-        let (key_space, key, value) = iri_reference_entry(record)?;
-        rows.writes.push((
-            DOCUMENT_IRI_KEYSPACE.to_string(),
-            document_key(document_id, &key).into(),
-            ByteView::from(Vec::new()),
-        ));
-        written.insert(key.to_vec());
-        rows.writes.push((key_space, key, value));
-    }
-    for key in document_rows(storage, DOCUMENT_IRI_KEYSPACE, document_id).await? {
-        if !written.contains(&key) {
-            let document_row = document_key(document_id, &key).into();
-            rows.deletes
-                .push((IRI_INDEX_KEYSPACE.to_string(), key.into()));
-            rows.deletes
-                .push((DOCUMENT_IRI_KEYSPACE.to_string(), document_row));
-        }
-    }
-    Ok(rows)
-}
-
 /// One page of the postings that name an object: every row of at most `limit` documents
 /// after the requested one, by document id. `next` is the last document when more may follow.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq)]
 pub(crate) struct BacklinkPage {
     pub documents: BTreeMap<Ulid, Vec<IriIndexRecord>>,
     pub next: Option<Ulid>,
 }
 
-/// Reads one page of the postings that name `object_iri`. Without a predicate, each
-/// predicate group under the object is found by one seek and read from `after` on.
-pub(crate) async fn read_backlinks(
-    storage: &StorageHandle,
-    object_iri: &str,
-    predicate_iri: Option<&str>,
-    after: Option<Ulid>,
-    limit: usize,
-    budget: &mut LinkBudget,
-) -> Result<BacklinkPage, MetadataIriError> {
-    let limit = limit.max(1);
-    let mut documents = BTreeMap::<Ulid, Vec<IriIndexRecord>>::new();
-    let mut truncated = false;
-    let group = GroupRead {
-        object_iri,
-        predicate_iri,
-        after,
-        limit,
-    };
-    match predicate_iri {
-        Some(predicate) => {
-            let prefix = iri_reference_prefix(predicate, object_iri);
-            truncated = group.read(storage, prefix, budget, &mut documents).await?;
-        }
-        None => {
-            let object = iri_object_prefix(object_iri);
-            let mut start = IterStart::At(object.clone());
-            loop {
-                if !budget.take_seek() {
-                    return Err(MetadataIriError::BudgetExhausted);
-                }
-                let (values, _) = iter_page(
-                    storage,
-                    IRI_INDEX_KEYSPACE,
-                    Some(object.clone()),
-                    Some(start),
-                    1,
-                )
-                .await?;
-                let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
-                    break;
-                };
-                let next = prefix_upper_bound(prefix);
-                let prefix = ByteView::from(prefix.to_vec());
-                truncated |= group.read(storage, prefix, budget, &mut documents).await?;
-                let Some(next) = next else {
-                    break;
-                };
-                start = IterStart::At(ByteView::from(next));
-            }
+/// Why a backlink page could not be read.
+#[derive(Debug, Error, PartialEq)]
+pub(crate) enum BacklinkError {
+    #[error("metadata IRI backlink lookup exceeded its budget")]
+    BudgetExhausted,
+    /// A stored row does not decode: callers charge it to the document.
+    #[error("metadata IRI backlink row is malformed: {0}")]
+    Malformed(String),
+    #[error("metadata IRI backlink read failed: {0}")]
+    Unavailable(String),
+}
+
+impl From<aruna_core::calls::IoError> for BacklinkError {
+    fn from(error: aruna_core::calls::IoError) -> Self {
+        match error {
+            aruna_core::calls::IoError::Codec(error) => Self::Malformed(error),
+            other => Self::Unavailable(other.to_string()),
         }
     }
-    let more = truncated || documents.len() > limit;
-    let documents: BTreeMap<_, _> = documents.into_iter().take(limit).collect();
-    let next = if more {
-        documents.keys().next_back().copied()
-    } else {
-        None
-    };
-    Ok(BacklinkPage { documents, next })
 }
 
-/// One object and predicate group of a backlink page.
-struct GroupRead<'a> {
-    object_iri: &'a str,
-    predicate_iri: Option<&'a str>,
+#[derive(Debug, PartialEq)]
+enum BacklinkStage {
+    /// The seek for the next predicate group under the object.
+    Group,
+    /// The rows of the group with this prefix.
+    Rows(Vec<u8>),
+}
+
+/// Reads one page of the postings that name `object_iri`, within `budget`, which comes back
+/// with what is left. Without a predicate, each predicate group under the object is found by
+/// one seek and read from `after` on. Hash collisions are dropped by comparing stored IRIs.
+#[derive(Debug, PartialEq)]
+pub(crate) struct BacklinksOperation {
+    object_iri: String,
+    predicate_iri: Option<String>,
     after: Option<Ulid>,
     limit: usize,
+    budget: LinkBudget,
+    start: Option<Vec<u8>>,
+    documents: BTreeMap<Ulid, Vec<IriIndexRecord>>,
+    truncated: bool,
+    stage: BacklinkStage,
 }
 
-impl GroupRead<'_> {
-    /// Reads up to `limit + 1` rows of the group after the page start; `true` when more
-    /// rows may follow. Hash collisions are dropped by comparing the stored IRIs.
-    async fn read(
-        &self,
-        storage: &StorageHandle,
-        prefix: ByteView,
-        budget: &mut LinkBudget,
-        documents: &mut BTreeMap<Ulid, Vec<IriIndexRecord>>,
-    ) -> Result<bool, MetadataIriError> {
-        if !budget.take_seek() {
-            return Err(MetadataIriError::BudgetExhausted);
+type BacklinkTurn = Result<Next<(BacklinkPage, LinkBudget)>, BacklinkError>;
+
+fn index_iter(prefix: Vec<u8>, start: IterStart, limit: usize) -> IoCall {
+    IoCall::Effect(Box::new(Effect::Storage(StorageEffect::Iter {
+        key_space: IRI_INDEX_KEYSPACE.to_string(),
+        prefix: Some(ByteView::from(prefix)),
+        start: Some(start),
+        limit,
+        txn_id: None,
+    })))
+}
+
+impl BacklinksOperation {
+    pub(crate) fn new(
+        (object_iri, predicate_iri): (&str, Option<&str>),
+        (after, limit): (Option<Ulid>, usize),
+        budget: LinkBudget,
+    ) -> Self {
+        Self {
+            object_iri: object_iri.to_string(),
+            predicate_iri: predicate_iri.map(str::to_string),
+            after,
+            limit: limit.max(1),
+            budget,
+            start: Some(iri_object_prefix(object_iri).to_vec()),
+            documents: BTreeMap::new(),
+            truncated: false,
+            stage: BacklinkStage::Group,
         }
-        let start = self
-            .after
-            .map(|document_id| IterStart::After(ByteView::from(group_key(&prefix, document_id))));
-        let (values, next) = iter_page(
-            storage,
-            IRI_INDEX_KEYSPACE,
-            Some(prefix),
-            start,
-            self.limit.saturating_add(1),
-        )
-        .await?;
-        budget.rows = budget
-            .rows
-            .checked_sub(values.len())
-            .ok_or(MetadataIriError::BudgetExhausted)?;
+    }
+
+    /// Reads up to `limit + 1` rows of one predicate group after the page start.
+    fn read_group(&mut self, prefix: Vec<u8>) -> BacklinkTurn {
+        if !self.budget.take_seek() {
+            return Err(BacklinkError::BudgetExhausted);
+        }
+        let start = match self.after {
+            Some(document_id) => IterStart::After(ByteView::from(group_key(&prefix, document_id))),
+            None => IterStart::At(ByteView::from(prefix.clone())),
+        };
+        let call = index_iter(prefix.clone(), start, self.limit.saturating_add(1));
+        self.stage = BacklinkStage::Rows(prefix);
+        Ok(Next::Call(call))
+    }
+
+    /// Seeks the next predicate group under the object, or ends the page.
+    fn seek_group(&mut self) -> BacklinkTurn {
+        let Some(start) = self.start.take() else {
+            return Ok(Next::Done(self.page()));
+        };
+        if !self.budget.take_seek() {
+            return Err(BacklinkError::BudgetExhausted);
+        }
+        let object = iri_object_prefix(&self.object_iri).to_vec();
+        self.stage = BacklinkStage::Group;
+        Ok(Next::Call(index_iter(
+            object,
+            IterStart::At(ByteView::from(start)),
+            1,
+        )))
+    }
+
+    fn rows(&mut self, result: IoResult) -> BacklinkTurn {
+        let (values, next) = result.page()?;
+        self.budget.rows =
+            (self.budget.rows.checked_sub(values.len())).ok_or(BacklinkError::BudgetExhausted)?;
         for (_, value) in values {
-            let record =
-                postcard::from_bytes::<IriIndexRecord>(&value).map_err(ConversionError::from)?;
+            let record = postcard::from_bytes::<IriIndexRecord>(&value)
+                .map_err(|error| BacklinkError::Malformed(error.to_string()))?;
             if record.object_iri != self.object_iri
-                || self
-                    .predicate_iri
+                || (self.predicate_iri.as_deref())
                     .is_some_and(|predicate| record.predicate_iri != predicate)
             {
                 continue;
             }
-            documents
+            self.documents
                 .entry(record.document_id)
                 .or_default()
                 .push(record);
         }
-        Ok(next.is_some())
+        self.truncated |= next.is_some();
+        if self.predicate_iri.is_some() {
+            return Ok(Next::Done(self.page()));
+        }
+        self.seek_group()
+    }
+
+    fn group_found(&mut self, result: IoResult) -> BacklinkTurn {
+        let (values, _) = result.page()?;
+        let Some(prefix) = values.first().and_then(|(key, _)| key.get(..64)) else {
+            return Ok(Next::Done(self.page()));
+        };
+        let prefix = prefix.to_vec();
+        self.start = prefix_upper_bound(&prefix);
+        self.read_group(prefix)
+    }
+
+    fn page(&mut self) -> (BacklinkPage, LinkBudget) {
+        let documents = std::mem::take(&mut self.documents);
+        let more = self.truncated || documents.len() > self.limit;
+        let documents: BTreeMap<_, _> = documents.into_iter().take(self.limit).collect();
+        let next = more
+            .then(|| documents.keys().next_back().copied())
+            .flatten();
+        (BacklinkPage { documents, next }, self.budget)
+    }
+}
+
+impl Operation for BacklinksOperation {
+    type Output = (BacklinkPage, LinkBudget);
+    type Error = BacklinkError;
+
+    fn first(&mut self) -> BacklinkTurn {
+        match self.predicate_iri.as_deref() {
+            Some(predicate) => {
+                let prefix = iri_reference_prefix(predicate, &self.object_iri).to_vec();
+                self.start = None;
+                self.read_group(prefix)
+            }
+            None => self.seek_group(),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> BacklinkTurn {
+        match std::mem::replace(&mut self.stage, BacklinkStage::Group) {
+            BacklinkStage::Group => self.group_found(result),
+            BacklinkStage::Rows(_) => self.rows(result),
+        }
     }
 }
 
@@ -251,71 +287,6 @@ fn group_key(prefix: &[u8], document_id: Ulid) -> Vec<u8> {
     let mut key = prefix.to_vec();
     key.extend_from_slice(&document_id.to_bytes());
     key
-}
-
-/// The live documents whose current postings name `object_iri` through `predicate_iri`, with
-/// their subjects: backlink pages by document id and one point read per document, at most
-/// `limit` documents and a bounded number of index rows. Never a walk over the registry.
-pub(crate) async fn lookup_iri_references(
-    storage: &StorageHandle,
-    predicate_iri: &str,
-    object_iri: &str,
-    limit: usize,
-) -> Result<(Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>), MetadataError> {
-    let mut budget = LinkBudget {
-        seeks: limit.max(INDEX_PAGE_SIZE),
-        rows: limit.saturating_mul(2).max(INDEX_PAGE_SIZE * 2),
-    };
-    let mut found = Vec::new();
-    let mut matches = BTreeMap::new();
-    let mut after = None;
-    while found.len() < limit {
-        let page = read_backlinks(
-            storage,
-            object_iri,
-            Some(predicate_iri),
-            after,
-            INDEX_PAGE_SIZE,
-            &mut budget,
-        )
-        .await;
-        let page = match page {
-            Ok(page) => page,
-            // The budget bounds the lookup; the documents found so far are the answer.
-            Err(MetadataIriError::BudgetExhausted) => break,
-            Err(error) => return Err(error.into()),
-        };
-        let mut records = Vec::with_capacity(page.documents.len());
-        for document_id in page.documents.keys() {
-            let read = storage
-                .send_effect(super::repository::read_document_registry(
-                    *document_id,
-                    None,
-                ))
-                .await;
-            if let Some(record) = parse_registry_read(read).map_err(status_error)? {
-                records.push(record);
-            }
-        }
-        let live = super::api::filter_live_records(storage, &records)
-            .await
-            .map_err(|error| MetadataError::Backend(error.to_string()))?;
-        let postings = page.documents.into_values().flatten().collect();
-        let page_matches = collect_iri_matches(postings, &live, predicate_iri, object_iri);
-        for record in live {
-            if found.len() < limit
-                && let Some(subjects) = page_matches.get(&record.document_id)
-            {
-                matches.insert(record.document_id, subjects.clone());
-                found.push(record);
-            }
-        }
-        match page.next {
-            Some(next) => after = Some(next),
-            None => break,
-        }
-    }
-    Ok((found, matches))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,18 +303,31 @@ pub(crate) struct IriFreshness {
     pub oldest_status_updated: Option<u64>,
 }
 
-/// Materialization state of the given documents, one status read each; callers pass the
-/// documents a lookup returned, never the whole registry.
-pub(crate) async fn iri_index_freshness(
-    storage: &StorageHandle,
+/// The status rows of the given documents; callers pass the documents a lookup returned, never
+/// the whole registry.
+pub(crate) fn status_rows(registry_records: &[MetadataRegistryRecord]) -> Vec<(String, ByteView)> {
+    (registry_records.iter())
+        .map(|record| {
+            let key = materialization_status_key(record.document_id);
+            (MATERIALIZATION_STATUS_KEYSPACE.to_string(), key)
+        })
+        .collect()
+}
+
+/// Materialization state of the given documents from their [`status_rows`] values.
+pub(crate) fn iri_freshness(
     registry_records: &[MetadataRegistryRecord],
+    values: Vec<Option<ByteView>>,
 ) -> Result<IriFreshness, MetadataError> {
     let mut current = false;
     let mut pending = false;
     let mut failed = false;
     let mut oldest_status_updated = None;
-    for record in registry_records {
-        let status = read_materialization_status(storage, record.document_id).await?;
+    for (record, value) in registry_records.iter().zip(values) {
+        let status = value
+            .map(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes))
+            .transpose()
+            .map_err(|error| MetadataError::Backend(error.to_string()))?;
         if let Some(status) = status.as_ref() {
             oldest_status_updated = Some(
                 oldest_status_updated.map_or(status.updated_at_ms, |oldest: u64| {
@@ -379,189 +363,6 @@ fn status_current(status: &MaterializationStatusRecord, record: &MetadataRegistr
     status.event_id == record.last_event_id
         && status.graph_iri == record.graph_iri
         && status.state == MaterializationState::Materialized
-}
-
-/// Re-projects each live materialized document on its own and replaces its postings, walking
-/// the registry a page at a time so its size never bounds the rebuild.
-pub(crate) async fn rebuild_index(context: &DriverContext) -> Result<usize, MetadataError> {
-    let storage = &context.storage_handle;
-    let mut written = 0usize;
-    let mut start_after = None;
-    loop {
-        let page = storage
-            .send_effect(Effect::Storage(StorageEffect::Iter {
-                key_space: METADATA_INDEX_KEYSPACE.to_string(),
-                prefix: None,
-                start: start_after.take().map(IterStart::After),
-                limit: INDEX_PAGE_SIZE,
-                txn_id: None,
-            }))
-            .await;
-        let (records, next) = parse_registry_iter(page).map_err(status_error)?;
-        written = written.saturating_add(rebuild_page(context, &records).await?);
-        match next {
-            Some(next) => start_after = Some(next),
-            None => return Ok(written),
-        }
-    }
-}
-
-/// Rebuilds the postings of one registry page's live materialized documents.
-async fn rebuild_page(
-    context: &DriverContext,
-    records: &[MetadataRegistryRecord],
-) -> Result<usize, MetadataError> {
-    let metadata_handle = context
-        .metadata_handle
-        .as_ref()
-        .ok_or(MetadataError::HandleMissing)?;
-    let storage = &context.storage_handle;
-    let registry_records = super::api::filter_live_records(storage, records)
-        .await
-        .map_err(|error| MetadataError::Backend(error.to_string()))?;
-    let mut written = 0usize;
-
-    for record in registry_records.iter() {
-        let Some(status) = read_materialization_status(storage, record.document_id).await? else {
-            continue;
-        };
-        if !status_current(&status, record) {
-            continue;
-        }
-
-        let references = metadata_handle
-            .snapshot_iri_references(record.graph_iri.clone())
-            .await?;
-        let mut links =
-            super::data_links::project_links(&record.graph_iri, record.last_event_id, &references);
-        super::data_links::associate_versions(storage, &mut links).await?;
-        let mut rows =
-            super::data_links::plan_link_rows(storage, record.document_id, &links).await?;
-        let projected =
-            project_iri_references(record.document_id, record.last_event_id, references);
-        let iri_rows = plan_iri_rows(storage, record.document_id, &projected).await?;
-        rows.writes.extend(iri_rows.writes);
-        rows.deletes.extend(iri_rows.deletes);
-        if replace_rows(storage, record, rows).await? {
-            written = written.saturating_add(projected.len());
-        }
-    }
-    Ok(written)
-}
-
-/// Commits one document's rows only while its status still names the projected event, so a
-/// newer materialization is never overwritten; `false` when one got there first.
-async fn replace_rows(
-    storage: &StorageHandle,
-    record: &MetadataRegistryRecord,
-    rows: LinkRows,
-) -> Result<bool, MetadataError> {
-    let backend = |error: MetadataQueueError| MetadataError::Backend(error.to_string());
-    let txn_id = start_write_transaction(storage).await.map_err(backend)?;
-    let result = async {
-        let status = parse_status_read(
-            storage
-                .send_effect(read_status_effect(record.document_id, Some(txn_id)))
-                .await,
-        )
-        .map_err(status_error)?;
-        if !status.is_some_and(|status| status_current(&status, record)) {
-            return Ok(false);
-        }
-        if !rows.writes.is_empty() {
-            expect_batch(
-                storage
-                    .send_storage_effect(StorageEffect::BatchWrite {
-                        writes: rows.writes,
-                        txn_id: Some(txn_id),
-                    })
-                    .await,
-            )?;
-        }
-        if !rows.deletes.is_empty() {
-            expect_batch(
-                storage
-                    .send_storage_effect(StorageEffect::BatchDelete {
-                        deletes: rows.deletes,
-                        txn_id: Some(txn_id),
-                    })
-                    .await,
-            )?;
-        }
-        Ok::<_, MetadataIriError>(true)
-    }
-    .await;
-    match result {
-        Ok(true) => match commit_storage_transaction(storage, txn_id).await {
-            Ok(()) => Ok(true),
-            Err(MetadataQueueError::Storage(StorageError::TransactionConflict)) => Ok(false),
-            Err(error) => Err(backend(error)),
-        },
-        other => {
-            abort_storage_transaction(
-                storage,
-                txn_id,
-                "Failed to abort IRI index rebuild transaction",
-                "Unexpected IRI index rebuild transaction abort result",
-            )
-            .await;
-            Ok(other?)
-        }
-    }
-}
-
-fn expect_batch(event: Event) -> Result<(), MetadataIriError> {
-    match event {
-        Event::Storage(StorageEvent::BatchWriteResult { .. })
-        | Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-        other => Err(MetadataIriError::UnexpectedEvent(format!("{other:?}"))),
-    }
-}
-
-/// Postings and per-document rows of one document, from its own rows. Each posting comes
-/// before its per-document row, so an interrupted deletion never orphans a posting.
-async fn document_keys(
-    storage: &StorageHandle,
-    document_id: Ulid,
-) -> Result<Vec<(String, ByteView)>, MetadataIriError> {
-    let mut keys = Vec::new();
-    for key in document_rows(storage, DOCUMENT_IRI_KEYSPACE, document_id).await? {
-        let document_row = ByteView::from(document_key(document_id, &key));
-        keys.push((IRI_INDEX_KEYSPACE.to_string(), ByteView::from(key)));
-        keys.push((DOCUMENT_IRI_KEYSPACE.to_string(), document_row));
-    }
-    Ok(keys)
-}
-
-/// Keys for the given documents, read through each document's own rows, so a deletion
-/// prunes its postings without touching any other document.
-pub(crate) async fn document_iri_keys(
-    storage: &StorageHandle,
-    document_ids: &BTreeSet<Ulid>,
-) -> Result<Vec<(String, ByteView)>, MetadataError> {
-    let mut keys = Vec::new();
-    for document_id in document_ids {
-        keys.extend(document_keys(storage, *document_id).await?);
-    }
-    Ok(keys)
-}
-
-pub(crate) async fn delete_keys(
-    storage: &StorageHandle,
-    keys: Vec<(String, ByteView)>,
-) -> Result<(), MetadataError> {
-    for chunk in keys.chunks(INDEX_BATCH_SIZE) {
-        expect_batch(
-            storage
-                .send_storage_effect(StorageEffect::BatchDelete {
-                    deletes: chunk.to_vec(),
-                    txn_id: None,
-                })
-                .await,
-        )?;
-    }
-    Ok(())
 }
 
 fn collect_iri_matches(
@@ -600,26 +401,526 @@ fn status_error(error: StorageReadError) -> MetadataIriError {
     }
 }
 
-async fn read_materialization_status(
-    storage: &StorageHandle,
+/// Replaces the document's IRI postings: writes the projection and deletes every older row of
+/// the document that the projection does not write again.
+#[derive(Debug, PartialEq)]
+pub(crate) struct IriRowsOperation {
     document_id: Ulid,
-) -> Result<Option<MaterializationStatusRecord>, MetadataIriError> {
-    let event = storage
-        .send_effect(read_status_effect(document_id, None))
-        .await;
-    parse_status_read(event).map_err(status_error)
+    records: Vec<IriIndexRecord>,
+}
+
+impl IriRowsOperation {
+    pub(crate) fn new(document_id: Ulid, records: Vec<IriIndexRecord>) -> Self {
+        Self {
+            document_id,
+            records,
+        }
+    }
+}
+
+impl Operation for IriRowsOperation {
+    type Output = LinkRows;
+    type Error = MetadataIriError;
+
+    fn first(&mut self) -> Result<Next<LinkRows>, MetadataIriError> {
+        let rows = DocumentRowsOperation::new(DOCUMENT_IRI_KEYSPACE, self.document_id);
+        Ok(Next::Call(IoCall::child(rows)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<LinkRows>, MetadataIriError> {
+        let existing = result.child::<Vec<Vec<u8>>, DataLinkError>()??;
+        let document_id = self.document_id;
+        let mut rows = LinkRows::default();
+        let mut written = HashSet::new();
+        for record in &self.records {
+            let (key_space, key, value) = iri_reference_entry(record)?;
+            rows.writes.push((
+                DOCUMENT_IRI_KEYSPACE.to_string(),
+                document_key(document_id, &key).into(),
+                ByteView::from(Vec::new()),
+            ));
+            written.insert(key.to_vec());
+            rows.writes.push((key_space, key, value));
+        }
+        for key in existing {
+            if !written.contains(&key) {
+                let document_row = document_key(document_id, &key).into();
+                rows.deletes
+                    .push((IRI_INDEX_KEYSPACE.to_string(), key.into()));
+                rows.deletes
+                    .push((DOCUMENT_IRI_KEYSPACE.to_string(), document_row));
+            }
+        }
+        Ok(Next::Done(rows))
+    }
+}
+
+/// The document a projection belongs to: its id, the event it projects and its graph.
+pub(crate) type ProjectedDocument = (Ulid, Ulid, String);
+
+#[derive(Debug, PartialEq)]
+enum ProjectStage {
+    References,
+    Versions(Vec<IriIndexRecord>),
+    Links(Vec<IriIndexRecord>),
+    Iris(LinkRows, usize),
+}
+
+/// The IRI index and data link rows of one document's graph as one event left it, with the
+/// stale rows of the document they replace, and how many postings they write.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ProjectRowsOperation {
+    document: ProjectedDocument,
+    stage: ProjectStage,
+}
+
+impl ProjectRowsOperation {
+    pub(crate) fn new(document: ProjectedDocument) -> Self {
+        Self {
+            document,
+            stage: ProjectStage::References,
+        }
+    }
+}
+
+type ProjectedRows = (LinkRows, usize);
+
+impl Operation for ProjectRowsOperation {
+    type Output = ProjectedRows;
+    type Error = MetadataIriError;
+
+    fn first(&mut self) -> Result<Next<ProjectedRows>, MetadataIriError> {
+        let graph_iri = self.document.2.clone();
+        let effect = MetadataEffect::IriReferences { graph_iri };
+        Ok(Next::Call(metadata_call(effect)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ProjectedRows>, MetadataIriError> {
+        let (document_id, cursor, graph_iri) = self.document.clone();
+        match std::mem::replace(&mut self.stage, ProjectStage::References) {
+            ProjectStage::References => {
+                let references = match result.event()? {
+                    Event::Metadata(MetadataEvent::IriReferences { references }) => references,
+                    Event::Metadata(MetadataEvent::Error { error, .. }) => {
+                        return Err(MetadataIriError::UnexpectedEvent(error.to_string()));
+                    }
+                    other => {
+                        return Err(MetadataIriError::UnexpectedEvent(other.label().to_string()));
+                    }
+                };
+                let links = super::data_links::project_links(&graph_iri, cursor, &references);
+                let records = project_iri_references(document_id, cursor, references);
+                self.stage = ProjectStage::Versions(records);
+                Ok(Next::Call(IoCall::child(AssociateVersionsOperation::new(
+                    links,
+                ))))
+            }
+            ProjectStage::Versions(records) => {
+                let links = result.child::<BTreeMap<DataLink, LinkPosting>, DataLinkError>()??;
+                self.stage = ProjectStage::Links(records);
+                Ok(Next::Call(IoCall::child(LinkRowsOperation::new(
+                    document_id,
+                    links,
+                ))))
+            }
+            ProjectStage::Links(records) => {
+                let rows = result.child::<LinkRows, DataLinkError>()??;
+                self.stage = ProjectStage::Iris(rows, records.len());
+                Ok(Next::Call(IoCall::child(IriRowsOperation::new(
+                    document_id,
+                    records,
+                ))))
+            }
+            ProjectStage::Iris(mut rows, postings) => {
+                let iri_rows = result.child::<LinkRows, MetadataIriError>()??;
+                rows.writes.extend(iri_rows.writes);
+                rows.deletes.extend(iri_rows.deletes);
+                Ok(Next::Done((rows, postings)))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ReplaceStage {
+    Status,
+    Written(Vec<(String, ByteView)>),
+    Deleted,
+}
+
+/// Commits one document's rows only while its status still names the projected event, so a
+/// newer materialization is never overwritten; `false` when one got there first.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReplaceRowsOperation {
+    record: MetadataRegistryRecord,
+    rows: Option<LinkRows>,
+    stage: ReplaceStage,
+}
+
+impl ReplaceRowsOperation {
+    pub(crate) fn new(record: MetadataRegistryRecord, rows: LinkRows) -> Self {
+        Self {
+            record,
+            rows: Some(rows),
+            stage: ReplaceStage::Status,
+        }
+    }
+}
+
+impl Operation for ReplaceRowsOperation {
+    type Output = bool;
+    type Error = MetadataIriError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    // A materialization that commits first wins; the rebuild leaves the document to it.
+    fn is_conflict(_error: &MetadataIriError) -> bool {
+        false
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, MetadataIriError> {
+        Ok(Next::Call(IoCall::Read(status_rows(std::slice::from_ref(
+            &self.record,
+        )))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, MetadataIriError> {
+        match std::mem::replace(&mut self.stage, ReplaceStage::Deleted) {
+            ReplaceStage::Status => {
+                let value = result.value()?;
+                let status = value
+                    .map(|bytes| postcard::from_bytes::<MaterializationStatusRecord>(&bytes))
+                    .transpose()
+                    .map_err(ConversionError::from)?;
+                if !status.is_some_and(|status| status_current(&status, &self.record)) {
+                    return Ok(Next::Done(false));
+                }
+                let rows = self.rows.take().unwrap_or_default();
+                self.stage = ReplaceStage::Written(rows.deletes);
+                Ok(Next::Call(IoCall::Write(rows.writes)))
+            }
+            ReplaceStage::Written(deletes) => {
+                result.done()?;
+                self.stage = ReplaceStage::Deleted;
+                Ok(Next::Call(IoCall::Delete(deletes)))
+            }
+            ReplaceStage::Deleted => {
+                result.done()?;
+                Ok(Next::Done(true))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum RebuildStage {
+    Page,
+    Live,
+    Statuses(Vec<MetadataRegistryRecord>),
+    Project(MetadataRegistryRecord),
+    Replace(usize),
+}
+
+/// Re-projects each live materialized document on its own and replaces its postings, walking
+/// the registry a page at a time so its size never bounds the rebuild. Answers how many
+/// postings it wrote.
+#[derive(Debug, PartialEq, Default)]
+pub struct RebuildIrisOperation {
+    next: Option<Key>,
+    current: VecDeque<MetadataRegistryRecord>,
+    written: usize,
+    stage: Option<RebuildStage>,
+}
+
+impl RebuildIrisOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn page(&mut self, after: Option<Key>) -> Result<Next<usize>, MetadataIriError> {
+        self.stage = Some(RebuildStage::Page);
+        Ok(Next::Call(IoCall::Page {
+            space: METADATA_INDEX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after,
+            limit: INDEX_PAGE_SIZE,
+        }))
+    }
+
+    fn project(&mut self) -> Result<Next<usize>, MetadataIriError> {
+        let Some(record) = self.current.pop_front() else {
+            return match self.next.take() {
+                Some(next) => self.page(Some(next)),
+                None => Ok(Next::Done(self.written)),
+            };
+        };
+        let document = (
+            record.document_id,
+            record.last_event_id,
+            record.graph_iri.clone(),
+        );
+        self.stage = Some(RebuildStage::Project(record));
+        Ok(Next::Call(IoCall::child(ProjectRowsOperation::new(
+            document,
+        ))))
+    }
+}
+
+impl Operation for RebuildIrisOperation {
+    type Output = usize;
+    type Error = MetadataIriError;
+
+    fn first(&mut self) -> Result<Next<usize>, MetadataIriError> {
+        self.page(None)
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, MetadataIriError> {
+        let backend =
+            |error: &dyn std::fmt::Display| MetadataIriError::UnexpectedEvent(error.to_string());
+        match self.stage.take() {
+            None => Err(MetadataIriError::UnexpectedEvent(
+                "rebuild not started".to_string(),
+            )),
+            Some(RebuildStage::Page) => {
+                let (rows, next) = result.page().map_err(|error| backend(&error))?;
+                self.next = next;
+                let records: Vec<MetadataRegistryRecord> = rows
+                    .iter()
+                    .filter_map(|(_, value)| postcard::from_bytes(value).ok())
+                    .collect();
+                self.stage = Some(RebuildStage::Live);
+                Ok(Next::Call(IoCall::child(LiveRecordsOperation::new(
+                    records, None,
+                ))))
+            }
+            Some(RebuildStage::Live) => {
+                let live = result.child::<Vec<MetadataRegistryRecord>, LiveRecordsError>();
+                let live = live
+                    .map_err(|error| backend(&error))?
+                    .map_err(|error| backend(&error))?;
+                let reads = status_rows(&live);
+                self.stage = Some(RebuildStage::Statuses(live));
+                Ok(Next::Call(IoCall::Read(reads)))
+            }
+            Some(RebuildStage::Statuses(live)) => {
+                let values = result.values().map_err(|error| backend(&error))?;
+                for (record, value) in live.into_iter().zip(values) {
+                    let status = value.and_then(|bytes| {
+                        postcard::from_bytes::<MaterializationStatusRecord>(&bytes).ok()
+                    });
+                    if status.is_some_and(|status| status_current(&status, &record)) {
+                        self.current.push_back(record);
+                    }
+                }
+                self.project()
+            }
+            Some(RebuildStage::Project(record)) => {
+                let projected = result.child::<ProjectedRows, MetadataIriError>();
+                let (rows, postings) = projected.map_err(|error| backend(&error))??;
+                self.stage = Some(RebuildStage::Replace(postings));
+                Ok(Next::Call(IoCall::child(ReplaceRowsOperation::new(
+                    record, rows,
+                ))))
+            }
+            Some(RebuildStage::Replace(postings)) => {
+                match result
+                    .child::<bool, MetadataIriError>()
+                    .map_err(|error| backend(&error))?
+                {
+                    Ok(true) => self.written = self.written.saturating_add(postings),
+                    Ok(false)
+                    | Err(MetadataIriError::Storage(StorageError::TransactionConflict)) => {}
+                    Err(error) => return Err(error),
+                }
+                self.project()
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum LookupStage {
+    Page,
+    Records(Vec<IriIndexRecord>),
+    Live(Vec<IriIndexRecord>),
+}
+
+/// The live documents whose current postings name `object_iri` through `predicate_iri`, with
+/// their subjects: backlink pages by document id and one point read per document, at most
+/// `limit` documents and a bounded number of index rows. Never a walk over the registry.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ReferenceLookupOperation {
+    iris: (String, String),
+    limit: usize,
+    budget: LinkBudget,
+    after: Option<Ulid>,
+    next: Option<Ulid>,
+    found: Vec<MetadataRegistryRecord>,
+    matches: BTreeMap<Ulid, Vec<String>>,
+    stage: LookupStage,
+}
+
+impl ReferenceLookupOperation {
+    pub(crate) fn new((predicate_iri, object_iri): (&str, &str), limit: usize) -> Self {
+        Self {
+            iris: (predicate_iri.to_string(), object_iri.to_string()),
+            limit,
+            budget: LinkBudget {
+                seeks: limit.max(INDEX_PAGE_SIZE),
+                rows: limit.saturating_mul(2).max(INDEX_PAGE_SIZE * 2),
+            },
+            after: None,
+            next: None,
+            found: Vec::new(),
+            matches: BTreeMap::new(),
+            stage: LookupStage::Page,
+        }
+    }
+
+    fn page(&mut self) -> Result<Next<ReferenceMatches>, MetadataIriError> {
+        if self.found.len() >= self.limit {
+            return Ok(Next::Done(self.answer()));
+        }
+        let (predicate_iri, object_iri) = (&self.iris.0, &self.iris.1);
+        let read = BacklinksOperation::new(
+            (object_iri, Some(predicate_iri)),
+            (self.after, INDEX_PAGE_SIZE),
+            self.budget,
+        );
+        self.stage = LookupStage::Page;
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn answer(&mut self) -> ReferenceMatches {
+        (
+            std::mem::take(&mut self.found),
+            std::mem::take(&mut self.matches),
+        )
+    }
+}
+
+/// The documents a reference lookup found and the subjects of each.
+pub(crate) type ReferenceMatches = (Vec<MetadataRegistryRecord>, BTreeMap<Ulid, Vec<String>>);
+
+impl Operation for ReferenceLookupOperation {
+    type Output = ReferenceMatches;
+    type Error = MetadataIriError;
+
+    fn first(&mut self) -> Result<Next<ReferenceMatches>, MetadataIriError> {
+        self.page()
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<ReferenceMatches>, MetadataIriError> {
+        let backend =
+            |error: &dyn std::fmt::Display| MetadataIriError::UnexpectedEvent(error.to_string());
+        match std::mem::replace(&mut self.stage, LookupStage::Page) {
+            LookupStage::Page => {
+                let page = result.child::<(BacklinkPage, LinkBudget), BacklinkError>();
+                let (page, left) = match page.map_err(|error| backend(&error))? {
+                    Ok(found) => found,
+                    // The budget bounds the lookup; the documents found so far are the answer.
+                    Err(BacklinkError::BudgetExhausted) => return Ok(Next::Done(self.answer())),
+                    Err(error) => return Err(backend(&error)),
+                };
+                self.budget = left;
+                self.next = page.next;
+                let reads: Vec<_> = page
+                    .documents
+                    .keys()
+                    .map(|id| DocumentRecordOperation::new(*id))
+                    .collect();
+                let postings = page.documents.into_values().flatten().collect();
+                if reads.is_empty() {
+                    return self.paged();
+                }
+                self.stage = LookupStage::Records(postings);
+                Ok(Next::Call(children(reads)))
+            }
+            LookupStage::Records(postings) => {
+                let loaded =
+                    child_results::<Option<MetadataRegistryRecord>, StorageReadError>(result)
+                        .map_err(|error| backend(&error))?;
+                let mut records = Vec::with_capacity(loaded.len());
+                for record in loaded {
+                    let record = record.ok_or_else(|| {
+                        MetadataIriError::UnexpectedEvent("record read unfinished".to_string())
+                    })?;
+                    if let Some(record) = record.map_err(status_error)? {
+                        records.push(record);
+                    }
+                }
+                self.stage = LookupStage::Live(postings);
+                Ok(Next::Call(IoCall::child(LiveRecordsOperation::new(
+                    records, None,
+                ))))
+            }
+            LookupStage::Live(postings) => {
+                let live = result.child::<Vec<MetadataRegistryRecord>, LiveRecordsError>();
+                let live = live
+                    .map_err(|error| backend(&error))?
+                    .map_err(|error| backend(&error))?;
+                let (predicate_iri, object_iri) = (&self.iris.0, &self.iris.1);
+                let page_matches = collect_iri_matches(postings, &live, predicate_iri, object_iri);
+                for record in live {
+                    if self.found.len() < self.limit
+                        && let Some(subjects) = page_matches.get(&record.document_id)
+                    {
+                        self.matches.insert(record.document_id, subjects.clone());
+                        self.found.push(record);
+                    }
+                }
+                self.paged()
+            }
+        }
+    }
+}
+
+impl ReferenceLookupOperation {
+    fn paged(&mut self) -> Result<Next<ReferenceMatches>, MetadataIriError> {
+        match self.next.take() {
+            Some(next) => {
+                self.after = Some(next);
+                self.page()
+            }
+            None => Ok(Next::Done(self.answer())),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::data_links::apply_rows;
+    use super::super::data_links::tests::apply_rows;
     use super::*;
+    use crate::tests::calls::{child, runs_child};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::entity_patch::DCTERMS_CONFORMS_IRI;
+    use aruna_core::events::StorageEvent;
     use aruna_core::storage_entries::{iri_reference_key, materialization_status_entry};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_storage::FjallStorage;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
 
     const OBJECT: &str = "https://example.test/object";
+
+    /// One backlink page read from `storage`, spending `budget` as the lookup does.
+    async fn read_backlinks(
+        storage: &StorageHandle,
+        object_iri: &str,
+        predicate_iri: Option<&str>,
+        after: Option<Ulid>,
+        limit: usize,
+        budget: &mut LinkBudget,
+    ) -> Result<BacklinkPage, BacklinkError> {
+        let read = BacklinksOperation::new((object_iri, predicate_iri), (after, limit), *budget);
+        let context = DriverContext::storage_only(storage.clone());
+        let (page, left) = drive(read, &context).await?;
+        *budget = left;
+        Ok(page)
+    }
 
     fn record(document_id: Ulid, cursor: Ulid, predicate: &str, object: &str) -> IriIndexRecord {
         IriIndexRecord {
@@ -629,6 +930,37 @@ mod tests {
             object_iri: object.to_string(),
             subject_iris: vec!["https://example.test/root".to_string()],
         }
+    }
+
+    async fn plan_iri_rows(
+        storage: &StorageHandle,
+        document_id: Ulid,
+        records: &[IriIndexRecord],
+    ) -> Result<LinkRows, MetadataIriError> {
+        let rows = IriRowsOperation::new(document_id, records.to_vec());
+        drive(rows, &DriverContext::storage_only(storage.clone())).await
+    }
+
+    async fn replace_rows(
+        storage: &StorageHandle,
+        record: &MetadataRegistryRecord,
+        rows: LinkRows,
+    ) -> Result<bool, MetadataIriError> {
+        let replace = ReplaceRowsOperation::new(record.clone(), rows);
+        drive(replace, &DriverContext::storage_only(storage.clone())).await
+    }
+
+    async fn lookup_iri_references(
+        context: &DriverContext,
+        predicate_iri: &str,
+        object_iri: &str,
+        limit: usize,
+    ) -> Result<ReferenceMatches, MetadataIriError> {
+        drive(
+            ReferenceLookupOperation::new((predicate_iri, object_iri), limit),
+            context,
+        )
+        .await
     }
 
     async fn write_document(
@@ -794,13 +1126,22 @@ mod tests {
             };
             storage.send_storage_effect(write).await;
         }
-        let (found, matches) = lookup_iri_references(&storage, "p", OBJECT, 8)
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
+        let (found, matches) = lookup_iri_references(&context, "p", OBJECT, 8)
             .await
             .unwrap();
         let ids: Vec<Ulid> = found.iter().map(|record| record.document_id).collect();
         assert_eq!(ids, [first, last], "a stale posting names no document");
         assert_eq!(matches.len(), 2);
-        let (capped, _) = lookup_iri_references(&storage, "p", OBJECT, 1)
+        let (capped, _) = lookup_iri_references(&context, "p", OBJECT, 1)
             .await
             .unwrap();
         assert_eq!(capped.len(), 1);
@@ -938,7 +1279,7 @@ mod tests {
         let error = read_backlinks(&storage, OBJECT, None, None, 10, &mut budget)
             .await
             .expect_err("two seeks are needed");
-        assert!(matches!(error, MetadataIriError::BudgetExhausted));
+        assert!(matches!(error, BacklinkError::BudgetExhausted));
     }
 
     #[tokio::test]
@@ -961,55 +1302,12 @@ mod tests {
         let error = read_backlinks(&storage, OBJECT, None, None, 10, &mut open_budget())
             .await
             .expect_err("malformed row fails to decode");
-        assert!(matches!(error, MetadataIriError::Conversion(_)));
+        assert!(matches!(error, BacklinkError::Malformed(_)));
     }
 
-    #[tokio::test]
-    async fn deletes_document_rows() {
-        // The deletion path reads only the deleted document's own rows.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-        let deleted = Ulid::from_parts(1, 1);
-        let kept = Ulid::from_parts(2, 1);
-        let cursor = Ulid::from_parts(1, 1);
-        write_document(
-            &storage,
-            deleted,
-            &[
-                record(deleted, cursor, "p", "o1"),
-                record(deleted, cursor, "p", "o2"),
-            ],
-        )
-        .await;
-        write_document(&storage, kept, &[record(kept, cursor, "p", "o1")]).await;
-
-        let keys = document_iri_keys(&storage, &BTreeSet::from([deleted]))
-            .await
-            .unwrap();
-        assert_eq!(keys.len(), 4);
-        delete_keys(&storage, keys).await.unwrap();
-
-        let page = read_backlinks(&storage, "o1", None, None, 10, &mut open_budget())
-            .await
-            .unwrap();
-        let ids: Vec<_> = page.documents.keys().copied().collect();
-        assert_eq!(ids, vec![kept]);
-        let kept_key = iri_reference_key("p", "o1", kept).to_vec();
-        assert!(
-            row_exists(
-                &storage,
-                DOCUMENT_IRI_KEYSPACE,
-                document_key(kept, &kept_key)
-            )
-            .await
-        );
-    }
-
-    #[tokio::test]
-    async fn freshness_of_documents() {
+    #[test]
+    fn freshness_of_documents() {
         // Only the documents passed in count; a pending one elsewhere does not.
-        let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
         let cursor = Ulid::from_parts(1, 1);
         let current = registry_record(Ulid::from_parts(4, 1), cursor);
         let pending = registry_record(Ulid::from_parts(4, 2), cursor);
@@ -1025,25 +1323,18 @@ mod tests {
             last_error: None,
             updated_at_ms: 5,
         };
-        let rows = LinkRows {
-            writes: vec![
-                materialization_status_entry(&status(&current, MaterializationState::Materialized))
-                    .unwrap(),
-                materialization_status_entry(&status(&pending, MaterializationState::Pending))
-                    .unwrap(),
-            ],
-            deletes: Vec::new(),
+        let value = |record, state| {
+            let bytes = postcard::to_allocvec(&status(record, state)).unwrap();
+            Some(ByteView::from(bytes))
         };
-        apply_rows(&storage, rows).await.unwrap();
-
-        let returned = iri_index_freshness(&storage, std::slice::from_ref(&current))
-            .await
-            .unwrap();
+        let materialized = value(&current, MaterializationState::Materialized);
+        let returned =
+            iri_freshness(std::slice::from_ref(&current), vec![materialized.clone()]).unwrap();
         assert_eq!(returned.state, IriFreshnessState::Current);
         assert_eq!(returned.oldest_status_updated, Some(5));
-        let both = iri_index_freshness(&storage, &[current, pending])
-            .await
-            .unwrap();
+        let values = vec![materialized, value(&pending, MaterializationState::Pending)];
+        let both = iri_freshness(&[current.clone(), pending.clone()], values).unwrap();
+        assert_eq!(status_rows(&[current, pending]).len(), 2);
         assert_eq!(both.state, IriFreshnessState::Mixed);
     }
 
@@ -1085,5 +1376,251 @@ mod tests {
             .unwrap();
         assert!(replace_rows(&storage, &record_at, rows).await.unwrap());
         assert!(row_exists(&storage, IRI_INDEX_KEYSPACE, key).await);
+    }
+
+    fn rows(records: &[IriIndexRecord]) -> IoResult {
+        let values = (records.iter())
+            .map(|record| {
+                let (_, key, value) = iri_reference_entry(record).unwrap();
+                (key, value)
+            })
+            .collect();
+        IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after: None,
+        })))
+    }
+
+    #[test]
+    fn predicate_reads_once() {
+        let budget = LinkBudget { seeks: 2, rows: 8 };
+        let mut read = BacklinksOperation::new((OBJECT, Some("p")), (None, 10), budget);
+        assert!(matches!(read.first(), Ok(Next::Call(IoCall::Effect(_)))));
+        let document = Ulid::from_parts(1, 1);
+        let found = record(document, Ulid::from_parts(2, 2), "p", OBJECT);
+        let other = record(
+            Ulid::from_parts(3, 3),
+            Ulid::from_parts(2, 2),
+            "p",
+            "elsewhere",
+        );
+        let Ok(Next::Done((page, left))) = read.next(rows(&[found.clone(), other])) else {
+            panic!("expected the page");
+        };
+        // A hash collision on another object is dropped.
+        assert_eq!(page.documents, BTreeMap::from([(document, vec![found])]));
+        assert_eq!(page.next, None);
+        assert_eq!(left, LinkBudget { seeks: 1, rows: 6 });
+    }
+
+    #[test]
+    fn spent_budget_refuses() {
+        let budget = LinkBudget { seeks: 0, rows: 8 };
+        let mut read = BacklinksOperation::new((OBJECT, None), (None, 10), budget);
+        assert_eq!(read.first(), Err(BacklinkError::BudgetExhausted));
+    }
+
+    #[test]
+    fn empty_object_ends() {
+        let budget = LinkBudget { seeks: 4, rows: 8 };
+        let mut read = BacklinksOperation::new((OBJECT, None), (None, 10), budget);
+        read.first().unwrap();
+        let Ok(Next::Done((page, _))) = read.next(rows(&[])) else {
+            panic!("expected an empty page");
+        };
+        assert_eq!(page, BacklinkPage::default());
+    }
+
+    fn materialized(record: &MetadataRegistryRecord) -> ByteView {
+        let status = MaterializationStatusRecord {
+            document_id: record.document_id,
+            event_id: record.last_event_id,
+            graph_iri: record.graph_iri.clone(),
+            context_digest: None,
+            dataset_digest: None,
+            state: MaterializationState::Materialized,
+            attempts: 1,
+            failures: 0,
+            last_error: None,
+            updated_at_ms: 1,
+        };
+        ByteView::from(postcard::to_allocvec(&status).unwrap())
+    }
+
+    #[test]
+    fn iri_rows_replace() {
+        let document_id = Ulid::from_parts(1, 1);
+        let fresh = record(document_id, Ulid::from_parts(2, 1), "p", OBJECT);
+        let mut rows = IriRowsOperation::new(document_id, vec![fresh.clone()]);
+        assert!(runs_child(rows.first()));
+        let stale = vec![9u8; 8];
+        let existing = child(Ok::<_, DataLinkError>(vec![stale.clone()]));
+        let Ok(Next::Done(planned)) = rows.next(existing) else {
+            panic!("expected the planned rows");
+        };
+        let (key_space, key, value) = iri_reference_entry(&fresh).unwrap();
+        assert!(planned.writes.contains(&(key_space, key, value)));
+        let stale_row = (
+            IRI_INDEX_KEYSPACE.to_string(),
+            ByteView::from(stale.clone()),
+        );
+        assert!(planned.deletes.contains(&stale_row));
+        let document_row = document_key(document_id, &stale).into();
+        assert!((planned.deletes).contains(&(DOCUMENT_IRI_KEYSPACE.to_string(), document_row)));
+    }
+
+    #[test]
+    fn projection_reads_references() {
+        let document_id = Ulid::from_parts(1, 1);
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let document = (document_id, Ulid::from_parts(2, 1), graph_iri.clone());
+        let mut project = ProjectRowsOperation::new(document);
+        let effect = MetadataEffect::IriReferences { graph_iri };
+        assert_eq!(project.first(), Ok(Next::Call(metadata_call(effect))));
+        let references = MetadataEvent::IriReferences {
+            references: Vec::new(),
+        };
+        let answered = IoResult::Event(Box::new(Event::Metadata(references)));
+        assert!(runs_child(project.next(answered)));
+        let links = child(Ok::<_, DataLinkError>(
+            BTreeMap::<DataLink, LinkPosting>::new(),
+        ));
+        assert!(runs_child(project.next(links)));
+        assert!(runs_child(
+            project.next(child(Ok::<_, DataLinkError>(LinkRows::default())))
+        ));
+        let iris = child(Ok::<_, MetadataIriError>(LinkRows::default()));
+        assert_eq!(project.next(iris), Ok(Next::Done((LinkRows::default(), 0))));
+    }
+
+    #[test]
+    fn projection_error_unexpected() {
+        let document_id = Ulid::from_parts(1, 1);
+        let graph_iri = MetadataRegistryRecord::graph_iri_for(document_id);
+        let mut project = ProjectRowsOperation::new((document_id, document_id, graph_iri));
+        project.first().unwrap();
+        let failed = MetadataEvent::Error {
+            graph_iri: None,
+            error: MetadataError::GraphNotFound,
+        };
+        let answered = IoResult::Event(Box::new(Event::Metadata(failed)));
+        assert!(matches!(
+            project.next(answered),
+            Err(MetadataIriError::UnexpectedEvent(_))
+        ));
+    }
+
+    #[test]
+    fn replace_needs_current() {
+        let record = registry_record(Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+        let mut replace = ReplaceRowsOperation::new(record.clone(), LinkRows::default());
+        assert_eq!(replace.transaction(), TransactionMode::Write);
+        let read = IoCall::Read(status_rows(std::slice::from_ref(&record)));
+        assert_eq!(replace.first(), Ok(Next::Call(read)));
+        assert_eq!(
+            replace.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
+        );
+    }
+
+    #[test]
+    fn replace_writes_first() {
+        let record = registry_record(Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+        let write = (
+            IRI_INDEX_KEYSPACE.to_string(),
+            ByteView::from(vec![1]),
+            ByteView::from(vec![2]),
+        );
+        let delete = (IRI_INDEX_KEYSPACE.to_string(), ByteView::from(vec![3]));
+        let rows = LinkRows {
+            writes: vec![write.clone()],
+            deletes: vec![delete.clone()],
+        };
+        let mut replace = ReplaceRowsOperation::new(record.clone(), rows);
+        replace.first().unwrap();
+        let current = IoResult::Values(vec![Some(materialized(&record))]);
+        assert_eq!(
+            replace.next(current),
+            Ok(Next::Call(IoCall::Write(vec![write])))
+        );
+        assert_eq!(
+            replace.next(IoResult::Done),
+            Ok(Next::Call(IoCall::Delete(vec![delete])))
+        );
+        assert_eq!(replace.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    #[test]
+    fn rebuild_empty_registry() {
+        let mut rebuild = RebuildIrisOperation::new();
+        let page = IoCall::Page {
+            space: METADATA_INDEX_KEYSPACE.to_string(),
+            prefix: Key::from(Vec::new()),
+            after: None,
+            limit: INDEX_PAGE_SIZE,
+        };
+        assert_eq!(rebuild.first(), Ok(Next::Call(page)));
+        let empty = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert!(runs_child(rebuild.next(empty)));
+        let live = child(Ok::<_, LiveRecordsError>(
+            Vec::<MetadataRegistryRecord>::new(),
+        ));
+        assert_eq!(rebuild.next(live), Ok(Next::Call(IoCall::Read(Vec::new()))));
+        assert_eq!(
+            rebuild.next(IoResult::Values(Vec::new())),
+            Ok(Next::Done(0))
+        );
+    }
+
+    #[test]
+    fn rebuild_counts_postings() {
+        let record = registry_record(Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+        let mut rebuild = RebuildIrisOperation::new();
+        rebuild.first().unwrap();
+        let row = (
+            Key::from(vec![1]),
+            ByteView::from(postcard::to_allocvec(&record).unwrap()),
+        );
+        let page = IoResult::Page {
+            rows: vec![row],
+            next: None,
+        };
+        rebuild.next(page).unwrap();
+        let live = child(Ok::<_, LiveRecordsError>(vec![record.clone()]));
+        rebuild.next(live).unwrap();
+        let statuses = IoResult::Values(vec![Some(materialized(&record))]);
+        assert!(runs_child(rebuild.next(statuses)));
+        let projected = child(Ok::<_, MetadataIriError>((LinkRows::default(), 3usize)));
+        assert!(runs_child(rebuild.next(projected)));
+        let replaced = child(Ok::<_, MetadataIriError>(true));
+        assert_eq!(rebuild.next(replaced), Ok(Next::Done(3)));
+    }
+
+    #[test]
+    fn lookup_empty_page() {
+        let mut lookup = ReferenceLookupOperation::new(("p", OBJECT), 10);
+        assert!(runs_child(lookup.first()));
+        let page = (BacklinkPage::default(), open_budget());
+        let answered = child(Ok::<_, BacklinkError>(page));
+        assert_eq!(
+            lookup.next(answered),
+            Ok(Next::Done((Vec::new(), BTreeMap::new())))
+        );
+    }
+
+    #[test]
+    fn lookup_budget_ends() {
+        let mut lookup = ReferenceLookupOperation::new(("p", OBJECT), 10);
+        lookup.first().unwrap();
+        let spent = child(Err::<(BacklinkPage, LinkBudget), _>(
+            BacklinkError::BudgetExhausted,
+        ));
+        assert_eq!(
+            lookup.next(spent),
+            Ok(Next::Done((Vec::new(), BTreeMap::new())))
+        );
     }
 }

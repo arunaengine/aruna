@@ -6,11 +6,11 @@
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use super::{
-    DistributionError, DistributionMember, KeyRange, MAX_BOUND_BYTES, MAX_RANGES, RouteError,
-    SetPhase, Statement, StatementKind,
-};
+use super::{DistributionMember, KeyRange, MAX_BOUND_BYTES, MAX_RANGES, SetPhase};
 use crate::structs::identity::realm::RealmId;
+use crate::structs::storage::distribution::route::RouteError;
+use crate::structs::storage::distribution::statement::{Statement, StatementKind};
+use crate::structs::storage::distribution::validate::DistributionError;
 
 use super::snapshot::DistributionSnapshot;
 

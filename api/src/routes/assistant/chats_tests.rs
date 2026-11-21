@@ -3,60 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::tests::routes::{test_context, test_state, test_storage};
-use aruna_core::UserId;
-use aruna_core::keys::generate_signing_key;
-use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::{
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
+use crate::tests::realms::member_state;
+use aruna_core::calls::IoError;
+use aruna_core::structs::assistant_chat::{
     MAX_ASSISTANT_BYTES, MAX_ASSISTANT_CHATS, MAX_ASSISTANT_TURNS, MAX_TURN_BYTES,
 };
-use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_core::structs::identity::auth::AuthContext;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use tempfile::TempDir;
-use ulid::Ulid;
-
-async fn setup_state() -> (TempDir, Arc<ServerState>, AuthContext) {
-    let (dir, storage) = test_storage();
-    let context = Arc::new(test_context(storage));
-    let signing_key = generate_signing_key();
-    let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
-    let user_id = UserId::local(Ulid::generate(), realm_id);
-    let node_id = iroh::SecretKey::generate().public();
-    drive(
-        CreateRealmOperation::new(CreateRealmConfig {
-            actor: Actor {
-                node_id,
-                user_id: UserId::nil(realm_id),
-                realm_id,
-            },
-            realm_description: "Realm".to_string(),
-            oidc_providers: Vec::new(),
-            node_location: None,
-            node_weight: None,
-            node_labels: Default::default(),
-        }),
-        &context,
-    )
-    .await
-    .unwrap();
-    let state = Arc::new(
-        test_state(
-            context,
-            realm_id,
-            node_id,
-            NodeCapabilities::management_node(signing_key).unwrap(),
-        )
-        .await,
-    );
-    let auth = AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    };
-    (dir, state, auth)
-}
 
 fn head_request(title: &str, revision: Option<u64>) -> Json<SaveChatRequest> {
     Json(SaveChatRequest {
@@ -82,7 +38,7 @@ async fn save_head(
 ) -> Result<ChatHeadResponse, StatusCode> {
     put_chat(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(id.to_string()),
         head_request(title, revision),
     )
@@ -100,7 +56,7 @@ async fn save_turn(
 ) -> Result<ChatHeadResponse, ServerError> {
     put_turn(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path((id.to_string(), seq)),
         turn_request(payload, None),
     )
@@ -116,7 +72,7 @@ async fn read_turns(
 ) -> Result<Vec<ChatTurnResponse>, StatusCode> {
     get_turns(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(id.to_string()),
         Query(ChatTurnsQuery { after }),
     )
@@ -126,7 +82,7 @@ async fn read_turns(
 }
 
 async fn list(state: &Arc<ServerState>, auth: &AuthContext) -> Vec<ChatHeadResponse> {
-    let (status, Json(body)) = list_chats(State(state.clone()), Extension(Some(auth.clone())))
+    let (status, Json(body)) = list_chats(State(state.clone()), UnrestrictedAuth(auth.clone()))
         .await
         .unwrap();
     assert_eq!(status, StatusCode::OK);
@@ -136,7 +92,7 @@ async fn list(state: &Arc<ServerState>, auth: &AuthContext) -> Vec<ChatHeadRespo
 async fn delete(state: &Arc<ServerState>, auth: &AuthContext, id: &str) -> StatusCode {
     delete_chat(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path(id.to_string()),
     )
     .await
@@ -146,7 +102,7 @@ async fn delete(state: &Arc<ServerState>, auth: &AuthContext, id: &str) -> Statu
 #[tokio::test]
 async fn creates_and_renames() {
     // A rename must carry the revision it read; the head keeps its creation time.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     assert!(list(&state, &auth).await.is_empty());
 
     let created = save_head(&state, &auth, "c-1", "  First  ", None)
@@ -184,7 +140,7 @@ async fn creates_and_renames() {
 
 #[tokio::test]
 async fn rejects_bad_input() {
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     for id in ["", "has space", "a/b", &"x".repeat(65)] {
         assert_eq!(
             save_head(&state, &auth, id, "Title", None)
@@ -203,7 +159,7 @@ async fn rejects_bad_input() {
     }
     let error = put_chat(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        UnrestrictedAuth(auth.clone()),
         Path("c-1".to_string()),
         Json(SaveChatRequest {
             title: "Title".to_string(),
@@ -218,7 +174,7 @@ async fn rejects_bad_input() {
         read_turns(&state, &auth, "bad id", None).await.unwrap_err(),
         StatusCode::BAD_REQUEST
     );
-    let error = delete_chat(State(state), Extension(Some(auth)), Path(String::new()))
+    let error = delete_chat(State(state), UnrestrictedAuth(auth), Path(String::new()))
         .await
         .unwrap_err();
     assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
@@ -227,7 +183,7 @@ async fn rejects_bad_input() {
 #[tokio::test]
 async fn appends_and_reads() {
     // Appends advance next_seq; `after` returns only the newer turns; the tail can be rewritten.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
 
     let head = save_turn(&state, &auth, "c-1", 0, "turn zero")
@@ -268,7 +224,7 @@ async fn appends_and_reads() {
 #[tokio::test]
 async fn refuses_wrong_seq() {
     // The 409 message tells the caller which seq the node expects next.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
     save_turn(&state, &auth, "c-1", 0, "zero").await.unwrap();
 
@@ -282,7 +238,7 @@ async fn refuses_wrong_seq() {
 #[tokio::test]
 async fn refuses_stale_revision() {
     // A turn write from an older head read is refused, whether it appends or rewrites the tail.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
     let write = |seq: u32, revision: Option<u64>| {
         let state = state.clone();
@@ -290,7 +246,7 @@ async fn refuses_stale_revision() {
         async move {
             put_turn(
                 State(state),
-                Extension(Some(auth)),
+                UnrestrictedAuth(auth),
                 Path(("c-1".to_string(), seq)),
                 turn_request("turn", revision),
             )
@@ -311,7 +267,7 @@ async fn refuses_stale_revision() {
 #[tokio::test]
 async fn handles_missing_chats() {
     // Unknown is 404; after a delete every route answers 410 and the listing drops the chat.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     assert_eq!(
         read_turns(&state, &auth, "c-1", None).await.unwrap_err(),
         StatusCode::NOT_FOUND
@@ -344,7 +300,7 @@ async fn handles_missing_chats() {
 
 #[tokio::test]
 async fn refuses_large_turn() {
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     save_head(&state, &auth, "c-1", "Chat", None).await.unwrap();
     let payload = "x".repeat(MAX_TURN_BYTES + 1);
     let error = save_turn(&state, &auth, "c-1", 0, &payload)
@@ -359,7 +315,7 @@ async fn refuses_large_turn() {
 #[tokio::test]
 async fn refuses_chat_cap() {
     // A deleted chat frees its slot.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     for index in 0..MAX_ASSISTANT_CHATS {
         save_head(&state, &auth, &format!("c-{index}"), "Chat", None)
             .await
@@ -382,7 +338,7 @@ async fn refuses_chat_cap() {
 #[tokio::test]
 async fn refuses_over_budget() {
     // 64 KiB turns across two chats fill the 8 MiB budget exactly; one more is refused.
-    let (_dir, state, auth) = setup_state().await;
+    let (_dir, state, auth) = member_state().await;
     let fill = 64 * 1024;
     assert!(fill <= MAX_TURN_BYTES);
     let payload = "x".repeat(fill);
@@ -427,37 +383,20 @@ async fn refuses_over_budget() {
 
 #[tokio::test]
 async fn requires_unrestricted_token() {
-    let (_dir, state, mut auth) = setup_state().await;
-    let error = list_chats(State(state.clone()), Extension(None))
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::UNAUTHORIZED);
+    let (_dir, state, mut auth) = member_state().await;
+    // The chat routes take `UnrestrictedAuth`, so these refusals are the extractor's.
+    let error = extract::<UnrestrictedAuth>(&state, None).await;
+    assert_eq!(error.err(), Some(StatusCode::UNAUTHORIZED));
 
     auth.path_restrictions = Some(Vec::new());
-    assert_eq!(
-        save_head(&state, &auth, "c-1", "Chat", None)
-            .await
-            .unwrap_err(),
-        StatusCode::FORBIDDEN
-    );
-    let error = save_turn(&state, &auth, "c-1", 0, "zero")
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
-    assert_eq!(
-        read_turns(&state, &auth, "c-1", None).await.unwrap_err(),
-        StatusCode::FORBIDDEN
-    );
-    let error = delete_chat(State(state), Extension(Some(auth)), Path("c-1".to_string()))
-        .await
-        .unwrap_err();
-    assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+    let error = extract::<UnrestrictedAuth>(&state, Some(auth)).await;
+    assert_eq!(error.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[test]
 fn maps_store_errors() {
     assert_eq!(
-        map_chat_error(ChatStoreError::NotFinished)
+        map_chat_error(IoError::Unfinished.into())
             .into_response()
             .status(),
         StatusCode::INTERNAL_SERVER_ERROR

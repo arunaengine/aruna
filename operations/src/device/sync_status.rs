@@ -2,67 +2,36 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use aruna_core::rows::{outside_answer, outside_call};
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
-use aruna_core::keyspaces::{SYNC_BASE_KEYSPACE, SYNC_STATE_KEYSPACE};
-use aruna_core::structs::{EntryState, FolderState, SyncBase, SyncedFolder};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::Effect;
+use aruna_core::events::Event;
+use aruna_core::keyspaces::{DEVICE_INTAKE_KEYSPACE, SYNC_STATE_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
+use aruna_core::structs::synced_folder::{EntryState, FolderState, SyncBase, SyncedFolder};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_millis;
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::{GroupId, Value};
 use byteview::ByteView;
-use serde::{Deserialize, Serialize};
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
-
-use super::drain::claim_state;
-use super::publish_queue::{PublishEntry, PublishState, scan_publish_queue};
-use super::replica::{DocumentState, ReplicaRecord, ReplicaState, document_state, list_replicas};
-use super::sync::folders::{list_folders, list_transfers};
-use super::sync::outbox::requeue_uploads;
-use super::sync::repository::{scan_folder, scan_page};
-
-/// How recently the realm must have answered for the device to call it
-/// reachable. Two folder beats, so one missed pass does not flip the view.
-pub const REALM_CONTACT_WINDOW: Duration = Duration::from_secs(90);
-
-/// How long a run stays active without finishing. A crashed run must not block
-/// the next one for longer than this.
-pub const SYNC_RUN_LIFETIME: Duration = Duration::from_secs(120);
-
-/// The one row this device keeps about its exchange with the realm.
-const SYNC_STATE_KEY: [u8; 1] = [0];
-
-/// When the realm last answered, when the last pass finished, and whether one
-/// is in flight.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceSyncState {
-    /// When the realm last answered. A failed contact attempt clears it, so the device shows
-    /// disconnected at once and connected again after the next answer.
-    pub last_contact_ms: Option<u64>,
-    pub last_sync_ms: Option<u64>,
-    pub run_started_ms: Option<u64>,
-}
-
-impl DeviceSyncState {
-    pub fn realm_reachable(&self, now_ms: u64) -> bool {
-        self.last_contact_ms.is_some_and(|contact| {
-            now_ms.saturating_sub(contact) <= REALM_CONTACT_WINDOW.as_millis() as u64
-        })
-    }
-
-    pub fn run_active(&self, now_ms: u64) -> bool {
-        self.run_started_ms.is_some_and(|started| {
-            now_ms.saturating_sub(started) <= SYNC_RUN_LIFETIME.as_millis() as u64
-        })
-    }
-}
+use super::publish_queue::{
+    ClaimError, ClaimStateOperation, PUBLISH_PAGE_SIZE, PublishEntry, PublishState,
+};
+use super::replica::{
+    DocumentState, ReplicaRecord, ReplicaScanError, ReplicaState, document_state,
+};
+use super::replica_store::list_replicas;
+use super::sync::folders::FolderError;
+use super::sync::folders::reads::{folder_bases, list_folders, list_transfers};
+use super::sync::outbox::RequeueUploadsOperation;
+use super::sync::repository::SyncUpload;
+use crate::device_node::scan_rows::{ScanRowsError, ScanRowsOperation};
+use crate::device_node::sync_note::{DeviceSyncState, sync_state_key};
 
 /// One selected document in the Sync view.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +60,7 @@ pub struct DatasetRow {
 }
 
 /// Everything the Sync view shows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncStatus {
     pub realm_reachable: bool,
     pub last_sync_ms: Option<u64>,
@@ -165,11 +134,7 @@ fn entry_error(entries: &[&PublishEntry]) -> Option<String> {
 }
 
 /// One folder's row from the rows the device already holds for it.
-pub fn dataset_row(
-    folder: &SyncedFolder,
-    bases: &[SyncBase],
-    pending_uploads: usize,
-) -> DatasetRow {
+fn dataset_row(folder: &SyncedFolder, bases: &[SyncBase], pending_uploads: usize) -> DatasetRow {
     let mut unsynced_files = 0usize;
     let mut conflicts = 0usize;
     for base in bases {
@@ -224,189 +189,354 @@ pub fn pending_total(documents: &[DocumentRow], datasets: &[DatasetRow]) -> usiz
     })
 }
 
-/// Reads everything the Sync view shows. A part the device cannot read is
-/// reported as empty rather than failing the whole view.
-pub async fn sync_status(context: &Arc<DriverContext>) -> SyncStatus {
-    let now = unix_timestamp_millis();
-    let state = read_sync_state(context).await;
-    let replicas = list_replicas(context).await.unwrap_or_default();
-    let entries = read_publish_entries(context).await;
-    let documents = document_rows(replicas, &entries);
-    let datasets = read_datasets(context).await;
-    SyncStatus {
-        realm_reachable: state.realm_reachable(now),
-        last_sync_ms: state.last_sync_ms,
-        pending_total: pending_total(&documents, &datasets),
-        documents,
-        datasets,
+/// The sync state row; an absent or unreadable one reads as nothing known yet.
+fn state_read() -> IoCall {
+    let read = read_row(SYNC_STATE_KEYSPACE, sync_state_key().to_vec());
+    outside_call(read)
+}
+
+fn state_of(result: IoResult) -> DeviceSyncState {
+    let stored = outside_answer(result).and_then(|read| read.value());
+    (stored.ok().flatten())
+        .and_then(|bytes| postcard::from_bytes(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The device's sync state.
+#[derive(Debug, Default, PartialEq)]
+pub struct SyncStateOperation;
+
+/// The read of the sync state; see [`SyncStateOperation`].
+pub fn read_sync_state() -> SyncStateOperation {
+    SyncStateOperation
+}
+
+impl Operation for SyncStateOperation {
+    type Output = DeviceSyncState;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<DeviceSyncState>, IoError> {
+        Ok(Next::Call(state_read()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<DeviceSyncState>, IoError> {
+        Ok(Next::Done(state_of(result)))
     }
 }
 
-/// Starts one sync pass: drain the publish queue, drain the upload outbox,
-/// refresh every selected replica. Idempotent while a pass is still in flight.
-pub async fn start_sync_run(context: &Arc<DriverContext>) -> bool {
-    let now = unix_timestamp_millis();
-    let mut state = read_sync_state(context).await;
-    if state.run_active(now) {
-        return false;
-    }
-    requeue_publish(context, now).await;
-    requeue_uploads(context, now).await;
-    state.run_started_ms = Some(now);
-    write_sync_state(context, &state).await;
-    for key in [
-        TaskKey::DrainDeviceIntake,
-        TaskKey::DrainUploadOutbox,
-        // The folder beat is also the beat the replicas refresh on.
-        TaskKey::ReconcileSyncedFolders,
-    ] {
-        arm(context, key).await;
-    }
-    true
+/// Every readable entry of the publish queue; a failed scan reads as none.
+#[derive(Debug, Default, PartialEq)]
+pub struct PublishEntriesOperation;
+
+/// The read of the publish queue; see [`PublishEntriesOperation`].
+pub(crate) fn read_publish_entries() -> PublishEntriesOperation {
+    PublishEntriesOperation
 }
 
-async fn requeue_publish(context: &Arc<DriverContext>, now_ms: u64) {
-    for entry in read_publish_entries(context).await {
-        let Some(state) = entry.retry_failed(now_ms) else {
-            continue;
+impl Operation for PublishEntriesOperation {
+    type Output = Vec<PublishEntry>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Vec<PublishEntry>>, IoError> {
+        let scan = ScanRowsOperation::new(DEVICE_INTAKE_KEYSPACE, None, PUBLISH_PAGE_SIZE);
+        Ok(Next::Call(IoCall::child(scan)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Vec<PublishEntry>>, IoError> {
+        let rows = result
+            .child::<Vec<Value>, ScanRowsError>()?
+            .unwrap_or_default();
+        Ok(Next::Done(
+            (rows.iter())
+                .filter_map(|bytes| PublishEntry::from_bytes(bytes).ok())
+                .collect(),
+        ))
+    }
+}
+
+/// Moves a timer to now. An idle arm would keep the beat a device always has pending.
+#[derive(Debug, PartialEq)]
+pub(crate) struct ArmTimerOperation {
+    key: TaskKey,
+}
+
+impl ArmTimerOperation {
+    pub(crate) fn new(key: TaskKey) -> Self {
+        Self { key }
+    }
+}
+
+impl Operation for ArmTimerOperation {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        let effect = TaskEffect::ShortenTimer {
+            key: self.key.clone(),
+            after: Duration::ZERO,
         };
-        claim_state(context, &entry, state).await;
+        Ok(Next::Call(IoCall::from(Effect::Task(effect))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        if let Event::Task(TaskEvent::Error { message, .. }) = result.event()? {
+            warn!(%message, "Failed to arm a device sync timer");
+        }
+        Ok(Next::Done(()))
     }
 }
 
-/// Moves the timer to now. An idle arm would keep the beat a device always has pending.
-pub(crate) async fn arm(context: &Arc<DriverContext>, key: TaskKey) {
-    let Some(task_handle) = context.task_handle.as_ref() else {
-        return;
-    };
-    let after = Duration::ZERO;
-    let now = Effect::Task(TaskEffect::ShortenTimer { key, after });
-    if let Event::Task(TaskEvent::Error { message, .. }) = task_handle.send_effect(now).await {
-        warn!(message = %message, "Failed to arm a device sync timer");
+/// What the pending call of the Sync view answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ViewStep {
+    State,
+    Replicas,
+    Entries,
+    Folders,
+    Transfers,
+    Bases,
+}
+
+/// Reads everything the Sync view shows. A part the device cannot read is reported as empty
+/// rather than failing the whole view.
+#[derive(Debug, PartialEq)]
+pub struct SyncStatusOperation {
+    now_ms: u64,
+    step: ViewStep,
+    state: DeviceSyncState,
+    replicas: Vec<ReplicaRecord>,
+    entries: Vec<PublishEntry>,
+    folders: VecDeque<SyncedFolder>,
+    current: Option<SyncedFolder>,
+    uploads: BTreeMap<Ulid, usize>,
+    datasets: Vec<DatasetRow>,
+}
+
+/// The read of the Sync view; see [`SyncStatusOperation`].
+pub fn sync_status() -> SyncStatusOperation {
+    SyncStatusOperation {
+        now_ms: 0,
+        step: ViewStep::State,
+        state: DeviceSyncState::default(),
+        replicas: Vec::new(),
+        entries: Vec::new(),
+        folders: VecDeque::new(),
+        current: None,
+        uploads: BTreeMap::new(),
+        datasets: Vec::new(),
     }
 }
 
-/// Records that the realm answered this device.
-pub async fn note_contact(context: &Arc<DriverContext>) {
-    let mut state = read_sync_state(context).await;
-    state.last_contact_ms = Some(unix_timestamp_millis());
-    write_sync_state(context, &state).await;
-}
-
-/// Records that the realm did not answer this device's last contact attempt.
-pub async fn note_failure(context: &Arc<DriverContext>) {
-    let mut state = read_sync_state(context).await;
-    if state.last_contact_ms.take().is_some() {
-        write_sync_state(context, &state).await;
-    }
-}
-
-/// Records that a sync pass finished, which also ends the run it belonged to.
-pub async fn note_sync(context: &Arc<DriverContext>) {
-    let now = unix_timestamp_millis();
-    let mut state = read_sync_state(context).await;
-    state.last_contact_ms = Some(now);
-    state.last_sync_ms = Some(now);
-    state.run_started_ms = None;
-    write_sync_state(context, &state).await;
-}
-
-pub async fn read_sync_state(context: &Arc<DriverContext>) -> DeviceSyncState {
-    let Event::Storage(StorageEvent::ReadResult {
-        value: Some(bytes), ..
-    }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            txn_id: None,
-        })
-        .await
-    else {
-        return DeviceSyncState::default();
-    };
-    postcard::from_bytes(&bytes).unwrap_or_default()
-}
-
-async fn write_sync_state(context: &Arc<DriverContext>, state: &DeviceSyncState) {
-    let Ok(bytes) = postcard::to_allocvec(state) else {
-        return;
-    };
-    if let Event::Storage(StorageEvent::Error { error }) = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: SYNC_STATE_KEYSPACE.to_string(),
-            key: sync_state_key(),
-            value: ByteView::from(bytes),
-            txn_id: None,
-        })
-        .await
-    {
-        warn!(error = %error, "Failed to store the device sync state");
-    }
-}
-
-fn sync_state_key() -> Key {
-    ByteView::from(SYNC_STATE_KEY.to_vec())
-}
-
-pub(crate) async fn read_publish_entries(context: &Arc<DriverContext>) -> Vec<PublishEntry> {
-    let mut entries = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((values, next)) = scan_page(context, scan_publish_queue(cursor, None)).await
-        else {
-            return entries;
+impl SyncStatusOperation {
+    fn next_folder(&mut self) -> Result<Next<SyncStatus>, IoError> {
+        let Some(folder) = self.folders.pop_front() else {
+            return Ok(Next::Done(self.finished()));
         };
-        entries.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| PublishEntry::from_bytes(&bytes).ok()),
-        );
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return entries,
+        let bases = folder_bases(folder.folder_id);
+        self.current = Some(folder);
+        self.step = ViewStep::Bases;
+        Ok(Next::Call(IoCall::child(bases)))
+    }
+
+    fn finished(&mut self) -> SyncStatus {
+        let replicas = std::mem::take(&mut self.replicas);
+        let documents = document_rows(replicas, &self.entries);
+        let datasets = std::mem::take(&mut self.datasets);
+        SyncStatus {
+            realm_reachable: self.state.realm_reachable(self.now_ms),
+            last_sync_ms: self.state.last_sync_ms,
+            pending_total: pending_total(&documents, &datasets),
+            documents,
+            datasets,
         }
     }
 }
 
-async fn read_datasets(context: &Arc<DriverContext>) -> Vec<DatasetRow> {
-    let Ok(folders) = list_folders(context).await else {
-        return Vec::new();
-    };
-    let mut uploads: BTreeMap<Ulid, usize> = BTreeMap::new();
-    for upload in list_transfers(context).await.unwrap_or_default() {
-        *uploads.entry(upload.folder_id).or_default() += 1;
+impl Operation for SyncStatusOperation {
+    type Output = SyncStatus;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
     }
-    let mut datasets = Vec::with_capacity(folders.len());
-    for folder in folders {
-        let bases = read_bases(context, folder.folder_id).await;
-        let pending = uploads.get(&folder.folder_id).copied().unwrap_or_default();
-        datasets.push(dataset_row(&folder, &bases, pending));
+
+    fn first(&mut self) -> Result<Next<SyncStatus>, IoError> {
+        Ok(Next::Call(state_read()))
     }
-    datasets
+
+    fn next(&mut self, result: IoResult) -> Result<Next<SyncStatus>, IoError> {
+        match self.step {
+            ViewStep::State => {
+                self.state = state_of(result);
+                self.step = ViewStep::Replicas;
+                Ok(Next::Call(IoCall::child(list_replicas())))
+            }
+            ViewStep::Replicas => {
+                let replicas = result.child::<Vec<ReplicaRecord>, ReplicaScanError>()?;
+                self.replicas = replicas.unwrap_or_default();
+                self.step = ViewStep::Entries;
+                Ok(Next::Call(IoCall::child(read_publish_entries())))
+            }
+            ViewStep::Entries => {
+                self.entries = result.child::<Vec<PublishEntry>, IoError>()??;
+                self.step = ViewStep::Folders;
+                Ok(Next::Call(IoCall::child(list_folders())))
+            }
+            ViewStep::Folders => match result.child::<Vec<SyncedFolder>, FolderError>()? {
+                Ok(folders) => {
+                    self.folders = folders.into();
+                    self.step = ViewStep::Transfers;
+                    Ok(Next::Call(IoCall::child(list_transfers())))
+                }
+                Err(_) => Ok(Next::Done(self.finished())),
+            },
+            ViewStep::Transfers => {
+                let uploads = result.child::<Vec<SyncUpload>, FolderError>()?;
+                for upload in uploads.unwrap_or_default() {
+                    *self.uploads.entry(upload.folder_id).or_default() += 1;
+                }
+                self.next_folder()
+            }
+            ViewStep::Bases => {
+                let bases = result
+                    .child::<Vec<SyncBase>, FolderError>()?
+                    .unwrap_or_default();
+                let folder = self.current.take().ok_or(IoError::Unfinished)?;
+                let pending = (self.uploads.get(&folder.folder_id).copied()).unwrap_or_default();
+                self.datasets.push(dataset_row(&folder, &bases, pending));
+                self.next_folder()
+            }
+        }
+    }
 }
 
-async fn read_bases(context: &Arc<DriverContext>, folder_id: Ulid) -> Vec<SyncBase> {
-    let mut bases = Vec::new();
-    let mut cursor: Option<Key> = None;
-    loop {
-        let Some((values, next)) = scan_page(
-            context,
-            scan_folder(SYNC_BASE_KEYSPACE, folder_id, cursor, None),
-        )
-        .await
-        else {
-            return bases;
+/// What the pending call of starting a sync run answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunStep {
+    State,
+    Entries,
+    Claim,
+    Uploads,
+    Store,
+    Arm,
+}
+
+/// Starts one sync pass: drain the publish queue, drain the upload outbox, refresh every
+/// selected replica. Idempotent while a pass is still in flight.
+#[derive(Debug, PartialEq)]
+pub struct SyncRunOperation {
+    now_ms: u64,
+    step: RunStep,
+    state: DeviceSyncState,
+    failed: VecDeque<(PublishEntry, PublishState)>,
+    timers: VecDeque<TaskKey>,
+}
+
+/// The start of one sync pass; see [`SyncRunOperation`].
+pub fn start_sync_run() -> SyncRunOperation {
+    SyncRunOperation {
+        now_ms: 0,
+        step: RunStep::State,
+        state: DeviceSyncState::default(),
+        failed: VecDeque::new(),
+        // The folder beat is also the beat the replicas refresh on.
+        timers: VecDeque::from([
+            TaskKey::DrainDeviceIntake,
+            TaskKey::DrainUploadOutbox,
+            TaskKey::ReconcileSyncedFolders,
+        ]),
+    }
+}
+
+impl SyncRunOperation {
+    fn next_claim(&mut self) -> Result<Next<bool>, IoError> {
+        if let Some((entry, state)) = self.failed.pop_front() {
+            self.step = RunStep::Claim;
+            let claim = ClaimStateOperation::new(entry, state);
+            return Ok(Next::Call(IoCall::child(claim)));
+        }
+        self.step = RunStep::Uploads;
+        let requeue = RequeueUploadsOperation::new(self.now_ms);
+        Ok(Next::Call(IoCall::child(requeue)))
+    }
+
+    fn store_state(&mut self) -> Result<Next<bool>, IoError> {
+        self.state.run_started_ms = Some(self.now_ms);
+        self.step = RunStep::Store;
+        let Ok(bytes) = postcard::to_allocvec(&self.state) else {
+            return self.next_timer();
         };
-        bases.extend(
-            values
-                .into_iter()
-                .filter_map(|(_, bytes)| SyncBase::from_bytes(&bytes).ok()),
+        let row = (
+            SYNC_STATE_KEYSPACE.to_string(),
+            sync_state_key(),
+            ByteView::from(bytes),
         );
-        match next {
-            Some(next) => cursor = Some(next),
-            None => return bases,
+        Ok(Next::Call(outside_call(IoCall::Write(vec![row]))))
+    }
+
+    fn next_timer(&mut self) -> Result<Next<bool>, IoError> {
+        let Some(key) = self.timers.pop_front() else {
+            return Ok(Next::Done(true));
+        };
+        self.step = RunStep::Arm;
+        Ok(Next::Call(IoCall::child(ArmTimerOperation::new(key))))
+    }
+}
+
+impl Operation for SyncRunOperation {
+    type Output = bool;
+    type Error = IoError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> Result<Next<bool>, IoError> {
+        Ok(Next::Call(state_read()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
+        match self.step {
+            RunStep::State => {
+                self.state = state_of(result);
+                if self.state.run_active(self.now_ms) {
+                    return Ok(Next::Done(false));
+                }
+                self.step = RunStep::Entries;
+                Ok(Next::Call(IoCall::child(read_publish_entries())))
+            }
+            RunStep::Entries => {
+                let entries = result.child::<Vec<PublishEntry>, IoError>()??;
+                self.failed = (entries.into_iter())
+                    .filter_map(|entry| {
+                        let state = entry.retry_failed(self.now_ms)?;
+                        Some((entry, state))
+                    })
+                    .collect();
+                self.next_claim()
+            }
+            RunStep::Claim => {
+                if let Err(error) = result.child::<bool, ClaimError>()? {
+                    warn!(%error, "Failed to requeue a failed publish entry");
+                }
+                self.next_claim()
+            }
+            RunStep::Uploads => {
+                if let Err(error) = result.child::<(), IoError>()? {
+                    warn!(%error, "Failed to requeue the folder uploads");
+                }
+                self.store_state()
+            }
+            RunStep::Store => {
+                if let Err(error) = outside_answer(result) {
+                    warn!(%error, "Failed to store the device sync state");
+                }
+                self.next_timer()
+            }
+            RunStep::Arm => {
+                result.child::<(), IoError>()?.ok();
+                self.next_timer()
+            }
         }
     }
 }
@@ -416,9 +546,15 @@ mod tests {
     use super::*;
     use crate::device::publish_queue::publish_entry;
     use crate::device::replica::ReplicaOrigin;
-    use aruna_core::UserId;
+    use crate::device_node::sync_note::{NoteSyncOperation, SyncNote};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::{FolderMode, RemoteBinding};
+    use aruna_core::structs::synced_folder::{FolderMode, RemoteBinding};
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use std::sync::Arc;
 
     fn replica(state: ReplicaState) -> ReplicaRecord {
         let mut replica = ReplicaRecord::new(
@@ -439,6 +575,7 @@ mod tests {
             "notes".to_string(),
             false,
             "{}".to_string(),
+            aruna_core::time::unix_timestamp_millis(),
         );
         entry.state = state;
         entry
@@ -470,7 +607,7 @@ mod tests {
 
     fn base(synced: bool, entry: EntryState) -> SyncBase {
         SyncBase {
-            synced: synced.then(|| aruna_core::structs::SyncedBytes {
+            synced: synced.then(|| aruna_core::structs::synced_folder::SyncedBytes {
                 fingerprint: "f".to_string(),
                 blake3: [6u8; 32],
                 size: 1,
@@ -545,35 +682,14 @@ mod tests {
         assert_eq!(empty.last_error.as_deref(), Some("remote unavailable"));
     }
 
-    #[test]
-    fn windows_realm_contact() {
-        // A device that has not heard from its realm in two beats is offline,
-        // and a run that never finished stops blocking the next one.
-        let now = 1_000_000;
-        let state = DeviceSyncState {
-            last_contact_ms: Some(now - 1_000),
-            last_sync_ms: Some(now - 1_000),
-            run_started_ms: Some(now - 1_000),
-        };
-        assert!(state.realm_reachable(now));
-        assert!(state.run_active(now));
-
-        let stale = DeviceSyncState {
-            last_contact_ms: Some(now - REALM_CONTACT_WINDOW.as_millis() as u64 - 1),
-            run_started_ms: Some(now - SYNC_RUN_LIFETIME.as_millis() as u64 - 1),
-            ..state
-        };
-        assert!(!stale.realm_reachable(now));
-        assert!(!stale.run_active(now));
-        assert!(!DeviceSyncState::default().realm_reachable(now));
-    }
-
     #[tokio::test]
     async fn runs_pending_beat() {
         // A device always has its folder beat pending, so an explicit run must move it to now.
-        use crate::tests::incoming::RecordingTaskHandler;
+        use aruna_drivers::testing::RecordingTaskHandler;
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let (seen, mut fired) = tokio::sync::mpsc::channel(16);
         let task = aruna_tasks::TaskHandle::new();
         task.set_inbound_handler(Arc::new(RecordingTaskHandler { seen }))
@@ -589,12 +705,13 @@ mod tests {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task),
             compute_handle: None,
+            outbound_handle: None,
         });
 
-        assert!(start_sync_run(&context).await);
+        assert!(drive(start_sync_run(), &context).await.unwrap());
         // Detects a wakeup that never arrives, not a slow machine.
         let woke = tokio::time::timeout(Duration::from_secs(60), async {
             while let Some(key) = fired.recv().await {
@@ -615,36 +732,58 @@ mod tests {
     async fn drops_failed_contact() {
         // The first failed attempt shows the realm as unreachable; the next answer restores it.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
-        note_contact(&context).await;
-        let now = unix_timestamp_millis();
-        assert!(read_sync_state(&context).await.realm_reachable(now));
-        note_failure(&context).await;
-        assert!(!read_sync_state(&context).await.realm_reachable(now));
-        note_contact(&context).await;
-        assert!(read_sync_state(&context).await.realm_reachable(now));
+        let now = aruna_core::time::unix_timestamp_millis();
+        let note = |note| aruna_drivers::driver::drive(NoteSyncOperation::new(note, now), &context);
+        note(SyncNote::Contact).await.unwrap();
+        assert!(
+            drive(read_sync_state(), &context)
+                .await
+                .unwrap()
+                .realm_reachable(now)
+        );
+        note(SyncNote::Failure).await.unwrap();
+        assert!(
+            !drive(read_sync_state(), &context)
+                .await
+                .unwrap()
+                .realm_reachable(now)
+        );
+        note(SyncNote::Contact).await.unwrap();
+        assert!(
+            drive(read_sync_state(), &context)
+                .await
+                .unwrap()
+                .realm_reachable(now)
+        );
     }
 
     #[tokio::test]
     async fn retries_explicit_sync() {
         // An owner-requested run re-arms retryable failures only.
         let dir = tempfile::tempdir().unwrap();
-        let storage = aruna_storage::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage =
+            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
+                .unwrap();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let document_id = Ulid::generate();
         let retryable = draft(PublishState::Failed {
@@ -673,8 +812,8 @@ mod tests {
             ));
         }
 
-        assert!(start_sync_run(&context).await);
-        let entries = read_publish_entries(&context).await;
+        assert!(drive(start_sync_run(), &context).await.unwrap());
+        let entries = drive(read_publish_entries(), &context).await.unwrap();
         assert!(entries.iter().any(|entry| matches!(
             entry.state,
             PublishState::Publishing {

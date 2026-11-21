@@ -2,20 +2,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
+use crate::device::retry::RetryView;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::ConversionError;
 use aruna_core::keyspaces::{DEVICE_FENCE_KEYSPACE, DEVICE_INTAKE_KEYSPACE};
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::{GroupId, Key, TxnId, Value};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::warn;
 use ulid::Ulid;
 
-use super::backlog::RetryView;
-use crate::auth::bearer_token::token_grant;
+use crate::auth::error::token_grant;
 
 /// Entries one device may hold. A device authors for one person, so the queue
 /// is a human-sized backlog rather than an unbounded spool.
@@ -96,8 +100,8 @@ impl PublishEntry {
         document_path: String,
         public: bool,
         jsonld: String,
+        now: u64,
     ) -> Self {
-        let now = unix_timestamp_millis();
         Self {
             draft_id,
             owner,
@@ -124,8 +128,8 @@ impl PublishEntry {
         record: &MetadataRegistryRecord,
         batch: MetadataBatch,
         authored: MetadataBatchSource,
+        now: u64,
     ) -> Self {
-        let now = unix_timestamp_millis();
         Self {
             draft_id,
             owner,
@@ -264,43 +268,98 @@ pub fn scan_publish_queue(start_after: Option<Key>, txn_id: Option<TxnId>) -> Ef
     })
 }
 
-pub fn read_publish_entry(draft_id: Ulid, txn_id: Option<TxnId>) -> Effect {
-    Effect::Storage(StorageEffect::Read {
-        key_space: DEVICE_INTAKE_KEYSPACE.to_string(),
-        key: publish_key(draft_id),
-        txn_id,
-    })
+/// The call that reads one queued draft.
+pub(super) fn read_entry(draft_id: Ulid) -> IoCall {
+    read_row(DEVICE_INTAKE_KEYSPACE, publish_key(draft_id))
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ClaimError {
+    #[error(transparent)]
+    Io(#[from] IoError),
+}
+
+/// Stores `next` only while the entry still carries the state the scan read, in one
+/// transaction, and outputs whether the entry was claimed. A delete committed in between
+/// therefore wins instead of the entry coming back as `Publishing`.
+#[derive(Debug, PartialEq)]
+pub struct ClaimStateOperation {
+    entry: PublishEntry,
+    next: PublishState,
+    written: bool,
+}
+
+impl ClaimStateOperation {
+    pub fn new(entry: PublishEntry, next: PublishState) -> Self {
+        Self {
+            entry,
+            next,
+            written: false,
+        }
+    }
+
+    fn write(&mut self, current: Option<PublishEntry>) -> Next<bool> {
+        if !current.is_some_and(|current| current.state == self.entry.state) {
+            return Next::Done(false);
+        }
+        let claimed = entry_with_state(&self.entry, self.next.clone());
+        let Ok(row) = publish_entry(&claimed) else {
+            warn!(draft_id = %self.entry.draft_id, "Failed to encode a queued draft");
+            return Next::Done(false);
+        };
+        self.written = true;
+        Next::Call(IoCall::Write(vec![row]))
+    }
+}
+
+impl Operation for ClaimStateOperation {
+    type Output = bool;
+    type Error = ClaimError;
+
+    fn first(&mut self) -> Result<Next<bool>, ClaimError> {
+        Ok(Next::Call(read_entry(self.entry.draft_id)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<bool>, ClaimError> {
+        if self.written {
+            result.done()?;
+            return Ok(Next::Done(true));
+        }
+        let [stored] = values::<1>(result)?;
+        let current = stored.and_then(|bytes| PublishEntry::from_bytes(&bytes).ok());
+        Ok(self.write(current))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// What one drain pass achieved, so the caller knows how soon to look again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainOutcome {
+    /// The pass could not complete; earlier pages may already be forwarded.
+    Deferred,
+    /// At least one entry asked for another pass; it does not prove entries remain.
+    Recheck,
+    /// No entry asked for another pass.
+    Idle,
 }
 
 #[cfg(test)]
 mod pure_tests {
-    use super::{PublishEntry, PublishState, publish_key};
-    use aruna_core::UserId;
+    use super::{
+        ClaimStateOperation, DEVICE_INTAKE_KEYSPACE, PublishEntry, PublishState, entry_with_state,
+        publish_entry, publish_key,
+    };
+    use crate::tests::device::record;
+    use aruna_core::calls::{IoCall, IoResult, Next};
     use aruna_core::metadata::{MetadataBatch, MetadataBatchSource, MetadataDot, MetadataQuadOp};
+    use aruna_core::operation::Operation;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_core::structs::placement::record::PlacementRef;
-    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_core::user::id::UserId;
     use craqle::VectorClock;
     use ulid::Ulid;
-
-    fn record() -> MetadataRegistryRecord {
-        let document_id = Ulid::from_bytes([2u8; 16]);
-        MetadataRegistryRecord {
-            realm_id: RealmId::from_bytes([3u8; 32]),
-            group_id: Ulid::from_bytes([1u8; 16]),
-            document_id,
-            document_path: "notes".to_string(),
-            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
-            public: false,
-            permission_path: "/notes".to_string(),
-            placement: PlacementRef::NIL,
-            holder_node_ids: Vec::new(),
-            created_at_ms: 1,
-            updated_at_ms: 2,
-            establishing_event_id: Ulid::from_bytes([4u8; 16]),
-            last_event_id: Ulid::from_bytes([5u8; 16]),
-        }
-    }
 
     fn batch() -> MetadataBatch {
         MetadataBatch {
@@ -329,6 +388,7 @@ mod pure_tests {
             "/notes".to_string(),
             false,
             "{}".to_string(),
+            10,
         )
     }
 
@@ -361,6 +421,7 @@ mod pure_tests {
             MetadataBatchSource::UpsertDataEntity {
                 jsonld: r#"{"@id":"data.csv"}"#.to_string(),
             },
+            10,
         );
         let decoded = PublishEntry::from_bytes(&entry.to_bytes().unwrap()).unwrap();
         assert_eq!(decoded, entry);
@@ -421,5 +482,58 @@ mod pure_tests {
                 attempts: 0,
             }) if retried == document_id
         ));
+    }
+
+    fn publishing() -> PublishState {
+        PublishState::Publishing {
+            document_id: Ulid::from_parts(4, 4),
+            due_at_ms: 0,
+            attempts: 1,
+        }
+    }
+
+    fn stored(entry: &PublishEntry) -> IoResult {
+        IoResult::Values(vec![Some(entry.to_bytes().unwrap().into())])
+    }
+
+    // An entry still in the scanned state is claimed in the operation's transaction.
+    #[test]
+    fn claims_unchanged_entry() {
+        let entry = entry();
+        let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
+        assert_eq!(
+            claim.transaction(),
+            aruna_core::operation::TransactionMode::Write
+        );
+        let read = (
+            DEVICE_INTAKE_KEYSPACE.to_string(),
+            publish_key(entry.draft_id),
+        );
+        assert_eq!(claim.first(), Ok(Next::Call(IoCall::Read(vec![read]))));
+        let row = publish_entry(&entry_with_state(&entry, publishing())).unwrap();
+        assert_eq!(
+            claim.next(stored(&entry)),
+            Ok(Next::Call(IoCall::Write(vec![row])))
+        );
+        assert_eq!(claim.next(IoResult::Done), Ok(Next::Done(true)));
+    }
+
+    // An entry that moved on or went away is left alone; another result fails.
+    #[test]
+    fn moved_entry_kept() {
+        let entry = entry();
+        let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
+        claim.first().unwrap();
+        let moved = entry_with_state(&entry, publishing());
+        assert_eq!(claim.next(stored(&moved)), Ok(Next::Done(false)));
+        let mut claim = ClaimStateOperation::new(entry.clone(), publishing());
+        claim.first().unwrap();
+        assert_eq!(
+            claim.next(IoResult::Values(vec![None])),
+            Ok(Next::Done(false))
+        );
+        let mut claim = ClaimStateOperation::new(entry, publishing());
+        claim.first().unwrap();
+        assert!(claim.next(IoResult::Woke).is_err());
     }
 }

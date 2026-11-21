@@ -6,7 +6,7 @@ datasets, objects, services, jobs and state through module functions; every chec
 from . import datasets, jobs, objects
 from ._run import Form, Request, SyncEvent, _field_loaders, _loaders, fields, log, on, run, settings, starts
 from .datasets import Dataset
-from .jobs import Job
+from .jobs import Job, Task, task
 from .objects import Object
 from .services import Reply, Service, secret, service
 from .state import state
@@ -42,6 +42,6 @@ except ImportError:
 __all__ = [
     "ArunaError", "Conflict", "Dataset", "Fail", "Form", "InvalidCall", "InvalidInput", "Job",
     "LimitReached", "NotAllowed", "NotFound", "Object", "Reply", "Request", "Retry", "Service",
-    "ServiceError", "SyncEvent", "Unavailable", "UnknownOutcome", "datasets", "jobs", "log", "objects",
-    "on", "run", "secret", "service", "settings", "state",
+    "ServiceError", "SyncEvent", "Task", "Unavailable", "UnknownOutcome", "datasets", "jobs", "log",
+    "objects", "on", "run", "secret", "service", "settings", "state", "task",
 ]

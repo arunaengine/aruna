@@ -4,15 +4,15 @@
 
 use std::time::SystemTime;
 
-use aruna_core::UserId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_storage::storage::StorageHandle;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
 
 use super::*;
 use crate::distribution::inventory::{InventoryChange, InventoryUpdate};
 use crate::distribution::test_store::{apply, context, install, open, range};
-use crate::driver::drive;
+use aruna_drivers::driver::drive;
 
 fn set() -> Ulid {
     Ulid::from_bytes([8; 16])

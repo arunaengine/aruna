@@ -3,53 +3,58 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::driver::DriverContext;
-use crate::metadata::protocol::MetadataReadError;
-use crate::notifications::inbox::upsert_inbox_records;
-use crate::notifications::settings::SettingPeers;
-use aruna_core::UserId;
-use aruna_core::compute::SecretBytes;
+#[cfg(test)]
+use crate::notifications::inbox::UpsertInboxOperation;
+#[cfg(test)]
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
+use aruna_core::structs::execution::notification_watch::{
+    WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_storage::storage::{FjallStorage, StorageHandle};
+use aruna_core::user::id::UserId;
+#[cfg(test)]
+use aruna_drivers::driver::{DriverContext, drive};
+#[cfg(test)]
+use aruna_storage::storage::handle::StorageHandle;
+#[cfg(test)]
+use aruna_storage::storage::worker::FjallStorage;
+#[cfg(test)]
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
 
-pub(crate) fn temp_storage() -> (TempDir, StorageHandle) {
+#[cfg(test)]
+pub fn temp_storage() -> (TempDir, StorageHandle) {
     let directory = tempdir().unwrap();
     let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
     (directory, storage)
 }
 
-pub(crate) fn context(storage: &StorageHandle) -> DriverContext {
-    DriverContext {
-        storage_handle: storage.clone(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
+#[cfg(test)]
+pub fn context(storage: &StorageHandle) -> DriverContext {
+    aruna_drivers::testing::test_context(storage.clone())
 }
 
-pub(crate) fn context_with_storage() -> (TempDir, DriverContext) {
+#[cfg(test)]
+pub fn context_with_storage() -> (TempDir, DriverContext) {
     let (directory, storage) = temp_storage();
     (directory, context(&storage))
 }
 
-pub(crate) fn user(realm: u8, seed: u8) -> UserId {
+pub fn user(realm: u8, seed: u8) -> UserId {
     UserId::new(Ulid::from_bytes([seed; 16]), RealmId([realm; 32]))
 }
 
-pub(crate) fn record(
+pub fn record(
     recipient: UserId,
     class: NotificationClass,
     created_at_ms: u64,
 ) -> NotificationRecord {
     NotificationRecord::new(
+        ulid::Ulid::generate(),
         recipient,
         class,
         NotificationKind::AddedToGroup {
@@ -60,52 +65,16 @@ pub(crate) fn record(
     )
 }
 
-pub(crate) async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
-    assert_eq!(
-        upsert_inbox_records(storage, records).await,
-        Ok(records.len())
-    );
+#[cfg(test)]
+pub async fn seed(storage: &StorageHandle, records: &[NotificationRecord]) {
+    let upsert = UpsertInboxOperation::new(records.to_vec());
+    let outcome = drive(upsert, &context(storage)).await;
+    assert_eq!(outcome.map(|outcome| outcome.written), Ok(records.len()));
 }
 
-/// Management nodes that open every setting with a fixed secret and count the requests. A node
-/// without a secret is unreachable.
-#[derive(Default)]
-pub(crate) struct CannedPeers {
-    pub secrets: std::collections::HashMap<aruna_core::NodeId, SecretBytes>,
-    pub opens: std::sync::atomic::AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl SettingPeers for CannedPeers {
-    async fn open(
-        &self,
-        node: aruna_core::NodeId,
-        _target: DocumentTarget,
-        _bytes: Vec<u8>,
-    ) -> Result<SecretBytes, MetadataReadError> {
-        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.secrets
-            .get(&node)
-            .cloned()
-            .ok_or(MetadataReadError::Unavailable)
-    }
-}
-
-/// Peers where every manager opens settings with `secret`.
-pub(crate) fn opening(secret: &[u8]) -> CannedPeers {
-    let secret = SecretBytes::new(secret.to_vec());
-    CannedPeers {
-        secrets: managers().map(|node| (node, secret.clone())).into(),
-        ..Default::default()
-    }
-}
-
+#[cfg(test)]
 /// Stores one register write of a setting on this node, as a local write or sync would.
-pub(crate) async fn store_setting(
-    storage: &StorageHandle,
-    target: &DocumentTarget,
-    bytes: Vec<u8>,
-) {
+pub async fn store_setting(storage: &StorageHandle, target: &DocumentTarget, bytes: Vec<u8>) {
     let write = aruna_core::effects::StorageEffect::Write {
         key_space: target.storage_keyspace().to_string(),
         key: target.storage_key(),
@@ -116,6 +85,144 @@ pub(crate) async fn store_setting(
 }
 
 /// Three management nodes, in config order.
-pub(crate) fn managers() -> [aruna_core::NodeId; 3] {
+pub fn managers() -> [aruna_core::id::NodeId; 3] {
     [61u8, 62, 63].map(|seed| iroh::SecretKey::from_bytes(&[seed; 32]).public())
+}
+
+#[cfg(test)]
+/// Creates a watch on this node as its holder, with the owner's READ check and replication.
+pub async fn create_holder_watch(
+    context: &DriverContext,
+    local_node_id: aruna_core::id::NodeId,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    authorization: aruna_core::structs::execution::notification_watch::WatchAuthorizationBinding,
+    now_ms: u64,
+) -> Result<
+    aruna_core::structs::execution::notification_watch::WatchSubscription,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let watch = (path_prefix, event_mask);
+    let create = crate::notifications::watch::store::CreateWatchOperation::new(
+        (Ulid::generate(), Ulid::generate()),
+        local_node_id,
+        owner,
+        watch,
+        authorization,
+        now_ms,
+    )?;
+    drive(create, context).await
+}
+
+#[cfg(test)]
+/// Stores a watch of `owner` on this node without authorization or replication.
+pub async fn create_local_watch(
+    storage: &StorageHandle,
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    now_ms: u64,
+) -> Result<
+    aruna_core::structs::execution::notification_watch::WatchSubscription,
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let (subscription, store) = local_watch(owner, path_prefix, event_mask, now_ms)?;
+    drive(store, &context(storage)).await?;
+    Ok(subscription)
+}
+
+/// A validated watch of `owner` and the operation that stores it on this node without
+/// authorization or replication.
+pub fn local_watch(
+    owner: UserId,
+    path_prefix: String,
+    event_mask: aruna_core::structs::execution::notification_watch::WatchEventMask,
+    now_ms: u64,
+) -> Result<
+    (
+        aruna_core::structs::execution::notification_watch::WatchSubscription,
+        crate::notifications::watch::store::StoreWatchOperation,
+    ),
+    crate::notifications::watch::records::WatchSubscriptionError,
+> {
+    let subscription = crate::notifications::watch::records::validated_subscription(
+        Ulid::generate(),
+        owner,
+        path_prefix,
+        event_mask,
+        now_ms,
+        Default::default(),
+    )?;
+    let store =
+        crate::notifications::watch::store::StoreWatchOperation::create(subscription.clone(), None);
+    Ok((subscription, store))
+}
+
+#[cfg(test)]
+/// Deletes a watch of `owner` on this node without replication.
+pub async fn delete_local_watch(
+    storage: &StorageHandle,
+    owner: UserId,
+    watch_id: Ulid,
+) -> Result<(), crate::notifications::watch::records::WatchSubscriptionError> {
+    let store =
+        crate::notifications::watch::store::StoreWatchOperation::delete(owner, watch_id, None);
+    drive(store, &context(storage)).await.map(|_| ())
+}
+
+/// A delivery from `node_id(2)` to `node_id(1)`, which holds the inbox of `user(1, 2)`.
+pub fn peer_input() -> crate::notifications::deliver::DeliverInput {
+    use crate::tests::locations::node_id;
+    crate::notifications::deliver::DeliverInput {
+        peer: node_id(2),
+        local: node_id(1),
+        local_realm: user(1, 2).realm_id,
+        now_ms: 1_000,
+    }
+}
+
+/// A direct notification whose ids and time follow `seed`.
+pub fn seeded_record(recipient: UserId, seed: u8) -> NotificationRecord {
+    NotificationRecord::new(
+        ulid::Ulid::generate(),
+        recipient,
+        NotificationClass::Direct,
+        NotificationKind::AddedToGroup {
+            group_id: Ulid::from_bytes([seed; 16]),
+            actor_user_id: recipient,
+        },
+        1_700_000_000_000 + seed as u64,
+    )
+}
+
+pub fn upload_event(realm_id: RealmId, actor: UserId, path: &str) -> WatchEvent {
+    let (_, key) = path.split_once('/').expect("bucket/key fixture");
+    WatchEvent {
+        event_id: Ulid::from_bytes([7u8; 16]),
+        realm_id,
+        kind: WatchEventKind::DataUploaded,
+        path: data_path(key),
+        actor,
+        occurred_at_ms: 1_700_000_000_000,
+        detail: WatchEventDetail::DataUploaded {
+            group_id: data_group_id(),
+            node_id: data_node_id(),
+            bucket: "bucket".to_string(),
+            key: key.to_string(),
+            size_bytes: 16,
+        },
+    }
+}
+
+pub fn data_group_id() -> Ulid {
+    Ulid::from_bytes([31u8; 16])
+}
+
+pub fn data_node_id() -> NodeId {
+    iroh::SecretKey::from_bytes(&[31u8; 32]).public()
+}
+
+pub fn data_path(key: &str) -> String {
+    watch_resource_path(data_group_id(), data_node_id(), "bucket", key)
 }

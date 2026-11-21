@@ -4,14 +4,17 @@
 
 use super::scope::resolve_scope;
 use super::server::S3OpLabel;
-use super::service::forwarded_digest;
+use super::service::forward::forwarded_digest;
 use super::util::{anonymous_read_allowed, operation_permission, public_read_allowed};
 use crate::object_key::ObjectKey;
 use crate::rate_limit::{LocalKey, LocalLease, LocalPermit};
-use crate::s3::service::InputView;
+use crate::s3::service::view::InputView;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::credential_encryption::{CredentialEncryptionKey, EncryptedS3Secret};
 use aruna_core::errors::StorageError;
+use aruna_core::id::NodeId;
+use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, SessionRef};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
@@ -23,24 +26,25 @@ use aruna_core::structs::storage::distribution::delegation::{
 };
 use aruna_core::structs::storage::encryption::TokenCredential;
 use aruna_core::structs::storage::share::SHARE_CREDENTIAL_PREFIX;
-use aruna_core::{NodeId, UserId};
-use aruna_operations::auth::bearer_token::{account_deactivated, realm_user_cutoff};
-use aruna_operations::auth::request_authorization::{AuthorizeError, authorize};
-use aruna_operations::auth::request_policy::{
-    PolicyRequestExtras, enforce_policies, policy_request_with,
-};
-use aruna_operations::distribution::delegate::{DelegateError, accept_delegation};
-use aruna_operations::distribution::guard::{delegated_range, delegated_read};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive, drive_retry};
+use aruna_operations::auth::bearer_token::AccountDeactivatedOperation;
+use aruna_operations::auth::bearer_token::UserCutoffOperation;
+use aruna_operations::auth::enforcement::EnforcePolicyOperation;
+use aruna_operations::auth::error::AuthorizeError;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::distribution::accept_delegation::DelegateError;
+use aruna_operations::distribution::delegate::accept_delegation;
+use aruna_operations::distribution::routing::{delegated_range, delegated_read};
+use aruna_operations::document_repository::GetConfigOperation;
 use aruna_operations::jobs::workflow::input_view::view_job;
-use aruna_operations::realm::get_config::GetConfigOperation;
 use aruna_operations::s3::access::get::{GetAccessError, GetAccessOperation};
 use aruna_operations::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::session::{
-    GetS3Operation, S3SessionError, TouchS3Config, TouchS3Operation,
-};
-use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_operations::s3::session::S3SessionError;
+use aruna_operations::s3::session::get::GetS3Operation;
+use aruna_operations::s3::session::touch::{TouchS3Config, TouchS3Operation};
+use aruna_operations::staging::offered_directory::OfferedDirectoryError;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use http::{HeaderMap, Uri};
 use s3s::access::{S3Access, S3AccessContext};
@@ -277,9 +281,13 @@ impl S3Access for AuthProvider {
         if matches!(action, Action::Write)
             && let Some(bucket) = cx.s3_path().get_bucket_name().map(str::to_owned)
         {
-            guard_bucket_write(self.driver_ctx.as_ref(), &bucket)
-                .await
-                .map_err(map_offered_error)?;
+            drive(
+                BucketGuardOperation::new(bucket.as_str()),
+                self.driver_ctx.as_ref(),
+            )
+            .await
+            .map_err(OfferedDirectoryError::from)
+            .map_err(map_offered_error)?;
         }
 
         // Reuse this request context for ordinary and per-object policy checks.
@@ -287,13 +295,15 @@ impl S3Access for AuthProvider {
 
         // DeleteObjects checks its body keys in the handler after these credential checks.
         if cx.s3_op().name() != "DeleteObjects" {
-            match authorize(
+            match drive(
+                AuthorizeOperation::new(
+                    self.realm_id,
+                    &auth_context,
+                    &path,
+                    &required_permission,
+                    extras.clone(),
+                ),
                 self.driver_ctx.as_ref(),
-                self.realm_id,
-                &auth_context,
-                &path,
-                &required_permission,
-                extras.clone(),
             )
             .await
             {
@@ -313,17 +323,17 @@ impl S3Access for AuthProvider {
         }
 
         if let Some(token_hash) = session_token_hash {
-            drive(
-                TouchS3Operation::new(TouchS3Config {
-                    access_key: access_key_id,
-                    token_hash,
-                    now,
-                    issued_by: *self.node_id.as_bytes(),
-                }),
-                self.driver_ctx.as_ref(),
-            )
-            .await
-            .map_err(map_session_error)?;
+            let config = TouchS3Config {
+                access_key: access_key_id,
+                token_hash,
+                now,
+                issued_by: *self.node_id.as_bytes(),
+            };
+            let seed = config.access_key.clone();
+            let build = || TouchS3Operation::new(config.clone());
+            drive_retry(build, self.driver_ctx.as_ref(), seed.as_bytes())
+                .await
+                .map_err(map_session_error)?;
         }
 
         cx.extensions_mut().insert(extras);
@@ -715,10 +725,12 @@ impl AuthProvider {
             .ok()
             .and_then(|value| SignedDelegation::decode(value).ok())
             .ok_or_else(|| denied("malformed delegation"))?;
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
-        let delegation = match accept_delegation(&self.driver_ctx, &signed, now).await {
+        let now = aruna_clock::unix_timestamp_secs();
+        let accepted = match accept_delegation(self.driver_ctx.node_and_realm(), &signed, now) {
+            Ok(accept) => drive(accept, &self.driver_ctx).await,
+            Err(error) => Err(error),
+        };
+        let delegation = match accepted {
             Ok(delegation) => delegation,
             Err(DelegateError::Unavailable) => {
                 return Err(s3_error!(
@@ -770,8 +782,8 @@ impl AuthProvider {
         if let Some(binding) = bucket_info.distribution.as_ref().filter(|_| !listing) {
             let context = self.driver_ctx.as_ref();
             let routed = match matches!(operation, "GetObject" | "HeadObject") {
-                true => delegated_read(context, binding, delegation.range_id, &key).await,
-                false => delegated_range(context, binding, delegation.range_id, &key).await,
+                true => drive(delegated_read(binding, delegation.range_id, &key), context).await,
+                false => drive(delegated_range(binding, delegation.range_id, &key), context).await,
             };
             routed.map_err(|error| crate::s3::error::guard_error(&error))?;
         }
@@ -818,13 +830,15 @@ impl AuthProvider {
             issued_by: *delegation.issuer.as_bytes(),
             revoked_at: None,
         };
-        let authorized = authorize(
+        let authorized = drive(
+            AuthorizeOperation::new(
+                self.realm_id,
+                &auth_context,
+                &path,
+                &required,
+                extras.clone(),
+            ),
             self.driver_ctx.as_ref(),
-            self.realm_id,
-            &auth_context,
-            &path,
-            &required,
-            extras.clone(),
         )
         .await;
         match authorized {
@@ -877,13 +891,15 @@ impl AuthProvider {
         let path = object_permission_path(self.realm_id, group_id, self.node_id, &bucket, &key);
 
         let extras = request_extras(cx, cx.s3_op().name());
-        authorize(
+        drive(
+            AuthorizeOperation::new(
+                self.realm_id,
+                &AuthContext::anonymous(self.realm_id),
+                &path,
+                &Permission::READ,
+                extras.clone(),
+            ),
             self.driver_ctx.as_ref(),
-            self.realm_id,
-            &AuthContext::anonymous(self.realm_id),
-            &path,
-            &Permission::READ,
-            extras.clone(),
         )
         .await
         .map_err(map_authorize_error)?;
@@ -964,9 +980,12 @@ impl AuthProvider {
             .strip_prefix(SESSION_ACCESS_PREFIX)
             .unwrap_or(access_key_id);
         let issued = ulid::Ulid::from_string(key_id).map_or(0, |id| id.timestamp_ms() / 1000);
-        let cutoff = realm_user_cutoff(&self.driver_ctx.storage_handle, self.realm_id, user_id)
-            .await
-            .map_err(|_| s3_error!(ServiceUnavailable, "Revocation state is unavailable"))?;
+        let cutoff = drive(
+            UserCutoffOperation::new(self.realm_id, user_id),
+            &self.driver_ctx,
+        )
+        .await
+        .map_err(|_| s3_error!(ServiceUnavailable, "Revocation state is unavailable"))?;
         if cutoff.is_some_and(|cutoff| issued < cutoff) {
             return Err(s3_error!(AccessDenied, "Credential has been revoked"));
         }
@@ -1002,7 +1021,7 @@ impl AuthProvider {
 
     /// Denies every key of an account this realm's replicated record marks deactivated.
     async fn check_status(&self, user_id: &UserId) -> S3Result<()> {
-        match account_deactivated(&self.driver_ctx.storage_handle, user_id).await {
+        match drive(AccountDeactivatedOperation::new(user_id), &self.driver_ctx).await {
             Ok(false) => Ok(()),
             Ok(true) => Err(s3_error!(AccessDenied, "Account is deactivated")),
             Err(_) => Err(s3_error!(
@@ -1160,10 +1179,12 @@ impl AuthProvider {
         }
         // The ordinary path enforces policies after RBAC, so an admitted
         // listing runs them too instead of skipping the verdict.
-        enforce_policies(
+        drive(
+            EnforcePolicyOperation::new(
+                self.realm_id,
+                policy_request_with(path, &Permission::READ, Some(auth_context), extras).clone(),
+            ),
             self.driver_ctx.as_ref(),
-            self.realm_id,
-            &policy_request_with(path, &Permission::READ, Some(auth_context), extras),
         )
         .await
         .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))?;
@@ -1208,7 +1229,7 @@ mod tests {
             &Payload::Framed { checksum: None }
         ));
     }
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
 
     fn provider(path: &str) -> AuthProvider {
         let storage = FjallStorage::open(path).unwrap();
@@ -1216,9 +1237,10 @@ mod tests {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         AuthProvider {
             driver_ctx,
@@ -1275,6 +1297,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "plaintext-secret",
+                [3; 24],
             )
             .unwrap();
         access
@@ -1302,6 +1325,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "temporary-secret",
+                [3; 24],
             )
             .unwrap();
         session
@@ -1318,7 +1342,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let provider = provider(dir.path().to_str().unwrap());
         let user = UserId::local(Ulid::generate(), provider.realm_id);
-        let cutoff = aruna_core::time::unix_timestamp_secs() + 60;
+        let cutoff = aruna_clock::unix_timestamp_secs() + 60;
         let mut config = RealmConfigDocument::new(provider.realm_id, Vec::new(), 3);
         config.revoked_tokens.push(TokenRevocation {
             token_hash: user_cutoff_hash(&user),
@@ -1505,7 +1529,7 @@ mod tests {
             S3Session::build_access_key(&ulid::Ulid::generate().to_string()).unwrap();
         long_lived.secret = EncryptedS3Secret::empty();
         long_lived
-            .encrypt_secret(&provider.encryption_key, "long-lived-secret")
+            .encrypt_secret(&provider.encryption_key, "long-lived-secret", [3; 24])
             .unwrap();
         store_access(&provider, &long_lived).await;
 
@@ -1543,6 +1567,7 @@ mod tests {
         old.encrypt_secret(
             &CredentialEncryptionKey::derive(&[7u8; 32]),
             "previous-secret",
+            [3; 24],
         )
         .unwrap();
         let mut session = S3Session {
@@ -1554,6 +1579,7 @@ mod tests {
             .encrypt_secret(
                 &CredentialEncryptionKey::derive(&[7u8; 32]),
                 "temporary-secret",
+                [3; 24],
             )
             .unwrap();
         session.previous = Some(PreviousCredential {

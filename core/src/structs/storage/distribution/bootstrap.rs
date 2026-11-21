@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::inventory::range_interval;
-use super::{DistributionMember, DistributionSnapshot, KeyRange, MemberState};
+use super::{DistributionMember, KeyRange, MemberState};
 use crate::errors::ConversionError;
+use crate::structs::storage::distribution::snapshot::DistributionSnapshot;
 
 /// The walk of one range for one catching-up member on the range's coordinator.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]

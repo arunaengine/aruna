@@ -2,26 +2,26 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_drivers::driver::drive;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::State;
-use axum::{Extension, Json};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
-use aruna_core::structs::identity::auth::AuthContext;
-use aruna_core::structs::{EntryState, SyncedFolder};
-use aruna_operations::device::sync::folders::{
+use aruna_core::structs::synced_folder::{EntryState, SyncedFolder};
+use aruna_operations::device::sync::folders::reads::{
     list_entries, list_folders, list_transfers as read_uploads,
 };
 use ulid::Ulid;
 
 use super::dto::{DeviceTransfer, DeviceTransferList, download_view, transfer_view};
 use super::folders::map_folder_error;
-use crate::auth::require_owner;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(list_device_transfers))
@@ -71,29 +71,26 @@ for.
                     "bytes_done": 0,
                     "attempts": 1,
                     "next_attempt_ms": 1775748191000_i64
-                }]
+                }],
             })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
-        (status = 403, description = "The caller is not the user this device is enrolled for", body = ErrorResponse),
         (status = 404, description = "This node is not a user node and serves no device plane", body = ErrorResponse),
-        (status = 503, description = "The realm configuration has not reached this device yet", body = ErrorResponse)
+        crate::openapi::DeviceErrors
     ),
     security(("bearer_auth" = []))
 )]
 async fn list_device_transfers(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: OwnerAuth,
 ) -> ServerResult<Json<DeviceTransferList>> {
-    require_owner(&state, auth).await?;
     let context = state.get_ctx();
-    let folders: HashMap<Ulid, SyncedFolder> = list_folders(&context)
+    let folders: HashMap<Ulid, SyncedFolder> = drive(list_folders(), &context)
         .await
         .map_err(map_folder_error)?
         .into_iter()
         .map(|folder| (folder.folder_id, folder))
         .collect();
 
-    let uploads = read_uploads(&context)
+    let uploads = drive(read_uploads(), &context)
         .await
         .map_err(map_folder_error)?
         .into_iter()
@@ -108,7 +105,7 @@ async fn list_device_transfers(
     for folder in folders.values() {
         let mut cursor = None;
         loop {
-            let (entries, next) = list_entries(&context, folder.folder_id, None, cursor)
+            let (entries, next) = drive(list_entries(folder.folder_id, None, cursor), &context)
                 .await
                 .map_err(map_folder_error)?;
             for (path, base) in entries {

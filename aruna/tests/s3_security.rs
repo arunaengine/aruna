@@ -329,10 +329,11 @@ async fn protocol_errors_mapped() -> TestResult<()> {
 // gateway's own S3 auth path, and nothing else.
 #[tokio::test]
 async fn workspace_credential_writes() -> TestResult<()> {
-    use aruna_core::structs::execution::job::{
-        ComputeResources, ExecutionSpec, JobId, JobPayload, JobRecord, WorkspaceMode,
-    };
-    use aruna_operations::jobs::workflow::workspace::mint_workspace_credential;
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
+    use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
+    use aruna_drivers::driver::drive;
+    use aruna_operations::jobs::workflow::credential::{MintCredentialOperation, RunIdentity};
 
     let seed = spawn_complete_seed().await?;
     let result = async {
@@ -361,6 +362,7 @@ async fn workspace_credential_writes() -> TestResult<()> {
             env: Default::default(),
             resources: ComputeResources::default(),
             executor_constraint: None,
+            backend: None,
             inputs: Vec::new(),
             file_outputs: Vec::new(),
             workspace_outputs: Vec::new(),
@@ -379,15 +381,16 @@ async fn workspace_credential_writes() -> TestResult<()> {
         );
         record.workspace_mode = WorkspaceMode::Existing;
         record.workspace_bucket = Some("ws-run".to_string());
-        let minted = mint_workspace_credential(
-            seed.context.as_ref(),
-            &spec,
-            &record,
-            node_id,
-            ("ws-run", None),
-        )
-        .await
-        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        let context = seed.context.as_ref();
+        let realm_id = context.serving_realm(record.created_by.realm_id);
+        let run = RunIdentity::new(&spec, &record, realm_id, node_id);
+        let key = (context.net_handle.as_ref()).map(|net| net.credential_encryption_key());
+        let secret = (key, std::time::SystemTime::now());
+        let job = (&spec, &record);
+        let mint = MintCredentialOperation::workspace(job, run, ("ws-run", None), secret);
+        let minted = drive(mint, context)
+            .await
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         let run = client(
             &seed,
             &S3Credentials {

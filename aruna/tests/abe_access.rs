@@ -4,31 +4,34 @@
 
 use crate::shared;
 
-use aruna_core::UserId;
+use aruna_core::calls::CallRun;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::key_seal::{SealedSecret, open_sealed, seal_to};
-use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::abe::{
-    AbeError, GRANT_PURPOSE, SysRng, create_parameters, derive_master, setup_context,
+    AbeError, GRANT_PURPOSE, create_parameters, derive_master, setup_context,
 };
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyScope, MAX_REQUESTS, MAX_WRITES,
 };
 use aruna_core::structs::storage::blob::{bucket_permission_path, group_permission_path};
 use aruna_core::structs::storage::encryption::{BucketKeyRef, copy_info, public_key_of};
-use aruna_kpabe::{Attribute, Envelope, Policy, UserKey};
-use aruna_operations::abe::copies::complete_copies;
-use aruna_operations::abe::rekey::rekey_page;
-use aruna_operations::abe::{
-    KeyAction, KeyError, KeyOperation, KeyResult, MemberKeysOperation, ReissueOperation,
-};
-use aruna_operations::driver::drive;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_kpabe::envelope::Envelope;
+use aruna_kpabe::policy::{Attribute, Policy};
+use aruna_kpabe::scheme::UserKey;
+use aruna_operations::abe::member::MemberKeysOperation;
+use aruna_operations::abe::reissue::ReissueOperation;
+use aruna_operations::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
+use aruna_operations::s3::abe_copies::CompleteCopiesOperation;
 use aruna_operations::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
+use aruna_operations::transfer::abe_rekey::{RekeyOperation, RekeyProgress};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use getrandom::SysRng;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
@@ -40,7 +43,7 @@ use ulid::Ulid;
 const BUCKET: &str = "abe-access";
 
 async fn create_bearer_token(
-    context: &aruna_operations::driver::DriverContext,
+    context: &aruna_drivers::driver::DriverContext,
     user_id: UserId,
     realm_id: aruna_core::structs::identity::realm::RealmId,
     capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
@@ -57,6 +60,22 @@ fn query_url(route: &str, query: &[(&str, &str)]) -> TestResult<reqwest::Url> {
     let mut url = reqwest::Url::parse(route)?;
     url.query_pairs_mut().extend_pairs(query.iter().copied());
     Ok(url)
+}
+
+/// Re-keys one page as the route does.
+async fn rekey_page(
+    context: &DriverContext,
+    bucket: &str,
+    prefix: &str,
+    page: usize,
+) -> Result<(RekeyProgress, bool), KeyError> {
+    let origin = (context.net_handle.as_ref()).map(|net| (*net.realm_id(), net.node_id()));
+    let now = std::time::SystemTime::now();
+    drive(
+        RekeyOperation::new(bucket, prefix, page, origin, now),
+        context,
+    )
+    .await
 }
 
 #[test]
@@ -93,7 +112,7 @@ fn abe_master() {
     let (parameters, master) =
         derive_master(&SecretBytes::new(clamped.to_vec()), &context).unwrap();
     let policy = KeyScope::Subtree("foo/".into()).policy(&a, &[1]).unwrap();
-    let user = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng).unwrap();
+    let user = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng).unwrap();
     for epoch in [1, 2] {
         let attrs = [
             Attribute::Domain(a.domain().unwrap()),
@@ -101,12 +120,13 @@ fn abe_master() {
             Attribute::Prefix(b"foo/".to_vec()),
         ];
         let sealed =
-            aruna_kpabe::seal(&parameters, &attrs, &[8; 32], b"envelope", &mut SysRng).unwrap();
+            aruna_kpabe::envelope::seal(&parameters, &attrs, &[8; 32], b"envelope", &mut SysRng)
+                .unwrap();
         assert_eq!(
-            aruna_kpabe::open(&parameters, &user, &sealed, b"envelope").is_ok(),
+            aruna_kpabe::envelope::open(&parameters, &user, &sealed, b"envelope").is_ok(),
             epoch == 1
         );
-        assert!(aruna_kpabe::open(&parameters, &user, &sealed, b"substituted").is_err());
+        assert!(aruna_kpabe::envelope::open(&parameters, &user, &sealed, b"substituted").is_err());
     }
     assert!(Policy::new(&a.domain().unwrap(), &[], &[]).is_err());
     let scope = KeyScope::Subtree("foo/".into());
@@ -206,10 +226,10 @@ async fn abe_read() -> TestResult<()> {
         let parameters = context.request.parameters.public()?;
         let master = context.request.parameters.recompute(&bucket_private)?;
         let policy = context.request.scope.policy(&context.request.parameters,&context.request.epochs)?;
-        let key = aruna_kpabe::issue(&parameters,&master,&policy,&mut SysRng)?;
+        let key = aruna_kpabe::scheme::issue(&parameters,&master,&policy,&mut SysRng)?;
         let aad = context.bytes()?;
         assert_eq!(aad,bytes(&proposal["aad"]));
-        let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain).map_err(|_|aruna_kpabe::Error))?;
+        let sealed = key.seal(|plain|seal_to(&user_public,GRANT_PURPOSE,&aad,plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_|aruna_kpabe::Error))?;
         let grant_route = format!("{request_route}/{request_id}/grant");
         let mut forged = context.clone(); forged.request.epochs = vec![2];
         let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
@@ -231,7 +251,7 @@ async fn abe_read() -> TestResult<()> {
         let status = response.status(); let env: Value = response.json().await?;
         assert_eq!(status,StatusCode::OK,"{env}");
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        let object = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+        let object = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
         let object_header = STANDARD.encode(object.as_bytes());
         let content_route = format!("{}/api/v1/data/blobs/content",seed.base_url);
         let response = client.get(query_url(&content_route,&query)?).bearer_auth(&token).send().await?;
@@ -250,7 +270,7 @@ async fn abe_read() -> TestResult<()> {
         let status = response.status(); let env: Value = response.json().await?;
         assert_eq!(status,StatusCode::OK,"{env}");
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        let multi_key = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+        let multi_key = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
         let response = client.get(query_url(&content_route,&multi_query)?).bearer_auth(&token)
             .header("x-aruna-object-key",STANDARD.encode(multi_key.as_bytes())).send().await?;
         assert_eq!(response.status(),StatusCode::OK);
@@ -262,7 +282,7 @@ async fn abe_read() -> TestResult<()> {
             let status = response.status(); let env: Value = response.json().await?;
             assert_eq!(status,StatusCode::OK,"{env}");
             let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-            let pending_key = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+            let pending_key = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
             let response = client.get(query_url(&content_route,&pending_query)?).bearer_auth(&token)
                 .header("x-aruna-object-key",STANDARD.encode(pending_key.as_bytes())).send().await?;
             assert_eq!(response.status(),StatusCode::OK);
@@ -275,7 +295,7 @@ async fn abe_read() -> TestResult<()> {
         let response = client.get(query_url(&envelope_route,&wrong_query)?).bearer_auth(&token).send().await?;
         let env: Value = response.json().await?;
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        assert!(aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
+        assert!(aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
         let response = client.get(&encryption).bearer_auth(&token).send().await?;
         let status: Value = response.json().await?;
         assert_eq!(status["unlock"]["state"],"locked");
@@ -286,7 +306,7 @@ async fn abe_read() -> TestResult<()> {
         assert_eq!(response.status(),StatusCode::OK);
         let env: Value = response.json().await?;
         let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-        assert!(aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
+        assert!(aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"])).is_err());
         let copy_query = [("bucket",BUCKET),("key","foo/copy"),("version_id",&copy_version)];
         let response = client.get(query_url(&envelope_route,&copy_query)?).bearer_auth(&token).send().await?;
         assert_eq!(response.status(),StatusCode::CONFLICT);
@@ -303,7 +323,7 @@ async fn abe_read() -> TestResult<()> {
             let status = response.status(); let env: Value = response.json().await?;
             assert_eq!(status,StatusCode::OK,"{env}");
             let cipher = Envelope::from_bytes(&parameters,&bytes(&env["envelope"]["abe"]))?;
-            let object = aruna_kpabe::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
+            let object = aruna_kpabe::envelope::open(&parameters,&key,&cipher,&bytes(&env["context"]["bytes"]))?;
             let response = client.get(query_url(&content_route,&query)?).bearer_auth(&token)
                 .header("x-aruna-object-key",STANDARD.encode(object.as_bytes())).send().await?;
             assert_eq!(response.status(),StatusCode::OK);
@@ -400,8 +420,12 @@ async fn abe_restart() -> TestResult<()> {
         let env: Value = response.json().await?;
         assert_eq!(status, StatusCode::OK, "{env}");
         let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
-        let object =
-            aruna_kpabe::open(&parameters, &key, &cipher, &bytes(&env["context"]["bytes"]))?;
+        let object = aruna_kpabe::envelope::open(
+            &parameters,
+            &key,
+            &cipher,
+            &bytes(&env["context"]["bytes"]),
+        )?;
         let content_route = format!("{}/api/v1/data/blobs/content", seed.base_url);
         let response = client
             .get(query_url(&content_route, &query)?)
@@ -545,10 +569,17 @@ async fn abe_restart_child() -> TestResult<()> {
         .request
         .scope
         .policy(&context.request.parameters, &context.request.epochs)?;
-    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+    let key = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng)?;
     let aad = context.bytes()?;
     let sealed = key.seal(|plain| {
-        seal_to(&user_public, GRANT_PURPOSE, &aad, plain).map_err(|_| aruna_kpabe::Error)
+        seal_to(
+            &user_public,
+            GRANT_PURPOSE,
+            &aad,
+            plain,
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .map_err(|_| aruna_kpabe::Error)
     })?;
     let grant_route = format!("{request_route}/{}/grant", context.request.request_id);
     let response = client.post(&grant_route).bearer_auth(&token).json(&json!({
@@ -678,7 +709,6 @@ async fn transition_settled(http: &reqwest::Client, url: &str, token: &str) -> T
     shared::wait_until(
         "settled transition",
         std::time::Duration::from_secs(120),
-        std::time::Duration::from_millis(50),
         || async move {
             send(http.get(url).bearer_auth(token))
                 .await
@@ -772,8 +802,7 @@ async fn abe_holders() -> TestResult<()> {
         let (holders, notices) = (&[owner.clone(), holder.clone()], &notices);
         let notified = |count: usize| async move {
             for token in holders {
-                let wait = std::time::Duration::from_millis(50);
-                shared::wait_until("key pending notice", std::time::Duration::from_secs(120), wait, || async { notices(token.clone()).await >= count }).await?;
+                shared::wait_until("key pending notice", std::time::Duration::from_secs(120), || async { notices(token.clone()).await >= count }).await?;
                 // The outbox drains in order, so an extra notice would be here already.
                 assert_eq!(notices(token.clone()).await, count);
             }
@@ -791,10 +820,10 @@ async fn abe_holders() -> TestResult<()> {
         let parameters = context.request.parameters.public()?;
         let master = context.request.parameters.recompute(&bucket_private)?;
         let policy = context.request.scope.policy(&context.request.parameters, &context.request.epochs)?;
-        let issued = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+        let issued = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng)?;
         let seal = |record: &Value| -> TestResult<Value> {
             let context: GrantContext = postcard::from_bytes(&bytes(record))?;
-            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain).map_err(|_| aruna_kpabe::Error))?;
+            let sealed = issued.seal(|plain| seal_to(&reader_public, GRANT_PURPOSE, &context.bytes().unwrap(), plain, &mut aruna_core::key_seal::SeedRng::new(&[7; 32])).map_err(|_| aruna_kpabe::Error))?;
             Ok(submission(record, sealed.enc, &sealed.ciphertext))
         };
         let grant_route = format!("{requests}/{request_id}/grant");
@@ -829,7 +858,7 @@ async fn abe_holders() -> TestResult<()> {
         let query = [("bucket", BUCKET), ("key", "foo/data"), ("version_id", &version)];
         let (_, envelope) = send(http.get(query_url(&envelope_route, &query)?).bearer_auth(&reader)).await?;
         let cipher = Envelope::from_bytes(&parameters, &bytes(&envelope["envelope"]["abe"]))?;
-        let object = aruna_kpabe::open(&parameters, &key, &cipher, &bytes(&envelope["context"]["bytes"]))?;
+        let object = aruna_kpabe::envelope::open(&parameters, &key, &cipher, &bytes(&envelope["context"]["bytes"]))?;
         let header = STANDARD.encode(object.as_bytes());
         let response = http.get(query_url(&content, &query)?).header("x-aruna-object-key", &header).send().await?;
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -858,8 +887,8 @@ async fn abe_holders() -> TestResult<()> {
         let context: GrantContext = postcard::from_bytes(&bytes(&owned["records"][0]["record"]))?;
         let racing = KeyGrant { context: context.clone(), enc: [1; 32], ciphertext: vec![1; 16] };
         let auth = AuthContext { user_id: seed.user_id, realm_id: seed.realm_id, path_restrictions: None, session: None };
-        let now = aruna_core::time::unix_timestamp_millis();
-        let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now);
+        let now = aruna_clock::unix_timestamp_millis();
+        let mut operation = CallRun::new(KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), KeyAction::Publish(racing), now));
         let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
             let Effect::Storage(effect) = effect else { panic!("unexpected effect {effect:?}") };
@@ -1464,7 +1493,6 @@ async fn abe_members() -> TestResult<()> {
         shared::wait_until(
             "key pending notification",
             std::time::Duration::from_secs(120),
-            std::time::Duration::from_millis(50),
             || async {
                 pending()
                     .await
@@ -1519,16 +1547,10 @@ async fn abe_members() -> TestResult<()> {
             session: None,
         };
         let (node_id, plain_id) = (seed.net.node_id(), Ulid::from_string(&plain.group_id)?);
-        let now = aruna_core::time::unix_timestamp_millis();
-        let mut operation = MemberKeysOperation::new(auth, node_id, plain_id, vec![first], now);
-        let mut effects = operation.start();
-        assert_eq!(effects.len(), 1, "{effects:?}");
-        let Some(Effect::Storage(scan)) = effects.pop() else {
-            panic!("expected the index scan")
-        };
-        let event = seed.context.storage_handle.send_storage_effect(scan).await;
-        assert!(operation.step(event).is_empty());
-        assert_eq!(operation.finalize(), Ok(Vec::new()));
+        let now = aruna_clock::unix_timestamp_millis();
+        let operation = MemberKeysOperation::new(auth, node_id, plain_id, vec![first], now);
+        let keys = drive(operation, &seed.context).await.unwrap();
+        assert!(keys.opened.is_empty() && keys.failed.is_empty(), "{keys:?}");
 
         // An unindexed bucket joins the index when a change admits a new generation.
         let bucket = "abe-plain-b";
@@ -1654,7 +1676,7 @@ async fn abe_rotation() -> TestResult<()> {
                 assert_eq!(status, StatusCode::OK, "{env}");
                 let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
                 let context = bytes(&env["context"]["bytes"]);
-                let object = aruna_kpabe::open(&parameters, &key, &cipher, &context)?;
+                let object = aruna_kpabe::envelope::open(&parameters, &key, &cipher, &context)?;
                 objects.push(STANDARD.encode(object.as_bytes()));
             }
             Ok::<_, Box<dyn std::error::Error>>(objects)
@@ -1673,7 +1695,6 @@ async fn abe_rotation() -> TestResult<()> {
         shared::wait_until(
             "rotated envelopes",
             std::time::Duration::from_secs(120),
-            std::time::Duration::from_millis(100),
             || async move {
                 for (name, version) in versions {
                     let query = [
@@ -1769,7 +1790,6 @@ async fn abe_conversion() -> TestResult<()> {
         shared::wait_until(
             "converted version",
             std::time::Duration::from_secs(120),
-            std::time::Duration::from_millis(100),
             || async move {
                 let Ok((_, status)) = send(http.get(encryption).bearer_auth(token)).await else {
                     return false;
@@ -1805,7 +1825,7 @@ async fn abe_conversion() -> TestResult<()> {
         assert_eq!(status, StatusCode::OK, "{env}");
         let cipher = Envelope::from_bytes(&parameters, &bytes(&env["envelope"]["abe"]))?;
         let context = bytes(&env["context"]["bytes"]);
-        let object = aruna_kpabe::open(&parameters, &key, &cipher, &context)?;
+        let object = aruna_kpabe::envelope::open(&parameters, &key, &cipher, &context)?;
         let response = http
             .post(format!("{encryption}/lock"))
             .bearer_auth(token)
@@ -1879,11 +1899,17 @@ fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyG
     let parameters = r.parameters.public()?;
     let master = r.parameters.recompute(bucket_private)?;
     let policy = r.scope.policy(&r.parameters, &r.epochs)?;
-    let key = aruna_kpabe::issue(&parameters, &master, &policy, &mut SysRng)?;
+    let key = aruna_kpabe::scheme::issue(&parameters, &master, &policy, &mut SysRng)?;
     let recipient = r.recipient_public.unwrap();
     let sealed = key.seal(|plain| {
-        seal_to(&recipient, GRANT_PURPOSE, &context.bytes().unwrap(), plain)
-            .map_err(|_| aruna_kpabe::Error)
+        seal_to(
+            &recipient,
+            GRANT_PURPOSE,
+            &context.bytes().unwrap(),
+            plain,
+            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+        )
+        .map_err(|_| aruna_kpabe::Error)
     })?;
     Ok(KeyGrant {
         context,
@@ -1892,7 +1918,7 @@ fn sealed_grant(record: &Value, bucket_private: &SecretBytes) -> TestResult<KeyG
     })
 }
 
-type HeldKey = (Vec<u64>, aruna_kpabe::PublicParameters, UserKey);
+type HeldKey = (Vec<u64>, aruna_kpabe::scheme::PublicParameters, UserKey);
 
 /// The epochs, parameters and user keys of the caller's grants, opened with `private`.
 async fn user_keys(base: &str, token: &str, private: &SecretBytes) -> TestResult<Vec<HeldKey>> {
@@ -1937,7 +1963,7 @@ async fn opens(
     let epoch = env["context"]["epoch"].as_u64().unwrap();
     let opened = keys.iter().any(|(_, p, user)| {
         Envelope::from_bytes(p, &abe)
-            .is_ok_and(|c| aruna_kpabe::open(p, user, &c, &context).is_ok())
+            .is_ok_and(|c| aruna_kpabe::envelope::open(p, user, &c, &context).is_ok())
     });
     Ok((epoch, opened))
 }
@@ -2170,10 +2196,15 @@ async fn abe_epochs() -> TestResult<()> {
             session: None,
         };
         let node = seed.net.node_id();
-        let now = aruna_core::time::unix_timestamp_millis();
+        let now = aruna_clock::unix_timestamp_millis();
         let action = KeyAction::Epoch { instant: false };
-        let mut operation =
-            KeyOperation::new(BUCKET.into(), auth.clone(), node, action.clone(), now);
+        let mut operation = CallRun::new(KeyOperation::new(
+            BUCKET.into(),
+            auth.clone(),
+            node,
+            action.clone(),
+            now,
+        ));
         let mut effects: std::collections::VecDeque<Effect> =
             operation.start().into_iter().collect();
         while let Some(effect) = effects.pop_front() {
@@ -2433,7 +2464,7 @@ async fn abe_rekey() -> TestResult<()> {
             caller: seed.user_id,
             key,
             duration: None,
-            now_ms: aruna_core::time::unix_timestamp_millis(),
+            now_ms: aruna_clock::unix_timestamp_millis(),
         };
         let secret = SharedSecret::new(SecretBytes::new(bucket_private.expose().to_vec()));
         drive(UnlockBucketOperation::new(input, secret), &seed.context).await?;
@@ -2481,7 +2512,7 @@ async fn abe_rekey() -> TestResult<()> {
         };
         assert_eq!(read_copy().await?.as_ref(), b"foo/a");
         let origin = (seed.realm_id, seed.net.node_id());
-        complete_copies(&seed.context, key, origin).await?;
+        drive(CompleteCopiesOperation::new(key, origin), &seed.context).await?;
         let completed = envelope(&base, &owner, "bar/copy", &copied).await?;
         assert_eq!(completed.0, StatusCode::OK, "{}", completed.1);
         assert_eq!(read_copy().await?.as_ref(), b"foo/a");
@@ -2521,9 +2552,15 @@ async fn publish_racing(
         path_restrictions: None,
         session: None,
     };
-    let now = aruna_core::time::unix_timestamp_millis();
+    let now = aruna_clock::unix_timestamp_millis();
     let action = KeyAction::Publish(grant);
-    let mut operation = KeyOperation::new(BUCKET.into(), auth, seed.net.node_id(), action, now);
+    let mut operation = CallRun::new(KeyOperation::new(
+        BUCKET.into(),
+        auth,
+        seed.net.node_id(),
+        action,
+        now,
+    ));
     let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
     let mut race = Some(race);
     while let Some(effect) = effects.pop_front() {

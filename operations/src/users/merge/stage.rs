@@ -8,6 +8,7 @@ use aruna_core::admin_documents::{
 };
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::ConversionError;
+use aruna_core::id::NodeId;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, stale_conflict_deletes,
@@ -16,12 +17,12 @@ use aruna_core::structs::identity::auth::{Actor, Role};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::types::{Key, KeySpace, RoleId, Value};
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
 use std::collections::HashMap;
 
-use crate::placement::fence::WriteFence;
-use crate::sync::document_outbox::{new_identified_record, outbox_write_entry};
+use crate::sync::outbox::record::{new_identified_record, outbox_write_entry};
+use aruna_core::placement::fence::WriteFence;
 
 /// One document's reducer before and after the merge, with the events it emitted.
 #[derive(Debug)]
@@ -55,12 +56,15 @@ impl Change {
         })
     }
 
+    /// Applies `op` as a new event with the id `event_id`, minted by the merge run.
     pub(super) fn apply(
         &mut self,
         actor: &Actor,
         op: AdminDocumentOperation,
+        event_id: ulid::Ulid,
     ) -> Result<(), MergeError> {
-        self.events.push(self.state.apply_operation(actor, op)?);
+        self.events
+            .push(self.state.apply_operation(actor, op, event_id)?);
         Ok(())
     }
 
@@ -72,6 +76,7 @@ impl Change {
         roles: &mut HashMap<RoleId, Role>,
         (handed, held): (&[RoleId], &[RoleId]),
         (survivor, merged): (UserId, UserId),
+        (ids, now_ms): (&mut aruna_core::id_mint::IdMint, u64),
     ) -> Result<(), MergeError> {
         let group = matches!(self.state.target, AdminDocumentTarget::Group { .. });
         for (role_id, user_id, added) in handed
@@ -80,9 +85,14 @@ impl Change {
             .chain(held.iter().map(|role_id| (*role_id, merged, false)))
         {
             if self.unseeded(role_id, group) {
-                self.apply(actor, seed_op(role_id, group))?;
+                self.apply(actor, seed_op(role_id, group), ids.mint(now_ms))?;
             }
-            self.apply(actor, assignment_op(role_id, user_id, added, group))?;
+            let event_id = ids.mint(now_ms);
+            self.apply(
+                actor,
+                assignment_op(role_id, user_id, added, group),
+                event_id,
+            )?;
         }
         let assignments = if group {
             self.state.materialized_group_assignments()

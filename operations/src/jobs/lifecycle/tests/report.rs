@@ -2,19 +2,20 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::effects::JobRecordFrame;
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::job::family::{
     JobFamilyId, JobRecordEnvelope, JobRecordKey, JobRecordKind, LogicalJobState,
     PhysicalExecutionState, SubmissionId,
 };
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
-use crate::jobs::lifecycle::report::{AuditPaging, AuditRange, family_audit, family_report};
-use crate::jobs::records::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
-use crate::tests::records::{Family, REALM, context, user};
+use super::{family_audit, family_report};
+use crate::jobs::lifecycle::report::{AuditPaging, AuditRange};
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::tests::records::{Family, REALM, context, user_auth};
+use aruna_drivers::driver::{DriverContext, drive};
 
 async fn append(context: &DriverContext, family: &Family, envelope: JobRecordEnvelope) {
     let record = JobRecordFrame::new(envelope).expect("bounded record");
@@ -39,15 +40,6 @@ async fn seed(context: &DriverContext, family: &Family, terminal: PhysicalExecut
     }
 }
 
-fn auth() -> AuthContext {
-    AuthContext {
-        user_id: user(),
-        realm_id: REALM,
-        path_restrictions: None,
-        session: None,
-    }
-}
-
 #[tokio::test]
 async fn reports_exact_outputs() {
     // A successful family reports its canonical execution and the exact
@@ -56,7 +48,7 @@ async fn reports_exact_outputs() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     seed(&ctx, &family, PhysicalExecutionState::Succeeded).await;
 
-    let report = family_report(&ctx, &auth(), family.job_id)
+    let report = family_report(&ctx, &user_auth(), family.job_id)
         .await
         .expect("alias names a family")
         .expect("report is readable");
@@ -89,7 +81,7 @@ async fn reports_launch_nodes() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     seed(&ctx, &family, PhysicalExecutionState::Succeeded).await;
 
-    let report = family_report(&ctx, &auth(), family.job_id)
+    let report = family_report(&ctx, &user_auth(), family.job_id)
         .await
         .expect("alias names a family")
         .expect("report is readable");
@@ -117,7 +109,7 @@ async fn marks_local_exhaustion() {
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
     seed(&ctx, &family, PhysicalExecutionState::Error).await;
 
-    let report = family_report(&ctx, &auth(), family.job_id)
+    let report = family_report(&ctx, &user_auth(), family.job_id)
         .await
         .expect("alias names a family")
         .expect("report is readable");
@@ -139,7 +131,7 @@ async fn counts_duplicate_success() {
         append(&ctx, &family, envelope).await;
     }
 
-    let report = family_report(&ctx, &auth(), family.job_id)
+    let report = family_report(&ctx, &user_auth(), family.job_id)
         .await
         .expect("alias names a family")
         .expect("report is readable");
@@ -159,7 +151,7 @@ async fn audit_pages_records() {
 
     let first = family_audit(
         &ctx,
-        &auth(),
+        &user_auth(),
         family.job_id,
         AuditRange::Family,
         AuditPaging::new(None, Some(3)).expect("paging is valid"),
@@ -172,7 +164,7 @@ async fn audit_pages_records() {
 
     let second = family_audit(
         &ctx,
-        &auth(),
+        &user_auth(),
         family.job_id,
         AuditRange::Family,
         AuditPaging::new(Some(cursor.as_slice().to_vec()), None).expect("paging is valid"),
@@ -198,7 +190,7 @@ async fn audit_pages_records() {
             AuditPaging::new(None, None).expect("paging is valid"),
         )
         .await,
-        Some(Err(crate::jobs::JobRouteError::NotFound))
+        Some(Err(crate::jobs::route::JobRouteError::NotFound))
     ));
 }
 

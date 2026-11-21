@@ -2,12 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::NodeId;
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::federation::MAX_NAME_LEN;
+use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
 use crate::types::RoleId;
+use crate::user::id::UserId;
 use core::fmt;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePrivateKey;
@@ -61,7 +61,7 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TokenClaims {
     /// Subject: user identity in format `{user_ulid}@{realm_pubkey_base64}`.
     pub sub: String,
@@ -142,7 +142,7 @@ pub struct PathRestriction {
     pub permission: Permission,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum NodeCapabilities {
     // This may seem redundant, but because we need both representations both
     // and need both on (nearly) every request, this mitigates unneeded conversions
@@ -212,6 +212,17 @@ impl NodeCapabilities {
     }
 }
 
+/// Names the variant only: the encoding keys are private key PEM.
+impl fmt::Debug for NodeCapabilities {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Management { .. } => "NodeCapabilities::Management",
+            Self::Server { .. } => "NodeCapabilities::Server",
+            Self::User { .. } => "NodeCapabilities::User",
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthContext {
     pub user_id: UserId,
@@ -221,6 +232,16 @@ pub struct AuthContext {
 }
 
 impl AuthContext {
+    /// The context of `user_id` acting in `realm_id`, without path restrictions or a session.
+    pub fn new(user_id: UserId, realm_id: RealmId) -> Self {
+        Self {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
     /// A user of another realm, or a session opened through a login of another realm.
     pub fn federated(&self) -> bool {
         self.user_id.realm_id != self.realm_id
@@ -298,6 +319,18 @@ pub struct Actor {
     pub realm_id: RealmId,
 }
 
+/// The actor's own unrestricted context, as an operation it runs checks permissions with.
+impl From<&Actor> for AuthContext {
+    fn from(actor: &Actor) -> Self {
+        Self {
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+}
+
 impl TryFrom<&[u8]> for Actor {
     type Error = ConversionError;
 
@@ -317,11 +350,35 @@ impl TryFrom<&Actor> for Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthContext, PathRestriction, Permission, SessionKind, TokenClaims, oidc_subject_key,
+        AuthContext, NodeCapabilities, PathRestriction, Permission, SessionKind, TokenClaims,
+        oidc_subject_key,
     };
-    use crate::UserId;
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use ulid::Ulid;
+
+    #[test]
+    fn capabilities_hide_keys() {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+        let realm_id = RealmId::from_bytes(key.verifying_key().to_bytes());
+        let management = NodeCapabilities::management_node(key.clone()).unwrap();
+        let server = NodeCapabilities::server_node(key, realm_id, "proof".to_string()).unwrap();
+        let NodeCapabilities::Management {
+            realm_encoding_key, ..
+        } = &management
+        else {
+            panic!("expected management capabilities");
+        };
+        let NodeCapabilities::Server {
+            issuer_encoding_key,
+            ..
+        } = &server
+        else {
+            panic!("expected server capabilities");
+        };
+        assert!(!format!("{management:?}").contains(&format!("{realm_encoding_key:?}")));
+        assert!(!format!("{server:?}").contains(&format!("{issuer_encoding_key:?}")));
+    }
 
     #[test]
     fn hashes_oidc_subject() {
@@ -459,9 +516,9 @@ mod tests {
 
 #[cfg(test)]
 mod test {
-    use crate::UserId;
     use crate::structs::identity::auth::{Permission, Role};
     use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
     use std::collections::{HashMap, HashSet};
     use ulid::Ulid;
 

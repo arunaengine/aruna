@@ -3,9 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::walk_cursor::{self, OffsetRow};
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
-use aruna_core::structs::execution::job::{
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::input::{
     StagingJobCheckpoint, StagingJobError, StagingJobItem, StagingJobPhase, StagingJobPrefix,
     StagingJobSpec,
 };
@@ -13,7 +15,7 @@ use aruna_core::structs::execution::staging::StagingStrategy;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
+use aruna_core::user::id::UserId;
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -176,6 +178,18 @@ pub(super) fn checkpoint_rows(
         if is_lane_bound(&key) {
             continue;
         }
+        // Alpha.159 kept a listing offset in the slot the walk cursor has now.
+        match walk_cursor::offset_row(&value) {
+            Some(OffsetRow::Finished(bytes)) => {
+                rows.push((key.to_vec(), bytes));
+                continue;
+            }
+            Some(OffsetRow::Unfinished) => {
+                restarted.push(key.to_vec());
+                continue;
+            }
+            None => {}
+        }
         if postcard::from_bytes::<StagingJobCheckpoint>(&value)
             .is_ok_and(|current| postcard::to_allocvec(&current).is_ok_and(|bytes| bytes == *value))
         {
@@ -209,7 +223,9 @@ mod tests {
     use super::super::tests::{read, write};
     use super::*;
     use aruna_core::keyspaces::{JOB_KEYSPACE, S3_BUCKET_KEYSPACE, STAGING_STATE_KEYSPACE};
-    use aruna_core::structs::execution::job::{JobId, JobPayload, JobRecord, job_record_key};
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::JobPayload;
+    use aruna_core::structs::execution::job::local::{JobRecord, job_record_key};
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::format::Compression;
     use std::time::Duration;
@@ -275,7 +291,9 @@ mod tests {
         let payload = JobPayload::Staging(spec);
         let mut record = JobRecord::new(done, payload, UserId::nil(realm_id), node_id, 5, 5, None);
         record.plan_digest = Some([3; 32]);
+        // That release stored no local admission, the job record's last field.
         let bytes = record.to_bytes().unwrap();
+        let bytes = &bytes[..bytes.len() - 1];
         let at = bytes
             .windows(new_spec.len())
             .position(|part| part == new_spec)

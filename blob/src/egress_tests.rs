@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::invenio::{InvenioClient, InvenioError, head_reference, read_reference};
+use crate::invenio::{InvenioClient, head_reference, read_reference};
+use aruna_core::repository::remote::InvenioError;
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;

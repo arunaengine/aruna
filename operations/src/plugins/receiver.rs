@@ -3,25 +3,44 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
+use std::collections::BTreeSet;
+
 use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementRef, shard_for_subject};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
-use crate::placement::{
-    PlacementResolutionContext, meta_bucket_subject, strategy_for_target, try_resolve_holders,
-};
 use crate::realm::mutate_placement::node_kind;
+use aruna_core::placement::resolver::{
+    PlacementResolutionContext, meta_bucket_subject, strategy_for_target,
+};
+use aruna_core::placement::try_resolve_holders;
 
-/// The first eligible holder of the group's root metadata bucket, in holder order.
-pub fn pick_receiver(
+/// The first eligible holder of the group's root metadata bucket, in holder order. A plugin
+/// with tasks passes the nodes that advertise an executor: then an eligible holder with one
+/// comes first, else any eligible node with one in node id order, else a holder as before.
+pub(crate) fn pick_receiver(
+    config: &RealmConfigDocument,
+    (realm_id, group_id): (RealmId, GroupId),
+    executors: &BTreeSet<NodeId>,
+) -> Option<NodeId> {
+    let holders = metadata_holders(config, realm_id, group_id).unwrap_or_default();
+    let eligible = |node: &&NodeId| eligible(config, **node);
+    let executing = |node: &&NodeId| executors.contains(*node);
+    (holders.iter().filter(eligible).find(executing))
+        .or_else(|| executors.iter().find(eligible))
+        .or_else(|| holders.iter().find(eligible))
+        .copied()
+}
+
+fn metadata_holders(
     config: &RealmConfigDocument,
     realm_id: RealmId,
     group_id: GroupId,
-) -> Option<NodeId> {
+) -> Option<Vec<NodeId>> {
     let path = MetadataRegistryRecord::normalize_document_path("/");
     let target = DocumentTarget::MetadataDocumentLifecycle {
         document_id: Ulid::nil(),
@@ -36,8 +55,7 @@ pub fn pick_receiver(
         strategy_id: strategy.strategy_id,
         shard: shard_for_subject(&subject, strategy.shard_count),
     };
-    let holders = try_resolve_holders(config, &placement).ok()?;
-    holders.into_iter().find(|node| eligible(config, *node))
+    try_resolve_holders(config, &placement).ok()
 }
 
 /// Whether `node` is a server or management node of the realm that is not draining.

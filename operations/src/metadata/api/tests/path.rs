@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::StructuredId;
+use crate::metadata::api::path_types::{
+    merge_path_views, reduce_path_candidates, select_path_holders,
+};
+use aruna_core::structured_id::StructuredId;
 
 #[test]
 fn user_result_opaque() {
@@ -27,7 +30,7 @@ fn user_result_opaque() {
         .iter()
         .map(|candidate| candidate.claim.clone())
         .collect::<Vec<_>>();
-    let winner = aruna_core::structs::resolve_path_claim(&claims)
+    let winner = aruna_core::structs::path_claim::resolve_path_claim(&claims)
         .unwrap()
         .winner;
     let hidden_id = winner.document_id.to_bytes();
@@ -218,10 +221,6 @@ fn path_config(
     (config, strategy.strategy_id)
 }
 
-fn holder_deadline() -> tokio::time::Instant {
-    tokio::time::Instant::now() + Duration::from_secs(30)
-}
-
 #[tokio::test]
 async fn shard_counts_match() {
     // The reported replica count per shard is what the merge waits for, so
@@ -238,7 +237,6 @@ async fn shard_counts_match() {
         8,
         Some(2),
         local,
-        holder_deadline(),
     )
     .expect("holder selection succeeds");
 
@@ -270,7 +268,6 @@ async fn everywhere_covers_shards() {
         8,
         None,
         local,
-        holder_deadline(),
     )
     .expect("holder selection succeeds");
 
@@ -297,7 +294,6 @@ async fn capped_shard_rejected() {
         64,
         Some(1),
         local,
-        holder_deadline(),
     );
 
     assert!(matches!(result, Err(MetadataApiError::ServiceUnavailable)));

@@ -3,31 +3,34 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
-use aruna::config::load;
-use aruna_api::routes::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
-use aruna_api::server::state::load_persisted_state;
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_millis;
+use aruna_config::load;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
+use aruna_core::calls::Next;
 use aruna_core::onboarding::{
     OnboardingMode, OnboardingPurpose, OnboardingSecret, OnboardingSecretRecord,
 };
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::auth::bearer_token::{
-    ArunaBearerError, ArunaValidationState, decode_bearer_token,
+    DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
 use aruna_operations::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_operations::auth::error::ArunaBearerError;
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::node::api_state::LoadStateOperation;
 use aruna_operations::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
 use aruna_operations::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
+use aruna_operations::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::realm::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
 use aruna_operations::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_tasks::TaskHandle;
-use async_trait::async_trait;
+use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use jsonwebtoken::dangerous::insecure_decode;
 use rand::Rng;
 use reqwest::Client;
@@ -100,9 +103,10 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
@@ -193,7 +197,9 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
         &driver_ctx,
     )
     .await
-    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    .map_err(|err| std::io::Error::other(err.to_string()))?
+    .expose()
+    .to_string();
 
     Ok(token)
 }
@@ -206,9 +212,10 @@ pub async fn recover_initial_admin() -> Result<String, CliError> {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     };
 
     let mut secret_bytes = [0u8; 32];
@@ -418,16 +425,17 @@ struct DoctorValidationState {
 impl DoctorValidationState {
     async fn load(driver_ctx: &DriverContext) -> Self {
         let mut revoked_token_hashes = HashSet::<String, ahash::RandomState>::default();
-        let trusted_realms = load_persisted_state::<HashSet<RealmId, ahash::RandomState>>(
-            driver_ctx,
-            REALMS_LIST_KEY,
-        )
-        .await
-        .unwrap_or_default();
+        let realms =
+            LoadStateOperation::<HashSet<RealmId, ahash::RandomState>>::new(REALMS_LIST_KEY);
+        let trusted_realms = drive(realms, driver_ctx)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         // The replicated realm config is the only revocation authority.
         for realm_id in &trusted_realms {
             if let Ok(config) = drive(GetConfigOperation::new(*realm_id), driver_ctx).await {
-                let now = aruna_core::time::unix_timestamp_secs();
+                let now = aruna_clock::unix_timestamp_secs();
                 revoked_token_hashes.extend(
                     config
                         .revoked_tokens
@@ -450,26 +458,23 @@ impl DoctorValidationState {
     }
 }
 
-#[async_trait]
-impl ArunaValidationState for DoctorValidationState {
-    async fn is_token_revoked(
-        &self,
-        _realm_id: &RealmId,
-        token_hash: &str,
-    ) -> Result<bool, ArunaBearerError> {
-        Ok(self.revoked_token_hashes.contains(token_hash))
-    }
-
-    async fn user_cutoff(
-        &self,
-        _realm_id: &RealmId,
-        _user_id: &aruna_core::UserId,
-    ) -> Result<Option<u64>, ArunaBearerError> {
-        Ok(None)
-    }
-
-    async fn is_trusted_realm(&self, realm_id: &RealmId) -> bool {
-        self.trusted_realms.contains(realm_id)
+impl DoctorValidationState {
+    /// Verifies `token` against the loaded realm state. The checks need no further reads.
+    fn decode(&self, token: &str) -> Result<TokenClaims, ArunaBearerError> {
+        let checks = TokenChecks {
+            trust: IssuerTrust::Listed(self.trusted_realms.iter().copied().collect()),
+            revocation: RevocationCheck::Listed(
+                self.revoked_token_hashes.iter().cloned().collect(),
+            ),
+            linked_realm: None,
+            keys: IssuerKeys::Uncached,
+        };
+        let mut decode = DecodeTokenOperation::new(token, checks);
+        decode.stamp(unix_timestamp_millis());
+        match decode.first()? {
+            Next::Done(claims) => Ok(claims),
+            _ => Err(ArunaBearerError::RevocationUnavailable),
+        }
     }
 }
 
@@ -480,9 +485,10 @@ pub async fn view_token(token: String) -> Result<String, CliError> {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let validation_state = DoctorValidationState::load(driver_ctx.as_ref()).await;
     let token_view = build_token_view(&token, &validation_state).await?;
@@ -495,7 +501,7 @@ async fn build_token_view(
     validation_state: &DoctorValidationState,
 ) -> Result<TokenView, CliError> {
     let unvalidated_claims = insecure_decode::<TokenClaims>(token)?;
-    let valid = match decode_bearer_token(validation_state, token).await {
+    let valid = match validation_state.decode(token) {
         Ok(_) => Valid::True,
         Err(err) => Valid::False {
             reason: err.to_string(),
@@ -515,32 +521,34 @@ mod tests {
         DoctorValidationState, Valid, build_token_view, create_bootstrap_token, create_oidc_token,
         load_oidc_providers, password_grant_body, request_oidc_token,
     };
-    use crate::tests::fixtures::{TestEnvGuard, env_lock};
+    use crate::tests::fixtures::env_lock;
     use aruna::bootstrap::ensure_onboarding_secret;
+    use aruna::inbound::initialize_net_holder;
+    use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::auth::OidcValidator;
     use aruna_api::routes::onboarding::ListSecretsResponse;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_core::UserId;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_core::keys::generate_signing_key;
-    use aruna_core::keyspaces::{REALM_CONFIG_KEYSPACE, USER_KEYSPACE};
+    use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, TokenClaims};
     use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
     use aruna_core::structs::identity::user::User;
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::{DriverContext, drive};
+    use aruna_core::testing::EnvGuard;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
     use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_operations::sync::incoming::initialize_net_holder;
-    use aruna_operations::tasks::incoming::start_task_queues;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use aruna_tasks::TaskHandle;
     use axum::extract::State;
     use axum::routing::{get, post};
@@ -735,20 +743,7 @@ mod tests {
     }
 
     async fn read_user(context: &DriverContext, user_id: UserId) -> User {
-        match context
-            .storage_handle
-            .send_effect(Effect::Storage(StorageEffect::Read {
-                key_space: USER_KEYSPACE.to_string(),
-                key: ByteView::from(user_id.to_bytes()),
-                txn_id: None,
-            }))
-            .await
-        {
-            Event::Storage(StorageEvent::ReadResult {
-                value: Some(bytes), ..
-            }) => User::from_bytes(&bytes).unwrap(),
-            other => panic!("unexpected user read result: {other:?}"),
-        }
+        aruna_drivers::testing::read_user(context, user_id).await
     }
 
     async fn read_realm_config(
@@ -790,15 +785,16 @@ mod tests {
             storage_handle: storage,
             net_handle: Some(net.clone()),
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: Some(task_handle.clone()),
             compute_handle: None,
+            outbound_handle: None,
         });
-        let jobs_runtime = aruna_operations::jobs::runtime::JobsRuntime::new();
-        let shutdown = aruna_core::shutdown::Shutdown::new();
+        let jobs_runtime = aruna_drivers::jobs::runtime::JobsRuntime::new();
+        let shutdown = aruna_tasks::shutdown::Shutdown::new();
         initialize_net_holder(
             context.clone(),
-            aruna_core::structs::execution::job::RoCrateLimits::default(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
             jobs_runtime.clone(),
             &shutdown,
         );
@@ -886,7 +882,7 @@ mod tests {
                 // initial production node does.
                 true,
                 Some(Arc::new(OidcValidator::new().unwrap())),
-                aruna_operations::jobs::runtime::JobsRuntime::new(),
+                aruna_drivers::jobs::runtime::JobsRuntime::new(),
             )
             .await,
         );
@@ -897,7 +893,7 @@ mod tests {
             state,
             ServerConfig {
                 http_addr: addr,
-                max_body_size: aruna_api::server::MAX_BODY_SIZE,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
                 cors: aruna_api::cors::CorsConfig::default(),
             },
         )
@@ -921,8 +917,8 @@ mod tests {
         }
     }
 
-    fn set_oidc_env(base_url: &str, provider: &OidcProviderConfig) -> TestEnvGuard {
-        TestEnvGuard::set(&[
+    fn set_oidc_env(base_url: &str, provider: &OidcProviderConfig) -> EnvGuard {
+        EnvGuard::set(&[
             (
                 "SOCKET_ADDRESS",
                 base_url.trim_start_matches("http://").to_string(),
@@ -946,22 +942,7 @@ mod tests {
     }
 
     fn aruna_token_claims(realm_id: RealmId, user_id: UserId) -> TokenClaims {
-        let now = chrono::Utc::now().timestamp().max(0) as u64;
-        TokenClaims {
-            sub: user_id.to_string(),
-            iss: realm_id.to_string(),
-            iat: now,
-            exp: now + 600,
-            jti: Ulid::generate().to_string(),
-            sid: None,
-            session_kind: None,
-            restrictions: None,
-            issuer_pubkey: None,
-            delegation_signature: None,
-            name: None,
-            via: None,
-            auth_time: None,
-        }
+        aruna_test_support::tokens::token_claims(realm_id, user_id)
     }
 
     fn sign_aruna_token(signing_key: &SigningKey, claims: &TokenClaims) -> String {
@@ -1161,7 +1142,7 @@ mod tests {
     #[tokio::test]
     async fn loads_oidc_providers() {
         let _guard = env_lock().lock().await;
-        let _env = TestEnvGuard::set(&[
+        let _env = EnvGuard::set(&[
             ("OIDC_PROVIDER_IDS", "main".to_string()),
             ("OIDC_MAIN_ISSUER", "https://issuer.example".to_string()),
             ("OIDC_MAIN_AUDIENCE", "aruna-api".to_string()),

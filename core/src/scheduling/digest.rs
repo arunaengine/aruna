@@ -5,9 +5,10 @@
 use crate::compute::ResourceEnvelope;
 use crate::scheduling::cost::InputRoute;
 use crate::scheduling::inputs::{PlanRequest, TargetCandidate, TargetScore};
-use crate::structs::execution::job::InputContent;
+use crate::structs::execution::job::input::InputContent;
+use crate::structs::execution::source_access::write_fingerprint_field;
 
-pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v1";
+pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v2";
 
 /// Digest over the request identity, the pinned inputs and their chosen
 /// sources, the target's eligibility values and stored subject, and the score.
@@ -30,18 +31,20 @@ pub fn plan_digest(
     hasher.update(&resources.disk_bytes.to_le_bytes());
     hasher.update(&resources.max_walltime_ms.to_le_bytes());
     flag(&mut hasher, resources.preemptible);
-    field(&mut hasher, request.executor_constraint.as_deref());
+    hasher.update(&request.group_id.to_bytes());
+    write_fingerprint_field(&mut hasher, request.executor_constraint.as_deref());
+    write_fingerprint_field(&mut hasher, request.backend.as_deref());
     count(&mut hasher, request.required_labels.len());
     for label in &request.required_labels {
-        field(&mut hasher, Some(&label.key));
-        field(&mut hasher, Some(&label.value));
+        write_fingerprint_field(&mut hasher, Some(&label.key));
+        write_fingerprint_field(&mut hasher, Some(&label.value));
     }
     hasher.update(&[request.staging as u8, request.network as u8]);
     flag(&mut hasher, request.session);
 
     count(&mut hasher, request.inputs.len());
     for (input, route) in request.inputs.iter().zip(routes) {
-        field(&mut hasher, Some(&input.destination_key));
+        write_fingerprint_field(&mut hasher, Some(&input.destination_key));
         hasher.update(&input.version_id.to_bytes());
         content(&mut hasher, &input.content);
         hasher.update(&input.bytes.to_le_bytes());
@@ -71,10 +74,26 @@ pub fn plan_digest(
 
     let capability = &candidate.capability;
     hasher.update(candidate.node_id.as_bytes());
-    field(&mut hasher, Some(&capability.kind));
-    field(&mut hasher, Some(candidate.node_kind.label()));
+    write_fingerprint_field(&mut hasher, Some(&capability.backend));
+    write_fingerprint_field(&mut hasher, Some(&capability.kind));
+    write_fingerprint_field(&mut hasher, Some(candidate.node_kind.label()));
     hasher.update(&capability.subject_digest);
     hasher.update(&capability.subject.generation.to_le_bytes());
+    hasher.update(&capability.config_digest);
+    hasher.update(&capability.config_generation.to_le_bytes());
+    ceiling(&mut hasher, capability.max_walltime_ms);
+    count(&mut hasher, capability.groups.len());
+    for group_id in &capability.groups {
+        hasher.update(&group_id.to_bytes());
+    }
+    let suitability = &capability.suitability;
+    for value in [
+        suitability.batch,
+        suitability.sessions,
+        suitability.services,
+    ] {
+        hasher.update(&[value as u8]);
+    }
     for value in [
         candidate.active,
         candidate.compute_draining,
@@ -108,21 +127,6 @@ pub fn plan_digest(
     *hasher.finalize().as_bytes()
 }
 
-/// Length-prefixed optional field, so two fields cannot collide across their
-/// encoding boundary.
-fn field(hasher: &mut blake3::Hasher, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            hasher.update(&[1]);
-            hasher.update(&(value.len() as u64).to_le_bytes());
-            hasher.update(value.as_bytes());
-        }
-        None => {
-            hasher.update(&[0]);
-        }
-    }
-}
-
 /// A tag per content kind, so a hash and an ETag never encode alike.
 fn content(hasher: &mut blake3::Hasher, value: &InputContent) {
     match value {
@@ -132,7 +136,7 @@ fn content(hasher: &mut blake3::Hasher, value: &InputContent) {
         }
         InputContent::Reference { etag, range_bound } => {
             hasher.update(&[1]);
-            field(hasher, etag.as_deref());
+            write_fingerprint_field(hasher, etag.as_deref());
             flag(hasher, *range_bound);
         }
     }

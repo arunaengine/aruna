@@ -1,0 +1,617 @@
+//! Async forms of the job store calls, for tests that drive one call at a time.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::BTreeMap;
+
+use aruna_core::id::NodeId;
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_core::structs::execution::job::family::JobRecordEnvelope;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::key_wait::KeyWait;
+use aruna_core::structs::execution::job::launch::LaunchRecord;
+use aruna_core::structs::execution::job::local::{
+    AttemptControl, AttemptIntent, JobError, JobProgress, JobRecord, JobResultPayload,
+};
+use aruna_core::structs::storage::distribution::hint::SetHint;
+use aruna_core::structs::storage::encryption::BucketKeyRef;
+use aruna_core::types::{Key, TxnId, Value};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::store::attempt_intent::AttemptCommit;
+use aruna_operations::jobs::store::job_calls::{
+    self, AdoptOutcome, CancelRequestOutcome, ClaimOutcome, ExecutionCompleteOutcome, ParkOutcome,
+    ReleaseOutcome, RenewOutcome, RequeueOutcome, RunSuccess,
+};
+use aruna_operations::jobs::store::mutation_error::JobMutationError;
+use aruna_operations::jobs::store::park_wake::AwaitOutcome;
+use aruna_operations::jobs::store::{JobMutation, RunDelete, row_calls};
+use aruna_operations::jobs::submit::execution::{ExecutionSubmission, SubmitExecutionOperation};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use ulid::Ulid;
+
+pub async fn adopt_external_attempt(
+    context: &DriverContext,
+    job_id: JobId,
+    holder_node_id: NodeId,
+    now_ms: u64,
+) -> Result<AdoptOutcome, JobMutationError> {
+    drive(
+        job_calls::adopt_external_attempt(job_id, holder_node_id, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn begin_external_running(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    started_at_ms: Option<u64>,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::begin_external_running(job_id, token, started_at_ms, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn cancel_running_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::cancel_running_job(job_id, token, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn claim_job(
+    context: &DriverContext,
+    job_id: JobId,
+    holder_node_id: NodeId,
+    now_ms: u64,
+) -> Result<ClaimOutcome, JobMutationError> {
+    drive(
+        job_calls::claim_job(job_id, holder_node_id, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn complete_execution(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    final_progress: JobProgress,
+    now_ms: u64,
+) -> Result<ExecutionCompleteOutcome, JobMutationError> {
+    drive(
+        job_calls::complete_execution(
+            job_id,
+            token,
+            RunSuccess {
+                result,
+                progress: final_progress,
+                now_ms,
+            },
+        ),
+        context,
+    )
+    .await
+}
+
+pub async fn complete_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    result: JobResultPayload,
+    final_progress: JobProgress,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::complete_job(job_id, token, result, final_progress, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn defer_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    retry_after_ms: u64,
+    error: JobError,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    drive(
+        job_calls::defer_job(job_id, token, now_ms, retry_after_ms, error),
+        context,
+    )
+    .await
+}
+
+pub async fn delete_finished_run(
+    context: &DriverContext,
+    user_id: UserId,
+    job_id: JobId,
+    recorded: bool,
+) -> Result<RunDelete, JobMutationError> {
+    drive(
+        job_calls::delete_finished_run(user_id, job_id, recorded),
+        context,
+    )
+    .await
+}
+
+pub async fn exhaust_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::exhaust_job(job_id, token, error, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn fail_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(job_calls::fail_job(job_id, token, error, now_ms), context).await
+}
+
+pub async fn find_dedup_job(
+    context: &DriverContext,
+    created_by: UserId,
+    dedup_key: &[u8],
+    _txn_id: Option<TxnId>,
+) -> Result<Option<JobId>, String> {
+    drive(row_calls::find_dedup_job(created_by, dedup_key), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn find_dedup_plan(
+    context: &DriverContext,
+    created_by: UserId,
+    dedup_key: &[u8],
+    _txn_id: Option<TxnId>,
+) -> Result<Option<(JobId, [u8; 32])>, String> {
+    drive(row_calls::find_dedup_plan(created_by, dedup_key), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn flush_progress(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    progress: JobProgress,
+    now_ms: u64,
+) -> Result<RenewOutcome, JobMutationError> {
+    drive(
+        job_calls::flush_progress(job_id, token, progress, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn handoff_external_attempt(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    drive(
+        job_calls::handoff_external_attempt(job_id, token, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn insert_job(context: &DriverContext, record: &JobRecord) -> Result<(), String> {
+    drive(row_calls::insert_job(record), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn list_job_entries(
+    context: &DriverContext,
+    job_id: JobId,
+    last_key: Option<Vec<u8>>,
+    limit: usize,
+) -> Result<(Vec<(Vec<u8>, Value)>, Option<Vec<u8>>), String> {
+    drive(
+        row_calls::list_job_entries(job_id, last_key, limit),
+        context,
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
+pub async fn mark_indeterminate(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    error: JobError,
+    now_ms: u64,
+) -> Result<ParkOutcome, JobMutationError> {
+    drive(
+        job_calls::mark_indeterminate(job_id, token, error, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn mutate_job<F>(
+    context: &DriverContext,
+    job_id: JobId,
+    mutate: F,
+) -> Result<JobRecord, JobMutationError>
+where
+    F: FnMut(&mut JobRecord) -> Result<JobMutation, JobMutationError> + Clone + Send + 'static,
+{
+    drive(job_calls::change_job(job_id, mutate), context).await
+}
+
+pub async fn park_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    waits: Vec<KeyWait>,
+) -> Result<AwaitOutcome, JobMutationError> {
+    drive(row_calls::park_job(job_id, token, now_ms, waits), context).await
+}
+
+pub async fn persist_output_record(
+    context: &DriverContext,
+    job_id: JobId,
+    control: &AttemptControl,
+    digest: [u8; 32],
+    envelope: Vec<u8>,
+) -> Result<(), JobMutationError> {
+    drive(
+        job_calls::persist_output_record(job_id, control, digest, envelope),
+        context,
+    )
+    .await
+}
+
+pub async fn put_crate_outcome(
+    context: &DriverContext,
+    job_id: JobId,
+    status: &aruna_core::structs::execution::job::local::RunCrateStatus,
+    link: &aruna_core::structs::execution::job::local::RunLink,
+) -> Result<(), String> {
+    drive(row_calls::put_crate_outcome(job_id, status, link), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn put_crate_status(
+    context: &DriverContext,
+    job_id: JobId,
+    status: &aruna_core::structs::execution::job::local::RunCrateStatus,
+) -> Result<(), String> {
+    drive(row_calls::put_crate_status(job_id, status), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn put_job_entry<T: Serialize>(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    entry_key: &[u8],
+    row: &T,
+) -> Result<(), JobMutationError> {
+    drive(
+        job_calls::put_job_entry(job_id, token, entry_key, row),
+        context,
+    )
+    .await
+}
+
+pub async fn put_state<T: Serialize>(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    key_space: &str,
+    key: Key,
+    row: &T,
+) -> Result<(), JobMutationError> {
+    drive(
+        job_calls::put_state(job_id, token, key_space, key, row),
+        context,
+    )
+    .await
+}
+
+pub async fn read_attempt_control(
+    context: &DriverContext,
+    job_id: JobId,
+    attempt_epoch: u64,
+    _txn_id: Option<TxnId>,
+) -> Result<Option<AttemptControl>, JobMutationError> {
+    drive(
+        row_calls::read_attempt_control(job_id, attempt_epoch),
+        context,
+    )
+    .await
+}
+
+pub async fn read_crate_status(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::execution::job::local::RunCrateStatus>, String> {
+    drive(row_calls::read_crate_status(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_job_record(
+    context: &DriverContext,
+    job_id: JobId,
+    _txn_id: Option<TxnId>,
+) -> Result<Option<JobRecord>, String> {
+    drive(row_calls::read_job_record(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_key_waits(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Vec<KeyWait>, String> {
+    drive(row_calls::read_key_waits(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_launch_record(
+    context: &DriverContext,
+    record: &JobRecord,
+) -> Result<Option<LaunchRecord>, String> {
+    drive(row_calls::read_launch_record(record), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_output_record(
+    context: &DriverContext,
+    job_id: JobId,
+    attempt_epoch: u64,
+) -> Result<Option<JobRecordEnvelope>, JobMutationError> {
+    drive(
+        row_calls::read_output_record(job_id, attempt_epoch),
+        context,
+    )
+    .await
+}
+
+pub async fn read_run_link(
+    context: &DriverContext,
+    job_id: JobId,
+) -> Result<Option<aruna_core::structs::execution::job::local::RunLink>, String> {
+    drive(row_calls::read_run_link(job_id), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn read_state<T: DeserializeOwned + Send + std::fmt::Debug + 'static>(
+    context: &DriverContext,
+    key_space: &str,
+    key: Key,
+    _label: &str,
+) -> Result<Option<T>, String> {
+    drive(row_calls::read_state(key_space, key), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+pub async fn record_attempt_intent(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    draft: AttemptIntent,
+    execution_id: Option<Ulid>,
+    launch: Option<&LaunchRecord>,
+    now_ms: u64,
+) -> Result<AttemptCommit, JobMutationError> {
+    drive(
+        job_calls::record_attempt_intent(
+            job_id,
+            token,
+            draft,
+            execution_id,
+            launch.cloned(),
+            now_ms,
+        ),
+        context,
+    )
+    .await
+}
+
+pub async fn record_attempt_started(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    started_at_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::record_attempt_started(job_id, token, started_at_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn release_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<ReleaseOutcome, JobMutationError> {
+    drive(job_calls::release_job(job_id, token, now_ms), context).await
+}
+
+pub async fn renew_lease(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    progress: Option<JobProgress>,
+) -> Result<RenewOutcome, JobMutationError> {
+    drive(
+        job_calls::renew_lease(job_id, token, now_ms, progress),
+        context,
+    )
+    .await
+}
+
+pub async fn requeue_before_attempt(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+    error: JobError,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::requeue_before_attempt(job_id, token, now_ms, error),
+        context,
+    )
+    .await
+}
+
+pub async fn requeue_job(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Option<Ulid>,
+    now_ms: u64,
+    require_expired_before: Option<u64>,
+    error: Option<JobError>,
+) -> Result<RequeueOutcome, JobMutationError> {
+    drive(
+        job_calls::requeue_job(job_id, token, now_ms, require_expired_before, error),
+        context,
+    )
+    .await
+}
+
+pub async fn reserve_output_commits(
+    context: &DriverContext,
+    job_id: JobId,
+    destinations: &[(NodeId, String, String)],
+    hints: &BTreeMap<(NodeId, String), SetHint>,
+) -> Result<AttemptControl, JobMutationError> {
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let destinations = destinations.to_vec();
+    let call = job_calls::reserve_output_commits(job_id, destinations, hints.clone(), now_ms);
+    drive(call, context).await
+}
+
+pub async fn set_cancel_requested(
+    context: &DriverContext,
+    job_id: JobId,
+    now_ms: u64,
+) -> Result<CancelRequestOutcome, JobMutationError> {
+    drive(job_calls::set_cancel_requested(job_id, now_ms), context).await
+}
+
+pub async fn transition_to_preparing(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::transition_to_preparing(job_id, token, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn transition_to_ready(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::transition_to_ready(job_id, token, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn transition_to_running(
+    context: &DriverContext,
+    job_id: JobId,
+    token: Ulid,
+    now_ms: u64,
+) -> Result<JobRecord, JobMutationError> {
+    drive(
+        job_calls::transition_to_running(job_id, token, now_ms),
+        context,
+    )
+    .await
+}
+
+pub async fn wake_key_page(
+    context: &DriverContext,
+    key: BucketKeyRef,
+    now_ms: u64,
+) -> Result<(usize, bool), JobMutationError> {
+    drive(row_calls::wake_key_page(key, now_ms), context).await
+}
+
+pub async fn wake_key_waits(
+    context: &DriverContext,
+    key: BucketKeyRef,
+    now_ms: u64,
+) -> Result<usize, JobMutationError> {
+    drive(row_calls::wake_key_waits(key, now_ms), context).await
+}
+
+/// Submits an execution job served by this context's node, at the current time.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_execution_job(
+    context: &DriverContext,
+    spec: aruna_core::structs::execution::job::input::ExecutionSpec,
+    created_by: aruna_core::user::id::UserId,
+    owner_node_id: aruna_core::id::NodeId,
+    idempotency_key: Option<String>,
+    workspace_mode: aruna_core::structs::execution::job::local::WorkspaceMode,
+    workspace_bucket: Option<String>,
+    retention_ms: u64,
+    active_cap: Option<u32>,
+) -> Result<SubmitJobResult, SubmitJobError> {
+    let submission = ExecutionSubmission {
+        spec,
+        created_by,
+        owner_node_id,
+        idempotency_key,
+        workspace_mode,
+        workspace_bucket,
+        retention_ms,
+        active_cap,
+        serving: context.node_and_realm(),
+        now_ms: aruna_core::time::unix_timestamp_millis(),
+        local_admission: None,
+    };
+    drive(SubmitExecutionOperation::new(submission), context).await
+}

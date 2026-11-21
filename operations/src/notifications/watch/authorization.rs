@@ -1,723 +1,122 @@
-//! Builds watch permission paths and checks if a watch may be created or delivered.
+//! Tests every watch check against a local store: creation, listing, delivery and forwarding.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::str::FromStr;
-
-use aruna_core::NodeId;
-use aruna_core::UserId;
-use aruna_core::errors::AuthorizationError;
-use aruna_core::metrics::WatchMetricReason;
-use aruna_core::structs::execution::notification::NotificationKind;
-use aruna_core::structs::execution::notification_watch::{
-    WatchAuthorizationBinding, WatchEvent, WatchEventDetail, WatchEventKind, WatchEventMask,
-    WatchSubscription, parse_watch_path, watch_path_matches, watch_resource_path,
-};
-use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use tracing::warn;
-use ulid::Ulid;
-
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::request_policy::{
-    PolicyEnforcementError, PolicyRequestExtras, enforce_policies, policy_request_with,
-};
-use crate::driver::{DriverContext, drive};
-use crate::notifications::placement::filter_local_subscriptions;
-use crate::notifications::watch::subscriptions::list_watch_subscriptions;
-
-const WATCH_CREATE_OPERATION: &str = "notifications.create_watch";
-const WATCH_LIST_OPERATION: &str = "notifications.list_watches";
-const WATCH_DELIVERY_OPERATION: &str = "notifications.deliver_watch";
-
-pub struct AuthorizedWatchSubscriptions {
-    pub subscriptions: Vec<WatchSubscription>,
-    pub dropped: bool,
-    pub check_failed: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WatchAuthorizationDenial {
-    InvalidState,
-    InvalidOwner,
-    TokenExpired,
-    TokenRevoked,
-    TokenRestricted,
-    PermissionDenied,
-}
-
-impl WatchAuthorizationDenial {
-    pub const fn metric_reason(self) -> WatchMetricReason {
-        match self {
-            Self::InvalidState => WatchMetricReason::InvalidState,
-            Self::InvalidOwner => WatchMetricReason::InvalidOwner,
-            Self::TokenExpired => WatchMetricReason::TokenExpired,
-            Self::TokenRevoked => WatchMetricReason::TokenRevoked,
-            Self::TokenRestricted => WatchMetricReason::TokenRestricted,
-            Self::PermissionDenied => WatchMetricReason::PermissionDenied,
-        }
-    }
-}
-
-pub enum WatchAuthorization {
-    Authorized,
-    Denied(WatchAuthorizationDenial),
-    Unavailable(String),
-}
-
-pub fn watch_permission_path(
-    realm_id: RealmId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-) -> Option<String> {
-    match event_mask.bits() {
-        WatchEventMask::METADATA_CREATED => {
-            let remainder = path_prefix.strip_prefix("meta/")?;
-            let (raw_group_id, document_path_prefix) = remainder.split_once('/')?;
-            let group_id = Ulid::from_str(raw_group_id).ok()?;
-            // An empty document prefix is the group-wide watch: every dataset
-            // of the group, derived as the group's `meta/` permission path.
-            if group_id.is_nil()
-                || raw_group_id != group_id.to_string()
-                || MetadataRegistryRecord::normalize_document_path(document_path_prefix)
-                    != document_path_prefix
-            {
-                return None;
-            }
-            Some(format!(
-                "/{realm_id}/g/{group_id}/meta/{document_path_prefix}"
-            ))
-        }
-        bits if bits != 0
-            && bits
-                & !(WatchEventMask::DATA_UPLOADED
-                    | WatchEventMask::SYNC_COMPLETED
-                    | WatchEventMask::SYNC_FAILED)
-                == 0 =>
-        {
-            let resource = parse_watch_path(path_prefix)?;
-            Some(object_permission_path(
-                realm_id,
-                resource.group_id,
-                resource.node_id,
-                resource.bucket,
-                resource.key_prefix,
-            ))
-        }
-        _ => None,
-    }
-}
-
-/// Canonical authorization result every watch surface shares: the owner must
-/// still hold READ on the watched prefix's permission path. No resource
-/// identity or a non-user owner denies; unevaluable checks are errors, not grants.
-#[cfg(test)]
-pub async fn is_watch_authorized(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<bool, String> {
-    Ok(matches!(
-        evaluate_watch_authorization(
-            context,
-            realm_id,
-            owner,
-            path_prefix,
-            event_mask,
-            authorization,
-        )
-        .await?,
-        WatchAuthorization::Authorized
-    ))
-}
-
-pub async fn evaluate_watch_authorization(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    evaluate_watch_scope(
-        context,
-        realm_id,
-        owner,
-        path_prefix,
-        event_mask,
-        authorization,
-        WATCH_LIST_OPERATION,
-    )
-    .await
-}
-
-pub async fn evaluate_watch_delivery(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    evaluate_watch_scope(
-        context,
-        realm_id,
-        owner,
-        path_prefix,
-        event_mask,
-        authorization,
-        WATCH_DELIVERY_OPERATION,
-    )
-    .await
-}
-
-async fn evaluate_watch_scope(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-    operation: &str,
-) -> Result<WatchAuthorization, String> {
-    if !authorization.is_valid() {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    }
-    let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    };
-    evaluate_permission_path(
-        context,
-        realm_id,
-        AuthContext {
-            user_id: owner,
-            realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        permission_path,
-        operation,
-    )
-    .await
-}
-
-pub async fn evaluate_watch_creation(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth_context: &AuthContext,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-) -> Result<WatchAuthorization, String> {
-    let Some(permission_path) = watch_permission_path(realm_id, path_prefix, event_mask) else {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    };
-    evaluate_permission_path(
-        context,
-        realm_id,
-        auth_context.clone(),
-        permission_path,
-        WATCH_CREATE_OPERATION,
-    )
-    .await
-}
-
-pub async fn authorize_forwarded_watch(
-    context: &DriverContext,
-    realm_id: RealmId,
-    owner: UserId,
-    path_prefix: &str,
-    event_mask: WatchEventMask,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    if !authorization.watch_path_prefix.is_empty() && authorization.watch_path_prefix != path_prefix
-    {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    }
-    evaluate_watch_scope(
-        context,
-        realm_id,
-        owner,
-        path_prefix,
-        event_mask,
-        authorization,
-        WATCH_CREATE_OPERATION,
-    )
-    .await
-}
-
-async fn evaluate_permission_path(
-    context: &DriverContext,
-    realm_id: RealmId,
-    auth_context: AuthContext,
-    permission_path: String,
-    operation: &str,
-) -> Result<WatchAuthorization, String> {
-    if auth_context.user_id.is_nil()
-        || auth_context.user_id.realm_id != realm_id
-        || auth_context.realm_id != realm_id
-    {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidOwner,
-        ));
-    }
-    if auth_context.path_restrictions.is_some() {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::TokenRestricted,
-        ));
-    }
-    let allowed = match drive(
-        CheckPermissionsOperation::new(CheckPermissionsConfig {
-            auth_context: auth_context.clone(),
-            path: permission_path.clone(),
-            required_permission: Permission::READ,
-        }),
-        context,
-    )
-    .await
-    {
-        Ok(allowed) => allowed,
-        // Missing authorization state is denied to hide existence but marked unavailable.
-        // Interest publication retains its retry marker.
-        Err(
-            error @ (AuthorizationError::InvalidRealmId
-            | AuthorizationError::InvalidGroupId
-            | AuthorizationError::GroupNotFound
-            | AuthorizationError::DocNotFound),
-        ) => return Ok(WatchAuthorization::Unavailable(error.to_string())),
-        Err(error) => return Err(error.to_string()),
-    };
-    if !allowed {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::PermissionDenied,
-        ));
-    }
-    match enforce_policies(
-        context,
-        realm_id,
-        &policy_request_with(
-            &permission_path,
-            &Permission::READ,
-            Some(&auth_context),
-            PolicyRequestExtras::operation(operation),
-        ),
-    )
-    .await
-    {
-        Ok(()) => Ok(WatchAuthorization::Authorized),
-        Err(PolicyEnforcementError::Denied { .. }) => Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::PermissionDenied,
-        )),
-        Err(PolicyEnforcementError::Unavailable(error)) => {
-            Ok(WatchAuthorization::Unavailable(error))
-        }
-    }
-}
-
-pub async fn authorize_watch_event(
-    context: &DriverContext,
-    owner: UserId,
-    authorization: &WatchAuthorizationBinding,
-    event: &WatchEvent,
-) -> Result<WatchAuthorization, String> {
-    if !authorization.is_valid() {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    }
-    let Some(permission_path) = event_permission_path(event) else {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    };
-    evaluate_permission_path(
-        context,
-        event.realm_id,
-        AuthContext {
-            user_id: owner,
-            realm_id: event.realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        permission_path,
-        WATCH_DELIVERY_OPERATION,
-    )
-    .await
-}
-
-pub async fn authorize_notification(
-    context: &DriverContext,
-    recipient: UserId,
-    kind: &NotificationKind,
-    authorization: &WatchAuthorizationBinding,
-) -> Result<WatchAuthorization, String> {
-    let event_mask = match kind {
-        NotificationKind::MetadataCreated { path, .. }
-            if watch_path_matches(
-                WatchEventKind::MetadataCreated,
-                path,
-                &authorization.watch_path_prefix,
-            ) =>
-        {
-            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated])
-        }
-        NotificationKind::DataUploaded { path, .. }
-            if watch_path_matches(
-                WatchEventKind::DataUploaded,
-                path,
-                &authorization.watch_path_prefix,
-            ) =>
-        {
-            WatchEventMask::from_kinds([WatchEventKind::DataUploaded])
-        }
-        NotificationKind::SyncCompleted { path, .. }
-            if watch_path_matches(
-                WatchEventKind::SyncCompleted,
-                path,
-                &authorization.watch_path_prefix,
-            ) =>
-        {
-            WatchEventMask::from_kinds([WatchEventKind::SyncCompleted])
-        }
-        NotificationKind::SyncFailed { path, .. }
-            if watch_path_matches(
-                WatchEventKind::SyncFailed,
-                path,
-                &authorization.watch_path_prefix,
-            ) =>
-        {
-            WatchEventMask::from_kinds([WatchEventKind::SyncFailed])
-        }
-        _ => {
-            return Ok(WatchAuthorization::Denied(
-                WatchAuthorizationDenial::InvalidState,
-            ));
-        }
-    };
-    match evaluate_watch_authorization(
-        context,
-        recipient.realm_id,
-        recipient,
-        &authorization.watch_path_prefix,
-        event_mask,
-        authorization,
-    )
-    .await?
-    {
-        WatchAuthorization::Authorized => {}
-        result => return Ok(result),
-    }
-    let Some(permission_path) = notification_permission_path(recipient.realm_id, kind) else {
-        return Ok(WatchAuthorization::Denied(
-            WatchAuthorizationDenial::InvalidState,
-        ));
-    };
-    evaluate_permission_path(
-        context,
-        recipient.realm_id,
-        AuthContext {
-            user_id: recipient,
-            realm_id: recipient.realm_id,
-            path_restrictions: None,
-            session: None,
-        },
-        permission_path,
-        WATCH_LIST_OPERATION,
-    )
-    .await
-}
-
-pub fn event_permission_path(event: &WatchEvent) -> Option<String> {
-    if event.actor.is_nil() {
-        return None;
-    }
-    match (&event.kind, &event.detail) {
-        (
-            WatchEventKind::MetadataCreated,
-            WatchEventDetail::MetadataCreated {
-                group_id,
-                document_id,
-            },
-        ) => metadata_permission_path(event.realm_id, &event.path, *group_id, *document_id),
-        (
-            WatchEventKind::DataUploaded,
-            WatchEventDetail::DataUploaded {
-                group_id,
-                node_id,
-                bucket,
-                key,
-                ..
-            },
-        ) => data_permission_path(
-            event.realm_id,
-            &event.path,
-            *group_id,
-            *node_id,
-            bucket,
-            key,
-        ),
-        (
-            WatchEventKind::SyncCompleted,
-            WatchEventDetail::SyncCompleted {
-                group_id,
-                node_id,
-                bucket,
-                relationship_id,
-                ..
-            },
-        )
-        | (
-            WatchEventKind::SyncFailed,
-            WatchEventDetail::SyncFailed {
-                group_id,
-                node_id,
-                bucket,
-                relationship_id,
-                ..
-            },
-        ) => sync_permission_path(
-            event.realm_id,
-            &event.path,
-            *group_id,
-            *node_id,
-            bucket,
-            *relationship_id,
-        ),
-        _ => None,
-    }
-}
-
-fn notification_permission_path(realm_id: RealmId, kind: &NotificationKind) -> Option<String> {
-    match kind {
-        NotificationKind::MetadataCreated {
-            path,
-            group_id,
-            document_id,
-            actor_user_id,
-        } if !actor_user_id.is_nil() => {
-            metadata_permission_path(realm_id, path, *group_id, *document_id)
-        }
-        NotificationKind::DataUploaded {
-            path,
-            group_id,
-            node_id,
-            bucket,
-            key,
-            actor_user_id,
-            ..
-        } if !actor_user_id.is_nil() => {
-            data_permission_path(realm_id, path, *group_id, *node_id, bucket, key)
-        }
-        NotificationKind::SyncCompleted {
-            path,
-            group_id,
-            node_id,
-            bucket,
-            relationship_id,
-            actor_user_id,
-            ..
-        }
-        | NotificationKind::SyncFailed {
-            path,
-            group_id,
-            node_id,
-            bucket,
-            relationship_id,
-            actor_user_id,
-            ..
-        } if !actor_user_id.is_nil() => sync_permission_path(
-            realm_id,
-            path,
-            *group_id,
-            *node_id,
-            bucket,
-            *relationship_id,
-        ),
-        _ => None,
-    }
-}
-
-fn metadata_permission_path(
-    realm_id: RealmId,
-    path: &str,
-    group_id: Ulid,
-    document_id: Ulid,
-) -> Option<String> {
-    if group_id.is_nil() || document_id.is_nil() {
-        return None;
-    }
-    let document_path = path.strip_prefix(&format!("meta/{group_id}/"))?;
-    if document_path.is_empty()
-        || MetadataRegistryRecord::normalize_document_path(document_path) != document_path
-    {
-        return None;
-    }
-    Some(MetadataRegistryRecord::permission_path_for(
-        &realm_id,
-        group_id,
-        document_path,
-        document_id,
-    ))
-}
-
-fn data_permission_path(
-    realm_id: RealmId,
-    path: &str,
-    group_id: Ulid,
-    node_id: NodeId,
-    bucket: &str,
-    key: &str,
-) -> Option<String> {
-    if group_id.is_nil()
-        || bucket.is_empty()
-        || key.is_empty()
-        || path != watch_resource_path(group_id, node_id, bucket, key)
-    {
-        return None;
-    }
-    Some(object_permission_path(
-        realm_id, group_id, node_id, bucket, key,
-    ))
-}
-
-fn sync_permission_path(
-    realm_id: RealmId,
-    path: &str,
-    group_id: Ulid,
-    node_id: NodeId,
-    bucket: &str,
-    relationship_id: Ulid,
-) -> Option<String> {
-    let resource = parse_watch_path(path)?;
-    if group_id.is_nil()
-        || relationship_id.is_nil()
-        || resource.group_id != group_id
-        || resource.node_id != node_id
-        || resource.bucket != bucket
-    {
-        return None;
-    }
-    if resource.key_prefix.is_empty() {
-        Some(bucket_permission_path(realm_id, group_id, node_id, bucket))
-    } else {
-        Some(object_permission_path(
-            realm_id,
-            group_id,
-            node_id,
-            bucket,
-            resource.key_prefix,
-        ))
-    }
-}
-
-/// Holder-side enumeration of one user's watches through the same authorization
-/// result delivery uses. Revoked watches retain only their opaque deletion id;
-/// protected watch details are redacted so the owner can still release quota.
-pub async fn list_authorized_subscriptions(
-    context: &DriverContext,
-    owner: UserId,
-) -> Result<Vec<WatchSubscription>, String> {
-    let subscriptions = list_watch_subscriptions(&context.storage_handle, owner)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut authorized = Vec::with_capacity(subscriptions.len());
-    for mut subscription in subscriptions {
-        match evaluate_watch_authorization(
-            context,
-            owner.realm_id,
-            subscription.owner,
-            &subscription.path_prefix,
-            subscription.event_mask,
-            &subscription.authorization,
-        )
-        .await?
-        {
-            WatchAuthorization::Authorized => {}
-            WatchAuthorization::Denied(_) => {
-                subscription.path_prefix.clear();
-                subscription.event_mask = WatchEventMask::empty();
-                subscription.created_at_ms = 0;
-            }
-            WatchAuthorization::Unavailable(error) => return Err(error),
-        }
-        authorized.push(subscription);
-    }
-    Ok(authorized)
-}
-
-pub async fn filter_authorized_subscriptions(
-    context: &DriverContext,
-    realm_id: RealmId,
-    realm_config: &aruna_core::structs::identity::realm::RealmConfigDocument,
-    local_node_id: NodeId,
-    subscriptions: Vec<WatchSubscription>,
-) -> Result<AuthorizedWatchSubscriptions, String> {
-    let (subscriptions, found_stale) =
-        filter_local_subscriptions(subscriptions, realm_config, local_node_id)
-            .map_err(|error| error.to_string())?;
-    let mut authorized = Vec::with_capacity(subscriptions.len());
-    let mut dropped = found_stale;
-    let mut check_failed = false;
-
-    for subscription in subscriptions {
-        match evaluate_watch_authorization(
-            context,
-            realm_id,
-            subscription.owner,
-            &subscription.path_prefix,
-            subscription.event_mask,
-            &subscription.authorization,
-        )
-        .await
-        {
-            Ok(WatchAuthorization::Authorized) => authorized.push(subscription),
-            Ok(WatchAuthorization::Denied(_)) => dropped = true,
-            Ok(WatchAuthorization::Unavailable(_)) | Err(_) => {
-                dropped = true;
-                check_failed = true;
-                warn!(
-                    parent: None,
-                    reason = WatchMetricReason::AuthorizationUnavailable.as_str(),
-                    "Notification watch authorization check failed"
-                );
-            }
-        }
-    }
-
-    Ok(AuthorizedWatchSubscriptions {
-        subscriptions: authorized,
-        dropped,
-        check_failed,
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::notifications::watch::check::WatchCheckOperation;
+    use crate::notifications::watch::paths::WatchAuthorization;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::execution::notification_watch::WatchEventMask;
     use aruna_core::structs::execution::notification_watch::{
         WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
     };
-    use aruna_core::structs::identity::auth::{Actor, PathRestriction};
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
     use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
     };
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
+    use ulid::Ulid;
+
+    use aruna_core::id::NodeId;
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchSubscription,
+    };
+    use aruna_core::user::id::UserId;
+
+    use crate::notifications::watch::check::{AuthorizedWatchSubscriptions, WatchFilterOperation};
+    use crate::notifications::watch::paths::{
+        WatchAuthorizationDenial, event_permission_path, watch_permission_path,
+    };
+
+    async fn checked(
+        context: &DriverContext,
+        check: WatchCheckOperation,
+    ) -> Result<WatchAuthorization, String> {
+        drive(check, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate_watch_creation(
+        context: &DriverContext,
+        realm_id: RealmId,
+        auth_context: &AuthContext,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+    ) -> Result<WatchAuthorization, String> {
+        let check = WatchCheckOperation::creation(realm_id, auth_context, path_prefix, event_mask);
+        checked(context, check).await
+    }
+
+    /// Canonical authorization result every watch surface shares: the owner must
+    /// still hold READ on the watched prefix's permission path. No resource
+    /// identity or a non-user owner denies; unevaluable checks are errors, not grants.
+    async fn is_watch_authorized(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<bool, String> {
+        let check =
+            WatchCheckOperation::listing(realm_id, owner, path_prefix, event_mask, authorization);
+        Ok(matches!(
+            checked(context, check).await?,
+            WatchAuthorization::Authorized
+        ))
+    }
+
+    async fn filter_authorized_subscriptions(
+        context: &DriverContext,
+        realm_id: RealmId,
+        realm_config: &RealmConfigDocument,
+        local_node_id: NodeId,
+        subscriptions: Vec<WatchSubscription>,
+    ) -> Result<AuthorizedWatchSubscriptions, String> {
+        let filter =
+            WatchFilterOperation::realm(realm_id, realm_config, local_node_id, subscriptions)
+                .map_err(|error| error.to_string())?;
+        drive(filter, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate_watch_delivery(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<WatchAuthorization, String> {
+        let check =
+            WatchCheckOperation::delivery(realm_id, owner, path_prefix, event_mask, authorization);
+        checked(context, check).await
+    }
+
+    async fn authorize_forwarded_watch(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<WatchAuthorization, String> {
+        let check =
+            WatchCheckOperation::forwarded(realm_id, owner, path_prefix, event_mask, authorization);
+        checked(context, check).await
+    }
 
     fn node(seed: u8) -> NodeId {
         iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -733,9 +132,10 @@ mod tests {
                 storage_handle: storage,
                 net_handle: None,
                 blob_handle: None,
-                metadata_handle: None,
+                graph_handle: None,
                 task_handle: None,
                 compute_handle: None,
+                outbound_handle: None,
             },
         )
     }
@@ -875,16 +275,18 @@ mod tests {
         let node_id = node(3);
         let path = watch_resource_path(group_id, node_id, "bucket", "");
         let event_mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
-        let subscription = WatchSubscription::new(owner, path.clone(), event_mask, 1);
+        let subscription =
+            WatchSubscription::new(ulid::Ulid::generate(), owner, path.clone(), event_mask, 1);
         let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
         realm_config.ensure_node(node_id, RealmNodeKind::Server);
         let context = DriverContext {
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         assert_eq!(

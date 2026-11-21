@@ -6,13 +6,12 @@
 // Each hop is read with the caller's credential on the node that holds it, exactly as the
 // origin and run routes answer it; the crate shows only what those reads show.
 
+use aruna_drivers::driver::{DriverContext, drive, drive_until};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering::Relaxed;
 use std::time::Duration;
 
-use aruna_core::NodeId;
-use aruna_core::metadata::AuthToken;
+use aruna_core::id::NodeId;
+use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::structs::storage::bucket_metadata::RELEASE_TAG;
@@ -21,12 +20,17 @@ use aruna_core::structs::storage::release::{
     CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_operations::distribution::resolve::{GlobalResolution, RESOLVE_BUDGET, resolve_version};
-use aruna_operations::metadata::MetadataReadError;
-use aruna_operations::metadata::provenance::{
-    CrateFile, Hop, ProvenanceCrate, Target, scratch_dir, scratch_file, scratch_name,
+use aruna_operations::distribution::resolve::{
+    GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved,
 };
-use aruna_operations::s3::bucket::release::publish::read_crate;
+use aruna_operations::metadata::provenance::export::{
+    ExportAnswer, ExportAsk, ExportStepOperation, ForgetSpoolOperation, Read, RootCursor,
+    RootPageOperation,
+};
+use aruna_operations::metadata::provenance::{CrateFile, ExportState, Hop, Target};
+use aruna_operations::transfer::release::holder::{
+    AskHolderError, AskHolderOperation, ReadCrateOperation,
+};
 use async_zip::tokio::write::ZipFileWriter;
 use async_zip::{Compression, ZipEntryBuilder};
 use axum::body::Body;
@@ -43,16 +47,17 @@ use tokio::time::Instant;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi};
+use utoipa::IntoParams;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ValidatedBearer, bearer_auth, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{MetadataRoCrateResponse, RoCrateExportParams};
+use crate::lookup::bucket_info;
+use crate::metadata::model::{MetadataRoCrateResponse, RoCrateExportParams};
 use crate::routes::execution::runs::run_answer;
 use crate::routes::metadata::rocrate::export_metadata_rocrate;
-use crate::routes::storage::deletion::bucket_info;
 use crate::routes::storage::origin::version_answer;
 use crate::server::state::ServerState;
 
@@ -60,19 +65,13 @@ use crate::server::state::ServerState;
 const EXPORT_DEADLINE: Duration = Duration::from_secs(15 * 60);
 /// The most time kept back for writing the root and closing the ZIP.
 const FINISH_WINDOW: Duration = Duration::from_secs(60);
-/// Why a walk ends when the caller's token no longer holds.
-const REVOKED: &str = "the token expired or was revoked";
 /// Bytes buffered between the walk and the client.
 const PIPE_BYTES: usize = 64 * 1024;
 /// A regular file readable by everyone, so an unpacked crate opens without a chmod.
 const FILE_MODE: u16 = 0o100_644;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ProvenanceApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ProvenanceApiDoc::openapi()).routes(routes!(export_provenance))
+    OpenApiRouter::new().routes(routes!(export_provenance))
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -113,17 +112,15 @@ it, as the origin and run routes do.
     responses(
         (status = 200, description = "RO-Crate ZIP stream", content_type = "application/zip"),
         (status = 400, description = "Neither or both of version and dataset given", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn export_provenance(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Query(params): Query<ExportParams>,
 ) -> ServerResult<Response> {
-    require_realm_auth(&state, auth)?;
     // Every hop checks this token again, so an export needs one.
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let start = match (params.version, params.dataset) {
@@ -140,7 +137,7 @@ pub async fn export_provenance(
             ));
         }
     };
-    let (now, unix_now) = (Instant::now(), aruna_core::time::unix_timestamp_secs());
+    let (now, unix_now) = (Instant::now(), aruna_clock::unix_timestamp_secs());
     let finish_by = export_deadline(now, unix_now, bearer.expires_at_secs());
     let caller = Caller {
         state,
@@ -177,13 +174,11 @@ fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
     let named = match &start {
         Start::Version(id) | Start::Dataset(id) => id,
     };
-    // The export keeps its working state on disk; without room for it nothing starts.
-    let built = ProvenanceCrate::new(named, &published)
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    let state = ExportState::new(Ulid::generate(), named, &published);
     let (writer, reader) = tokio::io::duplex(PIPE_BYTES);
     let gone = CancellationToken::new();
     let guard = gone.clone().drop_guard();
-    tokio::spawn(async move { walk(caller, start, built, writer, gone).await });
+    tokio::spawn(async move { walk(caller, start, state, writer, gone).await });
     // Dropping the body, as a disconnect does, stops the walk.
     let body = ReaderStream::new(reader).map(move |chunk| {
         let _ = &guard;
@@ -196,7 +191,7 @@ fn start_export(caller: Caller, start: Start) -> ServerResult<Response> {
             "attachment; filename=\"provenance.zip\"",
         )
         .body(Body::from_stream(body))
-        .map_err(|error| ServerError::InternalError(error.to_string()))
+        .map_err(|error| ServerError::InternalError(error.into()))
 }
 
 enum Start {
@@ -230,114 +225,83 @@ impl Caller {
     }
 }
 
-/// What one hop read gave.
-enum Read {
-    Answer(serde_json::Value),
-    Hidden,
-    Silent,
-}
-
 async fn walk(
     caller: Caller,
     start: Start,
-    mut built: ProvenanceCrate,
+    state: ExportState,
     writer: DuplexStream,
     gone: CancellationToken,
 ) {
+    let context = caller.state.get_ctx();
+    let _rows = SpoolRows::new(context.clone(), &state);
     let mut zip = ZipFileWriter::with_tokio(writer);
-    match &start {
-        Start::Version(_) => {
-            let first = built.version_start();
-            built.push([first]);
-        }
+    let (mut state, mut answer) = match &start {
+        Start::Version(_) => (state, ExportAnswer::Begin),
         Start::Dataset(document) => {
-            let Some(auth) = caller.current(&gone).await else {
-                built.stop(REVOKED);
-                return finish(&caller, &gone, zip, built).await;
+            let asked = ExportStepOperation::dataset(state);
+            let answer = match caller.current(&gone).await {
+                Some(auth) => {
+                    let read = crate_document(&caller, &auth, document);
+                    ExportAnswer::Read(bounded(&caller, &gone, read).await)
+                }
+                None => ExportAnswer::Revoked,
             };
-            match bounded(&caller, &gone, crate_document(&caller, &auth, document)).await {
-                Some(Read::Answer(dataset)) => {
-                    let (hops, file) = built.dataset(&dataset);
-                    if !write(&caller, &gone, &mut zip, file).await {
-                        return;
-                    }
-                    built.push(hops);
-                }
-                Some(Read::Hidden) => built.stop("the dataset is not readable"),
-                Some(Read::Silent) => built.stop("the dataset did not answer"),
-                None => built.stop("stopped before the dataset was read"),
+            (asked.state, answer)
+        }
+    };
+    loop {
+        let step = ExportStepOperation::new(state.clone(), answer);
+        let step = match drive(step, context.as_ref()).await {
+            Ok(step) => step,
+            Err(_) => {
+                state.lost();
+                break;
             }
+        };
+        state = step.state;
+        for file in step.files {
+            if !write(&caller, &gone, &mut zip, file).await {
+                return;
+            }
+        }
+        answer = match step.ask {
+            ExportAsk::Hop(hop) => match caller.current(&gone).await {
+                Some(auth) => {
+                    let read = read_hop(&caller, &auth, &hop);
+                    ExportAnswer::Read(bounded(&caller, &gone, read).await)
+                }
+                None => ExportAnswer::Revoked,
+            },
+            ExportAsk::RunCrate(document) => match crate_read(&caller, &gone, &document).await {
+                Some(read) => ExportAnswer::Read(read),
+                None => ExportAnswer::Revoked,
+            },
+            ExportAsk::Dataset | ExportAsk::Root => break,
+        };
+    }
+    finish(&caller, &gone, zip, state).await
+}
+
+/// Deletes the export's working rows when the export ends, however it ends.
+struct SpoolRows {
+    context: Arc<DriverContext>,
+    forget: Option<ForgetSpoolOperation>,
+}
+
+impl SpoolRows {
+    fn new(context: Arc<DriverContext>, state: &ExportState) -> Self {
+        let forget = Some(ForgetSpoolOperation::export(state));
+        Self { context, forget }
+    }
+}
+
+impl Drop for SpoolRows {
+    fn drop(&mut self) {
+        if let Some(forget) = self.forget.take() {
+            let context = self.context.clone();
+            tokio::spawn(async move { drive(forget, context.as_ref()).await });
         }
     }
-    while let Some(hop) = built.pop() {
-        if built.known(&hop) {
-            continue;
-        }
-        let Some(auth) = caller.current(&gone).await else {
-            built.stop(REVOKED);
-            break;
-        };
-        let Some(read) = bounded(&caller, &gone, read_hop(&caller, &auth, &hop)).await else {
-            built.stop("the export stopped at its time limit or on disconnect");
-            break;
-        };
-        match (&hop.target, read) {
-            (Target::Version(_), Read::Answer(origin)) => {
-                let next = built.version(&hop, &origin);
-                built.push(next);
-            }
-            (Target::Run(_), Read::Answer(run)) => {
-                let read = match run["run_crate"].as_str() {
-                    Some(document) => match crate_read(&caller, &gone, document).await {
-                        Some(read) => read,
-                        None => {
-                            built.run(&hop, None);
-                            built.stop(REVOKED);
-                            break;
-                        }
-                    },
-                    None => {
-                        let status = &run["run_crate_status"];
-                        if let Some(state) = status["status"].as_str()
-                            && built.unwritten(&hop, state, status["message"].as_str())
-                        {
-                            continue;
-                        }
-                        Some(Read::Hidden)
-                    }
-                };
-                let (hops, file, go_on) = record_run(&mut built, &hop, read);
-                if let Some(file) = file
-                    && !write(&caller, &gone, &mut zip, file).await
-                {
-                    return;
-                }
-                built.push(hops);
-                if !go_on {
-                    break;
-                }
-            }
-            (Target::Run(_), Read::Hidden) => {
-                built.run(&hop, None);
-            }
-            (Target::Release(_), Read::Answer(release)) => {
-                if let Some(file) = built.release(&hop, Some(&release))
-                    && !write(&caller, &gone, &mut zip, file).await
-                {
-                    return;
-                }
-            }
-            (Target::Release(_), read) => {
-                built.release(&hop, None);
-                if matches!(read, Read::Silent) {
-                    built.incomplete("a release crate did not answer");
-                }
-            }
-            (_, Read::Hidden) => built.hidden(&hop),
-            (_, Read::Silent) => built.unreachable(&hop),
-        }
-    }
-    finish(&caller, &gone, zip, built).await
 }
 
 /// Whether `id` names one exact version, as `/data/origin` accepts it.
@@ -348,30 +312,16 @@ fn is_version_id(id: &str) -> bool {
     )
 }
 
-/// Writes the root metadata and closes the ZIP within the finishing window. The root goes to a
-/// private temporary file first and is copied into the ZIP in pieces, never held whole.
+/// Writes the root metadata and closes the ZIP within the finishing window. The root is paged
+/// into the ZIP one entity at a time, never held whole.
 async fn finish(
     caller: &Caller,
     gone: &CancellationToken,
     mut zip: ZipFileWriter<DuplexStream>,
-    built: ProvenanceCrate,
+    state: ExportState,
 ) {
-    let stop = Arc::new(AtomicBool::new(false));
-    let halt = stop.clone();
-    let worker = tokio::task::spawn_blocking(move || {
-        let path = scratch_dir()?.join(format!("{}.json", scratch_name()));
-        spool_root(built, path, &|| halt.load(Relaxed))
-    });
-    let spooled = match until(caller.finish_by, gone, worker).await {
-        Some(Ok(Ok(spooled))) => spooled,
-        // The worker owns its file and removes it once it sees the stop.
-        _ => {
-            stop.store(true, Relaxed);
-            return;
-        }
-    };
-    let copied = async {
-        let mut file = tokio::fs::File::open(&spooled.0).await?;
+    let context = caller.state.get_ctx();
+    let written = async {
         let entry = ZipEntryBuilder::new(
             "ro-crate-metadata.json".to_string().into(),
             Compression::Stored,
@@ -381,70 +331,18 @@ async fn finish(
             .write_entry_stream(entry)
             .await
             .map_err(std::io::Error::other)?;
-        let mut chunk = vec![0u8; PIPE_BYTES];
-        loop {
-            let read = tokio::io::AsyncReadExt::read(&mut file, &mut chunk).await?;
-            if read == 0 {
-                break;
-            }
-            entry.write_all(&chunk[..read]).await?;
+        let mut cursor = Some(RootCursor::Head);
+        while let Some(at) = cursor {
+            let page = RootPageOperation::new(state.clone(), at);
+            let (piece, next) =
+                (drive(page, context.as_ref()).await).map_err(std::io::Error::other)?;
+            entry.write_all(piece.as_bytes()).await?;
+            cursor = next;
         }
         entry.close().await.map_err(std::io::Error::other)
     };
-    if matches!(until(caller.finish_by, gone, copied).await, Some(Ok(()))) {
+    if matches!(until(caller.finish_by, gone, written).await, Some(Ok(()))) {
         let _ = until(caller.finish_by, gone, zip.close()).await;
-    }
-}
-
-/// Writes the root to `path`, which only this user may read, and hands back the file. On any
-/// failure or stop the file is removed here, by the worker that made it.
-fn spool_root(
-    built: ProvenanceCrate,
-    path: std::path::PathBuf,
-    stop: &dyn Fn() -> bool,
-) -> std::io::Result<Spooled> {
-    let spooled = Spooled(path);
-    let mut out = std::io::BufWriter::new(scratch_file(&spooled.0)?);
-    built.write_root(&mut out, stop)?;
-    std::io::Write::flush(&mut out)?;
-    Ok(spooled)
-}
-
-/// A temporary file removed when the export ends, however it ends.
-struct Spooled(std::path::PathBuf);
-
-impl Drop for Spooled {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Records a run with what its crate read gave. A crate that did not answer in time leaves the
-/// export incomplete, never "not visible"; `false` ends the walk at the time limit.
-fn record_run(
-    built: &mut ProvenanceCrate,
-    hop: &Hop,
-    read: Option<Read>,
-) -> (Vec<Hop>, Option<CrateFile>, bool) {
-    match read {
-        Some(Read::Answer(run_crate)) => {
-            let (hops, file) = built.run(hop, Some(&run_crate));
-            (hops, file, true)
-        }
-        Some(Read::Hidden) => {
-            built.run(hop, None);
-            (Vec::new(), None, true)
-        }
-        Some(Read::Silent) => {
-            built.run(hop, None);
-            built.incomplete("a run record did not answer");
-            (Vec::new(), None, true)
-        }
-        None => {
-            built.run(hop, None);
-            built.stop("the export stopped at its time limit or on disconnect");
-            (Vec::new(), None, false)
-        }
     }
 }
 
@@ -511,7 +409,14 @@ async fn release_crate(
             version_id,
         })) if realm_id == state.get_realm_id() => {
             let deadline = Instant::now() + RESOLVE_BUDGET;
-            match resolve_version(context.as_ref(), version_id, deadline).await {
+            match resolved(
+                drive_until(
+                    resolve_version(context.node_and_realm(), version_id, RESOLVE_BUDGET),
+                    context.as_ref(),
+                    deadline,
+                )
+                .await,
+            ) {
                 GlobalResolution::Found(found) => {
                     // Holders come coordinator first.
                     let holder = match found.local {
@@ -542,10 +447,10 @@ async fn release_crate(
         realm_id,
         node_id,
     };
-    match read_crate(context.as_ref(), read).await {
-        Ok(found) if found.metadata.contains_key(RELEASE_TAG) => {
+    match drive(ReadCrateOperation::new(read), context.as_ref()).await {
+        Ok((found, _)) if found.metadata.contains_key(RELEASE_TAG) => {
             serde_json::from_slice(&found.bytes)
-                .map_err(|error| ServerError::InternalError(error.to_string()))
+                .map_err(|error| ServerError::InternalError(error.into()))
         }
         Ok(_) | Err(CrateReadError::Missing) => Err(ServerError::NotFound),
         Err(CrateReadError::Failed(reason)) => Err(ServerError::ServiceUnavailableReason(reason)),
@@ -559,9 +464,6 @@ async fn remote_crate(
     bearer: &ValidatedBearer,
     (holder, bucket, key, version_id): (NodeId, String, String, Ulid),
 ) -> ServerResult<serde_json::Value> {
-    let context = state.get_ctx();
-    let handle = context.metadata_handle.as_ref().ok_or_else(holder_silent)?;
-    let token = AuthToken::bearer(bearer.as_str().to_string()).map_err(|_| holder_silent())?;
     let mut bytes = Vec::new();
     loop {
         let ask = HolderAsk::Crate {
@@ -569,10 +471,12 @@ async fn remote_crate(
             version_id,
             offset: bytes.len() as u64,
         };
-        let answer = handle
-            .request_release_holder(holder, Some(token.clone()), bucket.clone(), ask)
-            .await;
-        let chunk = holder_chunk(answer)?;
+        let question = AskHolderOperation::new(holder, bearer.as_str(), &bucket, ask);
+        let answer = drive(question, &state.get_ctx()).await;
+        let chunk = holder_chunk(answer.map_err(|error| match error {
+            AskHolderError::Refused(error) => error,
+            AskHolderError::Failed(_) => MetadataReadError::Unavailable,
+        }))?;
         // A chunk that adds nothing before the end would never finish.
         if chunk.bytes.is_empty() && (bytes.len() as u64) < chunk.size {
             return Err(holder_silent());
@@ -582,7 +486,7 @@ async fn remote_crate(
             break;
         }
     }
-    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::from_slice(&bytes).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 fn holder_silent() -> ServerError {
@@ -618,7 +522,7 @@ fn classify(answer: ServerResult<serde_json::Value>) -> Read {
 }
 
 fn to_value(answer: &impl serde::Serialize) -> ServerResult<serde_json::Value> {
-    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.to_string()))
+    serde_json::to_value(answer).map_err(|error| ServerError::InternalError(error.into()))
 }
 
 /// A run crate read under the token as it holds now, checked again after the run read;
@@ -644,7 +548,9 @@ async fn crate_document(caller: &Caller, auth: &AuthContext, document_id: &str) 
     .await;
     classify(answer.and_then(|(_, Json(answer))| match answer {
         MetadataRoCrateResponse::Projected(projected) => Ok(projected.rocrate),
-        MetadataRoCrateResponse::Raw(_) => Err(ServerError::InternalError("raw view".to_string())),
+        MetadataRoCrateResponse::Raw(_) => {
+            Err(ServerError::InternalError("raw view".to_string().into()))
+        }
     }))
 }
 

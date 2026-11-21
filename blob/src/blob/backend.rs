@@ -18,12 +18,14 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
-use aruna_storage::storage::TransactionOwner;
+use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
 use ulid::Ulid;
 
 impl From<BlobError> for BlobLibError {
@@ -82,9 +84,7 @@ impl ReservationGuard {
 
 // Ulid randomness spreads retry storms without pulling in an rng dependency.
 fn conflict_backoff(attempt: u32) -> Duration {
-    let base = BUCKET_STATS_BACKOFF
-        .saturating_mul(1u32 << attempt.min(6))
-        .min(STATS_BACKOFF_CAP);
+    let base = capped_backoff(BUCKET_STATS_BACKOFF, STATS_BACKOFF_CAP, attempt, 0);
     let micros = base.as_micros() as u64;
     let spread = u64::from(Ulid::generate().to_bytes()[15]);
     Duration::from_micros(micros / 2 + micros * spread / 510)
@@ -461,9 +461,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -593,9 +593,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -929,9 +929,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
                 Ok(())
@@ -1036,9 +1036,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await
         {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 self.clear_active(location.ulid);
                 Ok(ReleaseUpdate::Applied)
@@ -1262,9 +1262,9 @@ impl BlobHandler {
             .send_effect(Effect::Storage(StorageEffect::CommitTransaction { txn_id }))
             .await;
         match event {
-            Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed })
-                if committed == txn_id =>
-            {
+            Event::Storage(StorageEvent::TransactionCommitted {
+                txn_id: committed, ..
+            }) if committed == txn_id => {
                 owner.finish();
                 Ok(LoadUpdate::Applied)
             }
@@ -1616,7 +1616,7 @@ mod split_tests {
             backend_path: backend_path.to_string(),
             ulid: Ulid::nil(),
             format: StoredFormat::default(),
-            created_by: aruna_core::UserId::default(),
+            created_by: aruna_core::user::id::UserId::default(),
             created_at: SystemTime::UNIX_EPOCH,
             staging: false,
             partial: false,

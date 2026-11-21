@@ -5,12 +5,12 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
-use aruna_core::DistributedTraceContext;
 use aruna_core::effects::DhtCompletion;
 use aruna_core::events::DhtEntry;
 use aruna_core::id::xor_distance_32;
 use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
 use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::trace_context::DistributedTraceContext;
 use smallvec::SmallVec;
 
 use super::constants::{
@@ -2426,8 +2426,8 @@ fn rpc_phase_order(phase: RpcPhase) -> u8 {
 mod tests {
     use super::*;
     use crate::test_support::{make_node, make_secret};
-    use aruna_core::UserId;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 

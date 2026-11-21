@@ -3,18 +3,19 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use aruna_core::document::DocumentTarget;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
     REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USAGE_STATS_KEYSPACE,
 };
-use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{
     GroupQuotaOverride, QuotaConfig, RealmConfigDocument, RealmId,
 };
@@ -30,29 +31,20 @@ use aruna_core::structs::storage::usage::{
     BucketCounters, BucketDelta, USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY, USAGE_SOURCE_KEYSPACES,
     UsageCounters, UsageDelta, global_group_key, usage_bucket_key, usage_group_key,
 };
-use aruna_core::types::{GroupId, Key};
+use aruna_core::types::{GroupId, Key, TxnId};
 use tempfile::tempdir;
 use ulid::Ulid;
 
 use super::{RebuildStatsError, RebuildStatsOperation};
-use crate::driver::DriverContext;
 use crate::node::rebuild_counts::CounterDeltas;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::{path_context, test_context};
+use aruna_storage::storage::handle::StorageHandle;
 
 const GROUP_A: GroupId = Ulid::from_parts(1, 1);
 const GROUP_B: GroupId = Ulid::from_parts(2, 2);
 /// Delete markers in beta, more than one walk page.
 const MARKERS: usize = 300;
-
-fn context(root: &str) -> DriverContext {
-    DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(root).unwrap(),
-        net_handle: None,
-        blob_handle: None,
-        metadata_handle: None,
-        task_handle: None,
-        compute_handle: None,
-    }
-}
 
 fn location(blob_size: u64) -> BackendLocation {
     BackendLocation {
@@ -200,7 +192,7 @@ async fn fixture(ctx: &DriverContext) -> u64 {
     write(ctx, ABE_VERSION_KEYSPACE, row, envelope).await;
 
     let copy_key = version(ctx, "beta", "copy.bin", materialized(hash)).await;
-    let copy = crate::abe::copies::copy_row(Ulid::generate(), &copy_key).unwrap();
+    let copy = crate::s3::abe_copies::copy_row(Ulid::generate(), &copy_key).unwrap();
     write(ctx, ABE_COPY_KEYSPACE, copy, vec![3; 70]).await;
     for index in 0..MARKERS {
         let marker = BlobVersion::deleted(now, Default::default());
@@ -209,44 +201,133 @@ async fn fixture(ctx: &DriverContext) -> u64 {
     plain.stored_size()
 }
 
-/// Drives the rebuild against storage; `live` commits right after the rebuild began, like a
-/// writer racing the walk. Returns the output and the prefixes of version page reads.
+/// What the watching storage does and saw: live deltas it commits right after the rebuild
+/// began, a stop after `pages` page commits, the version pages and reads outside the sources.
+#[derive(Default)]
+struct Watch {
+    live: Option<CounterDeltas>,
+    pages: Option<usize>,
+    commits: usize,
+    view: Option<TxnId>,
+    prefixes: Vec<Option<Key>>,
+    starts: Vec<bool>,
+    foreign: Vec<String>,
+}
+
+/// A storage that passes every effect to `real` and lets `watch` see it first.
+fn watched(real: StorageHandle, watch: Arc<Mutex<Watch>>) -> StorageHandle {
+    let (handle, receivers) = StorageHandle::new();
+    for receiver in [receivers.foreground, receivers.bulk] {
+        let (real, watch) = (real.clone(), watch.clone());
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            while let Ok((effect, response, ..)) = receiver.recv() {
+                response.send(runtime.block_on(pass(&real, &watch, effect)));
+            }
+        });
+    }
+    handle
+}
+
+/// Once the stop is reached, everything but aborts is refused, as a node that went down.
+async fn pass(real: &StorageHandle, watch: &Mutex<Watch>, effect: StorageEffect) -> StorageEvent {
+    {
+        let mut watch = watch.lock().unwrap();
+        if watch.pages.is_some_and(|pages| watch.commits >= pages)
+            && !matches!(effect, StorageEffect::AbortTransaction { .. })
+        {
+            let error = StorageError::PersistError("the node stopped".to_string());
+            return StorageEvent::Error { error };
+        }
+        note(&mut watch, &effect);
+    }
+    let begin = matches!(effect, StorageEffect::BeginUsageRebuild { .. });
+    let Event::Storage(event) = real.send_storage_effect(effect).await else {
+        panic!("storage answers with storage events");
+    };
+    let live = {
+        let mut watch = watch.lock().unwrap();
+        if let (true, StorageEvent::TransactionStarted { txn_id }) = (begin, &event) {
+            watch.view = Some(*txn_id);
+        }
+        let committed = matches!(event, StorageEvent::TransactionCommitted { .. });
+        watch.commits += usize::from(committed);
+        watch.live.take().filter(|_| begin)
+    };
+    if let Some((deltas, buckets)) = live {
+        commit_live(real, deltas, buckets).await;
+    }
+    event
+}
+
+/// Notes the version pages, and reads in the snapshot of keyspaces the rebuild must not read.
+fn note(watch: &mut Watch, effect: &StorageEffect) {
+    let spaces: Vec<&str> = match effect {
+        StorageEffect::Read {
+            key_space, txn_id, ..
+        }
+        | StorageEffect::Iter {
+            key_space, txn_id, ..
+        } if *txn_id == watch.view => vec![key_space.as_str()],
+        StorageEffect::BatchRead { reads, txn_id } if *txn_id == watch.view => reads
+            .iter()
+            .map(|(key_space, _)| key_space.as_str())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let kept =
+        |space: &str| USAGE_SOURCE_KEYSPACES.contains(&space) || space == USAGE_STATS_KEYSPACE;
+    let foreign = spaces.into_iter().filter(|space| !kept(space));
+    watch.foreign.extend(foreign.map(str::to_string));
+    if let StorageEffect::Iter {
+        key_space,
+        prefix,
+        start,
+        ..
+    } = effect
+        && key_space == BLOB_VERSIONS_KEYSPACE
+    {
+        watch.prefixes.push(prefix.clone());
+        watch.starts.push(start.is_some());
+    }
+}
+
+/// Runs `operation` through the runner on a storage that `watch` watches.
+async fn watch_run(
+    operation: RebuildStatsOperation,
+    ctx: &DriverContext,
+    watch: Watch,
+) -> (Result<UsageCounters, RebuildStatsError>, Watch) {
+    let shared = Arc::new(Mutex::new(watch));
+    let storage = watched(ctx.storage_handle.clone(), shared.clone());
+    let output = drive(operation, &test_context(storage)).await;
+    let watch = std::mem::take(&mut *shared.lock().unwrap());
+    assert!(watch.foreign.is_empty(), "read {:?}", watch.foreign);
+    (output, watch)
+}
+
+/// Runs `operation` to its end; `live` deltas commit right after the rebuild began.
 async fn run(
-    mut operation: RebuildStatsOperation,
+    operation: RebuildStatsOperation,
     ctx: &DriverContext,
     live: Option<CounterDeltas>,
 ) -> (Result<UsageCounters, RebuildStatsError>, Vec<Option<Key>>) {
-    let mut live = live;
-    let mut prefixes = Vec::new();
-    let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
-    while let Some(effect) = queue.pop_front() {
-        let Effect::Storage(effect) = effect else {
-            panic!("unexpected effect {effect:?}");
-        };
-        if let StorageEffect::Iter {
-            key_space, prefix, ..
-        } = &effect
-            && key_space == BLOB_VERSIONS_KEYSPACE
-        {
-            prefixes.push(prefix.clone());
-        }
-        let begin = matches!(effect, StorageEffect::BeginUsageRebuild { .. });
-        let event = ctx.storage_handle.send_storage_effect(effect).await;
-        if begin && let Some((deltas, buckets)) = live.take() {
-            commit_live(ctx, deltas, buckets).await;
-        }
-        queue.extend(operation.step(event));
-    }
-    assert!(operation.is_complete());
-    (operation.finalize(), prefixes)
+    let watch = Watch {
+        live,
+        ..Watch::default()
+    };
+    let (output, watch) = watch_run(operation, ctx, watch).await;
+    (output, watch.prefixes)
 }
 
 async fn commit_live(
-    ctx: &DriverContext,
+    storage: &StorageHandle,
     deltas: Vec<(Key, UsageDelta)>,
     buckets: Vec<(Key, BucketDelta)>,
 ) {
-    let storage = &ctx.storage_handle;
     let start = StorageEffect::StartTransaction { read: false };
     let Event::Storage(StorageEvent::TransactionStarted { txn_id }) =
         storage.send_storage_effect(start).await
@@ -274,7 +355,7 @@ async fn commit_live(
 #[tokio::test]
 async fn walk_matches_totals() {
     let temp = tempdir().unwrap();
-    let ctx = context(temp.path().to_str().unwrap());
+    let ctx = path_context(temp.path().to_str().unwrap());
     let plain_stored = fixture(&ctx).await;
 
     let (output, _) = run(RebuildStatsOperation::new(), &ctx, None).await;
@@ -324,7 +405,7 @@ async fn walk_matches_totals() {
 #[tokio::test]
 async fn walk_counts_concurrent() {
     let temp = tempdir().unwrap();
-    let ctx = context(temp.path().to_str().unwrap());
+    let ctx = path_context(temp.path().to_str().unwrap());
     bucket(&ctx, "alpha", GROUP_A).await;
     let plain = location(100);
     let hash = [1u8; 32];
@@ -386,7 +467,7 @@ async fn walk_counts_concurrent() {
 #[tokio::test]
 async fn quota_buckets_first() {
     let temp = tempdir().unwrap();
-    let ctx = context(temp.path().to_str().unwrap());
+    let ctx = path_context(temp.path().to_str().unwrap());
     let plain_stored = fixture(&ctx).await;
     let realm_id = RealmId::from_bytes([5u8; 32]);
     let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -426,67 +507,20 @@ async fn quota_buckets_first() {
     assert_eq!((alpha.objects, alpha.logical_bytes), (2, 249));
 }
 
-/// Drives a rebuild until it committed `pages` transactions, then stops it as a crash would:
-/// its open transactions end without a finish. Returns it with whether each version page
-/// started past the walk's start. Every read in its view names a keyspace storage keeps.
+/// Runs a rebuild until it committed `pages` page transactions, then stops it as a crash
+/// would: its open transactions end without a finish. Returns its outcome with whether each
+/// version page started after a saved position.
 async fn interrupt(
-    mut operation: RebuildStatsOperation,
+    operation: RebuildStatsOperation,
     ctx: &DriverContext,
     pages: usize,
-) -> (RebuildStatsOperation, Vec<bool>) {
-    let (mut commits, mut view, mut starts) = (0, None, Vec::new());
-    let mut queue: VecDeque<Effect> = operation.start().into_iter().collect();
-    while let Some(effect) = queue.pop_front() {
-        let Effect::Storage(effect) = effect else {
-            panic!("unexpected effect {effect:?}");
-        };
-        let read: Vec<&str> = match &effect {
-            StorageEffect::Read {
-                key_space, txn_id, ..
-            }
-            | StorageEffect::Iter {
-                key_space, txn_id, ..
-            } if *txn_id == view => {
-                vec![key_space.as_str()]
-            }
-            StorageEffect::BatchRead { reads, txn_id } if *txn_id == view => reads
-                .iter()
-                .map(|(key_space, _)| key_space.as_str())
-                .collect(),
-            _ => Vec::new(),
-        };
-        let kept = |space: &&str| USAGE_SOURCE_KEYSPACES.contains(space);
-        assert!(
-            read.iter()
-                .all(|space| kept(space) || *space == USAGE_STATS_KEYSPACE)
-        );
-        if let StorageEffect::Iter {
-            key_space, start, ..
-        } = &effect
-            && key_space == BLOB_VERSIONS_KEYSPACE
-        {
-            starts.push(start.is_some());
-        }
-        let begin = matches!(effect, StorageEffect::BeginUsageRebuild { .. });
-        let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
-        let event = ctx.storage_handle.send_storage_effect(effect).await;
-        if let (true, Event::Storage(StorageEvent::TransactionStarted { txn_id })) = (begin, &event)
-        {
-            view = Some(*txn_id);
-        }
-        commits += usize::from(commit);
-        queue.extend(operation.step(event));
-        if commits == pages {
-            for effect in operation.abort() {
-                let Effect::Storage(effect) = effect else {
-                    panic!("unexpected abort effect {effect:?}");
-                };
-                ctx.storage_handle.send_storage_effect(effect).await;
-            }
-            break;
-        }
-    }
-    (operation, starts)
+) -> (Result<UsageCounters, RebuildStatsError>, Vec<bool>) {
+    let watch = Watch {
+        pages: Some(pages),
+        ..Watch::default()
+    };
+    let (output, watch) = watch_run(operation, ctx, watch).await;
+    (output, watch.starts)
 }
 
 /// Commits version rows with their heads and the deltas a writer books for them at once.
@@ -553,10 +587,10 @@ fn markers(count: i128) -> BucketDelta {
 async fn resumes_after_restart() {
     let temp = tempdir().unwrap();
     let root = temp.path().to_str().unwrap();
-    let ctx = context(root);
+    let ctx = path_context(root);
     fixture(&ctx).await;
     let (stopped, starts) = interrupt(RebuildStatsOperation::new(), &ctx, 2).await;
-    assert!(!stopped.is_complete());
+    assert!(stopped.is_err(), "the stopped rebuild did not finish");
     assert_eq!(starts, vec![false], "stopped after the first version page");
     assert!(
         read(&ctx, USAGE_PROGRESS_KEY.to_vec(), |_| ())
@@ -582,7 +616,7 @@ async fn resumes_after_restart() {
     let DriverContext { storage_handle, .. } = ctx;
     storage_handle.close().await;
 
-    let ctx = context(root);
+    let ctx = path_context(root);
     let object = UsageDelta {
         objects: 1,
         logical_bytes: 100,
@@ -605,9 +639,8 @@ async fn resumes_after_restart() {
     commit_versions(&ctx, added, live).await;
 
     let (resumed, starts) = interrupt(RebuildStatsOperation::new(), &ctx, usize::MAX).await;
-    assert!(resumed.is_complete());
     // The walk totals count the rows as the rebuild began; later writes reach the counters.
-    assert_eq!(resumed.finalize().unwrap().objects, 3);
+    assert_eq!(resumed.unwrap().objects, 3);
     assert!(
         starts.iter().all(|start| *start),
         "the walk resumed after the saved page"

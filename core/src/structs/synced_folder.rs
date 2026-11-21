@@ -3,12 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::id::NodeId;
 use crate::structs::execution::offered_directory::FileStat;
 use crate::structs::storage::replication::VersionedObjectArn;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -666,7 +666,19 @@ pub enum SyncRefusal {
     Unavailable,
     /// The target key belongs to a range of a distributed bucket that this node does not
     /// coordinate; the named coordinator node takes the pull.
-    Coordinator(crate::NodeId),
+    Coordinator(crate::id::NodeId),
+}
+
+/// A stable label of `refusal` for logs.
+pub fn refusal_kind(refusal: &SyncRefusal) -> &'static str {
+    match refusal {
+        SyncRefusal::Unauthorized => "unauthorized",
+        SyncRefusal::Forbidden => "forbidden",
+        SyncRefusal::NotFound => "not_found",
+        SyncRefusal::Invalid(_) => "invalid",
+        SyncRefusal::Unavailable => "unavailable",
+        SyncRefusal::Coordinator(_) => "coordinator",
+    }
 }
 
 /// Where a realm node stands with one sync pull. A pull is accepted at once and polled until
@@ -772,6 +784,18 @@ impl TryFrom<usize> for SyncPageLimit {
         }
         Ok(Self(limit))
     }
+}
+
+/// The device-local bucket a folder is observed as. The owner never names it:
+/// a derived name cannot collide with a bucket they already use.
+pub fn folder_bucket(folder_id: Ulid) -> String {
+    format!("folder-{}", folder_id.to_string().to_lowercase())
+}
+
+/// The folder whose device-local bucket `bucket` is, if it is one.
+pub fn bucket_folder(bucket: &str) -> Option<Ulid> {
+    let folder_id = Ulid::from_string(bucket.strip_prefix("folder-")?).ok()?;
+    (folder_bucket(folder_id) == bucket).then_some(folder_id)
 }
 
 #[cfg(test)]

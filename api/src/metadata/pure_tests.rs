@@ -4,11 +4,10 @@
 
 use super::*;
 use crate::auth::ValidatedBearer;
+use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_operations::metadata::AuthToken;
-use aruna_operations::metadata::api::{
-    MetadataQueryForm as QueryForm, aggregate_query_results, deduplicate_fanout_nodes,
-    query_select_limit,
+use aruna_operations::metadata::api::distributed_types::{
+    MetadataQueryForm as QueryForm, aggregate_query_results,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -45,18 +44,6 @@ fn rejects_unknown_order() {
     assert_eq!(
         rejected.into_response().status(),
         axum::http::StatusCode::BAD_REQUEST
-    );
-}
-
-#[test]
-fn fanout_order_preserved() {
-    let first = iroh::SecretKey::from_bytes(&[31u8; 32]).public();
-    let second = iroh::SecretKey::from_bytes(&[32u8; 32]).public();
-    let third = iroh::SecretKey::from_bytes(&[33u8; 32]).public();
-
-    assert_eq!(
-        deduplicate_fanout_nodes(vec![first, second, first, third, second]),
-        vec![first, second, third]
     );
 }
 
@@ -122,25 +109,6 @@ fn select_limit_reapplied() {
         panic!("expected solutions");
     };
     assert_eq!(rows.len(), 3);
-}
-
-#[test]
-fn outer_limit_used() {
-    assert_eq!(
-        query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 5"),
-        Some(5)
-    );
-    assert_eq!(
-        query_select_limit("SELECT ?s WHERE { ?s ?p ?o } LIMIT 7 OFFSET 3"),
-        Some(7)
-    );
-    assert_eq!(query_select_limit("SELECT ?s WHERE { ?s ?p ?o }"), None);
-    assert_eq!(
-        query_select_limit("SELECT ?s WHERE { { SELECT ?s WHERE { ?s ?p ?o } LIMIT 5 } ?s ?p ?o }"),
-        None
-    );
-    assert_eq!(query_select_limit("ASK WHERE { ?s ?p ?o }"), None);
-    assert_eq!(query_select_limit("not sparql"), None);
 }
 
 #[test]

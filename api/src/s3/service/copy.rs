@@ -7,15 +7,15 @@ use crate::s3::auth::map_authorize_error;
 use crate::s3::checksum::{ApplyChecksums, ChecksumSelection, encode_checksums};
 use crate::s3::error::IntoS3Error;
 use crate::s3::util::{location_sse, sse_header, stored_encrypted};
+use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
-use aruna_operations::auth::request_authorization::authorize;
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::drive;
-use aruna_operations::s3::bucket::get::GetBucketOperation;
-use aruna_operations::s3::multipart::part_copy::PartCopyResult;
-use aruna_operations::s3::object::copy::{CopyResultData, CopySourceConditions};
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::request_authorization::AuthorizeOperation;
+use aruna_operations::transfer::copy::{CopyResultData, CopySourceConditions};
+use aruna_operations::transfer::part_copy::PartCopyResult;
 use s3s::dto::{
     ChecksumType, CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, ETagCondition,
     Timestamp, TimestampFormat, UploadPartCopyOutput,
@@ -47,19 +47,21 @@ impl ArunaS3Service {
         } else {
             AuthContext::anonymous(self.realm_id)
         };
-        authorize(
-            &self.state,
-            self.realm_id,
-            &source_auth_context,
-            &object_permission_path(
+        drive(
+            AuthorizeOperation::new(
                 self.realm_id,
-                source_bucket_info.group_id,
-                self.node_id,
-                &source_bucket,
-                source_key,
+                &source_auth_context,
+                &object_permission_path(
+                    self.realm_id,
+                    source_bucket_info.group_id,
+                    self.node_id,
+                    &source_bucket,
+                    source_key,
+                ),
+                &Permission::READ,
+                extras,
             ),
-            &Permission::READ,
-            extras,
+            &self.state,
         )
         .await
         .map_err(map_authorize_error)?;

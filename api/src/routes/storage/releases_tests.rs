@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use aruna_core::structs::identity::auth::AuthContext;
 use std::collections::HashMap;
 
 use aruna_core::effects::StorageEffect;
@@ -11,9 +12,11 @@ use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
-use aruna_operations::s3::object::origin::read_origin;
+use aruna_drivers::driver::drive;
+use aruna_operations::transfer::origin::ReadOriginOperation;
 
 use super::*;
+use crate::auth::RealmAuth;
 use crate::mcp::data::{WriteObjectInput, store_text};
 use crate::routes::storage::origin::{OriginParams, OriginResponse, get_origin};
 use crate::tests::distributed::{BUCKET, Node, node_state};
@@ -54,7 +57,7 @@ async fn publish(
 ) -> ServerResult<PublishReleaseResponse> {
     publish_release(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -67,7 +70,7 @@ async fn publish(
 async fn list(node: &Node) -> ReleaseListResponse {
     let Json(listed) = list_releases(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         Path(BUCKET.to_string()),
     )
@@ -83,7 +86,7 @@ async fn origin(node: &Node, key: &str) -> OriginResponse {
     };
     let Json(answer) = get_origin(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path(BUCKET.to_string()),
@@ -180,8 +183,15 @@ async fn publish_needs_reads() {
             key: "db/release.json".to_string(),
             spec: release_spec(&request("https://doi.org/10.5281/zenodo.1")).unwrap(),
         };
-        let refused =
-            release_publish::publish_release(state.get_ctx().as_ref(), scope, input).await;
+        let refused = drive(
+            release_publish::PublishReleaseOperation::new(
+                scope,
+                input,
+                aruna_drivers::driver::node_routing(state.get_ctx().as_ref()),
+            ),
+            state.get_ctx().as_ref(),
+        )
+        .await;
         assert!(matches!(refused, Err(PublishError::Forbidden(why)) if why == reason));
     }
     assert!(list(&node).await.releases.is_empty());
@@ -208,9 +218,12 @@ async fn pins_one_version() {
     store(&node, "db/a.fasta", ">a22").await;
     let place = (node.state.get_realm_id(), node.state.get_node_id());
     let context = node.state.get_ctx();
-    let view = read_origin(context.as_ref(), place, BUCKET, "db/a.fasta", None)
-        .await
-        .unwrap();
+    let view = drive(
+        ReadOriginOperation::new(place.0, BUCKET, "db/a.fasta", None),
+        context.as_ref(),
+    )
+    .await
+    .unwrap();
     assert_eq!(view.size, Some(4), "the size is the current version's");
 }
 
@@ -253,7 +266,7 @@ async fn files(
 ) -> ServerResult<ReleaseFilesResponse> {
     list_release_files(
         State(node.state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Extension(Some(ValidatedBearer::new_for_test("caller-token"))),
         HeaderMap::new(),
         Path((BUCKET.to_string(), version_id.to_string())),
@@ -345,10 +358,12 @@ async fn browses_release_files() {
 async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
-    use aruna_operations::driver::drive;
-    use aruna_operations::s3::object::delete::pinned::{PinnedError, refuse_pinned, refuse_scope};
+    use aruna_drivers::driver::drive;
     use aruna_operations::s3::object::delete::{
         DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
+    };
+    use aruna_operations::transfer::pinned::{
+        PinnedError, RefusePinnedOperation, RefuseScopeOperation,
     };
 
     let node = node_state().await;
@@ -377,7 +392,11 @@ async fn purge_keeps_pinned() {
     };
     let caller = &node.owner;
     let context = state.get_ctx();
-    let refused = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", pinned)).await;
+    let refused = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/a.fasta", pinned)),
+        context.as_ref(),
+    )
+    .await;
     assert!(
         matches!(refused, Err(PinnedError::Version { .. })),
         "the pinned version is kept: {refused:?}"
@@ -386,23 +405,33 @@ async fn purge_keeps_pinned() {
     let (realm, node_id) = (state.get_realm_id(), state.get_node_id());
     let path = object_permission_path(realm, node.group_id, node_id, BUCKET, "db/a.fasta");
     let blind = limited(&node, &[(path, Permission::WRITE)]);
-    let refused = refuse_pinned(context.as_ref(), scope, &blind, ("db/a.fasta", pinned)).await;
+    let refused = drive(
+        RefusePinnedOperation::new(scope, &blind, ("db/a.fasta", pinned)),
+        context.as_ref(),
+    )
+    .await;
     assert!(matches!(refused, Err(PinnedError::Version { .. })));
     let file = StoragePurgeScope::File {
         bucket: BUCKET.to_string(),
         key: "db/a.fasta".to_string(),
     };
-    let refused = refuse_scope(context.as_ref(), scope, &blind, &file).await;
+    let refused = drive(
+        RefuseScopeOperation::new(scope, &blind, &file),
+        context.as_ref(),
+    )
+    .await;
     assert_eq!(refused, Err(PinnedError::Scope));
     // The newer version and the release crate itself belong to no release.
-    let newer = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    let newer = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/a.fasta", current)),
+        context.as_ref(),
+    )
+    .await;
     let guards = newer.expect("no release pins the newer version");
     let crate_version = release.version_id.parse().unwrap();
-    let own = refuse_pinned(
+    let own = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/release.json", crate_version)),
         context.as_ref(),
-        scope,
-        caller,
-        ("db/release.json", crate_version),
     );
     assert!(own.await.is_ok());
     // A release published after the check pins the newer version: the checked delete fails.
@@ -421,12 +450,16 @@ async fn purge_keeps_pinned() {
     .with_fence(guards, Vec::new());
     let raced = drive(delete, context.as_ref()).await;
     assert_eq!(raced, Err(DeleteObjectError::FenceTaken));
-    let again = refuse_pinned(context.as_ref(), scope, caller, ("db/a.fasta", current)).await;
+    let again = drive(
+        RefusePinnedOperation::new(scope, caller, ("db/a.fasta", current)),
+        context.as_ref(),
+    )
+    .await;
     assert!(matches!(again, Err(PinnedError::Version { .. })));
 
     let shared = context.as_ref();
     let purge = |purged: StoragePurgeScope| async move {
-        refuse_scope(shared, scope, caller, &purged).await
+        drive(RefuseScopeOperation::new(scope, caller, &purged), shared).await
     };
     let file = StoragePurgeScope::File {
         bucket: BUCKET.to_string(),
@@ -450,7 +483,7 @@ async fn purge_keeps_pinned() {
 
     let submitted = submit_purge(
         State(node.state.clone()),
-        Extension(Some(node.owner.clone())),
+        RealmAuth(node.owner.clone()),
         Json(SubmitPurgeRequest {
             scope: PurgeScopeRequest::File {
                 bucket: BUCKET.to_string(),

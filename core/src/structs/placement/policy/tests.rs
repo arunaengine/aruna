@@ -16,12 +16,7 @@ fn label(key: &str, value: &str) -> LabelMatch {
 }
 
 fn selector() -> PlacementSelector {
-    PlacementSelector {
-        node_id: None,
-        location: None,
-        labels: Vec::new(),
-        executor_kind: None,
-    }
+    crate::tests::scheduling::selector()
 }
 
 fn policy(allowed: Vec<PlacementSelector>) -> PlacementPolicy {

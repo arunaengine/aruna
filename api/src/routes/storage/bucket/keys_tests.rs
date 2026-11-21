@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
 use crate::tests::routes::{seed_group_docs, seed_realm_auth, seed_realm_config, test_state};
 use aruna_blob::blob::BlobHandler;
 use aruna_core::effects::StorageEffect;
@@ -17,9 +18,10 @@ use aruna_core::structs::storage::encryption::{
     BucketEncryption, BucketHolder, BucketKeyRecord, EncryptionMode, GrantState, SealedCopy,
 };
 use aruna_core::structs::storage::format::Compression;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
-use aruna_storage::FjallStorage;
+use aruna_drivers::driver::DriverContext;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::worker::FjallStorage;
 use std::collections::HashMap;
 use std::time::SystemTime;
 use tempfile::TempDir;
@@ -39,7 +41,7 @@ async fn fixture() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
     let storage = FjallStorage::open(root).unwrap();
-    storage.open_vault(aruna_core::node_vault::NodeVaultKey::random());
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId([3; 32]);
     let config = NetConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -66,9 +68,10 @@ async fn fixture() -> Fixture {
         storage_handle: storage,
         net_handle: Some(net),
         blob_handle: Some(blob),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let owner = UserId::local(Ulid::generate(), realm_id);
     let actor = Actor {
@@ -190,7 +193,7 @@ async fn lists_then_removes() {
     let list = || {
         list_holders(
             State(fixture.state.clone()),
-            Extension(Some(fixture.owner.clone())),
+            UnrestrictedAuth(fixture.owner.clone()),
             Path(BUCKET.to_string()),
         )
     };
@@ -204,7 +207,7 @@ async fn lists_then_removes() {
     assert!(users.contains(&grantee.to_string()));
     let removed = remove_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path((BUCKET.to_string(), grantee.to_string())),
         Query(RemovalQuery {
             revision: before.revision.clone(),
@@ -226,7 +229,7 @@ async fn lists_then_removes() {
     // The old revision no longer names the current holders.
     let stale = remove_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path((BUCKET.to_string(), grantee.to_string())),
         Query(RemovalQuery {
             revision: before.revision,
@@ -268,7 +271,7 @@ async fn federated_keys_checked() {
     }
     let Json(grant) = grant_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path(BUCKET.to_string()),
         Json(GrantRequest {
             user_id: foreign.to_string(),
@@ -279,7 +282,7 @@ async fn federated_keys_checked() {
     assert_eq!(grant.user_id, foreign.to_string());
     let anonymous = grant_holder(
         State(fixture.state.clone()),
-        Extension(Some(fixture.owner.clone())),
+        UnrestrictedAuth(fixture.owner.clone()),
         Path(BUCKET.to_string()),
         Json(GrantRequest {
             user_id: UserId::nil(RealmId([9; 32])).to_string(),
@@ -293,7 +296,7 @@ async fn federated_keys_checked() {
     };
     let extend = extend_unlock(
         State(fixture.state.clone()),
-        Extension(Some(stranger)),
+        UnrestrictedAuth(stranger),
         Path(BUCKET.to_string()),
         Json(ExtendRequest {
             generation: 1,

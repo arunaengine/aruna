@@ -6,27 +6,34 @@ use aruna_core::effects::{JobRecordFrame, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ADMISSION_QUOTA_KEYSPACE, FAMILY_OUTBOX_KEYSPACE};
-use aruna_core::structs::execution::job::{
-    CapturedInput, InputMode, InputSelection, InputSource, JobFamilyRecord, JobId, JobState,
-    LogicalJobSpec, SubmissionClaim, WorkspaceMode,
+use aruna_core::structs::execution::job::family::{
+    JobFamilyRecord, LogicalJobSpec, SubmissionClaim,
 };
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, InputMode, InputSelection, InputSource,
+};
+use aruna_core::structs::execution::job::local::WorkspaceMode;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use tempfile::TempDir;
 use ulid::Ulid;
 
-use crate::driver::{DriverContext, drive};
+use super::{family_status, submit_external_job};
+use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::admit::{
     AdmissionCandidate, AdmitSubmissionConfig, AdmitSubmissionOperation,
 };
-use crate::jobs::lifecycle::ids::{SubmissionRequest, SubmissionScope, store_workspace};
-use crate::jobs::lifecycle::routing::{family_of_alias, family_status};
-use crate::jobs::lifecycle::{LifecycleError, submit_external_job};
-use crate::jobs::store::iter_prefix_page;
-use crate::jobs::submit::SubmitJobError;
-use crate::metadata::AuthToken;
+use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::tests::records::{Family, REALM, context, node, payload, secret, user};
+use aruna_core::job_request::{
+    SubmissionRequest, SubmissionScope, SubmitJobError, store_workspace,
+};
+use aruna_core::metadata::AuthToken;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_storage::scan::iter_prefix_page;
 
 fn frame(record: JobFamilyRecord, family: &Family) -> JobRecordFrame {
     JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record")
@@ -40,7 +47,7 @@ fn candidate(family: &Family, spec: LogicalJobSpec, claim: SubmissionClaim) -> A
     }
 }
 
-async fn admit(
+pub(super) async fn admit(
     context: &DriverContext,
     family: &Family,
     job_id: JobId,
@@ -57,6 +64,7 @@ async fn admit(
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: None,
+            admit_by: None,
         }),
         context,
     )
@@ -97,6 +105,7 @@ async fn rejects_stale_quota() {
             now_ms: 3_000,
             quota_refusal: None,
             quota_revision: Some(0),
+            admit_by: None,
         }),
         &ctx,
     )
@@ -107,7 +116,10 @@ async fn rejects_stale_quota() {
         error,
         LifecycleError::Storage(StorageError::TransactionConflict)
     );
-    assert_eq!(family_of_alias(&ctx, family.job_id).await, Ok(None));
+    assert_eq!(
+        drive(AliasFamilyOperation::new(family.job_id), &ctx).await,
+        Ok(None)
+    );
 }
 
 #[tokio::test]
@@ -122,10 +134,10 @@ async fn admits_local_claim() {
     assert!(created);
     assert_eq!(job_id, family.job_id);
     assert_eq!(
-        family_of_alias(&ctx, job_id).await,
+        drive(AliasFamilyOperation::new(job_id), &ctx).await,
         Ok(Some(family.family()))
     );
-    let record = crate::jobs::store::read_job_record(&ctx.storage_handle, job_id, None)
+    let record = aruna_test_support::jobs::read_job_record(&ctx, job_id, None)
         .await
         .expect("logical row read")
         .expect("logical row exists");
@@ -159,7 +171,11 @@ async fn replays_matching_claim() {
     assert!(!created);
     assert_eq!(second, first);
     assert_eq!(
-        family_of_alias(&ctx, JobId::from_bytes([4u8; 16])).await,
+        drive(
+            AliasFamilyOperation::new(JobId::from_bytes([4u8; 16])),
+            &ctx
+        )
+        .await,
         Ok(None)
     );
 }
@@ -184,7 +200,7 @@ async fn reports_key_conflict() {
         }
     );
     assert_eq!(
-        family_of_alias(&ctx, first).await,
+        drive(AliasFamilyOperation::new(first), &ctx).await,
         Ok(Some(family.family()))
     );
 }
@@ -196,22 +212,13 @@ async fn refuses_undeliverable_submit() {
     let family = Family::new([1u8; 32]);
     let (_dir, ctx) = context(&family.config, family.holder.public()).await;
 
-    let error = submit_external_job(
-        &ctx,
-        payload(),
-        user(),
-        Some("idempotency".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
-        None,
-    )
-    .await
-    .expect_err("no holder is reachable");
+    let error = submit_external_job(&ctx, payload(), "idempotency", None)
+        .await
+        .expect_err("no holder is reachable");
 
     assert!(matches!(
         error,
-        crate::jobs::submit::SubmitJobError::PlacementUnavailable(_)
+        aruna_core::job_request::SubmitJobError::PlacementUnavailable(_)
     ));
     let (queued, _) = iter_prefix_page(
         &ctx.storage_handle,
@@ -248,14 +255,14 @@ async fn answers_by_alias() {
     assert_eq!(status.job.job_id, family.job_id);
 
     let stranger = AuthContext {
-        user_id: aruna_core::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
+        user_id: aruna_core::user::id::UserId::new(Ulid::from_bytes([12u8; 16]), REALM),
         realm_id: REALM,
         path_restrictions: None,
         session: None,
     };
     assert!(matches!(
         family_status(&ctx, &stranger, family.job_id).await,
-        Some(Err(crate::jobs::JobRouteError::NotFound))
+        Some(Err(crate::jobs::route::JobRouteError::NotFound))
     ));
 }
 
@@ -274,6 +281,7 @@ fn identity_is_deterministic() {
         captured_inputs: Vec::new(),
         output_policies: Vec::new(),
         input_pages: None,
+        admit_by: None,
     };
     let identity = request.identity().expect("identity derives");
 
@@ -300,7 +308,7 @@ fn identity_is_deterministic() {
         destination_key: "reads.fastq".to_string(),
         source_node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
         version_id: Ulid::from_bytes([1u8; 16]),
-        content: aruna_core::structs::execution::job::InputContent::Blake3([2u8; 32]),
+        content: aruna_core::structs::execution::job::input::InputContent::Blake3([2u8; 32]),
         bytes: 3,
         policies: Vec::new(),
         source_group_id: Default::default(),
@@ -391,11 +399,7 @@ async fn device_skips_materialization() {
     let error = submit_external_job(
         &device,
         spec.clone(),
-        user(),
-        Some("device".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
+        "device",
         Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
@@ -418,11 +422,7 @@ async fn device_skips_materialization() {
     let refused = submit_external_job(
         &server,
         spec,
-        user(),
-        Some("server".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
+        "server",
         Some(AuthToken::bearer("token").expect("bearer fits")),
     )
     .await
@@ -445,18 +445,9 @@ async fn device_needs_bearer() {
     // cannot back with the caller's own bearer token is refused, not forwarded.
     let (_dir, device) = kind_context(7, RealmNodeKind::User { owner: user() }).await;
 
-    let error = submit_external_job(
-        &device,
-        payload(),
-        user(),
-        Some("device".to_string()),
-        WorkspaceMode::None,
-        None,
-        60_000,
-        None,
-    )
-    .await
-    .expect_err("an asserted context is not forwardable");
+    let error = submit_external_job(&device, payload(), "device", None)
+        .await
+        .expect_err("an asserted context is not forwardable");
 
     assert!(matches!(error, SubmitJobError::AuthorityDenied));
 }
@@ -468,4 +459,72 @@ fn refuses_reserved_tags() {
     let mut spec = payload();
     store_workspace(&mut spec, WorkspaceMode::None, None).expect("workspace stored");
     assert!(store_workspace(&mut spec, WorkspaceMode::None, None).is_err());
+}
+
+// A keyed submission whose family is still being deleted here gets a retryable error and writes
+// nothing; it is admitted as a new incarnation once the deletion finished.
+#[tokio::test]
+async fn waits_for_pruning() {
+    use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
+    use aruna_core::structs::execution::job::prune::FamilyTombstone;
+    use aruna_core::structs::execution::job::record_keys::family_prefix;
+    let family = Family::new([5u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let store = |finished| {
+        let tombstone = FamilyTombstone {
+            pruned_at_ms: 600,
+            last_record_ms: 500,
+            finished,
+            created_by: None,
+            aliases: Vec::new(),
+        };
+        StorageEffect::Write {
+            key_space: FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+            key: family_prefix(&family.family()),
+            value: postcard::to_allocvec(&tombstone).unwrap().into(),
+            txn_id: None,
+        }
+    };
+    ctx.storage_handle.send_storage_effect(store(false)).await;
+
+    let refused = admit(&ctx, &family, family.job_id).await;
+    assert_eq!(refused, Err(LifecycleError::Pruning));
+    let alias = drive(AliasFamilyOperation::new(family.job_id), &ctx).await;
+    assert_eq!(alias, Ok(None));
+    ctx.storage_handle.send_storage_effect(store(true)).await;
+    let admitted = admit(&ctx, &family, family.job_id).await;
+    assert!(
+        admitted.expect("new incarnation").1,
+        "the keyed family starts again"
+    );
+}
+
+// A keyed replay while the family is being deleted gets the retryable error, although its old
+// claim is still stored, instead of the old alias that already reads as pruned.
+#[tokio::test]
+async fn replay_waits_pruning() {
+    use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
+    use aruna_core::structs::execution::job::prune::FamilyTombstone;
+    use aruna_core::structs::execution::job::record_keys::family_prefix;
+    let family = Family::new([6u8; 32]);
+    let (_dir, ctx) = context(&family.config, family.holder.public()).await;
+    let first = admit(&ctx, &family, family.job_id).await;
+    assert!(first.expect("first admission").1);
+    let deleting = FamilyTombstone {
+        pruned_at_ms: 600,
+        last_record_ms: 500,
+        finished: false,
+        created_by: None,
+        aliases: Vec::new(),
+    };
+    let store = StorageEffect::Write {
+        key_space: FAMILY_TOMBSTONE_KEYSPACE.to_string(),
+        key: family_prefix(&family.family()),
+        value: postcard::to_allocvec(&deleting).unwrap().into(),
+        txn_id: None,
+    };
+    ctx.storage_handle.send_storage_effect(store).await;
+
+    let replay = admit(&ctx, &family, family.job_id).await;
+    assert_eq!(replay, Err(LifecycleError::Pruning));
 }

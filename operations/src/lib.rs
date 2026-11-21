@@ -1,4 +1,4 @@
-//! Domain state machines and their adapters over the operation runner.
+//! Domain state machines; the drivers crate runs them.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -13,16 +13,16 @@ pub mod auth;
 pub mod blob;
 pub mod connectors;
 pub mod device;
+pub mod device_node;
 pub mod distribution;
 pub mod document_repository;
-pub mod driver;
-pub(crate) mod effect_adapters;
 pub(crate) mod endpoint_screening;
 pub mod federation;
 pub mod forward;
 pub mod git;
 pub mod groups;
 pub mod harvest;
+pub mod holder_choice;
 pub mod jobs;
 pub mod metadata;
 pub mod node;
@@ -32,8 +32,10 @@ pub mod onboarding;
 mod owner_index;
 pub mod placement;
 pub mod plugins;
+pub mod queue_backoff;
 pub mod realm;
 pub mod realm_vault;
+pub mod relay;
 pub mod replication;
 pub mod s3;
 pub mod secrets;
@@ -41,18 +43,25 @@ pub mod session;
 pub mod shard;
 pub mod shares;
 pub mod staging;
-mod storage_read;
+#[cfg(test)]
+pub(crate) mod stepper;
 pub mod sync;
-pub mod tasks;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod testing;
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_objects.rs"]
+pub mod testing_objects;
+pub mod transfer;
+pub mod triggers;
 pub mod users;
 
-#[cfg(test)]
-mod tests;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod tests;
 
 /// Deterministic member order for records that several nodes must byte-match.
 pub(crate) fn sorted_user_ids(
-    user_ids: &std::collections::HashSet<aruna_core::UserId>,
-) -> Vec<aruna_core::UserId> {
+    user_ids: &std::collections::HashSet<aruna_core::user::id::UserId>,
+) -> Vec<aruna_core::user::id::UserId> {
     let mut user_ids: Vec<_> = user_ids.iter().copied().collect();
     user_ids.sort();
     user_ids

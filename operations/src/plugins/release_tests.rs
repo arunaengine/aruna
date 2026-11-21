@@ -3,17 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
 use aruna_core::compute::Secret;
-use aruna_core::node_vault::NodeVaultKey;
-use aruna_core::secrets::{SecretFields, UseRule};
+use aruna_core::node::vault::NodeVaultKey;
+use aruna_core::secrets::{ResponseExposure, SecretFields, SecretKind, SecretSettings, UseRule};
 use aruna_core::structs::identity::admin_audit::{AdminAuditAction, AuditIndex, audit_prefix};
+use aruna_core::user::id::UserId;
 
 use super::*;
-use crate::plugins::bound::tests::{ORIGIN, TOKEN, bound, edit_config, keys, secret};
-use crate::plugins::install::read_config;
-use crate::plugins::install::tests::Fixture;
+use crate::plugins::calls::*;
 use crate::secrets::SecretChange;
+use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
+use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding};
+use aruna_core::plugins::Refusal;
+use aruna_core::secrets::{Delivery, SecretConsumer, SecretName};
+use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::rows::Txn;
+use aruna_test_support::plugins::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret};
+use ulid::Ulid;
 
 fn request(install: &PluginInstall, url: &str) -> ReleaseRequest {
     ReleaseRequest {
@@ -35,7 +42,8 @@ async fn released(
         .await
         .unwrap();
     let local = fixture.actor.node_id;
-    release(&fixture.ctx, &keys(), (&config, local, peer), request).await
+    hold_keys(&fixture.ctx);
+    release(&fixture.ctx, (&config, local, peer), request).await
 }
 
 /// The use audit actions this node recorded, oldest first.
@@ -133,8 +141,8 @@ async fn refusals_per_step() {
 
 #[tokio::test]
 async fn node_secrets_local() {
-    use crate::driver::drive;
     use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    use aruna_drivers::driver::drive;
     let fixture = Fixture::keyed().await;
     fixture
         .ctx
@@ -185,18 +193,12 @@ async fn node_secrets_local() {
     let asked = request(&install, &format!("{ORIGIN}/api/records"));
     let receiver = install.receiver;
     let mine = (&config, receiver, receiver);
-    let answer = release(&fixture.ctx, &ReleaseKeys::default(), mine, &asked).await;
+    let answer = release(&fixture.ctx, mine, &asked).await;
     let fields = SecretFields::decode(answer.unwrap().fields.as_ref().unwrap()).unwrap();
     assert_eq!(fields.get("token"), Some(TOKEN));
     // A management node never serves another node's secret.
     let elsewhere = iroh::SecretKey::from_bytes(&[42u8; 32]).public();
-    let served = release(
-        &fixture.ctx,
-        &keys(),
-        (&config, elsewhere, receiver),
-        &asked,
-    )
-    .await;
+    let served = release(&fixture.ctx, (&config, elsewhere, receiver), &asked).await;
     assert_eq!(served, Err(ReleaseError::Refused(Refusal::Binding)));
 }
 
@@ -217,9 +219,8 @@ async fn change_secret(
         readable: false,
         now_ms: 10 + seed as u64,
         write_ids: [1, 2, 3].map(|part| Ulid::from_parts(80 + seed as u64, part)),
-        txn_id: None,
     };
-    crate::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
+    aruna_drivers::driver::drive(OwnerSecretOperation::new(input), &fixture.ctx)
         .await
         .unwrap();
 }

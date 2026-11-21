@@ -2,24 +2,23 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{ONBOARDING_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::onboarding::{OnboardingSecretRecord, OnboardingSecretState};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{PrefixPages, values};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
-use aruna_core::types::{Effects, TxnId, Value};
+use aruna_core::types::Value;
+use aruna_core::user::id::UserId;
 use byteview::ByteView;
-use smallvec::smallvec;
 use thiserror::Error;
 use ulid::Ulid;
 
 use crate::onboarding::create_secret::{
-    enrolled_devices, pending_devices, scan_secrets, secret_record_key,
+    Counted, SlotCount, enrolled_devices, secret_pages, secret_record_key,
 };
-use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
+use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReserveSecretInput {
@@ -31,42 +30,23 @@ pub struct ReserveSecretInput {
     pub finalizing: bool,
 }
 
+/// What the reservation transaction waits for.
+#[derive(Clone, Debug, PartialEq)]
+enum Stage {
+    Records,
+    Config { owner: UserId },
+    Count(SlotCount),
+    Write,
+}
+
+/// Reserves the secret for one node in one write transaction, re-checking the owner's device
+/// cap for a device secret.
 #[derive(Debug, PartialEq)]
 pub struct ReserveSecretOperation {
     input: ReserveSecretInput,
-    state: ReserveSecretState,
-    output: Option<Result<OnboardingSecretRecord, ReserveSecretError>>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ReserveSecretState {
-    Init,
-    StartTransaction,
-    ReadRecords {
-        txn_id: TxnId,
-    },
-    ReadRealmConfig {
-        txn_id: TxnId,
-        record: OnboardingSecretRecord,
-        owner: UserId,
-    },
-    CountPending {
-        txn_id: TxnId,
-        record: OnboardingSecretRecord,
-        cap: u32,
-        enrolled: Vec<String>,
-        /// Secrets counted by the pages already read.
-        pending: u32,
-    },
-    WriteReserved {
-        txn_id: TxnId,
-        record: OnboardingSecretRecord,
-    },
-    CommitTransaction {
-        record: OnboardingSecretRecord,
-    },
-    Finish,
-    Error,
+    stage: Stage,
+    record: Option<OnboardingSecretRecord>,
+    pages: PrefixPages,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -91,16 +71,34 @@ pub enum ReserveSecretError {
     UnexpectedEvent {
         state: String,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
+
+impl From<IoError> for ReserveSecretError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "ReserveSecret".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+type ReserveTurn = Result<Next<OnboardingSecretRecord>, ReserveSecretError>;
 
 impl ReserveSecretOperation {
     pub fn new(input: ReserveSecretInput) -> Self {
         Self {
             input,
-            state: ReserveSecretState::Init,
-            output: None,
+            stage: Stage::Records,
+            record: None,
+            pages: secret_pages(),
         }
     }
 
@@ -134,7 +132,14 @@ impl ReserveSecretOperation {
                 record.claimed_node_id = Some(self.input.node_id.clone());
                 Ok(Some(record))
             }
-            OnboardingSecretState::Reserved { node_id, .. } if node_id == self.input.node_id => {
+            OnboardingSecretState::Reserved {
+                node_id,
+                expires_at,
+            } if node_id == self.input.node_id => {
+                // A lapsed reservation is a new claim, which an expired secret refuses.
+                if expires_at < self.input.now && record.expires_at < self.input.now {
+                    return Err(ReserveSecretError::Expired);
+                }
                 record.claimed_node_id = Some(self.input.node_id.clone());
                 Ok(Some(record))
             }
@@ -161,14 +166,13 @@ impl ReserveSecretOperation {
         }
     }
 
-    fn emit_reserve_write(&mut self, txn_id: TxnId, record: OnboardingSecretRecord) -> Effects {
-        let record_value = match postcard::to_allocvec(&record) {
-            Ok(value) => value,
-            Err(error) => {
-                return fail(self, ReserveSecretError::ConversionError(error.into()));
-            }
-        };
-        let state_entry = match secret_state_entry(
+    fn reserve_write(&mut self) -> ReserveTurn {
+        let record = self
+            .record
+            .as_ref()
+            .ok_or(ReserveSecretError::NotFinished)?;
+        let record_value = postcard::to_allocvec(record).map_err(ConversionError::from)?;
+        let state_entry = secret_state_entry(
             self.input.enrollment_id,
             if self.input.finalizing {
                 OnboardingSecretState::Finalizing {
@@ -180,43 +184,76 @@ impl ReserveSecretOperation {
                     expires_at: self.input.reservation_expires_at,
                 }
             },
-        ) {
-            Ok(entry) => entry,
-            Err(error) => return fail(self, ReserveSecretError::ConversionError(error)),
-        };
-        self.state = ReserveSecretState::WriteReserved { txn_id, record };
-        smallvec![Effect::Storage(StorageEffect::BatchWrite {
-            writes: vec![
-                (
-                    ONBOARDING_KEYSPACE.to_string(),
-                    secret_record_key(self.input.enrollment_id),
-                    ByteView::from(record_value),
-                ),
-                state_entry,
-            ],
-            txn_id: Some(txn_id),
-        })]
+        )?;
+        self.stage = Stage::Write;
+        Ok(Next::Call(IoCall::Write(vec![
+            (
+                ONBOARDING_KEYSPACE.to_string(),
+                secret_record_key(self.input.enrollment_id),
+                ByteView::from(record_value),
+            ),
+            state_entry,
+        ])))
     }
 
-    /// The redeeming node re-checks the owner's device cap: the mint that issued
-    /// this secret only saw its own node's outstanding secrets, so a second
-    /// management node may have minted under the same cap.
-    fn emit_cap_check(
+    fn handle_records(
         &mut self,
-        txn_id: TxnId,
-        record: OnboardingSecretRecord,
-        owner: UserId,
-    ) -> Effects {
-        self.state = ReserveSecretState::ReadRealmConfig {
-            txn_id,
-            record,
-            owner,
+        record_value: Option<Value>,
+        state_value: Option<Value>,
+    ) -> ReserveTurn {
+        let (stored, state) = self.validate_record(record_value, state_value)?;
+        // A repeat by the node that already finalized or consumed writes nothing.
+        let Some(record) = self.reserve_state(stored.clone(), state)? else {
+            return Ok(Next::Done(stored));
         };
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: REALM_CONFIG_KEYSPACE.to_string(),
-            key: ByteView::from(*owner.realm_id.as_bytes()),
-            txn_id: Some(txn_id),
-        })]
+        let owner = record.mode.owner();
+        self.record = Some(record);
+        let Some(owner) = owner else {
+            return self.reserve_write();
+        };
+        // The redeeming node re-checks the owner's device cap: the mint that issued
+        // this secret only saw its own node's outstanding secrets, so a second
+        // management node may have minted under the same cap.
+        self.stage = Stage::Config { owner };
+        Ok(Next::Call(IoCall::Read(vec![(
+            REALM_CONFIG_KEYSPACE.to_string(),
+            ByteView::from(*owner.realm_id.as_bytes()),
+        )])))
+    }
+
+    fn handle_config(&mut self, owner: UserId, value: Option<Value>) -> ReserveTurn {
+        let config = value
+            .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+            .transpose()?;
+        let Some(cap) = config
+            .as_ref()
+            .and_then(|config| config.quota.devices_per_user)
+        else {
+            return self.reserve_write();
+        };
+        // The joiner's own membership is the slot this redemption takes,
+        // so a retry after it joined must not charge it twice.
+        let enrolled = enrolled_devices(config.as_ref(), owner)
+            .into_iter()
+            .filter(|node_id| node_id != &self.input.node_id)
+            .collect::<Vec<_>>();
+        if enrolled.len() as u32 >= cap {
+            return Err(ReserveSecretError::DeviceCapExceeded { limit: cap });
+        }
+        let scope = (owner, self.input.enrollment_id, self.input.now);
+        self.stage = Stage::Count(SlotCount::new(cap, enrolled, scope));
+        Ok(Next::Call(self.pages.call()))
+    }
+
+    fn handle_page(&mut self, result: IoResult) -> ReserveTurn {
+        let Stage::Count(count) = &mut self.stage else {
+            return Err(ReserveSecretError::NotFinished);
+        };
+        match count.step::<ReserveSecretError>(&mut self.pages, result)? {
+            Counted::Call(call) => Ok(Next::Call(call)),
+            Counted::Done => self.reserve_write(),
+            Counted::Exceeded(limit) => Err(ReserveSecretError::DeviceCapExceeded { limit }),
+        }
     }
 }
 
@@ -224,276 +261,50 @@ impl Operation for ReserveSecretOperation {
     type Output = OnboardingSecretRecord;
     type Error = ReserveSecretError;
 
-    fn start(&mut self) -> Effects {
-        self.state = ReserveSecretState::StartTransaction;
-        smallvec![Effect::Storage(StorageEffect::StartTransaction {
-            read: false,
-        })]
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        let event = match event {
-            Event::Storage(StorageEvent::Error { error }) => {
-                return fail(self, ReserveSecretError::StorageError(error));
-            }
-            other => other,
-        };
+    fn first(&mut self) -> ReserveTurn {
+        Ok(Next::Call(crate::onboarding::secret_reads(
+            self.input.enrollment_id,
+        )))
+    }
 
-        match self.state.clone() {
-            ReserveSecretState::StartTransaction => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::TransactionStarted { txn_id }) = event else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction started",
-                            got,
-                        },
-                    );
-                };
-
-                self.state = ReserveSecretState::ReadRecords { txn_id };
-                smallvec![Effect::Storage(StorageEffect::BatchRead {
-                    reads: vec![
-                        (
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_record_key(self.input.enrollment_id),
-                        ),
-                        (
-                            ONBOARDING_KEYSPACE.to_string(),
-                            secret_state_key(self.input.enrollment_id),
-                        ),
-                    ],
-                    txn_id: Some(txn_id),
-                })]
+    fn next(&mut self, result: IoResult) -> ReserveTurn {
+        match self.stage.clone() {
+            Stage::Records => {
+                let [record, state] = values::<2>(result)?;
+                self.handle_records(record, state)
             }
-            ReserveSecretState::ReadRecords { txn_id } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::BatchReadResult { values }) = event else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch read result",
-                            got,
-                        },
-                    );
-                };
-                let [(_, record_value), (_, state_value)] = values.as_slice() else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "record and state batch read result",
-                            got: format!("{values:?}"),
-                        },
-                    );
-                };
-
-                let (record, state) =
-                    match self.validate_record(record_value.clone(), state_value.clone()) {
-                        Ok(result) => result,
-                        Err(error) => return fail(self, error),
-                    };
-                let Some(record) = (match self.reserve_state(record, state) {
-                    Ok(record) => record,
-                    Err(error) => return fail(self, error),
-                }) else {
-                    self.state = ReserveSecretState::CommitTransaction {
-                        record: record_value
-                            .as_ref()
-                            .and_then(|value| postcard::from_bytes(value).ok())
-                            .expect("record was decoded earlier"),
-                    };
-                    return smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })];
-                };
-
-                match record.mode.owner() {
-                    Some(owner) => self.emit_cap_check(txn_id, record, owner),
-                    None => self.emit_reserve_write(txn_id, record),
-                }
+            Stage::Config { owner } => {
+                let [value] = values::<1>(result)?;
+                self.handle_config(owner, value)
             }
-            ReserveSecretState::ReadRealmConfig {
-                txn_id,
-                record,
-                owner,
-            } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "read result",
-                            got,
-                        },
-                    );
-                };
-                let config = match value
-                    .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
-                    .transpose()
-                {
-                    Ok(config) => config,
-                    Err(error) => {
-                        return fail(self, ReserveSecretError::ConversionError(error));
-                    }
-                };
-                let Some(cap) = config
-                    .as_ref()
-                    .and_then(|config| config.quota.devices_per_user)
-                else {
-                    return self.emit_reserve_write(txn_id, record);
-                };
-                // The joiner's own membership is the slot this redemption takes,
-                // so a retry after it joined must not charge it twice.
-                let enrolled = enrolled_devices(config.as_ref(), owner)
-                    .into_iter()
-                    .filter(|node_id| node_id != &self.input.node_id)
-                    .collect::<Vec<_>>();
-                if enrolled.len() as u32 >= cap {
-                    return fail(self, ReserveSecretError::DeviceCapExceeded { limit: cap });
-                }
-                self.state = ReserveSecretState::CountPending {
-                    txn_id,
-                    record,
-                    cap,
-                    enrolled,
-                    pending: 0,
-                };
-                smallvec![scan_secrets(txn_id, None)]
-            }
-            ReserveSecretState::CountPending {
-                txn_id,
-                record,
-                cap,
-                enrolled,
-                pending,
-            } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::IterResult {
-                    values,
-                    next_start_after,
-                }) = event
-                else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "iter result",
-                            got,
-                        },
-                    );
-                };
-                let pending = pending.saturating_add(pending_devices(
-                    &values,
-                    record.mode.owner(),
-                    self.input.enrollment_id,
-                    &enrolled,
-                ));
-                if enrolled.len() as u32 + pending >= cap {
-                    return fail(self, ReserveSecretError::DeviceCapExceeded { limit: cap });
-                }
-                // The range is followed to its end, so a slot this owner holds
-                // cannot hide behind another owner's records.
-                match next_start_after {
-                    Some(next) => {
-                        self.state = ReserveSecretState::CountPending {
-                            txn_id,
-                            record,
-                            cap,
-                            enrolled,
-                            pending,
-                        };
-                        smallvec![scan_secrets(txn_id, Some(next))]
-                    }
-                    None => self.emit_reserve_write(txn_id, record),
-                }
-            }
-            ReserveSecretState::WriteReserved { txn_id, record } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::BatchWriteResult { .. }) = event else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "batch write result",
-                            got,
-                        },
-                    );
-                };
-
-                self.state = ReserveSecretState::CommitTransaction {
-                    record: record.clone(),
-                };
-                smallvec![Effect::Storage(StorageEffect::CommitTransaction { txn_id })]
-            }
-            ReserveSecretState::CommitTransaction { record } => {
-                let got = format!("{event:?}");
-                let Event::Storage(StorageEvent::TransactionCommitted { .. }) = event else {
-                    return fail(
-                        self,
-                        ReserveSecretError::UnexpectedEvent {
-                            state: format!("{:?}", self.state),
-                            expected: "transaction committed",
-                            got,
-                        },
-                    );
-                };
-
-                self.state = ReserveSecretState::Finish;
-                self.output = Some(Ok(record));
-                smallvec![]
-            }
-            ReserveSecretState::Init | ReserveSecretState::Finish | ReserveSecretState::Error => {
-                smallvec![]
+            Stage::Count(_) => self.handle_page(result),
+            Stage::Write => {
+                result.done()?;
+                self.record
+                    .take()
+                    .map(Next::Done)
+                    .ok_or(ReserveSecretError::NotFinished)
             }
         }
     }
-
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            ReserveSecretState::Finish | ReserveSecretState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(ReserveSecretError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        match self.state {
-            ReserveSecretState::ReadRecords { txn_id }
-            | ReserveSecretState::ReadRealmConfig { txn_id, .. }
-            | ReserveSecretState::CountPending { txn_id, .. }
-            | ReserveSecretState::WriteReserved { txn_id, .. } => {
-                smallvec![Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
-            }
-            _ => smallvec![],
-        }
-    }
-}
-
-fn fail(operation: &mut ReserveSecretOperation, error: ReserveSecretError) -> Effects {
-    let cleanup = operation.abort();
-    operation.state = ReserveSecretState::Error;
-    operation.output = Some(Err(error));
-    cleanup
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ReserveSecretError, ReserveSecretInput, ReserveSecretOperation};
-    use crate::driver::{DriverContext, drive};
     use crate::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-    use aruna_core::UserId;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use aruna_core::structs::identity::realm::{
         QuotaConfig, RealmConfigDocument, RealmId, RealmNodeKind,
     };
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use byteview::ByteView;
     use tempfile::tempdir;
@@ -511,12 +322,14 @@ mod tests {
 
     fn open_context(tempdir: &tempfile::TempDir) -> DriverContext {
         DriverContext {
-            storage_handle: storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap(),
+            storage_handle: storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap())
+                .unwrap(),
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         }
     }
 
@@ -624,14 +437,16 @@ mod tests {
     #[tokio::test]
     async fn reserves_same_node() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let enrollment_id = Ulid::generate();
@@ -696,16 +511,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lapsed_renewal_expires() {
+        // A node whose reservation and secret both lapsed cannot revive the secret.
+        let tempdir = tempdir().unwrap();
+        let context = open_context(&tempdir);
+        let enrollment_id = Ulid::generate();
+        drive(
+            CreateSecretOperation::new(CreateSecretInput {
+                record: OnboardingSecretRecord {
+                    enrollment_id,
+                    secret_hash: "abc".to_string(),
+                    mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
+                    expires_at: 100,
+                    claimed_node_id: None,
+                },
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let input = |now, reservation_expires_at, finalizing| ReserveSecretInput {
+            enrollment_id,
+            secret_hash: "abc".to_string(),
+            node_id: "node-a".to_string(),
+            now,
+            reservation_expires_at,
+            finalizing,
+        };
+        drive(ReserveSecretOperation::new(input(10, 20, false)), &context)
+            .await
+            .unwrap();
+        let lapsed = drive(ReserveSecretOperation::new(input(101, 120, true)), &context).await;
+        assert_eq!(lapsed, Err(ReserveSecretError::Expired));
+    }
+
+    #[tokio::test]
     async fn expired_reservation_reclaimed() {
         let tempdir = tempdir().unwrap();
-        let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
         let context = DriverContext {
             storage_handle,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         };
 
         let enrollment_id = Ulid::generate();

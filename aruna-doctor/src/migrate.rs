@@ -5,22 +5,22 @@
 
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
-use aruna::identity::PersistedNodeState;
-use aruna_core::NodeId;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
-use aruna_core::document::DocumentTarget;
+use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
 use aruna_core::federation::FederationSettings;
 use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
+use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, BLOB_CLEANUP_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
     BROKEN_VERSION_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE, CONNECTOR_SECRET_KEYSPACE,
     COPY_WAIT_KEYSPACE, DEADLINE_INDEX_KEYSPACE, DEDUP_INDEX_KEYSPACE, EVENT_JOURNAL_KEYSPACE,
     EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE, FAMILY_ALIAS_KEYSPACE, FAMILY_CONFLICT_KEYSPACE,
     FAMILY_OUTBOX_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
-    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
-    JOB_KEYSPACE, JOB_STATE_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
-    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
-    PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
+    FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, INPUT_PAGE_KEYSPACE,
+    IRI_INDEX_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, JOB_STATE_KEYSPACE,
+    LAUNCH_RECORD_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE,
+    NODE_STATS_KEYSPACE, NODE_VAULT_KEYSPACE, ONBOARDING_KEYSPACE, PLAINTEXT_COPY_KEYSPACE,
+    PLAN_EXPLAIN_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
     QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
     REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE,
     S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
@@ -28,7 +28,7 @@ use aruna_core::keyspaces::{
     SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
     USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
-use aruna_core::node_vault::NodeVaultKey;
+use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugin_runs::{
     ForwardRow, JOURNAL_ROW, PENDING_ROW, PluginRun, RUN_ROW, SourceEvent,
@@ -36,30 +36,34 @@ use aruna_core::plugin_runs::{
 use aruna_core::plugins::PublishedPlugin;
 use aruna_core::realm_vault::RealmVaultRecord;
 use aruna_core::secrets::SecretRecord;
-use aruna_core::structs::QUARANTINE_USAGE_KEY;
 use aruna_core::structs::execution::email::RealmEmailProfile;
-use aruna_core::structs::execution::harvest::{HarvestSource, RepositoryConnectorSecret};
-use aruna_core::structs::execution::job::{
+use aruna_core::structs::execution::harvest::HarvestSource;
+use aruna_core::structs::execution::job::family::{
     ExecutionOutputRecord, ExecutionReceipt, ExecutionUpdate, JobCancelRecord, JobFamilyRecord,
     JobRecordEnvelope, LaunchIntent, LogicalJobSpec, PhysicalExecutionResult,
     PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
 };
-use aruna_core::structs::execution::source_connector::SourceConnector;
+use aruna_core::structs::execution::job::record_rows::{
+    ConflictRecord, PendingNeed, PendingRecord,
+};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, ReplicaQuota};
 use aruna_core::structs::identity::user::session::UserSession;
+use aruna_core::structs::persistent_id::{LegacyMapping, PersistentIdMapping};
 use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
 use aruna_core::structs::placement::policy::attachment::{
     BULK_INTENT_KEYSPACE, POLICY_MUTATION_KEYSPACE, PolicyIntent, PolicyMutationRecord,
 };
 use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
+use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
-use aruna_core::structs::{LegacyMapping, PersistentIdMapping};
-use aruna_operations::jobs::records::rows::{ConflictRecord, PendingNeed, PendingRecord};
+use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
+use aruna_core::structs::sync_quarantine::QUARANTINE_USAGE_KEY;
+use aruna_core::task::PersistedTaskTimer;
 use aruna_operations::plugins::decide::WaitingRow;
-use aruna_operations::replication::queue::LiveObligationRecord;
-use aruna_operations::sync::mirror_repair::SyncMirrorRecord;
-use aruna_storage::{SEALED_KEYSPACES, row_aad};
+use aruna_storage::storage::sealing::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use layouts::{CONNECTOR, HEAD, NODE_INFO, OBLIGATION, padded};
 use serde::de::DeserializeOwned;
@@ -70,7 +74,8 @@ use std::path::Path;
 use ulid::Ulid;
 
 mod buckets;
-mod cursor_repair;
+mod compute;
+pub(crate) mod cursor_repair;
 mod families;
 mod federation;
 mod git;
@@ -79,22 +84,24 @@ mod installs;
 mod jobs;
 mod layouts;
 mod mappings;
+mod onboarding;
+mod pages;
 mod plugin_events;
+mod prune_index;
 mod removals;
 mod session_refs;
 mod sessions;
 mod sizes;
 mod staging;
 mod sync_ops;
-mod topic_purge;
+mod tombstones;
+pub(crate) mod topic_purge;
 mod trailing;
 mod uploads;
 mod user_sessions;
 mod vault;
 mod versions;
-
-pub use cursor_repair::{CursorRepair, repair_cursor};
-pub use topic_purge::purge_topic;
+mod walk_cursor;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
@@ -112,6 +119,9 @@ pub struct MigrateOutput {
     pub old_runs_deleted: BTreeMap<String, usize>,
     /// Run crate documents of the deleted runs; the documents and their status rows stay.
     pub run_crates_kept: usize,
+    /// Deleted families with records that keep a finished prune tombstone and their aliases, so
+    /// the submitter reads "pruned" until the tombstone expires.
+    pub families_tombstoned: usize,
     /// Derived projection rows dropped. The reader rebuilds a missing one from
     /// the immutable records, so clearing them needs no re-encode.
     pub projections_cleared: usize,
@@ -185,6 +195,9 @@ pub struct MigrateOutput {
     /// Login sessions from before a session named the linked login it came through.
     pub user_sessions_scanned: usize,
     pub user_sessions_rewritten: usize,
+    /// Job families the family prune index did not name, as alpha.159 wrote no index rows;
+    /// each is scheduled one job retention after the migration.
+    pub families_scheduled: usize,
     /// Finished staging checkpoints from before the directory queue; unfinished ones are
     /// deleted, so their job walks its source again, and count as `staging_job_state` below.
     pub staging_checkpoints_rewritten: usize,
@@ -204,6 +217,15 @@ pub struct MigrateOutput {
     /// Pending sync mirror repairs from before the rollback flag, which gain `false`.
     pub mirror_repairs_scanned: usize,
     pub mirror_repairs_rewritten: usize,
+    /// Queued document publishes from before the incarnation, which gain none.
+    pub outbox_incarnations_scanned: usize,
+    pub outbox_incarnations_rewritten: usize,
+    /// Persisted timers from before the admission, which gain no admission.
+    pub timers_scanned: usize,
+    pub timers_rewritten: usize,
+    /// Onboarding secrets read, and the expiry index rows written for those that had none.
+    pub onboarding_secrets_scanned: usize,
+    pub expiry_rows_written: usize,
     /// Rows of those keyspaces that match no known shape, left unchanged, as
     /// `keyspace/key: reason`. Any such row makes the command fail after it prints this output.
     pub unknown_rows: Vec<String>,
@@ -281,6 +303,9 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let mutation_rows = db.keyspace(POLICY_MUTATION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let intent_rows = db.keyspace(BULK_INTENT_KEYSPACE, KeyspaceCreateOptions::default)?;
     let node_rows = db.keyspace(NODE_INFO_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let explain_rows = db.keyspace(PLAN_EXPLAIN_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let launch_rows = db.keyspace(LAUNCH_RECORD_KEYSPACE, KeyspaceCreateOptions::default)?;
+    let reservation_rows = db.keyspace(JOB_RESERVATION_KEYSPACE, KeyspaceCreateOptions::default)?;
     let connector_rows = db.keyspace(SOURCE_INDEX_KEYSPACE, KeyspaceCreateOptions::default)?;
     let obligation_rows = db.keyspace(
         REPLICATION_OBLIGATION_KEYSPACE,
@@ -302,8 +327,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let audit_rows = db.keyspace(trailing::AUDIT.0, KeyspaceCreateOptions::default)?;
     let harvest_rows = db.keyspace(trailing::HARVEST.0, KeyspaceCreateOptions::default)?;
     let mirror_rows = db.keyspace(trailing::MIRROR.0, KeyspaceCreateOptions::default)?;
+    let timer_rows = db.keyspace(trailing::TIMERS.0, KeyspaceCreateOptions::default)?;
+    let onboarding_rows = db.keyspace(ONBOARDING_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
+    // Old families are read before any write, so an unreadable one stops the run unchanged.
     let mut evidence = families::Evidence::default();
     let specs = [
         (
@@ -320,6 +348,14 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         ),
     ];
     let mut removal = families::old_families(&specs, &evidence)?;
+    // Queued publishes gain their incarnation first, so every outbox step below reads them.
+    let mut unknown_rows = Vec::new();
+    let incarnations = trailing::missing_fields::<DocumentOutboxRecord>(
+        &db,
+        &outbox_rows,
+        trailing::OUTBOX,
+        &mut unknown_rows,
+    )?;
     // Family keyspaces with the byte offset of the family in their keys.
     for (name, offset) in [
         (FAMILY_RECORD_KEYSPACE, 0),
@@ -338,6 +374,14 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &record_rows,
         FAMILY_RECORD_KEYSPACE,
     )?;
+    // Pages go with the families that alone name them, as a runtime prune walks their manifests.
+    if let Some(removed) = removal.rows.get(FAMILY_RECORD_KEYSPACE) {
+        let owned = pages::owned_pages(&db, &record_rows, removed, &records.rows)?;
+        if !owned.is_empty() {
+            let rows = removal.rows.entry(INPUT_PAGE_KEYSPACE.to_string());
+            rows.or_default().extend(owned);
+        }
+    }
     let pending = removal.rewrites::<PendingRecord, LegacyPending>(
         &db,
         &pending_rows,
@@ -350,6 +394,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     )?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
+    let expiries = onboarding::expiry_rows(&db, &onboarding_rows, &mut unknown_rows)?;
     let mappings =
         rewrites::<PersistentIdMapping, LegacyMapping>(&db, &mapping_rows, ID_MAPPING_KEYSPACE)?;
     let mapping =
@@ -425,7 +470,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         padded::<CurrentVersionPointer>(&db, &head_rows, BLOB_HEAD_KEYSPACE, HEAD)?,
         padded::<PolicyMutationRecord>(&db, &mutation_rows, POLICY_MUTATION_KEYSPACE, HEAD)?,
         padded::<PolicyIntent>(&db, &intent_rows, BULK_INTENT_KEYSPACE, HEAD)?,
-        padded::<NodeInfoDocument>(&db, &node_rows, NODE_INFO_KEYSPACE, NODE_INFO)?,
+        node_documents(&db, &node_rows)?,
         padded::<SourceConnector>(&db, &connector_rows, SOURCE_INDEX_KEYSPACE, CONNECTOR)?,
         padded::<LiveObligationRecord>(
             &db,
@@ -461,7 +506,32 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     relaid_rows.push((&consent_rows, PLAINTEXT_COPY_KEYSPACE, consents.rows));
     let announced = layouts::cleanup_rows(&db, &cleanup_rows)?.rows;
     relaid_rows.push((&cleanup_rows, BLOB_CLEANUP_KEYSPACE, announced));
-    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 7] = [
+    let stale_rows: [layouts::KeyspaceRows<Vec<u8>>; 12] = [
+        (
+            &reservation_rows,
+            JOB_RESERVATION_KEYSPACE,
+            compute::old_rows(&db, &reservation_rows, compute::old_reservation)?,
+        ),
+        (
+            &launch_rows,
+            LAUNCH_RECORD_KEYSPACE,
+            compute::old_rows(&db, &launch_rows, compute::old_launch)?,
+        ),
+        (
+            &node_rows,
+            NODE_INFO_KEYSPACE,
+            compute::old_rows(&db, &node_rows, compute::old_document)?,
+        ),
+        (
+            &explain_rows,
+            PLAN_EXPLAIN_KEYSPACE,
+            compute::old_rows(&db, &explain_rows, compute::old_explain)?,
+        ),
+        (
+            &outbox_rows,
+            SYNC_OUTBOX_KEYSPACE,
+            compute::old_outbox(&db, &outbox_rows)?,
+        ),
         (
             &refresh_rows,
             REFRESH_JOB_KEYSPACE,
@@ -507,6 +577,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         let found = vault::vault_rows(&db, &rows, moved, keys.as_ref(), &mut secrets_skipped)?;
         moves.push((rows, found));
     }
+    let now_ms = aruna_clock::unix_timestamp_millis();
+    let tombstones = removal.tombstones(now_ms)?;
 
     let mut txn = db.write_tx()?;
     for (keyspace, rows) in [
@@ -514,6 +586,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&pending_rows, &pending.rows),
         (&conflict_rows, &conflicts.rows),
         (&config_rows, &configs.rows),
+        (&onboarding_rows, &expiries.rows),
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
         (&outbox_rows, &git_outbox.rows),
@@ -593,13 +666,18 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             txn.remove(keyspace.clone(), key.clone());
         }
     }
+    for (name, key, value) in tombstones.iter().flatten() {
+        let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
+        txn.insert(keyspace, key.to_vec(), value.to_vec());
+    }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
     })?;
     // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
     let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
+    let families_scheduled =
+        prune_index::missing_index(&db, [&record_rows, &pending_rows, &conflict_rows], now_ms)?;
     // Each batch commits on its own; a rerun skips the rows an earlier run already rewrote.
-    let mut unknown_rows = Vec::new();
     let audits = trailing::missing_fields::<AdminAuditRecord>(
         &db,
         &audit_rows,
@@ -618,6 +696,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         trailing::MIRROR,
         &mut unknown_rows,
     )?;
+    let timers = trailing::missing_fields::<PersistedTaskTimer>(
+        &db,
+        &timer_rows,
+        trailing::TIMERS,
+        &mut unknown_rows,
+    )?;
 
     Ok(MigrateOutput {
         database_path: database_path.to_string(),
@@ -630,6 +714,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         old_families_deleted: removal.family_count(),
         old_runs_deleted: removal.counts(),
         run_crates_kept: removal.run_crates,
+        families_tombstoned: tombstones.len(),
         projections_cleared: projections.len(),
         realm_configs_scanned: configs.scanned,
         realm_configs_rewritten: configs.rows.len(),
@@ -683,6 +768,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         info_cursors_deleted: info.cursors.len() + fanout_cursors,
         user_sessions_scanned: logins.scanned,
         user_sessions_rewritten: logins.rows.len(),
+        families_scheduled,
         staging_checkpoints_rewritten: staged.rewrites.rows.len(),
         relaid_rows: counts(
             relaid_rows
@@ -696,8 +782,31 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         harvest_sources_rewritten: harvests.rewritten,
         mirror_repairs_scanned: mirrors.scanned,
         mirror_repairs_rewritten: mirrors.rewritten,
+        outbox_incarnations_scanned: incarnations.scanned,
+        outbox_incarnations_rewritten: incarnations.rewritten,
+        timers_scanned: timers.scanned,
+        timers_rewritten: timers.rewritten,
+        onboarding_secrets_scanned: expiries.scanned,
+        expiry_rows_written: expiries.rows.len(),
         unknown_rows,
     })
+}
+
+/// Node info documents in their older padded shape. An alpha.206 document is deleted instead.
+fn node_documents<'k>(
+    db: &OptimisticTxDatabase,
+    keyspace: &'k OptimisticTxKeyspace,
+) -> Result<layouts::KeyspaceRows<'k>, ExplorerError> {
+    let rows = rewrite_rows(
+        db,
+        keyspace,
+        NODE_INFO_KEYSPACE,
+        |value| match compute::old_document(value) {
+            true => Ok(None),
+            false => relaid::<NodeInfoDocument, NodeInfoDocument>(value, NODE_INFO),
+        },
+    )?;
+    Ok((keyspace, NODE_INFO_KEYSPACE, rows.rows))
 }
 
 /// The node secret the node derives its sealing keys from at startup.
@@ -721,7 +830,7 @@ fn seal_rows(
     skipped: &mut Vec<String>,
 ) -> Result<Rewrites, ExplorerError> {
     let plain = |value: &[u8]| match name {
-        CONNECTOR_SECRET_KEYSPACE => RepositoryConnectorSecret::from_bytes(value).is_ok(),
+        CONNECTOR_SECRET_KEYSPACE => SourceConnectorSecret::from_bytes(value).is_ok(),
         _ => false,
     };
     let mut scanned = 0;
@@ -741,7 +850,7 @@ fn seal_rows(
             skipped.push(row_note(name, &key, "neither sealed nor a plain secret"));
             continue;
         }
-        let sealed = seal_bytes(secret_key, &value, &aad)
+        let sealed = seal_bytes(secret_key, &value, &aad, rand::random::<[u8; 24]>())
             .map_err(|error| decode_error(name, &key, error))?;
         rows.push((key.to_vec(), sealed));
     }
@@ -1076,14 +1185,16 @@ mod tests {
         FAMILY_CONFLICT_KEYSPACE, FAMILY_PENDING_KEYSPACE, FAMILY_PROJECTION_KEYSPACE,
         FAMILY_RECORD_KEYSPACE, REALM_CONFIG_KEYSPACE,
     };
-    use aruna_core::node_vault::NodeVaultKey;
-    use aruna_core::structs::execution::job::{
+    use aruna_core::node::vault::NodeVaultKey;
+    use aruna_core::structs::execution::job::family::{
         ExecutionUpdate, JobFamilyRecord, JobRecordEnvelope, PhysicalExecutionState, ResultMessage,
         SubmissionId,
     };
+    use aruna_core::structs::execution::job::record_rows::{
+        PendingNeed, PendingRecord, ProjectionCache,
+    };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
     use aruna_core::structs::placement::compute_config::{CATCH_UP_MS, IDLE_AFTER_MS};
-    use aruna_operations::jobs::records::rows::{PendingNeed, PendingRecord, ProjectionCache};
     use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -1356,10 +1467,10 @@ mod tests {
     }
 
     pub(super) fn node_state(path: &Path) {
-        use aruna::identity::{
+        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
+        use aruna_core::structs::identity::node_state::{
             BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
         };
-        use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
@@ -1369,7 +1480,7 @@ mod tests {
             onboarding_phase: None,
             onboarding_sync_ticket: None,
             identity: PersistedNodeIdentity::User {
-                owner: aruna_core::UserId::nil(REALM),
+                owner: aruna_core::user::id::UserId::nil(REALM),
             },
         };
         // Only the node_state row holds the identity; another row that decodes must not win.
@@ -1390,13 +1501,13 @@ mod tests {
     #[test]
     fn seals_plain_secrets() {
         use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes};
-        use aruna_core::structs::execution::harvest::RepositoryConnectorSecret;
+        use aruna_core::structs::execution::source_connector::SourceConnectorSecret;
         use std::collections::HashMap;
 
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         node_state(&path);
-        let plain = RepositoryConnectorSecret::new(
+        let plain = SourceConnectorSecret::new(
             Ulid::from_bytes([1u8; 16]),
             HashMap::from([("token".to_string(), "canary-61d0".to_string())]),
             std::time::SystemTime::UNIX_EPOCH,
@@ -1423,7 +1534,7 @@ mod tests {
         let sealed = &read(&path, CONNECTOR_SECRET_KEYSPACE)[b"row".as_slice()];
         assert!(!sealed.windows(11).any(|window| window == b"canary-61d0"));
         let key = CredentialEncryptionKey::derive(&[11u8; 32]);
-        let aad = aruna_storage::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
+        let aad = aruna_storage::storage::sealing::row_aad(CONNECTOR_SECRET_KEYSPACE, b"row");
         assert_eq!(open_bytes(&key, sealed, &aad).unwrap(), plain);
         let again = migrate_output(path.to_str().unwrap()).unwrap();
         assert_eq!((again.secrets_sealed, again.secrets_skipped.len()), (0, 1));
@@ -1451,9 +1562,15 @@ mod tests {
         };
         // The source row is still plain; the backend row is sealed with the S3 credential key.
         let backend_key = backend_id.to_bytes();
-        let aad = aruna_storage::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
+        let aad = aruna_storage::storage::sealing::row_aad(BACKEND_SECRET_KEYSPACE, &backend_key);
         let credential = CredentialEncryptionKey::derive(&[11u8; 32]);
-        let sealed = seal_bytes(&credential, &backend.to_bytes().unwrap(), &aad).unwrap();
+        let sealed = seal_bytes(
+            &credential,
+            &backend.to_bytes().unwrap(),
+            &aad,
+            rand::random::<[u8; 24]>(),
+        )
+        .unwrap();
         let source_key = source_id.to_bytes();
         let source_rows = vec![
             (source_key.as_slice(), source.to_bytes().unwrap()),
@@ -1470,7 +1587,7 @@ mod tests {
         assert!(read(&path, BACKEND_SECRET_KEYSPACE).is_empty());
         let vault = read(&path, NODE_VAULT_KEYSPACE);
         let key = NodeVaultKey::derive(&[11u8; 32]);
-        let opened = |entry: aruna_core::node_vault::VaultEntry| {
+        let opened = |entry: aruna_core::node::vault::VaultEntry| {
             let row = &vault[&entry.key()];
             assert!(!row.windows(11).any(|window| window == b"canary-7e21"));
             key.open(entry, row).unwrap().expose().to_vec()

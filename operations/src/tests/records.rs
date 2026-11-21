@@ -2,30 +2,44 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::UserId;
+use std::collections::BTreeMap;
+
 use aruna_core::compute::ExecutionTargetId;
-use aruna_core::structs::execution::job::{
-    CancelAuthority, CollisionPolicy, ComputeResources, EffectiveResources, ExecutionOutputRecord,
-    ExecutionReceipt, ExecutionSpec, ExecutionUpdate, JobAdmissionRecord, JobCancelRecord,
-    JobFamilyId, JobFamilyRecord, JobId, JobRecordBody, JobRecordEnvelope, JobRetryPolicy,
-    LaunchIntent, LogicalJobSpec, OutputObject, OutputSet, PhysicalExecutionResult,
-    PhysicalExecutionState, ResultMessage, SubmissionClaim, SubmissionId, WitnessBudgetRecord,
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::family::{
+    CancelAuthority, EffectiveResources, ExecutionOutputRecord, ExecutionReceipt, ExecutionStop,
+    ExecutionUpdate, JobAdmissionRecord, JobCancelRecord, JobFamilyId, JobFamilyRecord,
+    JobRecordBody, JobRecordEnvelope, JobRetryPolicy, LaunchIntent, LogicalJobSpec, OutputSet,
+    PhysicalExecutionResult, PhysicalExecutionState, ResultMessage, StopEvidence, SubmissionClaim,
+    SubmissionId, WitnessBudgetRecord,
 };
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, CollisionPolicy, ComputeResources, ExecutionSpec, InputContent, InputSelection,
+};
+use aruna_core::structs::execution::job::local::OutputObject;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
-use aruna_core::structs::identity::auth::Actor;
-use aruna_storage::{FjallStorage, StorageHandle};
+use aruna_core::structs::identity::auth::{Actor, AuthContext};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 
-use crate::driver::DriverContext;
+use crate::jobs::lifecycle::launch_checks::LocalCapabilityOperation;
+use crate::jobs::lifecycle::submit_external::IngressNode;
+use crate::jobs::node_inputs::launch_node;
+use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
 use crate::jobs::records::verify::FamilyView;
+use aruna_core::effects::LaunchFrame;
+use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_drivers::driver::{DriverContext, drive};
 
 pub const REALM: RealmId = RealmId([3u8; 32]);
 
@@ -115,7 +129,7 @@ impl Family {
             group_id: Ulid::from_bytes([2u8; 16]),
             created_by: user(),
             created_at_ms: 1_000,
-            retention_ms: aruna_core::structs::execution::job::RETENTION_MS,
+            retention_ms: aruna_core::structs::execution::job::identity::RETENTION_MS,
             payload: payload(),
             request_digest: self.request_digest,
             spec_digest: [0u8; 32],
@@ -180,12 +194,14 @@ impl Family {
             plan_digest: [5u8; 32],
             spec_digest: spec.spec_digest,
             created_at_ms: 1_002,
+            config_clock: Default::default(),
         }
     }
 
     pub fn target_id(&self) -> ExecutionTargetId {
         ExecutionTargetId {
             node_id: self.target.public(),
+            backend: "docker".to_string(),
             executor_kind: "docker".to_string(),
         }
     }
@@ -206,6 +222,9 @@ impl Family {
             subject_generation: 1,
             subject_digest: [6u8; 32],
             accepted_at_ms: 1_003,
+            config_clock: Default::default(),
+            config_generation: 0,
+            config_digest: [0; 32],
         }
     }
 
@@ -273,6 +292,35 @@ impl Family {
         }
     }
 
+    /// A successful run of execution 1 with its stop record, as the target signed it.
+    pub fn stopped_run(&self) -> Vec<JobRecordEnvelope> {
+        self.stopped_with(PhysicalExecutionState::Succeeded)
+    }
+
+    /// One execution that ended in `terminal` and stopped.
+    pub fn stopped_with(&self, terminal: PhysicalExecutionState) -> Vec<JobRecordEnvelope> {
+        let mut records = self.run(1, 0, terminal);
+        let (JobFamilyRecord::Receipt(receipt), JobFamilyRecord::Update(update)) =
+            (&records[4].record, &records[7].record)
+        else {
+            panic!("the run fixture keeps its order");
+        };
+        let stop = ExecutionStop {
+            execution_id: receipt.execution_id,
+            submission_id: self.submission_id,
+            request_digest: self.request_digest,
+            executor_node_id: self.target.public(),
+            receipt_digest: receipt.digest().expect("receipt digest"),
+            update_sequence: update.sequence,
+            update_digest: update.digest().expect("update digest"),
+            output_digest: (update.result.as_ref()).and_then(|result| result.output_digest),
+            evidence: StopEvidence::Tombstoned,
+            stopped_at_ms: 1_100,
+        };
+        records.push(self.sign(&self.target, JobFamilyRecord::Stop(Box::new(stop))));
+        records
+    }
+
     pub fn sign(&self, key: &iroh::SecretKey, record: JobFamilyRecord) -> JobRecordEnvelope {
         JobRecordEnvelope::sign(REALM, record, key).expect("record signs")
     }
@@ -323,6 +371,27 @@ pub fn user() -> UserId {
     UserId::new(Ulid::from_bytes([8u8; 16]), REALM)
 }
 
+/// A capture of `input` taken at `source`.
+pub fn captured_input(input: &InputSelection, source: NodeId) -> CapturedInput {
+    CapturedInput {
+        destination_key: input.dest_key.clone(),
+        source_node_id: source,
+        version_id: Ulid::from_parts(1, 1),
+        content: InputContent::Blake3([1; 32]),
+        bytes: 1,
+        policies: Vec::new(),
+        source_group_id: Ulid::from_parts(2, 2),
+        public: false,
+        link: None,
+        source_pin: None,
+        database: None,
+        releases: Vec::new(),
+        releases_complete: false,
+        grant: None,
+        served_by: None,
+    }
+}
+
 pub fn payload() -> ExecutionSpec {
     ExecutionSpec {
         group_id: Ulid::from_bytes([2u8; 16]),
@@ -336,6 +405,7 @@ pub fn payload() -> ExecutionSpec {
         env: Default::default(),
         resources: ComputeResources::default(),
         executor_constraint: None,
+        backend: None,
         inputs: Vec::new(),
         file_outputs: Vec::new(),
         workspace_outputs: Vec::new(),
@@ -380,9 +450,99 @@ pub async fn context(config: &RealmConfigDocument, publisher: NodeId) -> (TempDi
             storage_handle: storage,
             net_handle: None,
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         },
     )
+}
+
+/// This node's executor capability that runs `intent`; see [`LocalCapabilityOperation`].
+pub async fn local_capability(
+    context: &DriverContext,
+    config: &RealmConfigDocument,
+    local: NodeId,
+    intent: &LaunchIntent,
+    spec: &LogicalJobSpec,
+) -> Result<aruna_core::compute::ExecutorCapability, aruna_core::events::LaunchDecline> {
+    let operation =
+        LocalCapabilityOperation::new(config.clone(), local, intent.clone(), spec.clone());
+    aruna_drivers::driver::drive(operation, context)
+        .await
+        .unwrap_or(Err(aruna_core::events::LaunchDecline::Draining))
+}
+
+/// Answers one record message the way the peer transport does.
+pub async fn serve_job_record(
+    context: &DriverContext,
+    peer: NodeId,
+    message: MetadataTransportMessage,
+) -> MetadataTransportMessage {
+    let now_ms = aruna_core::time::unix_timestamp_millis();
+    let serve = ServeRecordOperation::new(peer, message, context.node_and_realm(), now_ms);
+    drive(serve, context)
+        .await
+        .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable)
+}
+
+/// Answers one launch offer the way the peer transport does.
+pub async fn serve_launch_offer(
+    context: &DriverContext,
+    peer: NodeId,
+    launch: LaunchFrame,
+) -> MetadataTransportMessage {
+    let (now_ms, execution_id) = (aruna_core::time::unix_timestamp_millis(), Ulid::generate());
+    let limits = context.compute_limits();
+    let node = launch_node(
+        context.node_and_realm(),
+        &limits,
+        &launch,
+        now_ms,
+        execution_id,
+    );
+    let serve = ServeLaunchOperation::new(peer, launch, node);
+    drive(serve, context)
+        .await
+        .unwrap_or(MetadataTransportMessage::ForwardedWriteUnavailable)
+}
+
+/// Reads one stored row as bytes.
+pub async fn read_row(
+    context: &DriverContext,
+    key_space: &str,
+    key: Vec<u8>,
+) -> Result<Option<Vec<u8>>, String> {
+    let effect = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key: key.into(),
+        txn_id: None,
+    };
+    match context.storage_handle.send_storage_effect(effect).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
+            Ok(value.map(|value| value.to_vec()))
+        }
+        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
+        other => Err(format!("unexpected storage event: {}", other.label())),
+    }
+}
+
+/// An ingress node at node 1 of `REALM` without fresh peers.
+pub(crate) fn local_ingress() -> IngressNode {
+    IngressNode {
+        local: node(1),
+        realm_id: REALM,
+        now_ms: 0,
+        fresh: BTreeMap::new(),
+    }
+}
+
+/// The auth of `user` in `REALM`.
+pub(crate) fn user_auth() -> AuthContext {
+    AuthContext {
+        user_id: user(),
+        realm_id: REALM,
+        path_restrictions: None,
+        session: None,
+    }
 }

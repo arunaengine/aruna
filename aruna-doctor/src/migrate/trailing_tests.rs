@@ -6,20 +6,29 @@ use super::super::tests::{read, write};
 use super::super::{migrate, migrate_output};
 use super::*;
 use crate::error::CliError;
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentOutboxEvent, DocumentOutboxRecord,
+    DocumentSyncRevision, DocumentTarget,
+};
+use aruna_core::id::NodeId;
 use aruna_core::secrets::{SecretName, SecretScope};
 use aruna_core::structs::execution::harvest::{HarvestSelector, HarvestSource};
-use aruna_core::structs::execution::job::JobId;
+use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::admin_audit::{
     AdminAuditAction, AdminAuditRecord, PluginAudit, SecretAudit,
 };
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, PlacementRef};
+use aruna_core::structs::storage::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
 use aruna_core::structs::storage::replication::ArunaArn;
-use aruna_core::structs::{SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot};
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
+};
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::task::{PersistedTaskTimer, TaskKey};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
-use aruna_operations::sync::mirror_repair::{SyncMirrorIntent, SyncMirrorRecord};
+use aruna_core::user::id::UserId;
+use aruna_storage::task_timers::NO_ADMISSION;
 use fjall::KeyspaceCreateOptions;
 use serde::Deserialize;
 use std::path::Path;
@@ -108,7 +117,12 @@ fn secret_audit(write_id: Option<Ulid>) -> AdminAuditRecord {
         incarnation: Some(Ulid::from_parts(4, 4)),
         write_id,
     };
-    AdminAuditRecord::for_secret(AdminAuditAction::SecretRead, user(1), secret)
+    AdminAuditRecord::for_secret(
+        ulid::Ulid::from_parts(1, 3),
+        AdminAuditAction::SecretRead,
+        user(1),
+        secret,
+    )
 }
 
 #[test]
@@ -417,4 +431,128 @@ async fn unknown_rows_fail() {
         read(&path, ADMIN_AUDIT_KEYSPACE)[b"broken".as_slice()],
         vec![0xff; 3]
     );
+}
+
+/// A queued document publish as alpha.159 stored it, before `incarnation`.
+#[derive(Serialize)]
+struct OldOutbox {
+    outbox_id: Ulid,
+    node_id: NodeId,
+    target: DocumentTarget,
+    peers: Vec<NodeId>,
+    event: DocumentOutboxEvent,
+    placement: PlacementRef,
+    generation: u64,
+    updated_at: u64,
+    allow_genesis: bool,
+}
+
+fn queued(seed: u8, incarnation: Option<Ulid>) -> DocumentOutboxRecord {
+    let change = DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::from_bytes([seed; 16]),
+            actor: node(seed),
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Delete,
+        placement: PlacementRef::NIL,
+    };
+    DocumentOutboxRecord {
+        outbox_id: Ulid::from_bytes([seed; 16]),
+        node_id: node(seed),
+        target: DocumentTarget::WatchInterest {
+            realm_id: REALM,
+            node_id: node(seed),
+        },
+        peers: vec![node(9)],
+        event: DocumentOutboxEvent::Delete { change },
+        placement: PlacementRef::NIL,
+        generation: 3,
+        updated_at: 4,
+        allow_genesis: true,
+        incarnation,
+    }
+}
+
+// An alpha.159 publish gains no incarnation, as a first write has none; a current row stays,
+// and a second run rewrites nothing.
+#[test]
+fn outbox_gains_incarnation() {
+    let record = queued(6, None);
+    let old = OldOutbox {
+        outbox_id: record.outbox_id,
+        node_id: record.node_id,
+        target: record.target.clone(),
+        peers: record.peers.clone(),
+        event: record.event.clone(),
+        placement: record.placement,
+        generation: record.generation,
+        updated_at: record.updated_at,
+        allow_genesis: record.allow_genesis,
+    };
+    let old = postcard::to_allocvec(&old).expect("old row encodes");
+    let newer = queued(7, Some(Ulid::from_parts(8, 8)));
+    let current = postcard::to_allocvec(&newer).expect("current row encodes");
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("db");
+    let database = path.to_str().expect("path");
+    let rows = vec![
+        (b"old".as_slice(), old),
+        (b"current".as_slice(), current.clone()),
+    ];
+    write(&path, SYNC_OUTBOX_KEYSPACE, rows);
+
+    let output = migrate_output(database).expect("migration runs");
+    assert_eq!(output.outbox_incarnations_rewritten, 1);
+    let stored = read(&path, SYNC_OUTBOX_KEYSPACE);
+    let bytes = &stored[b"old".as_slice()];
+    let migrated: DocumentOutboxRecord = postcard::from_bytes(bytes).expect("row decodes");
+    assert_eq!(migrated, record);
+    assert_eq!(stored[b"current".as_slice()], current);
+
+    let again = migrate_output(database).expect("migration repeats");
+    assert_eq!(again.outbox_incarnations_rewritten, 0);
+    assert_eq!(read(&path, SYNC_OUTBOX_KEYSPACE), stored);
+}
+
+/// A persisted timer as alpha.159 stored it, before `admission`.
+#[derive(Serialize)]
+struct OldTimer {
+    key: TaskKey,
+    due_unix_millis: u64,
+}
+
+// An alpha.159 timer gains no admission, so the restore arms it under that admission and its
+// firing deletes the row; a second run rewrites nothing.
+#[test]
+fn timer_gains_admission() {
+    let key = TaskKey::MaintainRanges;
+    let old = OldTimer {
+        key: key.clone(),
+        due_unix_millis: 5,
+    };
+    let row = key.storage_key().expect("timer key encodes");
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let path = temp.path().join("db");
+    let database = path.to_str().expect("path");
+    let old = postcard::to_allocvec(&old).expect("old timer encodes");
+    write(&path, TASK_TIMER_KEYSPACE, vec![(row.as_ref(), old)]);
+
+    let output = migrate_output(database).expect("migration runs");
+    assert_eq!((output.timers_scanned, output.timers_rewritten), (1, 1));
+    let stored = read(&path, TASK_TIMER_KEYSPACE);
+    let bytes = &stored[row.as_ref()];
+    let timer: PersistedTaskTimer = postcard::from_bytes(bytes).expect("timer decodes");
+    let expected = PersistedTaskTimer {
+        key,
+        due_unix_millis: 5,
+        admission: NO_ADMISSION,
+    };
+    assert_eq!(timer, expected);
+
+    let again = migrate_output(database).expect("migration repeats");
+    assert_eq!(again.timers_rewritten, 0);
+    assert_eq!(read(&path, TASK_TIMER_KEYSPACE), stored);
 }

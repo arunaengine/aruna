@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 
 /// Live chats one user may keep on the node.
@@ -33,6 +33,24 @@ pub struct AssistantChatHead {
     /// Bumped by every accepted head or turn write.
     pub revision: u64,
     pub deleted_at: Option<u64>,
+}
+
+/// One user's live chats and the payload bytes they hold, kept in the transaction of every chat
+/// change, so a write never reads the user's other heads and their tombstones.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssistantChatTotals {
+    pub chats: u32,
+    pub bytes: u64,
+}
+
+impl AssistantChatTotals {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
 }
 
 /// One turn of a chat. The payload is the portal's own format and stays opaque.

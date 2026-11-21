@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::errors::ConversionError;
 use crate::password::PasswordHash;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 
 /// The `Authorization` scheme visitors send link and visit tokens in.
 pub const SHARE_SCHEME: &str = "Share";

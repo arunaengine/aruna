@@ -4,7 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::UserId;
+use ulid::Ulid;
+
+use crate::compute::SecretBytes;
+use crate::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
+use crate::user::id::UserId;
 
 /// Largest artifact a realm admin may publish; nodes copy and fetch it in chunks.
 pub const MAX_ARTIFACT: usize = 64 << 20;
@@ -85,6 +89,182 @@ pub fn valid_version(version: &str) -> bool {
         && (version.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-+.".contains(&b))
 }
 
+/// Artifact bytes in a node message; Debug prints only their length.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ArtifactBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for ArtifactBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArtifactBytes({} bytes)", self.0.len())
+    }
+}
+
+/// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub digest: String,
+    pub index: u32,
+    pub total: u64,
+    pub bytes: ArtifactBytes,
+}
+
+/// The step of the use check that refused a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    Peer,
+    Binding,
+    Entry,
+    Rule,
+    Authority,
+    Policy,
+}
+
+impl Refusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::Binding => "binding",
+            Self::Entry => "entry",
+            Self::Rule => "rule",
+            Self::Authority => "authority",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ReleaseError {
+    #[error("the use of the secret was refused at the {} check", .0.as_str())]
+    Refused(Refusal),
+    #[error("the secret cannot be released now: {0}")]
+    Unavailable(String),
+}
+
+/// Why a node binding does not fit its slot on the install's receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum NodeCheckError {
+    #[error("the receiver has no node secret of this name")]
+    Missing,
+    #[error("the node secret has another kind than the slot")]
+    OtherKind,
+    #[error("only a server node of the realm may ask")]
+    Forbidden,
+    #[error("the receiver did not answer")]
+    Unavailable,
+}
+
+/// What a run asks of the secret bound to one slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    pub install_id: Ulid,
+    pub slot: String,
+    pub delivery: Delivery,
+    /// The method and URL of the outgoing request, for `inject`.
+    pub target: Option<(String, String)>,
+    /// The value write id the receiver holds already; its fields are not sent again.
+    pub held: Option<Ulid>,
+    pub run_id: Option<Ulid>,
+}
+
+/// A released secret; `fields` is absent when the receiver holds this value already.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Released {
+    pub kind: SecretKind,
+    pub settings: SecretSettings,
+    pub exposure: ResponseExposure,
+    pub value_id: Ulid,
+    pub fields: Option<SecretBytes>,
+}
+
+/// A call to the plugin host's node-wide state, which lives as long as the node process.
+#[derive(Debug, PartialEq)]
+pub enum PluginEffect {
+    /// Takes one host call of the install at `now_ms` from its rate; answers `Taken`.
+    TakeCall { install_id: Ulid, now_ms: u64 },
+    /// Takes one webhook request of the install at `now_ms` from its rate; answers `Taken`.
+    TakeHook { install_id: Ulid, now_ms: u64 },
+    /// Reserves memory for an artifact of `bytes` from the node's budget; answers `Reserved`.
+    Reserve { bytes: u64 },
+    /// Forgets the `named` accounts and answers when each `unnamed` one was first seen, at
+    /// `now_ms` for one seen now; answers `Seen`.
+    FirstSeen {
+        named: Vec<UserId>,
+        unnamed: Vec<UserId>,
+        now_ms: u64,
+    },
+    /// The newest value write id whose fields `holder`, one broker of run `run_id`, holds for
+    /// `slot`; answers `Held`.
+    HeldValue {
+        run_id: Ulid,
+        holder: Ulid,
+        slot: String,
+    },
+    /// Keeps `fields` as value `value_id` of the holder's `slot` when given; answers `Fields` with
+    /// the fields the holder keeps for that value.
+    HoldValue {
+        run_id: Ulid,
+        holder: Ulid,
+        slot: String,
+        value_id: Ulid,
+        fields: Option<SecretBytes>,
+    },
+}
+
+/// The answer of a [`PluginEffect`].
+#[derive(Debug, PartialEq)]
+pub enum PluginEvent {
+    /// Whether the call or request was within the install's rate.
+    Taken(bool),
+    /// The reservation, or `None` while the node spends its budget elsewhere.
+    Reserved(Option<MemoryPermit>),
+    /// When each asked unnamed account was first seen, in the asked order.
+    Seen(Vec<u64>),
+    Held(Option<Ulid>),
+    Fields(Option<SecretBytes>),
+}
+
+/// Memory reserved for one artifact upload or assembly, given back when dropped.
+pub struct MemoryPermit {
+    mib: u32,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl MemoryPermit {
+    /// A reservation of `mib` that `release` gives back.
+    pub fn new(mib: u32, release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            mib,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// MiB this reservation holds of the node's budget.
+    pub fn mib(&self) -> u32 {
+        self.mib
+    }
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MemoryPermit({} MiB)", self.mib)
+    }
+}
+
+impl PartialEq for MemoryPermit {
+    fn eq(&self, other: &Self) -> bool {
+        self.mib == other.mib
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,8 +323,12 @@ mod tests {
             AdminDocumentState::new(target.clone()),
             AdminDocumentState::new(target),
         );
-        let from_a = a.apply_operation(&manager(3), set(left)).unwrap();
-        let from_b = b.apply_operation(&manager(4), set(right)).unwrap();
+        let from_a = a
+            .apply_operation(&manager(3), set(left), ulid::Ulid::generate())
+            .unwrap();
+        let from_b = b
+            .apply_operation(&manager(4), set(right), ulid::Ulid::generate())
+            .unwrap();
         a.apply(&from_b).unwrap();
         b.apply(&from_a).unwrap();
         [a.materialized_plugins(), b.materialized_plugins()]

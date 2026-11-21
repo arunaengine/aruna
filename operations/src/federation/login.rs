@@ -5,28 +5,27 @@
 
 use std::collections::BTreeSet;
 
-use aruna_core::UserId;
-use aruna_core::effects::{Effect, StorageEffect};
-use aruna_core::errors::ConversionError;
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::DocumentTarget;
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::federation::{FederationError, RealmDescriptor, Signed};
 use aruna_core::handoff::{FEDERATED_SESSION_SECS, HandoffError, LoginHandoff, check_handoff};
+use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{FEDERATION_KEYSPACE, USER_KEYSPACE};
 use aruna_core::link::{alias_claims_key, alias_owner};
 use aruna_core::operation::Operation;
+use aruna_core::rows::{read_row, values};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
-use aruna_core::types::Effects;
-use byteview::ByteView;
-use smallvec::smallvec;
+use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::realm::get_config::{GetConfigError, GetConfigOperation};
-use crate::session::{
+use crate::document_repository::GetConfigError;
+use crate::session::create::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, CreatedSession,
 };
-use crate::users::read_document::{ReadUserError, ReadUserOperation};
+use crate::users::read_document::ReadUserError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IssueHandoffConfig {
@@ -57,33 +56,43 @@ pub enum IssueHandoffError {
     UnexpectedEvent,
 }
 
+impl From<IoError> for IssueHandoffError {
+    fn from(error: IoError) -> Self {
+        let read = match error {
+            IoError::Conflict => ReadUserError::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => ReadUserError::StorageError(error),
+            IoError::Unexpected { .. } | IoError::Codec(_) => return Self::UnexpectedEvent,
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => {
+                return Self::NotFinished;
+            }
+        };
+        Self::Read(read)
+    }
+}
+
 /// Signs a login handoff for the caller after the local user, session and status checks.
 #[derive(Debug, PartialEq)]
 pub struct IssueHandoffOperation {
     config: IssueHandoffConfig,
-    read: Option<ReadUserOperation>,
-    output: Option<Result<Signed<LoginHandoff>, IssueHandoffError>>,
+    ids: IdMint,
 }
 
 impl IssueHandoffOperation {
     pub fn new(config: IssueHandoffConfig) -> Self {
         Self {
             config,
-            read: None,
-            output: None,
+            ids: IdMint::default(),
         }
     }
 
-    fn sign(
-        &self,
-        read: Result<aruna_core::structs::identity::user::User, ReadUserError>,
-    ) -> Result<Signed<LoginHandoff>, IssueHandoffError> {
-        let name = match read {
-            Ok(user) if user.is_deactivated() => return Err(IssueHandoffError::Deactivated),
-            Ok(user) => Some(user.name).filter(|name| !name.is_empty()),
-            Err(ReadUserError::NotFound) => None,
-            Err(error) => return Err(error.into()),
+    /// Signs the handoff with the name of the read user; a missing user signs without one.
+    fn sign(&mut self, user: Option<User>) -> Result<Signed<LoginHandoff>, IssueHandoffError> {
+        let name = match user {
+            Some(user) if user.is_deactivated() => return Err(IssueHandoffError::Deactivated),
+            Some(user) => Some(user.name).filter(|name| !name.is_empty()),
+            None => None,
         };
+        let handoff_id = self.ids.mint(self.config.now.saturating_mul(1000));
         let config = &self.config;
         let handoff = LoginHandoff::new(
             config.auth_context.realm_id,
@@ -92,6 +101,7 @@ impl IssueHandoffOperation {
             config.nonce.clone(),
             name,
             config.now,
+            handoff_id,
         )?;
         Ok(Signed::sign(handoff, &config.node_capabilities)?)
     }
@@ -101,44 +111,32 @@ impl Operation for IssueHandoffOperation {
     type Output = Signed<LoginHandoff>;
     type Error = IssueHandoffError;
 
-    fn start(&mut self) -> Effects {
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> Result<Next<Self::Output>, IssueHandoffError> {
         let auth = &self.config.auth_context;
         let portal = auth.session.as_ref().map(|session| session.kind) == Some(SessionKind::Portal);
         if auth.user_id.realm_id != auth.realm_id || auth.path_restrictions.is_some() || !portal {
-            self.output = Some(Err(IssueHandoffError::Refused));
-            return smallvec![];
+            return Err(IssueHandoffError::Refused);
         }
-        let mut read = ReadUserOperation::new(auth.user_id);
-        let effects = read.start();
-        self.read = Some(read);
-        effects
-    }
-
-    fn step(&mut self, event: Event) -> Effects {
-        // Only the user read of `start` answers; before it and once decided, events are refused.
-        let Some(read) = self.read.as_mut() else {
-            self.output = Some(Err(IssueHandoffError::UnexpectedEvent));
-            return smallvec![];
+        let user = DocumentTarget::User {
+            user_id: auth.user_id,
         };
-        let effects = read.step(event);
-        if read.is_complete()
-            && let Some(read) = self.read.take()
-        {
-            self.output = Some(self.sign(read.finalize()));
-        }
-        effects
+        Ok(Next::Call(read_row(
+            user.storage_keyspace(),
+            user.storage_key(),
+        )))
     }
 
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(IssueHandoffError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        self.read.as_mut().map(Operation::abort).unwrap_or_default()
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, IssueHandoffError> {
+        let [user] = values::<1>(result)?;
+        let user = user
+            .map(|bytes| User::from_bytes(&bytes))
+            .transpose()
+            .map_err(|error| IssueHandoffError::Read(error.into()))?;
+        self.sign(user).map(Next::Done)
     }
 }
 
@@ -174,42 +172,38 @@ pub enum FederatedLoginError {
     UnexpectedEvent,
 }
 
+super::io_failure!(FederatedLoginError);
+
 #[derive(Debug, PartialEq)]
-enum FederatedLoginState {
-    Start,
-    ReadConfig(GetConfigOperation),
-    ReadClaims,
-    ReadOwner(UserId),
-    Session(CreateSessionOperation),
-    Done,
+enum LoginPhase {
+    Config,
+    Claims,
+    Owner(UserId),
+    Session,
 }
+
+type LoginTurn = Result<Next<CreatedSession>, FederatedLoginError>;
 
 /// Admits a login handoff against the current settings and opens an 8 hour federated session,
 /// for the local account the login is linked to when that link resolves unambiguously.
 #[derive(Debug, PartialEq)]
 pub struct FederatedLoginOperation {
     config: FederatedLoginConfig,
-    state: FederatedLoginState,
+    phase: LoginPhase,
     /// The realm config read at admission, for the cutoff checks of the session ids.
     realm: Option<RealmConfigDocument>,
-    output: Option<Result<CreatedSession, FederatedLoginError>>,
 }
 
 impl FederatedLoginOperation {
     pub fn new(config: FederatedLoginConfig) -> Self {
         Self {
             config,
-            state: FederatedLoginState::Start,
+            phase: LoginPhase::Config,
             realm: None,
-            output: None,
         }
     }
 
-    fn admit(
-        &mut self,
-        read: Result<RealmConfigDocument, GetConfigError>,
-    ) -> Result<(), FederatedLoginError> {
-        let realm = read?;
+    fn admit(&mut self, realm: RealmConfigDocument) -> Result<(), FederatedLoginError> {
         let settings = realm
             .federation
             .as_ref()
@@ -238,10 +232,10 @@ impl FederatedLoginOperation {
             .is_some_and(|cutoff| now < cutoff)
     }
 
-    fn session(&mut self, user_id: UserId, via: Option<UserId>) -> Effects {
+    fn session(&mut self, user_id: UserId, via: Option<UserId>) -> LoginTurn {
         let config = &self.config;
         let handoff = &config.handoff.payload;
-        let mut session = CreateSessionOperation::new(CreateSessionConfig {
+        let session = CreateSessionOperation::new(CreateSessionConfig {
             time: config.now,
             expiry: config.now.saturating_add(FEDERATED_SESSION_SECS),
             user_id,
@@ -255,76 +249,45 @@ impl FederatedLoginOperation {
             auth_time: None,
             cutoff: None,
         });
-        let effects = session.start();
-        self.state = FederatedLoginState::Session(session);
-        effects
+        self.phase = LoginPhase::Session;
+        Ok(Next::Call(IoCall::child(session)))
     }
 
-    fn read(&mut self, key_space: &str, key: Vec<u8>) -> Effects {
-        smallvec![Effect::Storage(StorageEffect::Read {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            txn_id: None,
-        })]
-    }
-
-    /// The linked account and its stored bytes from a storage read, or the error it carries.
-    fn read_value(event: Event) -> Result<Option<ByteView>, FederatedLoginError> {
-        match event {
-            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
-            _ => Err(FederatedLoginError::NotFinished),
-        }
-    }
-
-    fn claims_read(&mut self, event: Event) -> Effects {
-        let foreign = self.config.handoff.payload.user;
-        let owner = Self::read_value(event).and_then(|value| {
-            let claims = value
-                .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes))
-                .transpose()
-                .map_err(ConversionError::from)?
-                .unwrap_or_default();
-            Ok(alias_owner(&claims))
-        });
-        match owner {
-            Ok(Some(owner)) => {
-                self.state = FederatedLoginState::ReadOwner(owner);
-                self.read(USER_KEYSPACE, owner.to_bytes())
+    /// The linked account named by the alias claims, or a session of the foreign login.
+    fn claims_read(&mut self, result: IoResult) -> LoginTurn {
+        let [value] = values::<1>(result)?;
+        let claims = value
+            .map(|bytes| postcard::from_bytes::<BTreeSet<UserId>>(&bytes))
+            .transpose()
+            .map_err(ConversionError::from)?
+            .unwrap_or_default();
+        match alias_owner(&claims) {
+            Some(owner) => {
+                self.phase = LoginPhase::Owner(owner);
+                Ok(Next::Call(read_row(USER_KEYSPACE, owner.to_bytes())))
             }
-            Ok(None) => self.session(foreign, None),
-            Err(error) => self.finish(Err(error)),
+            None => self.session(self.config.handoff.payload.user, None),
         }
     }
 
     /// A linked login opens a session of an active, non-service account that still links it.
-    fn owner_read(&mut self, event: Event, owner: UserId) -> Effects {
+    fn owner_read(&mut self, result: IoResult, owner: UserId) -> LoginTurn {
         let foreign = self.config.handoff.payload.user;
-        let user = Self::read_value(event).and_then(|value| {
-            value
-                .map(|bytes| User::from_bytes(&bytes).map_err(FederatedLoginError::from))
-                .transpose()
-        });
+        let [value] = values::<1>(result)?;
+        let user = value.map(|bytes| User::from_bytes(&bytes)).transpose()?;
         match user {
-            Ok(Some(user))
+            Some(user)
                 if !user.is_deactivated()
                     && user.service_group().is_none()
                     && user.linked_login(&foreign) =>
             {
                 if self.cut_off(&owner) {
-                    return self.finish(Err(FederatedLoginError::CutOff));
+                    return Err(FederatedLoginError::CutOff);
                 }
                 self.session(owner, Some(foreign))
             }
-            Ok(_) => self.session(foreign, None),
-            Err(error) => self.finish(Err(error)),
+            _ => self.session(foreign, None),
         }
-    }
-
-    fn finish(&mut self, result: Result<CreatedSession, FederatedLoginError>) -> Effects {
-        self.state = FederatedLoginState::Done;
-        self.output = Some(result);
-        smallvec![]
     }
 }
 
@@ -332,63 +295,34 @@ impl Operation for FederatedLoginOperation {
     type Output = CreatedSession;
     type Error = FederatedLoginError;
 
-    fn start(&mut self) -> Effects {
-        if self.state != FederatedLoginState::Start {
-            return smallvec![];
-        }
-        let mut read = GetConfigOperation::new(self.config.realm_id);
-        let effects = read.start();
-        self.state = FederatedLoginState::ReadConfig(read);
-        effects
+    fn first(&mut self) -> LoginTurn {
+        let target = DocumentTarget::RealmConfig {
+            realm_id: self.config.realm_id,
+        };
+        Ok(Next::Call(read_row(
+            target.storage_keyspace(),
+            target.storage_key(),
+        )))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match std::mem::replace(&mut self.state, FederatedLoginState::Done) {
-            FederatedLoginState::ReadConfig(mut read) => {
-                let effects = read.step(event);
-                if !read.is_complete() {
-                    self.state = FederatedLoginState::ReadConfig(read);
-                    return effects;
-                }
-                match self.admit(read.finalize()) {
-                    Ok(()) => {
-                        self.state = FederatedLoginState::ReadClaims;
-                        let key = alias_claims_key(&self.config.handoff.payload.user);
-                        self.read(FEDERATION_KEYSPACE, key)
-                    }
-                    Err(error) => self.finish(Err(error)),
-                }
+    fn next(&mut self, result: IoResult) -> LoginTurn {
+        match std::mem::replace(&mut self.phase, LoginPhase::Session) {
+            LoginPhase::Config => {
+                let [value] = values::<1>(result)?;
+                let bytes = value.ok_or(GetConfigError::DocumentNotFound)?;
+                let realm =
+                    RealmConfigDocument::from_bytes(&bytes).map_err(GetConfigError::from)?;
+                self.admit(realm)?;
+                self.phase = LoginPhase::Claims;
+                let key = alias_claims_key(&self.config.handoff.payload.user);
+                Ok(Next::Call(read_row(FEDERATION_KEYSPACE, key)))
             }
-            FederatedLoginState::ReadClaims => self.claims_read(event),
-            FederatedLoginState::ReadOwner(owner) => self.owner_read(event, owner),
-            FederatedLoginState::Session(mut session) => {
-                let effects = session.step(event);
-                if !session.is_complete() {
-                    self.state = FederatedLoginState::Session(session);
-                    return effects;
-                }
-                self.finish(session.finalize().map_err(Into::into));
-                effects
+            LoginPhase::Claims => self.claims_read(result),
+            LoginPhase::Owner(owner) => self.owner_read(result, owner),
+            LoginPhase::Session => {
+                let created = result.child::<CreatedSession, CreateSessionError>()??;
+                Ok(Next::Done(created))
             }
-            FederatedLoginState::Start | FederatedLoginState::Done => {
-                self.finish(Err(FederatedLoginError::UnexpectedEvent))
-            }
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        self.output.is_some()
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.unwrap_or(Err(FederatedLoginError::NotFinished))
-    }
-
-    fn abort(&mut self) -> Effects {
-        match &mut self.state {
-            FederatedLoginState::ReadConfig(read) => read.abort(),
-            FederatedLoginState::Session(session) => session.abort(),
-            _ => smallvec![],
         }
     }
 }
@@ -396,13 +330,12 @@ impl Operation for FederatedLoginOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::auth::{Actor, SessionRef};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
     use aruna_core::structs::identity::user::User;
+    use aruna_core::user::id::UserId;
     use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
-    use byteview::ByteView;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
     use url::Url;
@@ -423,11 +356,8 @@ mod tests {
         }
     }
 
-    fn read_result(value: Vec<u8>) -> Event {
-        Event::Storage(StorageEvent::ReadResult {
-            key: ByteView::from(Vec::new()),
-            value: Some(ByteView::from(value)),
-        })
+    fn read_result(value: Vec<u8>) -> IoResult {
+        IoResult::Values(vec![Some(value.into())])
     }
 
     fn issue(kind: SessionKind) -> IssueHandoffOperation {
@@ -464,14 +394,13 @@ mod tests {
     fn federated_session_refused() {
         // A federated session cannot chain a login to a third realm; nothing is read.
         let mut operation = issue(SessionKind::Federated);
-        assert!(operation.start().is_empty());
-        assert_eq!(operation.finalize(), Err(IssueHandoffError::Refused));
+        assert_eq!(operation.first(), Err(IssueHandoffError::Refused));
     }
 
     #[test]
     fn deactivated_user_refused() {
         let mut operation = issue(SessionKind::Portal);
-        assert_eq!(operation.start().len(), 1);
+        assert!(operation.first().is_ok());
         let user = User {
             user_id: actor().user_id,
             name: "Ada".to_string(),
@@ -479,8 +408,8 @@ mod tests {
             alias_user_ids: Default::default(),
             attributes: [(DEACTIVATED_ATTRIBUTE.to_string(), "true".to_string())].into(),
         };
-        operation.step(read_result(user.to_bytes(&actor()).unwrap()));
-        assert_eq!(operation.finalize(), Err(IssueHandoffError::Deactivated));
+        let read = IoResult::Values(vec![Some(user.to_bytes(&actor()).unwrap().into())]);
+        assert_eq!(operation.next(read), Err(IssueHandoffError::Deactivated));
     }
 
     fn login() -> FederatedLoginOperation {
@@ -509,33 +438,30 @@ mod tests {
     fn missing_settings_refused() {
         // Without federation settings no session is written.
         let mut operation = login();
-        assert_eq!(operation.start().len(), 1);
+        let target = DocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        };
+        let read = read_row(target.storage_keyspace(), target.storage_key());
+        assert_eq!(operation.first(), Ok(Next::Call(read)));
         let config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        let effects = operation.step(read_result(config.to_bytes(&actor()).unwrap()));
-        assert!(effects.is_empty());
-        assert_eq!(operation.finalize(), Err(FederatedLoginError::Disabled));
+        let answer = operation.next(read_result(config.to_bytes(&actor()).unwrap()));
+        assert_eq!(answer, Err(FederatedLoginError::Disabled));
+        let mut missing = login();
+        let answer = missing.next(IoResult::Values(vec![None]));
+        let not_found = FederatedLoginError::Config(GetConfigError::DocumentNotFound);
+        assert_eq!(answer, Err(not_found));
     }
 
     #[test]
-    fn stray_events_rejected() {
-        // Events before `start` and after the decision are refused, never read as answers.
-        let config = RealmConfigDocument::new(realm_id(), Vec::new(), 3);
-        let answer = || read_result(config.to_bytes(&actor()).unwrap());
-        let mut early = login();
-        assert!(early.step(answer()).is_empty());
-        assert_eq!(early.finalize(), Err(FederatedLoginError::UnexpectedEvent));
-        let mut late = login();
-        late.start();
-        late.step(answer());
-        assert!(late.step(answer()).is_empty());
-        assert_eq!(late.finalize(), Err(FederatedLoginError::UnexpectedEvent));
-
-        let mut early = issue(SessionKind::Portal);
-        early.step(answer());
-        assert_eq!(early.finalize(), Err(IssueHandoffError::UnexpectedEvent));
-        let mut late = issue(SessionKind::Federated);
-        late.start();
-        late.step(answer());
-        assert_eq!(late.finalize(), Err(IssueHandoffError::UnexpectedEvent));
+    fn unlinked_login_session() {
+        // Without one owning account the foreign login gets its own session.
+        let mut operation = login();
+        operation.phase = LoginPhase::Claims;
+        let answer = operation.next(IoResult::Values(vec![None]));
+        assert!(matches!(answer, Ok(Next::Call(IoCall::Child(_)))));
+        let refused = || CreateSessionError::LimitReached { oldest: 1 };
+        let outcome = ChildOutcome::new(Err::<CreatedSession, _>(refused()));
+        let answer = operation.next(IoResult::Child(outcome));
+        assert_eq!(answer, Err(FederatedLoginError::Session(refused())));
     }
 }

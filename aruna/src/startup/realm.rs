@@ -4,28 +4,30 @@
 
 use std::sync::Arc;
 
-use aruna_core::UserId;
 use aruna_core::document::DocumentTarget;
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::node_facts;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_net::NetHandle;
-use aruna_operations::device::realm_documents::fetch_realm_documents;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::metadata::projector::replay_until_stopped;
-use aruna_operations::node::startup::prepare_shard_policy;
+use aruna_operations::device_node::realm_documents::fetch_realm_documents;
+use aruna_operations::metadata::projection::{MetadataProjectionError, ReplayPageOperation};
+use aruna_operations::node::info::flows::SeedInfoOperation;
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
+use aruna_operations::shard::restore::PreparePolicyOperation;
 use tracing::{info, warn};
 
 use crate::bootstrap::{
     ensure_onboarding_secret, fetch_core_documents, prepare_core_documents, realm_bootstrap_exists,
     wait_for_placement,
 };
-use crate::config::{Config, StartupMode};
-use crate::identity::{mark_onboarding_phase, mark_state_complete};
 use crate::startup::federation::register_default;
+use aruna_config::identity::{mark_onboarding_phase, mark_state_complete};
+use aruna_config::{Config, StartupMode};
 
 pub(crate) struct CoreAnnouncement {
     pub(crate) documents: Vec<DocumentTarget>,
@@ -64,14 +66,22 @@ pub(crate) async fn prepare(
     };
 
     // Prepare local topics before binding; remote convergence stays behind the gate.
-    prepare_shard_policy(driver_ctx, config.node_id, config.realm_id).await;
+    let policy = PreparePolicyOperation::new(config.node_id, config.realm_id);
+    if let Err(error) = drive(policy, driver_ctx).await {
+        warn!(error = %error, "Deferring shard topic policy to remote recovery");
+    }
     if stop.is_cancelled() {
         return Ok(None);
     }
     // Devices fetch governing realm documents before serving because they run no sync.
     // A short attempt lets stored copies serve while heartbeat retries an unreachable realm.
     if matches!(config.node_capabilities, NodeCapabilities::User { .. })
-        && !fetch_realm_documents(driver_ctx, STARTUP_DOCUMENT_FETCH).await
+        && !drive(
+            fetch_realm_documents(driver_ctx.node_and_realm(), STARTUP_DOCUMENT_FETCH),
+            driver_ctx,
+        )
+        .await
+        .unwrap_or(false)
     {
         warn!("Serving this device from its stored realm documents for now");
     }
@@ -313,37 +323,59 @@ async fn provision_realm(
 /// placement map before it serves anything. A changed subject blocks governed
 /// serving until the local inventory has been revalidated under it.
 async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::placement::policy::sync_subject(
-        ctx,
+    let mode = aruna_operations::placement::policy::subject::SubjectScanMode::Revalidate(
+        aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
+    );
+    let sync = aruna_operations::placement::policy::reconcile::SubjectSyncOperation::new(
         config.realm_id,
         config.node_id,
-        aruna_operations::placement::policy::SubjectScanMode::Revalidate(
-            aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
-        ),
-        aruna_operations::driver::now_ms(),
-    )
-    .await
-    .map(|_| ())
-    .map_err(|error| error.to_string())
+        aruna_operations::placement::policy::reconcile::SubjectTrigger::Reconcile(mode),
+        aruna_clock::unix_timestamp_millis(),
+    );
+    aruna_drivers::driver::drive(sync, ctx)
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn seed_node_info(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    aruna_operations::node::node_info::seed_info_document(
-        ctx,
-        config.node_id,
-        config.realm_id,
-        NodeUrls {
-            api: config.api_public_url.clone(),
-            s3: config.s3_public_url.clone(),
-        },
-    )
-    .await
+    let urls = NodeUrls {
+        api: config.api_public_url.clone(),
+        s3: config.s3_public_url.clone(),
+    };
+    let facts = node_facts(ctx);
+    let seed = SeedInfoOperation::new(config.realm_id, config.node_id, urls, facts, false);
+    aruna_drivers::driver::drive(seed, ctx)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Replays the event log one page at a time, checking `should_continue` before each page. A
+/// stop accepted during a large replay ends at a page boundary with every completed page
+/// projected, so no in-flight projection step is abandoned.
+async fn replay_until_stopped(
+    context: &DriverContext,
+    mut should_continue: impl FnMut() -> bool,
+) -> Result<usize, MetadataProjectionError> {
+    let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+    let mut after = None;
+    let mut projected = 0usize;
+    while should_continue() {
+        let page = ReplayPageOperation::new(after, local_node);
+        let (count, next) = drive(page, context).await?;
+        projected = projected.saturating_add(count);
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    Ok(projected)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_net::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
 
     // A stop accepted before preparation starts must return cleanly without
     // touching storage or the network, so the caller can release the acquired
@@ -365,8 +397,8 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (config, storage) = crate::config::resolve_settings(
-            crate::settings::read_settings_from(&map).expect("settings parse"),
+        let (config, storage) = aruna_config::resolve_settings(
+            aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await
         .expect("settings resolve");
@@ -387,9 +419,10 @@ mod tests {
             storage_handle: storage,
             net_handle: Some(net.clone()),
             blob_handle: None,
-            metadata_handle: None,
+            graph_handle: None,
             task_handle: None,
             compute_handle: None,
+            outbound_handle: None,
         });
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();

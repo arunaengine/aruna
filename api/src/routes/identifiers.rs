@@ -5,27 +5,21 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{
     CompiledParser, Identifier, IdentifierParser, IdentifierRule, IdentifierTarget,
 };
-use axum::extract::State;
-use axum::{Extension, Json};
+use axum::Json;
 use serde::{Deserialize, Serialize};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct IdentifiersApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(IdentifiersApiDoc::openapi()).routes(routes!(test_rules))
+    OpenApiRouter::new().routes(routes!(test_rules))
 }
 
 /// What a rule reads: the object key or the recorded source URL.
@@ -171,16 +165,13 @@ pub struct ParserTestResponse {
             }]
         })),
         (status = 400, description = "Invalid rule", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn test_rules(
-    State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    _: RealmAuth,
     Json(request): Json<ParserTestRequest>,
 ) -> ServerResult<Json<ParserTestResponse>> {
-    require_realm_auth(&state, auth)?;
     let parser = CompiledParser::compile(&request.parser.into())
         .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
     let found = parser.find(&request.key, request.source_url.as_deref());

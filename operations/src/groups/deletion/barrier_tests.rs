@@ -5,10 +5,10 @@
 use std::collections::VecDeque;
 use std::time::SystemTime;
 
+use aruna_core::calls::CallRun;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::Operation;
 use aruna_core::structs::identity::group_delete::{
     GroupDeletePhase, GroupDeletionError, GroupWriteError, MembershipFence,
 };
@@ -20,12 +20,14 @@ use ed25519_dalek::SigningKey;
 use tempfile::tempdir;
 use ulid::Ulid;
 
+use super::coordinator::InstallOnboardingOperation;
 use super::prepare::PrepareOperation;
-use super::tests::{Fixture, context, node, read, write};
-use crate::driver::drive;
+use super::tests::{commit, prepare};
 use crate::groups::fence::GroupWriteOperation;
 use crate::onboarding::issue_ticket::{IssueSyncInput, IssueSyncOperation};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
+use aruna_drivers::driver::drive;
+use aruna_test_support::groups::{Fixture, context, node, read, write};
 
 fn enrollment(fixture: &Fixture) -> EnsureConfigOperation {
     EnsureConfigOperation::new(EnsureConfigParams {
@@ -62,7 +64,7 @@ async fn enroll_fixture() -> Fixture {
 #[tokio::test]
 async fn prepare_blocks_enrollment() {
     let fixture = enroll_fixture().await;
-    fixture.prepare(1).await.unwrap();
+    prepare(&fixture, 1).await.unwrap();
     assert_eq!(
         drive(enrollment(&fixture), &fixture.context).await,
         Err(EnsureConfigError::DeletionPending)
@@ -85,7 +87,7 @@ async fn prepare_blocks_enrollment() {
 #[tokio::test]
 async fn enrollment_conflicts_prepare() {
     let fixture = enroll_fixture().await;
-    let mut operation = enrollment(&fixture);
+    let mut operation = CallRun::new(enrollment(&fixture));
     let mut effects = VecDeque::from_iter(operation.start());
     let mut prepared = false;
     while !operation.is_complete() {
@@ -94,7 +96,7 @@ async fn enrollment_conflicts_prepare() {
         };
         if matches!(effect, StorageEffect::CommitTransaction { .. }) {
             assert!(!prepared);
-            fixture.prepare(1).await.unwrap();
+            prepare(&fixture, 1).await.unwrap();
             prepared = true;
         }
         let event = fixture
@@ -118,7 +120,7 @@ async fn enrollment_invalidates_prepare() {
     let fixture = enroll_fixture().await;
     drive(enrollment(&fixture), &fixture.context).await.unwrap();
     assert!(matches!(
-        fixture.prepare(1).await,
+        prepare(&fixture, 1).await,
         Err(GroupDeletionError::Conflict(_))
     ));
     assert!(
@@ -135,8 +137,8 @@ async fn enrollment_invalidates_prepare() {
 #[tokio::test]
 async fn commit_reopens_enrollment() {
     let fixture = enroll_fixture().await;
-    let proof = fixture.prepare(1).await.unwrap();
-    fixture.commit(vec![proof]).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
+    commit(&fixture, vec![proof]).await.unwrap();
     assert!(
         drive(enrollment(&fixture), &fixture.context)
             .await
@@ -160,8 +162,8 @@ async fn commit_reopens_enrollment() {
 #[tokio::test]
 async fn ticket_installs_tombstone() {
     let fixture = enroll_fixture().await;
-    let proof = fixture.prepare(1).await.unwrap();
-    fixture.commit(vec![proof]).await.unwrap();
+    let proof = prepare(&fixture, 1).await.unwrap();
+    commit(&fixture, vec![proof]).await.unwrap();
     drive(enrollment(&fixture), &fixture.context).await.unwrap();
     let ticket = drive(
         IssueSyncOperation::new(IssueSyncInput {
@@ -180,9 +182,12 @@ async fn ticket_installs_tombstone() {
     let dir = tempdir().unwrap();
     let joined = context(dir.path());
     for _ in 0..2 {
-        super::install_onboarding(&joined, &ticket, fixture.plan.realm_id, node(2), 100)
-            .await
-            .unwrap();
+        drive(
+            InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 100),
+            &joined,
+        )
+        .await
+        .unwrap();
     }
     joined.storage_handle.close().await;
     let joined = context(dir.path());
@@ -206,15 +211,27 @@ async fn ticket_installs_tombstone() {
     let mut tampered = ticket.clone();
     tampered.payload.group_deletions.clear();
     assert!(matches!(
-        super::install_onboarding(&joined, &tampered, fixture.plan.realm_id, node(2), 100).await,
+        drive(
+            InstallOnboardingOperation::new(&tampered, fixture.plan.realm_id, node(2), 100),
+            &joined
+        )
+        .await,
         Err(GroupDeletionError::Invalid(_))
     ));
     assert!(matches!(
-        super::install_onboarding(&joined, &ticket, fixture.plan.realm_id, node(3), 100).await,
+        drive(
+            InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(3), 100),
+            &joined
+        )
+        .await,
         Err(GroupDeletionError::Invalid(_))
     ));
     assert!(matches!(
-        super::install_onboarding(&joined, &ticket, fixture.plan.realm_id, node(2), 401).await,
+        drive(
+            InstallOnboardingOperation::new(&ticket, fixture.plan.realm_id, node(2), 401),
+            &joined
+        )
+        .await,
         Err(GroupDeletionError::Invalid(_))
     ));
 }
@@ -250,7 +267,7 @@ async fn replacement_cannot_reopen() {
         .await
         .unwrap();
         let connector_id = created.connector.connector_id;
-        let mut operation = ReplaceSourceOperation::new(ReplaceSourceInput {
+        let mut operation = CallRun::new(ReplaceSourceOperation::new(ReplaceSourceInput {
             group_id: fixture.plan.group_id,
             connector_id,
             name: "After".into(),
@@ -261,7 +278,7 @@ async fn replacement_cannot_reopen() {
             } else {
                 HashMap::new()
             },
-        });
+        }));
         let mut effects = VecDeque::from_iter(operation.start());
         let mut deleted = false;
         while !operation.is_complete() {
@@ -279,8 +296,8 @@ async fn replacement_cannot_reopen() {
                 )
                 .await
                 .unwrap();
-                let proof = fixture.prepare(1).await.unwrap();
-                fixture.commit(vec![proof]).await.unwrap();
+                let proof = prepare(&fixture, 1).await.unwrap();
+                commit(&fixture, vec![proof]).await.unwrap();
                 deleted = true;
             }
             let event = fixture

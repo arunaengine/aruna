@@ -8,17 +8,24 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
+use crate::lookup::actor;
+use aruna_core::metadata::api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_operations::metadata::api::{
-    DocumentQueryRequest, ExportMetadataRequest, MetadataQueryRequest, MetadataReferencesRequest,
-    MetadataSearchRequest, RoCrateExportView, query_metadata, query_metadata_document,
-    references_metadata, search_metadata,
+use aruna_drivers::driver::drive;
+use aruna_operations::auth::request_authorization::AuthorizeDocumentOperation;
+use aruna_operations::metadata::api::document_query::DocumentQueryOperation;
+use aruna_operations::metadata::api::export_types::ExportMetadataRequest;
+use aruna_operations::metadata::api::read::query_metadata;
+use aruna_operations::metadata::api::read_types::{
+    DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
-use aruna_operations::metadata::create_document::CreateDocumentPayload;
-use aruna_operations::metadata::forward::{export_rocrate_routed, route_metadata_update};
-use aruna_operations::metadata::profile::validation::preview_submission;
-use aruna_operations::metadata::update_document::UpdateDocumentMutation;
+use aruna_operations::metadata::api::realm_search::search_metadata;
+use aruna_operations::metadata::api::references::ReferencesOperation;
+use aruna_operations::metadata::api::search_types::MetadataSearchRequest;
+use aruna_operations::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_operations::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_operations::metadata::profile::validation::ProfileAssessOperation;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
 use rmcp::model::CallToolResult;
@@ -151,7 +158,7 @@ impl McpServer {
         let response = crate::metadata::run_document_list(
             &self.state,
             Some(auth.clone()),
-            crate::metadata::ListMetadataQuery {
+            crate::metadata::model::ListMetadataQuery {
                 group_id: None,
                 path_prefix: Some("profiles/".to_string()),
                 include: Some("summary".to_string()),
@@ -256,27 +263,30 @@ impl McpServer {
         let group_id = input.group_id.as_deref().map(parse_group).transpose()?;
         // As in REST, a group filter only narrows the hits, each checked for the caller.
         metadata_probe(self, &auth, "search_datasets", extras).await?;
-        let result = search_metadata(
+        let result = drive(
+            search_metadata(
+                self.state.get_realm_id(),
+                self.state.get_node_id(),
+                MetadataSearchRequest {
+                    auth: Some(auth),
+                    bearer_token: request_bearer(&parts)
+                        .map(|carrier| carrier.as_str().to_string()),
+                    graph_iris: None,
+                    query: input.q,
+                    conforms_to: input.conforms_to,
+                    group_id,
+                    limit: input.limit,
+                    cursor: None,
+                    mode: None,
+                    target_nodes: None,
+                },
+            ),
             self.state.get_ctx().as_ref(),
-            self.state.get_realm_id(),
-            self.state.get_node_id(),
-            MetadataSearchRequest {
-                auth: Some(auth),
-                bearer_token: request_bearer(&parts).map(|carrier| carrier.as_str().to_string()),
-                graph_iris: None,
-                query: input.q,
-                conforms_to: input.conforms_to,
-                group_id,
-                limit: input.limit,
-                cursor: None,
-                mode: None,
-                target_nodes: None,
-            },
         )
         .await
         .map_err(crate::metadata::map_api_error)
         .map_err(search_error)?;
-        let response = crate::metadata::SearchResultsResponse {
+        let response = crate::metadata::model::SearchResultsResponse {
             hits: result
                 .hits
                 .into_iter()
@@ -343,11 +353,14 @@ impl McpServer {
             None => metadata_probe(self, &auth, "validate_dataset", extras).await?,
         }
         let jsonld = rocrate_json(&input.rocrate.0)?;
-        let preview = preview_submission(&self.state.get_ctx(), group_id, &jsonld)
+        let context = self.state.get_ctx();
+        let local_node = context.net_handle.as_ref().map(|net| net.node_id());
+        let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
+        let preview = drive(preview, &context)
             .await
             .map_err(crate::metadata::map_metadata_error)
             .map_err(server_error)?;
-        let response = crate::metadata::ProfilePreviewResponse::from(preview);
+        let response = crate::metadata::model::ProfilePreviewResponse::from(preview);
         Ok(Json(JsonPayload(
             serde_json::to_value(response).map_err(internal_error)?,
         )))
@@ -366,10 +379,13 @@ impl McpServer {
         let group_id = parse_group(&input.group_id)?;
         let jsonld = rocrate_json(&input.rocrate.0)?;
         let ctx = self.state.get_ctx();
-        let resolved = aruna_operations::git::location::resolve(&ctx, &auth, group_id, None)
-            .await
-            .map_err(crate::routes::metadata::documents::map_location_error)
-            .map_err(server_error)?;
+        let resolved = drive(
+            aruna_operations::git::location::resolve(ctx.node_id(), &auth, group_id, None),
+            &ctx,
+        )
+        .await
+        .map_err(crate::routes::metadata::documents::map_location_error)
+        .map_err(server_error)?;
         let record = crate::metadata::run_create_metadata(
             &self.state,
             &auth,
@@ -390,8 +406,13 @@ impl McpServer {
             ),
             error => write_error(error),
         })?;
-        aruna_operations::git::location::establish(&ctx, &auth, &record, resolved).await;
-        let summary = crate::metadata::MetadataDocumentSummary::from(&record);
+        drive(
+            aruna_operations::git::location::establish(ctx.node_id(), &auth, &record, resolved),
+            &ctx,
+        )
+        .await
+        .ok();
+        let summary = crate::metadata::model::MetadataDocumentSummary::from(&record);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -417,25 +438,31 @@ impl McpServer {
         if record.is_none() {
             metadata_probe(self, &auth, "replace_dataset", extras).await?;
         }
-        let updated = route_metadata_update(
+        let updated = aruna_drivers::driver::drive(
+            RouteUpdateOperation::new(
+                (
+                    actor(&self.state, &auth),
+                    (self.state.get_ctx())
+                        .net_handle
+                        .as_ref()
+                        .map(|net| net.node_id()),
+                ),
+                (record.clone(), document_id),
+                DocumentUpdate {
+                    public: input.public,
+                    mutation: UpdateDocumentMutation::ReplaceRoCrate { jsonld },
+                    expected_revision: None,
+                    commit_message: None,
+                },
+                crate::metadata::forwarded_auth_token(request_bearer(&parts))
+                    .map_err(server_error)?,
+            ),
             &self.state.get_ctx(),
-            Actor {
-                node_id: self.state.get_node_id(),
-                user_id: auth.user_id,
-                realm_id: self.state.get_realm_id(),
-            },
-            record.as_ref(),
-            document_id,
-            input.public,
-            UpdateDocumentMutation::ReplaceRoCrate { jsonld },
-            None,
-            crate::metadata::forwarded_auth_token(request_bearer(&parts)).map_err(server_error)?,
-            None,
         )
         .await
         .map_err(crate::metadata::map_write_error)
         .map_err(update_error)?;
-        let summary = crate::metadata::MetadataDocumentSummary::from(&updated);
+        let summary = crate::metadata::model::MetadataDocumentSummary::from(&updated);
         Ok(Json(JsonPayload(
             serde_json::to_value(summary).map_err(internal_error)?,
         )))
@@ -467,35 +494,39 @@ impl McpServer {
             authorize_document(self, &auth, document, extras)
                 .await
                 .map_err(server_error)?;
-            query_metadata_document(
+            drive(
+                DocumentQueryOperation::new(
+                    self.state.get_realm_id(),
+                    self.state.get_node_id(),
+                    DocumentQueryRequest {
+                        document_id,
+                        auth: Some(auth.clone()),
+                        bearer_token: bearer,
+                        query: input.query,
+                        mode: None,
+                        allow_partial: true,
+                    },
+                ),
                 self.state.get_ctx().as_ref(),
-                self.state.get_realm_id(),
-                self.state.get_node_id(),
-                DocumentQueryRequest {
-                    document_id,
-                    auth: Some(auth.clone()),
-                    bearer_token: bearer,
-                    query: input.query,
-                    mode: None,
-                    allow_partial: true,
-                },
             )
             .await
         } else {
             metadata_probe(self, &auth, "sparql_query", extras).await?;
-            query_metadata(
+            drive(
+                query_metadata(
+                    self.state.get_realm_id(),
+                    self.state.get_node_id(),
+                    MetadataQueryRequest {
+                        auth: Some(auth),
+                        bearer_token: bearer,
+                        graph_iris: None,
+                        query: input.query,
+                        mode: None,
+                        target_nodes: None,
+                        allow_partial: true,
+                    },
+                ),
                 self.state.get_ctx().as_ref(),
-                self.state.get_realm_id(),
-                self.state.get_node_id(),
-                MetadataQueryRequest {
-                    auth: Some(auth),
-                    bearer_token: bearer,
-                    graph_iris: None,
-                    query: input.query,
-                    mode: None,
-                    target_nodes: None,
-                    allow_partial: true,
-                },
             )
             .await
         }
@@ -530,17 +561,19 @@ impl McpServer {
             tool_extras("find_references", &input)?,
         )
         .await?;
-        let execution = references_metadata(
+        let execution = drive(
+            ReferencesOperation::new(
+                self.state.get_realm_id(),
+                MetadataReferencesRequest {
+                    auth: Some(auth),
+                    iri: input.iri,
+                    predicate: input.predicate,
+                    limit: input.limit,
+                    resolve: false,
+                    after: None,
+                },
+            ),
             self.state.get_ctx().as_ref(),
-            self.state.get_realm_id(),
-            MetadataReferencesRequest {
-                auth: Some(auth),
-                iri: input.iri,
-                predicate: input.predicate,
-                limit: input.limit,
-                resolve: false,
-                after: None,
-            },
         )
         .await
         .map_err(crate::metadata::map_api_error)
@@ -683,7 +716,7 @@ async fn metadata_probe(
     server: &McpServer,
     auth: &AuthContext,
     _tool: &str,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(&server.state, auth, Permission::READ, extras)
         .await
@@ -699,7 +732,7 @@ async fn authorize_summary(
     auth: &AuthContext,
     (group_id, path): (&str, &str),
     (document_id, public): (&str, bool),
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     let group_id = crate::auth::parse_group_id(group_id).map_err(server_error)?;
     let document_id = crate::metadata::parse_document_id(document_id).map_err(server_error)?;
@@ -719,11 +752,12 @@ async fn authorize_document(
     server: &McpServer,
     auth: &AuthContext,
     document: (&str, bool),
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), crate::error::ServerError> {
     let (context, realm_id) = (server.state.get_ctx(), server.state.get_realm_id());
-    aruna_operations::auth::request_authorization::authorize_document(
-        &context, realm_id, auth, document, extras,
+    drive(
+        AuthorizeDocumentOperation::new(realm_id, auth, document, extras),
+        &context,
     )
     .await
     .map_err(crate::auth::map_authorize_error)
@@ -744,26 +778,34 @@ pub(crate) async fn load_raw(
     authorize_document(server, auth, document, tool_extras(tool, input)?)
         .await
         .map_err(document_error)?;
-    let params = crate::metadata::RoCrateExportParams {
-        view: Some(crate::metadata::MetadataRoCrateView::Raw),
+    let params = crate::metadata::model::RoCrateExportParams {
+        view: Some(crate::metadata::model::MetadataRoCrateView::Raw),
         limit: None,
         offset: None,
         after: None,
         here: false,
     };
-    let export = export_rocrate_routed(
+    let export = drive(
+        RoutedExportOperation::new(
+            server
+                .state
+                .get_ctx()
+                .net_handle
+                .as_ref()
+                .map(|net| net.node_id()),
+            server.state.get_realm_id(),
+            ExportMetadataRequest {
+                document_id,
+                auth: Some(auth.clone()),
+                view: RoCrateExportView::Raw,
+                limit: None,
+                offset: None,
+                after: None,
+            },
+            crate::metadata::forwarded_auth_token(bearer).map_err(server_error)?,
+            server.state.rocrate_limits().metadata_bytes,
+        ),
         &server.state.get_ctx(),
-        server.state.get_realm_id(),
-        ExportMetadataRequest {
-            document_id,
-            auth: Some(auth.clone()),
-            view: RoCrateExportView::Raw,
-            limit: None,
-            offset: None,
-            after: None,
-        },
-        crate::metadata::forwarded_auth_token(bearer).map_err(server_error)?,
-        server.state.rocrate_limits().metadata_bytes,
     )
     .await
     .map_err(crate::metadata::map_api_error)
@@ -771,7 +813,7 @@ pub(crate) async fn load_raw(
     let response = crate::metadata::map_export_response(
         export,
         &params,
-        crate::metadata::MetadataRoCrateView::Raw,
+        crate::metadata::model::MetadataRoCrateView::Raw,
     )
     .map_err(server_error)?;
     Ok((
@@ -995,17 +1037,18 @@ mod authorization_tests {
     use super::*;
     use crate::server::state::ServerState;
     use crate::tests::routes::{
-        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
+        seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+    use aruna_core::metadata::api::CreateDocumentPayload;
     use aruna_core::structs::identity::auth::{
         Actor, NodeCapabilities, PathRestriction, Permission,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-    use aruna_operations::driver::drive;
-    use aruna_operations::metadata::MetadataHandle;
-    use aruna_operations::metadata::create_document::CreateDocumentPayload;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_operations::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
@@ -1071,24 +1114,24 @@ mod authorization_tests {
         .await
         .unwrap();
         let node_id = net.node_id();
-        let user_id = aruna_core::UserId::local(Ulid::from_parts(3, 3), realm_id);
+        let user_id = aruna_core::user::id::UserId::local(Ulid::from_parts(3, 3), realm_id);
         let actor = Actor {
             node_id,
             user_id,
             realm_id,
         };
-        let metadata_handle = MetadataHandle::new(
+        let graph_handle = aruna_graph::GraphHandle::open(
             metadata_dir.path(),
             node_id,
-            storage_handle.clone(),
             None,
             None,
-            None,
+            aruna_graph::GraphOptions::default(),
         )
         .unwrap();
+        storage_handle.install_metadata_indexes(metadata_dir.path());
         let mut context = test_context(storage_handle);
         context.net_handle = Some(net);
-        context.metadata_handle = Some(metadata_handle);
+        context.graph_handle = Some(graph_handle);
         context.task_handle = Some(TaskHandle::new());
         let driver_ctx = Arc::new(context);
         let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
@@ -1147,7 +1190,10 @@ mod authorization_tests {
 
     fn stranger(fixture: &Fixture) -> AuthContext {
         AuthContext {
-            user_id: aruna_core::UserId::local(Ulid::from_parts(5, 5), fixture.auth.realm_id),
+            user_id: aruna_core::user::id::UserId::local(
+                Ulid::from_parts(5, 5),
+                fixture.auth.realm_id,
+            ),
             realm_id: fixture.auth.realm_id,
             path_restrictions: None,
             session: None,
@@ -1156,22 +1202,20 @@ mod authorization_tests {
 
     async fn drain_metadata_background(state: &ServerState) {
         let ctx = state.get_ctx();
-        let drained = aruna_operations::metadata::projector::drain_projection_queue(ctx.as_ref())
+        let drained = aruna_test_support::projection::drain_projection_queue(ctx.as_ref())
             .await
             .unwrap();
         if drained.markers_examined == 0 {
-            aruna_operations::metadata::projector::replay_event_log(ctx.as_ref())
+            aruna_test_support::projection::replay_event_log(ctx.as_ref())
                 .await
                 .unwrap();
         }
-        aruna_operations::metadata::materialization_queue::process_materialization_batch(
-            ctx.as_ref(),
-        )
-        .await
-        .unwrap();
+        aruna_test_support::metadata::process_materialization_batch(ctx.as_ref())
+            .await
+            .unwrap();
         // A text search sees only committed index updates.
-        let handle = ctx.metadata_handle.as_ref().unwrap();
-        handle.flush_search_updates().await.unwrap();
+        let graph = ctx.graph_handle.as_ref().unwrap();
+        graph.flush_search_updates().await.unwrap();
     }
 
     fn draft_crate(name: &str) -> Value {

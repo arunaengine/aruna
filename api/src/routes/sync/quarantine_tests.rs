@@ -3,24 +3,27 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::NodeId;
-use aruna_core::UserId;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
 use aruna_core::effects::StorageEffect;
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{
+use aruna_core::structs::sync_quarantine::{
     SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineInput, SyncQuarantineUsage,
     build_quarantine_entries, quarantine_usage_entry,
 };
-use aruna_operations::driver::{DriverContext, drive};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_storage::storage::FjallStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use axum::http::StatusCode;
 use ulid::Ulid;
 
 struct Fixture {
@@ -37,9 +40,10 @@ async fn setup() -> Fixture {
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[31u8; 32])
@@ -80,7 +84,7 @@ async fn setup() -> Fixture {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -154,7 +158,7 @@ async fn admin_lists_records() {
 
     let (_, Json(page)) = list_quarantine(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        UnrestrictedAuth(fx.admin.clone()),
         Query(QuarantineQuery {
             cursor: None,
             topic: None,
@@ -170,7 +174,7 @@ async fn admin_lists_records() {
 
     let (_, Json(inspected)) = inspect_quarantine(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        UnrestrictedAuth(fx.admin.clone()),
         Path(page.records[0].id.clone()),
     )
     .await
@@ -185,7 +189,7 @@ async fn admin_acknowledges_row() {
     seed_rows(&fx, 2).await;
     let (_, Json(page)) = list_quarantine(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        UnrestrictedAuth(fx.admin.clone()),
         Query(QuarantineQuery::default()),
     )
     .await
@@ -195,7 +199,7 @@ async fn admin_acknowledges_row() {
     for _ in 0..2 {
         let (_, Json(record)) = acknowledge_quarantine(
             State(fx.state.clone()),
-            Extension(Some(fx.admin.clone())),
+            UnrestrictedAuth(fx.admin.clone()),
             Path(id.clone()),
         )
         .await
@@ -205,7 +209,7 @@ async fn admin_acknowledges_row() {
 
     let (_, Json(pruned)) = prune_quarantine(
         State(fx.state.clone()),
-        Extension(Some(fx.admin.clone())),
+        UnrestrictedAuth(fx.admin.clone()),
         Query(QuarantineQuery::default()),
     )
     .await
@@ -221,31 +225,9 @@ async fn admin_acknowledges_row() {
 #[tokio::test]
 async fn anonymous_is_rejected() {
     let fx = setup().await;
-    for result in [
-        list_quarantine(
-            State(fx.state.clone()),
-            Extension(None),
-            Query(QuarantineQuery::default()),
-        )
-        .await
-        .err(),
-        prune_quarantine(
-            State(fx.state.clone()),
-            Extension(None),
-            Query(QuarantineQuery::default()),
-        )
-        .await
-        .err(),
-    ] {
-        assert!(matches!(result, Some(ServerError::Unauthorized)));
-    }
-    let inspected = inspect_quarantine(
-        State(fx.state.clone()),
-        Extension(None),
-        Path("00".to_string()),
-    )
-    .await;
-    assert!(matches!(inspected, Err(ServerError::Unauthorized)));
+    // The list, prune and inspect routes take `UnrestrictedAuth`; the refusal is the extractor's.
+    let result = extract::<UnrestrictedAuth>(&fx.state, None).await;
+    assert_eq!(result.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -260,7 +242,7 @@ async fn stranger_is_rejected() {
     };
     let listed = list_quarantine(
         State(fx.state.clone()),
-        Extension(Some(stranger.clone())),
+        UnrestrictedAuth(stranger.clone()),
         Query(QuarantineQuery::default()),
     )
     .await;
@@ -268,7 +250,7 @@ async fn stranger_is_rejected() {
 
     let acknowledged = acknowledge_quarantine(
         State(fx.state.clone()),
-        Extension(Some(stranger)),
+        UnrestrictedAuth(stranger),
         Path("00".to_string()),
     )
     .await;
@@ -284,11 +266,7 @@ async fn restricted_token_rejected() {
         path_restrictions: Some(Vec::new()),
         session: None,
     };
-    let listed = list_quarantine(
-        State(fx.state.clone()),
-        Extension(Some(delegated)),
-        Query(QuarantineQuery::default()),
-    )
-    .await;
+    // `list_quarantine` takes `UnrestrictedAuth`, so the refusal is its check.
+    let listed = crate::auth::require_unrestricted_auth(&fx.state, Some(delegated));
     assert!(matches!(listed, Err(ServerError::Forbidden)));
 }

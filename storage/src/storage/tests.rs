@@ -2,8 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::handle::StorageHandle;
+use super::persistence::FjallPersistPolicy;
 use super::tests_rebuild::{first_dropped, seal_journal};
-use super::{FjallPersistPolicy, FjallStorage, StorageHandle};
+use super::worker::FjallStorage;
 use aruna_core::effects::{Effect, IterStart, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use ulid::Ulid;
 
-fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
+fn small_handle(capacity: usize) -> (StorageHandle, super::handle::StorageReceivers) {
     let (sender, foreground) = crossfire::mpsc::bounded_blocking(capacity);
     let (bulk_sender, bulk) = crossfire::mpsc::bounded_blocking(capacity);
     let handle = StorageHandle {
@@ -28,7 +30,7 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
         write_channel: sender,
         bulk_channel: bulk_sender,
         priority: StoragePriority::Foreground,
-        metrics: std::sync::Arc::new(super::StorageMetrics::default()),
+        metrics: std::sync::Arc::new(super::metrics::StorageMetrics::default()),
         transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::new(),
         )),
@@ -36,8 +38,11 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::StorageReceivers) {
         secret_key: std::sync::Arc::new(std::sync::OnceLock::new()),
         vault_key: std::sync::Arc::new(std::sync::OnceLock::new()),
         database: std::sync::Arc::new(std::sync::OnceLock::new()),
+        realm_keys: std::sync::Arc::new(std::sync::OnceLock::new()),
+        range_indexes: std::sync::Arc::new(std::sync::OnceLock::new()),
+        policies: std::sync::Arc::new(super::policies::PolicyPrograms::default()),
     };
-    (handle, super::StorageReceivers { foreground, bulk })
+    (handle, super::handle::StorageReceivers { foreground, bulk })
 }
 
 fn cleanup_write() -> StorageEffect {
@@ -62,9 +67,9 @@ fn foreground_precedes_bulk() {
     let mut keep = Vec::new();
     for key_space in ["b1", "b2", "b3"] {
         let effect = read(key_space);
-        let (tx, rx) = super::response_channel(super::ResponseToken::empty());
-        let span = super::storage_effect_span(&effect);
-        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        let (tx, rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+        let span = super::telemetry::storage_effect_span(&effect);
+        let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
         assert!(
             handle
                 .bulk_channel
@@ -75,9 +80,9 @@ fn foreground_precedes_bulk() {
         keep.push(rx);
     }
     let effect = read("fg");
-    let (tx, rx) = super::response_channel(super::ResponseToken::empty());
-    let span = super::storage_effect_span(&effect);
-    let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+    let (tx, rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+    let span = super::telemetry::storage_effect_span(&effect);
+    let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
     assert!(
         handle
             .write_channel
@@ -87,10 +92,10 @@ fn foreground_precedes_bulk() {
     );
     keep.push(rx);
 
-    let mut lanes = super::LaneScheduler::default();
+    let mut lanes = super::worker::LaneScheduler::default();
     let (first, priority) = lanes.next(&receivers).expect("first item");
     assert_eq!(priority, StoragePriority::Foreground);
-    assert_eq!(super::effect_keyspace(&first.0), Some("fg"));
+    assert_eq!(super::worker::effect_keyspace(&first.0), Some("fg"));
     for _ in 0..3 {
         let (_, priority) = lanes.next(&receivers).expect("bulk item");
         assert_eq!(priority, StoragePriority::Bulk);
@@ -108,11 +113,11 @@ fn bulk_keeps_share() {
         txn_id: None,
     };
     let mut keep = Vec::new();
-    let mut enqueue = |channel: &super::EffectSender, key_space: &str| {
+    let mut enqueue = |channel: &super::handle::EffectSender, key_space: &str| {
         let effect = read(key_space);
-        let (tx, rx) = super::response_channel(super::ResponseToken::empty());
-        let span = super::storage_effect_span(&effect);
-        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        let (tx, rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+        let span = super::telemetry::storage_effect_span(&effect);
+        let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
         assert!(
             channel
                 .try_send((effect, tx, span, Instant::now(), in_flight))
@@ -121,8 +126,8 @@ fn bulk_keeps_share() {
         );
         keep.push(rx);
     };
-    let batch = super::MAX_GROUP_COMMIT;
-    let expected_bulk = batch / super::FOREGROUND_PER_BULK;
+    let batch = super::worker::MAX_GROUP_COMMIT;
+    let expected_bulk = batch / super::worker::FOREGROUND_PER_BULK;
     for _ in 0..batch {
         enqueue(&handle.write_channel, "fg");
     }
@@ -130,7 +135,7 @@ fn bulk_keeps_share() {
         enqueue(&handle.bulk_channel, "bulk");
     }
 
-    let mut lanes = super::LaneScheduler::default();
+    let mut lanes = super::worker::LaneScheduler::default();
     let (_, priority) = lanes.next(&receivers).expect("first item");
     assert_eq!(priority, StoragePriority::Foreground);
     // The actor drains the rest of the foreground queue as one batch.
@@ -162,9 +167,9 @@ fn abort_routes_foreground() {
             key: b"k".to_vec().into(),
             txn_id: None,
         };
-        let (tx, rx) = super::response_channel(super::ResponseToken::empty());
-        let span = super::storage_effect_span(&effect);
-        let in_flight = super::InFlightGuard::acquire(&handle.metrics);
+        let (tx, rx) = super::handle::response_channel(super::handle::ResponseToken::empty());
+        let span = super::telemetry::storage_effect_span(&effect);
+        let in_flight = super::metrics::InFlightGuard::acquire(&handle.metrics);
         if handle
             .bulk_channel
             .try_send((effect, tx, span, Instant::now(), in_flight))
@@ -201,9 +206,10 @@ async fn cleanup_waits_space() {
         key: b"filler".to_vec().into(),
         txn_id: None,
     };
-    let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
-    let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
+    let filler_span = super::telemetry::storage_effect_span(&filler);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -215,10 +221,10 @@ async fn cleanup_waits_space() {
         async move { handle.send_storage_effect(cleanup_write()).await }
     });
     let (effect, ..) = receiver.recv().await.expect("filler effect");
-    assert!(!super::is_cleanup_write(&effect));
+    assert!(!super::handle::is_cleanup_write(&effect));
     assert!(handle.transaction_cleanup.try_lock().is_ok());
     let (effect, response_tx, ..) = receiver.recv().await.expect("cleanup effect");
-    assert!(super::is_cleanup_write(&effect));
+    assert!(super::handle::is_cleanup_write(&effect));
     assert!(response_tx.send(StorageEvent::WriteResult {
         key: b"cleanup".to_vec().into(),
     }));
@@ -237,9 +243,10 @@ async fn ordinary_write_full() {
         key: b"filler".to_vec().into(),
         txn_id: None,
     };
-    let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
-    let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
+    let filler_span = super::telemetry::storage_effect_span(&filler);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -319,20 +326,21 @@ fn bulk_full_rejects() {
         .open()
         .unwrap();
     let (bulk_sender, _bulk_receiver) = crossfire::mpmc::bounded_blocking(1);
-    let mut storage = super::FjallStorage {
-        store: super::Store::new(db),
+    let mut storage = super::worker::FjallStorage {
+        store: super::worker::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::new(),
         transaction_cleanup: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::new(),
         )),
-        metrics: std::sync::Arc::new(super::StorageMetrics::default()),
+        metrics: std::sync::Arc::new(super::metrics::StorageMetrics::default()),
         read_pool: crossfire::mpmc::bounded_blocking(1).0,
         bulk_read_pool: bulk_sender,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -340,7 +348,7 @@ fn bulk_full_rejects() {
         usage_views: std::collections::HashSet::new(),
         txn_rows: std::collections::HashMap::new(),
     };
-    let metrics = std::sync::Arc::new(super::StorageMetrics::default());
+    let metrics = std::sync::Arc::new(super::metrics::StorageMetrics::default());
     let read_effect = || StorageEffect::Read {
         key_space: "node_state".to_string(),
         key: b"missing".to_vec().into(),
@@ -348,9 +356,10 @@ fn bulk_full_rejects() {
     };
 
     let filler = read_effect();
-    let span = super::storage_effect_span(&filler);
-    let guard = super::InFlightGuard::acquire(&metrics);
-    let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
+    let span = super::telemetry::storage_effect_span(&filler);
+    let guard = super::metrics::InFlightGuard::acquire(&metrics);
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
     assert!(
         storage
             .bulk_read_pool
@@ -360,10 +369,11 @@ fn bulk_full_rejects() {
     );
 
     let target = read_effect();
-    let span = super::storage_effect_span(&target);
-    let guard = super::InFlightGuard::acquire(&metrics);
-    let (target_tx, mut target_rx) = super::response_channel(super::ResponseToken::empty());
-    let mut slow = super::SlowQueueAggregator::default();
+    let span = super::telemetry::storage_effect_span(&target);
+    let guard = super::metrics::InFlightGuard::acquire(&metrics);
+    let (target_tx, mut target_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
+    let mut slow = super::worker::SlowQueueAggregator::default();
     storage.forward_read(
         ((target, target_tx, span, Instant::now(), guard), None),
         StoragePriority::Bulk,
@@ -557,6 +567,9 @@ fn worker_exit_latches() {
         secret_key: _,
         vault_key: _,
         database: _,
+        realm_keys: _,
+        range_indexes: _,
+        policies: _,
     } = handle;
 
     assert!(!metrics.channel_closed.load(Ordering::Relaxed));
@@ -692,11 +705,11 @@ pub(super) fn worker(dir: &tempfile::TempDir, handle: &StorageHandle) -> FjallSt
         .open()
         .expect("database opens");
     FjallStorage::new(
-        super::Store::new(db),
+        super::worker::Store::new(db),
         FjallPersistPolicy::default(),
         handle,
-        super::READ_POOL_THREADS,
-        super::BULK_POOL_THREADS,
+        super::worker::READ_POOL_THREADS,
+        super::worker::BULK_POOL_THREADS,
     )
 }
 
@@ -717,9 +730,9 @@ fn keyed_read(key: &str) -> StorageEffect {
     }
 }
 
-fn serve_next(storage: &mut FjallStorage, receiver: &super::EffectReceiver) {
+fn serve_next(storage: &mut FjallStorage, receiver: &super::handle::EffectReceiver) {
     let item = receiver.recv().expect("effect stays queued");
-    storage.process_single(item, &mut super::SlowQueueAggregator::default());
+    storage.process_single(item, &mut super::worker::SlowQueueAggregator::default());
 }
 
 /// Polls a dispatch once: the effect is enqueued and still awaiting a reply.
@@ -873,7 +886,7 @@ async fn fence_aborts_txns() {
 
 async fn started_txn(
     handle: &StorageHandle,
-    receivers: &super::StorageReceivers,
+    receivers: &super::handle::StorageReceivers,
     storage: &mut FjallStorage,
 ) -> Ulid {
     let mut started =
@@ -958,9 +971,10 @@ async fn deferred_respects_fence() {
     let (handle, receivers) = small_handle(1);
     let mut storage = worker(&dir, &handle);
     let filler = keyed_read("filler");
-    let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
-    let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
+    let filler_span = super::telemetry::storage_effect_span(&filler);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -977,9 +991,9 @@ async fn deferred_respects_fence() {
     let receiver = receivers.foreground.into_async();
     drop(receiver.recv().await.expect("filler effect"));
     let item = receiver.recv().await.expect("cleanup effect");
-    assert!(super::is_cleanup_write(&item.0));
+    assert!(super::handle::is_cleanup_write(&item.0));
     handle.fence_mutations();
-    storage.process_single(item, &mut super::SlowQueueAggregator::default());
+    storage.process_single(item, &mut super::worker::SlowQueueAggregator::default());
 
     assert!(matches!(
         waiter.await.expect("cleanup sender"),
@@ -1009,13 +1023,7 @@ async fn sync_surfaces_errors() {
 }
 
 pub(super) async fn start_write_transaction(handle: &StorageHandle) -> Ulid {
-    match handle
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
-        other => panic!("unexpected storage event: {other:?}"),
-    }
+    handle.begin_write().await
 }
 
 #[tokio::test]
@@ -1043,8 +1051,8 @@ async fn abort_fence() {
     let txn_id = Ulid::from_parts(1, 1);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::CommitUnknown,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::CommitUnknown,
             attempts: 0,
             queued: false,
         },
@@ -1068,13 +1076,13 @@ fn unknown_open_keeps() {
     let txn_id = Ulid::from_parts(1, 5);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
     );
-    let mut owner = super::TransactionOwner::new(handle, txn_id);
+    let mut owner = super::owner::TransactionOwner::new(handle, txn_id);
 
     owner.unknown();
     assert_eq!(owner.id(), Some(txn_id));
@@ -1097,8 +1105,8 @@ async fn disconnected_clears_open() {
     let txn_id = Ulid::from_parts(1, 2);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
@@ -1122,19 +1130,19 @@ fn delivery_aborts_start() {
     let txn_id = Ulid::from_parts(1, 3);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
     );
     let effect = StorageEffect::StartTransaction { read: true };
-    let token = super::ResponseToken::new(&handle, &effect);
-    let (response_tx, response_rx) = super::response_channel(token);
+    let token = super::handle::ResponseToken::new(&handle, &effect);
+    let (response_tx, response_rx) = super::handle::response_channel(token);
     assert!(!response_tx.is_closed());
     drop(response_rx);
 
-    super::FjallStorage::deliver_response(
+    super::worker::FjallStorage::deliver_response(
         response_tx,
         StorageEvent::TransactionStarted { txn_id },
         "start_transaction",
@@ -1151,8 +1159,8 @@ fn delivery_aborts_start() {
     ));
     assert!(matches!(
         handle.transaction_cleanup.lock().unwrap().get(&txn_id),
-        Some(super::CleanupEntry {
-            kind: super::CleanupKind::Abort,
+        Some(super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Abort,
             ..
         })
     ));
@@ -1164,20 +1172,23 @@ fn delivery_finishes_commit() {
     let txn_id = Ulid::from_parts(1, 4);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::CommitQueued,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::CommitQueued,
             attempts: 0,
             queued: false,
         },
     );
     let effect = StorageEffect::CommitTransaction { txn_id };
-    let token = super::ResponseToken::new(&handle, &effect);
-    let (response_tx, response_rx) = super::response_channel(token);
+    let token = super::handle::ResponseToken::new(&handle, &effect);
+    let (response_tx, response_rx) = super::handle::response_channel(token);
     drop(response_rx);
 
-    super::FjallStorage::deliver_response(
+    super::worker::FjallStorage::deliver_response(
         response_tx,
-        StorageEvent::TransactionCommitted { txn_id },
+        StorageEvent::TransactionCommitted {
+            txn_id,
+            sequence: 1,
+        },
         "commit_transaction",
         "transaction_committed",
     );
@@ -1191,8 +1202,8 @@ fn token_aborts_write() {
     let txn_id = Ulid::from_parts(1, 6);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
@@ -1204,7 +1215,7 @@ fn token_aborts_write() {
         txn_id: Some(txn_id),
     };
 
-    drop(super::ResponseToken::new(&handle, &effect));
+    drop(super::handle::ResponseToken::new(&handle, &effect));
 
     let (effect, ..) = receivers
         .foreground
@@ -1222,15 +1233,15 @@ fn commit_aborts_open() {
     let txn_id = Ulid::from_parts(1, 7);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
     );
     let effect = StorageEffect::CommitTransaction { txn_id };
 
-    drop(super::ResponseToken::new(&handle, &effect));
+    drop(super::handle::ResponseToken::new(&handle, &effect));
 
     let (effect, ..) = receivers
         .foreground
@@ -1248,19 +1259,24 @@ fn duplicate_commit_safe() {
     let mut pending = std::collections::BTreeMap::new();
     pending.insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::CommitUnknown,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::CommitUnknown,
             attempts: 0,
             queued: false,
         },
     );
 
     assert!(
-        super::reserve_cleanup(&mut pending, txn_id, super::CleanupKind::CommitQueued).is_err()
+        super::handle::reserve_cleanup(
+            &mut pending,
+            txn_id,
+            super::handle::CleanupKind::CommitQueued
+        )
+        .is_err()
     );
     assert!(matches!(
         pending.get(&txn_id).map(|entry| entry.kind),
-        Some(super::CleanupKind::CommitUnknown)
+        Some(super::handle::CleanupKind::CommitUnknown)
     ));
 }
 
@@ -1268,11 +1284,11 @@ fn duplicate_commit_safe() {
 fn cleanup_cap_distinct() {
     // Capacity exhaustion is not a conflict, so retry loops must not spin on it.
     let mut pending = std::collections::BTreeMap::new();
-    for index in 0..super::MAX_TRANSACTION_CLEANUP {
+    for index in 0..super::handle::MAX_TRANSACTION_CLEANUP {
         pending.insert(
             Ulid::from_parts(index as u64, 0),
-            super::CleanupEntry {
-                kind: super::CleanupKind::Open,
+            super::handle::CleanupEntry {
+                kind: super::handle::CleanupKind::Open,
                 attempts: 0,
                 queued: false,
             },
@@ -1280,10 +1296,10 @@ fn cleanup_cap_distinct() {
     }
 
     assert!(matches!(
-        super::reserve_cleanup(
+        super::handle::reserve_cleanup(
             &mut pending,
             Ulid::from_parts(u64::MAX, 0),
-            super::CleanupKind::Abort,
+            super::handle::CleanupKind::Abort,
         ),
         Err(StorageError::CleanupCapacity)
     ));
@@ -1302,27 +1318,28 @@ fn unknown_commit_runs() {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::CommitUnknown,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::CommitUnknown,
             attempts: 0,
             queued: false,
         },
     );
-    let mut storage = super::FjallStorage {
-        store: super::Store::new(db),
+    let mut storage = super::worker::FjallStorage {
+        store: super::worker::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::from([(
             txn_id,
-            super::Txn::Write(std::sync::Arc::new(txn)),
+            super::worker::Txn::Write(std::sync::Arc::new(txn)),
         )]),
         transaction_cleanup,
-        metrics: std::sync::Arc::new(super::StorageMetrics::default()),
+        metrics: std::sync::Arc::new(super::metrics::StorageMetrics::default()),
         read_pool: crossfire::mpmc::bounded_blocking(1).0,
         bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1334,11 +1351,17 @@ fn unknown_commit_runs() {
     let event = storage.commit_transaction(txn_id);
     assert!(matches!(
         &event,
-        StorageEvent::TransactionCommitted { txn_id: committed } if *committed == txn_id
+        StorageEvent::TransactionCommitted {
+            txn_id: committed,
+            sequence: 1,
+        } if *committed == txn_id
     ));
     assert!(storage.txns.is_empty());
-    assert!(storage.observe_cleanup(Some((txn_id, super::CleanupKind::CommitQueued)), &event));
-    super::finish_cleanup(&storage.transaction_cleanup, txn_id);
+    assert!(storage.observe_cleanup(
+        Some((txn_id, super::handle::CleanupKind::CommitQueued)),
+        &event
+    ));
+    super::handle::finish_cleanup(&storage.transaction_cleanup, txn_id);
     assert!(storage.transaction_cleanup.lock().unwrap().is_empty());
 }
 
@@ -1356,24 +1379,25 @@ fn unknown_commit_retires() {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::CommitUnknown,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::CommitUnknown,
             attempts: 0,
             queued: false,
         },
     );
-    let mut storage = super::FjallStorage {
-        store: super::Store::new(db),
+    let mut storage = super::worker::FjallStorage {
+        store: super::worker::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::new(),
         transaction_cleanup,
-        metrics: std::sync::Arc::new(super::StorageMetrics::default()),
+        metrics: std::sync::Arc::new(super::metrics::StorageMetrics::default()),
         read_pool: crossfire::mpmc::bounded_blocking(1).0,
         bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1382,7 +1406,7 @@ fn unknown_commit_retires() {
         txn_rows: std::collections::HashMap::new(),
     };
 
-    for _ in 0..=super::MAX_CLEANUP_ATTEMPTS {
+    for _ in 0..=super::handle::MAX_CLEANUP_ATTEMPTS {
         storage.retry_cleanup();
     }
 
@@ -1404,27 +1428,28 @@ fn retry_skips_queued() {
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
     transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Abort,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Abort,
             attempts: 0,
             queued: true,
         },
     );
-    let mut storage = super::FjallStorage {
-        store: super::Store::new(db),
+    let mut storage = super::worker::FjallStorage {
+        store: super::worker::Store::new(db),
         persist_policy: FjallPersistPolicy::default(),
         txns: std::collections::HashMap::from([(
             txn_id,
-            super::Txn::Write(std::sync::Arc::new(txn)),
+            super::worker::Txn::Write(std::sync::Arc::new(txn)),
         )]),
         transaction_cleanup,
-        metrics: std::sync::Arc::new(super::StorageMetrics::default()),
+        metrics: std::sync::Arc::new(super::metrics::StorageMetrics::default()),
         read_pool: crossfire::mpmc::bounded_blocking(1).0,
         bulk_read_pool: crossfire::mpmc::bounded_blocking(1).0,
         pool_threads: Vec::new(),
         compactor: crate::compaction::Compactor::idle(),
         deletes: std::collections::HashMap::new(),
         swept: 0,
+        commits: 0,
         txn_deletes: std::collections::HashMap::new(),
         txn_usage: std::collections::HashMap::new(),
         config_txns: std::collections::HashSet::new(),
@@ -1453,8 +1478,8 @@ fn handoff_marks_queued() {
     let txn_id = Ulid::from_parts(1, 8);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
@@ -1477,14 +1502,24 @@ fn queued_commit_fences() {
     let mut pending = std::collections::BTreeMap::new();
     pending.insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
     );
-    assert!(super::reserve_cleanup(&mut pending, txn_id, super::CleanupKind::CommitQueued).is_ok());
-    assert!(super::reserve_cleanup(&mut pending, txn_id, super::CleanupKind::Abort).is_err());
+    assert!(
+        super::handle::reserve_cleanup(
+            &mut pending,
+            txn_id,
+            super::handle::CleanupKind::CommitQueued
+        )
+        .is_ok()
+    );
+    assert!(
+        super::handle::reserve_cleanup(&mut pending, txn_id, super::handle::CleanupKind::Abort)
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1495,8 +1530,8 @@ async fn commit_full_aborts() {
     let txn_id = Ulid::from_parts(1, 9);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Open,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Open,
             attempts: 0,
             queued: false,
         },
@@ -1506,9 +1541,10 @@ async fn commit_full_aborts() {
         key: b"filler".to_vec().into(),
         txn_id: None,
     };
-    let (filler_tx, _filler_rx) = super::response_channel(super::ResponseToken::empty());
-    let filler_span = super::storage_effect_span(&filler);
-    let filler_guard = super::InFlightGuard::acquire(&handle.metrics);
+    let (filler_tx, _filler_rx) =
+        super::handle::response_channel(super::handle::ResponseToken::empty());
+    let filler_span = super::telemetry::storage_effect_span(&filler);
+    let filler_guard = super::metrics::InFlightGuard::acquire(&handle.metrics);
     handle
         .write_channel
         .try_send((filler, filler_tx, filler_span, Instant::now(), filler_guard))
@@ -1537,14 +1573,14 @@ fn dropped_commit_unknown() {
     let txn_id = Ulid::from_parts(1, 10);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::CommitQueued,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::CommitQueued,
             attempts: 0,
             queued: true,
         },
     );
 
-    drop(super::ResponseToken::new(
+    drop(super::handle::ResponseToken::new(
         &handle,
         &StorageEffect::CommitTransaction { txn_id },
     ));
@@ -1561,8 +1597,8 @@ fn terminal_entry_frees() {
     let txn_id = Ulid::from_parts(1, 11);
     handle.transaction_cleanup.lock().unwrap().insert(
         txn_id,
-        super::CleanupEntry {
-            kind: super::CleanupKind::Committed,
+        super::handle::CleanupEntry {
+            kind: super::handle::CleanupKind::Committed(1),
             attempts: 0,
             queued: false,
         },
@@ -1578,8 +1614,8 @@ fn terminal_entry_frees() {
 async fn transaction_cap() {
     let dir = tempdir().unwrap();
     let handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
-    let mut owners = Vec::with_capacity(super::MAX_TRANSACTION_CLEANUP);
-    for _ in 0..super::MAX_TRANSACTION_CLEANUP {
+    let mut owners = Vec::with_capacity(super::handle::MAX_TRANSACTION_CLEANUP);
+    for _ in 0..super::handle::MAX_TRANSACTION_CLEANUP {
         let owner = handle.start_transaction(true).await.unwrap();
         owners.push(owner);
     }
@@ -1612,7 +1648,9 @@ pub(super) async fn commit_transaction(handle: &StorageHandle, txn_id: Ulid) {
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }) => {
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: committed, ..
+        }) => {
             assert_eq!(committed, txn_id);
         }
         other => panic!("unexpected storage event: {other:?}"),
@@ -2176,7 +2214,9 @@ async fn write_during_transaction() {
         .send_storage_effect(StorageEffect::CommitTransaction { txn_id })
         .await
     {
-        Event::Storage(StorageEvent::TransactionCommitted { txn_id: committed }) => {
+        Event::Storage(StorageEvent::TransactionCommitted {
+            txn_id: committed, ..
+        }) => {
             assert_eq!(committed, txn_id);
         }
         other => panic!("unexpected storage event: {other:?}"),
@@ -2211,7 +2251,7 @@ async fn request_metrics_count() {
     assert!(matches!(event, Event::Storage(StorageEvent::Error { .. })));
     assert_eq!(
         handle.snapshot_metrics(),
-        super::StorageMetricsSnapshot {
+        super::metrics::StorageMetricsSnapshot {
             requests_total: 1,
             errors_total: 1,
             conflicts_total: 0,
@@ -2405,6 +2445,26 @@ fn commit_counts_deletes() {
 
     storage.process_effect(StorageEffect::CommitTransaction { txn_id });
     assert_eq!(storage.deletes.get("dht_meta_v2").copied(), Some(1));
+}
+
+#[test]
+fn commits_numbered() {
+    let dir = tempdir().unwrap();
+    let (handle, _receivers) = StorageHandle::new();
+    let mut storage = worker(&dir, &handle);
+    let mut commit = |read: bool| {
+        let StorageEvent::TransactionStarted { txn_id } =
+            storage.process_effect(StorageEffect::StartTransaction { read })
+        else {
+            panic!("transaction starts");
+        };
+        match storage.process_effect(StorageEffect::CommitTransaction { txn_id }) {
+            StorageEvent::TransactionCommitted { sequence, .. } => sequence,
+            other => panic!("the commit failed: {other:?}"),
+        }
+    };
+    // Write commits take the next number; a read-only one answers the last write commit.
+    assert_eq!([commit(false), commit(false), commit(true)], [1, 2, 2]);
 }
 
 #[test]
@@ -2678,11 +2738,9 @@ async fn sweep_drops_journals() {
         drained.remove(key).unwrap();
         drained.rotate_memtable_and_wait().unwrap();
     }
-    let cap = Instant::now() + Duration::from_secs(120);
-    while drained.table_count() > 0 {
-        assert!(Instant::now() < cap, "the keyspace never compacts away");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    let empty = async || (drained.table_count() == 0).then_some(());
+    let compacted = aruna_clock::testing::poll_until(Duration::from_secs(120), empty).await;
+    assert!(compacted.is_some(), "the keyspace never compacts away");
     pending.inner().rotate_memtable_and_wait().unwrap();
     storage.compactor.sweep(db.clone());
     (jobs.try_recv().expect("sweep is queued").run)().unwrap();

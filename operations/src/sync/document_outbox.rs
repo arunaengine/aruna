@@ -1,422 +1,309 @@
-//! Builds sync outbox keys and records and schedules drains of pending publishes.
+//! Reads, deletes and retimes the document sync outbox records waiting for publication.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::time::Duration;
 
-use aruna_core::NodeId;
-use aruna_core::admin_documents::AdminDocumentOperation;
-use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
-use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::DocumentOutboxRecord;
+use aruna_core::document_apply::{ApplyError, Step};
+use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
-use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::row_plan::{NeedsRows, PlanRows, PlanStop, Planned, RowPlan};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::time::unix_timestamp_secs;
-use aruna_core::types::{Key, TxnId, Value};
-use aruna_storage::StorageHandle;
-use aruna_tasks::TaskHandle;
+use aruna_core::types::{Key, KeySpace};
 use byteview::ByteView;
 use tracing::warn;
-use ulid::Ulid;
 
-// Size one drain for several full topic batches; every grouped peer receives every topic.
-pub const OUTBOX_DRAIN_SIZE: usize = 4 * aruna_net::document_sync::BATCH_TOPIC_LIMIT;
-const ADMIN_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/admin-operation/";
-const DELETE_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/delete/";
-const UPSERT_OUTBOX_PREFIX: &[u8] = b"document-sync-outbox-v1/upsert/";
+use crate::sync::outbox::record::{
+    ADMIN_OUTBOX_PREFIX, outbox_stream_prefixes, revocation_index_key,
+};
 
-pub(crate) fn outbox_stream_prefixes() -> [&'static [u8]; 3] {
-    [
-        ADMIN_OUTBOX_PREFIX,
-        DELETE_OUTBOX_PREFIX,
-        UPSERT_OUTBOX_PREFIX,
-    ]
+/// One stored outbox record; a row that does not decode is an error.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReadOutboxPlan {
+    pub key: Vec<u8>,
 }
 
-// Sort by kind and ULID; admin records also sort by origin sequence to preserve FIFO order.
-pub fn outbox_prefix(event: &DocumentOutboxEvent) -> Key {
-    let mut bytes = b"document-sync-outbox-v1/".to_vec();
-    bytes.extend_from_slice(event.kind());
-    bytes.push(b'/');
-    ByteView::from(bytes)
-}
+impl RowPlan for ReadOutboxPlan {
+    type Output = Option<DocumentOutboxRecord>;
+    type Error = ApplyError;
 
-pub fn admin_outbox_prefix(node_id: NodeId) -> Key {
-    let mut bytes = ADMIN_OUTBOX_PREFIX.to_vec();
-    bytes.extend_from_slice(node_id.as_bytes());
-    ByteView::from(bytes)
-}
-
-pub fn outbox_key(record: &DocumentOutboxRecord) -> Key {
-    let mut bytes = outbox_prefix(&record.event).to_vec();
-    if let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event {
-        bytes.extend_from_slice(event.origin_node_id.as_bytes());
-        bytes.extend_from_slice(&event.origin_seq.to_be_bytes());
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<Self::Output>> {
+        let record = rows
+            .read(SYNC_OUTBOX_KEYSPACE, self.key.clone())?
+            .map(|bytes| postcard::from_bytes::<DocumentOutboxRecord>(&bytes))
+            .transpose()
+            .map_err(|error| ApplyError::Failed(error.to_string()))?;
+        Ok(Planned::output(record))
     }
-    bytes.extend_from_slice(&record.outbox_id.to_bytes());
-    // Include the target so one event can enqueue distinct lifecycle and registry publishes.
-    bytes.extend_from_slice(record.target.storage_key().as_ref());
-    ByteView::from(bytes)
-}
 
-pub fn revocation_index_entry(record: &DocumentOutboxRecord) -> (String, Key, Value) {
-    (
-        OUTBOX_INDEX_KEYSPACE.to_string(),
-        outbox_key(record),
-        Value::from(vec![1u8]),
-    )
-}
-
-fn revocation_index_key(record: &DocumentOutboxRecord) -> Option<Key> {
-    let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
-        return None;
-    };
-    matches!(&event.op, AdminDocumentOperation::ConfigTokenRevoked { .. })
-        .then(|| outbox_key(record))
-}
-
-pub fn new_outbox_record(
-    node_id: NodeId,
-    target: DocumentTarget,
-    peers: Vec<NodeId>,
-    event: DocumentOutboxEvent,
-    admin_placement: PlacementRef,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    new_identified_record(
-        Ulid::generate(),
-        node_id,
-        target,
-        peers,
-        event,
-        admin_placement,
-        allow_genesis,
-    )
-}
-
-/// `admin_placement` is only consulted for `AdminOperation` records (which carry
-/// no envelope change); `Upsert`/`Delete` always take their ref from the event's
-/// change so the record and its envelope can never diverge.
-pub fn new_identified_record(
-    outbox_id: Ulid,
-    node_id: NodeId,
-    target: DocumentTarget,
-    mut peers: Vec<NodeId>,
-    event: DocumentOutboxEvent,
-    admin_placement: PlacementRef,
-    allow_genesis: bool,
-) -> DocumentOutboxRecord {
-    crate::sync::shard_placement::sort_node_ids(&mut peers);
-    let placement = match &event {
-        DocumentOutboxEvent::Upsert { change, .. } | DocumentOutboxEvent::Delete { change } => {
-            change.placement
-        }
-        DocumentOutboxEvent::AdminOperation { .. } => admin_placement,
-    };
-    DocumentOutboxRecord {
-        outbox_id,
-        node_id,
-        target,
-        peers,
-        event,
-        placement,
-        // Unfenced by default; a fence-admitted writer stamps its generation.
-        generation: 0,
-        updated_at: unix_timestamp_secs(),
-        allow_genesis,
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::None
     }
 }
 
-pub fn write_outbox_effect(record: &DocumentOutboxRecord) -> Result<Effect, postcard::Error> {
-    write_transaction_effect(record, None)
-}
-
-#[cfg(debug_assertions)]
-fn record_ledger(record: &DocumentOutboxRecord, key: &[u8], value: &[u8]) {
-    use std::io::Write;
-    use std::sync::{Mutex, OnceLock};
-
-    let Some(path) = std::env::var_os("ARUNA_TEST_OUTBOX_LEDGER") else {
-        return;
-    };
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let Ok(_guard) = LOCK.get_or_init(|| Mutex::new(())).lock() else {
-        return;
-    };
-    let key_hash = blake3::hash(key).to_hex();
-    let value_hash = blake3::hash(value).to_hex();
-    let line = format!(
-        "target={:?} key_hash={key_hash} value_hash={value_hash}\n",
-        record.target
-    );
-    let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(std::path::PathBuf::from(path))
-    else {
-        return;
-    };
-    let _ = file.write_all(line.as_bytes());
-}
-
-pub fn outbox_write_entry(
-    record: &DocumentOutboxRecord,
-) -> Result<(String, ByteView, ByteView), postcard::Error> {
-    let key = outbox_key(record);
-    let value = ByteView::from(postcard::to_allocvec(record)?);
-    #[cfg(debug_assertions)]
-    record_ledger(record, key.as_ref(), value.as_ref());
-    Ok((SYNC_OUTBOX_KEYSPACE.to_string(), key, value))
-}
-
-pub fn write_transaction_effect(
-    record: &DocumentOutboxRecord,
-    txn_id: Option<TxnId>,
-) -> Result<Effect, postcard::Error> {
-    let (key_space, key, value) = outbox_write_entry(record)?;
-    Ok(Effect::Storage(StorageEffect::Write {
-        key_space,
-        key,
-        value,
-        txn_id,
-    }))
-}
-
-pub fn schedule_drain_effect() -> Effect {
-    Effect::Task(TaskEffect::ResetTimer {
-        key: TaskKey::DrainSyncOutbox,
-        after: Duration::ZERO,
-    })
-}
-
-pub async fn read_outbox_record(
-    storage: &StorageHandle,
-    key: &[u8],
-) -> Result<Option<DocumentOutboxRecord>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
-            key: ByteView::from(key.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value
-            .map(|bytes| {
-                postcard::from_bytes::<DocumentOutboxRecord>(&bytes)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose(),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
-    }
-}
-
+#[derive(Debug, PartialEq)]
 pub struct OutboxReadBatch {
     pub records: Vec<(Vec<u8>, DocumentOutboxRecord)>,
+    /// The rows the page read, decoded or not; the invocation limits charge them.
+    pub scanned: usize,
     pub has_more: bool,
     pub next_start_after: Option<Vec<u8>>,
 }
 
-pub async fn read_outbox_records(
-    storage: &StorageHandle,
-    prefix: &[u8],
-    start_after: Option<Vec<u8>>,
-    limit: usize,
-) -> Result<OutboxReadBatch, String> {
-    let read_limit = limit.saturating_add(1);
-    match storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
-            prefix: Some(ByteView::from(prefix.to_vec())),
-            start: start_after.map(|key| IterStart::After(ByteView::from(key))),
-            limit: read_limit,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => {
-            let has_more = values.len() > limit;
-            let page: Vec<_> = values.into_iter().take(limit).collect();
-            let next_start_after = page.last().map(|(key, _)| key.to_vec());
-            let mut records = Vec::with_capacity(page.len());
-            for (key, value) in page {
-                match postcard::from_bytes::<DocumentOutboxRecord>(&value) {
-                    Ok(record) => records.push((key.to_vec(), record)),
-                    Err(error) => {
-                        let key = key.to_vec();
-                        warn!(error = %error, key = ?key, "Deleting malformed document sync outbox record");
-                        delete_outbox_records(storage, vec![key]).await?;
-                    }
-                }
-            }
-            Ok(OutboxReadBatch {
-                records,
-                has_more,
-                next_start_after,
-            })
-        }
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
-    }
+/// One page of outbox records; rows that do not decode are deleted on the way.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutboxPagePlan {
+    pub prefix: Vec<u8>,
+    pub start_after: Option<Vec<u8>>,
+    pub limit: usize,
 }
 
-pub async fn read_outbox_tails(storage: &StorageHandle) -> Result<Vec<(Vec<u8>, Vec<u8>)>, String> {
-    let mut tails = Vec::with_capacity(3);
-    for prefix in outbox_stream_prefixes() {
-        match storage
-            .send_storage_effect(StorageEffect::Last {
-                key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
-                prefix: Some(prefix.to_vec().into()),
-                txn_id: None,
-            })
-            .await
-        {
-            Event::Storage(StorageEvent::IterResult { values, .. }) => {
-                if let Some((key, _)) = values.into_iter().next() {
-                    tails.push((prefix.to_vec(), key.to_vec()));
-                }
+impl RowPlan for OutboxPagePlan {
+    type Output = OutboxReadBatch;
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<OutboxReadBatch>> {
+        let values = rows.scan_after(
+            SYNC_OUTBOX_KEYSPACE,
+            Some(ByteView::from(self.prefix.clone())),
+            self.start_after.clone().map(ByteView::from),
+            self.limit.saturating_add(1),
+        )?;
+        let has_more = values.len() > self.limit;
+        let page: Vec<_> = values.into_iter().take(self.limit).collect();
+        let scanned = page.len();
+        let next_start_after = page.last().map(|(key, _)| key.to_vec());
+        let mut records = Vec::with_capacity(page.len());
+        let mut malformed = Vec::new();
+        for (key, value) in page {
+            match postcard::from_bytes::<DocumentOutboxRecord>(&value) {
+                Ok(record) => records.push((key.to_vec(), record)),
+                Err(_) => malformed.push(key.to_vec()),
             }
-            Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-            other => return Err(format!("unexpected outbox tail result: {other:?}")),
         }
-    }
-    Ok(tails)
-}
-
-pub async fn delete_outbox_records(
-    storage: &StorageHandle,
-    keys: Vec<Vec<u8>>,
-) -> Result<(), String> {
-    if keys.is_empty() {
-        return Ok(());
-    }
-    let mut deletes = Vec::with_capacity(keys.len());
-    for key in keys {
-        let index_key = if key.starts_with(ADMIN_OUTBOX_PREFIX) {
-            let value = match storage
-                .send_storage_effect(StorageEffect::Read {
-                    key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
-                    key: ByteView::from(key.clone()),
-                    txn_id: None,
-                })
-                .await
-            {
-                Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-                Event::Storage(StorageEvent::Error { error }) => return Err(error.to_string()),
-                other => return Err(format!("unexpected storage event: {other:?}")),
-            };
-
-            match value {
-                Some(value) => match postcard::from_bytes::<DocumentOutboxRecord>(&value) {
-                    Ok(record) => {
-                        if let Some(index_key) = revocation_index_key(&record) {
-                            if read_index_value(storage, &index_key).await?.is_some() {
-                                Some(index_key)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    }
-                    Err(_) => {
-                        // A malformed value can clear only an existing index row.
-                        let index_key = ByteView::from(key.clone());
-                        if read_index_value(storage, &index_key).await?.is_some() {
-                            Some(index_key)
-                        } else {
-                            None
-                        }
-                    }
-                },
-                None => None,
-            }
-        } else {
-            None
+        let deletes = outbox_deletes(rows, &malformed)?;
+        for key in &malformed {
+            warn!(key = ?key, "Deleting malformed document sync outbox record");
+        }
+        let batch = OutboxReadBatch {
+            records,
+            scanned,
+            has_more,
+            next_start_after,
         };
-
-        let key = ByteView::from(key);
-        deletes.push((SYNC_OUTBOX_KEYSPACE.to_string(), key));
-        if let Some(index_key) = index_key {
-            deletes.push((OUTBOX_INDEX_KEYSPACE.to_string(), index_key));
-        }
+        Ok(Planned::changes(batch, deletes, Vec::new()))
     }
-    match storage
-        .send_storage_effect(StorageEffect::BatchDelete {
-            deletes,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::BatchDeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::None
     }
 }
 
-async fn read_index_value(storage: &StorageHandle, key: &[u8]) -> Result<Option<Value>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: OUTBOX_INDEX_KEYSPACE.to_string(),
-            key: ByteView::from(key.to_vec()),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage event: {other:?}")),
+/// Deletes outbox records with the revocation index row each admin record owns.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DeleteOutboxPlan {
+    pub keys: Vec<Vec<u8>>,
+}
+
+impl RowPlan for DeleteOutboxPlan {
+    type Output = ();
+    type Error = ApplyError;
+
+    fn plan(&self, rows: &mut PlanRows) -> Step<Planned<()>> {
+        let deletes = outbox_deletes(rows, &self.keys)?;
+        Ok(Planned::changes((), deletes, Vec::new()))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::None
     }
 }
 
-pub async fn restore_outbox_timers(storage: &StorageHandle, task_handle: &TaskHandle) {
-    let event = storage
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
-            prefix: None,
-            start: None,
-            limit: 1,
-            txn_id: None,
-        })
-        .await;
+fn outbox_deletes(rows: &mut PlanRows, keys: &[Vec<u8>]) -> Step<Vec<(KeySpace, Key)>> {
+    let mut deletes = Vec::with_capacity(keys.len());
+    let mut waiting = false;
+    for key in keys {
+        match index_row(rows, key) {
+            Ok(index_key) => {
+                deletes.push((
+                    SYNC_OUTBOX_KEYSPACE.to_string(),
+                    ByteView::from(key.clone()),
+                ));
+                deletes.extend(
+                    index_key.map(|index_key| (OUTBOX_INDEX_KEYSPACE.to_string(), index_key)),
+                );
+            }
+            Err(PlanStop::NeedsRows) => waiting = true,
+            Err(stop) => return Err(stop),
+        }
+    }
+    if waiting {
+        return Err(NeedsRows.into());
+    }
+    Ok(deletes)
+}
 
-    let has_records = match event {
-        Event::Storage(StorageEvent::IterResult { values, .. }) => !values.is_empty(),
-        Event::Storage(StorageEvent::Error { error }) => {
-            warn!(error = %error, "Failed to scan document sync outbox");
-            return;
-        }
-        other => {
-            warn!(event = ?other, "Unexpected event while scanning document sync outbox");
-            return;
-        }
+/// The existing index row of an admin record; a malformed value can clear only its own row.
+fn index_row(rows: &mut PlanRows, key: &[u8]) -> Step<Option<Key>> {
+    if !key.starts_with(ADMIN_OUTBOX_PREFIX) {
+        return Ok(None);
+    }
+    let Some(value) = rows.read(SYNC_OUTBOX_KEYSPACE, key.to_vec())? else {
+        return Ok(None);
     };
+    let index_key = match postcard::from_bytes::<DocumentOutboxRecord>(&value) {
+        Ok(record) => revocation_index_key(&record),
+        Err(_) => Some(ByteView::from(key.to_vec())),
+    };
+    let Some(index_key) = index_key else {
+        return Ok(None);
+    };
+    Ok(rows
+        .read(OUTBOX_INDEX_KEYSPACE, index_key.clone())?
+        .map(|_| index_key))
+}
 
-    if has_records {
-        let event = task_handle
-            .schedule_idle_timer(TaskKey::DrainSyncOutbox, Duration::ZERO)
-            .await;
-        if let TaskEvent::Error { message, .. } = event {
-            warn!(message = %message, "Failed to restore document sync outbox timer");
+/// The last key of every outbox stream that holds a record, with the stream's prefix.
+#[derive(Debug, Default, PartialEq)]
+pub struct OutboxTailsOperation {
+    position: usize,
+    tails: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+impl OutboxTailsOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn advance(&mut self) -> Next<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(prefix) = outbox_stream_prefixes().get(self.position).copied() else {
+            return Next::Done(std::mem::take(&mut self.tails));
+        };
+        let last = StorageEffect::Last {
+            key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
+            prefix: Some(prefix.to_vec().into()),
+            txn_id: None,
+        };
+        Next::Call(IoCall::Effect(Box::new(Effect::Storage(last))))
+    }
+}
+
+impl Operation for OutboxTailsOperation {
+    type Output = Vec<(Vec<u8>, Vec<u8>)>;
+    type Error = ApplyError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, ApplyError> {
+        Ok(self.advance())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, ApplyError> {
+        let values = match result.event()? {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            Event::Storage(StorageEvent::Error { error }) => {
+                return Err(ApplyError::Storage(error));
+            }
+            other => {
+                return Err(IoError::Unexpected {
+                    expected: "StorageEvent::IterResult",
+                    got: other.label(),
+                }
+                .into());
+            }
+        };
+        if let (Some(prefix), Some((key, _))) = (
+            outbox_stream_prefixes().get(self.position),
+            values.into_iter().next(),
+        ) {
+            self.tails.push((prefix.to_vec(), key.to_vec()));
         }
+        self.position += 1;
+        Ok(self.advance())
+    }
+}
+
+/// Arms the outbox drain when any record waits, unless it is armed or running already.
+#[derive(Debug, Default, PartialEq)]
+pub struct OutboxTimerOperation {
+    arming: bool,
+}
+
+impl OutboxTimerOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for OutboxTimerOperation {
+    type Output = ();
+    type Error = ApplyError;
+
+    fn first(&mut self) -> Result<Next<()>, ApplyError> {
+        Ok(Next::Call(IoCall::Page {
+            space: SYNC_OUTBOX_KEYSPACE.to_string(),
+            prefix: ByteView::from(Vec::new()),
+            after: None,
+            limit: 1,
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, ApplyError> {
+        if self.arming {
+            return match result.event()? {
+                Event::Task(TaskEvent::Error { message, .. }) => Err(ApplyError::Failed(message)),
+                _ => Ok(Next::Done(())),
+            };
+        }
+        let (rows, _) = result.page()?;
+        if rows.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        self.arming = true;
+        let arm = Effect::Task(TaskEffect::ScheduleIdleTimer {
+            key: TaskKey::DrainSyncOutbox,
+            after: Duration::ZERO,
+        });
+        Ok(Next::Call(IoCall::Effect(Box::new(arm))))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_core::UserId;
+    use crate::sync::outbox::record::{
+        OUTBOX_DRAIN_SIZE, admin_outbox_prefix, outbox_key, outbox_prefix, revocation_index_entry,
+    };
+    use crate::sync::outbox::record::{new_identified_record, write_outbox_effect};
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
     use aruna_core::handle::Handle;
+    use aruna_core::id::NodeId;
+    use aruna_core::row_plan::PlanOperation;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
-    use aruna_storage::{FjallStorage, StorageHandle};
+    use aruna_core::types::Value;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::drive;
+    use aruna_drivers::testing::test_context;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_test_support::documents::{read_outbox_record, read_outbox_records};
     use tempfile::tempdir;
+    use ulid::Ulid;
+
+    async fn delete_outbox_records(
+        storage: &StorageHandle,
+        keys: Vec<Vec<u8>>,
+    ) -> Result<(), ApplyError> {
+        let plan = DeleteOutboxPlan { keys };
+        drive(PlanOperation::new(plan), &test_context(storage.clone())).await
+    }
 
     fn node(seed: u8) -> NodeId {
         let mut bytes = [0u8; 32];
@@ -557,7 +444,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let corrupt_key = b"000-corrupt-outbox".to_vec();
-        let valid = new_outbox_record(
+        let valid = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -614,7 +502,8 @@ mod tests {
     #[test]
     fn record_roundtrip_deduplicates() {
         let peer = node(3);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![peer, peer],
@@ -634,7 +523,8 @@ mod tests {
 
     #[test]
     fn upsert_roundtrip_revision() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(3)],
@@ -660,7 +550,8 @@ mod tests {
 
     #[test]
     fn delete_roundtrip_revision() {
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(3)],
@@ -683,7 +574,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let left = new_outbox_record(
+        let left = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -691,7 +583,8 @@ mod tests {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        let right = new_outbox_record(
+        let right = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -712,7 +605,8 @@ mod tests {
             bytes: vec![1],
             change: change(),
         };
-        let mut older = new_outbox_record(
+        let mut older = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -721,7 +615,8 @@ mod tests {
             false,
         );
         older.outbox_id = Ulid::from_parts(1, 0);
-        let mut newer = new_outbox_record(
+        let mut newer = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig {
                 realm_id: RealmId::from_bytes([9u8; 32]),
@@ -740,7 +635,8 @@ mod tests {
     fn admin_keys_ordered() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
         let target = DocumentTarget::User { user_id };
-        let mut earlier = new_outbox_record(
+        let mut earlier = new_identified_record(
+            Ulid::generate(),
             node(1),
             target.clone(),
             Vec::new(),
@@ -749,7 +645,8 @@ mod tests {
             false,
         );
         earlier.outbox_id = Ulid::from_parts(2, 2);
-        let mut later = new_outbox_record(
+        let mut later = new_identified_record(
+            Ulid::generate(),
             node(1),
             target,
             Vec::new(),
@@ -767,7 +664,8 @@ mod tests {
     #[test]
     fn admin_prefix_scopes() {
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::User { user_id },
             Vec::new(),
@@ -784,7 +682,8 @@ mod tests {
     #[test]
     fn index_uses_key() {
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -805,7 +704,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -851,7 +751,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let user_id = UserId::local(Ulid::from_parts(7, 1), RealmId::from_bytes([3; 32]));
-        let metadata = new_outbox_record(
+        let metadata = new_identified_record(
+            Ulid::generate(),
             node(1),
             target(),
             vec![node(2)],
@@ -862,7 +763,8 @@ mod tests {
             aruna_core::structs::placement::record::PlacementRef::NIL,
             false,
         );
-        let admin = new_outbox_record(
+        let admin = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::User { user_id },
             Vec::new(),
@@ -912,7 +814,8 @@ mod tests {
         let storage =
             FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
         let realm_id = RealmId::from_bytes([7u8; 32]);
-        let record = new_outbox_record(
+        let record = new_identified_record(
+            Ulid::generate(),
             node(1),
             DocumentTarget::RealmConfig { realm_id },
             Vec::new(),
@@ -967,5 +870,78 @@ mod tests {
         // The FIFO key layout must not depend on the placement field.
         assert_ne!(nil.placement, sharded.placement);
         assert_eq!(outbox_key(&nil), outbox_key(&sharded));
+    }
+
+    fn stored_rows() -> Vec<(Key, aruna_core::types::Value)> {
+        vec![(ByteView::from(vec![1]), ByteView::from(vec![2]))]
+    }
+
+    #[test]
+    fn tails_cover_streams() {
+        let mut operation = OutboxTailsOperation::new();
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let empty = || {
+            IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+                values: Vec::new(),
+                next_start_after: None,
+            })))
+        };
+        let found = IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+            values: stored_rows(),
+            next_start_after: None,
+        })));
+        assert!(matches!(
+            operation.next(found),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        assert!(matches!(
+            operation.next(empty()),
+            Ok(Next::Call(IoCall::Effect(_)))
+        ));
+        let prefix = outbox_stream_prefixes()[0].to_vec();
+        assert_eq!(
+            operation.next(empty()),
+            Ok(Next::Done(vec![(prefix, vec![1])]))
+        );
+    }
+
+    #[test]
+    fn restore_arms_timer() {
+        let mut operation = OutboxTimerOperation::new();
+        operation.first().unwrap();
+        let page = IoResult::Page {
+            rows: stored_rows(),
+            next: None,
+        };
+        let arm = Effect::Task(TaskEffect::ScheduleIdleTimer {
+            key: TaskKey::DrainSyncOutbox,
+            after: Duration::ZERO,
+        });
+        assert_eq!(
+            operation.next(page),
+            Ok(Next::Call(IoCall::Effect(Box::new(arm))))
+        );
+        let armed = Event::Task(TaskEvent::TimerScheduled {
+            key: TaskKey::DrainSyncOutbox,
+            after: Duration::ZERO,
+        });
+        assert_eq!(
+            operation.next(IoResult::Event(Box::new(armed))),
+            Ok(Next::Done(()))
+        );
+    }
+
+    #[test]
+    fn restore_skips_empty() {
+        let mut operation = OutboxTimerOperation::new();
+        operation.first().unwrap();
+        let page = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(page), Ok(Next::Done(())));
     }
 }

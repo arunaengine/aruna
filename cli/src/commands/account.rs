@@ -7,21 +7,11 @@ use crate::args::LoginArgs;
 use crate::client::Api;
 use crate::config::Profile;
 use crate::error::CliError;
+use aruna_wire::info::InfoResponse;
 use base64::Engine;
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use std::io::BufRead;
-
-#[derive(Debug, Deserialize)]
-struct NodeInfo {
-    node: NodeStatus,
-}
-
-#[derive(Debug, Deserialize)]
-struct NodeStatus {
-    realm_id: String,
-    peer_id: Option<String>,
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct UserInfo {
@@ -82,7 +72,7 @@ pub async fn login(context: &mut Context<'_>, args: LoginArgs) -> Result<(), Cli
         return Err(CliError::usage("the token is empty"));
     }
     let api = Api::new(&base, Some(given.clone()))?;
-    let info: NodeInfo = api.get("system/info", &[]).await?;
+    let info: InfoResponse = api.get("system/info", &[]).await?;
     let me: UserInfo = api.get("access/users/me", &[]).await?;
     let label = format!("cli@{}", host_name());
     let body = serde_json::json!({ "kind": "api", "label": label });

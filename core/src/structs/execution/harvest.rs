@@ -2,10 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::UserId;
 use crate::errors::ConversionError;
-use crate::structs::execution::job::JobId;
+use crate::structs::execution::job::identity::JobId;
 use crate::types::GroupId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -74,50 +74,6 @@ impl RepositoryConnector {
             updated_at,
             created_by,
         }
-    }
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
-        Ok(postcard::to_allocvec(self)?)
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
-        Ok(postcard::from_bytes(bytes)?)
-    }
-}
-
-/// Credentials for a repository connector, split from the public record so the
-/// public projection never carries a secret.
-#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RepositoryConnectorSecret {
-    pub connector_id: Ulid,
-    pub secret_config: HashMap<String, String>,
-    pub updated_at: SystemTime,
-}
-
-/// Shows only the secret keys; the values are live credentials.
-impl fmt::Debug for RepositoryConnectorSecret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RepositoryConnectorSecret")
-            .field("connector_id", &self.connector_id)
-            .field("keys", &self.secret_config.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-impl RepositoryConnectorSecret {
-    pub fn new(
-        connector_id: Ulid,
-        secret_config: HashMap<String, String>,
-        updated_at: SystemTime,
-    ) -> Option<Self> {
-        if secret_config.is_empty() {
-            return None;
-        }
-        Some(Self {
-            connector_id,
-            secret_config,
-            updated_at,
-        })
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -376,6 +332,7 @@ pub struct HarvestJobSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::structs::execution::source_connector::SourceConnectorSecret;
     use crate::structs::identity::realm::RealmId;
 
     fn user(seed: u8) -> UserId {
@@ -399,22 +356,6 @@ mod tests {
         }
     }
 
-    // the connector secret split stays redacted
-    #[test]
-    fn debug_hides_secrets() {
-        let secret = RepositoryConnectorSecret::new(
-            Ulid::from_bytes([1u8; 16]),
-            HashMap::from([("token".to_string(), "canary-7f3a".to_string())]),
-            SystemTime::UNIX_EPOCH,
-        )
-        .unwrap();
-
-        let rendered = format!("{secret:?}");
-
-        assert!(!rendered.contains("canary-7f3a"));
-        assert!(rendered.contains("token"));
-    }
-
     #[test]
     fn secret_stays_redacted() {
         let connector = RepositoryConnector::new(
@@ -428,7 +369,7 @@ mod tests {
             SystemTime::UNIX_EPOCH,
             user(3),
         );
-        let secret = RepositoryConnectorSecret::new(
+        let secret = SourceConnectorSecret::new(
             connector.connector_id,
             HashMap::from([("token".to_string(), "super-secret".to_string())]),
             SystemTime::UNIX_EPOCH,
@@ -447,18 +388,6 @@ mod tests {
                 .unwrap()
                 .windows("super-secret".len())
                 .any(|w| w == b"super-secret")
-        );
-    }
-
-    #[test]
-    fn empty_secret_none() {
-        assert!(
-            RepositoryConnectorSecret::new(
-                Ulid::from_bytes([4u8; 16]),
-                HashMap::new(),
-                SystemTime::UNIX_EPOCH,
-            )
-            .is_none()
         );
     }
 

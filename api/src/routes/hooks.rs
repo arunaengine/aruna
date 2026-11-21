@@ -3,29 +3,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
 
-use aruna_core::NodeId;
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::id::NodeId;
 use aruna_core::plugin_runs::HookRequest;
-use aruna_core::time::unix_timestamp_millis;
-use aruna_operations::distribution::delegate::node_urls;
-use aruna_operations::plugins::hooks::{HookError, admit_hook, checks_authorization};
-use aruna_operations::plugins::install::read_config;
-use aruna_operations::plugins::release::ReleaseKeys;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::plugins::dispatch::VerifyHook;
+use aruna_operations::plugins::hooks::{AdmitHook, HookError};
+use aruna_operations::relay::hook::{HookRelay, HookRelayOperation};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use tracing::warn;
 use ulid::Ulid;
-use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::error::{ErrorResponse, ServerError};
-use crate::routes::management_relay::{RELAY_HOP_HEADER, passed_hops};
-use crate::routes::storage::relay::{capped_body, relay_url};
+use crate::routes::management_relay::{add_headers, passed_text, reply_status};
 use crate::server::state::ServerState;
 
 /// Bounds of a webhook request, checked before its body is read or relayed.
@@ -36,35 +34,8 @@ pub const MAX_HOOK_QUERY: usize = 2 * 1024;
 /// Seconds a provider waits before it sends a refused request again.
 const HOOK_RETRY_SECS: u32 = 60;
 
-/// Headers a relay never passes on: hop-by-hop ones and credentials no check reads.
-const NOT_RELAYED: &[&str] = &[
-    "connection",
-    "content-length",
-    "cookie",
-    "host",
-    "keep-alive",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
-
-/// The relay client follows no redirect; without one the relay answers 503.
-static HOOK_CLIENT: LazyLock<Option<reqwest::Client>> = LazyLock::new(|| {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()
-});
-
-#[derive(OpenApi)]
-pub struct HooksApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(HooksApiDoc::openapi()).routes(routes!(receive))
+    OpenApiRouter::new().routes(routes!(receive))
 }
 
 #[utoipa::path(
@@ -124,12 +95,6 @@ pub async fn receive(
         return ServerError::NotFound.into_response();
     };
     let ctx = state.get_ctx();
-    let keys = (ctx.metadata_handle.as_ref())
-        .map(|handle| ReleaseKeys {
-            seal: handle.realm_seal_key(),
-            vault: handle.realm_vault_key(),
-        })
-        .unwrap_or_default();
     let request = HookRequest {
         delivery_id: None,
         method: method.to_string(),
@@ -139,9 +104,8 @@ pub async fn receive(
             .collect(),
         body: body.to_vec(),
     };
-    let place = (state.get_node_id(), &keys);
-    let ids = (state.get_realm_id(), install_id);
-    match admit_hook(&ctx, place, ids, request, unix_timestamp_millis()).await {
+    let node = (state.get_realm_id(), state.get_node_id());
+    match admit_request(&ctx, node, install_id, request).await {
         Ok(_) => StatusCode::ACCEPTED.into_response(),
         Err(HookError::Elsewhere(receiver)) => {
             let path = match query {
@@ -152,6 +116,20 @@ pub async fn receive(
         }
         Err(error) => hook_error(install_id, error),
     }
+}
+
+/// Checks one webhook request and queues its run. Answers `false` for a delivery id the
+/// receiver already admitted, which starts nothing.
+async fn admit_request(
+    ctx: &DriverContext,
+    node: (RealmId, NodeId),
+    install_id: Ulid,
+    request: HookRequest,
+) -> Result<bool, HookError> {
+    let now_ms = unix_timestamp_millis();
+    let hook = drive(VerifyHook::new(node, install_id, request, now_ms), ctx).await?;
+    let admit = AdmitHook::new(hook.run, (hook.install_id, hook.delivery_id), now_ms)?;
+    Ok(drive(admit, ctx).await?)
 }
 
 /// A refusal of a request over its bounds, before anything is read or relayed.
@@ -204,20 +182,6 @@ fn hook_error(install_id: Ulid, error: HookError) -> Response {
     }
 }
 
-/// The headers a relay passes on: all but hop-by-hop ones, `cookie` and `proxy-authorization`,
-/// and `authorization` only when the verify secret checks it.
-fn relayed(headers: &HeaderMap, keep_authorization: bool) -> HeaderMap {
-    let mut sent = headers.clone();
-    for name in NOT_RELAYED {
-        sent.remove(*name);
-    }
-    sent.remove(RELAY_HOP_HEADER);
-    if !keep_authorization {
-        sent.remove(header::AUTHORIZATION);
-    }
-    sent
-}
-
 /// Sends the request on to the receiver and answers what it answered.
 async fn relay(
     state: &ServerState,
@@ -226,51 +190,26 @@ async fn relay(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    let unavailable = || retry_later(ServerError::ServiceUnavailable.into_response());
-    let (Some(client), Some(hops)) = (
-        HOOK_CLIENT.as_ref(),
-        passed_hops(state, headers, Some(receiver)),
-    ) else {
-        return unavailable();
+    let received = (headers.iter())
+        .map(|(name, value)| (name.as_str().to_string(), value.as_bytes().to_vec()))
+        .collect();
+    let hook = HookRelay {
+        realm_id: state.get_realm_id(),
+        local: state.get_node_id(),
+        receiver,
+        install_id,
+        path: path.to_string(),
+        passed: passed_text(headers).to_string(),
+        headers: received,
+        body,
     };
     let ctx = state.get_ctx();
-    // Without knowing whether the check needs `authorization`, nothing is forwarded.
-    let keep = match read_config(&ctx, state.get_realm_id()).await {
-        Ok(config) => {
-            let place = (state.get_node_id(), install_id);
-            checks_authorization(&ctx, &config, place).await
-        }
-        Err(_) => None,
+    let Ok(Some(reply)) = drive(HookRelayOperation::new(hook), ctx.as_ref()).await else {
+        return retry_later(ServerError::ServiceUnavailable.into_response());
     };
-    let Some(keep) = keep else {
-        return unavailable();
-    };
-    let Some(base) = node_urls(&ctx, receiver).await.and_then(|urls| urls.api) else {
-        return unavailable();
-    };
-    let mut sent = relayed(headers, keep);
-    sent.insert(RELAY_HOP_HEADER, hops);
-    let url = relay_url(&base, path);
-    let answer = client.post(&url).headers(sent).body(body).send().await;
-    let answer = match answer {
-        Ok(answer) => answer,
-        Err(error) => {
-            warn!(%receiver, error = %error.without_url(), "A plugin webhook relay failed");
-            return unavailable();
-        }
-    };
-    let status = answer.status();
-    let wait = answer.headers().get(header::RETRY_AFTER).cloned();
-    let kind = answer.headers().get(header::CONTENT_TYPE).cloned();
-    let Ok(body) = capped_body(answer).await else {
-        return unavailable();
-    };
-    let mut response = (status, body).into_response();
-    for (name, value) in [(header::RETRY_AFTER, wait), (header::CONTENT_TYPE, kind)] {
-        if let Some(value) = value {
-            response.headers_mut().insert(name, value);
-        }
-    }
+    let status = reply_status(&reply);
+    let mut response = (status, reply.body).into_response();
+    add_headers(&mut response, &reply.headers);
     response
 }
 

@@ -7,31 +7,35 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
     server_error, tool_extras,
 };
+use crate::lookup::ObjectOutput;
 use crate::routes::storage::objects::object_page;
 use crate::routes::storage::relay::{relay_json, rest_target};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::stream::BackendStream;
-use aruna_core::structs::checksum::{HASH_BLAKE3, HASH_MD5};
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
-use aruna_core::structs::storage::data::identity::content_id;
-use aruna_operations::driver::{bucket_snapshot, drive, gate_context, now_ms};
-use aruna_operations::metadata::api::{BucketSearchRequest, search_buckets_distributed};
-use aruna_operations::realm::get_config::GetConfigOperation;
-use aruna_operations::replication::queue::complete_put;
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::object::get::{
-    GetObjectError, GetObjectInput, ObjectRangeRequest, get_object_routed,
-};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_drivers::driver::{drive, node_routing};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_operations::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_operations::metadata::api::search_types::BucketSearchRequest;
+use aruna_operations::placement::policy::gate::GateOperation;
+use aruna_operations::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_operations::s3::object::get::{GetObjectError, GetObjectInput};
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_operations::s3::object::list::ListedObject;
 use aruna_operations::s3::object::pages::ListRequest;
 use aruna_operations::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_operations::staging::offered_directory::{OfferedDirectoryError, guard_bucket_write};
+use aruna_operations::staging::offered_directory::OfferedDirectoryError;
+use aruna_operations::transfer::read::GetRoutedOperation;
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use rmcp::Json;
@@ -98,24 +102,6 @@ pub struct ListObjectsInput {
     /// on the node that holds the bucket, found by its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
-pub struct ObjectOutput {
-    pub key: String,
-    /// The current version, so a selection can pin exactly what was listed.
-    pub version_id: String,
-    pub size: Option<u64>,
-    pub etag: Option<String>,
-    pub last_modified: Option<String>,
-    pub content_type: Option<String>,
-    pub referenced: bool,
-    /// Content address `https://w3id.org/aruna/data/<blake3>` to use as a File entity `@id`.
-    /// Absent for a reference whose bytes were never read.
-    pub content_id: Option<String>,
-    /// A link's binding, kept to check its target before the entry is shown; never sent.
-    #[serde(skip)]
-    pub link: Option<aruna_core::structs::execution::staging::VersionSourceBinding>,
 }
 
 #[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
@@ -374,23 +360,25 @@ impl McpServer {
         authorize_search(self, &auth, extras.clone()).await?;
         // Every node checks the caller on its own buckets and leaves out what it may not read.
         let bearer = request_bearer(&parts).map(|carrier| carrier.as_str().to_string());
-        let result = search_buckets_distributed(
+        let result = drive(
+            search_buckets_distributed(
+                self.state.get_realm_id(),
+                self.state.get_node_id(),
+                BucketSearchRequest {
+                    auth: auth.clone(),
+                    bearer_token: bearer,
+                    query: String::new(),
+                    key: None,
+                    // The tool's policies apply on each node, before members of a bucket merge.
+                    extras: Some(extras.clone()),
+                    limit: BUCKET_PAGE,
+                    group_id: None,
+                    cursor: input.cursor,
+                    target_nodes: None,
+                    database: false,
+                },
+            ),
             self.state.get_ctx().as_ref(),
-            self.state.get_realm_id(),
-            self.state.get_node_id(),
-            BucketSearchRequest {
-                auth: auth.clone(),
-                bearer_token: bearer,
-                query: String::new(),
-                key: None,
-                // The tool's policies apply on each node, before members of a bucket merge.
-                extras: Some(extras.clone()),
-                limit: BUCKET_PAGE,
-                group_id: None,
-                cursor: input.cursor,
-                target_nodes: None,
-                database: false,
-            },
         )
         .await
         .map_err(crate::metadata::map_api_error)
@@ -795,70 +783,6 @@ impl McpServer {
     }
 }
 
-/// One listed object as the listing tools and the REST object listing show it.
-pub(crate) fn object_output(object: &ListedObject) -> ObjectOutput {
-    let size = entry_size(object);
-    let etag = object
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_MD5))
-        .map(hex::encode)
-        .or_else(|| {
-            object
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.etag.clone())
-        });
-    let content_type = object
-        .source_metadata
-        .as_ref()
-        .and_then(|metadata| metadata.content_type.clone());
-    let content_id = object
-        .location
-        .as_ref()
-        .and_then(|location| location.hashes.get(HASH_BLAKE3))
-        .and_then(|hash| <[u8; 32]>::try_from(hash.as_slice()).ok())
-        .map(content_id);
-    let last_modified =
-        entry_time(object).map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
-    ObjectOutput {
-        key: object.head.key.clone(),
-        version_id: object.version_id.to_string(),
-        size,
-        etag,
-        last_modified,
-        content_type,
-        referenced: object.referenced,
-        content_id,
-        link: object.link.clone(),
-    }
-}
-
-fn entry_size(object: &ListedObject) -> Option<u64> {
-    object
-        .location
-        .as_ref()
-        .map(|location| location.blob_size)
-        .or_else(|| {
-            object
-                .source_metadata
-                .as_ref()
-                .map(|metadata| metadata.content_length)
-        })
-}
-
-fn entry_time(object: &ListedObject) -> Option<std::time::SystemTime> {
-    object
-        .version_created_at
-        .or(object.last_refresh)
-        .or_else(|| {
-            object
-                .source_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.last_modified)
-        })
-}
-
 pub(crate) fn filename_of(key: &str) -> String {
     key.rsplit('/')
         .find(|segment| !segment.is_empty())
@@ -976,7 +900,7 @@ pub(crate) async fn read_text(
     server: &McpServer,
     auth: &AuthContext,
     input: ReadObjectInput,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<ReadObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
     let max_bytes = bounded_bytes(input.max_bytes)?;
@@ -1007,19 +931,22 @@ pub(crate) async fn read_text(
                 .ok_or_else(|| bad_request("offset and max_bytes overflow"))?,
         })
     };
-    let mut result = get_object_routed(
+    let mut result = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                version_id: None,
+                range,
+                group_id: bucket_info.group_id,
+                user_identity: auth.user_id,
+                realm_id: auth.realm_id,
+                node_id: server.state.get_node_id(),
+            },
+            auth.path_restrictions.clone(),
+            None,
+        ),
         &server.state.get_ctx(),
-        GetObjectInput {
-            bucket: input.bucket.clone(),
-            key: input.key.clone(),
-            version_id: None,
-            range,
-            group_id: bucket_info.group_id,
-            user_identity: auth.user_id,
-            realm_id: auth.realm_id,
-            node_id: server.state.get_node_id(),
-        },
-        auth.path_restrictions.clone(),
     )
     .await
     .map_err(map_get_error)?;
@@ -1067,7 +994,7 @@ pub(crate) async fn write_text(
     server: &McpServer,
     auth: &AuthContext,
     input: WriteObjectInput,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
     (headers, bearer): (&http::HeaderMap, Option<&crate::auth::ValidatedBearer>),
 ) -> Result<WriteObjectOutput, CallToolResult> {
     validate_key(&input.key)?;
@@ -1080,9 +1007,13 @@ pub(crate) async fn write_text(
             ),
         )));
     }
-    guard_bucket_write(server.state.get_ctx().as_ref(), &input.bucket)
-        .await
-        .map_err(map_offered_error)?;
+    drive(
+        BucketGuardOperation::new(input.bucket.as_str()),
+        server.state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(OfferedDirectoryError::from)
+    .map_err(map_offered_error)?;
     let bucket_info = server.bucket_info(&input.bucket).await?;
     authorize_tool(
         &server.state,
@@ -1183,7 +1114,8 @@ pub(crate) async fn store_stream(
     (metadata, create_only): (HashMap<String, String>, bool),
 ) -> Result<PutObjectResult, crate::error::ServerError> {
     use crate::error::ServerError;
-    let internal = |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string());
+    let internal =
+        |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string().into());
     let realm = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
@@ -1191,12 +1123,22 @@ pub(crate) async fn store_stream(
     .await
     .map_err(|error| internal(&error))?;
     let quota_ceiling = realm.quota.effective_group_ceiling(&bucket_info.group_id);
-    let routing = bucket_snapshot(&state.get_ctx(), bucket_info)
-        .await
-        .map_err(|error| internal(&error))?;
-    let gate = gate_context(&state.get_ctx(), state.get_realm_id(), now_ms())
-        .await
-        .map_err(|error| internal(&error))?;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&state.get_ctx()),
+            (bucket_info).group_id,
+            BucketRules::of(bucket_info),
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
+    let gate = drive(
+        GateOperation::new(state.get_realm_id(), unix_timestamp_millis()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
     let mut operation = PutObjectOperation::new(PutObjectConfig {
         user_id: auth.user_id,
         group_id: bucket_info.group_id,
@@ -1228,18 +1170,21 @@ pub(crate) async fn store_stream(
     let result = drive(operation, &state.get_ctx())
         .await
         .map_err(put_server_error)?;
-    complete_put(
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            auth: auth.clone(),
+            group_id: bucket_info.group_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: result.version_id,
+            size_bytes: result.location.blob_size,
+        }),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        auth.clone(),
-        bucket_info.group_id,
-        bucket.to_string(),
-        key.to_string(),
-        result.version_id,
-        result.location.blob_size,
     )
-    .await;
+    .await
+    .ok();
     Ok(result)
 }
 
@@ -1294,7 +1239,7 @@ fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
 async fn authorize_search(
     server: &McpServer,
     auth: &AuthContext,
-    extras: aruna_operations::auth::request_policy::PolicyRequestExtras,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
 ) -> Result<(), CallToolResult> {
     super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
         .await
@@ -1311,7 +1256,7 @@ pub(crate) fn map_bucket_error(error: GetBucketError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received}"
         )),
         GetBucketError::Incomplete => internal_error("bucket lookup failed"),
     }
@@ -1351,7 +1296,7 @@ fn map_get_error(error: GetObjectError) -> CallToolResult {
             expected,
             received,
         } => internal_error(format!(
-            "unexpected object read event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected object read event in {state:?}: expected {expected}, got {received}"
         )),
         GetObjectError::NoTransactionFound => internal_error("object read transaction is missing"),
         GetObjectError::UsageError(error) => internal_error(error),
@@ -1388,21 +1333,16 @@ fn map_head_error(error: HeadObjectError) -> CallToolResult {
         ),
         HeadObjectError::StorageError(error) => internal_error(error),
         HeadObjectError::ConversionError(error) => internal_error(error),
-        HeadObjectError::InvalidState { current, expected } => internal_error(format!(
-            "invalid object head state {current:?}; expected {expected:?}"
-        )),
         HeadObjectError::InvalidStateEvent {
             state,
             expected,
             received,
         } => internal_error(format!(
-            "unexpected object head event in {state:?}: expected {expected}, got {received:?}"
+            "unexpected object head event in {state:?}: expected {expected}, got {received}"
         )),
-        HeadObjectError::NoTransactionFound => internal_error("object head transaction is missing"),
         HeadObjectError::ResolveReferenceError(error) => internal_error(error),
         HeadObjectError::StagingSourceError(error) => internal_error(error),
         HeadObjectError::ManagedCopyError(error) => internal_error(error),
-        HeadObjectError::NotFinished => internal_error("object head did not finish"),
         HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
     }
 }
@@ -1419,23 +1359,21 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         error @ PutObjectError::UsageRebuilding => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        PutObjectError::Distribution(error) => {
-            crate::routes::storage::distributed::map_guard_error(error)
-        }
+        PutObjectError::Distribution(error) => crate::lookup::map_guard_error(error),
         PutObjectError::InvalidOperationState => {
-            ServerError::InternalError("invalid object write state".to_string())
+            ServerError::InternalError("invalid object write state".to_string().into())
         }
         PutObjectError::NoTransactionFound => {
-            ServerError::InternalError("object write transaction is missing".to_string())
+            ServerError::InternalError("object write transaction is missing".to_string().into())
         }
         PutObjectError::MissingOutput => {
-            ServerError::InternalError("object write output is missing".to_string())
+            ServerError::InternalError("object write output is missing".to_string().into())
         }
         PutObjectError::MissingHash(hash) => {
-            ServerError::InternalError(format!("object hash is missing: {hash}"))
+            ServerError::InternalError(format!("object hash is missing: {hash}").into())
         }
         PutObjectError::InvalidPreassignedVersion => {
-            ServerError::InternalError("invalid object version".to_string())
+            ServerError::InternalError("invalid object version".to_string().into())
         }
         PutObjectError::ObjectExists => ServerError::Refused(
             http::StatusCode::CONFLICT,
@@ -1443,7 +1381,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
             "another file took this name during the upload; upload again".to_string(),
         ),
         PutObjectError::PutObjectFailed => {
-            ServerError::InternalError("object write failed".to_string())
+            ServerError::InternalError("object write failed".to_string().into())
         }
         error @ (PutObjectError::StorageError(_)
         | PutObjectError::WriteFailed(_)
@@ -1461,7 +1399,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         | PutObjectError::ImportRemoved
         | PutObjectError::VersionExists
         | PutObjectError::HistoryDeleted
-        | PutObjectError::FenceTaken) => ServerError::InternalError(error.to_string()),
+        | PutObjectError::FenceTaken) => ServerError::InternalError(error.into()),
     }
 }
 

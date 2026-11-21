@@ -30,7 +30,7 @@ use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
 use super::records::run_read;
 use super::telemetry::{storage_effect_kind, storage_event_kind};
-use super::transactions::CounterChange;
+use super::transactions::PendingChanges;
 use crate::compaction::Compactor;
 
 /// An open transaction; a read pool thread holds a clone while it reads in it.
@@ -88,7 +88,9 @@ pub(super) fn effect_keyspace(effect: &StorageEffect) -> Option<&str> {
         StorageEffect::StartTransaction { .. }
         | StorageEffect::CommitTransaction { .. }
         | StorageEffect::AbortTransaction { .. }
-        | StorageEffect::SyncAll => None,
+        | StorageEffect::SyncAll
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => None,
     }
 }
 const STORAGE_EFFECT_THRESHOLD: Duration = Duration::from_millis(50);
@@ -175,8 +177,10 @@ pub struct FjallStorage {
     pub(super) deletes: HashMap<String, u64>,
     /// Journal count at the last journal sweep.
     pub(super) swept: usize,
+    /// Write commits applied so far, the sequence of the last one.
+    pub(super) commits: u64,
     pub(super) txn_deletes: HashMap<Ulid, HashMap<String, u64>>,
-    pub(super) txn_usage: HashMap<Ulid, Vec<(String, ByteView, CounterChange)>>,
+    pub(super) txn_usage: HashMap<Ulid, PendingChanges>,
     /// Open write transactions that wrote or deleted realm config rows.
     pub(super) config_txns: HashSet<Ulid>,
     /// Keyspaces whose committed usage deltas also go to their rebuild rows.
@@ -290,10 +294,12 @@ impl FjallStorage {
                 prefix,
                 txn_id,
             } => self.last(key_space, prefix, txn_id),
-            // The handle turns vault effects into row effects before they are queued.
+            // The handle runs vault and realm key effects before anything is queued.
             StorageEffect::VaultWrite { .. }
             | StorageEffect::VaultRead { .. }
-            | StorageEffect::VaultDelete { .. } => StorageEvent::Error {
+            | StorageEffect::VaultDelete { .. }
+            | StorageEffect::RealmOpen(_)
+            | StorageEffect::CompilePolicies(_) => StorageEvent::Error {
                 error: StorageError::InvalidEffect,
             },
             StorageEffect::BeginUsageRebuild { key_space } => self.begin_usage_rebuild(key_space),

@@ -2,8 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::handle::StorageHandle;
 use super::tests::{commit_transaction, start_write_transaction};
-use super::{FjallStorage, StorageHandle};
+use super::worker::FjallStorage;
 use aruna_core::effects::{IterEnd, IterStart, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};

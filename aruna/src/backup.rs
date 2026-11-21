@@ -4,29 +4,29 @@
 
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use aruna_storage::snapshot::{SnapshotError, SnapshotStats, SnapshotWriter, consistent_snapshots};
+use aruna_blob::git::GitStore;
+use aruna_storage::snapshot::{
+    BACKUP_SOCKET, GIT_KEYSPACE, PREFIXES, SnapshotError, SnapshotStats, SnapshotWriter,
+    consistent_snapshots,
+};
 use tracing::warn;
 #[cfg(unix)]
 use {
-    aruna_core::shutdown::Shutdown,
-    aruna_operations::driver::DriverContext,
+    aruna_drivers::driver::DriverContext,
+    aruna_tasks::shutdown::Shutdown,
     std::io::BufWriter,
     std::os::unix::fs::{FileTypeExt, PermissionsExt},
-    tokio::net::UnixListener,
+    std::time::Duration,
+    tokio::net::{UnixListener, UnixStream},
+    tokio_util::sync::CancellationToken,
     tracing::info,
 };
 
-/// File name of the backup socket in the node's storage directory.
-pub const BACKUP_SOCKET: &str = "backup.sock";
-/// Keyspace name prefixes of the node, document sync and metadata stores in a backup.
-pub const MAIN_PREFIX: &str = "main/";
-pub const SYNC_PREFIX: &str = "document-sync/";
-pub const METADATA_PREFIX: &str = "craqle/";
-/// Pseudo keyspace holding the Git repositories: relative path to file bytes, `/` ends a directory.
-pub const GIT_KEYSPACE: &str = "git";
-/// The store prefixes in stream order: node, document sync, metadata.
-pub const PREFIXES: [&str; 3] = [MAIN_PREFIX, SYNC_PREFIX, METADATA_PREFIX];
+/// How long a backup write may make no progress before the client is dropped.
+#[cfg(unix)]
+const BACKUP_STALL: Duration = Duration::from_secs(60);
 
 /// The stores one backup covers.
 #[derive(Clone)]
@@ -35,10 +35,12 @@ pub struct BackupSources {
     pub sync: fjall::Database,
     pub metadata: fjall::Database,
     pub git_root: PathBuf,
+    /// Holds each repository while it is read, so a backup has its refs with their objects.
+    pub git: Option<Arc<GitStore>>,
 }
 
-/// Writes one backup stream. The three stores are read from snapshots of one instant; the Git
-/// files are read afterwards. Blob contents are not part of a backup.
+/// Writes one backup stream. The three stores are read from snapshots of one instant; each Git
+/// repository is read afterwards while no Git effect changes it. Blob contents are left out.
 pub fn write_backup(
     out: impl Write,
     sources: &BackupSources,
@@ -51,18 +53,19 @@ pub fn write_backup(
         writer.database_at(db, snapshot, prefix)?;
     }
     writer.begin_keyspace(GIT_KEYSPACE)?;
-    write_files(&mut writer, &sources.git_root, "")?;
+    write_files(&mut writer, &sources.git_root, "", sources.git.as_deref())?;
     writer.end_keyspace()?;
     let (_, stats) = writer.finish()?;
     Ok(stats)
 }
 
 /// Writes the tree below `dir` in name order. Lock files and entries that vanish while the
-/// walk runs are skipped, since Git may update a repository meanwhile.
+/// walk runs are skipped. A repository below `dir` is read while `git` holds it.
 fn write_files(
     writer: &mut SnapshotWriter<impl Write>,
     dir: &Path,
     relative: &str,
+    git: Option<&GitStore>,
 ) -> Result<(), SnapshotError> {
     let mut entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries.collect::<Result<Vec<_>, _>>()?,
@@ -85,14 +88,20 @@ fn write_files(
             Err(error) => return Err(error.into()),
         };
         if file_type.is_dir() {
+            let id = name
+                .strip_suffix(".git")
+                .and_then(|id| id.parse::<ulid::Ulid>().ok());
+            let _held = git.zip(id).map(|(store, id)| store.hold_repository(id));
             writer.entry(format!("{path}/").as_bytes(), &[])?;
-            write_files(writer, &entry.path(), &format!("{path}/"))?;
+            write_files(writer, &entry.path(), &format!("{path}/"), None)?;
         } else if file_type.is_file() {
-            match std::fs::read(entry.path()) {
-                Ok(bytes) => writer.entry(path.as_bytes(), &bytes)?,
+            let file = match std::fs::File::open(entry.path()) {
+                Ok(file) => file,
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
                 Err(error) => return Err(error.into()),
-            }
+            };
+            let len = file.metadata()?.len();
+            writer.entry_from(path.as_bytes(), len, file)?;
         }
     }
     Ok(())
@@ -127,27 +136,61 @@ pub(crate) fn serve(storage_path: &Path, ctx: &DriverContext, shutdown: &Shutdow
                     }
                 },
             };
-            let sources = sources.clone();
-            let backup = tokio::task::spawn_blocking(move || {
-                let stream = stream.into_std()?;
-                stream.set_nonblocking(false)?;
-                let now = aruna_core::time::unix_timestamp_secs();
-                write_backup(BufWriter::new(stream), &sources, now)
-            });
-            tokio::select! {
-                () = token.cancelled() => break,
-                result = backup => match result {
-                    Ok(Ok(stats)) => info!(
-                        keyspaces = stats.keyspace_count,
-                        entries = stats.entry_count,
-                        "Live backup written"
-                    ),
-                    Ok(Err(error)) => warn!(error = %error, "Live backup failed"),
-                    Err(error) => warn!(error = %error, "Live backup task failed"),
-                },
+            match write_client(stream, sources.clone(), BACKUP_STALL, &token).await {
+                Ok(Ok(stats)) => info!(
+                    keyspaces = stats.keyspace_count,
+                    entries = stats.entry_count,
+                    "Live backup written"
+                ),
+                Ok(Err(error)) => warn!(error = %error, "Live backup failed"),
+                Err(error) => warn!(error = %error, "Live backup task failed"),
             }
         }
     });
+}
+
+/// Writes one backup to `stream` on a blocking thread and waits for it. A write without
+/// progress for `stall` fails, and cancellation closes the socket so the writer stops.
+#[cfg(unix)]
+async fn write_client(
+    stream: UnixStream,
+    sources: BackupSources,
+    stall: Duration,
+    token: &CancellationToken,
+) -> Result<Result<SnapshotStats, SnapshotError>, tokio::task::JoinError> {
+    let (stream, closer) = match blocking_stream(stream, stall) {
+        Ok(pair) => pair,
+        Err(error) => return Ok(Err(error.into())),
+    };
+    let mut backup = tokio::task::spawn_blocking(move || {
+        let now = aruna_clock::unix_timestamp_secs();
+        write_backup(BufWriter::new(stream), &sources, now)
+    });
+    tokio::select! {
+        () = token.cancelled() => {
+            if let Err(error) = closer.shutdown(std::net::Shutdown::Both) {
+                warn!(error = %error, "Backup socket did not close");
+            }
+            backup.await
+        }
+        result = &mut backup => result,
+    }
+}
+
+/// The stream in blocking mode with a write timeout, and a second handle that can close it.
+#[cfg(unix)]
+fn blocking_stream(
+    stream: UnixStream,
+    stall: Duration,
+) -> std::io::Result<(
+    std::os::unix::net::UnixStream,
+    std::os::unix::net::UnixStream,
+)> {
+    let stream = stream.into_std()?;
+    stream.set_nonblocking(false)?;
+    stream.set_write_timeout(Some(stall))?;
+    let closer = stream.try_clone()?;
+    Ok((stream, closer))
 }
 
 /// The stores of a node with its storage, document sync and metadata databases open.
@@ -161,8 +204,9 @@ fn node_sources(storage_path: &Path, ctx: &DriverContext) -> Option<BackupSource
             .document_sync_database()
             .inner()
             .clone(),
-        metadata: ctx.metadata_handle.as_ref()?.store_database(),
+        metadata: ctx.graph_handle.as_ref()?.store_database(),
         git_root: storage_path.join("git"),
+        git: ctx.blob_handle.as_ref().and_then(|blob| blob.git_store()),
     })
 }
 
@@ -183,4 +227,110 @@ fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_storage::snapshot::{SnapshotReader, SnapshotRecord};
+
+    fn open_sources(root: &Path) -> BackupSources {
+        let open = |name: &str| fjall::Database::builder(root.join(name)).open().unwrap();
+        BackupSources {
+            main: open("main"),
+            sync: open("sync"),
+            metadata: open("metadata"),
+            git_root: root.join("git"),
+            git: Some(Arc::new(GitStore::new(
+                root.join("git"),
+                root.join("helper"),
+            ))),
+        }
+    }
+
+    fn git_entries(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let mut reader = SnapshotReader::new(bytes).unwrap();
+        let mut section = String::new();
+        let mut entries = Vec::new();
+        while let Some(record) = reader.next_record().unwrap() {
+            match record {
+                SnapshotRecord::Keyspace(name) => section = name,
+                SnapshotRecord::Entry { key, value } if section == GIT_KEYSPACE => {
+                    entries.push((String::from_utf8(key).unwrap(), value));
+                }
+                SnapshotRecord::Entry { .. } | SnapshotRecord::EndKeyspace => {}
+            }
+        }
+        entries
+    }
+
+    /// Sources whose Git files exceed a socket buffer, so a write waits for its reader.
+    #[cfg(unix)]
+    fn large_sources(root: &Path) -> BackupSources {
+        std::fs::create_dir_all(root.join("git")).unwrap();
+        std::fs::write(root.join("git/large"), vec![0_u8; 8 << 20]).unwrap();
+        open_sources(root)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_joins_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let token = CancellationToken::new();
+        token.cancel();
+        let stall = Duration::from_secs(3600);
+        let writing = write_client(server, large_sources(root.path()), stall, &token);
+        let written = tokio::time::timeout(Duration::from_secs(300), writing).await;
+        assert!(
+            matches!(written, Ok(Ok(Err(_)))),
+            "shutdown did not stop and join the writer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_client_dropped() {
+        let root = tempfile::tempdir().unwrap();
+        let (server, _client) = UnixStream::pair().unwrap();
+        let token = CancellationToken::new();
+        let stall = Duration::from_millis(100);
+        let writing = write_client(server, large_sources(root.path()), stall, &token);
+        let written = tokio::time::timeout(Duration::from_secs(300), writing).await;
+        assert!(
+            matches!(written, Ok(Ok(Err(_)))),
+            "a stalled write did not fail"
+        );
+    }
+
+    #[test]
+    fn backup_includes_push() {
+        let root = tempfile::tempdir().unwrap();
+        let sources = open_sources(root.path());
+        let id = ulid::Ulid::from(7_u128);
+        let repository = root.path().join(format!("git/{id}.git"));
+        std::fs::create_dir_all(repository.join("objects")).unwrap();
+        std::fs::create_dir_all(repository.join("refs/heads")).unwrap();
+        let store = sources.git.clone().unwrap();
+        let held = store.hold_repository(id);
+        let backup = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            write_backup(&mut bytes, &sources, 1).map(|_| bytes)
+        });
+        // A push writes its object and then its ref while it holds the repository.
+        std::fs::write(repository.join("objects/pushed"), "object").unwrap();
+        std::fs::write(repository.join("refs/heads/main"), "pushed\n").unwrap();
+        drop(held);
+        let entries = git_entries(&backup.join().unwrap().unwrap());
+        for (path, value) in [
+            ("objects/pushed", "object"),
+            ("refs/heads/main", "pushed\n"),
+        ] {
+            let path = format!("{id}.git/{path}");
+            assert!(
+                entries.contains(&(path.clone(), value.as_bytes().to_vec())),
+                "the backup misses {path}"
+            );
+        }
+    }
 }

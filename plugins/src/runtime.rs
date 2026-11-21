@@ -16,16 +16,17 @@ use wasmtime::component::{
 };
 use wasmtime::{Config, Engine, Store, Trap, UpdateDeadline};
 
-use crate::artifact::{ArtifactDigest, SectionError, read_manifest};
-use crate::broker::{
-    Broker, CallContext, Document, Entry, ErrorKind, HostError, Intent, Listing, MetadataPatch,
-    ObjectInfo, ObjectPage, Response, SendRequest, StatePut,
+use aruna_plugin_types::artifact::{ArtifactDigest, SectionError, read_manifest};
+use aruna_plugin_types::calls::{
+    Document, Entry, ErrorKind, HostError, Intent, Listing, ObjectInfo, ObjectPage, Response,
 };
+use aruna_plugin_types::manifest::{Manifest, ManifestError};
+use aruna_plugin_types::permission::Permission;
+
+use crate::broker::{Broker, CallContext, MetadataPatch, SendRequest, StatePut};
 use crate::host::wit::aruna::plugin::types::{Failure, Field, Invocation as GuestCall, Trigger};
 use crate::host::{Exceeded, Grants, Limit, Session, wit};
 use crate::limits::{Limits, RuntimeConfig};
-use crate::manifest::{Manifest, ManifestError};
-use crate::permission::Permission;
 
 /// Time between two epoch ticks; a running guest yields to the executor on each tick.
 const TICK: std::time::Duration = std::time::Duration::from_millis(10);
@@ -146,9 +147,17 @@ impl Runtime {
     }
 
     /// Checks and compiles `bytes` on a blocking thread, at most `compiles` at a time
-    /// on this node. Never runs guest code.
+    /// on this node. The size is checked first and the digest computed once, off the async
+    /// workers. Never runs guest code.
     pub async fn prepare(&self, bytes: Vec<u8>) -> Result<Arc<Compiled>, CompileError> {
-        let digest = ArtifactDigest::of(&bytes);
+        self.within_limit(&bytes)?;
+        let hashed = tokio::task::spawn_blocking(move || {
+            let digest = ArtifactDigest::of(&bytes);
+            (bytes, digest)
+        });
+        let (bytes, digest) = hashed
+            .await
+            .map_err(|err| CompileError::Wasm(err.to_string()))?;
         if let Some(compiled) = self.inner.cached(&digest) {
             return Ok(compiled);
         }
@@ -162,7 +171,7 @@ impl Runtime {
         let runtime = self.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            runtime.compile(&bytes)
+            runtime.build(&bytes, digest)
         })
         .await
         .map_err(|err| CompileError::Wasm(err.to_string()))?
@@ -170,15 +179,24 @@ impl Runtime {
 
     /// Checks and compiles `bytes` on the calling thread, without node admission.
     pub fn compile(&self, bytes: &[u8]) -> Result<Arc<Compiled>, CompileError> {
-        let inner = &self.inner;
-        let limit = inner.config.max_artifact;
+        self.within_limit(bytes)?;
+        self.build(bytes, ArtifactDigest::of(bytes))
+    }
+
+    fn within_limit(&self, bytes: &[u8]) -> Result<(), CompileError> {
+        let limit = self.inner.config.max_artifact;
         if bytes.len() > limit {
             return Err(CompileError::TooLarge {
                 size: bytes.len(),
                 limit,
             });
         }
-        let digest = ArtifactDigest::of(bytes);
+        Ok(())
+    }
+
+    /// Compiles checked `bytes` whose digest is `digest`, unless the cache holds them by now.
+    fn build(&self, bytes: &[u8], digest: ArtifactDigest) -> Result<Arc<Compiled>, CompileError> {
+        let inner = &self.inner;
         if let Some(compiled) = inner.cached(&digest) {
             return Ok(compiled);
         }

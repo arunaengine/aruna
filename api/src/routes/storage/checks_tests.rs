@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::{BucketCheckQuery, CleanupQuery, clean_bucket_check, get_bucket_check, visible_page};
+use crate::auth::RealmAuth;
 use crate::error::ServerError;
 use crate::tests::storage_routing::{TestState, setup_state};
 use aruna_core::effects::StorageEffect;
@@ -14,8 +15,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_operations::blob::migration::check::clean_broken;
-use axum::Extension;
+use aruna_drivers::driver::drive;
+use aruna_operations::blob::migration::broken::CleanBrokenOperation;
 use axum::extract::{Path, Query, State};
 use std::time::SystemTime;
 use ulid::Ulid;
@@ -125,7 +126,7 @@ async fn cleanup_checks_objects() {
 
     let response = clean_bucket_check(
         State(test.state.clone()),
-        Extension(Some(restricted)),
+        RealmAuth(restricted),
         Path(test.bucket.clone()),
         Query(CleanupQuery::default()),
     )
@@ -143,7 +144,7 @@ async fn cleanup_checks_objects() {
 
     let refused = clean_bucket_check(
         State(test.state.clone()),
-        Extension(Some(test.other_auth.clone())),
+        RealmAuth(test.other_auth.clone()),
         Path(test.bucket.clone()),
         Query(CleanupQuery::default()),
     )
@@ -182,7 +183,7 @@ async fn listing_hides_rows() {
 
     let response = get_bucket_check(
         State(test.state.clone()),
-        Extension(Some(restricted)),
+        RealmAuth(restricted),
         Path(test.bucket.clone()),
         Query(BucketCheckQuery::default()),
     )
@@ -217,7 +218,7 @@ async fn cleanup_clears_vanished() {
 
     let response = clean_bucket_check(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Query(CleanupQuery::default()),
     )
@@ -228,7 +229,7 @@ async fn cleanup_clears_vanished() {
     assert_eq!((response.deleted, response.kept), (0, 0));
     let listed = get_bucket_check(
         State(test.state.clone()),
-        Extension(Some(test.auth.clone())),
+        RealmAuth(test.auth.clone()),
         Path(test.bucket.clone()),
         Query(BucketCheckQuery::default()),
     )
@@ -277,7 +278,7 @@ async fn cursor_names_visible() {
         };
         let page = get_bucket_check(
             State(test.state.clone()),
-            Extension(Some(hiding(&test))),
+            RealmAuth(hiding(&test)),
             Path(test.bucket.clone()),
             Query(query),
         )
@@ -301,14 +302,20 @@ async fn cursor_names_visible() {
         deleted_by: test.auth.user_id,
     };
     let (ctx, auth) = (test.state.get_ctx(), hiding(&test));
-    let first = clean_broken(&ctx, &template, &auth, None, 1, 100)
-        .await
-        .unwrap();
+    let first = drive(
+        CleanBrokenOperation::new(&template, &auth, None, (1, 100)),
+        &ctx,
+    )
+    .await
+    .unwrap();
     let next = first.next.clone().unwrap();
     assert_eq!(VersionKey::from_bytes(&next).unwrap().key, "b/y.gz");
-    let second = clean_broken(&ctx, &template, &auth, Some(next), 1, 100)
-        .await
-        .unwrap();
+    let second = drive(
+        CleanBrokenOperation::new(&template, &auth, Some(next), (1, 100)),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert!(
         second
             .next
@@ -360,13 +367,19 @@ async fn scan_budget_bounds() {
         deleted_by: test.auth.user_id,
     };
     let ctx = test.state.get_ctx();
-    let spent = clean_broken(&ctx, &template, &auth, None, 10, 1)
-        .await
-        .unwrap();
+    let spent = drive(
+        CleanBrokenOperation::new(&template, &auth, None, (10, 1)),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert!(spent.exhausted && spent.next.is_none() && spent.deleted == 0);
-    let cleaned = clean_broken(&ctx, &template, &auth, None, 10, 2)
-        .await
-        .unwrap();
+    let cleaned = drive(
+        CleanBrokenOperation::new(&template, &auth, None, (10, 2)),
+        &ctx,
+    )
+    .await
+    .unwrap();
     assert!(!cleaned.exhausted);
     assert_eq!(cleaned.deleted, 1);
     assert_eq!(

@@ -5,15 +5,17 @@
 
 // Nothing here reads the bucket's objects, so the cost never grows with the bucket.
 
-use aruna_core::effects::{IterStart, StorageEffect};
-use aruna_core::events::{Event, StorageEvent};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{ConversionError, StorageError};
 use aruna_core::keyspaces::{BACKEND_IMPORT_KEYSPACE, RELATIONSHIP_IN_KEYSPACE};
+use aruna_core::operation::Operation;
 use aruna_core::structs::storage::backend_import::BackendImport;
-use aruna_core::structs::{SyncMode, SyncRelationship, sync_relationship_prefix};
-use aruna_core::types::GroupId;
+use aruna_core::structs::sync_relationship::{
+    SyncMode, SyncRelationship, sync_relationship_prefix,
+};
+use aruna_core::types::{GroupId, Key, Value};
+use thiserror::Error;
 use ulid::Ulid;
-
-use crate::driver::DriverContext;
 
 /// At most this many rows of each kind are read.
 const MAX_ROWS: usize = 256;
@@ -36,75 +38,109 @@ pub enum FileSource {
     },
 }
 
-/// The incoming paths of `bucket`, owned by `group_id`, and whether every row was read.
-pub async fn bucket_sources(
-    context: &DriverContext,
-    group_id: GroupId,
-    bucket: &str,
-) -> Result<(Vec<FileSource>, bool), String> {
-    let mut sources = Vec::new();
-    let (syncs, all_syncs) = rows(
-        context,
-        RELATIONSHIP_IN_KEYSPACE,
-        sync_relationship_prefix(bucket),
-    )
-    .await?;
-    for value in syncs {
-        let relationship =
-            SyncRelationship::from_bytes(&value).map_err(|error| error.to_string())?;
-        sources.push(FileSource::Sync {
-            relationship_id: relationship.id,
-            source: relationship.source.to_string(),
-            mode: relationship.mode,
-        });
-    }
-    let (imports, all_imports) = rows(
-        context,
-        BACKEND_IMPORT_KEYSPACE,
-        group_id.to_bytes().to_vec(),
-    )
-    .await?;
-    for value in imports {
-        let import = BackendImport::from_bytes(&value).map_err(|error| error.to_string())?;
-        if import.bucket == bucket {
-            sources.push(FileSource::Storage {
-                import_id: import.import_id,
-                backend_id: import.backend_id,
-                backend_prefix: import.backend_prefix,
-                key_prefix: import.key_prefix,
-            });
-        }
-    }
-    Ok((sources, all_syncs && all_imports))
+#[derive(Debug, Error, PartialEq)]
+pub enum SourcesError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("could not list bucket sources: {0}")]
+    Io(IoError),
 }
 
-async fn rows(
-    context: &DriverContext,
-    key_space: &str,
-    prefix: Vec<u8>,
-) -> Result<(Vec<Vec<u8>>, bool), String> {
-    match context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Iter {
-            key_space: key_space.to_string(),
-            prefix: Some(prefix.into()),
-            start: None::<IterStart>,
-            limit: MAX_ROWS,
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::IterResult {
-            values,
-            next_start_after,
-        }) => Ok((
-            values
-                .into_iter()
-                .map(|(_, value)| value.to_vec())
-                .collect(),
-            next_start_after.is_none(),
-        )),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected storage answer {other:?}")),
+impl From<IoError> for SourcesError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
     }
 }
+
+/// The incoming paths of `bucket`, owned by `group_id`, and whether every row was read.
+#[derive(Debug, PartialEq)]
+pub struct BucketSourcesOperation {
+    group_id: GroupId,
+    bucket: String,
+    /// Whether the sync rows were read and the import rows are next.
+    syncs_read: bool,
+    sources: Vec<FileSource>,
+    complete: bool,
+}
+
+impl BucketSourcesOperation {
+    pub fn new(group_id: GroupId, bucket: &str) -> Self {
+        Self {
+            group_id,
+            bucket: bucket.to_string(),
+            syncs_read: false,
+            sources: Vec::new(),
+            complete: true,
+        }
+    }
+
+    fn sync_rows(&mut self, values: Vec<(Key, Value)>) -> Result<(), SourcesError> {
+        for (_, value) in values {
+            let relationship = SyncRelationship::from_bytes(&value)?;
+            self.sources.push(FileSource::Sync {
+                relationship_id: relationship.id,
+                source: relationship.source.to_string(),
+                mode: relationship.mode,
+            });
+        }
+        Ok(())
+    }
+
+    fn import_rows(&mut self, values: Vec<(Key, Value)>) -> Result<(), SourcesError> {
+        for (_, value) in values {
+            let import = BackendImport::from_bytes(&value)?;
+            if import.bucket == self.bucket {
+                self.sources.push(FileSource::Storage {
+                    import_id: import.import_id,
+                    backend_id: import.backend_id,
+                    backend_prefix: import.backend_prefix,
+                    key_prefix: import.key_prefix,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Operation for BucketSourcesOperation {
+    type Output = (Vec<FileSource>, bool);
+    type Error = SourcesError;
+
+    fn first(&mut self) -> Result<Next<Self::Output>, SourcesError> {
+        let prefix = sync_relationship_prefix(&self.bucket);
+        Ok(Next::Call(rows(RELATIONSHIP_IN_KEYSPACE, prefix)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, SourcesError> {
+        let (values, next) = result.page()?;
+        self.complete &= next.is_none();
+        if self.syncs_read {
+            self.import_rows(values)?;
+            let sources = std::mem::take(&mut self.sources);
+            return Ok(Next::Done((sources, self.complete)));
+        }
+        self.sync_rows(values)?;
+        self.syncs_read = true;
+        let prefix = self.group_id.to_bytes().to_vec();
+        Ok(Next::Call(rows(BACKEND_IMPORT_KEYSPACE, prefix)))
+    }
+}
+
+/// One bounded read of the rows under `prefix`.
+fn rows(key_space: &str, prefix: Vec<u8>) -> IoCall {
+    IoCall::Page {
+        space: key_space.to_string(),
+        prefix: prefix.into(),
+        after: None,
+        limit: MAX_ROWS,
+    }
+}
+
+#[cfg(test)]
+#[path = "sources_tests.rs"]
+mod tests;

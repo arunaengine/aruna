@@ -2,30 +2,29 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::UserId;
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, StorageError};
-use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::events::{BlobEvent, Event};
+use aruna_core::job_request::UploadClaimError;
 use aruna_core::keyspaces::{ROCRATE_UPLOAD_KEYSPACE, UPLOAD_CLEANUP_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::values;
 use aruna_core::stream::{BackendStream, StreamError};
-use aruna_core::structs::execution::job::{
-    JobId, RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord,
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    RoCrateMediaType, RoCrateUploadCleanup, RoCrateUploadRecord, upload_key,
 };
 use aruna_core::structs::storage::blob::HiddenBlobKey;
-use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_core::types::{Effects, TxnId};
-use aruna_storage::StorageHandle;
+use aruna_core::task::{TaskEffect, TaskKey};
+use aruna_core::user::id::UserId;
 use bytes::Bytes;
 use byteview::ByteView;
-use smallvec::smallvec;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::driver::DriverContext;
 use crate::jobs::MUTATE_MAX_ATTEMPTS;
-use crate::jobs::store::{CommitStep, commit_write};
 
 #[derive(Debug, PartialEq)]
 pub struct CreateRoCrateConfig {
@@ -54,23 +53,30 @@ pub enum CreateRoCrateError {
     UnexpectedEvent {
         state: &'static str,
         expected: &'static str,
-        got: String,
+        got: &'static str,
     },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CreateUploadState {
-    Init,
-    Spool,
-    Write,
-    CleanupBlob,
-    CleanupRecord,
-    QueueCleanup,
-    ScheduleSweep,
-    Finish,
-    Error,
+impl From<IoError> for CreateRoCrateError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "call",
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished => Self::Aborted,
+            IoError::Codec(error) => Self::Invalid(error),
+        }
+    }
 }
 
+type Step = Result<Next<RoCrateUploadRecord>, CreateRoCrateError>;
+
+/// Spools the upload into a hidden blob and records it. A run that fails after the spool
+/// deletes the record and the blob, and leaves a cleanup row the hidden-blob sweep finishes.
 #[derive(Debug, PartialEq)]
 pub struct CreateRoCrateOperation {
     upload_id: Ulid,
@@ -80,12 +86,10 @@ pub struct CreateRoCrateOperation {
     max_bytes: u64,
     deadline: Option<Instant>,
     blob: Option<BackendStream<Result<Bytes, StreamError>>>,
+    /// The record being written for the spooled blob.
     record: Option<RoCrateUploadRecord>,
+    /// The spooled blob until the record holding it is written.
     hidden_key: Option<HiddenBlobKey>,
-    pending_error: Option<CreateRoCrateError>,
-    cleanup_attempts: u8,
-    output: Option<Result<RoCrateUploadRecord, CreateRoCrateError>>,
-    state: CreateUploadState,
 }
 
 impl CreateRoCrateOperation {
@@ -100,263 +104,47 @@ impl CreateRoCrateOperation {
             blob: Some(config.blob),
             record: None,
             hidden_key: None,
-            pending_error: None,
-            cleanup_attempts: 0,
-            output: None,
-            state: CreateUploadState::Init,
         }
     }
 
-    fn fail(&mut self, error: CreateRoCrateError) -> Effects {
-        self.output = Some(Err(error));
-        self.state = CreateUploadState::Error;
-        smallvec![]
-    }
-
-    fn cleanup_effect(&self) -> Effects {
-        self.hidden_key
-            .clone()
-            .map(|key| smallvec![Effect::Blob(BlobEffect::DeleteHidden { key })])
-            .unwrap_or_default()
-    }
-
-    fn record_effect(&self) -> Effects {
-        self.record
-            .as_ref()
-            .map(|record| {
-                smallvec![Effect::Storage(StorageEffect::Delete {
-                    key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-                    key: upload_key(record.upload_id),
-                    txn_id: None,
-                })]
-            })
-            .unwrap_or_default()
-    }
-
-    fn cleanup_obligation_effect(&self) -> Effects {
-        let Some(hidden_key) = self.hidden_key.clone() else {
-            return smallvec![];
-        };
-        let obligation = RoCrateUploadCleanup {
-            upload_id: self.upload_id,
-            hidden_key,
-        };
-        let Ok(value) = obligation.to_bytes() else {
-            return smallvec![];
-        };
-        smallvec![Effect::Storage(StorageEffect::Write {
-            key_space: UPLOAD_CLEANUP_KEYSPACE.to_string(),
-            key: upload_key(self.upload_id),
-            value: ByteView::from(value),
-            txn_id: None,
-        })]
-    }
-
-    fn schedule_sweep(&mut self) -> Effects {
-        self.state = CreateUploadState::ScheduleSweep;
-        smallvec![Effect::Task(TaskEffect::ShortenTimer {
-            key: TaskKey::SweepHiddenBlobs,
-            after: Duration::ZERO,
-        })]
-    }
-
-    fn queue_cleanup(&mut self, error: CreateRoCrateError) -> Effects {
-        self.pending_error = Some(error);
-        self.cleanup_attempts = 0;
-        let effects = self.cleanup_obligation_effect();
-        if effects.is_empty() {
-            return self.schedule_sweep();
-        }
-        self.state = CreateUploadState::QueueCleanup;
-        effects
-    }
-
-    fn fail_with_cleanup(&mut self, error: CreateRoCrateError) -> Effects {
-        let (state, effects) = if self.record.is_some() {
-            (CreateUploadState::CleanupRecord, self.record_effect())
-        } else {
-            (CreateUploadState::CleanupBlob, self.cleanup_effect())
-        };
-        if effects.is_empty() {
-            return self.fail(error);
-        }
-        self.pending_error = Some(error);
-        self.cleanup_attempts = 0;
-        self.state = state;
-        effects
-    }
-
-    fn unexpected_event(&mut self, expected: &'static str, event: Event) -> Effects {
-        let error = CreateRoCrateError::UnexpectedEvent {
-            state: self.state_name(),
-            expected,
-            got: format!("{event:?}"),
-        };
-        if self.hidden_key.is_some() {
-            self.fail_with_cleanup(error)
-        } else {
-            self.fail(error)
-        }
-    }
-
-    fn state_name(&self) -> &'static str {
-        match self.state {
-            CreateUploadState::Init => "init",
-            CreateUploadState::Spool => "spool",
-            CreateUploadState::Write => "write",
-            CreateUploadState::CleanupBlob => "cleanup_blob",
-            CreateUploadState::CleanupRecord => "cleanup_record",
-            CreateUploadState::QueueCleanup => "queue_cleanup",
-            CreateUploadState::ScheduleSweep => "schedule_sweep",
-            CreateUploadState::Finish => "finish",
-            CreateUploadState::Error => "error",
-        }
-    }
-
-    fn handle_spool(&mut self, event: Event) -> Effects {
-        match event {
+    /// Writes the record of the spooled blob.
+    fn spooled(&mut self, event: Event) -> Step {
+        let location = match event {
             Event::Blob(BlobEvent::HiddenSpooled {
                 location,
                 blake3,
                 size,
-            }) => {
-                let hidden_key = match HiddenBlobKey::try_from(&location) {
-                    Ok(key) => key,
-                    Err(error) => return self.fail(BlobError::from(error).into()),
-                };
-                let record = RoCrateUploadRecord {
-                    upload_id: self.upload_id,
-                    owner: self.owner,
-                    location,
-                    blake3,
-                    size,
-                    media_type: self.media_type,
-                    expires_at_ms: self.expires_at_ms,
-                    claimed_by: None,
-                };
-                self.record = Some(record.clone());
-                let value = match postcard::to_allocvec(&record) {
-                    Ok(value) => ByteView::from(value),
-                    Err(error) => {
-                        self.hidden_key = Some(hidden_key);
-                        return self
-                            .fail_with_cleanup(CreateRoCrateError::Invalid(error.to_string()));
-                    }
-                };
-                self.hidden_key = Some(hidden_key);
-                self.state = CreateUploadState::Write;
-                smallvec![Effect::Storage(StorageEffect::Write {
-                    key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-                    key: upload_key(self.upload_id),
-                    value,
-                    txn_id: None,
-                })]
+            }) => (location, blake3, size),
+            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
+            other => {
+                return Err(CreateRoCrateError::UnexpectedEvent {
+                    state: "spool",
+                    expected: "Event::Blob(BlobEvent::HiddenSpooled | BlobEvent::Error)",
+                    got: other.label(),
+                });
             }
-            Event::Blob(BlobEvent::Error(error)) => self.fail(error.into()),
-            event => self.unexpected_event(
-                "Event::Blob(BlobEvent::HiddenSpooled | BlobEvent::Error)",
-                event,
-            ),
-        }
-    }
-
-    fn handle_write(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => {
-                let Some(record) = self.record.take() else {
-                    return self.fail_with_cleanup(CreateRoCrateError::NotFinished);
-                };
-                self.hidden_key = None;
-                self.output = Some(Ok(record));
-                self.state = CreateUploadState::Finish;
-                smallvec![]
-            }
-            Event::Storage(StorageEvent::Error { error }) => self.fail_with_cleanup(error.into()),
-            event => self.unexpected_event(
-                "Event::Storage(StorageEvent::WriteResult | StorageEvent::Error)",
-                event,
-            ),
-        }
-    }
-
-    fn handle_cleanup_blob(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Blob(BlobEvent::HiddenDeleted) => self.emit_pending_error(),
-            Event::Blob(BlobEvent::Error(error)) => {
-                if self.cleanup_attempts < 2 {
-                    self.cleanup_attempts += 1;
-                    return self.cleanup_effect();
-                }
-                self.queue_cleanup(error.into())
-            }
-            event => self.unexpected_event(
-                "Event::Blob(BlobEvent::HiddenDeleted | BlobEvent::Error)",
-                event,
-            ),
-        }
-    }
-
-    fn handle_cleanup_record(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::DeleteResult { .. }) => {
-                self.record = None;
-                self.state = CreateUploadState::CleanupBlob;
-                self.cleanup_attempts = 0;
-                let effects = self.cleanup_effect();
-                if effects.is_empty() {
-                    self.emit_pending_error()
-                } else {
-                    effects
-                }
-            }
-            Event::Storage(StorageEvent::Error { error }) => {
-                if self.cleanup_attempts < 2 {
-                    self.cleanup_attempts += 1;
-                    return self.record_effect();
-                }
-                self.queue_cleanup(error.into())
-            }
-            event => self.unexpected_event(
-                "Event::Storage(StorageEvent::DeleteResult | StorageEvent::Error)",
-                event,
-            ),
-        }
-    }
-
-    fn handle_cleanup_queue(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Storage(StorageEvent::WriteResult { .. }) => self.schedule_sweep(),
-            Event::Storage(StorageEvent::Error { .. }) => {
-                if self.cleanup_attempts < 2 {
-                    self.cleanup_attempts += 1;
-                    return self.cleanup_obligation_effect();
-                }
-                self.schedule_sweep()
-            }
-            event => self.unexpected_event(
-                "Event::Storage(StorageEvent::WriteResult | StorageEvent::Error)",
-                event,
-            ),
-        }
-    }
-
-    fn handle_schedule_sweep(&mut self, event: Event) -> Effects {
-        match event {
-            Event::Task(TaskEvent::TimerScheduled { .. })
-            | Event::Task(TaskEvent::Error { .. }) => self.emit_pending_error(),
-            event => self.unexpected_event(
-                "Event::Task(TaskEvent::TimerScheduled | TaskEvent::Error)",
-                event,
-            ),
-        }
-    }
-
-    fn emit_pending_error(&mut self) -> Effects {
-        let error = self
-            .pending_error
-            .take()
-            .unwrap_or(CreateRoCrateError::Aborted);
-        self.fail(error)
+        };
+        let (location, blake3, size) = location;
+        self.hidden_key = Some(HiddenBlobKey::try_from(&location).map_err(BlobError::from)?);
+        let record = RoCrateUploadRecord {
+            upload_id: self.upload_id,
+            owner: self.owner,
+            location,
+            blake3,
+            size,
+            media_type: self.media_type,
+            expires_at_ms: self.expires_at_ms,
+            claimed_by: None,
+        };
+        let value = postcard::to_allocvec(&record)
+            .map_err(|error| CreateRoCrateError::Invalid(error.to_string()))?;
+        let row = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(self.upload_id),
+            ByteView::from(value),
+        );
+        self.record = Some(record);
+        Ok(Next::Call(IoCall::Write(vec![row])))
     }
 }
 
@@ -364,87 +152,133 @@ impl Operation for CreateRoCrateOperation {
     type Output = RoCrateUploadRecord;
     type Error = CreateRoCrateError;
 
-    fn start(&mut self) -> Effects {
-        let Some(blob) = self.blob.take() else {
-            return self.fail(CreateRoCrateError::NotFinished);
-        };
-        self.state = CreateUploadState::Spool;
-        smallvec![Effect::Blob(BlobEffect::SpoolHidden {
-            namespace: self.upload_id,
-            name: "input".to_string(),
-            created_by: self.owner,
-            max_bytes: Some(self.max_bytes),
-            deadline: self.deadline,
-            blob,
-        })]
+    fn first(&mut self) -> Step {
+        let blob = self.blob.take().ok_or(CreateRoCrateError::NotFinished)?;
+        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(
+            BlobEffect::SpoolHidden {
+                namespace: self.upload_id,
+                name: "input".to_string(),
+                created_by: self.owner,
+                max_bytes: Some(self.max_bytes),
+                deadline: self.deadline,
+                blob,
+            },
+        )))))
     }
 
-    fn step(&mut self, event: Event) -> Effects {
-        match self.state {
-            CreateUploadState::Spool => self.handle_spool(event),
-            CreateUploadState::Write => self.handle_write(event),
-            CreateUploadState::Init | CreateUploadState::Finish | CreateUploadState::Error => {
-                self.unexpected_event("no event", event)
+    fn next(&mut self, result: IoResult) -> Step {
+        match (self.record.take(), result) {
+            (None, IoResult::Event(event)) => self.spooled(*event),
+            (Some(record), IoResult::Done) => {
+                self.hidden_key = None;
+                Ok(Next::Done(record))
             }
-            CreateUploadState::CleanupBlob => self.handle_cleanup_blob(event),
-            CreateUploadState::CleanupRecord => self.handle_cleanup_record(event),
-            CreateUploadState::QueueCleanup => self.handle_cleanup_queue(event),
-            CreateUploadState::ScheduleSweep => self.handle_schedule_sweep(event),
+            (_, other) => Err(CreateRoCrateError::UnexpectedEvent {
+                state: "call",
+                expected: "the spool event or the record write",
+                got: other.label(),
+            }),
         }
     }
 
-    fn is_complete(&self) -> bool {
-        matches!(
-            self.state,
-            CreateUploadState::Finish | CreateUploadState::Error
-        )
-    }
-
-    fn finalize(self) -> Result<Self::Output, Self::Error> {
-        self.output.ok_or(CreateRoCrateError::NotFinished)?
-    }
-
-    fn abort(&mut self) -> Effects {
-        if self.state == CreateUploadState::CleanupBlob {
-            return self.cleanup_effect();
+    /// Removes what a failed run left: the record, then the blob, with a cleanup row first so
+    /// the sweep finishes whatever of it does not land.
+    fn abort(&mut self) -> Vec<IoCall> {
+        let Some(hidden_key) = self.hidden_key.take() else {
+            return Vec::new();
+        };
+        let mut calls = vec![IoCall::Delete(vec![(
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(self.upload_id),
+        )])];
+        let obligation = RoCrateUploadCleanup {
+            upload_id: self.upload_id,
+            hidden_key: hidden_key.clone(),
+        };
+        if let Ok(value) = obligation.to_bytes() {
+            calls.push(IoCall::Write(vec![(
+                UPLOAD_CLEANUP_KEYSPACE.to_string(),
+                upload_key(self.upload_id),
+                ByteView::from(value),
+            )]));
         }
-        if self.state == CreateUploadState::CleanupRecord {
-            return self.record_effect();
-        }
-        if self.state == CreateUploadState::QueueCleanup {
-            return self.cleanup_obligation_effect();
-        }
-        if self.state == CreateUploadState::ScheduleSweep {
-            return smallvec![Effect::Task(TaskEffect::ShortenTimer {
+        calls.push(IoCall::Effect(Box::new(Effect::Blob(
+            BlobEffect::DeleteHidden { key: hidden_key },
+        ))));
+        calls.push(IoCall::Effect(Box::new(Effect::Task(
+            TaskEffect::ShortenTimer {
                 key: TaskKey::SweepHiddenBlobs,
                 after: Duration::ZERO,
-            })];
-        }
-        if self.is_complete() {
-            return smallvec![];
-        }
-        if self.hidden_key.is_some() {
-            self.fail_with_cleanup(CreateRoCrateError::Aborted)
-        } else {
-            self.fail(CreateRoCrateError::Aborted)
+            },
+        ))));
+        calls
+    }
+}
+
+/// Claims a stored upload for job `job_id` of `owner` in one write transaction; see
+/// [`claim_upload`]. A record the claim leaves unchanged is not written again.
+#[derive(Debug, PartialEq)]
+pub struct ClaimUploadOperation {
+    upload_id: Ulid,
+    owner: UserId,
+    job_id: JobId,
+    now_ms: u64,
+    claimed: Option<RoCrateUploadRecord>,
+}
+
+impl ClaimUploadOperation {
+    pub fn new(upload_id: Ulid, owner: UserId, job_id: JobId, now_ms: u64) -> Self {
+        Self {
+            upload_id,
+            owner,
+            job_id,
+            now_ms,
+            claimed: None,
         }
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
-pub enum UploadClaimError {
-    #[error("upload not found")]
-    NotFound,
-    #[error("upload is owned by another user")]
-    WrongOwner,
-    #[error("upload expired")]
-    Expired,
-    #[error("upload is already claimed")]
-    AlreadyClaimed,
-    #[error("upload record is invalid: {0}")]
-    Invalid(String),
-    #[error("upload storage failed: {0}")]
-    Storage(String),
+impl Operation for ClaimUploadOperation {
+    type Output = RoCrateUploadRecord;
+    type Error = UploadClaimError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn conflict_retries() -> u32 {
+        MUTATE_MAX_ATTEMPTS - 1
+    }
+
+    fn first(&mut self) -> Result<Next<RoCrateUploadRecord>, UploadClaimError> {
+        let row = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(self.upload_id),
+        );
+        Ok(Next::Call(IoCall::Read(vec![row])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<RoCrateUploadRecord>, UploadClaimError> {
+        if let Some(record) = self.claimed.take() {
+            result.done()?;
+            return Ok(Next::Done(record));
+        }
+        let [value] = values::<1>(result)?;
+        let value = value.ok_or(UploadClaimError::NotFound)?;
+        let invalid = |error: postcard::Error| UploadClaimError::Invalid(error.to_string());
+        let mut record: RoCrateUploadRecord = postcard::from_bytes(&value).map_err(invalid)?;
+        if !claim_upload(&mut record, self.owner, self.job_id, self.now_ms)? {
+            return Ok(Next::Done(record));
+        }
+        let value = ByteView::from(postcard::to_allocvec(&record).map_err(invalid)?);
+        let row = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(self.upload_id),
+            value,
+        );
+        self.claimed = Some(record);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
 }
 
 /// Claims `record` for job `job_id` of `owner`. A claimed upload stays with its job, also after it
@@ -469,218 +303,14 @@ pub(crate) fn claim_upload(
     }
 }
 
-/// Whether a bound upload can no longer start an import under [`claim_upload`]: it is unclaimed
-/// and expired, or it is gone and no import job holds its import key.
-pub(crate) fn upload_stale(
-    record: Option<&RoCrateUploadRecord>,
-    job_held: bool,
-    now_ms: u64,
-) -> bool {
-    match record {
-        Some(record) => record.claimed_by.is_none() && record.expires_at_ms <= now_ms,
-        None => !job_held,
-    }
-}
-
-pub async fn read_rocrate_upload(
-    storage: &StorageHandle,
-    upload_id: Ulid,
-) -> Result<Option<RoCrateUploadRecord>, String> {
-    match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(upload_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => postcard::from_bytes(value.as_ref())
-            .map(Some)
-            .map_err(|error| error.to_string()),
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(None),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload read event: {other:?}")),
-    }
-}
-
-pub async fn load_rocrate_upload(
-    context: &DriverContext,
-    upload_id: Ulid,
-) -> Result<Option<RoCrateUploadRecord>, String> {
-    read_rocrate_upload(&context.storage_handle, upload_id).await
-}
-
-pub async fn write_rocrate_upload(
-    storage: &StorageHandle,
-    record: &RoCrateUploadRecord,
-) -> Result<(), String> {
-    let value = postcard::to_allocvec(record).map_err(|error| error.to_string())?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(record.upload_id),
-            value: ByteView::from(value),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload write event: {other:?}")),
-    }
-}
-
-pub async fn claim_rocrate_upload(
-    storage: &StorageHandle,
-    upload_id: Ulid,
-    owner: UserId,
-    job_id: JobId,
-    now_ms: u64,
-) -> Result<RoCrateUploadRecord, UploadClaimError> {
-    for attempt in 0..MUTATE_MAX_ATTEMPTS {
-        let txn_id = start_txn(storage)
-            .await
-            .map_err(UploadClaimError::Storage)?;
-        let result = claim_in_txn(storage, txn_id, upload_id, owner, job_id, now_ms).await;
-        let record = match result {
-            Ok(record) => record,
-            Err(error) => {
-                abort_txn(storage, txn_id).await;
-                return Err(error);
-            }
-        };
-        match commit_write(
-            storage,
-            txn_id,
-            attempt,
-            "upload claim exhausted conflict retries",
-        )
-        .await
-        .map_err(|error| UploadClaimError::Storage(error.to_string()))?
-        {
-            CommitStep::Committed => return Ok(record),
-            CommitStep::Retry => continue,
-        }
-    }
-    Err(UploadClaimError::Storage(
-        "upload claim exhausted conflict retries".to_string(),
-    ))
-}
-
-pub async fn delete_rocrate_upload(
-    storage: &StorageHandle,
-    upload_id: Ulid,
-    claimed_by: JobId,
-) -> Result<(), String> {
-    let Some(record) = read_rocrate_upload(storage, upload_id).await? else {
-        return Ok(());
-    };
-    if record.claimed_by != Some(claimed_by) {
-        return Err("upload cleanup claim does not match the job".to_string());
-    }
-    match storage
-        .send_storage_effect(StorageEffect::Delete {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(upload_id),
-            txn_id: None,
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::DeleteResult { .. }) => Ok(()),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload delete event: {other:?}")),
-    }
-}
-
-async fn claim_in_txn(
-    storage: &StorageHandle,
-    txn_id: TxnId,
-    upload_id: Ulid,
-    owner: UserId,
-    job_id: JobId,
-    now_ms: u64,
-) -> Result<RoCrateUploadRecord, UploadClaimError> {
-    let value = match storage
-        .send_storage_effect(StorageEffect::Read {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(upload_id),
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult {
-            value: Some(value), ..
-        }) => value,
-        Event::Storage(StorageEvent::ReadResult { value: None, .. }) => {
-            return Err(UploadClaimError::NotFound);
-        }
-        Event::Storage(StorageEvent::Error { error }) => {
-            return Err(UploadClaimError::Storage(error.to_string()));
-        }
-        other => {
-            return Err(UploadClaimError::Storage(format!(
-                "unexpected upload claim read event: {other:?}"
-            )));
-        }
-    };
-    let mut record: RoCrateUploadRecord = postcard::from_bytes(value.as_ref())
-        .map_err(|error| UploadClaimError::Invalid(error.to_string()))?;
-    if !claim_upload(&mut record, owner, job_id, now_ms)? {
-        return Ok(record);
-    }
-    let value = postcard::to_allocvec(&record)
-        .map(ByteView::from)
-        .map_err(|error| UploadClaimError::Invalid(error.to_string()))?;
-    match storage
-        .send_storage_effect(StorageEffect::Write {
-            key_space: ROCRATE_UPLOAD_KEYSPACE.to_string(),
-            key: upload_key(upload_id),
-            value,
-            txn_id: Some(txn_id),
-        })
-        .await
-    {
-        Event::Storage(StorageEvent::WriteResult { .. }) => Ok(record),
-        Event::Storage(StorageEvent::Error { error }) => {
-            Err(UploadClaimError::Storage(error.to_string()))
-        }
-        other => Err(UploadClaimError::Storage(format!(
-            "unexpected upload claim write event: {other:?}"
-        ))),
-    }
-}
-
-async fn start_txn(storage: &StorageHandle) -> Result<TxnId, String> {
-    match storage
-        .send_storage_effect(StorageEffect::StartTransaction { read: false })
-        .await
-    {
-        Event::Storage(StorageEvent::TransactionStarted { txn_id }) => Ok(txn_id),
-        Event::Storage(StorageEvent::Error { error }) => Err(error.to_string()),
-        other => Err(format!("unexpected upload transaction event: {other:?}")),
-    }
-}
-
-async fn abort_txn(storage: &StorageHandle, txn_id: TxnId) {
-    let _ = storage
-        .send_storage_effect(StorageEffect::AbortTransaction { txn_id })
-        .await;
-}
-
-pub(crate) fn upload_key(upload_id: Ulid) -> ByteView {
-    ByteView::from(upload_id.to_bytes().to_vec())
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use aruna_core::structs::execution::job::RoCrateMediaType;
+    use aruna_core::structs::execution::job::input::RoCrateMediaType;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
     use aruna_core::structs::storage::format::StoredFormat;
-    use aruna_storage::FjallStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use std::collections::HashMap;
     use std::time::SystemTime;
     use tempfile::tempdir;
@@ -723,337 +353,93 @@ pub(crate) mod tests {
         (operation, location)
     }
 
+    fn spooled(location: BackendLocation) -> IoResult {
+        IoResult::Event(Box::new(Event::Blob(BlobEvent::HiddenSpooled {
+            location,
+            blake3: [4u8; 32],
+            size: 7,
+        })))
+    }
+
     #[test]
     fn carries_deadline() {
         let deadline = Instant::now();
         let (mut operation, _) = upload_operation_with(Some(deadline));
-        let effects = operation.start();
-        let [
-            Effect::Blob(BlobEffect::SpoolHidden {
-                deadline: actual, ..
-            }),
-        ] = effects.as_slice()
+        let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
+            panic!("expected hidden spool call")
+        };
+        let Effect::Blob(BlobEffect::SpoolHidden {
+            deadline: actual, ..
+        }) = *effect
         else {
             panic!("expected hidden spool effect")
         };
-        assert_eq!(*actual, Some(deadline));
+        assert_eq!(actual, Some(deadline));
     }
 
     #[test]
     fn creates_upload() {
         let (mut operation, location) = upload_operation();
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Blob(BlobEffect::SpoolHidden { .. })]
-        ));
-
-        let effects = operation.step(Event::Blob(BlobEvent::HiddenSpooled {
-            location,
-            blake3: [4u8; 32],
-            size: 7,
-        }));
-        let [Effect::Storage(StorageEffect::Write { value, .. })] = effects.as_slice() else {
+        operation.first().expect("spool call");
+        let Ok(Next::Call(IoCall::Write(rows))) = operation.next(spooled(location)) else {
             panic!("expected upload record write")
         };
-        let record: RoCrateUploadRecord = postcard::from_bytes(value.as_ref()).unwrap();
-
-        assert!(
-            operation
-                .step(Event::Storage(StorageEvent::WriteResult {
-                    key: upload_key(record.upload_id),
-                }))
-                .is_empty()
-        );
-        assert_eq!(operation.finalize().unwrap(), record);
+        let record: RoCrateUploadRecord = postcard::from_bytes(rows[0].2.as_ref()).unwrap();
+        assert_eq!(rows[0].0, ROCRATE_UPLOAD_KEYSPACE);
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(record)));
+        // A written record keeps its blob, so nothing is cleaned up afterwards.
+        assert!(operation.abort().is_empty());
     }
 
+    // A run that fails before the spool finished has no blob to clean up.
     #[test]
-    fn cleans_storage_error() {
-        let (mut operation, location) = upload_operation();
-        assert!(matches!(
-            operation.start().as_slice(),
-            [Effect::Blob(BlobEffect::SpoolHidden { .. })]
-        ));
-        assert!(matches!(
-            operation
-                .step(Event::Blob(BlobEvent::HiddenSpooled {
-                    location: location.clone(),
-                    blake3: [4u8; 32],
-                    size: 7,
-                }))
-                .as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key, .. })]
-                if key == &upload_key(Ulid::from_bytes([2u8; 16]))
-        ));
-        let effects = operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: upload_key(Ulid::from_bytes([2u8; 16])),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Blob(BlobEffect::DeleteHidden { key })]
-                if key == &HiddenBlobKey::try_from(&location).unwrap()
-        ));
-        assert!(
-            operation
-                .step(Event::Blob(BlobEvent::HiddenDeleted))
-                .is_empty()
-        );
-        assert_eq!(
-            operation.finalize(),
-            Err(CreateRoCrateError::Storage(StorageError::WriteError(
-                "boom".to_string()
-            )))
-        );
-    }
-
-    #[test]
-    fn queues_record_cleanup() {
-        let (mut operation, location) = upload_operation();
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::HiddenSpooled {
-            location: location.clone(),
-            blake3: [4u8; 32],
-            size: 7,
-        }));
-        let mut effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        for attempt in 0..3 {
-            if attempt < 2 {
-                assert!(matches!(
-                    effects.as_slice(),
-                    [Effect::Storage(StorageEffect::Delete { .. })]
-                ));
-            }
-            effects = operation.step(Event::Storage(StorageEvent::Error {
-                error: StorageError::WriteError("boom".to_string()),
-            }));
-        }
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space,
-                key,
-                value,
-                ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected durable cleanup row")
-        };
-        assert_eq!(key_space, UPLOAD_CLEANUP_KEYSPACE);
-        assert_eq!(key, &upload_key(Ulid::from_bytes([2u8; 16])));
-        let cleanup = RoCrateUploadCleanup::from_bytes(value.as_ref()).unwrap();
-        assert_eq!(cleanup.upload_id, Ulid::from_bytes([2u8; 16]));
-        assert_eq!(
-            cleanup.hidden_key,
-            HiddenBlobKey::try_from(&location).unwrap()
-        );
-
-        let effects = operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: upload_key(Ulid::from_bytes([2u8; 16])),
-        }));
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::SweepHiddenBlobs,
-                after
-            })] if after.is_zero()
-        ));
-        assert!(
-            operation
-                .step(Event::Task(TaskEvent::TimerScheduled {
-                    key: TaskKey::SweepHiddenBlobs,
-                    after: Duration::ZERO,
-                }))
-                .is_empty()
-        );
-        assert_eq!(
-            operation.hidden_key,
-            Some(HiddenBlobKey::try_from(&location).unwrap())
-        );
-        assert_eq!(
-            operation.finalize(),
-            Err(CreateRoCrateError::Storage(StorageError::WriteError(
-                "boom".to_string()
-            )))
-        );
-    }
-
-    /// Drives a failed record write through record deletion so the operation
-    /// waits in `CleanupBlob` with the spooled blob still owned.
-    fn cleanup_operation() -> (CreateRoCrateOperation, BackendLocation) {
-        let (mut operation, location) = upload_operation();
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::HiddenSpooled {
-            location: location.clone(),
-            blake3: [4u8; 32],
-            size: 7,
-        }));
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-        operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: upload_key(Ulid::from_bytes([2u8; 16])),
-        }));
-        (operation, location)
-    }
-
-    #[test]
-    fn retries_blob_cleanup() {
-        // A hidden blob that resists deletion is retried a bounded number of
-        // times and then handed to the sweeper instead of being orphaned.
-        let (mut operation, location) = cleanup_operation();
-        let hidden_key = HiddenBlobKey::try_from(&location).unwrap();
-        for _ in 0..2 {
-            let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ReadError(
-                "gone".to_string(),
-            ))));
-            assert!(matches!(
-                effects.as_slice(),
-                [Effect::Blob(BlobEffect::DeleteHidden { key })] if key == &hidden_key
-            ));
-        }
-        let effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ReadError(
-            "gone".to_string(),
+    fn spool_failure_clean() {
+        let (mut operation, _) = upload_operation();
+        operation.first().expect("spool call");
+        let failed = IoResult::Event(Box::new(Event::Blob(BlobEvent::Error(
+            BlobError::ChannelClosed,
         ))));
-
-        let [
-            Effect::Storage(StorageEffect::Write {
-                key_space, value, ..
-            }),
-        ] = effects.as_slice()
-        else {
-            panic!("expected durable cleanup row")
-        };
-        assert_eq!(key_space, UPLOAD_CLEANUP_KEYSPACE);
         assert_eq!(
-            RoCrateUploadCleanup::from_bytes(value.as_ref())
-                .unwrap()
-                .hidden_key,
-            hidden_key
-        );
-        assert!(matches!(
-            operation
-                .step(Event::Storage(StorageEvent::WriteResult {
-                    key: upload_key(Ulid::from_bytes([2u8; 16])),
-                }))
-                .as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer { .. })]
-        ));
-        assert!(operation.finalize().is_err());
-    }
-
-    #[test]
-    fn sweeps_without_obligation() {
-        // Even when the durable row cannot be written, the sweep is still
-        // requested and the operation terminates instead of retrying forever.
-        let (mut operation, _) = cleanup_operation();
-        let mut effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)));
-        for _ in 0..2 {
-            effects = operation.step(Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)));
-        }
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Storage(StorageEffect::Write { .. })]
-        ));
-        for _ in 0..2 {
-            assert!(matches!(
-                operation
-                    .step(Event::Storage(StorageEvent::Error {
-                        error: StorageError::WriteError("boom".to_string()),
-                    }))
-                    .as_slice(),
-                [Effect::Storage(StorageEffect::Write { .. })]
-            ));
-        }
-        let effects = operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
-
-        assert!(matches!(
-            effects.as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::SweepHiddenBlobs,
-                after,
-            })] if after.is_zero()
-        ));
-        assert!(
-            operation
-                .step(Event::Task(TaskEvent::Error {
-                    key: Some(TaskKey::SweepHiddenBlobs),
-                    message: "no runtime".to_string(),
-                }))
-                .is_empty()
-        );
-        assert!(operation.is_complete());
-        assert_eq!(
-            operation.finalize(),
+            operation.next(failed),
             Err(CreateRoCrateError::Blob(BlobError::ChannelClosed))
         );
+        assert!(operation.abort().is_empty());
     }
 
+    // A run that fails after the spool removes the record and the blob, and leaves a cleanup
+    // row and a sweep for whatever of that does not land.
     #[test]
-    fn aborts_during_cleanup() {
-        // Aborting mid-cleanup must re-emit the outstanding compensation so the
-        // record row and the hidden blob are never left behind.
+    fn abort_cleans_spool() {
         let (mut operation, location) = upload_operation();
-        operation.start();
-        operation.step(Event::Blob(BlobEvent::HiddenSpooled {
-            location: location.clone(),
-            blake3: [4u8; 32],
-            size: 7,
-        }));
-        operation.step(Event::Storage(StorageEvent::Error {
-            error: StorageError::WriteError("boom".to_string()),
-        }));
+        operation.first().expect("spool call");
+        operation.next(spooled(location)).expect("record write");
+        let calls = operation.abort();
         assert!(matches!(
-            operation.abort().as_slice(),
-            [Effect::Storage(StorageEffect::Delete { key_space, .. })]
-                if key_space == ROCRATE_UPLOAD_KEYSPACE
+            &calls[..],
+            [
+                IoCall::Delete(records),
+                IoCall::Write(cleanups),
+                IoCall::Effect(blob),
+                IoCall::Effect(timer),
+            ] if records[0].0 == ROCRATE_UPLOAD_KEYSPACE
+                && cleanups[0].0 == UPLOAD_CLEANUP_KEYSPACE
+                && matches!(**blob, Effect::Blob(BlobEffect::DeleteHidden { .. }))
+                && matches!(
+                    **timer,
+                    Effect::Task(TaskEffect::ShortenTimer {
+                        key: TaskKey::SweepHiddenBlobs,
+                        ..
+                    })
+                )
         ));
-
-        operation.step(Event::Storage(StorageEvent::DeleteResult {
-            key: upload_key(Ulid::from_bytes([2u8; 16])),
-        }));
-        assert!(matches!(
-            operation.abort().as_slice(),
-            [Effect::Blob(BlobEffect::DeleteHidden { key })]
-                if key == &HiddenBlobKey::try_from(&location).unwrap()
-        ));
-
-        for _ in 0..3 {
-            operation.step(Event::Blob(BlobEvent::Error(BlobError::ChannelClosed)));
-        }
-        assert!(matches!(
-            operation.abort().as_slice(),
-            [Effect::Storage(StorageEffect::Write { key_space, .. })]
-                if key_space == UPLOAD_CLEANUP_KEYSPACE
-        ));
-
-        operation.step(Event::Storage(StorageEvent::WriteResult {
-            key: upload_key(Ulid::from_bytes([2u8; 16])),
-        }));
-        assert!(matches!(
-            operation.abort().as_slice(),
-            [Effect::Task(TaskEffect::ShortenTimer {
-                key: TaskKey::SweepHiddenBlobs,
-                ..
-            })]
-        ));
+        assert!(operation.abort().is_empty());
     }
 
     #[tokio::test]
     async fn reclaims_expired_upload() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner = UserId::nil(realm_id);
         let upload_id = Ulid::from_bytes([2u8; 16]);
@@ -1082,19 +468,42 @@ pub(crate) mod tests {
             expires_at_ms: 10,
             claimed_by: None,
         };
-        write_rocrate_upload(&storage, &record).await.unwrap();
-        claim_rocrate_upload(&storage, upload_id, owner, job_id, 9)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+        aruna_drivers::driver::drive_retry(
+            || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 9),
+            &context,
+            &upload_id.to_bytes(),
+        )
+        .await
+        .unwrap();
 
-        let reclaimed = claim_rocrate_upload(&storage, upload_id, owner, job_id, 11)
-            .await
-            .unwrap();
+        let reclaimed = aruna_drivers::driver::drive_retry(
+            || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 11),
+            &context,
+            &upload_id.to_bytes(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(reclaimed.claimed_by, Some(job_id));
         assert!(matches!(
-            claim_rocrate_upload(&storage, upload_id, owner, JobId::from_bytes([6u8; 16]), 11)
-                .await,
+            aruna_drivers::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id,
+                    owner,
+                    JobId::from_bytes([6u8; 16]),
+                    11
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::AlreadyClaimed)
         ));
     }
@@ -1134,23 +543,38 @@ pub(crate) mod tests {
     async fn reads_missing_upload() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let upload_id = Ulid::from_bytes([2u8; 16]);
         assert!(
-            read_rocrate_upload(&storage, upload_id)
-                .await
-                .unwrap()
-                .is_none()
+            aruna_drivers::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+                &context
+            )
+            .await
+            .map_err(|error| error.0)
+            .unwrap()
+            .is_none()
         );
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
-        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 10))
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 10).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         assert_eq!(
-            read_rocrate_upload(&storage, upload_id)
-                .await
-                .unwrap()
-                .unwrap()
-                .owner,
+            aruna_drivers::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+                &context
+            )
+            .await
+            .map_err(|error| error.0)
+            .unwrap()
+            .unwrap()
+            .owner,
             owner
         );
     }
@@ -1159,20 +583,41 @@ pub(crate) mod tests {
     async fn claim_rejects_owner() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let realm_id = RealmId::from_bytes([1u8; 32]);
         let owner = UserId::nil(realm_id);
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
         assert!(matches!(
-            claim_rocrate_upload(&storage, upload_id, owner, job_id, 5).await,
+            aruna_drivers::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id, owner, job_id, 5
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::NotFound)
         ));
-        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 100))
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 100).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         let intruder = UserId::new(Ulid::from_bytes([7u8; 16]), realm_id);
         assert!(matches!(
-            claim_rocrate_upload(&storage, upload_id, intruder, job_id, 5).await,
+            aruna_drivers::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id, intruder, job_id, 5
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::WrongOwner)
         ));
     }
@@ -1181,14 +626,28 @@ pub(crate) mod tests {
     async fn claim_rejects_expired() {
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
-        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 10))
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 10).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         assert!(matches!(
-            claim_rocrate_upload(&storage, upload_id, owner, job_id, 10).await,
+            aruna_drivers::driver::drive_retry(
+                || crate::jobs::import::upload::ClaimUploadOperation::new(
+                    upload_id, owner, job_id, 10
+                ),
+                &context,
+                &upload_id.to_bytes()
+            )
+            .await,
             Err(UploadClaimError::Expired)
         ));
     }
@@ -1198,32 +657,95 @@ pub(crate) mod tests {
         // Cleanup deletes only when the claiming job matches; an absent upload is a no-op.
         let dir = tempdir().unwrap();
         let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let context = aruna_drivers::testing::test_context(storage.clone());
         let owner = UserId::nil(RealmId::from_bytes([1u8; 32]));
         let upload_id = Ulid::from_bytes([2u8; 16]);
         let job_id = JobId::from_bytes([3u8; 16]);
-        delete_rocrate_upload(&storage, upload_id, job_id)
-            .await
-            .unwrap();
-        write_rocrate_upload(&storage, &upload_record(owner, upload_id, 100))
-            .await
-            .unwrap();
-        claim_rocrate_upload(&storage, upload_id, owner, job_id, 5)
-            .await
-            .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::WriteUploadOperation::new(
+                upload_record(owner, upload_id, 100).clone(),
+            ),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
+        aruna_drivers::driver::drive_retry(
+            || crate::jobs::import::upload::ClaimUploadOperation::new(upload_id, owner, job_id, 5),
+            &context,
+            &upload_id.to_bytes(),
+        )
+        .await
+        .unwrap();
         let intruder = JobId::from_bytes([8u8; 16]);
         assert!(
-            delete_rocrate_upload(&storage, upload_id, intruder)
-                .await
-                .is_err()
-        );
-        delete_rocrate_upload(&storage, upload_id, job_id)
+            aruna_drivers::driver::drive(
+                crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, intruder),
+                &context
+            )
             .await
-            .unwrap();
+            .map_err(|error| error.0)
+            .is_err()
+        );
+        aruna_drivers::driver::drive(
+            crate::jobs::import::upload_store::DeleteUploadOperation::new(upload_id, job_id),
+            &context,
+        )
+        .await
+        .map_err(|error| error.0)
+        .unwrap();
         assert!(
-            read_rocrate_upload(&storage, upload_id)
-                .await
-                .unwrap()
-                .is_none()
+            aruna_drivers::driver::drive(
+                crate::jobs::import::upload_store::ReadUploadOperation::new(upload_id),
+                &context
+            )
+            .await
+            .map_err(|error| error.0)
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    // A claim writes the job into an unclaimed upload once; a repeat changes nothing.
+    #[test]
+    fn claim_writes_once() {
+        use crate::jobs::store::mutation::{Rows, run_in_memory};
+        let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+        let upload_id = Ulid::from_bytes([3u8; 16]);
+        let job_id = JobId::from_bytes([4u8; 16]);
+        let missing = ClaimUploadOperation::new(upload_id, owner, job_id, 5);
+        assert_eq!(missing.transaction(), TransactionMode::Write);
+        let mut rows = Rows::new();
+        assert_eq!(
+            run_in_memory(missing, &mut rows),
+            Err(UploadClaimError::NotFound)
+        );
+
+        let record = upload_record(owner, upload_id, 10);
+        let key = (
+            ROCRATE_UPLOAD_KEYSPACE.to_string(),
+            upload_key(upload_id).to_vec(),
+        );
+        rows.insert(key.clone(), postcard::to_allocvec(&record).unwrap());
+        let claim = ClaimUploadOperation::new(upload_id, owner, job_id, 5);
+        let claimed = run_in_memory(claim, &mut rows).expect("claimed");
+        assert_eq!(claimed.claimed_by, Some(job_id));
+        let stored: RoCrateUploadRecord = postcard::from_bytes(&rows[&key]).unwrap();
+        assert_eq!(stored, claimed);
+
+        let again = ClaimUploadOperation::new(upload_id, owner, job_id, 11);
+        assert_eq!(run_in_memory(again, &mut rows), Ok(claimed));
+        let other = ClaimUploadOperation::new(upload_id, owner, JobId::from_bytes([6u8; 16]), 5);
+        assert_eq!(
+            run_in_memory(other, &mut rows),
+            Err(UploadClaimError::AlreadyClaimed)
         );
     }
 }

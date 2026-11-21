@@ -674,7 +674,7 @@ fn folder_backend(
         timeouts: Default::default(),
     };
     let backend_id = ulid::Ulid::generate();
-    let entry = std::sync::Arc::new(crate::blob::NodeBackend::new(config, None));
+    let entry = std::sync::Arc::new(crate::blob::registry::NodeBackend::new(config, None));
     let groups = std::collections::HashMap::from([(backend_id, entry)]);
     let handler = crate::blob::BlobHandler {
         registry: handler.registry.with_groups(groups),

@@ -5,6 +5,8 @@
 use super::*;
 use serde_json::json;
 
+use crate::auth::install_access::parse_grants;
+
 fn manifest(extra: serde_json::Value) -> Manifest {
     let mut value = json!({
         "name": "dataset-announcer",
@@ -151,11 +153,23 @@ fn unsupported_manifests() {
         json!({ "triggers": { "webhook": {} } }),
         json!({ "permissions": { "optional": ["secrets.value"] } }),
     ];
+    let open = ComputeQuota::default();
     for extra in cases {
-        assert_eq!(check_supported(&manifest(extra.clone())), Ok(()), "{extra}");
+        let checked = check_supported(&manifest(extra.clone()), &open);
+        assert_eq!(checked, Ok(()), "{extra}");
     }
-    let jobs = manifest(json!({ "permissions": { "optional": ["jobs.run"] } }));
-    assert!(check_supported(&jobs).is_err());
+    // Tasks are supported, within the group's per-job limits.
+    let image = format!("harbor.example/map@sha256:{}", "a".repeat(64));
+    let tasks = manifest(json!({
+        "permissions": { "required": ["jobs.run"] },
+        "recipes": { "map": { "image": image, "cpu": 8, "memory": 1024, "time": 60 } }
+    }));
+    assert_eq!(check_supported(&tasks, &open), Ok(()));
+    let small = ComputeQuota {
+        job_cpu_cores: Some(4),
+        ..ComputeQuota::default()
+    };
+    assert!(check_supported(&tasks, &small).is_err());
 }
 
 #[test]
@@ -181,4 +195,21 @@ fn update_keeps_grants() {
     let writer = manifest(json!({ "permissions": { "required": ["metadata.write"] } }));
     let (_, missing) = carry_grants(&kept, &writer, &scope);
     assert_eq!(missing, vec!["write".to_string()]);
+}
+
+#[test]
+fn account_access_follows() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(4, 4));
+    let realm = install.account.realm_id;
+    let patterns = BTreeSet::from(["/r/g/x/meta/**".to_string()]);
+    let account = restricted_account((&install, realm), &patterns, Permission::ObjectsCopy);
+    let restrictions = account.path_restrictions.unwrap();
+    assert_eq!(restrictions.len(), 1);
+    assert_eq!(restrictions[0].permission, Access::WRITE);
+    assert_eq!(
+        (account.user_id, account.realm_id),
+        (install.account, realm)
+    );
+    let read = restricted_account((&install, realm), &patterns, Permission::MetadataRead);
+    assert_eq!(read.path_restrictions.unwrap()[0].permission, Access::READ);
 }

@@ -6,10 +6,11 @@
 #![deny(unsafe_code)]
 #![recursion_limit = "256"]
 
-mod config;
-mod connection_pool;
+pub mod config;
+pub mod connection_pool;
 mod connectivity;
 mod construction;
+pub mod contacts;
 pub mod device_limits;
 pub mod dht;
 mod discovery;
@@ -17,7 +18,13 @@ pub mod document_sync;
 mod effect_handlers;
 pub mod error;
 mod eviction;
-mod heartbeat;
+pub mod frames;
+pub mod heartbeat;
+pub mod issuer_keys;
+pub mod job_control;
+pub mod notification;
+pub mod shard_manifest;
+mod signing;
 pub mod streams;
 mod tasks;
 mod telemetry;
@@ -31,11 +38,11 @@ mod tests_reload;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use aruna_core::UserId;
 use aruna_core::alpn::Alpn;
-use aruna_core::document::{DocumentEvictedDocument, DocumentReconcileResult, DocumentTarget};
+use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
 use aruna_core::handle::Handle;
@@ -44,9 +51,10 @@ use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, WatchInterestTable};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::info::{NetState, NetworkDiagnosticsState};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::{NetState, NetworkDiagnosticsState};
-use aruna_storage::StorageHandle;
+use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
@@ -57,16 +65,13 @@ use tokio_util::task::TaskTracker;
 use tracing::{Span, debug, warn};
 use ulid::Ulid;
 
-pub use ::irokle::net::IrohRuntimeConfig;
-pub use config::{
-    DiscoveryMethod, NetConfig, RelayMethod, format_endpoint_config, parse_endpoint_config,
-};
-pub use connection_pool::{Monitor, PoolCounts};
-pub use dht::DhtHandle;
-pub use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
-pub use error::{NetError, Result};
-pub use heartbeat::HeartbeatSlot;
-pub use streams::StreamsService;
+use config::{DiscoveryMethod, RelayMethod};
+use connection_pool::{Monitor, PoolCounts};
+use dht::handle::DhtHandle;
+use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
+use error::{NetError, Result};
+use heartbeat::HeartbeatSlot;
+use streams::StreamsService;
 
 use connection_pool::ConnectionPool;
 use connectivity::{
@@ -120,9 +125,19 @@ struct NetInner {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     /// Storage change count of the last realm config reload; `None` forces the next reload.
     config_applied: tokio::sync::Mutex<Option<u64>>,
+    /// A lock-free copy of `config_applied` (`u64::MAX` for `None`), so an unchanged config
+    /// costs a storage commit no lock.
+    config_seen: AtomicU64,
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
+    peer_contacts: contacts::PeerContacts,
+    issuer_keys: issuer_keys::IssuerKeys,
+    /// The realm or issuer key this node signs federation payloads with, installed at start.
+    federation_keys: std::sync::OnceLock<aruna_core::structs::identity::auth::NodeCapabilities>,
+    /// Test hook: the payload of the next answer a frame request drops as if lost.
+    #[cfg(feature = "test-hooks")]
+    dropped_answer: parking_lot::Mutex<Option<Vec<u8>>>,
     download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
     avoided_holders: aruna_core::download_slots::AvoidList,
     notification_watch_metrics: NotificationWatchMetrics,
@@ -197,6 +212,14 @@ impl NetHandle {
         self.inner.endpoint.secret_key().sign(message)
     }
 
+    /// Signs a member statement when it names this node; see the `StatementSign` effect.
+    pub fn sign_statement(
+        &self,
+        claim: aruna_core::structs::storage::distribution::statement::StatementClaim,
+    ) -> aruna_core::events::StatementSignEvent {
+        effect_handlers::sign_statement(self.inner.endpoint.secret_key(), claim)
+    }
+
     /// Issuer-local key that encrypts S3 credential secrets at rest. Derived
     /// from this node's secret, so only this node can decrypt what it wrote.
     pub fn credential_encryption_key(
@@ -250,6 +273,12 @@ impl NetHandle {
         self.inner.document_sync.database()
     }
 
+    /// Waits until no document reconcile, shard membership change or eviction runs, and keeps
+    /// them out while the guard lives.
+    pub async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.document_sync.hold_reconcile().await
+    }
+
     pub async fn sync_topic_peers(
         &self,
         topic_id: ::irokle::TopicId,
@@ -258,6 +287,27 @@ impl NetHandle {
         self.inner
             .document_sync
             .sync_with_peers(topic_id, peers)
+            .await
+    }
+
+    /// One realm config catch-up round with `peer`; `None` when it stopped at its page budget.
+    pub async fn catch_up_round(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peer: NodeId,
+    ) -> Result<Option<::irokle::ActorClock>> {
+        self.inner.document_sync.sync_round(topic_id, peer).await
+    }
+
+    /// Whether this node applied `topic_id` up to every one of `targets`.
+    pub async fn applied_covers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        targets: &[::irokle::ActorClock],
+    ) -> Result<bool> {
+        self.inner
+            .document_sync
+            .applied_covers(topic_id, targets)
             .await
     }
 
@@ -322,20 +372,6 @@ impl NetHandle {
             .await
     }
 
-    /// Shard-topic anti-entropy for the startup restore and placement
-    /// reconciler: ensures the topics locally, syncs them with `peers`, and
-    /// reconciles the applied events.
-    pub async fn sync_document_topics(
-        &self,
-        topics: Vec<::irokle::TopicId>,
-        peers: Vec<NodeId>,
-    ) -> aruna_core::document::DocumentNetEvent {
-        self.inner
-            .document_sync
-            .sync_documents_event(topics, peers)
-            .await
-    }
-
     pub async fn handle_sync_stream(
         &self,
         stream: streams::BiStream,
@@ -345,25 +381,6 @@ impl NetHandle {
             .document_sync
             .handle_inbound_stream(stream, peer)
             .await
-    }
-
-    pub async fn reconcile_sync_topics(
-        &self,
-        topic_ids: Vec<::irokle::TopicId>,
-    ) -> Result<DocumentReconcileResult> {
-        let applied = self
-            .inner
-            .document_sync
-            .reconcile_sync_topics(topic_ids)
-            .await?;
-        if applied
-            .targets
-            .iter()
-            .any(|target| matches!(target, DocumentTarget::RealmConfig { .. }))
-        {
-            self.reload_realm_peers().await?;
-        }
-        Ok(applied)
     }
 
     /// Connection-attempt counters behind the structured connection
@@ -419,7 +436,7 @@ impl NetHandle {
     ) -> Result<Vec<NodeId>> {
         let mut applied = self.inner.config_applied.lock().await;
         // A supplied document may be older than storage, so the next check reloads.
-        *applied = None;
+        self.mark_applied(&mut applied, None);
         self.apply_document(document).await
     }
 
@@ -490,6 +507,9 @@ impl NetHandle {
     /// Reloads realm peers only when storage reports a realm config change since the last
     /// successful reload, or when peers came from a supplied document since then.
     pub async fn reload_if_changed(&self) -> Result<Option<Vec<NodeId>>> {
+        if self.inner.config_seen.load(Ordering::Acquire) == self.inner.storage.config_changes() {
+            return Ok(None);
+        }
         let mut applied = self.inner.config_applied.lock().await;
         if *applied == Some(self.inner.storage.config_changes()) {
             return Ok(None);
@@ -500,7 +520,7 @@ impl NetHandle {
     async fn reload_locked(&self, applied: &mut Option<u64>) -> Result<Option<Vec<NodeId>>> {
         // Read before the row, so a change during this reload moves the count past it.
         let seen = self.inner.storage.config_changes();
-        *applied = None;
+        self.mark_applied(applied, None);
         let target = DocumentTarget::RealmConfig {
             realm_id: self.inner.realm_id,
         };
@@ -508,14 +528,21 @@ impl NetHandle {
             .read_storage(target.storage_keyspace().to_string(), target.storage_key())
             .await?
         else {
-            *applied = Some(seen);
+            self.mark_applied(applied, Some(seen));
             return Ok(None);
         };
         let document = RealmConfigDocument::from_bytes(&bytes)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let peers = self.apply_document(&document).await?;
-        *applied = Some(seen);
+        self.mark_applied(applied, Some(seen));
         Ok(Some(peers))
+    }
+
+    /// Records the applied change count under the `config_applied` lock and in its copy.
+    fn mark_applied(&self, applied: &mut Option<u64>, value: Option<u64>) {
+        *applied = value;
+        let seen = value.unwrap_or(u64::MAX);
+        self.inner.config_seen.store(seen, Ordering::Release);
     }
 
     pub async fn realm_peers(&self) -> Vec<NodeId> {
@@ -553,6 +580,48 @@ impl NetHandle {
     /// Holders this node skips for a while after they failed.
     pub fn avoided_holders(&self) -> &aruna_core::download_slots::AvoidList {
         &self.inner.avoided_holders
+    }
+
+    /// When this node last saw each authorized peer.
+    pub fn peer_contacts(&self) -> contacts::PeerContacts {
+        self.inner.peer_contacts.clone()
+    }
+
+    /// The trusted issuer keys this node checked.
+    pub fn issuer_keys(&self) -> &issuer_keys::IssuerKeys {
+        &self.inner.issuer_keys
+    }
+
+    /// Installs the key this node signs federation payloads with; a second install is ignored.
+    pub fn install_federation_keys(
+        &self,
+        capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
+    ) {
+        let _ = self.inner.federation_keys.set(capabilities);
+    }
+
+    /// The key this node signs federation payloads with, once installed.
+    pub fn federation_keys(
+        &self,
+    ) -> Option<&aruna_core::structs::identity::auth::NodeCapabilities> {
+        self.inner.federation_keys.get()
+    }
+
+    /// Test hook: the next frame request whose answer payload is `payload` fails as if the
+    /// answer was lost after the peer acted on the request.
+    #[cfg(feature = "test-hooks")]
+    pub fn drop_answer(&self, payload: Vec<u8>) {
+        *self.inner.dropped_answer.lock() = Some(payload);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_dropped(&self, answer: &[u8]) -> bool {
+        let mut dropped = self.inner.dropped_answer.lock();
+        let matches = dropped.as_deref() == Some(answer);
+        if matches {
+            dropped.take();
+        }
+        matches
     }
 
     /// Time since the last heartbeat of `node`, or since this node started without one.
@@ -1052,6 +1121,18 @@ impl Handle for NetHandle {
     )]
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
+            // The round trip needs this handle's streams, so it never reaches the effect actor.
+            Effect::Net(NetEffect::JobControl(job)) => Event::Net(NetEvent::JobControl(
+                job_control::exchange(self, job.owner, job.request).await,
+            )),
+            // The heartbeat table belongs to this handle.
+            Effect::Net(NetEffect::HeartbeatSilence(nodes)) => {
+                let silence = nodes
+                    .into_iter()
+                    .map(|node| (node, self.heartbeat_silence(node).as_millis() as u64))
+                    .collect();
+                Event::Net(NetEvent::HeartbeatSilence(silence))
+            }
             Effect::Net(net_effect) => {
                 let (tx, rx) = oneshot::channel();
                 if self
@@ -1080,25 +1161,68 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
         Effect::Net(NetEffect::Stream(_)) => "stream",
         Effect::Net(NetEffect::JobControl(_)) => "job_control",
-        Effect::Net(NetEffect::AuditPage(_)) => "audit_page",
-        Effect::Net(NetEffect::PolicyFetch(_)) => "policy_fetch",
-        Effect::Net(NetEffect::JobRecord(_)) => "job_record",
-        Effect::Net(NetEffect::LaunchOffer(_)) => "launch_offer",
         Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
-        Effect::Net(NetEffect::VaultFetch(_)) => "vault_fetch",
+        Effect::Net(NetEffect::SignDeletePlan(_)) => "sign_delete_plan",
+        Effect::Net(NetEffect::SignCountRelay(_)) => "sign_count_relay",
         Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
         Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
         Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
-        Effect::Net(NetEffect::Release(_)) => "release",
+        Effect::Net(NetEffect::ExecutionSign(_)) => "execution_sign",
+        Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
+        Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
+        Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
+        Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
+        Effect::Net(NetEffect::PeerContact(_)) => "peer_contact",
+        Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
+        Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",
+        Effect::Net(NetEffect::AvoidHolder { .. }) => "avoid_holder",
+        Effect::Net(NetEffect::CursorSign(_)) => "cursor_sign",
+        Effect::Net(NetEffect::FederationSign(_)) => "federation_sign",
+        Effect::Net(NetEffect::OpenCredential(_)) => "open_credential",
+        Effect::Net(NetEffect::AdminSign { .. }) => "admin_sign",
+        Effect::Net(NetEffect::SealPosition(_)) => "seal_position",
+        Effect::Net(NetEffect::OpenPosition(_)) => "open_position",
+        Effect::Net(NetEffect::DrawSecret(_)) => "draw_secret",
+        Effect::Net(NetEffect::Shard(_)) => "shard",
+        Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
+        Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
+        Effect::Net(NetEffect::SyncTopic { .. }) => "sync_topic",
+        Effect::Net(NetEffect::MissingTopicPeers { .. }) => "missing_topic_peers",
+        Effect::Net(NetEffect::ConfigCatchUp(_)) => "config_catch_up",
+        Effect::Net(NetEffect::Notification(_)) => "notification",
+        Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
+        Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
+        Effect::Net(NetEffect::HeartbeatSilence(_)) => "heartbeat_silence",
+        Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
+        Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
+        Effect::Net(NetEffect::PeerContacts { .. }) => "peer_contacts",
+        Effect::Net(NetEffect::LocalNode) => "local_node",
+        Effect::Net(NetEffect::LocalRealm) => "local_realm",
+        Effect::Net(NetEffect::IssuerKey { .. }) => "issuer_key",
+        Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
+        Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
+        Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",
+        Effect::Net(NetEffect::ReplaceInterest(_)) => "replace_interest",
+        Effect::Net(NetEffect::UpdateRealmInterest { .. }) => "update_realm_interest",
         Effect::Blob(_) => "blob",
         Effect::StagingSource(_) => "staging_source",
         Effect::LocalFile(_) => "local_file",
         Effect::Storage(_) => "storage",
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
+        Effect::Background(_) => "background",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
+        Effect::Index(_) => "index",
+        Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
+        Effect::Git(_) => "git",
+        Effect::Outbound(_) => "outbound",
+        Effect::Plugin(_) => "plugin",
+        Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
     }
 }
 pub(crate) fn unique_endpoint_addrs(

@@ -1,28 +1,38 @@
-//! Starts runs on the receiver: by hand with the manual form, and on `every` timers. A timer
-//! queues its occurrence and advances its last due time in one transaction.
+//! Starts runs on the receiver: by hand with the manual form, on `every` timers and from checked
+//! webhooks. A timer queues its occurrence and advances its last due time in one transaction.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::NodeId;
-use aruna_core::keyspaces::PLUGIN_RUNS_KEYSPACE;
-use aruna_core::plugin_installs::{InstallState, PluginInstall};
-use aruna_core::plugin_runs::{
-    MAX_INPUT, PluginRun, RunState, RunTrigger, SourceEvent, SourceKind, timer_key,
-};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::id::NodeId;
+use aruna_core::id_mint::IdMint;
+use aruna_core::injection::verify_request;
+use aruna_core::operation::{HoldScope, Operation};
+use aruna_core::plugin_installs::{BoundScope, InstallState, PluginInstall};
+use aruna_core::plugin_runs::{HookRequest, MAX_INPUT, PluginRun, RunTrigger};
+use aruna_core::plugins::{ReleaseRequest, Released};
+use aruna_core::secrets::Delivery;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
-use aruna_plugins::trigger::{Trigger, TriggerKind};
-use serde::{Deserialize, Serialize};
+use aruna_plugin_types::manifest::{Manifest, SecretKind};
+use aruna_plugin_types::trigger::TriggerKind;
+use std::collections::VecDeque;
+use std::sync::Arc;
 use ulid::Ulid;
 
-use super::install::{InstallError, check_admin, pick_version, read_config, read_manifest};
+use super::bound::{CheckNodeBinding, NodeCheckFailure, delivery_clash, vault_kind};
+use super::held::{AskRelease, fresh_fields};
+use super::hooks::{DROPPED, HookError};
+use super::install::{InstallError, admin_answer, admin_call, pick_version, read_manifest};
+use super::rate::{take_hook, taken};
 use super::receiver::lost_reason;
-use super::runs::{ADMISSIONS, RunError, admit, admit_in};
+use super::rows::StoreError;
+use super::runs::{RunError, admit, declared_trigger, enqueue_timer, new_run};
+use super::secret_use::{ReleaseFailure, SelectSecret, Selected};
 use super::settings::{SettingError, check_fields};
-use super::store::{StoreError, Txn, decode, encode, transact};
-use crate::driver::DriverContext;
+use crate::document_repository::{GetConfigError, GetConfigOperation};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, thiserror::Error)]
 pub enum StartError {
     #[error(transparent)]
     Install(#[from] InstallError),
@@ -43,219 +53,450 @@ pub enum StartError {
     Run(#[from] RunError),
 }
 
-/// The last due occurrence of an install's timer, and occurrences skipped at the queue bound.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TimerRow {
-    pub last_due_ms: u64,
-    pub skipped: u64,
-}
-
-/// The trigger's name when the install's pinned version declares it; the guest picks its
-/// function by this name.
-fn handler(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    kind: TriggerKind,
-) -> Option<String> {
-    trigger(config, install, kind).map(|_| kind.as_str().to_string())
-}
-
-/// The trigger of `kind` the install's pinned version declares.
-fn trigger(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    kind: TriggerKind,
-) -> Option<Trigger> {
-    let plugin = pick_version(config, &install.plugin, Some(&install.digest)).ok()?;
-    read_manifest(&plugin).ok()?.triggers.remove(&kind)
-}
-
-/// A queued run of the install's current revision, due at `due_ms`.
-pub(super) fn new_run(
-    install: &PluginInstall,
-    handler: String,
-    trigger: RunTrigger,
-    due_ms: u64,
-) -> PluginRun {
-    PluginRun {
-        run_id: Ulid::generate(),
-        install_id: install.install_id,
-        group_id: install.group_id,
-        plugin: install.plugin.clone(),
-        version: install.version.clone(),
-        revision: install.revision,
-        digest: install.digest.clone(),
-        handler,
-        settings: install.settings.clone(),
-        trigger,
-        state: RunState::Queued,
-        attempts: 0,
-        due_ms,
-        created_ms: due_ms,
-        finished_ms: None,
-        message: None,
-        output: None,
-        log: Vec::new(),
+impl From<IoError> for StartError {
+    fn from(error: IoError) -> Self {
+        Self::Install(error.into())
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum StartPhase {
+    Config,
+    Admin(Box<RealmConfigDocument>),
+    Admitting(Box<PluginRun>),
 }
 
 /// Queues a manual run for a group admin with the form's values, defaults filled in. Only the
 /// install's receiver admits it; an install over its queue bound refuses it.
-pub async fn start_run(
-    ctx: &DriverContext,
-    auth: &AuthContext,
+#[derive(Debug, PartialEq)]
+pub struct StartRun {
+    auth: AuthContext,
     realm_id: RealmId,
     local: NodeId,
     install_id: Ulid,
-    input: &str,
+    input: String,
     now_ms: u64,
-) -> Result<PluginRun, StartError> {
-    let config = read_config(ctx, realm_id).await?;
-    let install = (config.installs.iter())
-        .find(|install| install.install_id == install_id)
-        .ok_or(InstallError::NotFound)?;
-    check_admin(ctx, auth, install.group_id).await?;
-    if let Some(reason) = lost_reason(&config, install.receiver) {
-        let receiver = install.receiver;
-        return Err(StartError::Lost { receiver, reason });
-    }
-    if install.receiver != local {
-        return Err(StartError::Elsewhere(install.receiver));
-    }
-    if install.state != InstallState::Active {
-        return Err(InstallError::State(install.state.as_str()).into());
-    }
-    let values: serde_json::Map<String, serde_json::Value> = (input.len() <= MAX_INPUT)
-        .then(|| serde_json::from_str(input).ok())
-        .flatten()
-        .ok_or(StartError::Input)?;
-    let manual = TriggerKind::Manual;
-    let form = trigger(&config, install, manual).ok_or(StartError::NoTrigger("manual"))?;
-    let checked = check_fields(&form.form, &values).map_err(StartError::Form)?;
-    let input = serde_json::Value::Object(checked).to_string();
-    if input.len() > MAX_INPUT {
-        return Err(StartError::Input);
-    }
-    let trigger = RunTrigger::Manual {
-        by: auth.user_id,
-        input,
-    };
-    let run = new_run(install, manual.as_str().to_string(), trigger, now_ms);
-    admit(ctx, &run).await?;
-    Ok(run)
+    ids: IdMint,
+    phase: StartPhase,
 }
 
-/// A run of the install's handler for the event's kind, due at `now_ms`, or `None` when the
-/// manifest has no trigger of that kind.
-pub fn event_run(
-    config: &RealmConfigDocument,
-    install: &PluginInstall,
-    event: &SourceEvent,
-    now_ms: u64,
-) -> Option<PluginRun> {
-    let handler = handler(config, install, event_trigger(event.kind))?;
-    let trigger = RunTrigger::Event(event.clone());
-    Some(new_run(install, handler, trigger, now_ms))
+impl StartRun {
+    pub fn new(
+        auth: &AuthContext,
+        (realm_id, local): (RealmId, NodeId),
+        install_id: Ulid,
+        input: &str,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            auth: auth.clone(),
+            realm_id,
+            local,
+            install_id,
+            input: input.to_string(),
+            now_ms,
+            ids: IdMint::default(),
+            phase: StartPhase::Config,
+        }
+    }
+
+    fn install<'a>(
+        &self,
+        config: &'a RealmConfigDocument,
+    ) -> Result<&'a PluginInstall, InstallError> {
+        (config.installs.iter())
+            .find(|install| install.install_id == self.install_id)
+            .ok_or(InstallError::NotFound)
+    }
+
+    /// The run the form asks for, on a receiver that may start it.
+    fn new_manual(
+        &self,
+        config: &RealmConfigDocument,
+        run_id: Ulid,
+    ) -> Result<PluginRun, StartError> {
+        let install = self.install(config)?;
+        if let Some(reason) = lost_reason(config, install.receiver) {
+            let receiver = install.receiver;
+            return Err(StartError::Lost { receiver, reason });
+        }
+        if install.receiver != self.local {
+            return Err(StartError::Elsewhere(install.receiver));
+        }
+        if install.state != InstallState::Active {
+            return Err(InstallError::State(install.state.as_str()).into());
+        }
+        let values: serde_json::Map<String, serde_json::Value> = (self.input.len() <= MAX_INPUT)
+            .then(|| serde_json::from_str(&self.input).ok())
+            .flatten()
+            .ok_or(StartError::Input)?;
+        let manual = TriggerKind::Manual;
+        let form = declared_trigger(config, install, manual);
+        let form = form.ok_or(StartError::NoTrigger("manual"))?;
+        let checked = check_fields(&form.form, &values).map_err(StartError::Form)?;
+        let input = serde_json::Value::Object(checked).to_string();
+        if input.len() > MAX_INPUT {
+            return Err(StartError::Input);
+        }
+        let trigger = RunTrigger::Manual {
+            by: self.auth.user_id,
+            input,
+        };
+        let handler = manual.as_str().to_string();
+        Ok(new_run(install, handler, trigger, (run_id, self.now_ms)))
+    }
 }
 
-/// The manifest trigger a journaled event kind starts.
-pub fn event_trigger(kind: SourceKind) -> TriggerKind {
-    match kind {
-        SourceKind::DatasetCreated => TriggerKind::DatasetCreated,
-        SourceKind::DataUploaded => TriggerKind::DataUploaded,
-        SourceKind::DatasetUpdated => TriggerKind::DatasetUpdated,
-        SourceKind::SyncCompleted => TriggerKind::SyncCompleted,
-        SourceKind::SyncFailed => TriggerKind::SyncFailed,
-        SourceKind::JobFinished => TriggerKind::JobFinished,
+impl Operation for StartRun {
+    type Output = PluginRun;
+    type Error = StartError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
+    fn first(&mut self) -> Result<Next<PluginRun>, StartError> {
+        let read = GetConfigOperation::new(self.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<PluginRun>, StartError> {
+        match std::mem::replace(&mut self.phase, StartPhase::Config) {
+            StartPhase::Config => {
+                let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+                let config = config.map_err(InstallError::from)?;
+                let group_id = self.install(&config)?.group_id;
+                self.phase = StartPhase::Admin(Box::new(config));
+                Ok(Next::Call(admin_call(&self.auth, group_id)))
+            }
+            StartPhase::Admin(config) => {
+                admin_answer(result)?;
+                let run_id = self.ids.mint(self.now_ms);
+                let run = self.new_manual(&config, run_id)?;
+                let queue = admit(run.clone());
+                self.phase = StartPhase::Admitting(Box::new(run));
+                Ok(Next::Call(IoCall::child(queue)))
+            }
+            StartPhase::Admitting(run) => {
+                result.child::<(), RunError>()??;
+                Ok(Next::Done(*run))
+            }
+        }
     }
 }
 
 /// Queues the due `every` occurrence of each active install this node receives. Missed
 /// occurrences collapse into the latest; one over the queue bound is counted as skipped.
-pub async fn enqueue_timers(
-    ctx: &DriverContext,
-    config: &RealmConfigDocument,
-    local: NodeId,
+#[derive(Debug, PartialEq)]
+pub struct EnqueueTimers {
     now_ms: u64,
-) -> Result<usize, StoreError> {
-    let mut queued = 0;
-    for install in &config.installs {
-        let lost = lost_reason(config, install.receiver).is_some();
-        if install.receiver != local || install.state != InstallState::Active || lost {
-            continue;
-        }
-        let Some(every) = (pick_version(config, &install.plugin, Some(&install.digest)).ok())
-            .and_then(|plugin| read_manifest(&plugin).ok())
-            .and_then(|manifest| manifest.triggers.get(&TriggerKind::Every).cloned())
-        else {
-            continue;
-        };
-        let Some(secs) = every.interval_secs() else {
-            continue;
-        };
-        let handler = TriggerKind::Every.as_str().to_string();
-        if enqueue_timer(ctx, install, handler, secs * 1000, now_ms).await? {
-            queued += 1;
+    timers: VecDeque<(PluginInstall, u64)>,
+    queued: usize,
+}
+
+impl EnqueueTimers {
+    pub fn new(config: &RealmConfigDocument, local: NodeId, now_ms: u64) -> Self {
+        let timers = (config.installs.iter())
+            .filter(|install| {
+                let lost = lost_reason(config, install.receiver).is_some();
+                install.receiver == local && install.state == InstallState::Active && !lost
+            })
+            .filter_map(|install| {
+                let every = declared_trigger(config, install, TriggerKind::Every)?;
+                Some((install.clone(), every.interval_secs()?))
+            })
+            .collect();
+        Self {
+            now_ms,
+            timers,
+            queued: 0,
         }
     }
-    Ok(queued)
+
+    fn advance(&mut self) -> Next<usize> {
+        let Some((install, secs)) = self.timers.pop_front() else {
+            return Next::Done(self.queued);
+        };
+        let handler = TriggerKind::Every.as_str().to_string();
+        let timer = enqueue_timer(&install, handler, secs * 1000, self.now_ms);
+        Next::Call(IoCall::child(timer))
+    }
 }
 
-async fn enqueue_timer(
-    ctx: &DriverContext,
-    install: &PluginInstall,
-    handler: String,
-    interval_ms: u64,
-    now_ms: u64,
-) -> Result<bool, StoreError> {
-    let _admitting = ADMISSIONS.lock().await;
-    let key = timer_key(install.install_id);
-    transact(ctx, async |txn: &Txn<'_>| {
-        let mut row = match txn.read(PLUGIN_RUNS_KEYSPACE, &key).await? {
-            Some(bytes) => decode::<TimerRow>(&bytes)?,
-            None => TimerRow::default(),
-        };
-        // Occurrences count from the last activation, so a pause is never replayed.
-        let base = row
-            .last_due_ms
-            .max(install.active_since_ms.unwrap_or(now_ms));
-        if now_ms < base.saturating_add(interval_ms) {
-            return Ok(false);
-        }
-        let occurrence = base + (now_ms - base) / interval_ms * interval_ms;
-        let trigger = RunTrigger::Timer {
-            occurrence_ms: occurrence,
-        };
-        let run = new_run(install, handler, trigger, now_ms);
-        let admitted = match admit_in(txn, &run).await {
-            Ok(()) => true,
-            Err(RunError::Full(_)) => false,
-            Err(RunError::Store(error)) => return Err(error),
-            Err(
-                RunError::NotFound
-                | RunError::NotWaiting(_)
-                | RunError::NotRetried(_)
-                | RunError::NotHeld,
-            ) => false,
-        };
-        row.last_due_ms = occurrence;
-        row.skipped += u64::from(!admitted);
-        txn.write(PLUGIN_RUNS_KEYSPACE, vec![(key.clone(), encode(&row)?)])
-            .await?;
-        Ok(admitted)
-    })
-    .await
+impl Operation for EnqueueTimers {
+    type Output = usize;
+    type Error = StoreError;
+
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(HoldScope::PluginAdmissions)
+    }
+
+    fn first(&mut self) -> Result<Next<usize>, StoreError> {
+        Ok(self.advance())
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<usize>, StoreError> {
+        self.queued += usize::from(result.child::<bool, StoreError>()??);
+        Ok(self.advance())
+    }
 }
 
-/// The timer row of an install, if its timer ran before.
-pub async fn read_timer(
-    ctx: &DriverContext,
+/// A webhook request that passed its check, ready to queue with `AdmitHook`.
+#[derive(Debug, PartialEq)]
+pub struct VerifiedHook {
+    pub run: PluginRun,
+    pub install_id: Ulid,
+    pub delivery_id: Option<String>,
+}
+
+/// What a hook check keeps while its secret is released.
+#[derive(Debug, PartialEq)]
+struct HookCheck {
+    config: Arc<RealmConfigDocument>,
+    manifest: Box<Manifest>,
+    slot: String,
+}
+
+/// Checks one webhook request for the install on this receiver: its install and rate, then the
+/// request with its bound secret. Removes credential headers from what the run keeps.
+#[derive(Debug, PartialEq)]
+pub struct VerifyHook {
+    realm_id: RealmId,
+    local: NodeId,
     install_id: Ulid,
-) -> Result<Option<TimerRow>, StoreError> {
-    let row = (Txn::direct(ctx))
-        .read(PLUGIN_RUNS_KEYSPACE, &timer_key(install_id))
-        .await?;
-    row.map(|bytes| decode(&bytes)).transpose()
+    request: Option<HookRequest>,
+    now_ms: u64,
+    ids: IdMint,
+    check: Option<HookCheck>,
+    /// The secret release asked once the request is counted within the install's rate.
+    rating: Option<ReleaseRequest>,
+}
+
+impl VerifyHook {
+    pub fn new(
+        (realm_id, local): (RealmId, NodeId),
+        install_id: Ulid,
+        request: HookRequest,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            realm_id,
+            local,
+            install_id,
+            request: Some(request),
+            now_ms,
+            ids: IdMint::default(),
+            check: None,
+            rating: None,
+        }
+    }
+
+    fn checked(&mut self, config: RealmConfigDocument) -> Result<Next<VerifiedHook>, HookError> {
+        let unavailable = |why: String| HookError::Unavailable(why);
+        let id = self.install_id;
+        let install = (config.installs.iter()).find(|install| install.install_id == id);
+        let install = install.ok_or(HookError::NotFound)?;
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let manifest = plugin.and_then(|plugin| read_manifest(&plugin));
+        let manifest = manifest.map_err(|error| unavailable(error.to_string()))?;
+        let hook = manifest.triggers.get(&TriggerKind::Webhook);
+        let hook = hook.ok_or(HookError::NotFound)?;
+        let slot = hook.verify.clone().ok_or(HookError::NotFound)?;
+        if let Some(reason) = lost_reason(&config, install.receiver) {
+            return Err(HookError::Paused(reason));
+        }
+        if install.receiver != self.local {
+            return Err(HookError::Elsewhere(install.receiver));
+        }
+        if install.state != InstallState::Active {
+            return Err(HookError::Paused(install.state.as_str()));
+        }
+        let release = ReleaseRequest {
+            install_id: id,
+            slot: slot.clone(),
+            delivery: Delivery::Verify,
+            target: None,
+            held: None,
+            run_id: None,
+        };
+        self.check = Some(HookCheck {
+            config: Arc::new(config),
+            manifest: Box::new(manifest),
+            slot,
+        });
+        self.rating = Some(release);
+        Ok(Next::Call(take_hook(id, self.now_ms)))
+    }
+
+    fn released(
+        &mut self,
+        check: HookCheck,
+        released: Released,
+    ) -> Result<Next<VerifiedHook>, HookError> {
+        let unavailable = |why: String| HookError::Unavailable(why);
+        let HookCheck {
+            config,
+            manifest,
+            slot,
+        } = check;
+        let (released, fields) =
+            fresh_fields(released).map_err(|error| unavailable(error.to_string()))?;
+        // A secret edit can make the checked header the delivery id; nothing starts then.
+        if delivery_clash(&manifest, &slot, &released.settings) {
+            let clash = "the delivery id header is the checked header".to_string();
+            return Err(unavailable(clash));
+        }
+        let mut request = self.request.take().ok_or(IoError::Unfinished)?;
+        let (kind, settings) = (&released.kind, &released.settings);
+        let passed = verify_request(kind, settings, &fields, &mut request.headers, &request.body);
+        let passed = passed.map_err(|error| unavailable(error.to_string()))?;
+        (request.headers)
+            .retain(|(name, _)| !DROPPED.contains(&name.to_ascii_lowercase().as_str()));
+        if !passed {
+            return Err(HookError::Unverified);
+        }
+        let hook = manifest.triggers.get(&TriggerKind::Webhook);
+        let id_header = hook.and_then(|hook| hook.delivery_id.as_deref());
+        request.delivery_id = (request.headers.iter())
+            .find(|(name, _)| id_header.is_some_and(|id| name.eq_ignore_ascii_case(id)))
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty());
+        let delivery_id = request.delivery_id.clone();
+        let id = self.install_id;
+        let install = (config.installs.iter()).find(|install| install.install_id == id);
+        let install = install.ok_or(HookError::NotFound)?;
+        let handler = TriggerKind::Webhook.as_str().to_string();
+        let trigger = RunTrigger::Webhook(request);
+        let run_id = self.ids.mint(self.now_ms);
+        Ok(Next::Done(VerifiedHook {
+            run: new_run(install, handler, trigger, (run_id, self.now_ms)),
+            install_id: id,
+            delivery_id,
+        }))
+    }
+}
+
+impl Operation for VerifyHook {
+    type Output = VerifiedHook;
+    type Error = HookError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> Result<Next<VerifiedHook>, HookError> {
+        let read = GetConfigOperation::new(self.realm_id);
+        Ok(Next::Call(IoCall::child(read)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<VerifiedHook>, HookError> {
+        if let Some(release) = self.rating.take() {
+            if !taken(result)? {
+                return Err(HookError::Rate);
+            }
+            let config = (self.check.as_ref())
+                .ok_or(IoError::Unfinished)?
+                .config
+                .clone();
+            let ask = AskRelease::new(config, self.local, release);
+            return Ok(Next::Call(IoCall::child(ask)));
+        }
+        let Some(check) = self.check.take() else {
+            let config = result.child::<RealmConfigDocument, GetConfigError>()?;
+            let config = config
+                .map_err(|error| HookError::Unavailable(InstallError::from(error).to_string()))?;
+            return self.checked(config);
+        };
+        let released = result.child::<Released, ReleaseFailure>()?;
+        let released = released.map_err(|error| HookError::Unavailable(error.to_string()))?;
+        self.released(check, released)
+    }
+}
+
+/// Whether a relay from `local` passes `authorization` on: only when the install's verify secret
+/// checks that header. A node secret is asked of the receiver; `None` when it cannot be told.
+#[derive(Debug, PartialEq)]
+pub struct HookAuthorization {
+    config: Arc<RealmConfigDocument>,
+    local: NodeId,
+    install_id: Ulid,
+    by_node: bool,
+}
+
+impl HookAuthorization {
+    pub fn new(config: RealmConfigDocument, (local, install_id): (NodeId, Ulid)) -> Self {
+        Self {
+            config: Arc::new(config),
+            local,
+            install_id,
+            by_node: false,
+        }
+    }
+
+    fn checks(header: Option<String>) -> Next<Option<bool>> {
+        let authorization =
+            header.is_some_and(|header| header.eq_ignore_ascii_case("authorization"));
+        Next::Done(Some(authorization))
+    }
+}
+
+impl Operation for HookAuthorization {
+    type Output = Option<bool>;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<Option<bool>>, IoError> {
+        let id = self.install_id;
+        let config = self.config.clone();
+        let install = (config.installs.iter()).find(|install| install.install_id == id);
+        let Some(install) = install else {
+            return Ok(Next::Done(None));
+        };
+        let plugin = pick_version(&config, &install.plugin, Some(&install.digest));
+        let Ok(manifest) = plugin.and_then(|plugin| read_manifest(&plugin)) else {
+            return Ok(Next::Done(None));
+        };
+        let hook = manifest.triggers.get(&TriggerKind::Webhook);
+        let Some(slot) = hook.and_then(|hook| hook.verify.as_ref()) else {
+            return Ok(Next::Done(Some(false)));
+        };
+        let declared = manifest.secrets.get(slot).map(|declared| declared.kind);
+        if declared == Some(SecretKind::Bearer) {
+            return Ok(Next::Done(Some(true)));
+        }
+        let Some(binding) = install.secrets.get(slot) else {
+            return Ok(Next::Done(Some(false)));
+        };
+        Ok(Next::Call(match binding.scope {
+            BoundScope::Node => {
+                let Some(kind) = declared.and_then(vault_kind) else {
+                    return Ok(Next::Done(None));
+                };
+                self.by_node = true;
+                let place = (self.local, install.receiver);
+                IoCall::child(CheckNodeBinding::new(place, &binding.name, &kind))
+            }
+            BoundScope::Group | BoundScope::Realm => {
+                IoCall::child(SelectSecret::new(config.clone(), install, binding))
+            }
+        }))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<bool>>, IoError> {
+        if self.by_node {
+            return Ok(match result.child::<Option<String>, NodeCheckFailure>()? {
+                Ok(header) => Self::checks(header),
+                Err(_) => Next::Done(None),
+            });
+        }
+        Ok(match result.child::<Option<Selected>, ReleaseFailure>()? {
+            Ok(Some(selected)) => Self::checks(selected.settings.get("header").cloned()),
+            _ => Next::Done(None),
+        })
+    }
 }
 
 #[cfg(test)]

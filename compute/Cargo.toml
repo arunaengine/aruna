@@ -21,6 +21,7 @@ kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch", "dep:serde-saphyr
 slurm = ["apptainer"]
 
 [dependencies]
+aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true, optional = true, features = ["ssl"] }
@@ -43,6 +44,7 @@ k8s-openapi = { workspace = true, optional = true }
 json-patch = { workspace = true, optional = true }
 
 [dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
 http = { workspace = true }
 iroh = { workspace = true }
 tempfile = { workspace = true }

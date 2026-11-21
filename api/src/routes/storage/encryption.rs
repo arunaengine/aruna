@@ -3,13 +3,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::abe::ScopeView;
+use super::abe::records::ScopeView;
 use super::routing::ensure_group_admin;
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::routes::storage::bucket::keys::activate_and_wake;
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::BlobError;
-use aruna_core::structs::execution::job::RoCrateLimits;
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::abe_access::KeyScope;
@@ -23,45 +27,38 @@ use aruna_core::structs::storage::holders::{
 use aruna_core::structs::storage::key_audit::AuditAction;
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionState};
 use aruna_core::types::GroupId;
-use aruna_core::{NodeId, UserId};
-use aruna_operations::driver::{DriverContext, drive, now_ms};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::s3::bucket::encryption::{
     EnableEncryptionOperation, EnableError, EnableInput,
 };
-use aruna_operations::s3::bucket::get::{GetBucketError, GetBucketOperation};
-use aruna_operations::s3::bucket::holders::lookup_keys;
-use aruna_operations::s3::bucket::key_install::{
-    InstallInput, InstallKeyOperation, install_and_wake,
-};
-use aruna_operations::s3::bucket::key_rows::SettingsError;
+use aruna_operations::s3::bucket::holders::LookupKeysOperation;
+use aruna_operations::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
+use aruna_operations::s3::bucket::key::rows::SettingsError;
 use aruna_operations::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
 use aruna_operations::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
-use aruna_operations::s3::key_status::{
-    AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
-};
 use aruna_operations::s3::unlock_limit::{
     UnlockLimitError, UnlockLimitInput, UnlockLimitOperation,
 };
+use aruna_operations::transfer::key_status::{
+    AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
+};
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::{Extension, Json};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct StorageEncryptionDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(StorageEncryptionDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(get_bucket_encryption, put_bucket_encryption))
         .routes(routes!(list_bucket_tokens))
 }
@@ -265,7 +262,7 @@ pub(crate) fn key_refusal(error: &BucketKeyError) -> ServerError {
         BucketKeyError::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "unlock_capacity"),
         BucketKeyError::InvalidDuration => (StatusCode::BAD_REQUEST, "invalid_duration"),
         BucketKeyError::ManagedLimit => (StatusCode::BAD_REQUEST, "managed_limit"),
-        BucketKeyError::Seal => return ServerError::InternalError(message),
+        BucketKeyError::Seal => return ServerError::InternalError(message.into()),
         BucketKeyError::Unsupported => (StatusCode::NOT_IMPLEMENTED, "not_supported"),
         BucketKeyError::InvalidToken => (StatusCode::FORBIDDEN, "invalid_token"),
     };
@@ -332,7 +329,6 @@ owning group's admin path.
                 }]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or neither key holder nor group admin", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
@@ -341,11 +337,10 @@ owning group's admin path.
 )]
 pub async fn list_bucket_tokens(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<TokenListView>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     if !is_holder(&snapshot, auth.user_id) {
         ensure_group_admin(&state, &auth, group_id).await?;
@@ -356,7 +351,7 @@ pub async fn list_bucket_tokens(
     let operation = ListTokensOperation::new(bucket_id, std::time::SystemTime::now());
     let entries = drive(operation, &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     let active = snapshot.settings.active_key();
     let tokens = entries
         .into_iter()
@@ -396,7 +391,7 @@ pub(crate) fn blob_refusal(error: BlobError) -> ServerError {
         BlobError::SizeLimitExceeded { limit } => {
             refused(StatusCode::CONFLICT, "object_too_large", &too_large(limit))
         }
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -410,7 +405,7 @@ pub(crate) fn settings_refusal(error: SettingsError) -> ServerError {
     match error {
         SettingsError::NoSuchBucket | SettingsError::GroupMismatch => ServerError::NotFound,
         SettingsError::MissingAuthority => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -420,19 +415,6 @@ pub(crate) fn not_encrypted() -> ServerError {
         "not_encrypted",
         "the bucket has no keys",
     )
-}
-
-pub(crate) async fn bucket_group(state: &ServerState, bucket: &str) -> ServerResult<GroupId> {
-    drive(
-        GetBucketOperation::new(bucket.to_string()),
-        &state.get_ctx(),
-    )
-    .await
-    .map(|info| info.group_id)
-    .map_err(|error| match error {
-        GetBucketError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.to_string()),
-    })
 }
 
 pub(crate) async fn ensure_bucket_read(
@@ -456,7 +438,7 @@ pub(crate) async fn read_snapshot(
         .map_err(|error| match error {
             KeyStatusError::Settings(error) => settings_refusal(error),
             KeyStatusError::Blob(error) => blob_refusal(error),
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })
 }
 
@@ -471,13 +453,13 @@ pub(crate) async fn holder_report(
         .chain(snapshot.admins.iter().copied())
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
         &state.get_ctx(),
-        state.get_realm_id(),
-        state.get_node_id(),
-        users,
     )
-    .await;
+    .await
+    .unwrap_or_default();
     let copies: Vec<_> = snapshot
         .copies
         .iter()
@@ -656,7 +638,7 @@ pub(crate) async fn current_status(
         &snapshot,
         report.as_ref(),
         caller,
-        now_ms(),
+        unix_timestamp_millis(),
     ))
 }
 
@@ -707,7 +689,6 @@ pub(crate) async fn current_status(
                 "caller": { "holder": true, "ready_copy": true, "admin": true }
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "An authorization document of the bucket is missing", body = ErrorResponse)
@@ -716,11 +697,10 @@ pub(crate) async fn current_status(
 )]
 pub async fn get_bucket_encryption(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_bucket_read(&state, &auth, group_id, &bucket).await?;
     let status = current_status(&state, bucket, group_id, auth.user_id).await?;
     Ok(Json(status))
@@ -756,7 +736,6 @@ pub async fn get_bucket_encryption(
     responses(
         (status = 200, description = "The status after the change", body = EncryptionStatus, example = json!({ "bucket": "research-raw", "mode": "node_managed", "bucket_id": "01JAMXQ7B1D7Q8E7Q2F3R8Z9KC", "storage_generation": 1, "key_generation": 1, "public_key": "qL3UuCZ0XkWbQZ2yZ8m1qL3UuCZ0XkWbQZ2yZ8m1qL0=", "fingerprint": "5d1c0a6f9e1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5", "cipher": "chacha20_poly1305", "block_keys": "content_derived", "max_unlock_ms": null, "unlock": { "state": "unlocked", "lock_reason": null, "locked_at_ms": null, "session_id": "01JAMXR0C8M7T2D4WQ3V9KX6EZ", "unlocked_at_ms": 1790000000000_u64, "deadline_ms": null, "max_deadline_ms": null }, "generations": [], "holders": { "ready": 2, "pending": 0, "missing_key": 0 }, "recovery": { "state": "met", "ready_holders": 2, "ready_with_recovery": 1 }, "transition": null, "abe": null, "caller": { "holder": true, "ready_copy": true, "admin": true } })),
         (status = 400, description = "An invalid mode, cipher or unlock maximum", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the group admin path", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "`stale_generation`, `open_uploads`, `recovery_unmet`, `bucket_locked`, `transition_running`, `object_too_large` when a stored object exceeds the encryption size limit, or `unchanged` when the settings already apply", body = ErrorResponse)
@@ -765,12 +744,11 @@ pub async fn get_bucket_encryption(
 )]
 pub async fn put_bucket_encryption(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(bucket): Path<String>,
     Json(request): Json<EncryptionRequest>,
 ) -> ServerResult<Json<EncryptionStatus>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let group_id = bucket_group(&state, &bucket).await?;
+    let group_id = bucket_info(&state, &bucket).await?.group_id;
     ensure_group_admin(&state, &auth, group_id).await?;
     let snapshot = read_snapshot(&state, &bucket, group_id).await?;
     let current = &snapshot.settings;
@@ -895,7 +873,7 @@ async fn set_unlock_limit(
         caller,
         max_unlock_ms,
         expected_generation,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     drive(UnlockLimitOperation::new(input), &state.get_ctx())
         .await
@@ -905,7 +883,7 @@ async fn set_unlock_limit(
             UnlockLimitError::Key(error) => key_refusal(&error),
             UnlockLimitError::NotEncrypted => not_encrypted(),
             UnlockLimitError::NotAdmin => ServerError::Forbidden,
-            other => ServerError::InternalError(other.to_string()),
+            other => ServerError::InternalError(other.into()),
         })
 }
 
@@ -925,7 +903,13 @@ pub(crate) async fn change_bucket(
         .chain(snapshot.grants.iter().map(|grant| grant.user_id))
         .collect::<Vec<_>>();
     let context = state.get_ctx();
-    let lookups = lookup_keys(&context, state.get_realm_id(), state.get_node_id(), users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(
+        LookupKeysOperation::new(state.get_realm_id(), state.get_node_id(), users),
+        &context,
+    )
+    .await
+    .unwrap_or_default();
     let input = ChangeInput {
         bucket: bucket.to_string(),
         group_id,
@@ -936,7 +920,7 @@ pub(crate) async fn change_bucket(
         max_unlock_ms,
         expected_generation,
         lookups,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let changed = drive(ChangeEncryptionOperation::new(input), &context)
         .await
@@ -951,10 +935,14 @@ pub(crate) async fn change_bucket(
         };
         // The change is committed either way; a failed install only leaves the key locked.
         let node_id = state.get_node_id();
-        let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
+        let install = InstallKeyOperation::new(install).audited(
+            node_id,
+            Some(caller),
+            unix_timestamp_millis(),
+        );
         let origin = (state.get_realm_id(), node_id);
         if let Err(error) =
-            install_and_wake(&context, install, origin, state.rocrate_limits()).await
+            activate_and_wake(&context, install, origin, state.rocrate_limits()).await
         {
             tracing::warn!(%bucket, ?error, "new bucket key stays locked");
         }
@@ -985,7 +973,7 @@ fn change_refusal(error: ChangeError) -> ServerError {
             "the key holders do not meet the recovery rule",
         ),
         ChangeError::TransitionRunning => transition_running(),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1005,7 +993,10 @@ pub(crate) async fn enable_bucket(
         .into_iter()
         .chain(snapshot.admins.iter().copied())
         .collect::<Vec<_>>();
-    let lookups = lookup_keys(context, realm_id, node_id, users).await;
+    // A failed lookup counts as unavailable, as a missing answer does.
+    let lookups = drive(LookupKeysOperation::new(realm_id, node_id, users), context)
+        .await
+        .unwrap_or_default();
     let input = EnableInput {
         bucket: bucket.to_string(),
         group_id,
@@ -1018,7 +1009,7 @@ pub(crate) async fn enable_bucket(
         max_unlock_ms: request.max_unlock_ms.flatten(),
         expected_generation: request.expected_generation,
         lookups,
-        now_ms: now_ms(),
+        now_ms: unix_timestamp_millis(),
     };
     let enabled = drive(EnableEncryptionOperation::new(input), context).await?;
     let install = InstallInput {
@@ -1029,8 +1020,9 @@ pub(crate) async fn enable_bucket(
         max: enabled.settings.max_unlock_ms.map(Duration::from_millis),
     };
     // The bucket is encrypted either way; a failed install only leaves it locked.
-    let install = InstallKeyOperation::new(install).audited(node_id, Some(caller), now_ms());
-    if let Err(error) = install_and_wake(context, install, (realm_id, node_id), limits).await {
+    let install =
+        InstallKeyOperation::new(install).audited(node_id, Some(caller), unix_timestamp_millis());
+    if let Err(error) = activate_and_wake(context, install, (realm_id, node_id), limits).await {
         tracing::warn!(%bucket, ?error, "new bucket key stays locked");
     }
     Ok(())
@@ -1064,9 +1056,9 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
         EnableError::Mapped => refused(
             StatusCode::CONFLICT,
             "mapped_bucket",
-            aruna_operations::groups::imports::MAPPED_REASON,
+            aruna_operations::s3::imports::MAPPED_REASON,
         ),
-        other => ServerError::InternalError(other.to_string()),
+        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -1082,7 +1074,7 @@ mod tests {
         };
         let bucket_id = Ulid::from_bytes([4; 16]);
         let realm = RealmId::from_bytes([1; 32]);
-        let user = aruna_core::UserId::new(Ulid::from_bytes([5; 16]), realm);
+        let user = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm);
         let node = iroh::SecretKey::from_bytes(&[2; 32]).public();
         let entry = |generation, credential_active| TokenEntry {
             grant: KeyGrant {
@@ -1275,7 +1267,7 @@ mod tests {
 
     #[test]
     fn reports_abe_state() {
-        use aruna_operations::abe::rekey::RekeyProgress;
+        use aruna_operations::transfer::abe_rekey::RekeyProgress;
         let mut abe = snapshot();
         abe.abe = Some(AbeSnapshot {
             epoch: 4,

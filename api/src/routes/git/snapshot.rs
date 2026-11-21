@@ -2,17 +2,18 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::git_node;
 use super::location::StorageLocation;
 use super::{base_url, map_error};
-use crate::auth::require_realm_auth;
+use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::repo_layout::Layout;
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::dataset_location::default_bucket;
+use aruna_drivers::driver::drive;
 use aruna_operations::git;
+use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
@@ -67,18 +68,12 @@ impl From<Layout> for RepositoryLayout {
               (status = 503, description = "Metadata or conversion runtime unavailable")))]
 pub async fn repository_status(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let (status, projection, layout, document, pending) = git::snapshot::status(
-        &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
-        &auth,
-        id,
-    )
-    .await
-    .map_err(map_error)?;
+    let read = git::snapshot::status(&git_node(&state), &auth, id);
+    let (status, projection, layout, document, pending) =
+        drive(read, &state.get_ctx()).await.map_err(map_error)?;
     let storage_location = git::location::chosen(&document, projection.state.location.clone());
     let clone_url = base_url(&state, id).await?;
     Ok(Json(RepositoryStatus {
@@ -124,20 +119,12 @@ pub struct RevisionQuery {
               (status = 503, description = "Git revision or converter unavailable")))]
 pub async fn export_revision(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<Ulid>,
     Query(query): Query<RevisionQuery>,
 ) -> ServerResult<Json<Value>> {
-    let auth = require_realm_auth(&state, auth)?;
-    let bytes = git::snapshot::export(
-        &state.get_ctx(),
-        state.git().ok_or(ServerError::ServiceUnavailable)?,
-        &auth,
-        id,
-        query.revision,
-    )
-    .await
-    .map_err(map_error)?;
+    let export = git::snapshot::export(&git_node(&state), &auth, id, query.revision);
+    let bytes = drive(export, &state.get_ctx()).await.map_err(map_error)?;
     let result: Value =
         serde_json::from_slice(&bytes).map_err(|_| ServerError::ServiceUnavailable)?;
     Ok(Json(result))

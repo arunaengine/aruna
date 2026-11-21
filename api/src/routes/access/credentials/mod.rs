@@ -2,15 +2,17 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::auth::{ValidatedBearer, require_unrestricted_auth};
+use crate::auth::TokenAuth;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
-use aruna_operations::abe::{KeyAction, KeyResult, drive_key};
-use aruna_operations::driver::drive;
-use aruna_operations::driver::now_ms;
+use aruna_drivers::driver::drive;
+use aruna_operations::abe::{KeyAction, KeyResult};
 use aruna_operations::s3::access::create::{
     CreateUserConfig, CreateUserError, CreateUserOperation,
 };
@@ -27,20 +29,14 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime};
 use std::{str::FromStr, sync::Arc};
 use ulid::Ulid;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 mod sessions;
 
-#[derive(OpenApi)]
-#[openapi(
-    tags((name = "access/credentials", description = "User credential management"))
-)]
-pub struct CredentialsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(CredentialsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(list_s3_credentials, create_s3_credentials))
         .routes(routes!(revoke_s3_credentials))
         .merge(sessions::router())
@@ -307,17 +303,14 @@ pub(crate) fn serialize_restrictions(
                 ]
             })
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, or is path-restricted", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_s3_credentials(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
 ) -> ServerResult<(StatusCode, Json<ListS3Response>)> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-
     let credentials = drive(
         ListUserOperation::new(ListUserInput {
             user_identity: auth.user_id,
@@ -325,7 +318,7 @@ pub async fn list_s3_credentials(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?;
+    .map_err(|error| ServerError::InternalError(error.into()))?;
 
     Ok((
         StatusCode::OK,
@@ -413,7 +406,6 @@ to the group data root and can never widen them.
             body = ErrorResponse,
             example = json!({"error": "bucket research-raw is not encrypted", "code": "bucket_not_encrypted"})
         ),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (
             status = 403,
             description = "Token belongs to another realm, the caller may read no part of the group data path, or a restriction reaches outside the group root or the caller's own grant",
@@ -427,11 +419,10 @@ to the group data root and can never widen them.
 )]
 pub async fn create_s3_credentials(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    TokenAuth(auth): TokenAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Json(request): Json<CreateS3Request>,
 ) -> ServerResult<(StatusCode, Json<CreateS3Response>)> {
-    let auth = auth.ok_or(ServerError::Unauthorized)?;
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let realm_id = state.get_realm_id();
     let node_id = state.get_node_id();
@@ -503,7 +494,7 @@ pub async fn create_s3_credentials(
     );
     if !buckets.is_empty() {
         let buckets = buckets.iter().cloned().collect();
-        operation = operation.with_tokens(buckets, (realm_id, node_id), now_ms());
+        operation = operation.with_tokens(buckets, (realm_id, node_id), unix_timestamp_millis());
     }
     let (access_key_id, access_secret, access) = match drive(operation, &state.get_ctx()).await {
         Ok(created) => created,
@@ -523,7 +514,16 @@ pub async fn create_s3_credentials(
                 public_key,
                 restrictions: access.path_restrictions.clone(),
             };
-            match drive_key(bucket, auth.clone(), node_id, action, &state.get_ctx()).await {
+            let ctx = state.get_ctx();
+            match crate::routes::storage::abe::drive_key(
+                bucket,
+                auth.clone(),
+                node_id,
+                action,
+                &ctx,
+            )
+            .await
+            {
                 Ok(KeyResult::Opened(ids)) => key_requests.extend(ids.iter().map(Ulid::to_string)),
                 Ok(_) => {}
                 Err(error) => {
@@ -558,7 +558,7 @@ fn token_refusal(error: CreateUserError) -> ServerError {
         CreateUserError::OtherGroup(_) => {
             ServerError::Refused(StatusCode::BAD_REQUEST, "bucket_outside_group", message)
         }
-        _ => ServerError::InternalError(message),
+        _ => ServerError::InternalError(message.into()),
     }
 }
 
@@ -580,7 +580,6 @@ WRITE on the group the credential is bound to is deliberately not enough.
     params(("access_key_id" = String, Path, description = "Access key id of the credential to revoke, as returned when it was created or listed")),
     responses(
         (status = 204, description = "Credential revoked"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Token belongs to another realm, is path-restricted, or lacks WRITE on the owning user's administration path", body = ErrorResponse),
         (status = 404, description = "This node holds no credential with that access key id", body = ErrorResponse)
     ),
@@ -588,11 +587,9 @@ WRITE on the group the credential is bound to is deliberately not enough.
 )]
 pub async fn revoke_s3_credentials(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    UnrestrictedAuth(auth): UnrestrictedAuth,
     Path(access_key_id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let auth = require_unrestricted_auth(&state, auth)?;
-
     let credential = match drive(
         GetAccessOperation::new(access_key_id.clone()),
         &state.get_ctx(),
@@ -601,7 +598,7 @@ pub async fn revoke_s3_credentials(
     {
         Ok(credential) => credential,
         Err(GetAccessError::NotFound) => return Err(ServerError::NotFound),
-        Err(err) => return Err(ServerError::InternalError(err.to_string())),
+        Err(err) => return Err(ServerError::InternalError(err.into())),
     };
 
     // Group write cannot revoke another member's credential without user administration.
@@ -622,11 +619,11 @@ pub async fn revoke_s3_credentials(
     match drive(RevokeUserOperation::new(access_key_id), &state.get_ctx()).await {
         Ok(_) => {
             let group = Some(credential.group_id);
-            crate::routes::storage::abe::epoch_due(&state, &auth, group).await;
+            crate::routes::storage::abe::records::epoch_due(&state, &auth, group).await;
             Ok(StatusCode::NO_CONTENT)
         }
         Err(RevokeUserError::NotFound) => Err(ServerError::NotFound),
-        Err(err) => Err(ServerError::InternalError(err.to_string())),
+        Err(err) => Err(ServerError::InternalError(err.into())),
     }
 }
 
@@ -928,10 +925,12 @@ pub(crate) async fn authorize_credential_issuance(
         // A member whose roles reach only part of the group data may still take
         // a credential: authorization uses the derived roots, while probing the
         // bare directory would ask a `/**` grant to match the directory itself.
-        let roots = aruna_operations::auth::permission_rules::reachable_roots(
+        let rules = aruna_drivers::driver::drive(
+            aruna_operations::auth::request_authorization::rules_operation(
+                &effective_auth,
+                &group_root,
+            ),
             &state.get_ctx(),
-            &effective_auth,
-            &group_root,
         )
         .await
         .map_err(|error| match error {
@@ -940,8 +939,13 @@ pub(crate) async fn authorize_credential_issuance(
             | AuthorizationError::GroupNotFound
             | AuthorizationError::InvalidRealmId
             | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
-            _ => ServerError::InternalError(error.to_string()),
+            _ => ServerError::InternalError(error.into()),
         })?;
+        let roots = aruna_operations::auth::request_authorization::reachable_roots(
+            &rules,
+            &effective_auth,
+            &group_root,
+        );
         if roots.is_empty() {
             return Err(ServerError::Forbidden);
         }

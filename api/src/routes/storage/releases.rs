@@ -5,35 +5,37 @@
 
 use std::sync::Arc;
 
-use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-use aruna_operations::s3::bucket::release::publish::{
+use aruna_drivers::driver::{drive, node_routing};
+use aruna_operations::transfer::release::access::MembersCheckOperation;
+use aruna_operations::transfer::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_operations::s3::bucket::release::view::{FilePage, MAX_PAGE, ViewError, release_view};
-use aruna_operations::s3::bucket::release::{BucketScope, MembershipCaller, release_members};
+use aruna_operations::transfer::release::view::{
+    CheckedViewOperation, FilePage, MAX_PAGE, ViewError,
+};
+use aruna_operations::transfer::release::{BucketScope, MembershipCaller};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::bucket::metadata::BucketIdentifierBody;
-use super::deletion::bucket_info;
-use super::relay::{copy_miss, query_path, read_holders, relay_json, relay_read, rest_target};
-use crate::auth::{ValidatedBearer, require_realm_auth};
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::bucket_info;
+use crate::routes::storage::relay::{
+    RestRead, holder_json, missed_json, query_path, relay_json, rest_target,
+};
 use crate::server::state::ServerState;
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct ReleasesApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(ReleasesApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(publish_release, list_releases))
         .routes(routes!(list_release_files))
 }
@@ -123,7 +125,6 @@ under `prefix`, or nothing is published.
             "replayed": false
         })),
         (status = 400, description = "Invalid identifier link or run id", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No WRITE on the bucket, neither admin nor curator, or a file under the prefix is not readable", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 409, description = "The key changed while the release was written", body = ErrorResponse),
@@ -133,13 +134,12 @@ under `prefix`, or nothing is published.
 )]
 pub async fn publish_release(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path(bucket): Path<String>,
     Json(request): Json<PublishReleaseRequest>,
 ) -> ServerResult<Json<PublishReleaseResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let spec = release_spec(&request)?;
     let info = bucket_info(&state, &bucket).await?;
     // In a distributed bucket the coordinator of the key's range writes it.
@@ -160,13 +160,20 @@ pub async fn publish_release(
         key: request.key.clone(),
         spec,
     };
-    let published = release_publish::publish_release(state.get_ctx().as_ref(), scope, input)
-        .await
-        .map_err(|error| match error {
-            PublishError::Forbidden(_) => ServerError::Forbidden,
-            PublishError::Conflict(reason) => ServerError::Conflict(reason),
-            PublishError::Unavailable(reason) => ServerError::ServiceUnavailableReason(reason),
-        })?;
+    let published = drive(
+        release_publish::PublishReleaseOperation::new(
+            scope,
+            input,
+            node_routing(state.get_ctx().as_ref()),
+        ),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| match error {
+        PublishError::Forbidden(_) => ServerError::Forbidden,
+        PublishError::Conflict(reason) => ServerError::Conflict(reason),
+        PublishError::Unavailable(reason) => ServerError::ServiceUnavailableReason(reason),
+    })?;
     Ok(Json(PublishReleaseResponse {
         bucket,
         key: request.key,
@@ -220,7 +227,6 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
             "releases": [{"key": "bakta/6.0/ro-crate-metadata.json", "version_id": "01K8W1B3D5F7H9KMQ1S3V5X7Z2", "label": "6.0", "prefix": "bakta/6.0/"}],
             "complete": true
         })),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 404, description = "Bucket not found on this node", body = ErrorResponse),
         (status = 503, description = "The releases could not be read now", body = ErrorResponse)
     ),
@@ -228,11 +234,10 @@ fn release_spec(request: &PublishReleaseRequest) -> ServerResult<ReleaseSpec> {
 )]
 pub async fn list_releases(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     Path(bucket): Path<String>,
 ) -> ServerResult<Json<ReleaseListResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let info = bucket_info(&state, &bucket).await?;
     let scope = BucketScope {
         realm_id: state.get_realm_id(),
@@ -244,9 +249,12 @@ pub async fn list_releases(
         auth: &auth,
         bearer: bearer.as_ref().map(ValidatedBearer::as_str),
     };
-    let found = release_members(state.get_ctx().as_ref(), scope, caller, &[])
-        .await
-        .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    let found = drive(
+        MembersCheckOperation::new(scope, caller, &[]),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
     let releases = (found.releases.into_iter())
         .map(|valid| ReleaseItem {
             key: valid.key,
@@ -353,7 +361,6 @@ pub struct ReleaseFilesResponse {
             "next": "db/pfam/"
         })),
         (status = 400, description = "Invalid version id, delimiter or limit", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "No READ on the release crate", body = ErrorResponse),
         (status = 404, description = "Bucket not found, or the version is gone or no release", body = ErrorResponse),
         (status = 503, description = "The release crate could not be read now", body = ErrorResponse)
@@ -362,13 +369,12 @@ pub struct ReleaseFilesResponse {
 )]
 pub async fn list_release_files(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Extension(bearer): Extension<Option<ValidatedBearer>>,
     headers: HeaderMap,
     Path((bucket, version_id)): Path<(String, String)>,
     Query(params): Query<ReleaseFilesParams>,
 ) -> ServerResult<Json<ReleaseFilesResponse>> {
-    let auth = require_realm_auth(&state, auth)?;
     let version: Ulid = (version_id.parse())
         .map_err(|_| ServerError::BadRequestMessage(format!("`{version_id}` is not an id")))?;
     let folders = match params.delimiter.as_deref() {
@@ -403,8 +409,15 @@ pub async fn list_release_files(
         query_path(route, &[pairs, vec![("limit", limit.as_str())]].concat())
     };
     let route = format!("/data/buckets/{bucket}/releases/{version}/files");
-    if let Some(holders) = read_holders(&state, &info, &params.key, &headers).await? {
-        let answer = relay_read(&state, &holders, &relayed(&route), bearer.as_ref()).await?;
+    let path = relayed(&route);
+    let read = RestRead {
+        info: &info,
+        key: &params.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &read).await? {
         return Ok(Json(answer));
     }
     let scope = BucketScope {
@@ -420,17 +433,16 @@ pub async fn list_release_files(
         limit,
     };
     let context = state.get_ctx();
-    let found = release_view(context.as_ref(), scope, &auth, (&params.key, version), page).await;
+    let found = drive(
+        CheckedViewOperation::new(scope, &auth, (&params.key, version), page),
+        context.as_ref(),
+    )
+    .await;
     let view = match found {
         Ok(view) => view,
         // A copy may not have received the release yet; its coordinator decides.
-        Err(ViewError::Missing) => match copy_miss(&state, &info, &params.key, &headers).await? {
-            Some(holders) => {
-                let path = relayed(&route);
-                return Ok(Json(
-                    relay_read(&state, &holders, &path, bearer.as_ref()).await?,
-                ));
-            }
+        Err(ViewError::Missing) => match missed_json(&state, &read).await? {
+            Some(answer) => return Ok(Json(answer)),
             None => return Err(ServerError::NotFound),
         },
         Err(ViewError::NoRelease) => return Err(ServerError::NotFound),

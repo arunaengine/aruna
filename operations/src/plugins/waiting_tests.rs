@@ -3,19 +3,27 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use crate::plugins::calls::*;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, PLUGIN_GAPS_KEYSPACE, PLUGIN_SEEN_KEYSPACE};
 use aruna_core::plugin_installs::PluginInstall;
-use aruna_core::plugin_runs::{ForwardRow, GapRow, RECEIVER_GAP, RunTrigger};
+use aruna_core::plugin_runs::{ForwardRow, GapRow, RECEIVER_GAP, RunTrigger, WAITING_EXPIRY_MS};
 use aruna_core::storage_entries::reducer_state_key;
 use aruna_core::time::unix_timestamp_millis;
+use aruna_drivers::driver::drive;
 
 use super::*;
-use crate::plugins::decide::{SeenRow, decide_batch, seen_key};
-use crate::plugins::forward::EventBatch;
-use crate::plugins::install::tests::Fixture;
-use crate::plugins::matcher::tests::config;
+use crate::plugins::decide::{SeenRow, seen_key};
+use crate::plugins::rows::decode;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::{page_result, values_result};
 use crate::plugins::runs::list_runs;
-use crate::plugins::worker::tests::{created, installed};
+use aruna_core::plugin_runs::EventBatch;
+use aruna_test_support::plugins::Fixture;
+use aruna_test_support::plugins::artifacts::installed;
+use aruna_test_support::plugins::created;
+use aruna_test_support::plugins::flows::matcher::config;
+use aruna_test_support::plugins::rows::Txn;
+use ulid::Ulid;
 
 /// An event decided as waiting because the account's writes are gone; returns the event and
 /// the account's state row, which arrives again later.
@@ -93,7 +101,7 @@ async fn queues_when_ready() {
     assert_eq!(slots(&fixture, &install).await, 1);
     assert_eq!(seen(&fixture, &row).await, Outcome::Queued);
     assert_eq!(decide(&fixture, &row, now).await, Outcome::Queued);
-    let runs = list_runs(&fixture.ctx, install.install_id, None, 10).await;
+    let runs = drive(list_runs(install.install_id, None, 10), &fixture.ctx).await;
     let runs = runs.unwrap().0;
     assert_eq!(runs.len(), 1);
     assert!(matches!(runs[0].trigger, RunTrigger::Event(_)));
@@ -117,4 +125,120 @@ async fn expires_with_gap() {
         .unwrap();
     let gap: GapRow = decode(&gaps[0].1).unwrap();
     assert_eq!((gap.reason, gap.count), (GapReason::Waited, 1));
+}
+
+/// A waiting event received at `received_ms`.
+fn waiting_row(received_ms: u64) -> WaitingRow {
+    let event = aruna_core::plugin_runs::SourceEvent {
+        kind: aruna_core::plugin_runs::SourceKind::DatasetCreated,
+        group_id: Ulid::from_parts(1, 9),
+        path: "/r/g/x/meta/a@d".into(),
+        resource: "d".into(),
+        revision: "e".into(),
+        source: "s1".into(),
+        actor: None,
+        anchor_ms: 5,
+        journaled_ms: 5,
+    };
+    let row = ForwardRow {
+        install_id: Ulid::from_parts(1, 1),
+        revision: 1,
+        event,
+        queued_ms: 5,
+    };
+    WaitingRow { row, received_ms }
+}
+
+#[test]
+fn settle_frees_slot() {
+    let local = iroh::SecretKey::from_bytes(&[4; 32]).public();
+    let key = b"slot".to_vec();
+    // An expired event frees its slot and is counted as a gap.
+    let mut expired = SettleWaiting::new(key.clone(), waiting_row(1), None, (local, 9));
+    let freed = vec![
+        (PLUGIN_WAITING_KEYSPACE, key.clone()),
+        (PLUGIN_QUEUE_KEYSPACE, key.clone()),
+    ];
+    assert_eq!(expired.first().unwrap(), Next::Call(delete_call(freed)));
+    assert!(matches!(
+        expired.next(IoResult::Done).unwrap(),
+        Next::Call(IoCall::Read(_))
+    ));
+    let Next::Call(IoCall::Write(rows)) = expired.next(values_result(vec![None])).unwrap() else {
+        panic!("the gap and the dedup record are written");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(expired.next(IoResult::Done).unwrap(), Next::Done(()));
+    // A denied event records its denial only.
+    let denied = Some(Verdict::Denied("no".into()));
+    let mut refused = SettleWaiting::new(key, waiting_row(1), denied, (local, 9));
+    refused.first().unwrap();
+    let Next::Call(IoCall::Write(rows)) = refused.next(IoResult::Done).unwrap() else {
+        panic!("the denial is recorded");
+    };
+    assert_eq!(rows.len(), 1);
+    assert!(refused.next(page_result(Vec::new(), None)).is_err());
+}
+
+fn stored_waiting(received_ms: u64) -> (Vec<u8>, Vec<u8>) {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let row = ForwardRow {
+        install_id: install.install_id,
+        revision: 1,
+        event: aruna_core::plugin_runs::SourceEvent {
+            kind: aruna_core::plugin_runs::SourceKind::DatasetCreated,
+            group_id: install.group_id,
+            path: "/r/g/x/meta/a@d".into(),
+            resource: "d".into(),
+            revision: "e".into(),
+            source: "s1".into(),
+            actor: None,
+            anchor_ms: 5,
+            journaled_ms: 5,
+        },
+        queued_ms: 5,
+    };
+    let row = WaitingRow { row, received_ms };
+    (b"w".to_vec(), crate::plugins::rows::encode(&row).unwrap())
+}
+
+fn recheck_pass(now_ms: u64) -> RecheckWaiting {
+    let realm = aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]);
+    let config = RealmConfigDocument::new(realm, Vec::new(), 3);
+    let node = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+    RecheckWaiting::new(Arc::new(config), node, now_ms)
+}
+
+#[test]
+fn expired_waiting_settles() {
+    let mut pass = recheck_pass(WAITING_EXPIRY_MS + 10);
+    assert!(matches!(pass.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let page = page_result(vec![stored_waiting(1)], None);
+    assert!(matches!(pass.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(pass.phase, RecheckPhase::Settling);
+    let settled = child_result(Ok::<(), StoreError>(()));
+    assert_eq!(pass.next(settled), Ok(Next::Done(1)));
+}
+
+#[test]
+fn unready_waiting_stays() {
+    let mut pass = recheck_pass(10);
+    let page = page_result(vec![stored_waiting(5)], None);
+    assert!(matches!(pass.next(page), Ok(Next::Call(IoCall::Child(_)))));
+    let verdict = child_result(Ok::<_, StoreError>(Verdict::Unready));
+    assert_eq!(pass.next(verdict), Ok(Next::Done(0)));
+}
+
+#[test]
+fn ready_waiting_settles() {
+    let mut pass = recheck_pass(10);
+    pass.next(page_result(vec![stored_waiting(5)], None))
+        .unwrap();
+    let verdict = child_result(Ok::<_, StoreError>(Verdict::Denied("no".into())));
+    assert!(matches!(
+        pass.next(verdict),
+        Ok(Next::Call(IoCall::Child(_)))
+    ));
+    let settled = child_result(Ok::<(), StoreError>(()));
+    assert_eq!(pass.next(settled), Ok(Next::Done(1)));
 }

@@ -2,20 +2,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-pub use aruna_core::compute::session::{EventKind, TRUNCATED_NOTICE};
 use aruna_core::compute::session::{
-    MAX_CELL_OUTPUTS, MAX_OUTPUT_BYTES, MAX_RING_BYTES, MAX_RING_EVENTS,
+    EventKind, MAX_CELL_OUTPUTS, MAX_OUTPUT_BYTES, MAX_RING_BYTES, MAX_RING_EVENTS, SessionEvent,
 };
 use serde::Serialize;
 use std::collections::VecDeque;
-
-/// One stream frame. `data` is already serialized so the ring can measure it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SessionEvent {
-    pub id: u64,
-    pub kind: EventKind,
-    pub data: String,
-}
 
 /// The bounded event history of one session.
 #[derive(Debug, Default)]

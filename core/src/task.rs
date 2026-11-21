@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,7 @@ use ulid::Ulid;
 
 use crate::id::NodeId;
 use crate::structs::identity::realm::RealmId;
+use crate::structs::synced_folder::{SyncPullAck, SyncPullStatus, SyncRefusal};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TaskKey {
@@ -88,6 +91,23 @@ pub enum TaskKey {
     PruneConnectorReferences,
     /// Accounts recorded splits, rebuilds split children and splits ranges above thresholds.
     MaintainRanges,
+    /// Prunes the job families whose prune index row is due, page by page.
+    PruneFamilies,
+    /// Catches up with the realm config after a start, then refreshes the last contact.
+    ConfigCatchUp,
+    /// Emits the watch events producers queued as rows, then deletes the rows.
+    DrainWatchEvents,
+    /// Runs the follow-ups of the reconciles shard pulls applied, then deletes their rows.
+    DrainAppliedSync,
+    /// Takes the Git snapshots of materialized documents whose capture marks remain.
+    DrainCaptures,
+}
+
+impl TaskKey {
+    /// The row key of this timer in the persisted timer keyspace.
+    pub fn storage_key(&self) -> Result<crate::types::Key, crate::errors::ConversionError> {
+        Ok(postcard::to_allocvec(self)?.into())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -95,17 +115,73 @@ pub struct PersistedTaskTimer {
     pub key: TaskKey,
     #[serde(rename = "due_at_unix_millis")]
     pub due_unix_millis: u64,
+    /// The scheduler admission that owns this row: only the firing of that admission deletes it.
+    pub admission: u64,
 }
+
+/// The message of the error a task effect gets on a node without a task handler.
+pub const NO_TASK_HANDLE: &str = "task handle unavailable";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskEffect {
-    ResetTimer { key: TaskKey, after: Duration },
-    ShortenTimer { key: TaskKey, after: Duration },
-    CancelTimer { key: TaskKey },
-    AbortRunningHandlers { key: TaskKey },
+    ResetTimer {
+        key: TaskKey,
+        after: Duration,
+    },
+    ShortenTimer {
+        key: TaskKey,
+        after: Duration,
+    },
+    CancelTimer {
+        key: TaskKey,
+    },
+    AbortRunningHandlers {
+        key: TaskKey,
+    },
+    /// Arms the timer unless it is armed already or its handler runs.
+    ScheduleIdleTimer {
+        key: TaskKey,
+        after: Duration,
+    },
+    Pull(PullEffect),
 }
 
+/// The synced-folder pulls this node runs, by receipt key; answered by `TaskEvent::Pull`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullEffect {
+    /// Claims a pull of `total` bytes: its progress, or the status of the run holding the key.
+    Claim { key: Vec<u8>, total: u64 },
+    /// Ends a run; a refusal is kept until the device asked for it once.
+    Finish {
+        key: Vec<u8>,
+        result: Result<SyncPullAck, SyncRefusal>,
+    },
+    /// Where the run of `key` stands, when this node runs or refused it.
+    Status { key: Vec<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PullEvent {
+    Claimed(Result<PullProgress, SyncPullStatus>),
+    Finished,
+    Status(Option<SyncPullStatus>),
+}
+
+/// The bytes of a pull that arrived so far, shared with the poll that reports them. A run holds
+/// it until it ends, so a dropped run frees its claim.
+#[derive(Clone, Debug, Default)]
+pub struct PullProgress(pub Arc<AtomicU64>);
+
+/// Two progress counters are the same when they count the same pull.
+impl PartialEq for PullProgress {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for PullProgress {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TaskEvent {
     TimerScheduled {
         key: TaskKey,
@@ -118,6 +194,11 @@ pub enum TaskEvent {
         key: TaskKey,
         count: usize,
     },
+    /// Answers `Effect::Background`: whether a free slot let the child start.
+    BackgroundStarted {
+        started: bool,
+    },
+    Pull(PullEvent),
     Error {
         key: Option<TaskKey>,
         message: String,

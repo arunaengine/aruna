@@ -4,11 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
-use crate::{NodeId, UserId};
+use crate::id::NodeId;
+use crate::user::id::UserId;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
-use ulid::{Generator, Ulid};
+use ulid::Ulid;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,22 +54,6 @@ pub struct BucketAuditRecord {
     pub deadline_ms: Option<u64>,
     pub reason: Option<String>,
     pub outcome: AuditOutcome,
-}
-
-/// Event ids of this process in issue order, so the records of one bucket sort as they happened
-/// even within one millisecond.
-static EVENT_IDS: Mutex<Generator> = Mutex::new(Generator::new());
-
-/// The next audit event id at `at_ms`; it sorts after every id issued before it.
-pub fn next_event_id(at_ms: u64) -> Ulid {
-    let at = SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms);
-    let Ok(mut ids) = EVENT_IDS.lock() else {
-        return Ulid::from_datetime(at);
-    };
-    match ids.generate_from_datetime(at) {
-        Ok(id) => id,
-        Err(overflow) => overflow.commit_overflow_increment(),
-    }
 }
 
 impl BucketAuditRecord {
@@ -122,15 +105,5 @@ mod tests {
         );
         let names = serde_json::to_value((AuditAction::TimedLock, AuditOutcome::Applied)).unwrap();
         assert_eq!(names, serde_json::json!(["timed_lock", "applied"]));
-    }
-
-    #[test]
-    fn event_ids_monotonic() {
-        // Ids issued within one millisecond, or with an older time, still sort in issue order.
-        let first = next_event_id(1_000);
-        let same = next_event_id(1_000);
-        let older = next_event_id(999);
-        assert!(first < same && same < older);
-        assert!(older < next_event_id(2_000));
     }
 }

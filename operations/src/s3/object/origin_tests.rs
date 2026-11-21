@@ -18,19 +18,7 @@ const BUCKET: &str = "bakrep";
 const KEY: &str = "genes/SAMN15803895.faa.gz";
 
 async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
-    let event = context
-        .storage_handle
-        .send_storage_effect(StorageEffect::Write {
-            key_space: key_space.to_string(),
-            key: key.into(),
-            value: value.into(),
-            txn_id: None,
-        })
-        .await;
-    assert!(matches!(
-        event,
-        Event::Storage(StorageEvent::WriteResult { .. })
-    ));
+    aruna_drivers::testing::write_value(&context.storage_handle, key_space, key, value).await;
 }
 
 /// A bucket with one version and database metadata whose rules find BioSample ids.
@@ -111,12 +99,13 @@ async fn seed(context: &DriverContext, actor: &Actor, listed: bool) -> Ulid {
 
 fn test_context(temp: &tempfile::TempDir) -> DriverContext {
     DriverContext {
-        storage_handle: aruna_storage::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
+        storage_handle: aruna_storage::storage::worker::FjallStorage::open(temp.path().to_str().unwrap()).unwrap(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     }
 }
 
@@ -169,7 +158,7 @@ async fn connector_name_read() {
         source_version: None,
         digests: Default::default(),
     };
-    let binding = crate::staging::descriptor::build_source_binding(
+    let binding = crate::connectors::descriptor::build_source_binding(
         StagingStrategy::Reference,
         &connector,
         &observed,

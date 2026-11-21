@@ -4,7 +4,7 @@
 
 use aruna_core::permission_path::{bind_wildcards, permission_pattern_matches};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
-use aruna_operations::s3::object::get::ObjectRangeRequest;
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
 
 pub(super) fn object_range_request(range: s3s::dto::Range) -> ObjectRangeRequest {
     match range {

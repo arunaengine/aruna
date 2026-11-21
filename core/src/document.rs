@@ -3,35 +3,40 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
+use std::time::Duration;
 
 use byteview::ByteView;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::UserId;
 use crate::admin_documents::AdminDocumentEvent;
+use crate::effects::Effect;
+use crate::errors::ConversionError;
+use crate::id::{NodeId, TopicId};
 use crate::keyspaces::{
-    AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE, EVENT_LOG_KEYSPACE,
-    GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE, GROUP_KEYSPACE,
-    ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE, NODE_STATS_KEYSPACE,
-    OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
+    APPLIED_SYNC_KEYSPACE, AUTH_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE, EMAIL_SETTINGS_KEYSPACE,
+    EVENT_LOG_KEYSPACE, GIT_PACK_KEYSPACE, GIT_RECORD_KEYSPACE, GRAPH_LIFECYCLE_KEYSPACE,
+    GROUP_KEYSPACE, ID_MAPPING_KEYSPACE, METADATA_INDEX_KEYSPACE, NODE_INFO_KEYSPACE,
+    NODE_STATS_KEYSPACE, OWNER_SECRETS_KEYSPACE, PLACEMENT_POLICY_KEYSPACE, REALM_CONFIG_KEYSPACE,
     REPOSITORY_LINK_KEYSPACE, USER_KEY_KEYSPACE, USER_KEYSPACE, VAULT_REVISION_KEYSPACE,
     WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE, WEBHOOK_SETTINGS_KEYSPACE,
 };
 use crate::metadata::{GraphLifecycleRecord, MetadataEventRecord};
-use crate::repository::link_key;
+use crate::repository::link::link_key;
 use crate::storage_entries::{document_lifecycle_key, event_log_key, graph_lifecycle_key};
 use crate::structs::execution::notification_watch::{interest_node_key, watch_subscription_key};
 use crate::structs::execution::setting::setting_key;
 use crate::structs::identity::realm::RealmId;
 use crate::structs::identity::user::vault::user_record_key;
-use crate::structs::persistent_id_key;
+use crate::structs::persistent_id::persistent_id_key;
 use crate::structs::placement::policy::document::placement_policy_key;
 use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
 use crate::structs::storage::node_info::node_info_key;
 use crate::structs::storage::usage::{usage_global_key, usage_snapshot_key};
-use crate::types::{GroupId, Key};
-use crate::{NodeId, TopicId};
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DocumentTarget {
@@ -173,6 +178,46 @@ pub struct ShardManifest {
     pub updated_at_ms: u64,
 }
 
+/// New-holder request: give me your paged manifest for this shard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardTransportMessage {
+    ManifestRequest {
+        realm_id: RealmId,
+        placement: PlacementRef,
+    },
+}
+
+/// A digest of the entries that does not depend on their order.
+pub fn manifest_entry_digest(entries: &[ShardManifestEntry]) -> [u8; 32] {
+    let mut encoded_entries: Vec<Vec<u8>> = entries.iter().map(canonical_entry_bytes).collect();
+    encoded_entries.sort();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(encoded_entries.len() as u64).to_be_bytes());
+    for encoded in encoded_entries {
+        hasher.update(&(encoded.len() as u64).to_be_bytes());
+        hasher.update(&encoded);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn canonical_entry_bytes(entry: &ShardManifestEntry) -> Vec<u8> {
+    let target_key = crate::storage_entries::sync_revision_key(&entry.target);
+    let target_key = target_key.as_ref();
+    let mut bytes = Vec::with_capacity(4 + target_key.len() + 8 + 16 + 32 + 8);
+    bytes.extend_from_slice(&(target_key.len() as u32).to_be_bytes());
+    bytes.extend_from_slice(target_key);
+    bytes.extend_from_slice(&entry.revision.generation.to_be_bytes());
+    bytes.extend_from_slice(&entry.revision.event_id.to_bytes());
+    bytes.extend_from_slice(entry.revision.actor.as_bytes());
+    bytes.extend_from_slice(&entry.revision.updated_at_ms.to_be_bytes());
+    bytes
+}
+
+// Matches irokle's 1024-topic wire batches; the worst-case data stream sends
+// three messages per topic, staying under the peer's 4096-message stream cap.
+pub const BATCH_TOPIC_LIMIT: usize = 1_024;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentOutboxRecord {
     pub outbox_id: Ulid,
@@ -193,6 +238,9 @@ pub struct DocumentOutboxRecord {
     /// is missing. Only the node that originated the document sets this; every
     /// other publisher waits (retryable) for the origin's genesis to replicate.
     pub allow_genesis: bool,
+    /// A fresh id eviction recovery writes into a row it re-emits, so the row never equals the
+    /// one an older drain read and finishes; `None` on a first write.
+    pub incarnation: Option<Ulid>,
 }
 
 impl DocumentOutboxRecord {
@@ -219,6 +267,32 @@ pub enum DocumentOutboxEvent {
     Delete {
         change: DocumentChange,
     },
+}
+
+/// The topics and admin origins whose later records in one publish batch wait behind an earlier
+/// record that retries, so none of them lands or syncs ahead of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldDomains {
+    topics: BTreeSet<irokle::TopicId>,
+    origins: BTreeSet<NodeId>,
+}
+
+impl HeldDomains {
+    /// Holds the topic and the admin origin of a record that retries.
+    pub fn hold(&mut self, topic: irokle::TopicId, origin: Option<NodeId>) {
+        self.topics.insert(topic);
+        self.origins.extend(origin);
+    }
+
+    /// Whether a record waits behind a held one; a waiting record holds both its domains too.
+    pub fn waits(&mut self, topic: irokle::TopicId, origin: Option<NodeId>) -> bool {
+        let waits = self.topics.contains(&topic)
+            || origin.is_some_and(|origin| self.origins.contains(&origin));
+        if waits {
+            self.hold(topic, origin);
+        }
+        waits
+    }
 }
 
 impl DocumentOutboxEvent {
@@ -315,7 +389,46 @@ pub enum DocumentSyncPublish {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// One bounded causal batch of a document sync topic, read under its stored cursor. The new
+/// cursor is written, as `cursor_value` under `cursor_key`, only once the batch applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileBatch {
+    /// The encoded cursor the batch starts from, where an overflow replay resumes.
+    pub start_value: ByteView,
+    pub cursor_key: ByteView,
+    pub cursor_value: ByteView,
+    /// Ops whose payload never decoded into an event.
+    pub rejections: Vec<crate::structs::sync_quarantine::SyncRejection>,
+    pub events: Vec<BatchEvent>,
+}
+
+/// One step of an overflow replay over a topic's stored events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverflowPage {
+    /// The topic no longer exists on this node.
+    TopicGone,
+    /// The replay reached the topic's applied cursor.
+    Finished,
+    Page {
+        /// The encoded position this page starts from.
+        at: ByteView,
+        /// The encoded position after this page.
+        next: ByteView,
+        events: Vec<(DocumentEvent, irokle::ActorId)>,
+    },
+}
+
+/// One event of a [`ReconcileBatch`] with its publishing actor and that actor's sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchEvent {
+    pub event: DocumentEvent,
+    pub actor: irokle::ActorId,
+    pub actor_seq: u64,
+    /// Whether the topic's shard publisher policy admits this actor at this sequence.
+    pub publisher_allowed: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocumentReconcileResult {
     pub targets: Vec<DocumentTarget>,
     pub metadata_create_events: Vec<MetadataEventRecord>,
@@ -326,6 +439,80 @@ impl DocumentReconcileResult {
     pub fn applied(&self) -> usize {
         self.targets.len()
     }
+}
+
+/// The follow-up of an [`AppliedSync`] the node drain runs next, in this order.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppliedStep {
+    #[default]
+    Usage,
+    Interest,
+    Mail,
+    Metadata,
+}
+
+impl AppliedStep {
+    /// The follow-up after this one, `None` after the last.
+    pub fn after(self) -> Option<Self> {
+        match self {
+            Self::Usage => Some(Self::Interest),
+            Self::Interest => Some(Self::Mail),
+            Self::Mail => Some(Self::Metadata),
+            Self::Metadata => None,
+        }
+    }
+}
+
+/// A reconcile a shard pull applied, kept until the node drain ran its usage, watch, mail and
+/// metadata follow-ups. The id orders the rows and is the generation of the usage refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedSync {
+    pub id: Ulid,
+    pub node_id: NodeId,
+    /// The realm this node serves, when it runs a net transport.
+    pub realm_id: Option<RealmId>,
+    pub result: DocumentReconcileResult,
+    /// The drain stores each finished follow-up here, so a rerun after a restart goes on.
+    pub next: AppliedStep,
+}
+
+impl AppliedSync {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// The row that queues `applied` for the node drain.
+pub fn applied_sync_entry(
+    applied: &AppliedSync,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let key = Key::from(applied.id.to_bytes().to_vec());
+    let value = Value::from(applied.to_bytes()?);
+    Ok((APPLIED_SYNC_KEYSPACE.to_string(), key, value))
+}
+
+/// The counter row of the order `document_id`'s queued follow-ups were accepted in.
+pub fn order_counter_key(document_id: Ulid) -> Key {
+    Key::from(document_id.to_bytes().to_vec())
+}
+
+/// The entry of the follow-up batch queued `sequence`-th for `document_id`; it holds the id.
+pub fn order_entry_key(document_id: Ulid, sequence: u64) -> Key {
+    let mut key = document_id.to_bytes().to_vec();
+    key.extend_from_slice(&sequence.to_be_bytes());
+    Key::from(key)
+}
+
+/// Arms the node drain of applied reconciles to run now.
+pub fn schedule_applied_drain() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainAppliedSync,
+        after: Duration::ZERO,
+    })
 }
 
 impl DocumentSyncPublish {
@@ -416,6 +603,19 @@ impl DocumentTarget {
                 | Self::RealmConfig { .. }
                 | Self::User { .. }
         )
+    }
+
+    /// Whether a change of this document can change what a dashboard shows. Usage snapshots
+    /// republish often and are left out; the dashboard polls usage on its own.
+    pub fn changes_dashboard(&self) -> bool {
+        self.is_admin_document()
+            || matches!(
+                self,
+                Self::MetadataRegistry { .. }
+                    | Self::MetadataCreateEvent { .. }
+                    | Self::MetadataDocumentLifecycle { .. }
+                    | Self::MetadataGraphLifecycle { .. }
+            )
     }
 
     pub fn topic_id(&self) -> TopicId {
@@ -704,9 +904,12 @@ impl DocumentEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentEffect {
+    /// `expected` names, by document position, the lineage root a topic must still have for
+    /// its event to append; a document on a moved topic retries.
     PublishDocuments {
         documents: Vec<DocumentSyncPublish>,
         peers: Vec<NodeId>,
+        expected: Vec<Option<[u8; 32]>>,
     },
     SyncDocument {
         topic: irokle::TopicId,
@@ -716,17 +919,36 @@ pub enum DocumentEffect {
         topics: Vec<irokle::TopicId>,
         peers: Vec<NodeId>,
     },
+    /// Reads the next causal batch of a topic above its stored applied cursor.
+    ReconcileBatch {
+        topic: irokle::TopicId,
+        stored_cursor: Option<ByteView>,
+    },
+    /// Reads the next overflow replay page of a topic from the encoded position `start`.
+    OverflowPage {
+        topic: irokle::TopicId,
+        start: ByteView,
+        applied: Option<ByteView>,
+    },
+    /// Rebuilds the peer set after a realm config change; the runner carries it out.
+    ReloadRealmPeers,
+    /// Counts one durably stored Git record of the document for its readers.
+    NoteGitRecord { document_id: Ulid },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentNetEvent {
+    /// `lineages` hold, by document position, the lineage root each event was found or
+    /// appended on; `None` where it is unknown.
     DocumentsPublished {
         targets: Vec<DocumentTarget>,
+        lineages: Vec<Option<[u8; 32]>>,
     },
     DocumentsPartiallyPublished {
         published_indices: Vec<usize>,
         retry_indices: Vec<usize>,
         error: String,
+        lineages: Vec<Option<[u8; 32]>>,
     },
     DocumentsReconciled {
         applied: usize,
@@ -734,10 +956,37 @@ pub enum DocumentNetEvent {
         metadata_create_events: Vec<MetadataEventRecord>,
         metadata_graph_tombstones: Vec<GraphLifecycleRecord>,
     },
+    /// These topics were synced with their peers and flushed; a reconcile applies them next.
+    DocumentsSynced {
+        topics: Vec<irokle::TopicId>,
+    },
+    /// The next batch of a topic, or none when the topic has nothing new to apply.
+    ReconcileBatch(Option<Box<ReconcileBatch>>),
+    OverflowPage(Box<OverflowPage>),
+    RealmPeersReloaded,
+    GitRecordNoted,
     Error {
         target: Option<DocumentTarget>,
         error: String,
     },
+}
+
+impl DocumentNetEvent {
+    /// The event that reports the outcome of a reconcile pass.
+    pub fn reconciled<E: std::fmt::Display>(result: Result<DocumentReconcileResult, E>) -> Self {
+        match result {
+            Ok(result) => Self::DocumentsReconciled {
+                applied: result.applied(),
+                targets: result.targets,
+                metadata_create_events: result.metadata_create_events,
+                metadata_graph_tombstones: result.metadata_graph_tombstones,
+            },
+            Err(error) => Self::Error {
+                target: None,
+                error: error.to_string(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,8 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -17,10 +19,10 @@ use aruna_core::structs::storage::share::{
     SHARE_SCHEME, ShareAction, ShareEvent, ShareLink, ShareTarget, ShareToken, TICKET_SECS,
     TicketBody, client_network,
 };
-use aruna_operations::auth::request_policy::PolicyRequestExtras;
-use aruna_operations::driver::{drive, now_ms};
-use aruna_operations::notifications::emit::{EmitNotificationsInput, EmitNotificationsOperation};
-use aruna_operations::s3::object::get::{GetObjectInput, get_object_routed};
+use aruna_drivers::driver::{drive, drive_retry};
+use aruna_operations::distribution::nonce::SpendNonceOperation;
+use aruna_operations::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_operations::s3::object::get::GetObjectInput;
 use aruna_operations::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_operations::shares::lifecycle::{
     OpenShareConfig, OpenShareOperation, OpenedShare, ShareError,
@@ -30,7 +32,10 @@ use aruna_operations::shares::rules::{
     NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
 use aruna_operations::shares::store::GetShareOperation;
-use aruna_operations::staging::offered_directory::guard_bucket_write;
+use aruna_operations::sync::notification_outbox::{
+    EmitNotificationsInput, EmitNotificationsOperation,
+};
+use aruna_operations::transfer::read::GetRoutedOperation;
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, State};
@@ -39,26 +44,29 @@ use axum::response::{IntoResponse, Response};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::relay::{
-    ShareRelay, UploadStream, counted_blob, member_error, share_access, upload_error,
+    UploadStream, counted_blob, listing_refusal, read_refusal, share_access, share_listing,
+    upload_error,
 };
-use super::{ShareModeBody, log_event, rfc3339, unix_now};
+use super::{ShareModeBody, log_event, rfc3339};
 use crate::auth::ensure_permission_with;
 use crate::download::{self, AdmissionError};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::forwarded::client_ip;
+use crate::lookup::{ObjectOutput, bucket_info};
 use crate::mcp::data::store_stream;
 use crate::rate_limit::LocalKey;
-use crate::routes::federation::import::shared_stream;
-use crate::routes::storage::deletion::bucket_info;
-use crate::routes::storage::objects::page_error;
-use crate::s3::service::{ArunaS3Service, ReadAnswer};
+use crate::routes::storage::objects::{page_error, page_node};
+use crate::s3::service::ArunaS3Service;
+use crate::s3::service::forward::reads::delegated_caller;
 use crate::server::state::ServerState;
-use aruna_operations::s3::object::pages::{self, ListRequest, PageError, PageScope};
+use aruna_clock::unix_timestamp_secs;
+use aruna_operations::s3::object::member::read::{MemberKey, MemberRead, MemberReadOperation};
+use aruna_operations::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Entries per listing page when the visitor names no limit.
@@ -68,13 +76,9 @@ const MAX_JSON_BYTES: usize = 64 * 1024;
 /// The longest one upload may take; a stalled body also ends after the import idle timeout.
 const UPLOAD_SECS: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-#[derive(OpenApi)]
-#[openapi()]
-pub struct VisitDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
     // Uploads stream their body unbuffered; every other visitor body is small JSON.
-    let small = OpenApiRouter::with_openapi(VisitDoc::openapi())
+    let small = OpenApiRouter::new()
         .routes(routes!(open_share))
         .routes(routes!(list_files))
         .routes(routes!(create_ticket))
@@ -188,7 +192,7 @@ pub(crate) fn visit_error(error: ShareError) -> ServerError {
         ),
         ShareError::Denied => ServerError::Forbidden,
         ShareError::Rule(error) => ServerError::BadRequestReason(error.to_string()),
-        error => ServerError::InternalError(error.to_string()),
+        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -225,7 +229,7 @@ pub(crate) fn visitor_ip(state: &ServerState, peer: SocketAddr, headers: &Header
 
 pub(crate) fn event(action: ShareAction, key: Option<String>, ip: IpAddr) -> ShareEvent {
     ShareEvent {
-        at: now_ms(),
+        at: unix_timestamp_millis(),
         action,
         key,
         bytes: None,
@@ -236,7 +240,7 @@ pub(crate) fn event(action: ShareAction, key: Option<String>, ip: IpAddr) -> Sha
 async fn active_link(state: &ServerState, id: Ulid, now: u64) -> ServerResult<ShareLink> {
     let link = drive(GetShareOperation::new(id), &state.get_ctx())
         .await
-        .map_err(|error| ServerError::InternalError(error.to_string()))?
+        .map_err(|error| ServerError::InternalError(error.into()))?
         .filter(|link| link.active(now))
         .ok_or_else(unavailable)?;
     // A deactivated creator ends every link at once.
@@ -256,7 +260,7 @@ pub(crate) async fn visited_link(
     let ShareToken::Visit { expires_at, .. } = token else {
         return Err(unavailable());
     };
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let link = active_link(state, token.share_id(), now).await?;
     match link.admits(&token, now) {
         true => Ok((link, expires_at)),
@@ -389,7 +393,7 @@ pub async fn open_share(
     let config = OpenShareConfig {
         token,
         password: request.and_then(|Json(request)| request.password),
-        now: unix_now(),
+        now: unix_timestamp_secs(),
         entry_id: Ulid::generate(),
         client: client_network(ip),
     };
@@ -400,7 +404,7 @@ pub async fn open_share(
         runtime.block_on(drive(OpenShareOperation::new(config), &context))
     })
     .await
-    .map_err(|error| ServerError::InternalError(error.to_string()))?
+    .map_err(|error| ServerError::InternalError(error.into()))?
     .map_err(visit_error)?;
     let OpenedShare {
         link,
@@ -497,20 +501,17 @@ pub(crate) async fn list_below(
         limit,
         partial: false,
     };
-    let relay = ShareRelay {
-        state,
-        user: share_access(state, link, (auth, info), visit_end),
-    };
-    let context = state.get_ctx();
-    let scope = PageScope {
-        context: context.as_ref(),
-        realm_id: state.get_realm_id(),
-        node_id: state.get_node_id(),
-        relay: &relay,
-    };
-    let page = pages::object_page(&scope, info, Some((auth, visit_end)), request).await;
+    let list = ObjectPageOperation::<ObjectOutput>::new(
+        page_node(state),
+        share_listing(state, link, (auth, info), visit_end),
+        info,
+        Some((auth, visit_end)),
+        request,
+    );
+    let page = drive(list, &state.get_ctx()).await;
     let page = page.map_err(|error| match error {
         PageError::Unanswered { .. } => range_unavailable("cannot be listed"),
+        PageError::Relay(refusal) => listing_refusal(refusal),
         error => page_error(error),
     })?;
     let relative = |key: &str| key.strip_prefix(root).map(str::to_string);
@@ -554,7 +555,7 @@ pub(crate) fn sign_ticket(
     (bucket, key): (&str, &str),
     version_id: Option<Ulid>,
 ) -> ServerResult<TicketResponse> {
-    let expires_at = (unix_now() + TICKET_SECS).min(visit_end);
+    let expires_at = (unix_timestamp_secs() + TICKET_SECS).min(visit_end);
     let body = TicketBody {
         share_id: link.id,
         bucket: bucket.to_string(),
@@ -565,7 +566,7 @@ pub(crate) fn sign_ticket(
     };
     let ticket = link
         .ticket(&body)
-        .map_err(|error| ServerError::InternalError(error.to_string()))?;
+        .map_err(|error| ServerError::InternalError(error.into()))?;
     Ok(TicketResponse {
         path: format!("/api/v1/shares/download?ticket={ticket}"),
         expires_at: rfc3339(expires_at),
@@ -590,7 +591,7 @@ pub(crate) async fn current_version(
             | HeadObjectError::NoSuchVersion
             | HeadObjectError::DeleteMarker,
         ) => Err(ServerError::NotFound),
-        Err(error) => Err(ServerError::InternalError(error.to_string())),
+        Err(error) => Err(ServerError::InternalError(error.into())),
     }
 }
 
@@ -605,14 +606,26 @@ pub(crate) async fn head_version(
     if info.distribution.is_none() {
         return current_version(state, bucket, key).await;
     }
-    let service = member_service(state).await;
-    match service.member_head(user, (bucket, info), key).await {
-        Ok(ReadAnswer::Local(_)) => current_version(state, bucket, key).await,
-        Ok(ReadAnswer::Forwarded(response, _)) => Ok((response.headers().get("x-amz-version-id"))
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| Ulid::from_string(value).ok())),
-        Err(error) => Err(member_error(&error)),
+    match read_member(state, user, info, MemberKey::head(bucket, key)).await? {
+        MemberRead::Local(_) => current_version(state, bucket, key).await,
+        MemberRead::Remote { body, .. } => Ok(body.version()),
     }
+}
+
+/// Reads `key` where an S3 request of `user` would be answered.
+async fn read_member(
+    state: &ServerState,
+    user: &UserAccess,
+    info: &BucketInfo,
+    key: MemberKey,
+) -> ServerResult<MemberRead> {
+    let Some(binding) = info.distribution.clone() else {
+        return Ok(MemberRead::Local(None));
+    };
+    let context = state.get_ctx();
+    let ids = context.node_and_realm();
+    let read = MemberReadOperation::new(ids, delegated_caller(user), binding, key);
+    drive(read, &context).await.map_err(read_refusal)
 }
 
 async fn member_service(state: &ServerState) -> ArunaS3Service {
@@ -710,7 +723,7 @@ pub async fn download_file(
     Query(query): Query<DownloadQuery>,
 ) -> ServerResult<Response> {
     let ip = visitor_ip(&state, peer, &headers);
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let share_id = ticket_share(&query.ticket).ok_or_else(unavailable)?;
     let link = active_link(&state, share_id, now).await?;
     let ticket = link
@@ -727,10 +740,8 @@ pub async fn download_file(
     )
     .await?;
     let ctx = state.get_ctx();
-    aruna_operations::distribution::delegate::spend_nonce(&ctx, ticket.nonce, ticket.expires_at)
-        .await
-        .map_err(|_| unavailable())?;
-    aruna_operations::distribution::delegate::prune_nonces(&ctx, now).await;
+    let spend = SpendNonceOperation::new(ticket.nonce, ticket.expires_at, now);
+    drive(spend, &ctx).await.map_err(|_| unavailable())?;
     let permit = download::admit(&state, LocalKey::Ip(ip)).map_err(|error| match error {
         AdmissionError::Total => {
             ServerError::ServiceUnavailableReason("download capacity exhausted".into())
@@ -745,15 +756,14 @@ pub async fn download_file(
     let remote = match info.distribution.is_some() {
         true => {
             let user = share_access(&state, &link, (&auth, &info), ticket.expires_at);
-            let service = member_service(&state).await;
-            let read = service.member_get(&user, (&bucket, &info), &ticket.key, ticket.version_id);
-            match read.await.map_err(|error| member_error(&error))? {
-                ReadAnswer::Forwarded(response, _) => {
-                    let size = (response.headers().get(header::CONTENT_LENGTH))
-                        .and_then(|value| value.to_str().ok()?.parse::<u64>().ok());
-                    Some((shared_stream(response.bytes_stream()), size))
+            let key = MemberKey::get(&bucket, &ticket.key, ticket.version_id);
+            match read_member(&state, &user, &info, key).await? {
+                MemberRead::Remote { body, .. } => {
+                    let size =
+                        (body.header("content-length")).and_then(|value| value.parse::<u64>().ok());
+                    Some((body.stream, size))
                 }
-                ReadAnswer::Local(_) => None,
+                MemberRead::Local(_) => None,
             }
         }
         false => None,
@@ -761,19 +771,22 @@ pub async fn download_file(
     let (blob, size) = match remote {
         Some(remote) => remote,
         None => {
-            let result = get_object_routed(
+            let result = drive(
+                GetRoutedOperation::new(
+                    GetObjectInput {
+                        bucket: bucket.clone(),
+                        key: ticket.key.clone(),
+                        version_id: ticket.version_id,
+                        range: None,
+                        group_id: info.group_id,
+                        user_identity: auth.user_id,
+                        realm_id: state.get_realm_id(),
+                        node_id: state.get_node_id(),
+                    },
+                    auth.path_restrictions.clone(),
+                    None,
+                ),
                 &state.get_ctx(),
-                GetObjectInput {
-                    bucket: bucket.clone(),
-                    key: ticket.key.clone(),
-                    version_id: ticket.version_id,
-                    range: None,
-                    group_id: info.group_id,
-                    user_identity: auth.user_id,
-                    realm_id: state.get_realm_id(),
-                    node_id: state.get_node_id(),
-                },
-                auth.path_restrictions.clone(),
             )
             .await
             .map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
@@ -813,7 +826,7 @@ async fn claim_key(
     wanted: &str,
     user: &UserAccess,
 ) -> ServerResult<String> {
-    let now = unix_now();
+    let now = unix_timestamp_secs();
     let until = now + UPLOAD_SECS.as_secs();
     let mut number = 0;
     loop {
@@ -829,8 +842,9 @@ async fn claim_key(
         }
         let permission = (Permission::WRITE, "share.upload");
         authorize_object(state, auth, (bucket, info), &candidate, permission).await?;
-        let claim = ClaimNameOperation::new(bucket, &candidate, now, until);
-        if drive(claim, &state.get_ctx()).await.map_err(visit_error)? {
+        let claim = || ClaimNameOperation::new(bucket, &candidate, now, until);
+        let claimed = drive_retry(claim, &state.get_ctx(), candidate.as_bytes()).await;
+        if claimed.map_err(visit_error)? {
             return Ok(candidate);
         }
     }
@@ -886,9 +900,12 @@ pub async fn upload_file(
     crate::s3::util::validate_object_key(&wanted)
         .map_err(|_| ServerError::BadRequestReason("the name is not a valid object key".into()))?;
     let (bucket, info, auth) = visit_scope(&state, &link).await?;
-    guard_bucket_write(state.get_ctx().as_ref(), &bucket)
-        .await
-        .map_err(|_| ServerError::Forbidden)?;
+    drive(
+        BucketGuardOperation::new(bucket.as_str()),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|_| ServerError::Forbidden)?;
     let user = share_access(&state, &link, (&auth, &info), visit_end);
     let key = claim_key(&state, &auth, (&bucket, &info), &wanted, &user).await?;
     let content_length = headers
@@ -965,8 +982,13 @@ async fn notify_owner(
         key: key.to_string(),
         size_bytes: size,
     };
-    let record =
-        NotificationRecord::new(link.created_by, NotificationClass::Direct, kind, now_ms());
+    let record = NotificationRecord::new(
+        ulid::Ulid::generate(),
+        link.created_by,
+        NotificationClass::Direct,
+        kind,
+        unix_timestamp_millis(),
+    );
     let operation = EmitNotificationsOperation::new(EmitNotificationsInput {
         records: vec![record],
     });

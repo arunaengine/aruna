@@ -63,7 +63,7 @@ impl ChangeEncryptionOperation {
                     settings.storage_generation += 1;
                 }
                 if mode == EncryptionMode::NodeManaged && secret.is_some() {
-                    old.vault_entry = Some(Ulid::generate());
+                    old.vault_entry = Some(self.ids.mint(self.input.now_ms));
                 }
                 rows.push((
                     aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE.to_string(),
@@ -139,7 +139,7 @@ impl ChangeEncryptionOperation {
             .as_ref()
             .map_or(old.key.generation, |(record, _)| record.key.generation);
         rows.push(audit_row(&BucketAuditRecord {
-            event_id: Ulid::generate(),
+            event_id: self.ids.mint(self.input.now_ms),
             bucket_id: old.key.bucket_id,
             at_ms: self.input.now_ms,
             action,

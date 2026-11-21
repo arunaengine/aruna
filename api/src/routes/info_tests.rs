@@ -4,12 +4,14 @@
 
 use super::{
     GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
-    PeerContacts, PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus,
-    RealmPlacementOverride, RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig,
-    RealmQuotaOverride, ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info,
-    get_realm_placement, get_usage, map_handle_error, map_placement_error, map_quota_error,
-    map_realm_nodes, mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
+    PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
+    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
+    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
+    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
+    mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
 };
+use crate::auth::extract;
+use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::ServerError;
 use crate::openapi::ApiDoc;
 use crate::routes::federation::{
@@ -19,8 +21,8 @@ use crate::routes::federation::{
 use crate::routes::node_names::{NodeNameRequest, name_own_device, name_realm_node};
 use crate::routes::promotion::promote_server_node;
 use crate::server::state::ServerState;
-use crate::tests::routes::{test_context, test_state, test_storage};
-use aruna_core::UserId;
+use crate::tests::routes::{test_state, test_storage};
+use crate::tests::users::foreign_auth;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -31,10 +33,11 @@ use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
-use aruna_operations::driver::{DriverContext, drive};
-use aruna_operations::placement::allocate_handle::{
-    HandleAllocationError, allocate_placement_binding,
-};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_drivers::testing::test_context;
+use aruna_operations::placement::allocate_handle::HandleAllocationError;
+use aruna_operations::placement::provision::AllocateBindingOperation;
 use aruna_operations::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_operations::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_operations::realm::get_nodes::RealmPresence;
@@ -71,16 +74,6 @@ async fn setup_state() -> (Arc<ServerState>, TempDir) {
     );
 
     (state, tempdir)
-}
-
-fn foreign_auth() -> AuthContext {
-    let realm_id = RealmId::from_bytes([7u8; 32]);
-    AuthContext {
-        user_id: UserId::local(Ulid::generate(), realm_id),
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
 }
 
 fn key_set(value: &serde_json::Value) -> std::collections::HashSet<&str> {
@@ -258,9 +251,9 @@ async fn admin_sees_operations() {
 /// member sees it redacted while a realm config admin sees it in full.
 #[test]
 fn peer_error_visibility() {
-    let peer = aruna_core::structs::PeerConnectionState {
+    let peer = aruna_core::structs::info::PeerConnectionState {
         node_id: iroh::SecretKey::from_bytes(&[3u8; 32]).public(),
-        status: aruna_core::structs::PeerConnectionStatus::Unreachable,
+        status: aruna_core::structs::info::PeerConnectionStatus::Unreachable,
         active_addresses: Vec::new(),
         last_error: Some("dial refused: 10.0.0.9:4433".to_string()),
         retry_in_secs: Some(5),
@@ -375,17 +368,20 @@ async fn usage_requires_auth() {
     let (state, _tempdir) = setup_state().await;
     seed_usage_state(&state).await;
 
-    assert!(matches!(
-        get_usage(State(state.clone()), Extension(None)).await,
-        Err(ServerError::Unauthorized)
-    ));
-    assert!(matches!(
-        get_usage(State(state.clone()), Extension(Some(foreign_auth()))).await,
-        Err(ServerError::Forbidden)
-    ));
+    // `get_usage` takes `UnrestrictedAuth`, so its refusals are the extractor's.
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&state, None).await.err(),
+        Some(StatusCode::UNAUTHORIZED)
+    );
+    assert_eq!(
+        extract::<UnrestrictedAuth>(&state, Some(foreign_auth()))
+            .await
+            .err(),
+        Some(StatusCode::FORBIDDEN)
+    );
 
     let auth = test_auth_context(&state);
-    let (status, Json(response)) = get_usage(State(state), Extension(Some(auth)))
+    let (status, Json(response)) = get_usage(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
     assert_eq!(status, StatusCode::OK);
@@ -409,26 +405,28 @@ async fn usage_counts_documents() {
 
     let storage_dir = tempdir().unwrap();
     let metadata_dir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
     let node_id = iroh::SecretKey::generate().public();
-    let metadata_handle = aruna_operations::metadata::MetadataHandle::new(
+    let graph_handle = aruna_graph::GraphHandle::open(
         metadata_dir.path(),
         node_id,
-        storage_handle.clone(),
         None,
         None,
-        None,
+        aruna_graph::GraphOptions::default(),
     )
     .unwrap();
+    storage_handle.install_metadata_indexes(metadata_dir.path());
     let realm_signing_key = generate_signing_key();
     let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
     let driver_ctx = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
         blob_handle: None,
-        metadata_handle: Some(metadata_handle),
+        graph_handle: Some(graph_handle),
         task_handle: None,
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(
@@ -438,7 +436,7 @@ async fn usage_counts_documents() {
             NodeCapabilities::user_node(realm_id).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -485,7 +483,7 @@ async fn usage_counts_documents() {
     ));
 
     let auth = test_auth_context(&state);
-    let (_, Json(response)) = get_usage(State(state), Extension(Some(auth)))
+    let (_, Json(response)) = get_usage(State(state), UnrestrictedAuth(auth))
         .await
         .unwrap();
 
@@ -578,14 +576,16 @@ fn quota_capacity_unavailable() {
 
 async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle = storage::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle =
+        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
 
     let realm_signing_key = generate_signing_key();
@@ -631,7 +631,7 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
             NodeCapabilities::management_node(realm_signing_key).unwrap(),
             false,
             None,
-            aruna_operations::jobs::runtime::JobsRuntime::new(),
+            aruna_drivers::jobs::runtime::JobsRuntime::new(),
         )
         .await,
     );
@@ -640,19 +640,14 @@ async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir
 }
 
 fn admin_auth(realm_id: RealmId, user_id: UserId) -> AuthContext {
-    AuthContext {
-        user_id,
-        realm_id,
-        path_restrictions: None,
-        session: None,
-    }
+    AuthContext::new(user_id, realm_id)
 }
 
 /// Installs a realm deny policy for one permission path.
 async fn deny_path(state: &ServerState, path: &str) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -714,12 +709,14 @@ fn placement_strategy(strategy_id: Ulid) -> RealmPlacementStrategy {
 }
 
 async fn provision_strategy(state: &ServerState, actor: Actor, strategy_id: Ulid) {
-    allocate_placement_binding(
+    drive(
+        AllocateBindingOperation::new(
+            actor.clone(),
+            PlacementScope::Realm(actor.realm_id),
+            DocumentClass::Metadata,
+            strategy_id,
+        ),
         state.get_ctx().as_ref(),
-        actor.clone(),
-        PlacementScope::Realm(actor.realm_id),
-        DocumentClass::Metadata,
-        strategy_id,
     )
     .await
     .unwrap();
@@ -745,13 +742,11 @@ async fn placement_admin_gated() {
         Err(ServerError::Forbidden)
     ));
 
-    let request = RealmPlacementRequest::RemoveOverride {
-        subject: "00".to_string(),
-    };
-    assert!(matches!(
-        mutate_realm_placement(State(state.clone()), Extension(None), Ok(Json(request))).await,
-        Err(ServerError::Unauthorized)
-    ));
+    // `mutate_realm_placement` takes `RealmAuth`, so the refusal is the extractor's.
+    assert_eq!(
+        extract::<RealmAuth>(&state, None).await.err(),
+        Some(StatusCode::UNAUTHORIZED)
+    );
 
     let stranger = AuthContext {
         user_id: UserId::local(Ulid::generate(), realm_id),
@@ -770,7 +765,7 @@ async fn placement_binding_lifecycle() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let auth = admin_auth(realm_id, admin);
     let family_strategy_id = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -792,7 +787,7 @@ async fn placement_binding_lifecycle() {
 
     let (_status, Json(after_upsert)) = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::UpsertStrategy {
             strategy: placement_strategy(strategy_id),
         })),
@@ -805,7 +800,7 @@ async fn placement_binding_lifecycle() {
     );
     let _ = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::ProvisionMetadataBinding {
             strategy_id: strategy_id.to_string(),
             group_id: None,
@@ -835,7 +830,7 @@ async fn placement_binding_lifecycle() {
     ] {
         let (status, _) = mutate_realm_placement(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Ok(Json(request)),
         )
         .await
@@ -860,7 +855,7 @@ async fn placement_binding_lifecycle() {
 
     let error = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::RemoveStrategy {
             strategy_id: strategy_id.to_string(),
         })),
@@ -882,7 +877,7 @@ async fn placement_binding_lifecycle() {
     ] {
         let (_status, _body) = mutate_realm_placement(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Ok(Json(request)),
         )
         .await
@@ -891,7 +886,7 @@ async fn placement_binding_lifecycle() {
 
     let error = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::RemoveStrategy {
             strategy_id: strategy_id.to_string(),
         })),
@@ -926,7 +921,7 @@ async fn replication_factor_defaults() {
 
     let (_status, _body) = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::UpsertStrategy {
             strategy: placement_strategy(strategy_id),
         })),
@@ -945,7 +940,7 @@ async fn replication_factor_defaults() {
     .await;
     let (_status, _body) = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::SetDefaultStrategy {
             strategy_id: strategy_id.to_string(),
         })),
@@ -965,7 +960,7 @@ async fn replication_factor_defaults() {
     unbounded.replica_count = None;
     let _ = mutate_realm_placement(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Ok(Json(RealmPlacementRequest::UpsertStrategy {
             strategy: unbounded,
         })),
@@ -1030,7 +1025,7 @@ async fn placement_rejects_invalid() {
         assert!(matches!(
             mutate_realm_placement(
                 State(state.clone()),
-                Extension(Some(auth.clone())),
+                RealmAuth(auth.clone()),
                 Ok(Json(request))
             )
             .await,
@@ -1057,7 +1052,7 @@ async fn placement_rejects_invalid() {
         assert!(matches!(
             mutate_realm_placement(
                 State(state.clone()),
-                Extension(Some(auth.clone())),
+                RealmAuth(auth.clone()),
                 Ok(Json(request))
             )
             .await,
@@ -1075,7 +1070,7 @@ async fn placement_rejects_invalid() {
         .await
         .unwrap_err();
     assert!(matches!(
-        mutate_realm_placement(State(state), Extension(Some(auth)), Err(rejection)).await,
+        mutate_realm_placement(State(state), RealmAuth(auth), Err(rejection)).await,
         Err(ServerError::BadRequestReason(_))
     ));
 }
@@ -1152,13 +1147,10 @@ fn placement_capacity_unavailable() {
 #[tokio::test]
 async fn quota_requires_auth() {
     let (state, _realm_id, _admin, _tempdir) = setup_management_state().await;
-    let body = RealmQuotaConfig::from(QuotaConfig::default());
 
-    let error = set_realm_quota(State(state), Extension(None), Json(body))
-        .await
-        .unwrap_err();
-
-    assert!(matches!(error, ServerError::Unauthorized));
+    // `set_realm_quota` takes `RealmAuth`, so the refusal is the extractor's.
+    let error = extract::<RealmAuth>(&state, None).await;
+    assert_eq!(error.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -1172,7 +1164,7 @@ async fn quota_requires_admin() {
     };
     let body = RealmQuotaConfig::from(QuotaConfig::default());
 
-    let error = set_realm_quota(State(state), Extension(Some(stranger)), Json(body))
+    let error = set_realm_quota(State(state), RealmAuth(stranger), Json(body))
         .await
         .unwrap_err();
 
@@ -1207,13 +1199,10 @@ async fn admin_sets_quota() {
         ..over
     }];
 
-    let (status, Json(stored)) = set_realm_quota(
-        State(state.clone()),
-        Extension(Some(auth.clone())),
-        Json(body),
-    )
-    .await
-    .unwrap();
+    let (status, Json(stored)) =
+        set_realm_quota(State(state.clone()), RealmAuth(auth.clone()), Json(body))
+            .await
+            .unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stored.default_quota_bytes, Some(4096));
     assert_eq!(stored.devices_per_user, Some(3));
@@ -1255,8 +1244,12 @@ fn first_setup() -> HeaderMap {
 async fn federation_admin_reads() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let auth = admin_auth(realm_id, admin);
-    let read =
-        |auth: Option<AuthContext>| get_realm_federation(State(state.clone()), Extension(auth));
+    let read = |auth: Option<AuthContext>| {
+        get_realm_federation(
+            State(state.clone()),
+            RealmAuth(auth.expect("a signed-in caller")),
+        )
+    };
     assert!(matches!(
         read(Some(auth.clone())).await,
         Err(ServerError::Refused(
@@ -1268,7 +1261,7 @@ async fn federation_admin_reads() {
 
     let (stored_headers, Json(stored)) = set_realm_federation(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         first_setup(),
         Json(federation_body("Realm")),
     )
@@ -1284,7 +1277,11 @@ async fn federation_admin_reads() {
         read(Some(stranger)).await,
         Err(ServerError::Forbidden)
     ));
-    assert!(matches!(read(None).await, Err(ServerError::Unauthorized)));
+    // `get_realm_federation` takes `RealmAuth`, so the refusal is its check.
+    assert!(matches!(
+        crate::auth::require_realm_auth(&state, None),
+        Err(ServerError::Unauthorized)
+    ));
 }
 
 #[tokio::test]
@@ -1295,7 +1292,7 @@ async fn federation_preconditions() {
     let put = |headers: HeaderMap, name: &str| {
         set_realm_federation(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             headers,
             Json(federation_body(name)),
         )
@@ -1324,7 +1321,7 @@ async fn federation_preconditions() {
         (StatusCode::PRECONDITION_FAILED, "settings_changed")
     );
     let (headers, Json(loaded)) =
-        get_realm_federation(State(state.clone()), Extension(Some(auth.clone())))
+        get_realm_federation(State(state.clone()), RealmAuth(auth.clone()))
             .await
             .unwrap();
     assert_eq!(loaded, stored);
@@ -1350,7 +1347,7 @@ async fn federation_sets_description() {
     let stranger = admin_auth(realm_id, UserId::local(Ulid::generate(), realm_id));
     let refused = set_realm_federation(
         State(state.clone()),
-        Extension(Some(stranger)),
+        RealmAuth(stranger),
         first_setup(),
         Json(body.clone()),
     )
@@ -1360,7 +1357,7 @@ async fn federation_sets_description() {
 
     let (_, Json(stored)) = set_realm_federation(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         first_setup(),
         Json(body),
     )
@@ -1382,18 +1379,18 @@ async fn federation_no_config() {
     };
     let expected = (StatusCode::SERVICE_UNAVAILABLE, "realm_config_missing");
 
-    let read = get_realm_federation(State(state.clone()), Extension(Some(auth.clone()))).await;
+    let read = get_realm_federation(State(state.clone()), RealmAuth(auth.clone())).await;
     assert_eq!(missing(read), expected);
     let write = set_realm_federation(
         State(state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         first_setup(),
         Json(federation_body("Realm")),
     )
     .await;
     assert_eq!(missing(write), expected);
-    let anonymous = get_realm_federation(State(state), Extension(None)).await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
+    let anonymous = extract::<RealmAuth>(&state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
 }
 
 #[tokio::test]
@@ -1416,7 +1413,7 @@ async fn accepted_realms_public() {
     };
     let (headers, _) = set_realm_federation(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         first_setup(),
         Json(only),
     )
@@ -1429,7 +1426,7 @@ async fn accepted_realms_public() {
 
     let _ = set_realm_federation(
         State(state.clone()),
-        Extension(Some(auth)),
+        RealmAuth(auth),
         HeaderMap::from_iter([(header::IF_MATCH, headers[header::ETAG].clone())]),
         Json(federation_body("Realm")),
     )
@@ -1452,13 +1449,9 @@ async fn realm_gates_detail() {
         user_id: admin.to_string(),
         max_groups: Some(1),
     }];
-    let _ = set_realm_quota(
-        State(state.clone()),
-        Extension(Some(auth.clone())),
-        Json(body),
-    )
-    .await
-    .unwrap();
+    let _ = set_realm_quota(State(state.clone()), RealmAuth(auth.clone()), Json(body))
+        .await
+        .unwrap();
 
     for anonymous in [None, Some(foreign_auth())] {
         let (_status, Json(info)) = get_realm_info(State(state.clone()), Extension(anonymous))
@@ -1664,6 +1657,7 @@ async fn realm_node_details() {
     // the default location/weight. Publish a node info document for it too.
     let mut docker = aruna_core::compute::ExecutorCapability::new(
         "docker".to_string(),
+        "docker".to_string(),
         aruna_core::structs::placement::policy::PlacementSubject {
             node_id,
             generation: 1,
@@ -1676,6 +1670,10 @@ async fn realm_node_details() {
     .expect("subject is valid");
     docker.file_staging = true;
     docker.direct_s3 = true;
+    let group = ulid::Ulid::from_bytes([7u8; 16]);
+    docker.groups = vec![group];
+    docker.max_walltime_ms = Some(3_600_000);
+    docker.config_generation = 4;
     let document = NodeInfoDocument {
         node_id,
         executors: vec![docker],
@@ -1738,6 +1736,16 @@ async fn realm_node_details() {
     let node_info = node.info.as_ref().expect("node info document present");
     assert_eq!(node_info.executors.len(), 1);
     assert_eq!(node_info.executors[0].kind, "docker");
+    let executor = &node_info.executors[0];
+    assert_eq!(executor.backend, "docker");
+    assert_eq!(executor.location, "eu-west");
+    assert_eq!(executor.max_walltime_ms, Some(3_600_000));
+    assert_eq!(executor.config_generation, 4);
+    assert_eq!(executor.suitability.sessions, "good");
+    // An allow-list shows as a count; the group ids stay on the node.
+    assert_eq!(executor.group_count, 1);
+    let shown = serde_json::to_string(executor).unwrap();
+    assert!(!shown.contains(&group.to_string()), "{shown}");
     assert_eq!(node_info.labels.get("tier"), Some(&"hot".to_string()));
     assert_eq!(node_info.urls.s3.as_deref(), Some("s3.example"));
     assert_eq!(node_info.utilization.storage_bytes_used, 4_096);
@@ -1821,7 +1829,7 @@ async fn quota_invalid_reason() {
     let mut body = RealmQuotaConfig::from(QuotaConfig::default());
     body.warn_threshold_percent = 0;
 
-    let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
+    let error = set_realm_quota(State(state), RealmAuth(auth), Json(body))
         .await
         .unwrap_err();
     assert!(matches!(error, ServerError::BadRequestReason(_)));
@@ -1857,7 +1865,7 @@ async fn rejects_zero_cap() {
     let mut body = RealmQuotaConfig::from(QuotaConfig::default());
     body.devices_per_user = Some(0);
 
-    let error = set_realm_quota(State(state), Extension(Some(auth)), Json(body))
+    let error = set_realm_quota(State(state), RealmAuth(auth), Json(body))
         .await
         .unwrap_err();
 
@@ -1887,13 +1895,9 @@ async fn rejects_zero_limits() {
             ..RealmQuotaConfig::from(QuotaConfig::default())
         },
     ] {
-        let error = set_realm_quota(
-            State(state.clone()),
-            Extension(Some(auth.clone())),
-            Json(body),
-        )
-        .await
-        .unwrap_err();
+        let error = set_realm_quota(State(state.clone()), RealmAuth(auth.clone()), Json(body))
+            .await
+            .unwrap_err();
 
         assert!(matches!(
             error,
@@ -1922,7 +1926,7 @@ async fn device_never_connected() {
     // this node answering about itself, may still not connect it.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1943,7 +1947,7 @@ async fn device_never_connected() {
         &config,
         present,
         BTreeMap::new(),
-        &PeerContacts::default(),
+        &BTreeMap::new(),
         &aruna_operations::realm::node_name::NodeDisplays::default(),
         10_000,
     );
@@ -1971,7 +1975,7 @@ async fn reports_device_seen() {
     // device's own node is serving the request, so it saw itself now.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1987,10 +1991,8 @@ async fn reports_device_seen() {
             });
     }
     let now_ms = 1_000_000;
-    let window = aruna_operations::metadata::PEER_CONTACT_WINDOW.as_millis() as u64;
-    let contacts = PeerContacts::default();
-    contacts.note(recent, now_ms - window);
-    contacts.note(stale, now_ms - window - 1);
+    let window = aruna_core::heartbeat::PEER_CONTACT_WINDOW.as_millis() as u64;
+    let contacts = BTreeMap::from([(recent, now_ms - window), (stale, now_ms - window - 1)]);
 
     let nodes = map_realm_nodes(
         &state,
@@ -2001,7 +2003,7 @@ async fn reports_device_seen() {
         &aruna_operations::realm::node_name::NodeDisplays::default(),
         now_ms,
     );
-    let device = |node_id: aruna_core::NodeId| {
+    let device = |node_id: aruna_core::id::NodeId| {
         nodes
             .iter()
             .find(|node| node.node_id == node_id.to_string() && node.kind == NodeKindInfo::User)
@@ -2140,7 +2142,7 @@ async fn node_place_shown() {
         let request = serde_json::from_value::<NodeNameRequest>(body).unwrap();
         name_realm_node(
             State(state.clone()),
-            Extension(Some(auth.clone())),
+            RealmAuth(auth.clone()),
             Path(own.clone()),
             Ok(Json(request)),
         )
@@ -2207,7 +2209,7 @@ async fn node_name_shown() {
     let placement = placement.placement.clone();
     let (status, Json(named)) = name_realm_node(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(own.clone()),
         Ok(name_body(Some(" Giessen storage 1 "))),
     )
@@ -2223,7 +2225,7 @@ async fn node_name_shown() {
 
     let (_, Json(cleared)) = name_realm_node(
         State(state.clone()),
-        Extension(Some(auth.clone())),
+        RealmAuth(auth.clone()),
         Path(own.clone()),
         Ok(name_body(None)),
     )
@@ -2253,15 +2255,16 @@ async fn node_name_gated() {
     let call = |auth: Option<AuthContext>, node: String, name: &str| {
         name_realm_node(
             State(state.clone()),
-            Extension(auth),
+            RealmAuth(auth.expect("a signed-in caller")),
             Path(node),
             Ok(name_body(Some(name))),
         )
     };
     let unknown = iroh::SecretKey::generate().public().to_string();
     let admin = Some(admin_auth(realm_id, admin));
+    // `name_realm_node` takes `RealmAuth`, so the refusal is its check.
     assert!(matches!(
-        call(None, own.clone(), "x").await,
+        crate::auth::require_realm_auth(&state, None),
         Err(ServerError::Unauthorized)
     ));
     assert!(matches!(
@@ -2280,7 +2283,7 @@ async fn node_name_gated() {
     assert!(matches!(
         name_own_device(
             State(state.clone()),
-            Extension(Some(stranger)),
+            UnrestrictedAuth(stranger),
             Path(own),
             Ok(name_body(Some("mine"))),
         )
@@ -2295,7 +2298,7 @@ async fn owner_names_device() {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let device = iroh::SecretKey::generate().public();
     let mut config = drive(
-        aruna_operations::realm::get_config::GetConfigOperation::new(realm_id),
+        aruna_operations::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -2322,7 +2325,7 @@ async fn owner_names_device() {
 
     let (_, Json(named)) = name_own_device(
         State(state.clone()),
-        Extension(Some(admin_auth(realm_id, owner))),
+        UnrestrictedAuth(admin_auth(realm_id, owner)),
         Path(device.to_string()),
         Ok(name_body(Some("Lab laptop"))),
     )
@@ -2332,14 +2335,9 @@ async fn owner_names_device() {
 
     let mut delegated = admin_auth(realm_id, owner);
     delegated.path_restrictions = Some(Vec::new());
+    // `name_own_device` takes `UnrestrictedAuth`, so the refusal is its check.
     assert!(matches!(
-        name_own_device(
-            State(state),
-            Extension(Some(delegated)),
-            Path(device.to_string()),
-            Ok(name_body(Some("x"))),
-        )
-        .await,
+        crate::auth::require_unrestricted_auth(&state, Some(delegated)),
         Err(ServerError::Forbidden)
     ));
 }

@@ -3,15 +3,16 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::auth::UnrestrictedAuth;
+use crate::auth::extract;
 use crate::server::state::ROCRATE_UPLOAD_SLOTS;
 use aruna_blob::blob::BlobHandler;
-use aruna_core::UserId;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::structs::execution::job::{RoCrateLimits, RoCrateUploadRecord};
+use aruna_core::structs::execution::job::input::{RoCrateLimits, RoCrateUploadRecord};
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{
@@ -22,12 +23,14 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::StoredFormat;
-use aruna_net::{DiscoveryMethod, NetConfig, NetHandle, RelayMethod};
-use aruna_operations::driver::DriverContext;
-use aruna_operations::jobs::import::write_rocrate_upload;
-use aruna_operations::jobs::runtime::JobsRuntime;
-use aruna_storage::FjallStorage;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::DriverContext;
+use aruna_drivers::jobs::runtime::JobsRuntime;
+use aruna_net::NetHandle;
+use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_storage::storage::worker::FjallStorage;
 use aruna_tasks::TaskHandle;
+use axum::http::StatusCode;
 use axum::http::{HeaderValue, Request};
 use byteview::ByteView;
 use std::collections::HashMap;
@@ -37,78 +40,11 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn invenio_requires_auth() {
-    use crate::metadata::RepositoryExportRequest;
-    use crate::routes::repository::{
-        RepositoryImportRequest, SubmitRepositoryExport, export_record, import_record,
-    };
     let (_root, state, user) = plain_state(test_limits()).await;
+    // The import, search and export routes take `UnrestrictedAuth`, so each refusal is its check.
     for auth in [None, restricted(user)] {
-        let group_id = Ulid::generate().to_string();
-        let import = RepositoryImportRequest {
-            group_id: group_id.clone(),
-            connector_id: Ulid::generate().to_string(),
-            record_id: Some("42".into()),
-            doi: None,
-            url: None,
-            options: Default::default(),
-            keep_updated: false,
-            auto_update: None,
-            target: ImportTargetRequest {
-                bucket: "target".into(),
-                prefix: String::new(),
-            },
-            metadata: ImportMetadataRequest {
-                group_id: group_id.clone(),
-                path: "datasets/import".into(),
-                public: false,
-            },
-            idempotency_key: None,
-        };
-        let result =
-            import_record(State(state.clone()), Extension(auth.clone()), Json(import)).await;
         assert!(matches!(
-            result,
-            Err(ServerError::Unauthorized | ServerError::Forbidden)
-        ));
-        let query = crate::routes::repository::RepositorySearch {
-            q: "dataset".into(),
-            page: 1,
-            size: 25,
-            all_versions: false,
-        };
-        let result = crate::routes::repository::search_records(
-            State(state.clone()),
-            Extension(auth.clone()),
-            axum::extract::Path((group_id.clone(), Ulid::generate().to_string())),
-            axum::extract::Query(query),
-        )
-        .await;
-        assert!(matches!(
-            result,
-            Err(ServerError::Unauthorized | ServerError::Forbidden)
-        ));
-        let export = SubmitRepositoryExport {
-            repository: RepositoryExportRequest {
-                group_id,
-                connector_id: Ulid::generate().to_string(),
-                draft_id: None,
-                published_id: None,
-                metadata: serde_json::json!({}),
-                publish: true,
-                public_files: false,
-                access_token: Some("author-token".into()),
-            },
-            idempotency_key: None,
-        };
-        let result = export_record(
-            State(state.clone()),
-            Extension(auth),
-            axum::extract::Path("invalid".into()),
-            Json(export),
-        )
-        .await;
-        assert!(matches!(
-            result,
+            crate::auth::require_unrestricted_auth(&state, auth),
             Err(ServerError::Unauthorized | ServerError::Forbidden)
         ));
     }
@@ -138,7 +74,12 @@ async fn invenio_denies_connector() {
         },
         idempotency_key: None,
     };
-    let result = import_record(State(state), Extension(auth(user)), Json(request)).await;
+    let result = import_record(
+        State(state),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
+        Json(request),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::Forbidden)));
 }
 
@@ -169,7 +110,7 @@ async fn one_record_required() {
     for (record_id, doi) in [(None, None), (Some("42"), Some("10.5281/zenodo.42"))] {
         let result = import_record(
             State(state.clone()),
-            Extension(auth(user)),
+            UnrestrictedAuth(auth(user).expect("a signed-in caller")),
             Json(request(record_id, doi)),
         )
         .await;
@@ -194,7 +135,7 @@ async fn update_needs_write() {
     // The connector's group is another owner's; the caller only reads it.
     let shared = Ulid::generate();
     grant_reader(&state, user, shared).await;
-    let connector_id = aruna_operations::driver::drive(
+    let connector_id = aruna_drivers::driver::drive(
         aruna_operations::harvest::create_connector::CreateConnectorOperation::new(
             aruna_operations::harvest::create_connector::CreateConnectorInput {
                 group_id: shared,
@@ -235,7 +176,7 @@ async fn update_needs_write() {
     let import = |keep_updated| {
         import_record(
             State(state.clone()),
-            Extension(auth(user)),
+            UnrestrictedAuth(auth(user).expect("a signed-in caller")),
             Json(request(keep_updated)),
         )
     };
@@ -266,13 +207,13 @@ fn invenio_openapi_contract() {
     }
     let request =
         serde_json::json!({"group_id": "group", "connector_id": "connector", "metadata": {}});
-    let default: crate::metadata::RepositoryExportRequest =
+    let default: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(request.clone()).unwrap();
     assert!(!default.publish);
     assert!(!default.public_files);
     let mut configured = request;
     configured["publish"] = serde_json::json!(true);
-    let configured: crate::metadata::RepositoryExportRequest =
+    let configured: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(configured).unwrap();
     assert!(configured.publish);
 }
@@ -301,7 +242,7 @@ fn invenio_mode_contract() {
 
 #[test]
 fn invenio_login_private() {
-    let request: crate::metadata::RepositoryExportRequest =
+    let request: crate::metadata::model::RepositoryExportRequest =
         serde_json::from_value(serde_json::json!({
             "group_id": "group", "connector_id": "connector", "access_token": "author-private-token"
         }))
@@ -506,9 +447,13 @@ async fn seed_upload(
         expires_at_ms,
         claimed_by: None,
     };
-    write_rocrate_upload(&state.get_ctx().storage_handle, &record)
-        .await
-        .unwrap();
+    aruna_drivers::driver::drive(
+        aruna_operations::jobs::import::upload_store::WriteUploadOperation::new(record.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| error.0)
+    .unwrap();
 }
 
 fn submit_request(
@@ -543,9 +488,10 @@ async fn plain_state(limits: RoCrateLimits) -> (TempDir, Arc<ServerState>, UserI
         storage_handle: storage,
         net_handle: None,
         blob_handle: None,
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(
@@ -631,9 +577,10 @@ async fn blob_state(limits: RoCrateLimits) -> (TempDir, TempDir, Arc<ServerState
         storage_handle: storage,
         net_handle: Some(net),
         blob_handle: Some(blob),
-        metadata_handle: None,
+        graph_handle: None,
         task_handle: Some(TaskHandle::new()),
         compute_handle: None,
+        outbound_handle: None,
     });
     let state = Arc::new(
         ServerState::new(
@@ -800,12 +747,12 @@ async fn upload_requires_auth() {
 async fn submit_accepts_upload() {
     let (_dir, state, user, group) = submit_state().await;
     let upload_id = Ulid::generate();
-    let future = aruna_core::time::unix_timestamp_millis() + 60_000;
+    let future = aruna_clock::unix_timestamp_millis() + 60_000;
     seed_upload(&state, upload_id, user, 1, future).await;
     seed_bucket(&state, "target", group, user).await;
     let (status, Json(response)) = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", None)),
     )
     .await
@@ -827,7 +774,7 @@ async fn submit_missing_upload() {
     let (_dir, state, user, group) = submit_state().await;
     let result = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(Ulid::generate(), group, "crate", None)),
     )
     .await;
@@ -844,12 +791,12 @@ async fn submit_foreign_upload() {
         upload_id,
         other,
         1,
-        aruna_core::time::unix_timestamp_millis() + 60_000,
+        aruna_clock::unix_timestamp_millis() + 60_000,
     )
     .await;
     let result = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", None)),
     )
     .await;
@@ -865,7 +812,7 @@ async fn submit_expired_upload() {
     seed_bucket(&state, "target", group, user).await;
     let result = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", None)),
     )
     .await;
@@ -877,12 +824,12 @@ async fn submit_oversized_upload() {
     // An upload larger than the import-source cap is rejected at submit time.
     let (_dir, state, user, group) = submit_state().await;
     let upload_id = Ulid::generate();
-    let future = aruna_core::time::unix_timestamp_millis() + 60_000;
+    let future = aruna_clock::unix_timestamp_millis() + 60_000;
     seed_upload(&state, upload_id, user, 2048, future).await;
     seed_bucket(&state, "target", group, user).await;
     let result = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", None)),
     )
     .await;
@@ -899,7 +846,7 @@ async fn submit_target_forbidden() {
         upload_id,
         user,
         1,
-        aruna_core::time::unix_timestamp_millis() + 60_000,
+        aruna_clock::unix_timestamp_millis() + 60_000,
     )
     .await;
     let foreign = Ulid::generate();
@@ -907,7 +854,7 @@ async fn submit_target_forbidden() {
     seed_bucket(&state, "target", foreign, user).await;
     let result = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", None)),
     )
     .await;
@@ -923,13 +870,13 @@ async fn submit_dedups_key() {
         upload_id,
         user,
         1,
-        aruna_core::time::unix_timestamp_millis() + 60_000,
+        aruna_clock::unix_timestamp_millis() + 60_000,
     )
     .await;
     seed_bucket(&state, "target", group, user).await;
     let (_, Json(first)) = submit_import(
         State(state.clone()),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", Some("key"))),
     )
     .await
@@ -937,7 +884,7 @@ async fn submit_dedups_key() {
     assert!(first.created);
     let (_, Json(replay)) = submit_import(
         State(state.clone()),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "crate", Some("key"))),
     )
     .await
@@ -946,7 +893,7 @@ async fn submit_dedups_key() {
     assert_eq!(replay.job_id, first.job_id);
     let conflict = submit_import(
         State(state),
-        Extension(auth(user)),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
         Json(submit_request(upload_id, group, "other", Some("key"))),
     )
     .await;
@@ -955,13 +902,12 @@ async fn submit_dedups_key() {
 
 #[tokio::test]
 async fn submit_requires_auth() {
-    let (_dir, state, user, group) = submit_state().await;
-    let request = submit_request(Ulid::generate(), group, "crate", None);
-    let anonymous =
-        submit_import(State(state.clone()), Extension(None), Json(request.clone())).await;
-    assert!(matches!(anonymous, Err(ServerError::Unauthorized)));
-    let delegated = submit_import(State(state), Extension(restricted(user)), Json(request)).await;
-    assert!(matches!(delegated, Err(ServerError::Forbidden)));
+    let (_dir, state, user, _group) = submit_state().await;
+    // `submit_import` takes `UnrestrictedAuth`, so these refusals are the extractor's.
+    let anonymous = extract::<UnrestrictedAuth>(&state, None).await;
+    assert_eq!(anonymous.err(), Some(StatusCode::UNAUTHORIZED));
+    let delegated = extract::<UnrestrictedAuth>(&state, restricted(user)).await;
+    assert_eq!(delegated.err(), Some(StatusCode::FORBIDDEN));
 }
 
 #[tokio::test]
@@ -985,7 +931,12 @@ async fn submit_object_source() {
         },
         idempotency_key: None,
     };
-    let result = submit_import(State(state), Extension(auth(user)), Json(request)).await;
+    let result = submit_import(
+        State(state),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
+        Json(request),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::NotFound)));
 }
 
@@ -1012,7 +963,12 @@ async fn submit_connector_source() {
         },
         idempotency_key: None,
     };
-    let result = submit_import(State(state), Extension(auth(user)), Json(request)).await;
+    let result = submit_import(
+        State(state),
+        UnrestrictedAuth(auth(user).expect("a signed-in caller")),
+        Json(request),
+    )
+    .await;
     assert!(matches!(result, Err(ServerError::Forbidden)));
 }
 

@@ -3,52 +3,52 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use aruna_core::UserId;
+use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::StorageError;
-use aruna_core::plugin_installs::{BoundScope, PluginInstall, SecretBinding};
-use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::id::NodeId;
+use aruna_core::plugin_installs::PluginInstall;
+use aruna_core::reducer::targets::InstallEntry;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
-use aruna_operations::plugins::account::plugin_account;
-use aruna_operations::plugins::bound::vault_kind;
-use aruna_operations::plugins::check::covers;
-use aruna_operations::plugins::grants::{GrantError, InstallScope, parse_grants, writes};
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::plugins::account::PluginAccount;
+use aruna_operations::plugins::grants::GrantError;
 use aruna_operations::plugins::install::{
-    InstallError, InstallRequest, install_plugin, pick_version, prepare_install, read_config,
-    read_manifest,
+    InstallCaller, InstallError, InstallPrepared, InstallRequest, PrepareInstall, Summary,
+    installed_summary, pick_version, prepared_summary, read_manifest,
 };
-use aruna_operations::plugins::lifecycle::remove_install;
+use aruna_operations::plugins::lifecycle::{RemoveConflicted, RemoveInstall};
 use aruna_operations::plugins::receiver::lost_reason;
-use aruna_operations::plugins::records::RecordError;
+use aruna_operations::plugins::records::{ReadEntry, RecordError};
 use aruna_operations::users::service_account::group_admin_path;
-use aruna_plugins::manifest::Manifest;
-use aruna_plugins::permission::Grant;
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::{Extension, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use ulid::Ulid;
-use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::auth::{ensure_permission, require_realm_auth, require_unrestricted_auth};
+use crate::auth::RealmAuth;
+use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
 use crate::server::state::ServerState;
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 
-#[derive(OpenApi)]
-pub struct InstallsApiDoc;
-
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
-    OpenApiRouter::with_openapi(InstallsApiDoc::openapi())
+    OpenApiRouter::new()
         .routes(routes!(install))
         .routes(routes!(list_installs))
         .routes(routes!(get_install, remove))
@@ -122,6 +122,21 @@ pub struct InstallSummary {
     pub secrets: Vec<SecretLine>,
     /// What the admin should know before approving, such as a shared secret's use rule.
     pub warnings: Vec<String>,
+    /// The container tasks the plugin may start on the install's receiver.
+    #[serde(default)]
+    pub tasks: Vec<TaskLine>,
+}
+
+/// One container task of the summary: the pinned image and its ceilings.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TaskLine {
+    pub name: String,
+    pub image: String,
+    pub cpu: u32,
+    pub memory_bytes: u64,
+    pub time_secs: u64,
+    /// With an open network the container can send anything it reads anywhere.
+    pub open_network: bool,
 }
 
 /// One secret slot of the summary: its kind and the secret it uses.
@@ -134,6 +149,56 @@ pub struct SecretLine {
     pub secret: String,
     /// The code may read the secret's value: the manifest lists it under `[secrets]`.
     pub value: bool,
+}
+
+impl From<Summary> for InstallSummary {
+    fn from(summary: Summary) -> Self {
+        Self {
+            id: summary.id,
+            plugin: summary.plugin,
+            title: summary.title,
+            version: summary.version,
+            digest: summary.digest,
+            group: summary.group,
+            permissions: (summary.permissions.into_iter())
+                .map(|line| PermissionLine {
+                    permission: line.permission,
+                    required: line.required,
+                    granted: line.granted,
+                })
+                .collect(),
+            connections: (summary.connections.into_iter())
+                .map(|line| ConnectionLine {
+                    name: line.name,
+                    url: line.url,
+                    methods: line.methods,
+                    required: line.required,
+                    granted: line.granted,
+                    stored: line.stored,
+                })
+                .collect(),
+            triggers: summary.triggers,
+            secrets: (summary.secrets.into_iter())
+                .map(|line| SecretLine {
+                    slot: line.slot,
+                    kind: line.kind,
+                    secret: line.secret,
+                    value: line.value,
+                })
+                .collect(),
+            warnings: summary.warnings,
+            tasks: (summary.tasks.into_iter())
+                .map(|line| TaskLine {
+                    name: line.name,
+                    image: line.image,
+                    cpu: line.cpu,
+                    memory_bytes: line.memory_bytes,
+                    time_secs: line.time_secs,
+                    open_network: line.open_network,
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -226,7 +291,6 @@ relays it to one.
         (status = 200, description = "The summary of a preview", body = InstallSummary, example = json!(view_example()["summary"])),
         (status = 201, description = "The active install", body = InstallView, example = json!(view_example())),
         (status = 400, description = "Invalid settings or grants, or the plugin cannot be installed yet", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin or lacks a granted right", body = ErrorResponse),
         (status = 404, description = "No published version matches", body = ErrorResponse),
         (status = 409, description = "The id belongs to another request, or a step failed", body = ErrorResponse),
@@ -236,12 +300,11 @@ relays it to one.
 )]
 pub async fn install(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(name): Path<String>,
     Query(query): Query<InstallQuery>,
     Json(body): Json<InstallBody>,
 ) -> ServerResult<Response> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_id(&body.group)?;
     ensure_admin(&state, &auth, group_id).await?;
     let request = InstallRequest {
@@ -264,23 +327,15 @@ pub async fn install(
         let digest = chosen.map(|plugin| plugin.digest);
         secret_session(&state, &auth, (request.install_id, digest.as_deref())).await?;
     }
+    let place = (state.get_realm_id(), local_node(&ctx));
+    let prepare = PrepareInstall::new(&auth, place, &request);
+    let prepared = drive(prepare, &ctx).await.map_err(map_error)?;
     if preview {
-        let prepared = prepare_install(&ctx, &auth, state.get_realm_id(), &request)
-            .await
-            .map_err(map_error)?;
-        let grants = aruna_operations::plugins::grants::stored_grants(&prepared.grants);
-        let granted = (&grants, &prepared.secrets);
-        let summary = summary(
-            &prepared.manifest,
-            &prepared.plugin.digest,
-            &prepared.scope,
-            granted,
-        );
+        let summary = InstallSummary::from(prepared_summary(&prepared));
         return Ok(Json(summary).into_response());
     }
-    let installed = install_plugin(&ctx, &actor(&state, &auth), &auth, &request)
-        .await
-        .map_err(map_error)?;
+    let install = InstallPrepared::new(caller(&state, &auth), prepared);
+    let installed = drive(install, &ctx).await.map_err(map_error)?;
     let view = view(&state, installed).await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
@@ -302,17 +357,15 @@ pub async fn install(
     responses(
         (status = 200, description = "One page of installs", body = InstallPage, example = json!({"installs": [view_example()], "next": null})),
         (status = 400, description = "The group id or the limit is invalid", body = ErrorResponse),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse)
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_installs(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Query(query): Query<InstallListQuery>,
 ) -> ServerResult<Json<InstallPage>> {
-    let auth = require_realm_auth(&state, auth)?;
     let group_id = parse_id(&query.group)?;
     ensure_admin(&state, &auth, group_id).await?;
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
@@ -359,7 +412,6 @@ pub async fn list_installs(
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 200, description = "The install", body = InstallView, example = json!(view_example())),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse)
     ),
@@ -367,10 +419,9 @@ pub async fn list_installs(
 )]
 pub async fn get_install(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<Json<InstallView>> {
-    let auth = require_realm_auth(&state, auth)?;
     let install_id = parse_id(&id)?;
     let config = load_config(&state).await?;
     let install = (config.installs.iter())
@@ -394,11 +445,14 @@ the call and every other node relays it to one.
 
 **Behavior**
 - The install is marked `removing` first, so a retry after a failure finishes the removal.
-- The account id stays in audit rows."#,
+- The account id stays in audit rows.
+- An install whose record is in conflict with its own removal is removed again: every candidate
+  record is torn down and the conflict resolves to the removal. The caller must be an admin of
+  every candidate's group; a candidate that appears meanwhile answers 409, and a retry checks it.
+- A removed install's id is never installed again; a new install gets a new id."#,
     params(("id" = String, Path, description = "The install id")),
     responses(
         (status = 204, description = "The install is removed"),
-        (status = 401, description = "Missing or invalid bearer token", body = ErrorResponse),
         (status = 403, description = "Caller is not a group admin", body = ErrorResponse),
         (status = 404, description = "No install has this id", body = ErrorResponse),
         (status = 409, description = "The install changed meanwhile, or a step failed", body = ErrorResponse)
@@ -407,23 +461,65 @@ the call and every other node relays it to one.
 )]
 pub async fn remove(
     State(state): State<Arc<ServerState>>,
-    Extension(auth): Extension<Option<AuthContext>>,
+    RealmAuth(auth): RealmAuth,
     Path(id): Path<String>,
 ) -> ServerResult<StatusCode> {
-    let (auth, install_id) = admin_call(&state, auth, &id).await?;
+    let (auth, install_id) = match admin_call(&state, auth.clone(), &id).await {
+        Err(ServerError::NotFound) => return remove_conflicted(&state, auth, &id).await,
+        called => called?,
+    };
     secret_session(&state, &auth, (Some(install_id), None)).await?;
-    remove_install(&state.get_ctx(), &actor(&state, &auth), &auth, install_id)
-        .await
-        .map_err(map_error)?;
+    let remove = RemoveInstall::new(caller(&state, &auth), install_id);
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub(crate) fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
-    Actor {
-        node_id: state.get_node_id(),
-        user_id: auth.user_id,
-        realm_id: state.get_realm_id(),
+/// Removes an install whose path holds a conflict with a deletion. The caller must be admin of
+/// every candidate's group, with the same checks as a removal; any other path stays not found.
+async fn remove_conflicted(
+    state: &ServerState,
+    auth: AuthContext,
+    id: &str,
+) -> ServerResult<StatusCode> {
+    let install_id = parse_id(id)?;
+    let read = ReadEntry::new(state.get_realm_id(), install_id);
+    let entry = drive(read, &state.get_ctx()).await;
+    let entry = entry.map_err(|error| ServerError::ServiceUnavailableReason(error.to_string()))?;
+    let InstallEntry::Conflict {
+        deletion: true,
+        installs,
+    } = entry
+    else {
+        return Err(ServerError::NotFound);
+    };
+    let mut proven = BTreeSet::new();
+    for candidate in &installs {
+        if proven.insert(candidate.group_id) {
+            ensure_admin(state, &auth, candidate.group_id).await?;
+        }
+        secret_session(state, &auth, (None, Some(&candidate.digest))).await?;
     }
+    let remove = RemoveConflicted::new(caller(state, &auth), (install_id, proven));
+    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The realm config as this node holds it.
+pub(crate) async fn read_config(
+    ctx: &DriverContext,
+    realm_id: RealmId,
+) -> Result<RealmConfigDocument, InstallError> {
+    Ok(drive(GetConfigOperation::new(realm_id), ctx).await?)
+}
+
+/// The caller of an install change made now.
+pub(crate) fn caller(state: &ServerState, auth: &AuthContext) -> InstallCaller {
+    InstallCaller::new(&actor(state, auth), auth, unix_timestamp_millis())
+}
+
+/// This node as a secret binding check sees it.
+pub(crate) fn local_node(ctx: &DriverContext) -> Option<NodeId> {
+    ctx.net_handle.as_ref().map(|net| net.node_id())
 }
 
 pub(crate) fn parse_id(id: &str) -> ServerResult<Ulid> {
@@ -471,10 +567,9 @@ pub(crate) async fn secret_session(
 /// The caller and install of a change, after the caller proved admin of the install's group.
 pub(crate) async fn admin_call(
     state: &ServerState,
-    auth: Option<AuthContext>,
+    auth: AuthContext,
     id: &str,
 ) -> ServerResult<(AuthContext, Ulid)> {
-    let auth = require_realm_auth(state, auth)?;
     let install_id = parse_id(id)?;
     let config = load_config(state).await?;
     let install = (config.installs.iter())
@@ -495,21 +590,7 @@ pub(crate) async fn view(state: &ServerState, install: PluginInstall) -> ServerR
 }
 
 fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView {
-    let manifest = pick_version(config, &install.plugin, Some(&install.digest))
-        .ok()
-        .and_then(|plugin| read_manifest(&plugin).ok());
-    let scope = InstallScope {
-        realm_id: config.realm_id,
-        group_id: install.group_id,
-        install_id: install.install_id,
-    };
-    let summary = match manifest {
-        Some(manifest) => {
-            let granted = (&install.grants, &install.secrets);
-            summary(&manifest, &install.digest, &scope, granted)
-        }
-        None => bare_summary(&install),
-    };
+    let summary = InstallSummary::from(installed_summary(config, &install));
     // A lost receiver blocks the install here; its stored state stays as it is.
     let lost = lost_reason(config, install.receiver);
     let webhook = (summary.triggers.iter().any(|kind| kind == "webhook"))
@@ -538,107 +619,6 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
     }
 }
 
-/// The summary of `grants` against the manifest's requests.
-fn summary(
-    manifest: &Manifest,
-    digest: &str,
-    scope: &InstallScope,
-    (grants, bound): (
-        &BTreeMap<String, Vec<String>>,
-        &BTreeMap<String, SecretBinding>,
-    ),
-) -> InstallSummary {
-    let granted = parse_grants(grants);
-    let requested = [Grant::Read]
-        .into_iter()
-        .chain(writes(manifest).then_some(Grant::Write));
-    let permissions = requested
-        .map(|grant| PermissionLine {
-            permission: grant.to_string(),
-            required: true,
-            granted: (granted.get(&grant).into_iter().flatten())
-                .cloned()
-                .collect(),
-        })
-        .collect();
-    let sends = granted.get(&Grant::Services);
-    let values = granted.get(&Grant::Secrets);
-    let readable = |slot: &str| {
-        let path = scope.secret(slot);
-        values.is_some_and(|patterns| patterns.iter().any(|pattern| covers(pattern, &path)))
-    };
-    let downloads =
-        (manifest.requested()).contains(&aruna_plugins::permission::Permission::TransfersDownload);
-    let connections = (manifest.connections.iter())
-        .map(|(name, connection)| ConnectionLine {
-            name: name.clone(),
-            url: connection.url.clone(),
-            methods: (connection.methods.iter())
-                .map(|method| method.as_str().to_string())
-                .collect(),
-            required: !connection.optional,
-            granted: sends.is_some_and(|paths| paths.contains(&scope.connection(name))),
-            stored: downloads && connection.auth.is_some(),
-        })
-        .collect();
-    InstallSummary {
-        id: scope.install_id.to_string(),
-        plugin: manifest.name.clone(),
-        title: manifest.title.clone(),
-        version: manifest.version.clone(),
-        digest: digest.to_string(),
-        group: scope.group_id.to_string(),
-        permissions,
-        connections,
-        triggers: manifest
-            .triggers
-            .keys()
-            .map(|kind| kind.as_str().to_string())
-            .collect(),
-        secrets: (bound.iter())
-            .map(|(slot, binding)| SecretLine {
-                slot: slot.clone(),
-                kind: (manifest.secrets.get(slot))
-                    .and_then(|declared| vault_kind(declared.kind))
-                    .map_or_else(String::new, |kind| kind.as_str().to_string()),
-                secret: binding.to_string(),
-                value: readable(slot),
-            })
-            .collect(),
-        warnings: (bound.iter())
-            .filter_map(|(slot, binding)| {
-                let shared = matches!(binding.scope, BoundScope::Realm | BoundScope::Node);
-                shared
-                    .then(|| format!("a realm admin adds the use rule of `{binding}` for `{slot}`"))
-            })
-            .collect(),
-    }
-}
-
-/// A summary from the record alone, when the pinned version's manifest is not here yet.
-fn bare_summary(install: &PluginInstall) -> InstallSummary {
-    let permissions = (install.grants.iter())
-        .map(|(permission, granted)| PermissionLine {
-            permission: permission.clone(),
-            required: false,
-            granted: granted.clone(),
-        })
-        .collect();
-    InstallSummary {
-        id: install.install_id.to_string(),
-        plugin: install.plugin.clone(),
-        title: None,
-        version: install.version.clone(),
-        digest: install.digest.clone(),
-        group: install.group_id.to_string(),
-        permissions,
-        connections: Vec::new(),
-        triggers: Vec::new(),
-        secrets: Vec::new(),
-        warnings: Vec::new(),
-    }
-}
-
 pub(crate) fn map_error(error: InstallError) -> ServerError {
     let message = error.to_string();
     match error {
@@ -655,10 +635,15 @@ pub(crate) fn map_error(error: InstallError) -> ServerError {
             ServerError::Forbidden
         }
         InstallError::Record(
-            RecordError::Stale(_) | RecordError::StorageError(StorageError::TransactionConflict),
+            RecordError::Stale(_)
+            | RecordError::Retired
+            | RecordError::Unproven
+            | RecordError::StorageError(StorageError::TransactionConflict),
         ) => ServerError::Conflict(message),
         InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
-        InstallError::Manifest(_) | InstallError::Record(_) => ServerError::InternalError(message),
+        InstallError::Manifest(_) | InstallError::Record(_) => {
+            ServerError::InternalError(message.into())
+        }
     }
 }
 
@@ -667,12 +652,12 @@ pub(crate) async fn refuse_plugin_account(
     state: &ServerState,
     user_id: UserId,
 ) -> ServerResult<()> {
-    match plugin_account(&state.get_ctx(), user_id).await {
+    match drive(PluginAccount(user_id), &state.get_ctx()).await {
         Ok(false) => Ok(()),
         Ok(true) => Err(ServerError::Conflict(
             "the account acts for a plugin install; change the install instead".into(),
         )),
-        Err(error) => Err(ServerError::InternalError(error)),
+        Err(error) => Err(ServerError::InternalError(error.0.into())),
     }
 }
 
@@ -696,13 +681,15 @@ mod tests {
     use super::*;
     use crate::routes::install_changes::{GrantsBody, put_grants};
     use crate::tests::routes::{
-        seed_group_docs, seed_realm_auth, test_context, test_state, test_storage, write_doc,
+        seed_group_docs, seed_realm_auth, test_state, test_storage, write_doc,
     };
     use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
     use aruna_core::plugin_installs::InstallState;
     use aruna_core::plugins::PublishedPlugin;
+    use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::auth::{NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_drivers::testing::test_context;
 
     #[tokio::test]
     async fn secret_changes_unrestricted() {
@@ -784,7 +771,7 @@ mod tests {
         });
         let refused = put_grants(
             State(state.clone()),
-            Extension(Some(restricted.clone())),
+            RealmAuth(restricted.clone()),
             id,
             body,
         );
@@ -805,70 +792,5 @@ mod tests {
                 .await
                 .is_ok()
         );
-    }
-
-    #[test]
-    fn summary_warnings() {
-        let scope = InstallScope {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
-            group_id: Ulid::from_parts(1, 1),
-            install_id: Ulid::from_parts(2, 2),
-        };
-        let warned = |triggers: Value, binding: Option<&str>| {
-            let manifest =
-                serde_json::json!({"name": "p", "version": "0.1.0", "triggers": triggers});
-            let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-            let bound = (binding.into_iter())
-                .map(|text| ("key".to_string(), SecretBinding::parse(text).unwrap()))
-                .collect();
-            summary(&manifest, "sha256:ab", &scope, (&BTreeMap::new(), &bound)).warnings
-        };
-        // Sync triggers are delivered now and warn about nothing; a shared secret still warns.
-        let sync = serde_json::json!({"sync_completed": {}, "sync_failed": {}});
-        assert!(warned(sync.clone(), None).is_empty());
-        assert!(warned(sync.clone(), Some("group:key")).is_empty());
-        assert_eq!(
-            warned(sync, Some("realm:key")),
-            vec!["a realm admin adds the use rule of `realm:key` for `key`".to_string()]
-        );
-    }
-
-    #[test]
-    fn summary_lists_methods() {
-        let scope = InstallScope {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
-            group_id: Ulid::from_parts(1, 1),
-            install_id: Ulid::from_parts(2, 2),
-        };
-        let manifest = serde_json::json!({"name": "p", "version": "0.1.0", "connections": {
-            "catalog": {"url": "https://c.example.org/", "methods": ["GET", "POST"]}}});
-        let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-        let none = (&BTreeMap::new(), &BTreeMap::new());
-        let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
-        assert_eq!(lines[0].methods, ["GET", "POST"]);
-    }
-
-    #[test]
-    fn summary_stored_answers() {
-        // Only a download through a connection with a secret stores answers the rule screens.
-        let scope = InstallScope {
-            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([1u8; 32]),
-            group_id: Ulid::from_parts(1, 1),
-            install_id: Ulid::from_parts(2, 2),
-        };
-        let stored = |required: Value| {
-            let manifest = serde_json::json!({"name": "p", "version": "0.1.0",
-                "permissions": {"required": required},
-                "connections": {
-                    "files": {"url": "https://f.example.org/", "auth": "token"},
-                    "public": {"url": "https://p.example.org/"}}});
-            let manifest: Manifest = serde_json::from_value(manifest).unwrap();
-            let none = (&BTreeMap::new(), &BTreeMap::new());
-            let lines = summary(&manifest, "sha256:ab", &scope, none).connections;
-            lines.iter().map(|line| line.stored).collect::<Vec<_>>()
-        };
-        let download = serde_json::json!(["transfers.download"]);
-        assert_eq!(stored(download), [true, false]);
-        assert_eq!(stored(serde_json::json!([])), [false, false]);
     }
 }

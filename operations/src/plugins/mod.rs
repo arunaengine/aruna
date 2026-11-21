@@ -3,72 +3,84 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 pub mod account;
+pub mod admitted;
 pub mod artifacts;
+pub mod attempt;
 pub mod bound;
-pub mod broker;
 pub mod check;
 pub mod cleanup;
 pub mod clock;
 pub mod copies;
+pub mod copy;
 pub mod creates;
+pub mod dataset;
 pub mod decide;
 pub mod dispatch;
+pub mod entry;
 pub mod finished;
 pub mod forward;
 pub mod grants;
 pub mod held;
 pub mod hooks;
+pub mod host;
 pub mod install;
 pub mod intents;
-pub mod jobs;
+pub mod job_work;
 pub mod journal;
 pub mod lifecycle;
 pub mod marks;
 
 pub mod matcher;
-pub mod outbound;
+pub mod objects;
 pub mod outgoing;
+pub mod peer;
 pub mod prune;
 pub mod publish;
 pub mod rate;
 pub mod receiver;
+pub mod reconcile;
 pub mod records;
-pub mod release;
 pub mod replay;
+pub mod rows;
 pub mod rules;
 pub mod runs;
+pub(crate) mod secret_use;
+pub mod send_calls;
 pub mod settings;
 pub mod state;
-pub mod store;
 pub mod submit;
 pub mod sweep;
+pub mod task;
+pub mod transfer_steps;
 pub mod waiting;
 pub mod work;
-pub mod worker;
+
+use aruna_plugin_types::calls::{ErrorKind, HostError};
 
 #[cfg(test)]
-#[path = "delivery_tests.rs"]
-mod delivery_tests;
+#[path = "calls_tests.rs"]
+pub mod calls;
+#[cfg(test)]
+#[path = "fixtures_tests.rs"]
+pub(crate) mod fixtures;
+#[cfg(test)]
+#[path = "test_flows.rs"]
+pub mod flow_support;
+#[cfg(test)]
+pub mod test_support;
+
 #[cfg(test)]
 #[path = "events_tests.rs"]
 mod events_tests;
 
-use serde::{Deserialize, Serialize};
-
-/// Artifact bytes in a node message; Debug prints only their length.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ArtifactBytes(pub Vec<u8>);
-
-impl std::fmt::Debug for ArtifactBytes {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ArtifactBytes({} bytes)", self.0.len())
-    }
+/// A host call that cannot be answered now; the guest may try again.
+pub fn unavailable(message: impl Into<String>) -> HostError {
+    HostError::new(ErrorKind::Unavailable, message)
 }
 
 /// Management nodes that must hold a copy before a publish is answered: a majority, and at
 /// least two once the realm has two. Plain copies with acknowledgements, no vote.
-pub fn copies_needed(managers: usize) -> usize {
+pub(crate) fn copies_needed(managers: usize) -> usize {
     match managers {
         0 | 1 => 1,
         count => count / 2 + 1,
@@ -78,6 +90,7 @@ pub fn copies_needed(managers: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::plugins::ArtifactBytes;
 
     #[test]
     fn majority_copies() {
