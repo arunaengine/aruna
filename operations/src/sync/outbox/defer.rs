@@ -26,6 +26,8 @@ pub struct DrainDeferState {
     pub blocked_origins: HashSet<NodeId>,
     pub undeliverable_topics: HashSet<TopicId>,
     pub sync_waits: SyncWaits,
+    /// Origins with a relay out on this page: held only until the relay answers.
+    pub relay_origins: HashSet<NodeId>,
 }
 
 /// Published records that must sync again, by admin origin (`None` for other records), with the
@@ -78,37 +80,39 @@ pub fn classify_deferred_record(
     }
 }
 
-/// Splits FIFO-ordered drain records into publish-now, deferred (no local shard genesis
-/// yet) and undeliverable. Holdership decides publishability, not local topic presence,
-/// and a topic never straddles the defer/publish boundary; `publishes_shared` gates devices.
+/// Splits FIFO-ordered drain records into publish-now, deferred, undeliverable and unread ones by
+/// holdership; a topic never straddles the defer/publish boundary. A record of an origin with a
+/// relay out that is no plain relay stops the split: it and the rest wait for the relay's answer.
 pub fn partition_drain_records(
     records: Vec<DrainRecord>,
     defer: &mut DrainDeferState,
     publishes_shared: bool,
     mut topic_available: impl FnMut(TopicId) -> bool,
     mut classify_defer: impl FnMut(&DocumentOutboxRecord) -> DeferOutcome,
-) -> (Vec<DrainRecord>, Vec<DrainRecord>, Vec<DrainRecord>) {
+) -> PagePartition {
     let mut to_publish = Vec::with_capacity(records.len());
     let mut deferred = Vec::new();
     let mut undeliverable = Vec::new();
-    // Origins only a relay of this page blocked: the relay run decides their later relays in order.
-    let mut relaying = HashSet::new();
-    for (record_key, record, topic) in records {
+    let mut unread = Vec::new();
+    let mut records = records.into_iter();
+    while let Some((record_key, record, topic)) = records.next() {
         // Origin order is the contract, whatever topic the later records ride; a held record
         // holds its topic too.
         if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
-            let relayed = admin_origin(&record).is_some_and(|origin| relaying.contains(&origin));
-            if relayed && relay_only(&record, topic, defer, &mut classify_defer) {
-                undeliverable.push((record_key, record, topic));
-                continue;
-            }
-            // Once a record of the origin waits here, no later one relays past it.
-            if let Some(origin) = admin_origin(&record) {
-                relaying.remove(&origin);
-            }
             defer.deferred_topics.insert(topic);
             deferred.push((record_key, record, topic));
             continue;
+        }
+        // A later record of an origin with a relay out relays after it in order, or waits for
+        // that relay's answer with the rest of the page.
+        if admin_origin(&record).is_some_and(|origin| defer.relay_origins.contains(&origin)) {
+            if relay_only(&record, topic, defer, &mut classify_defer) {
+                undeliverable.push((record_key, record, topic));
+                continue;
+            }
+            unread.push((record_key, record, topic));
+            unread.extend(records);
+            break;
         }
         // A record of an origin waiting on another topic's sync waits too, and holds its origin,
         // so no later record of the origin overtakes it on the waiting topic.
@@ -141,8 +145,7 @@ pub fn partition_drain_records(
         }
         if defer.undeliverable_topics.contains(&topic) {
             if let Some(origin) = admin_origin(&record) {
-                defer.blocked_origins.insert(origin);
-                relaying.insert(origin);
+                defer.relay_origins.insert(origin);
             }
             undeliverable.push((record_key, record, topic));
             continue;
@@ -154,8 +157,7 @@ pub fn partition_drain_records(
         if !held {
             defer.undeliverable_topics.insert(topic);
             if let Some(origin) = admin_origin(&record) {
-                defer.blocked_origins.insert(origin);
-                relaying.insert(origin);
+                defer.relay_origins.insert(origin);
             }
             undeliverable.push((record_key, record, topic));
             continue;
@@ -182,8 +184,16 @@ pub fn partition_drain_records(
         );
         deferred.push((record_key, record, topic));
     }
-    (to_publish, deferred, undeliverable)
+    (to_publish, deferred, undeliverable, unread)
 }
+
+/// The records to publish now, the deferred, the undeliverable and the unread ones of a page.
+pub type PagePartition = (
+    Vec<DrainRecord>,
+    Vec<DrainRecord>,
+    Vec<DrainRecord>,
+    Vec<DrainRecord>,
+);
 
 /// Whether this node can only relay `record`: a shard record on a topic it does not hold and no
 /// failure deferred.

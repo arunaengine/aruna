@@ -85,7 +85,7 @@ fn admin_block_spans() {
     let blocked_topic = TopicId::hash(b"blocked-admin-page");
     let healthy_topic = TopicId::hash(b"healthy-admin-page");
     let mut defer = DrainDeferState::default();
-    let (_, deferred, _) = partition_drain_records(
+    let (_, deferred, _, _) = partition_drain_records(
         vec![(b"first".to_vec(), admin_record(origin, 1), blocked_topic)],
         &mut defer,
         true,
@@ -94,7 +94,7 @@ fn admin_block_spans() {
     );
     assert_eq!(deferred.len(), 1);
 
-    let (published, deferred, undeliverable) = partition_drain_records(
+    let (published, deferred, undeliverable, _) = partition_drain_records(
         vec![(b"second".to_vec(), admin_record(origin, 2), healthy_topic)],
         &mut defer,
         true,
@@ -119,7 +119,7 @@ fn admin_origin_blocks() {
     ];
 
     let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
+    let (to_publish, deferred, undeliverable, _) = partition_drain_records(
         records,
         &mut defer,
         true,
@@ -152,7 +152,7 @@ fn shared_topic_blocked() {
         (b"shared".to_vec(), shared, topic),
         (b"admin".to_vec(), admin_record(origin, 1), topic),
     ];
-    let (to_publish, deferred, undeliverable) =
+    let (to_publish, deferred, undeliverable, _) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
     assert!(to_publish.is_empty() && undeliverable.is_empty());
     assert_eq!(deferred.len(), 2);
@@ -170,7 +170,7 @@ fn held_origin_topic() {
         (b"admin".to_vec(), admin_record(origin, 1), topic),
         (b"later".to_vec(), shard_topic_record(2), topic),
     ];
-    let (to_publish, deferred, _) =
+    let (to_publish, deferred, _, _) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
     assert!(to_publish.is_empty());
     assert_eq!(deferred.len(), 2);
@@ -190,7 +190,7 @@ fn later_relays_ordered() {
         (b"admin/2".to_vec(), admin_record(origin, 2), second),
     ];
     let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
+    let (to_publish, deferred, undeliverable, _) = partition_drain_records(
         records,
         &mut defer,
         true,
@@ -202,8 +202,8 @@ fn later_relays_ordered() {
     assert_eq!(keys, vec![b"admin/1".to_vec(), b"admin/2".to_vec()]);
 }
 
-// A record of a relaying origin that waits here stops the later relays of that origin, so none
-// reaches a holder before it.
+// A record of an origin with a relay out that is no plain relay itself stops the split: it and
+// the later records stay unread until the relay answers, so no later relay passes it.
 #[test]
 fn deferred_row_stops() {
     let origin = node(4);
@@ -216,14 +216,15 @@ fn deferred_row_stops() {
     let mut defer = DrainDeferState::default();
     defer.topic_held.insert(remote, false);
     defer.topic_held.insert(local, true);
-    let (to_publish, deferred, undeliverable) =
+    let (to_publish, deferred, undeliverable, unread) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
     let keys = |records: &[DrainRecord]| -> Vec<Vec<u8>> {
         records.iter().map(|(key, ..)| key.clone()).collect()
     };
-    assert!(to_publish.is_empty());
+    assert!(to_publish.is_empty() && deferred.is_empty());
     assert_eq!(keys(&undeliverable), vec![b"admin/1".to_vec()]);
-    assert_eq!(keys(&deferred), vec![b"admin/2".to_vec(), b"admin/3".to_vec()]);
+    assert_eq!(keys(&unread), vec![b"admin/2".to_vec(), b"admin/3".to_vec()]);
+    assert!(!defer.blocked_origins.contains(&origin));
 }
 
 // A relay held behind another origin on its shard holds its own origin's later relays to other
@@ -282,7 +283,7 @@ fn sync_wait_topics() {
         (b"second".to_vec(), admin_record(origin, 2), other),
         (b"third".to_vec(), admin_record(origin, 3), waiting),
     ];
-    let (to_publish, deferred, _) =
+    let (to_publish, deferred, _, _) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
     let keys = |records: &[DrainRecord]| -> Vec<Vec<u8>> {
         records.iter().map(|(key, ..)| key.clone()).collect()
@@ -324,7 +325,7 @@ fn split_waits_hold() {
         ],
     );
     let records = vec![(b"later".to_vec(), admin_record(origin, 3), first)];
-    let (to_publish, deferred, _) =
+    let (to_publish, deferred, _, _) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
     assert!(to_publish.is_empty());
     assert_eq!(deferred.len(), 1);
@@ -335,7 +336,7 @@ fn topic_block_spans() {
     let topic = TopicId::hash(b"blocked-topic-pages");
     let healthy_topic = TopicId::hash(b"healthy-topic-pages");
     let mut defer = DrainDeferState::default();
-    let (_, deferred, _) = partition_drain_records(
+    let (_, deferred, _, _) = partition_drain_records(
         vec![(b"first".to_vec(), shard_topic_record(1), topic)],
         &mut defer,
         true,
@@ -344,7 +345,7 @@ fn topic_block_spans() {
     );
     assert_eq!(deferred.len(), 1);
 
-    let (published, deferred, undeliverable) = partition_drain_records(
+    let (published, deferred, undeliverable, _) = partition_drain_records(
         vec![
             (b"healthy".to_vec(), shard_topic_record(3), healthy_topic),
             (b"second".to_vec(), shard_topic_record(2), topic),
@@ -375,7 +376,7 @@ fn drain_partition_flips() {
 
     let mut calls = 0usize;
     let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
+    let (to_publish, deferred, undeliverable, _) = partition_drain_records(
         records,
         &mut defer,
         true,
@@ -404,7 +405,7 @@ fn drain_partition_order() {
     ];
 
     let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) =
+    let (to_publish, deferred, undeliverable, _) =
         partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
 
     assert!(deferred.is_empty());
@@ -425,7 +426,7 @@ fn unheld_bucket_undeliverable() {
 
     let mut classified = 0usize;
     let mut defer = DrainDeferState::default();
-    let (to_publish, deferred, undeliverable) = partition_drain_records(
+    let (to_publish, deferred, undeliverable, _) = partition_drain_records(
         records,
         &mut defer,
         true,

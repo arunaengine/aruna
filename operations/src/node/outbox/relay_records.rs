@@ -36,6 +36,8 @@ pub struct RelayedRecords {
     pub held: usize,
     pub held_topics: Vec<TopicId>,
     pub held_origins: Vec<NodeId>,
+    /// Origins with a relay a holder took or none could: their later records wait.
+    pub kept_origins: Vec<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -202,6 +204,9 @@ impl RelayRecordsOperation {
             return;
         }
         self.out.left += 1;
+        if let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event {
+            self.out.kept_origins.push(event.origin_node_id);
+        }
         error!(
             event = "pipeline.drain.undeliverable",
             target = ?record.target,
@@ -260,6 +265,7 @@ impl Operation for RelayRecordsOperation {
         match result.child::<(), ForwardError>()? {
             Ok(()) => {
                 if let DocumentOutboxEvent::AdminOperation { event, .. } = &record.1.event {
+                    self.out.kept_origins.push(event.origin_node_id);
                     info!(
                         event = "pipeline.drain.relayed",
                         target = ?record.1.target,
@@ -351,6 +357,7 @@ mod tests {
             retry: true,
             held_topics: vec![TopicId::hash(b"topic")],
             held_origins: vec![node()],
+            kept_origins: vec![node()],
             ..RelayedRecords::default()
         };
         assert_eq!(
@@ -365,6 +372,7 @@ mod tests {
         let mut run = RelayRecordsOperation::new(node(), None, vec![admin_record()]);
         let left = RelayedRecords {
             left: 1,
+            kept_origins: vec![node()],
             ..RelayedRecords::default()
         };
         assert_eq!(run.first(), Ok(Next::Done(left)));
@@ -429,6 +437,7 @@ mod tests {
             retry: true,
             held_topics: vec![TopicId::hash(b"topic")],
             held_origins: vec![node()],
+            kept_origins: vec![node()],
             ..RelayedRecords::default()
         };
         let answer = run.next(IoResult::Child(ChildOutcome::new(refused)));

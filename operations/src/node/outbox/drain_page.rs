@@ -106,6 +106,8 @@ pub struct DrainPageOperation {
     page: Option<DrainedPage>,
     batch: Option<OutboxReadBatch>,
     records: Vec<DrainRecord>,
+    /// The topics with a local genesis, for the records a relay's answer held.
+    existing: BTreeSet<TopicId>,
     to_publish: Vec<DrainRecord>,
     missing: VecDeque<(Vec<NodeId>, Vec<TopicId>)>,
     blocked: DrainSyncOutcome,
@@ -143,6 +145,7 @@ impl DrainPageOperation {
             page: Some(page),
             batch: None,
             records: Vec::new(),
+            existing: BTreeSet::new(),
             to_publish: Vec::new(),
             missing: VecDeque::new(),
             blocked: DrainSyncOutcome::default(),
@@ -338,23 +341,33 @@ impl DrainPageOperation {
     /// Splits the page into records to publish, deferred ones and undeliverable ones, counts the
     /// stuck ones and relays what this node cannot publish.
     fn partition(&mut self, existing: BTreeSet<TopicId>) -> PageTurn {
+        self.existing = existing;
+        self.split()
+    }
+
+    /// Splits the unread records of the page, relays what only a holder can publish, and splits
+    /// the records a relay's answer held after it arrives.
+    fn split(&mut self) -> PageTurn {
         let (local, now_ms) = (self.serving.0, self.now_ms);
         let config = self.config.clone();
         let device = (config.as_deref())
             .and_then(|config| config.node_kind(&local))
             .is_some_and(|kind| !kind.is_sync_eligible());
         let records = std::mem::take(&mut self.records);
+        let existing = std::mem::take(&mut self.existing);
+        let mut publishing = std::mem::take(&mut self.to_publish);
         let invocation = self.invocation()?;
-        let (to_publish, deferred, undeliverable) = partition_drain_records(
+        let (to_publish, deferred, undeliverable, unread) = partition_drain_records(
             records,
             &mut invocation.defer,
             !device,
             |topic| existing.contains(&topic),
             |record| classify_deferred_record(config.as_deref(), local, record),
         );
+        publishing.extend(to_publish);
         // A relay after a record of its origin that still publishes waits and holds its origin and
         // shard topic, so the later records of either wait too.
-        let (undeliverable, held) = hold_relays(&to_publish, undeliverable, &mut invocation.defer);
+        let (undeliverable, held) = hold_relays(&publishing, undeliverable, &mut invocation.defer);
         invocation.deferred += deferred.len() + held.len();
         let stuck_after = OUTBOX_STUCK_AFTER.as_millis() as u64;
         for (_, record, topic) in &deferred {
@@ -370,12 +383,19 @@ impl DrainPageOperation {
                 invocation.oldest_stuck = Some(stuck);
             }
         }
-        self.to_publish = to_publish;
         if undeliverable.is_empty() {
-            return self.publish();
+            // Every relay of the split was held, which blocks its origin for real.
+            invocation.defer.relay_origins.clear();
         }
-        let relay = RelayRecordsOperation::new(local, config, undeliverable);
-        self.ask(PageStep::Relay, relay)
+        (self.to_publish, self.records, self.existing) = (publishing, unread, existing);
+        if !undeliverable.is_empty() {
+            let relay = RelayRecordsOperation::new(local, config, undeliverable);
+            return self.ask(PageStep::Relay, relay);
+        }
+        match self.records.is_empty() {
+            true => self.publish(),
+            false => self.split(),
+        }
     }
 
     /// Groups the records to publish into sub-batches and publishes them.
@@ -556,22 +576,29 @@ impl Operation for DrainPageOperation {
             }
             PageStep::Relay => {
                 let invocation = self.invocation()?;
+                let relaying = std::mem::take(&mut invocation.defer.relay_origins);
                 match result.child::<RelayedRecords, IoError>()? {
                     Ok(relayed) => {
                         invocation.undeliverable += relayed.left;
                         invocation.deferred += relayed.held;
                         invocation.outcome.retry_needed |= relayed.retry;
-                        // The domains of a relay that did not go out hold on the next pages.
+                        // The domains of a relay that did not go out hold on the next pages, as
+                        // does the origin of an accepted one; a refused one holds nothing.
                         let defer = &mut invocation.defer;
                         defer.deferred_topics.extend(relayed.held_topics);
                         defer.blocked_origins.extend(relayed.held_origins);
+                        defer.blocked_origins.extend(relayed.kept_origins);
                     }
                     Err(error) => {
                         warn!(%error, "Relaying undeliverable outbox records broke off");
                         invocation.outcome.retry_needed = true;
+                        invocation.defer.blocked_origins.extend(relaying);
                     }
                 }
-                self.publish()
+                match self.records.is_empty() {
+                    true => self.publish(),
+                    false => self.split(),
+                }
             }
             PageStep::Lineage => {
                 let lineages = lineages(&self.topics, result)?;
@@ -670,6 +697,74 @@ mod tests {
         assert_eq!(page.end, PageEnd::Skip);
         assert_eq!((page.invocation.pages, page.invocation.scanned), (1, 8));
         assert_eq!(page.invocation.records, 0);
+    }
+
+    /// An admin record of `origin` on the topic `group` that this node holds.
+    fn admin_record(origin: NodeId) -> DrainRecord {
+        use aruna_core::admin_documents::{
+            AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
+        };
+        use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
+        use aruna_core::structs::identity::auth::Actor;
+        use aruna_core::structs::placement::record::PlacementRef;
+        use aruna_core::user::id::UserId;
+
+        let realm_id = RealmId::from_bytes([3; 32]);
+        let user_id = UserId::nil(realm_id);
+        let event = AdminDocumentEvent {
+            event_id: ulid::Ulid::from_parts(9, 2),
+            target: AdminDocumentTarget::User { user_id },
+            origin_node_id: origin,
+            origin_seq: 2,
+            observed: AdminDocumentClock::default(),
+            actor: Actor {
+                node_id: origin,
+                user_id,
+                realm_id,
+            },
+            op: AdminDocumentOperation::UserNameSet {
+                name: "user".to_string(),
+            },
+        };
+        let target = DocumentTarget::Group {
+            group_id: ulid::Ulid::from_parts(7, 1),
+        };
+        let (id, placement) = (ulid::Ulid::from_parts(10, 2), PlacementRef::NIL);
+        let event = DocumentOutboxEvent::admin(event);
+        let record = crate::sync::outbox::record::new_identified_record(
+            id,
+            origin,
+            target,
+            Vec::new(),
+            event,
+            placement,
+            false,
+        );
+        (b"admin/2".to_vec(), record, TopicId::hash(b"group"))
+    }
+
+    // A record that waited for its origin's relay gets its own decision once a holder refused
+    // that relay, and publishes; after an accepted relay it waits for the next rotation.
+    #[test]
+    fn refused_relay_releases() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        for (kept, publishes) in [(Vec::new(), true), (vec![origin], false)] {
+            let mut run = page();
+            run.records = vec![admin_record(origin)];
+            run.existing = BTreeSet::from([TopicId::hash(b"group")]);
+            run.invocation().unwrap().defer.relay_origins.insert(origin);
+            run.step = PageStep::Relay;
+            let relayed = RelayedRecords {
+                left: 1,
+                kept_origins: kept,
+                ..RelayedRecords::default()
+            };
+            let answer = run.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(relayed))));
+            let invocation = &run.page.as_ref().unwrap().invocation;
+            assert_eq!(invocation.defer.blocked_origins.contains(&origin), !publishes);
+            assert_eq!(invocation.deferred, usize::from(!publishes));
+            assert_eq!(matches!(answer, Ok(Next::Call(IoCall::Group(_)))), publishes);
+        }
     }
 
     // A failed relay, or a relay run that broke off, marks the page for a retry, so the last
