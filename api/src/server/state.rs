@@ -281,7 +281,7 @@ impl ServerState {
             .net_handle
             .as_ref()
             .map(|net| net.credential_encryption_key())
-            .unwrap_or_else(CredentialEncryptionKey::random);
+            .unwrap_or_else(|| CredentialEncryptionKey::derive(&rand::random()));
         let assistant_client =
             crate::routes::assistant::egress::outbound_client(&node_capabilities);
         let download_slots = driver_ctx
