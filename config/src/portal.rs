@@ -951,6 +951,18 @@ mod tests {
             install_verified_artifact(&second_config, &archive, checksum, "now".to_string())
         });
 
+        // The second install has staged its portal and is waiting for the lock.
+        while !staged_checksum(tempdir.path()) {
+            assert!(!second.is_finished());
+            std::thread::yield_now();
+        }
+        let probe = fs::File::open(previous.with_extension("lock")).unwrap();
+        assert!(matches!(
+            probe.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        assert!(!second.is_finished());
+
         // The first install fails and restores its backup, as `replace_portable` does.
         fs::rename(&backup, &target).unwrap();
         fs::remove_dir_all(&previous).unwrap();
@@ -962,6 +974,15 @@ mod tests {
             "new"
         );
         assert!(!previous.exists());
+    }
+
+    /// Whether an installer staged a portal with its checksum file under `parent`.
+    fn staged_checksum(parent: &Path) -> bool {
+        fs::read_dir(parent).unwrap().any(|entry| {
+            let entry = entry.unwrap();
+            entry.file_name().to_string_lossy().starts_with(".portal-")
+                && entry.path().join(CHECKSUM_FILE).is_file()
+        })
     }
 
     // A claim interrupted before its marker leaves only its staging directory, so the next
