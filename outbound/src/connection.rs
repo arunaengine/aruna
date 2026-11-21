@@ -28,6 +28,10 @@ pub(crate) fn screened(
     Ok(http.request(method, url))
 }
 
+/// How long one connection call may take, from sending to the last byte of its answer, so a
+/// destination that trickles bytes cannot hold the call open past the per-read timeout.
+const CONNECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// The node's screened client.
 pub(crate) struct ScreenedSender {
     pub(crate) http: reqwest::Client,
@@ -37,6 +41,17 @@ pub(crate) struct ScreenedSender {
 #[async_trait]
 impl ConnectionSender for ScreenedSender {
     async fn send(&self, call: ConnectionCall) -> Result<ConnectionAnswer, ConnectionError> {
+        tokio::time::timeout(CONNECTION_DEADLINE, self.exchange(call))
+            .await
+            .map_err(|_| {
+                ConnectionError::Unknown("the destination did not answer in time".into())
+            })?
+    }
+}
+
+impl ScreenedSender {
+    /// Sends `call` and reads its whole answer within the bound.
+    async fn exchange(&self, call: ConnectionCall) -> Result<ConnectionAnswer, ConnectionError> {
         let not_sent = |why: String| ConnectionError::NotSent(why);
         let ConnectionCall { request, body } = call;
         let method = reqwest::Method::from_bytes(request.method.as_bytes());
@@ -70,7 +85,8 @@ impl ConnectionSender for ScreenedSender {
         let mut read = Vec::new();
         loop {
             let chunk = response.chunk().await;
-            let chunk = chunk.map_err(|error| ConnectionError::Unknown(error.to_string()))?;
+            let chunk =
+                chunk.map_err(|error| ConnectionError::Unknown(error.without_url().to_string()))?;
             let Some(chunk) = chunk else {
                 break;
             };
