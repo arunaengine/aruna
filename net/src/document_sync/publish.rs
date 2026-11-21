@@ -4,6 +4,24 @@
 
 use super::*;
 
+/// The lineage an appended event may be reported on: the one read after the append, `None` when
+/// the event left it or the read failed.
+pub(in crate::document_sync) fn confirmed_lineage(
+    read: Result<Option<[u8; 32]>>,
+) -> Option<[u8; 32]> {
+    match read {
+        Ok(Some(lineage)) => Some(lineage),
+        Ok(None) => {
+            warn!("A published event left its lineage before the read");
+            None
+        }
+        Err(error) => {
+            warn!(%error, "Cannot read the lineage of a publish");
+            None
+        }
+    }
+}
+
 impl DocumentSyncService {
     pub async fn publish_documents(
         &self,
@@ -366,15 +384,17 @@ impl DocumentSyncService {
                 }
                 Err(error) => return Err(error),
             };
-            // Read under the publish lock, so a tie-break after it shows as a lineage change; an
-            // unknown lineage keeps the row and holds its domains at the finish.
-            match self.appended_lineage(&op) {
-                Ok(Some(lineage)) => {
-                    outcome.lineages.insert(index, lineage);
-                }
-                Ok(None) => warn!(%topic_id, "A published event left its lineage before the read"),
-                Err(error) => warn!(%topic_id, %error, "Cannot read the lineage of a publish"),
-            }
+            // Read under the publish lock, so a tie-break after it shows as a lineage change. An
+            // event without that evidence retries and holds the later events of both its domains.
+            let Some(lineage) = confirmed_lineage(self.appended_lineage(&op)) else {
+                outcome.retry_indices.push(index);
+                let error = || "Published event left its lineage".to_string();
+                outcome.retry_error.get_or_insert_with(error);
+                held_topics.insert(topic_id);
+                held_origins.extend(origin);
+                continue;
+            };
+            outcome.lineages.insert(index, lineage);
             outcome.published_indices.push(index);
             outcome
                 .published

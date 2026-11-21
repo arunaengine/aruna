@@ -172,6 +172,17 @@ async fn blocked_allows_ready() {
     );
 }
 
+// An appended event is reported published only with the lineage it stands on; an evicted one or
+// an unreadable lineage makes it retry.
+#[test]
+fn unknown_lineage_retries() {
+    use crate::document_sync::publish::confirmed_lineage;
+    assert_eq!(confirmed_lineage(Ok(Some([1; 32]))), Some([1; 32]));
+    assert_eq!(confirmed_lineage(Ok(None)), None);
+    let unreadable = Err(NetError::Bootstrap("down".to_string()));
+    assert_eq!(confirmed_lineage(unreadable), None);
+}
+
 // An event bound to a lineage appends only while its topic still has that lineage; otherwise it
 // retries and holds its topic for the later events.
 #[tokio::test]
