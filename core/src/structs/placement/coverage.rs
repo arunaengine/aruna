@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::errors::ConversionError;
+use crate::id::NodeId;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -44,5 +45,54 @@ impl CoverageCount {
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
         Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// What a node signs to start one count run on the other members of a distributed bucket.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CountRelay {
+    pub bucket: String,
+    pub set_id: Ulid,
+    pub run: Ulid,
+}
+
+impl CountRelay {
+    /// The signed bytes, behind a prefix that no other signed record of a node starts with.
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        let mut bytes = b"aruna-count-relay-v1\0".to_vec();
+        bytes.extend(postcard::to_allocvec(self)?);
+        Ok(bytes)
+    }
+
+    pub fn signed_by(&self, node_id: &NodeId, signature: &iroh::Signature) -> bool {
+        (self.signing_bytes()).is_ok_and(|bytes| node_id.verify(&bytes, signature).is_ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A signature holds for its bucket, set and run only, and only under the signing node.
+    #[test]
+    fn relay_signature_bound() {
+        let key = iroh::SecretKey::from_bytes(&[7; 32]);
+        let relay = CountRelay {
+            bucket: "photos".to_string(),
+            set_id: Ulid::from_parts(1, 1),
+            run: Ulid::from_parts(2, 2),
+        };
+        let signature = key.sign(&relay.signing_bytes().unwrap());
+        assert!(relay.signed_by(&key.public(), &signature));
+        let other = iroh::SecretKey::from_bytes(&[8; 32]).public();
+        assert!(!relay.signed_by(&other, &signature));
+        let moved = CountRelay {
+            run: Ulid::from_parts(3, 3),
+            ..relay.clone()
+        };
+        assert!(!moved.signed_by(&key.public(), &signature));
+        // The bare record bytes, without the prefix, are not what a node signs.
+        let bare = key.sign(&postcard::to_allocvec(&relay).unwrap());
+        assert!(!relay.signed_by(&key.public(), &bare));
     }
 }

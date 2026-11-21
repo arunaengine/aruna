@@ -152,6 +152,7 @@ async fn blocked_allows_ready() {
             published_indices,
             retry_indices,
             error,
+            ..
         } => {
             assert_eq!(published_indices, vec![1]);
             assert_eq!(retry_indices, vec![0]);

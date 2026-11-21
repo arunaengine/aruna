@@ -245,6 +245,9 @@ pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> Net
         NetEffect::SignDeletePlan(plan) => {
             NetEvent::DeletePlanSigned(crate::signing::sign_delete_plan(&ctx.secret_key, &plan))
         }
+        NetEffect::SignCountRelay(relay) => {
+            NetEvent::CountRelaySigned(crate::signing::sign_count_relay(&ctx.secret_key, &relay))
+        }
         NetEffect::VaultSign(records) => {
             NetEvent::VaultSign(crate::signing::sign_records(&ctx.secret_key, *records))
         }
@@ -682,6 +685,7 @@ fn net_effect_kind(effect: &NetEffect) -> &'static str {
         NetEffect::JobControl(_) => "job_control",
         NetEffect::PolicySign(_) => "policy_sign",
         NetEffect::SignDeletePlan(_) => "sign_delete_plan",
+        NetEffect::SignCountRelay(_) => "sign_count_relay",
         NetEffect::VaultSign(_) => "vault_sign",
         NetEffect::SnapshotSign(_) => "snapshot_sign",
         NetEffect::StatementSign(_) => "statement_sign",

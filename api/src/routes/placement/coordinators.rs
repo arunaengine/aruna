@@ -72,6 +72,18 @@ pub(super) async fn coordinators(
     Ok(nodes)
 }
 
+/// The node of every member of the set, from this node's record.
+pub(super) async fn set_members(
+    state: &ServerState,
+    binding: &DistributionBinding,
+) -> ServerResult<Vec<NodeId>> {
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
+        .await
+        .map_err(map_guard_error)?;
+    let members = &view.snapshot().config.members;
+    Ok(members.iter().map(|member| member.node_id).collect())
+}
+
 /// A coordinator's answer, as far as the spread needs it: where its own pass goes on.
 trait Paged {
     fn next(&self) -> Option<String>;
