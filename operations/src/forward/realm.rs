@@ -127,6 +127,10 @@ pub(crate) fn admit_relayed_admin(
     if !is_sync_eligible(config, peer) {
         return RelayAdmission::Forbidden;
     }
+    // An origin this config does not list may be newer than it: another holder may know it.
+    if config.node_kind(&event.origin_node_id).is_none() {
+        return RelayAdmission::Unavailable;
+    }
     if !is_sync_eligible(config, event.origin_node_id) {
         return RelayAdmission::Reject("relayed admin event origin may not publish".to_string());
     }
@@ -381,6 +385,18 @@ mod tests {
             RelayAdmission::Reject(reason)
                 if reason == "relayed admin event origin may not publish"
         ));
+    }
+
+    #[test]
+    fn unknown_origin_unavailable() {
+        // A holder that does not list the origin yet leaves the relay to another holder.
+        let (config, placement, holder) = relay_fixture();
+        let (event, signature) = signed_event(&config, &placement, 42);
+
+        assert_eq!(
+            admit_relayed_admin(&config, holder, node(2), &event, &placement, &signature),
+            RelayAdmission::Unavailable
+        );
     }
 
     #[test]

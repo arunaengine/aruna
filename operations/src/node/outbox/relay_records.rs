@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 
 use crate::forward::realm::RelayAdminOperation;
 use crate::forward::transport::ForwardError;
+use crate::realm::peer_trust::is_sync_eligible;
 use crate::sync::document_outbox::DeleteOutboxPlan;
 use crate::sync::outbox::defer::DrainRecord;
 
@@ -150,6 +151,11 @@ impl RelayRecordsOperation {
             self.left(record);
             return None;
         };
+        let config = self.config.as_deref();
+        if !config.is_some_and(|config| is_sync_eligible(config, event.origin_node_id)) {
+            self.rejected(record);
+            return None;
+        }
         let (target, placement) = (record.1.target.clone(), record.1.placement);
         let relay = RelayAdminOperation::new(
             Some(self.local),
@@ -162,6 +168,17 @@ impl RelayRecordsOperation {
         self.current = Some(record);
         self.step = RelayStep::Relay;
         Some(Ok(Next::Call(IoCall::child(relay))))
+    }
+
+    /// Reports a relay a holder rejected, or whose origin this node's config no longer admits: no
+    /// retry changes that verdict, so the row stays without one and holds nothing.
+    fn rejected(&mut self, record: DrainRecord) {
+        error!(
+            event = "pipeline.drain.relay_rejected",
+            target = ?record.1.target,
+            "A relayed admin outbox record was rejected; leaving it in the outbox"
+        );
+        self.out.left += 1;
     }
 
     /// Holds the shard topic and admin origin of a relay that did not go out for the later ones.
@@ -252,15 +269,7 @@ impl Operation for RelayRecordsOperation {
                 }
                 self.out.relayed.push(record.0);
             }
-            Err(ForwardError::Forbidden) => {
-                // A holder judged the envelope; no retry changes that, so the row is only reported.
-                error!(
-                    event = "pipeline.drain.relay_rejected",
-                    target = ?record.1.target,
-                    "A holder rejected a relayed admin outbox record; leaving it in the outbox"
-                );
-                self.out.left += 1;
-            }
+            Err(ForwardError::Forbidden) => self.rejected(record),
             Err(error) => {
                 warn!(
                     event = "pipeline.drain.relay_failed",
@@ -378,6 +387,9 @@ mod tests {
         config.default_strategy_id = Some(Ulid::from_bytes([9; 16]));
         let holder = iroh::SecretKey::from_bytes(&[2; 32]).public();
         config.ensure_node(holder, RealmNodeKind::Server);
+        // The origins of the relayed records, which this config admits.
+        config.ensure_node(node(), RealmNodeKind::Server);
+        config.ensure_node(iroh::SecretKey::from_bytes(&[5; 32]).public(), RealmNodeKind::Server);
         config.snapshot_candidate_map();
         config
     }
@@ -434,6 +446,20 @@ mod tests {
         };
         let answer = run.next(IoResult::Child(ChildOutcome::new(rejected)));
         assert_eq!(answer, Ok(Next::Done(left)));
+    }
+
+    // An origin this node's own config no longer admits gets no holder's verdict: the record is
+    // reported and stays, without a retry.
+    #[test]
+    fn removed_origin_reported() {
+        let removed = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let records = vec![signed_record(b"admin", removed)];
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(holder_config())), records);
+        let left = RelayedRecords {
+            left: 1,
+            ..RelayedRecords::default()
+        };
+        assert_eq!(run.first(), Ok(Next::Done(left)));
     }
 
     // A relay to the shard topic of one that failed waits behind it, also from another origin,
