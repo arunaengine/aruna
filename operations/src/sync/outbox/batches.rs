@@ -16,7 +16,7 @@ use irokle::TopicId;
 use tracing::info;
 use ulid::Ulid;
 
-use super::defer::{DrainDeferState, DrainRecord, admin_origin};
+use super::defer::{DrainDeferState, DrainRecord, add_waits, admin_origin};
 use super::record::OUTBOX_DRAIN_SIZE;
 use super::rotation::OutboxRotation;
 use crate::sync::shard_placement::{DEFER_RETRY_AFTER, sort_node_ids};
@@ -258,6 +258,8 @@ pub struct DrainSyncOutcome {
     /// Ordering domains to block for the rest of the rotation.
     pub blocked_topics: Vec<TopicId>,
     pub blocked_origins: Vec<NodeId>,
+    /// The admin origin and topic of each published record whose sync must retry.
+    pub sync_waits: Vec<(NodeId, TopicId)>,
 }
 
 impl DrainSyncOutcome {
@@ -269,6 +271,7 @@ impl DrainSyncOutcome {
         self.deleted += other.deleted;
         self.blocked_topics.extend(other.blocked_topics);
         self.blocked_origins.extend(other.blocked_origins);
+        self.sync_waits.extend(other.sync_waits);
     }
 }
 
@@ -309,6 +312,7 @@ impl DrainInvocation {
                 deferred_topics: rotation.blocked_topics.clone(),
                 blocked_origins: rotation.blocked_origins.clone(),
                 undeliverable_topics: rotation.undeliverable_topics.clone(),
+                sync_waits: rotation.sync_waits.clone(),
                 ..DrainDeferState::default()
             },
             cursor: rotation.cursor.clone(),
@@ -340,6 +344,7 @@ impl DrainInvocation {
         defer
             .blocked_origins
             .extend(outcome.blocked_origins.iter().copied());
+        add_waits(&mut defer.sync_waits, &outcome.sync_waits);
         self.outcome.merge(outcome);
     }
 
@@ -365,6 +370,7 @@ impl DrainInvocation {
         defer
             .blocked_origins
             .extend(outcome.blocked_origins.iter().copied());
+        add_waits(&mut defer.sync_waits, &outcome.sync_waits);
         let unvisited = self.has_unvisited();
         let retry = self.outcome.retry_needed || self.read_failed;
         rotation.cursor = match self.reached_end {
@@ -374,6 +380,7 @@ impl DrainInvocation {
         rotation.blocked_topics = std::mem::take(&mut self.defer.deferred_topics);
         rotation.blocked_origins = std::mem::take(&mut self.defer.blocked_origins);
         rotation.undeliverable_topics = std::mem::take(&mut self.defer.undeliverable_topics);
+        rotation.sync_waits = std::mem::take(&mut self.defer.sync_waits);
         let totals = &mut rotation.totals;
         totals.examined += self.records;
         totals.deleted += self.outcome.deleted;

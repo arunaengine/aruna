@@ -25,6 +25,19 @@ pub struct DrainDeferState {
     pub deferred_topics: HashSet<TopicId>,
     pub blocked_origins: HashSet<NodeId>,
     pub undeliverable_topics: HashSet<TopicId>,
+    pub sync_waits: SyncWaits,
+}
+
+/// Admin origins whose already published records must sync again, with the topics those records
+/// ride. A later record of such an origin goes out only on one of these topics, whose sync
+/// carries the earlier record in order; on any other topic it waits.
+pub type SyncWaits = HashMap<NodeId, HashSet<TopicId>>;
+
+/// Adds the origin and topic of each record whose sync must retry to `waits`.
+pub fn add_waits(waits: &mut SyncWaits, pairs: &[(NodeId, TopicId)]) {
+    for (origin, topic) in pairs {
+        waits.entry(*origin).or_default().insert(*topic);
+    }
 }
 
 /// Whether a shard-classed record can ever publish from this node.
@@ -78,6 +91,18 @@ pub fn partition_drain_records(
     for (record_key, record, topic) in records {
         // Origin order is the contract, whatever topic the later records ride.
         if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
+            deferred.push((record_key, record, topic));
+            continue;
+        }
+        // A record of an origin waiting on another topic's sync waits too, and holds its origin,
+        // so no later record of the origin overtakes it on the waiting topic.
+        if let Some(origin) = admin_origin(&record)
+            && defer
+                .sync_waits
+                .get(&origin)
+                .is_some_and(|topics| !topics.contains(&topic))
+        {
+            defer.blocked_origins.insert(origin);
             deferred.push((record_key, record, topic));
             continue;
         }

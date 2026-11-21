@@ -10,6 +10,7 @@ use aruna_core::id::NodeId;
 use irokle::TopicId;
 use tracing::info;
 
+use super::defer::SyncWaits;
 use crate::queue_backoff::retry_delay_ms;
 use crate::sync::shard_placement::DEFER_RETRY_AFTER;
 
@@ -41,6 +42,8 @@ pub struct OutboxRotation {
     pub blocked_origins: HashSet<NodeId>,
     /// Topics this node can never publish onto, for the rest of this rotation.
     pub undeliverable_topics: HashSet<TopicId>,
+    /// Admin origins whose published records must sync again, by the topics they ride.
+    pub sync_waits: SyncWaits,
     pub totals: RotationTotals,
     /// Continuations already spent without yielding through the timer.
     pub continuations: u32,

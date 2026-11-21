@@ -192,14 +192,22 @@ impl PublishBatchesOperation {
     }
 
     /// Leaves out the entries whose topic or admin origin an earlier failure of this run
-    /// blocked: they stay in the outbox for a retry and keep their own domains blocked.
+    /// blocked, or whose origin waits for a sync on another topic: they stay in the outbox for a
+    /// retry and keep their own domains blocked.
     fn without_blocked(&mut self, batch: DrainSubBatch) -> Option<DrainSubBatch> {
         let outcome = &self.out.outcome;
+        let waits_elsewhere = |origin: NodeId, topic: TopicId| {
+            let waits = outcome.sync_waits.iter().filter(|(waiting, _)| *waiting == origin);
+            waits.clone().next().is_some() && !waits.clone().any(|(_, on)| *on == topic)
+        };
         let blocked = |index: usize| {
             let topic = batch.topics.get(index);
             let origin = batch.origins.get(index).copied().flatten();
             topic.is_some_and(|topic| outcome.blocked_topics.contains(topic))
                 || origin.is_some_and(|origin| outcome.blocked_origins.contains(&origin))
+                || origin
+                    .zip(topic.copied())
+                    .is_some_and(|(origin, topic)| waits_elsewhere(origin, topic))
         };
         let (held, kept): (Vec<usize>, Vec<usize>) =
             (0..batch.record_keys.len()).partition(|&index| blocked(index));
@@ -586,13 +594,36 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished.outcome.blocked_origins.push(origin);
+        finished.outcome.sync_waits.push((origin, TopicId::hash(b"one")));
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("the later batch is held");
         };
         assert_eq!(done.published, vec![kept(b"one", b"one")]);
         assert!(done.outcome.retry_needed);
+    }
+
+    // A failed sync holds no later record on its own topic: the record is in the oplog, and the
+    // later record's sync carries it in order, also past a peer that stays unreachable.
+    #[test]
+    fn same_topic_proceeds() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let (mut first, mut second) = (batch(b"one"), batch(b"one"));
+        (first.origins, second.origins) = (vec![Some(origin)], vec![Some(origin)]);
+        second.record_keys = vec![b"later".to_vec()];
+        let mut run = PublishBatchesOperation::new(serving(), vec![first, second]);
+        run.first().unwrap();
+        let published = net(DocumentNetEvent::DocumentsPublished {
+            targets: Vec::new(),
+        });
+        let sync = run.next(published);
+        assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
+        let mut finished = FinishedBatch::default();
+        finished.outcome.retry_needed = true;
+        finished.outcome.sync_waits.push((origin, TopicId::hash(b"one")));
+        let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
+        let publish = run.next(synced);
+        assert!(matches!(publish, Ok(Next::Call(IoCall::Effect(_)))));
     }
 
     // An entry the adapter published after a retried entry of its topic stays in the oplog but

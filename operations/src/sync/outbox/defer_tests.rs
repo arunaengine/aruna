@@ -179,6 +179,28 @@ fn later_relay_held() {
     );
 }
 
+// An origin waiting for a sync on one topic publishes there; on another topic its record waits
+// and holds the origin, so no later record of it overtakes the held one.
+#[test]
+fn sync_wait_topics() {
+    let origin = node(4);
+    let (waiting, other) = (TopicId::hash(b"waiting"), TopicId::hash(b"other"));
+    let mut defer = DrainDeferState::default();
+    add_waits(&mut defer.sync_waits, &[(origin, waiting)]);
+    let records = vec![
+        (b"first".to_vec(), admin_record(origin, 1), waiting),
+        (b"second".to_vec(), admin_record(origin, 2), other),
+        (b"third".to_vec(), admin_record(origin, 3), waiting),
+    ];
+    let (to_publish, deferred, _) =
+        partition_drain_records(records, &mut defer, true, |_| true, |_| DeferOutcome::Retry);
+    let keys = |records: &[DrainRecord]| -> Vec<Vec<u8>> {
+        records.iter().map(|(key, ..)| key.clone()).collect()
+    };
+    assert_eq!(keys(&to_publish), vec![b"first".to_vec()]);
+    assert_eq!(keys(&deferred), vec![b"second".to_vec(), b"third".to_vec()]);
+}
+
 #[test]
 fn topic_block_spans() {
     let topic = TopicId::hash(b"blocked-topic-pages");

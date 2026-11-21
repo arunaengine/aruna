@@ -1,5 +1,5 @@
-//! Syncs one published outbox sub-batch with its peers and finishes it; a batch that must retry
-//! blocks its ordering domains for the rest of the rotation.
+//! Syncs one published outbox sub-batch with its peers and finishes it; the admin origins of a
+//! batch that must retry wait for it on every other topic.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -28,7 +28,8 @@ pub struct SyncBatchOperation {
     serving: (NodeId, RealmId),
     generation: Ulid,
     batch: Option<DrainSubBatch>,
-    domains: (Vec<TopicId>, Vec<NodeId>),
+    /// Each record's topic and admin origin, in the order of the record keys.
+    entries: Vec<(TopicId, Option<NodeId>)>,
     finishing: bool,
     started_ms: u64,
     now_ms: u64,
@@ -39,7 +40,7 @@ impl SyncBatchOperation {
         Self {
             serving,
             generation,
-            domains: batch.ordering_domains(),
+            entries: batch.topics.iter().copied().zip(batch.origins.iter().copied()).collect(),
             batch: Some(batch),
             finishing: false,
             started_ms: 0,
@@ -70,10 +71,12 @@ impl Operation for SyncBatchOperation {
     fn next(&mut self, result: IoResult) -> SyncTurn {
         if self.finishing {
             let mut finished = result.child::<FinishedBatch, IoError>()??;
+            // The records are in the oplog already, so a later record on their topic goes out:
+            // its sync carries them in order. Only other topics of their origins wait.
             if finished.outcome.retry_needed {
-                let (topics, origins) = std::mem::take(&mut self.domains);
-                finished.outcome.blocked_topics.extend(topics);
-                finished.outcome.blocked_origins.extend(origins);
+                let waits = self.entries.iter().copied();
+                let waits = waits.filter_map(|(topic, origin)| Some((origin?, topic)));
+                finished.outcome.sync_waits.extend(waits);
             }
             return Ok(Next::Done(finished));
         }
@@ -90,7 +93,8 @@ impl Operation for SyncBatchOperation {
         };
         // Each record's topic and stamp, in the order of the record keys.
         let stamps = (0..batch.record_keys.len()).map(|index| batch.stamp(index));
-        let guards = self.domains.0.iter().copied().zip(stamps).collect();
+        let topics = self.entries.iter().map(|(topic, _)| *topic);
+        let guards = topics.zip(stamps).collect();
         let finished = (batch.record_keys, batch.targets);
         let finish = FinishBatchOperation::new(
             Some(self.serving),
@@ -123,9 +127,9 @@ mod tests {
         }
     }
 
-    // A finished batch that must retry blocks its topics and admin origins.
+    // A finished batch that must retry blocks no topic: its admin origins wait on other topics.
     #[test]
-    fn retried_batch_blocks() {
+    fn retried_batch_waits() {
         let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
         let serving = (local, RealmId::from_bytes([3; 32]));
         let mut run = SyncBatchOperation::new(serving, Ulid::from_parts(1, 1), batch());
@@ -139,7 +143,8 @@ mod tests {
         let Ok(Next::Done(done)) = run.next(IoResult::Child(ChildOutcome::new(finished))) else {
             panic!("the batch finishes");
         };
-        assert_eq!(done.outcome.blocked_topics, vec![TopicId::hash(b"topic")]);
-        assert_eq!(done.outcome.blocked_origins, batch().ordering_domains().1);
+        assert!(done.outcome.blocked_topics.is_empty() && done.outcome.blocked_origins.is_empty());
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        assert_eq!(done.outcome.sync_waits, vec![(peer, TopicId::hash(b"topic"))]);
     }
 }
