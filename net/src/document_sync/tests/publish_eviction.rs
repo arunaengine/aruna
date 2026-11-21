@@ -188,13 +188,19 @@ fn unknown_lineage_retries() {
 #[test]
 fn batch_root_carried() {
     use crate::document_sync::publish::{bound_lineage, confirmed_lineage};
-    let (topic, other) = (::irokle::TopicId::hash(b"topic"), ::irokle::TopicId::hash(b"other"));
+    let (topic, other) = (
+        ::irokle::TopicId::hash(b"topic"),
+        ::irokle::TopicId::hash(b"other"),
+    );
     let confirmed = BTreeMap::from([(topic, [1; 32])]);
     let bound = bound_lineage(None, &confirmed, topic);
     assert_eq!(bound, Some([1; 32]));
     assert_eq!(confirmed_lineage(Ok(Some([2; 32])), bound), None);
     assert_eq!(bound_lineage(None, &confirmed, other), None);
-    assert_eq!(bound_lineage(Some([3; 32]), &confirmed, topic), Some([3; 32]));
+    assert_eq!(
+        bound_lineage(Some([3; 32]), &confirmed, topic),
+        Some([3; 32])
+    );
 }
 
 // An event bound to one lineage whose append a received history moved to another is not
