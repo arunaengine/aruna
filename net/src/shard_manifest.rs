@@ -436,31 +436,39 @@ impl NetHandle {
         topic: irokle::TopicId,
         frontier: &irokle::ActorClock,
     ) -> Result<[u8; 32], String> {
-        let node = self.document_sync_node();
-        let storage = node.storage();
-        let state = storage
-            .topic_state(&topic)
-            .map_err(|error| format!("failed to read shard topic state: {error}"))?
-            .ok_or_else(|| "shard topic has no genesis".to_string())?;
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"aruna-shard-frontier-root-v1");
-        hasher.update(state.genesis.as_bytes());
-        hasher.update(&(frontier.iter().count() as u64).to_be_bytes());
-        for (actor_id, actor_seq) in frontier.iter() {
-            let op_id = storage
-                .actor_index(&topic, actor_id, *actor_seq)
-                .map_err(|error| format!("failed to read shard frontier operation: {error}"))?
-                .ok_or_else(|| {
-                    format!(
-                        "shard frontier operation missing for actor {actor_id} sequence {actor_seq}"
-                    )
-                })?;
-            hasher.update(actor_id.as_bytes());
-            hasher.update(&actor_seq.to_be_bytes());
-            hasher.update(op_id.as_bytes());
-        }
-        Ok(*hasher.finalize().as_bytes())
+        frontier_root(self.document_sync_node().storage(), topic, frontier)
     }
+}
+
+/// The root [`NetHandle::shard_frontier_root`] answers, read from `storage`; with an empty
+/// frontier it is the topic's lineage root.
+pub(crate) fn frontier_root(
+    storage: &irokle::FjallStorage,
+    topic: irokle::TopicId,
+    frontier: &irokle::ActorClock,
+) -> Result<[u8; 32], String> {
+    let state = storage
+        .topic_state(&topic)
+        .map_err(|error| format!("failed to read shard topic state: {error}"))?
+        .ok_or_else(|| "shard topic has no genesis".to_string())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"aruna-shard-frontier-root-v1");
+    hasher.update(state.genesis.as_bytes());
+    hasher.update(&(frontier.iter().count() as u64).to_be_bytes());
+    for (actor_id, actor_seq) in frontier.iter() {
+        let op_id = storage
+            .actor_index(&topic, actor_id, *actor_seq)
+            .map_err(|error| format!("failed to read shard frontier operation: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "shard frontier operation missing for actor {actor_id} sequence {actor_seq}"
+                )
+            })?;
+        hasher.update(actor_id.as_bytes());
+        hasher.update(&actor_seq.to_be_bytes());
+        hasher.update(op_id.as_bytes());
+    }
+    Ok(*hasher.finalize().as_bytes())
 }
 
 async fn read_response_before(

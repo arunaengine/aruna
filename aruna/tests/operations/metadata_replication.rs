@@ -1346,7 +1346,7 @@ async fn publish_to_peer(
         )))
         .await
     {
-        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { targets })) => {
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { targets, .. })) => {
             assert_eq!(targets, vec![target]);
             Ok(())
         }

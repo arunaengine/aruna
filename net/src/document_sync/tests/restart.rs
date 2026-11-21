@@ -93,12 +93,10 @@ fn buffered_publish_child() {
             )
             .await;
 
-        assert_eq!(
-            event,
-            DocumentNetEvent::DocumentsPublished {
-                targets: vec![target]
-            }
-        );
+        let DocumentNetEvent::DocumentsPublished { targets, .. } = event else {
+            panic!("the publish succeeds: {event:?}");
+        };
+        assert_eq!(targets, vec![target]);
     });
 
     // Skip Rust destructors so the parent verifies the restart contract, not shutdown cleanup.
@@ -181,13 +179,13 @@ fn own_tip(service: &DocumentSyncService) -> Option<u64> {
 }
 
 async fn publish_again(service: &DocumentSyncService) {
-    let published = DocumentNetEvent::DocumentsPublished {
-        targets: vec![restart_target()],
-    };
     let event = service
         .publish_documents(vec![restart_upsert()], Vec::new())
         .await;
-    assert_eq!(event, published);
+    let DocumentNetEvent::DocumentsPublished { targets, .. } = event else {
+        panic!("the publish succeeds again: {event:?}");
+    };
+    assert_eq!(targets, vec![restart_target()]);
 }
 
 // The child stops after the oplog flush, before any outbox delete. The publish the restarted node

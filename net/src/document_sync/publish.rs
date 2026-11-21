@@ -16,7 +16,8 @@ impl DocumentSyncService {
             .collect::<Vec<_>>();
         match self.publish_events(documents, peers).await {
             Ok(outcome) if outcome.retry_indices.is_empty() => {
-                DocumentNetEvent::DocumentsPublished { targets }
+                let lineages = outcome.lineage_list(targets.len());
+                DocumentNetEvent::DocumentsPublished { targets, lineages }
             }
             Ok(outcome) if outcome.published_indices.is_empty() => DocumentNetEvent::Error {
                 target: outcome
@@ -28,6 +29,7 @@ impl DocumentSyncService {
                     .unwrap_or_else(|| "Document sync topic not ready".to_string()),
             },
             Ok(outcome) => DocumentNetEvent::DocumentsPartiallyPublished {
+                lineages: outcome.lineage_list(targets.len()),
                 published_indices: outcome.published_indices,
                 retry_indices: outcome.retry_indices,
                 error: outcome
@@ -341,6 +343,14 @@ impl DocumentSyncService {
                 }
                 Err(error) => return Err(error),
             };
+            // Read under the publish lock, so a tie-break after it shows as a lineage change.
+            let empty = ::irokle::ActorClock::default();
+            match crate::shard_manifest::frontier_root(self.node.storage(), topic_id, &empty) {
+                Ok(lineage) => {
+                    outcome.lineages.insert(index, lineage);
+                }
+                Err(error) => warn!(%topic_id, %error, "Cannot read the lineage of a publish"),
+            }
             outcome.published_indices.push(index);
             outcome
                 .published

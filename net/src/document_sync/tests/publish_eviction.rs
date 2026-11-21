@@ -327,8 +327,14 @@ async fn held_topic_origin() {
         DocumentNetEvent::DocumentsPartiallyPublished {
             published_indices,
             retry_indices,
+            lineages,
             ..
-        } => assert_eq!((published_indices, retry_indices), (vec![3], vec![0, 1, 2])),
+        } => {
+            assert_eq!((published_indices, retry_indices), (vec![3], vec![0, 1, 2]));
+            // Only the published event reports the lineage it was appended on.
+            let reported: Vec<bool> = lineages.iter().map(Option::is_some).collect();
+            assert_eq!(reported, vec![false, false, false, true]);
+        }
         other => panic!("expected partial publish, got {other:?}"),
     }
 }
