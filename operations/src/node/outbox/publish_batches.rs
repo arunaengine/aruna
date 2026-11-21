@@ -210,17 +210,16 @@ impl PublishBatchesOperation {
             let origin = batch.origins.get(index).copied().flatten();
             let stamped = batch.stamp(index).lineage;
             let outcome = &self.out.outcome;
-            // A successor rides only a topic that holds every wait of its origin, on the lineage
-            // that wait was verified on.
+            // Any successor on a waiting topic rides only the lineage that wait was verified on,
+            // and a successor of a waiting origin only a topic that holds every wait of it.
             let mut waits = self.waits.iter().chain(&outcome.sync_waits);
-            let waits_elsewhere = |origin: NodeId| {
-                waits.any(|(waiting, on, lineage)| {
-                    *waiting == origin && (*on != topic || stamped != Some(*lineage))
-                })
-            };
+            let waited = waits.any(|(waiting, on, lineage)| {
+                (*on == topic && stamped != Some(*lineage))
+                    || (origin.is_some() && *waiting == origin && *on != topic)
+            });
             let held = outcome.blocked_topics.contains(&topic)
                 || origin.is_some_and(|origin| outcome.blocked_origins.contains(&origin))
-                || origin.is_some_and(waits_elsewhere);
+                || waited;
             if !held {
                 kept.push(index);
                 continue;
@@ -234,18 +233,15 @@ impl PublishBatchesOperation {
         (!kept.is_empty()).then(|| batch.select(&kept)).flatten()
     }
 
-    /// The lineage each entry's topic must still have when it appends: that of the wait its
-    /// origin holds on the topic, so a successor never lands on a replaced history.
+    /// The lineage each entry's topic must still have when it appends: that of a wait on the
+    /// topic, so a successor never lands on a replaced history.
     fn expected(&self, batch: &DrainSubBatch) -> Vec<Option<[u8; 32]>> {
         let waits: Vec<&SyncWait> = (self.waits.iter())
             .chain(&self.out.outcome.sync_waits)
             .collect();
         let expected = |index: usize| {
             let topic = batch.topics.get(index)?;
-            let origin = batch.origins.get(index).copied().flatten()?;
-            let wait = waits
-                .iter()
-                .find(|(waiting, on, _)| *waiting == origin && on == topic);
+            let wait = waits.iter().find(|(_, on, _)| on == topic);
             wait.map(|(.., lineage)| *lineage)
         };
         (0..batch.record_keys.len()).map(expected).collect()
@@ -677,7 +673,7 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        let wait = (origin, TopicId::hash(b"one"), lineage(b"one"));
+        let wait = (Some(origin), TopicId::hash(b"one"), lineage(b"one"));
         finished.outcome.sync_waits.push(wait);
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
@@ -701,7 +697,7 @@ mod tests {
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
         let waits = [TopicId::hash(b"one"), TopicId::hash(b"two")];
-        let waits = waits.map(|topic| (origin, topic, lineage(b"one")));
+        let waits = waits.map(|topic| (Some(origin), topic, lineage(b"one")));
         finished.outcome.sync_waits = waits.to_vec();
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
@@ -731,7 +727,7 @@ mod tests {
         run.next(published).unwrap();
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        finished.outcome.sync_waits = vec![(origin, TopicId::hash(b"one"), lineage(b"one"))];
+        finished.outcome.sync_waits = vec![(Some(origin), TopicId::hash(b"one"), lineage(b"one"))];
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Done(done)) = run.next(synced) else {
             panic!("both rows of the second batch are held");
@@ -755,7 +751,7 @@ mod tests {
         assert!(matches!(sync, Ok(Next::Call(IoCall::Child(_)))));
         let mut finished = FinishedBatch::default();
         finished.outcome.retry_needed = true;
-        let wait = (origin, TopicId::hash(b"one"), lineage(b"one"));
+        let wait = (Some(origin), TopicId::hash(b"one"), lineage(b"one"));
         finished.outcome.sync_waits.push(wait);
         let synced = IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(finished)));
         let Ok(Next::Call(IoCall::Effect(effect))) = run.next(synced) else {
@@ -770,6 +766,20 @@ mod tests {
         assert_eq!(expected, vec![Some(lineage(b"one"))]);
     }
 
+    // A wait binds every later record on its topic to the lineage it was verified on, also one of
+    // another writer or without an admin origin.
+    #[test]
+    fn foreign_wait_holds() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let wait = (Some(origin), TopicId::hash(b"one"), [9; 32]);
+        let run = PublishBatchesOperation::new(serving(), vec![batch(b"one")]);
+        let mut run = run.waiting(vec![wait]);
+        let Ok(Next::Done(done)) = run.first() else {
+            panic!("the record of another writer is held");
+        };
+        assert!(done.outcome.blocked_topics.contains(&TopicId::hash(b"one")));
+    }
+
     // A wait an earlier page verified on one lineage holds a same-topic successor once the drain
     // reads another lineage for the topic; both its domains then hold.
     #[test]
@@ -777,7 +787,7 @@ mod tests {
         let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
         let mut later = batch(b"one");
         later.origins = vec![Some(origin)];
-        let wait = (origin, TopicId::hash(b"one"), [9; 32]);
+        let wait = (Some(origin), TopicId::hash(b"one"), [9; 32]);
         let mut run = PublishBatchesOperation::new(serving(), vec![later]).waiting(vec![wait]);
         let Ok(Next::Done(done)) = run.first() else {
             panic!("the successor is held");

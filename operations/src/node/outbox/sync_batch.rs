@@ -80,13 +80,9 @@ impl Operation for SyncBatchOperation {
             if finished.outcome.retry_needed {
                 for (index, &(topic, origin, lineage)) in self.entries.iter().enumerate() {
                     let outcome = &mut finished.outcome;
-                    let lost = finished.lost.contains(&index);
-                    match (origin, lineage) {
-                        (Some(origin), Some(lineage)) if !lost => {
-                            outcome.sync_waits.push((origin, topic, lineage));
-                        }
-                        (None, _) if !lost => {}
-                        (origin, _) => {
+                    match lineage.filter(|_| !finished.lost.contains(&index)) {
+                        Some(lineage) => outcome.sync_waits.push((origin, topic, lineage)),
+                        None => {
                             outcome.blocked_topics.push(topic);
                             outcome.blocked_origins.extend(origin);
                         }
@@ -166,7 +162,29 @@ mod tests {
         };
         assert!(done.outcome.blocked_topics.is_empty() && done.outcome.blocked_origins.is_empty());
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        let wait = (peer, TopicId::hash(b"topic"), [5; 32]);
+        let wait = (Some(peer), TopicId::hash(b"topic"), [5; 32]);
+        assert_eq!(done.outcome.sync_waits, vec![wait]);
+    }
+
+    // A record without an admin origin leaves a wait on its topic too, so no later writer there
+    // overtakes it on another lineage.
+    #[test]
+    fn plain_record_waits() {
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let serving = (local, RealmId::from_bytes([3; 32]));
+        let mut plain = batch();
+        plain.origins = vec![None];
+        let mut run = SyncBatchOperation::new(serving, Ulid::from_parts(1, 1), plain);
+        run.first().unwrap();
+        let failed = Err::<DocumentReconcileResult, _>(ApplyError::Failed("down".to_string()));
+        run.next(IoResult::Child(ChildOutcome::new(failed))).unwrap();
+        let mut finished = FinishedBatch::default();
+        finished.outcome.retry_needed = true;
+        let finished = Ok::<_, IoError>(finished);
+        let Ok(Next::Done(done)) = run.next(IoResult::Child(ChildOutcome::new(finished))) else {
+            panic!("the batch finishes");
+        };
+        let wait = (None, TopicId::hash(b"topic"), [5; 32]);
         assert_eq!(done.outcome.sync_waits, vec![wait]);
     }
 

@@ -204,7 +204,7 @@ fn sync_wait_topics() {
     let origin = node(4);
     let (waiting, other) = (TopicId::hash(b"waiting"), TopicId::hash(b"other"));
     let mut defer = DrainDeferState::default();
-    add_waits(&mut defer.sync_waits, &[(origin, waiting, [1; 32])]);
+    add_waits(&mut defer.sync_waits, &[(Some(origin), waiting, [1; 32])]);
     let records = vec![
         (b"first".to_vec(), admin_record(origin, 1), waiting),
         (b"second".to_vec(), admin_record(origin, 2), other),
@@ -246,7 +246,7 @@ fn split_waits_hold() {
     let mut defer = DrainDeferState::default();
     add_waits(
         &mut defer.sync_waits,
-        &[(origin, first, [1; 32]), (origin, second, [1; 32])],
+        &[(Some(origin), first, [1; 32]), (Some(origin), second, [1; 32])],
     );
     let records = vec![(b"later".to_vec(), admin_record(origin, 3), first)];
     let (to_publish, deferred, _) =
