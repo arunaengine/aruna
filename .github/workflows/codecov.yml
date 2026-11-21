@@ -60,6 +60,9 @@ jobs:
       # The measured target set matches the main tests job, so a coverage move
       # cannot come from a different target selection.
       - name: Build the instrumented test archive
+        # Four parallel instrumented crates outgrew memory and swap, and the runner stopped answering.
+        env:
+          CARGO_BUILD_JOBS: 2
         run: >-
           cargo nextest archive --workspace --all-targets --all-features --locked
           --archive-file coverage-archive.tar.zst
