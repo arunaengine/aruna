@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Cursor};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tar::Archive;
 use thiserror::Error;
@@ -260,6 +260,8 @@ fn validate_install_target(path: &Path) -> Result<(), PortalArtifactError> {
         match component {
             Component::Normal(_) => normal_components += 1,
             Component::CurDir | Component::RootDir => {}
+            Component::Prefix(prefix)
+                if path.is_absolute() && matches!(prefix.kind(), Prefix::Disk(_)) => {}
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(PortalArtifactError::InvalidPortalDirectory(
                     path.to_path_buf(),
@@ -732,6 +734,24 @@ mod tests {
         write_portal(&installed, "old");
         assert!(existing_install(&installed).unwrap());
         assert!(!existing_install(&tempdir.path().join("missing")).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn parent_allows_drive() {
+        for path in [r"C:portal", r"C:\", r"C:\run", r"\\server\share\portal"] {
+            assert!(
+                matches!(
+                    install_parent(Path::new(path)),
+                    Err(PortalArtifactError::InvalidPortalDirectory(_))
+                ),
+                "expected {path:?} to be rejected"
+            );
+        }
+        assert_eq!(
+            install_parent(Path::new(r"C:\run\portal")).unwrap(),
+            Path::new(r"C:\run")
+        );
     }
 
     #[tokio::test]
