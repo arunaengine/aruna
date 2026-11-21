@@ -34,8 +34,17 @@ pub async fn change_timer(
     keep_live: bool,
 ) -> Event {
     // The row and the scheduler see changes of one key in the same order.
-    let _held = hold_change(&effect).await;
-    apply_change(storage, task_handle, effect, keep_live).await
+    let held = hold_change(&effect).await;
+    if !timer_has_row(&effect) {
+        return apply_change(storage, task_handle, effect, keep_live).await;
+    }
+    let (storage, task_handle) = (storage.clone(), task_handle.cloned());
+    let key = task_effect_key(&effect);
+    finish_owned(key, async move {
+        let _held = held;
+        apply_change(&storage, task_handle.as_ref(), effect, keep_live).await
+    })
+    .await
 }
 
 /// Arms a timer's stored due time, which may be earlier, with the admission that owns its row,
@@ -46,7 +55,22 @@ pub async fn arm_unless_stored(
     task_handle: &TaskHandle,
     effect: TaskEffect,
 ) -> Event {
-    let _held = hold_change(&effect).await;
+    let held = hold_change(&effect).await;
+    let (storage, task_handle) = (storage.clone(), task_handle.clone());
+    let key = task_effect_key(&effect);
+    finish_owned(key, async move {
+        let _held = held;
+        arm_stored(&storage, &task_handle, effect).await
+    })
+    .await
+}
+
+/// [`arm_unless_stored`] once its caller holds the key's change lock.
+async fn arm_stored(
+    storage: &StorageHandle,
+    task_handle: &TaskHandle,
+    effect: TaskEffect,
+) -> Event {
     if let TaskEffect::ShortenTimer { key, after } = &effect {
         let admission = match read_timer(storage, key).await {
             Ok(Some(row)) => {
@@ -88,17 +112,17 @@ async fn apply_change(
             return refused_handle();
         };
         // The row is written before a new wake is armed, so a refused row arms nothing.
-        let (event, holder) = task_handle
+        let (event, plan) = task_handle
             .plan_shorten(key.clone(), *after, admission)
             .await;
-        let written = match &event {
-            Event::Task(TaskEvent::TimerScheduled { after, .. }) if holder == Some(admission) => {
-                write_owned(storage, key, *after, admission).await
-            }
-            Event::Task(TaskEvent::TimerScheduled { after, .. }) => {
-                own_row(storage, key, *after, holder).await
-            }
-            _ => return event,
+        let (Event::Task(TaskEvent::TimerScheduled { after, .. }), Some(plan)) = (&event, plan)
+        else {
+            return event;
+        };
+        let written = if plan.holder == Some(admission) {
+            write_owned(storage, key, *after, admission).await
+        } else {
+            own_row(storage, key, *after, plan.holder).await
         };
         if let Err(message) = &written {
             warn!(key = ?key, %message, "Timer kept in memory only");
@@ -106,14 +130,25 @@ async fn apply_change(
                 return refused(message.clone());
             }
         }
-        if holder != Some(admission) {
+        if plan.holder != Some(admission) {
             return event;
         }
-        let (key, after) = (key.clone(), *after);
-        let (event, _) = match written {
-            Ok(()) => task_handle.claim_shorten(key, after, admission).await,
-            Err(_) => task_handle.shorten_owned(key, after, admission).await,
-        };
+        if written.is_err() {
+            return task_handle
+                .arm_planned(key.clone(), plan, admission)
+                .await
+                .0;
+        }
+        let (event, holder) = task_handle
+            .claim_shorten(key.clone(), plan, admission)
+            .await;
+        // The wake that held the key fired since the plan and serves this change, so its run
+        // owns the row and deletes it.
+        if let Some(holder) = holder.filter(|holder| *holder != admission)
+            && let Err(message) = write_owned(storage, key, Duration::ZERO, holder).await
+        {
+            warn!(key = ?key, %message, "Timer row kept for the next restart");
+        }
         return event;
     }
     if timer_has_row(&effect) {
@@ -151,6 +186,18 @@ async fn own_row(
         return Ok(());
     }
     write_owned(storage, key, after, holder).await
+}
+
+/// Runs a timer handoff on its own task, so a caller that stops waiting cannot leave a stored row
+/// without its live wake; the caller's own timeout only ends its wait.
+async fn finish_owned(
+    key: Option<TaskKey>,
+    handoff: impl Future<Output = Event> + Send + 'static,
+) -> Event {
+    tokio::spawn(handoff).await.unwrap_or_else(|error| {
+        let message = error.to_string();
+        Event::Task(TaskEvent::Error { key, message })
+    })
 }
 
 /// The error of a timer change on a node without a task handle.

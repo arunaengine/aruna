@@ -120,7 +120,7 @@ mod tests {
     use aruna_tasks::InboundTaskHandler;
     use async_trait::async_trait;
     use std::sync::Arc;
-    use tokio::sync::{Mutex, Notify};
+    use tokio::sync::{Mutex, Notify, oneshot};
 
     struct RecordingHandler {
         observed: Arc<Mutex<Option<TaskKey>>>,
@@ -389,7 +389,8 @@ mod tests {
         let key = TaskKey::PublishRegistration;
         refused_shorten(&storage, &task_handle, &key).await;
         let probe = Duration::from_secs(60);
-        let (_, holder) = task_handle.plan_shorten(key.clone(), probe, 1).await;
+        let (_, plan) = task_handle.plan_shorten(key.clone(), probe, 1).await;
+        let holder = plan.and_then(|plan| plan.holder);
         assert_eq!(holder, Some(1), "no wake holds the key");
         assert_eq!(read_timer(&storage, &key).await.expect("reads"), None);
     }
@@ -411,8 +412,8 @@ mod tests {
         let before = before.expect("the armed wake owns a row");
         refused_shorten(&storage, &task_handle, &key).await;
         let probe = Duration::from_secs(120);
-        let (event, holder) = task_handle.plan_shorten(key.clone(), probe, 1).await;
-        assert_eq!(holder, Some(before.admission));
+        let (event, plan) = task_handle.plan_shorten(key.clone(), probe, 1).await;
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(before.admission));
         let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
             panic!("the armed wake is answered");
         };
@@ -422,6 +423,162 @@ mod tests {
         );
         let row = read_timer(&storage, &key).await.expect("reads");
         assert_eq!(row, Some(before));
+    }
+
+    /// A timer row store on the test runtime: write number `held` is stored, then answered only
+    /// after `arrived` is notified and the returned sender fires.
+    fn gated_store(held: usize) -> (StorageHandle, Arc<Notify>, oneshot::Sender<()>) {
+        let (store, receivers) = StorageHandle::new();
+        let receiver = receivers.foreground.into_async();
+        let arrived = Arc::new(Notify::new());
+        let (release, mut gate) = oneshot::channel::<()>();
+        let signal = arrived.clone();
+        tokio::spawn(async move {
+            let mut rows = std::collections::HashMap::new();
+            let mut writes = 0;
+            while let Ok((effect, response, ..)) = receiver.recv().await {
+                let event = match effect {
+                    StorageEffect::Read { key, .. } => {
+                        let value = rows.get(&key).cloned();
+                        StorageEvent::ReadResult { key, value }
+                    }
+                    StorageEffect::Write { key, value, .. } => {
+                        rows.insert(key.clone(), value);
+                        if writes == held {
+                            signal.notify_one();
+                            let _ = (&mut gate).await;
+                        }
+                        writes += 1;
+                        StorageEvent::WriteResult { key }
+                    }
+                    StorageEffect::Delete { key, .. } => {
+                        rows.remove(&key);
+                        StorageEvent::DeleteResult { key }
+                    }
+                    other => panic!("unexpected storage effect: {other:?}"),
+                };
+                response.send(event);
+            }
+        });
+        (store, arrived, release)
+    }
+
+    /// A timer key no other test changes, so no other test holds its change lock.
+    fn gated_key() -> TaskKey {
+        TaskKey::RealmPresence {
+            realm_id: aruna_core::structs::identity::realm::RealmId::from_bytes([0x5a; 32]),
+            node_id: iroh::SecretKey::from_bytes(&[0x5b; 32]).public(),
+        }
+    }
+
+    /// A durable shorten of `key` to `after`, run on its own task.
+    fn spawn_shorten(
+        store: &StorageHandle,
+        task_handle: &TaskHandle,
+        key: &TaskKey,
+        after: Duration,
+    ) -> tokio::task::JoinHandle<Event> {
+        let (store, task_handle) = (store.clone(), task_handle.clone());
+        let shorten = TaskEffect::ShortenTimer {
+            key: key.clone(),
+            after,
+        };
+        tokio::spawn(async move { change_timer(&store, Some(&task_handle), shorten, false).await })
+    }
+
+    // A shorten whose row write took five seconds arms at the deadline it planned, so the live
+    // wake does not count its delay again after the write.
+    #[tokio::test(start_paused = true)]
+    async fn held_write_deadline() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(0);
+        let key = gated_key();
+        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+        arrived.notified().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        release.send(()).expect("the write waits");
+        change.await.expect("the change ends");
+        let (event, _) = task_handle
+            .plan_shorten(key, Duration::from_secs(120), 1)
+            .await;
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
+            panic!("the armed wake is answered");
+        };
+        assert_eq!(after, Duration::from_secs(55));
+    }
+
+    /// Deletes the row its firing owns, as a production firing does, and reports start and end.
+    struct DeletingFiring {
+        storage: StorageHandle,
+        started: Arc<Notify>,
+        ended: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl InboundTaskHandler for DeletingFiring {
+        async fn handle_timer(&self, _key: TaskKey) {}
+
+        async fn handle_firing(&self, key: TaskKey, stamp: Option<u64>) {
+            self.started.notify_one();
+            aruna_storage::task_timers::delete_persisted_timer(&self.storage, &key, stamp).await;
+            self.ended.notify_one();
+        }
+    }
+
+    // A later wake that fires while a shorten's row write is held serves that shorten: no second
+    // wake is armed, and the fired run owns the row and deletes it.
+    #[tokio::test(start_paused = true)]
+    async fn fired_wake_owns() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(1);
+        let (started, ended) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let firing = DeletingFiring {
+            storage: store.clone(),
+            started: started.clone(),
+            ended: ended.clone(),
+        };
+        task_handle.set_inbound_handler(Arc::new(firing)).await;
+        let key = gated_key();
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(3),
+        };
+        change_timer(&store, Some(&task_handle), reset, false).await;
+        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(1));
+        arrived.notified().await;
+        tokio::time::advance(Duration::from_secs(4)).await;
+        started.notified().await;
+        release.send(()).expect("the write waits");
+        change.await.expect("the change ends");
+        ended.notified().await;
+        assert_eq!(read_timer(&store, &key).await.expect("reads"), None);
+        let (_, plan) = task_handle
+            .plan_shorten(key, Duration::from_secs(60), 1)
+            .await;
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(1), "no second wake");
+    }
+
+    // A caller that goes away after its row write committed still leaves one live wake, owned by
+    // the row's admission.
+    #[tokio::test]
+    async fn cancelled_caller_armed() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(0);
+        let key = gated_key();
+        let caller = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+        arrived.notified().await;
+        caller.abort();
+        let cancelled = caller.await.expect_err("the caller is cancelled");
+        assert!(cancelled.is_cancelled());
+        release.send(()).expect("the write waits");
+        // The change lock is free once the handoff ended.
+        drop(hold_timer(&key).await);
+        let row = read_timer(&store, &key).await.expect("reads");
+        let row = row.expect("the row is stored");
+        let (_, plan) = task_handle
+            .plan_shorten(key, Duration::from_secs(120), 1)
+            .await;
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
     }
 
     // Two resets with the same deadline are two admissions: the first one's firing leaves the
