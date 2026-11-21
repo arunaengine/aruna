@@ -429,8 +429,11 @@ mod tests {
     }
 
     /// A timer row store on the test runtime: write number `held` is stored, then answered only
-    /// after `arrived` is notified and the returned sender fires.
-    fn gated_store(held: usize) -> (StorageHandle, Arc<Notify>, oneshot::Sender<()>) {
+    /// after `arrived` is notified and the returned sender fires. The first `refused` reads fail.
+    fn gated_store(
+        held: usize,
+        refused: usize,
+    ) -> (StorageHandle, Arc<Notify>, oneshot::Sender<()>) {
         let (store, receivers) = StorageHandle::new();
         let receiver = receivers.foreground.into_async();
         let arrived = Arc::new(Notify::new());
@@ -438,9 +441,14 @@ mod tests {
         let signal = arrived.clone();
         tokio::spawn(async move {
             let mut rows = std::collections::HashMap::new();
-            let mut writes = 0;
+            let (mut writes, mut reads) = (0, 0);
             while let Ok((effect, response, ..)) = receiver.recv().await {
                 let event = match effect {
+                    StorageEffect::Read { .. } if reads < refused => {
+                        reads += 1;
+                        let error = aruna_core::errors::StorageError::QueueFull;
+                        StorageEvent::Error { error }
+                    }
                     StorageEffect::Read { key, .. } => {
                         let value = rows.get(&key).cloned();
                         StorageEvent::ReadResult { key, value }
@@ -494,7 +502,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn held_write_deadline() {
         let task_handle = TaskHandle::new();
-        let (store, arrived, release) = gated_store(0);
+        let (store, arrived, release) = gated_store(0, 0);
         let key = gated_key();
         let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
         arrived.notified().await;
@@ -511,27 +519,29 @@ mod tests {
     }
 
     // A shorten whose row write is answered only after the storage timeout reads the stored row
-    // once the write settled, so the committed row has its live wake.
+    // once the write settled, also after a refused read, so the committed row has its live wake.
     #[tokio::test(start_paused = true)]
     async fn late_write_armed() {
-        let task_handle = TaskHandle::new();
-        let (store, arrived, release) = gated_store(0);
-        let key = gated_key();
-        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
-        arrived.notified().await;
-        tokio::time::advance(Duration::from_secs(11)).await;
-        release.send(()).expect("the write waits");
-        let event = change.await.expect("the change ends");
-        assert!(matches!(
-            event,
-            Event::Task(TaskEvent::TimerScheduled { .. })
-        ));
-        let row = read_timer(&store, &key).await.expect("reads");
-        let row = row.expect("the row is stored");
-        let (_, plan) = task_handle
-            .plan_shorten(key, Duration::from_secs(120), 1)
-            .await;
-        assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
+        for refused in [0, 1] {
+            let task_handle = TaskHandle::new();
+            let (store, arrived, release) = gated_store(0, refused);
+            let key = gated_key();
+            let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+            arrived.notified().await;
+            tokio::time::advance(Duration::from_secs(11)).await;
+            release.send(()).expect("the write waits");
+            let event = change.await.expect("the change ends");
+            assert!(matches!(
+                event,
+                Event::Task(TaskEvent::TimerScheduled { .. })
+            ));
+            let row = read_timer(&store, &key).await.expect("reads");
+            let row = row.expect("the row is stored");
+            let (_, plan) = task_handle
+                .plan_shorten(key, Duration::from_secs(120), 1)
+                .await;
+            assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
+        }
     }
 
     /// Deletes the row its firing owns, as a production firing does, and reports start and end.
@@ -557,7 +567,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fired_wake_owns() {
         let task_handle = TaskHandle::new();
-        let (store, arrived, release) = gated_store(1);
+        let (store, arrived, release) = gated_store(1, 0);
         let (started, ended) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
         let firing = DeletingFiring {
             storage: store.clone(),
@@ -590,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_caller_armed() {
         let task_handle = TaskHandle::new();
-        let (store, arrived, release) = gated_store(0);
+        let (store, arrived, release) = gated_store(0, 0);
         let key = gated_key();
         let caller = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
         arrived.notified().await;

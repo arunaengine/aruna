@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
+use aruna_core::backoff::capped_backoff;
 use aruna_core::errors::StorageError;
 use aruna_core::events::Event;
 use aruna_core::task::{NO_TASK_HANDLE, TaskEffect, TaskEvent, TaskKey};
@@ -201,10 +202,17 @@ async fn write_settled(
     if written != Err(StorageError::Timeout) {
         return written;
     }
+    let mut refused = 0;
     loop {
         match read_timer(storage, key).await {
             Ok(Some(row)) if row.admission == admission => return Ok(()),
-            Err(StorageError::Timeout) => continue,
+            Err(StorageError::Timeout) => {}
+            // A read refused before it reached storage says nothing about the write.
+            Err(StorageError::QueueFull) => {
+                let (base, cap) = (Duration::from_millis(25), Duration::from_secs(1));
+                tokio::time::sleep(capped_backoff(base, cap, refused, 0)).await;
+                refused = refused.saturating_add(1);
+            }
             _ => return written,
         }
     }
