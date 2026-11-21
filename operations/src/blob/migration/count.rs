@@ -15,6 +15,8 @@ use aruna_core::keyspaces::{COUNT_QUEUE_KEYSPACE, COVERAGE_COUNT_KEYSPACE, S3_BU
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::read_row;
 use aruna_core::structs::placement::coverage::{CountRelay, CoverageCount};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use tracing::warn;
@@ -76,6 +78,7 @@ pub struct StartCountOperation {
     bucket: String,
     record: CoverageCount,
     ids: IdMint,
+    binding: Option<DistributionBinding>,
     written: bool,
 }
 
@@ -88,8 +91,27 @@ impl StartCountOperation {
                 ..CoverageCount::new(0)
             },
             ids: IdMint::default(),
+            binding: None,
             written: false,
         }
+    }
+
+    /// Starts only while the bucket carries `binding`'s set, member and incarnation, read in the
+    /// write transaction; a bucket made again under the name answers `NoSuchBucket`.
+    pub fn bound_to(mut self, binding: DistributionBinding) -> Self {
+        self.binding = Some(binding);
+        self
+    }
+
+    fn binds(&self, bucket: &[u8]) -> Result<bool, ConversionError> {
+        let Some(member) = self.binding.as_ref() else {
+            return Ok(true);
+        };
+        let info = BucketInfo::from_bytes(bucket)?;
+        Ok(info.distribution.as_ref().is_some_and(|binding| {
+            (binding.set_id, binding.member_id, binding.incarnation)
+                == (member.set_id, member.member_id, member.incarnation)
+        }))
     }
 }
 
@@ -221,7 +243,10 @@ impl Operation for StartCountOperation {
                 got: "another number of rows",
             })
         })?;
-        if bucket.is_none() {
+        let Some(bucket) = bucket else {
+            return Err(StartCountError::NoSuchBucket);
+        };
+        if !self.binds(&bucket)? {
             return Err(StartCountError::NoSuchBucket);
         }
         if let Some(stored) = decode_count(stored)? {
