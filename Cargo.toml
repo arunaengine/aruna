@@ -179,7 +179,7 @@ lettre = { version = "0.11.23", default-features = false, features = [
 lru = "0.19.1"
 md5 = "0.8.1"
 mime = "0.3.17"
-nix = { version = "0.31.3", features = ["time", "fs", "process", "signal"] }
+nix = { version = "0.32.0", features = ["time", "fs", "process", "signal"] }
 opendal = { version = "0.59.4", features = [
     "services-azblob",
     "services-azdls",
