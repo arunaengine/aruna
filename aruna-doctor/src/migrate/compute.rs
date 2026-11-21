@@ -101,6 +101,17 @@ pub(super) fn stated(value: &[u8]) -> Option<Stated> {
     })
 }
 
+/// The input page manifest an alpha.206 spec or launch names.
+pub(super) fn input_pages(value: &[u8]) -> Option<PageManifest> {
+    let envelope = exact::<Envelope>(value)
+        .or_else(|| session_refs::decode::<Envelope>(value, UNNAMED).ok())?;
+    match envelope.record {
+        Record::Spec(spec) => spec.input_pages,
+        Record::Launch(launch) => launch.input_pages,
+        _ => None,
+    }
+}
+
 /// A job record stored as alpha.206 stored it, read into the current shape.
 pub(super) fn old_job(value: &[u8]) -> Option<JobRecord> {
     match exact::<JobRecord>(value) {
