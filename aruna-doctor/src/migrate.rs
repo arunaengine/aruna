@@ -6,7 +6,7 @@
 use crate::error::CliError;
 use crate::explorer::ExplorerError;
 use aruna_core::credential_encryption::{CredentialEncryptionKey, open_bytes, seal_bytes};
-use aruna_core::document::DocumentTarget;
+use aruna_core::document::{DocumentOutboxRecord, DocumentTarget};
 use aruna_core::federation::FederationSettings;
 use aruna_core::git::{GitRecord, LOCAL_OBJECTS, StoredObject};
 use aruna_core::id::NodeId;
@@ -60,6 +60,7 @@ use aruna_core::structs::storage::mirror_repair::SyncMirrorRecord;
 use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use aruna_core::structs::storage::replication_queue::LiveObligationRecord;
 use aruna_core::structs::sync_quarantine::QUARANTINE_USAGE_KEY;
+use aruna_core::task::PersistedTaskTimer;
 use aruna_operations::plugins::decide::WaitingRow;
 use aruna_storage::storage::sealing::{SEALED_KEYSPACES, row_aad};
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
@@ -204,6 +205,12 @@ pub struct MigrateOutput {
     /// Pending sync mirror repairs from before the rollback flag, which gain `false`.
     pub mirror_repairs_scanned: usize,
     pub mirror_repairs_rewritten: usize,
+    /// Queued document publishes from before the incarnation, which gain none.
+    pub outbox_incarnations_scanned: usize,
+    pub outbox_incarnations_rewritten: usize,
+    /// Persisted timers from before the admission, which gain no admission.
+    pub timers_scanned: usize,
+    pub timers_rewritten: usize,
     /// Rows of those keyspaces that match no known shape, left unchanged, as
     /// `keyspace/key: reason`. Any such row makes the command fail after it prints this output.
     pub unknown_rows: Vec<String>,
@@ -305,8 +312,17 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let audit_rows = db.keyspace(trailing::AUDIT.0, KeyspaceCreateOptions::default)?;
     let harvest_rows = db.keyspace(trailing::HARVEST.0, KeyspaceCreateOptions::default)?;
     let mirror_rows = db.keyspace(trailing::MIRROR.0, KeyspaceCreateOptions::default)?;
+    let timer_rows = db.keyspace(trailing::TIMERS.0, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
+    // Queued publishes gain their incarnation first, so every outbox step below reads them.
+    let mut unknown_rows = Vec::new();
+    let incarnations = trailing::missing_fields::<DocumentOutboxRecord>(
+        &db,
+        &outbox_rows,
+        trailing::OUTBOX,
+        &mut unknown_rows,
+    )?;
     let mut evidence = families::Evidence::default();
     let specs = [
         (
@@ -627,7 +643,6 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
     let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
     // Each batch commits on its own; a rerun skips the rows an earlier run already rewrote.
-    let mut unknown_rows = Vec::new();
     let audits = trailing::missing_fields::<AdminAuditRecord>(
         &db,
         &audit_rows,
@@ -644,6 +659,12 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         &db,
         &mirror_rows,
         trailing::MIRROR,
+        &mut unknown_rows,
+    )?;
+    let timers = trailing::missing_fields::<PersistedTaskTimer>(
+        &db,
+        &timer_rows,
+        trailing::TIMERS,
         &mut unknown_rows,
     )?;
 
@@ -724,6 +745,10 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         harvest_sources_rewritten: harvests.rewritten,
         mirror_repairs_scanned: mirrors.scanned,
         mirror_repairs_rewritten: mirrors.rewritten,
+        outbox_incarnations_scanned: incarnations.scanned,
+        outbox_incarnations_rewritten: incarnations.rewritten,
+        timers_scanned: timers.scanned,
+        timers_rewritten: timers.rewritten,
         unknown_rows,
     })
 }
