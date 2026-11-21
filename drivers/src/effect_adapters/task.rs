@@ -88,17 +88,17 @@ async fn apply_change(
             return refused_handle();
         };
         // The row is written before a new wake is armed, so a refused row arms nothing.
-        let (event, holder) = task_handle
+        let (event, plan) = task_handle
             .plan_shorten(key.clone(), *after, admission)
             .await;
-        let written = match &event {
-            Event::Task(TaskEvent::TimerScheduled { after, .. }) if holder == Some(admission) => {
-                write_owned(storage, key, *after, admission).await
-            }
-            Event::Task(TaskEvent::TimerScheduled { after, .. }) => {
-                own_row(storage, key, *after, holder).await
-            }
-            _ => return event,
+        let (Event::Task(TaskEvent::TimerScheduled { after, .. }), Some(plan)) = (&event, plan)
+        else {
+            return event;
+        };
+        let written = if plan.holder == Some(admission) {
+            write_owned(storage, key, *after, admission).await
+        } else {
+            own_row(storage, key, *after, plan.holder).await
         };
         if let Err(message) = &written {
             warn!(key = ?key, %message, "Timer kept in memory only");
@@ -106,14 +106,25 @@ async fn apply_change(
                 return refused(message.clone());
             }
         }
-        if holder != Some(admission) {
+        if plan.holder != Some(admission) {
             return event;
         }
-        let (key, after) = (key.clone(), *after);
-        let (event, _) = match written {
-            Ok(()) => task_handle.claim_shorten(key, after, admission).await,
-            Err(_) => task_handle.shorten_owned(key, after, admission).await,
-        };
+        if written.is_err() {
+            return task_handle
+                .arm_planned(key.clone(), plan, admission)
+                .await
+                .0;
+        }
+        let (event, holder) = task_handle
+            .claim_shorten(key.clone(), plan, admission)
+            .await;
+        // The wake that held the key fired since the plan and serves this change, so its run
+        // owns the row and deletes it.
+        if let Some(holder) = holder.filter(|holder| *holder != admission)
+            && let Err(message) = write_owned(storage, key, Duration::ZERO, holder).await
+        {
+            warn!(key = ?key, %message, "Timer row kept for the next restart");
+        }
         return event;
     }
     if timer_has_row(&effect) {

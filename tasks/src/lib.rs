@@ -63,9 +63,11 @@ enum TaskCommand {
         after: Duration,
         stamp: Option<u64>,
         mode: Shorten,
-        /// The event, and the admission whose wake holds the key: this one when it armed, else
-        /// the earlier one it kept.
-        response: oneshot::Sender<(TaskEvent, Option<u64>)>,
+        /// The plan this arming completes, from an earlier [`Shorten::Plan`].
+        plan: Option<ShortenPlan>,
+        /// The event, and the plan whose holder is the admission whose wake holds the key: this
+        /// one when it armed, else the earlier one it kept.
+        response: oneshot::Sender<(TaskEvent, Option<ShortenPlan>)>,
     },
     ScheduleIdleTimer {
         key: TaskKey,
@@ -109,6 +111,17 @@ enum Shorten {
     Plan,
     /// Arms; a kept earlier wake takes over the row `stamp` owns, so its firing deletes it.
     Claim,
+}
+
+/// A shorten planned before its durable row is written, so arming it afterwards neither starts
+/// its delay again nor arms a second wake when the wake that held the key fired meanwhile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortenPlan {
+    /// The admission whose wake would hold the key: the planned one, or an earlier kept wake.
+    pub holder: Option<u64>,
+    deadline: Instant,
+    /// The wake that held the key when planned, by timer id, with the admission it fires as.
+    replaced: Option<(u64, Option<u64>)>,
 }
 
 /// Outcome of draining the scheduler's timer handlers on shutdown. This is the
@@ -462,6 +475,45 @@ impl SchedulerState {
         (TaskEvent::TimerScheduled { key, after }, stamp)
     }
 
+    /// [`Self::shorten_timer`], answered as a plan. An arming that completes `plan` keeps its
+    /// deadline; when the wake that held the key fired since, that run started after the request
+    /// and serves it, so no second wake is armed.
+    fn shorten_planned(
+        &mut self,
+        (key, stamp): (TaskKey, Option<u64>),
+        after: Duration,
+        (now, mode): (Instant, Shorten),
+        plan: Option<ShortenPlan>,
+    ) -> (TaskEvent, Option<ShortenPlan>) {
+        let replaced = (self.timers_by_key.get(&key)).map(|entry| (entry.id, entry.stamp));
+        let fired = plan.and_then(|plan| plan.replaced).filter(|(id, _)| {
+            !self.refire_requested.contains_key(&key)
+                && replaced.is_none_or(|(current, _)| current != *id)
+        });
+        let Some(deadline) =
+            plan.map_or_else(|| now.checked_add(after), |plan| Some(plan.deadline))
+        else {
+            return (self.shorten_timer((key, stamp), after, (now, mode)).0, None);
+        };
+        let (event, holder) = match fired {
+            Some((_, holder)) => {
+                let after = Duration::ZERO;
+                (TaskEvent::TimerScheduled { key, after }, holder)
+            }
+            None => {
+                let after = deadline.saturating_duration_since(now);
+                self.shorten_timer((key, stamp), after, (now, mode))
+            }
+        };
+        let planned = ShortenPlan {
+            holder,
+            deadline,
+            replaced,
+        };
+        let scheduled = matches!(event, TaskEvent::TimerScheduled { .. });
+        (event, scheduled.then_some(planned))
+    }
+
     fn schedule_idle_timer(&mut self, key: TaskKey, after: Duration, now: Instant) -> TaskEvent {
         if let Some(existing) = self.timers_by_key.get(&key) {
             return TaskEvent::TimerScheduled {
@@ -610,9 +662,11 @@ impl SchedulerState {
                 after,
                 stamp,
                 mode,
+                plan,
                 response,
             } => {
-                let _ = response.send(self.shorten_timer((key, stamp), after, (now, mode)));
+                let answer = self.shorten_planned((key, stamp), after, (now, mode), plan);
+                let _ = response.send(answer);
             }
             TaskCommand::ScheduleIdleTimer {
                 key,
@@ -846,8 +900,8 @@ impl TaskHandle {
         &self,
         key: TaskKey,
         after: Duration,
-        (stamp, mode): (Option<u64>, Shorten),
-    ) -> (TaskEvent, Option<u64>) {
+        (stamp, mode, plan): (Option<u64>, Shorten, Option<ShortenPlan>),
+    ) -> (TaskEvent, Option<ShortenPlan>) {
         let command_key = key.clone();
         let (response, result) = oneshot::channel();
         let command = TaskCommand::ShortenTimer {
@@ -855,6 +909,7 @@ impl TaskHandle {
             after,
             stamp,
             mode,
+            plan,
             response,
         };
         if self.command_tx.send(command).await.is_err() {
@@ -871,37 +926,49 @@ impl TaskHandle {
         after: Duration,
         stamp: u64,
     ) -> (Event, Option<u64>) {
-        let (event, holder) = self
-            .shorten_timer(key, after, (Some(stamp), Shorten::Arm))
+        let (event, plan) = self
+            .shorten_timer(key, after, (Some(stamp), Shorten::Arm, None))
             .await;
-        (Event::Task(event), holder)
+        (Event::Task(event), plan.and_then(|plan| plan.holder))
     }
 
-    /// Answers what [`TaskHandle::shorten_owned`] would, without arming or changing any wake.
+    /// Answers what [`TaskHandle::shorten_owned`] would, without arming or changing any wake; the
+    /// plan lets the arming after the row write keep this deadline.
     pub async fn plan_shorten(
         &self,
         key: TaskKey,
         after: Duration,
         stamp: u64,
-    ) -> (Event, Option<u64>) {
-        let (event, holder) = self
-            .shorten_timer(key, after, (Some(stamp), Shorten::Plan))
+    ) -> (Event, Option<ShortenPlan>) {
+        let (event, plan) = self
+            .shorten_timer(key, after, (Some(stamp), Shorten::Plan, None))
             .await;
-        (Event::Task(event), holder)
+        (Event::Task(event), plan)
     }
 
-    /// [`TaskHandle::shorten_owned`] once the row of `stamp` is stored: an earlier wake that
-    /// holds the key now owns that row, so its firing deletes it.
+    /// Arms `plan` as admission `stamp` once its row is stored: an earlier wake that holds the
+    /// key now owns that row, so its firing deletes it.
     pub async fn claim_shorten(
         &self,
         key: TaskKey,
-        after: Duration,
+        plan: ShortenPlan,
         stamp: u64,
     ) -> (Event, Option<u64>) {
-        let (event, holder) = self
-            .shorten_timer(key, after, (Some(stamp), Shorten::Claim))
-            .await;
-        (Event::Task(event), holder)
+        let planned = (Some(stamp), Shorten::Claim, Some(plan));
+        let (event, plan) = self.shorten_timer(key, Duration::ZERO, planned).await;
+        (Event::Task(event), plan.and_then(|plan| plan.holder))
+    }
+
+    /// Arms `plan` as admission `stamp` when its row could not be stored.
+    pub async fn arm_planned(
+        &self,
+        key: TaskKey,
+        plan: ShortenPlan,
+        stamp: u64,
+    ) -> (Event, Option<u64>) {
+        let planned = (Some(stamp), Shorten::Arm, Some(plan));
+        let (event, plan) = self.shorten_timer(key, Duration::ZERO, planned).await;
+        (Event::Task(event), plan.and_then(|plan| plan.holder))
     }
 
     /// Hands a timer change to the scheduler with the due time of the durable row it wrote, so
@@ -910,7 +977,7 @@ impl TaskHandle {
         let event = match effect {
             TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after, stamp).await,
             TaskEffect::ShortenTimer { key, after } => {
-                self.shorten_timer(key, after, (stamp, Shorten::Arm))
+                self.shorten_timer(key, after, (stamp, Shorten::Arm, None))
                     .await
                     .0
             }
@@ -1111,7 +1178,9 @@ impl Handle for TaskHandle {
                         self.reset_timer(key, after, None).await
                     }
                     TaskEffect::ShortenTimer { key, after } => {
-                        self.shorten_timer(key, after, (None, Shorten::Arm)).await.0
+                        self.shorten_timer(key, after, (None, Shorten::Arm, None))
+                            .await
+                            .0
                     }
                     TaskEffect::ScheduleIdleTimer { key, after } => {
                         self.schedule_idle_timer(key, after).await
@@ -2463,6 +2532,53 @@ mod decision_tests {
         assert_eq!(holder, Some(6));
         assert_eq!(state.refire_requested.get(&key), Some(&Some(6)));
         assert!(!state.timers_by_key.contains_key(&key));
+    }
+
+    // A claim after its row write arms at the planned deadline, not its delay counted again.
+    #[test]
+    fn claim_keeps_deadline() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        let delay = Duration::from_secs(5);
+        let planned = (start, Shorten::Plan);
+        let (_, plan) = state.shorten_planned((key.clone(), Some(6)), delay, planned, None);
+        let claimed = (start + Duration::from_secs(2), Shorten::Claim);
+        let (event, plan) =
+            state.shorten_planned((key.clone(), Some(6)), Duration::ZERO, claimed, plan);
+        let after = Duration::from_secs(3);
+        assert_eq!(
+            event,
+            TaskEvent::TimerScheduled {
+                key: key.clone(),
+                after
+            }
+        );
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(6));
+        let entry = state.timers_by_key.get(&key).expect("armed");
+        assert_eq!(entry.deadline, start + delay);
+    }
+
+    // A later wake that fired between plan and claim started after the request and serves it: the
+    // claim arms no second wake and answers that wake's admission.
+    #[test]
+    fn fired_wake_serves() {
+        let mut state = state();
+        let start = Instant::now();
+        let key = key();
+        state.reset_timer((key.clone(), Some(4)), Duration::from_secs(10), start);
+        let planned = (start, Shorten::Plan);
+        let delay = Duration::from_secs(5);
+        let (_, plan) = state.shorten_planned((key.clone(), Some(6)), delay, planned, None);
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(6));
+        let (tx, _rx) = mpsc::channel(1);
+        let fired_at = start + Duration::from_secs(10);
+        state.dispatch_due_timers(fired_at, &tx.downgrade());
+        let claimed = (fired_at, Shorten::Claim);
+        let (_, plan) =
+            state.shorten_planned((key.clone(), Some(6)), Duration::ZERO, claimed, plan);
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(4));
+        assert!(!state.timers_by_key.contains_key(&key), "no second wake");
     }
 
     #[test]
