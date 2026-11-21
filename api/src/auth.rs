@@ -36,6 +36,9 @@ use ulid::Ulid;
 const HTTP_TIMEOUT_SECS: u64 = 5;
 const CONNECT_TIMEOUT_SECS: u64 = 2;
 const CACHE_TTL_SECS: u64 = 300;
+/// An unknown key id refetches the provider keys at most this often, so forged ids cannot
+/// turn every request into calls to the provider.
+const KEY_REFRESH_COOLDOWN_SECS: u64 = 30;
 
 #[derive(Debug)]
 pub struct OidcValidator {
@@ -226,6 +229,9 @@ impl OidcValidator {
             let jwks = serde_json::from_value::<JwkSet>(metadata.jwks.clone())?;
             if let Some(jwk) = jwks.find(kid) {
                 return DecodingKey::from_jwk(jwk).map_err(Into::into);
+            }
+            if metadata.fetched_at.elapsed() < Duration::from_secs(KEY_REFRESH_COOLDOWN_SECS) {
+                break;
             }
         }
 
@@ -735,10 +741,10 @@ pub(crate) fn blob_permission_path(
 #[cfg(test)]
 mod test {
     use crate::auth::{
-        CACHE_TTL_SECS, OidcValidator, blob_permission_path, extract_auth_context,
-        extract_auth_parts, handle_token, map_authorize_error,
+        CACHE_TTL_SECS, KEY_REFRESH_COOLDOWN_SECS, OidcValidator, blob_permission_path,
+        extract_auth_context, extract_auth_parts, handle_token, map_authorize_error,
     };
-    use crate::error::{ServerError, TokenError};
+    use crate::error::{OidcError, ServerError, TokenError};
     use crate::server::state::ServerState;
     use aruna_core::auth::bearer_token_hash;
     use aruna_core::effects::{Effect, StorageEffect};
@@ -1420,6 +1426,17 @@ mod test {
             None,
         );
         validator.validate(&provider, &old_token).await.unwrap();
+        // The rotation is seen once the refresh cooldown has passed.
+        let cooled_at = Instant::now()
+            .checked_sub(Duration::from_secs(KEY_REFRESH_COOLDOWN_SECS + 1))
+            .unwrap();
+        validator
+            .provider_metadata_cache
+            .write()
+            .await
+            .get_mut(&provider.discovery_url)
+            .unwrap()
+            .fetched_at = cooled_at;
 
         *metrics.jwks.write().await = eddsa_jwk(new_kid, &new_signing_key);
 
@@ -1438,6 +1455,44 @@ mod test {
         assert_eq!(identity.subject_id, "subject-2");
         assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 2);
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_kid_cools_down() {
+        // A forged key id right after a fetch is refused without calling the provider again.
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, kid, eddsa_jwk(kid, &signing_key)).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let validator = OidcValidator::new().unwrap();
+        let token = |kid| {
+            sign_oidc_token(
+                issuer,
+                audience,
+                "subject-1",
+                kid,
+                &signing_key,
+                Algorithm::EdDSA,
+                None,
+            )
+        };
+        validator.validate(&provider, &token(kid)).await.unwrap();
+        for _ in 0..3 {
+            let forged = validator.validate(&provider, &token("forged-key")).await;
+            assert!(matches!(forged, Err(OidcError::SigningNotFound)));
+        }
+        assert_eq!(metrics.discovery_requests.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.jwks_requests.load(Ordering::Relaxed), 1);
 
         task.abort();
     }
