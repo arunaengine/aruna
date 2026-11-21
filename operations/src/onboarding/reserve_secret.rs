@@ -132,7 +132,14 @@ impl ReserveSecretOperation {
                 record.claimed_node_id = Some(self.input.node_id.clone());
                 Ok(Some(record))
             }
-            OnboardingSecretState::Reserved { node_id, .. } if node_id == self.input.node_id => {
+            OnboardingSecretState::Reserved {
+                node_id,
+                expires_at,
+            } if node_id == self.input.node_id => {
+                // A lapsed reservation is a new claim, which an expired secret refuses.
+                if expires_at < self.input.now && record.expires_at < self.input.now {
+                    return Err(ReserveSecretError::Expired);
+                }
                 record.claimed_node_id = Some(self.input.node_id.clone());
                 Ok(Some(record))
             }
@@ -501,6 +508,42 @@ mod tests {
         )
         .await;
         assert_eq!(different_node, Err(ReserveSecretError::AlreadyClaimed));
+    }
+
+    #[tokio::test]
+    async fn lapsed_renewal_expires() {
+        // A node whose reservation and secret both lapsed cannot revive the secret.
+        let tempdir = tempdir().unwrap();
+        let context = open_context(&tempdir);
+        let enrollment_id = Ulid::generate();
+        drive(
+            CreateSecretOperation::new(CreateSecretInput {
+                record: OnboardingSecretRecord {
+                    enrollment_id,
+                    secret_hash: "abc".to_string(),
+                    mode: OnboardingMode::Server,
+                    purpose: OnboardingPurpose::NodeEnrollment,
+                    expires_at: 100,
+                    claimed_node_id: None,
+                },
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let input = |now, reservation_expires_at, finalizing| ReserveSecretInput {
+            enrollment_id,
+            secret_hash: "abc".to_string(),
+            node_id: "node-a".to_string(),
+            now,
+            reservation_expires_at,
+            finalizing,
+        };
+        drive(ReserveSecretOperation::new(input(10, 20, false)), &context)
+            .await
+            .unwrap();
+        let lapsed = drive(ReserveSecretOperation::new(input(101, 120, true)), &context).await;
+        assert_eq!(lapsed, Err(ReserveSecretError::Expired));
     }
 
     #[tokio::test]
