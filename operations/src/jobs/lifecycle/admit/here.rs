@@ -6,14 +6,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
-use aruna_core::operation::Operation;
+use aruna_core::operation::{Operation, boxed_retry};
 use aruna_core::structs::execution::job::family::{
     ExecutionClaim, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordKind,
     JobRetryPolicy, LogicalJobSpec, LogicalJobState, SubmissionClaim, SubmissionId,
@@ -154,13 +154,19 @@ impl Operation for ObservedStateOperation {
             return Ok(Next::Done(state_of(cache.projection)));
         }
         self.reducing = true;
-        Ok(Next::Call(IoCall::child(ProjectFamilyOperation::new(
-            ProjectFamilyConfig {
-                family: FamilyRef::Family(self.family),
-                now_ms: self.now_ms,
+        // A conflict lost to a concurrent projection of the family reruns the reduction.
+        let (family, now_ms) = (self.family, self.now_ms);
+        let build = move || {
+            ProjectFamilyOperation::new(ProjectFamilyConfig {
+                family: FamilyRef::Family(family),
+                now_ms,
                 rebuild: false,
-            },
-        ))))
+            })
+        };
+        let child = boxed_retry(build, &family.to_bytes(), |result| {
+            Event::Child(ChildOutcome::new(result))
+        });
+        Ok(Next::Call(IoCall::Child(child)))
     }
 }
 
@@ -467,7 +473,7 @@ impl Operation for AdmitHereOperation {
 mod tests {
     use super::*;
     use crate::tests::records::{Family, payload, user};
-    use aruna_core::calls::ChildOutcome;
+    use aruna_core::events::StorageEvent;
     use aruna_core::job_request::{SubmissionScope, store_workspace};
     use aruna_core::structs::execution::job::family::{JobProjection, OutputSet};
     use aruna_core::structs::execution::job::local::WorkspaceMode;
@@ -665,6 +671,26 @@ mod tests {
             stale.next(IoResult::Child(ChildOutcome::new(failed))),
             Ok(Next::Done(LogicalJobState::Indeterminate))
         );
+    }
+
+    // A reduction that loses a conflict to a concurrent projection reruns after a backoff, so
+    // the replay is never reported indeterminate for it.
+    #[test]
+    fn conflict_reruns_projection() {
+        let family = Family::new([6u8; 32]).family();
+        let mut observed = ObservedStateOperation::new(family, 1);
+        observed.first().expect("cache page");
+        let Ok(Next::Call(IoCall::Child(mut child))) = observed.next(claims(Vec::new())) else {
+            panic!("a missing cache reduces the family");
+        };
+        assert_eq!(child.start().len(), 1, "the projection reads its cache");
+        let error = StorageError::TransactionConflict;
+        let effects = child.step(Event::Storage(StorageEvent::Error { error }));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Delay(_)]),
+            "{effects:?}"
+        );
+        assert!(!child.is_complete());
     }
 
     // A family without a usable cache row is reduced from its records, as a stale one is.
