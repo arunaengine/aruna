@@ -328,6 +328,18 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
     bearer: Option<&ValidatedBearer>,
     body: &impl Serialize,
 ) -> ServerResult<(StatusCode, T)> {
+    relay_json_with(state, forward, path, bearer, body, Vec::new()).await
+}
+
+/// [`relay_json`] with `headers` added to the request.
+pub(crate) async fn relay_json_with<T: DeserializeOwned>(
+    state: &ServerState,
+    forward: &RestForward,
+    path: &str,
+    bearer: Option<&ValidatedBearer>,
+    body: &impl Serialize,
+    headers: Vec<(String, String)>,
+) -> ServerResult<(StatusCode, T)> {
     let bearer = bearer.ok_or(ServerError::Unauthorized)?;
     let json =
         serde_json::to_vec(body).map_err(|error| ServerError::InternalError(error.into()))?;
@@ -336,7 +348,7 @@ pub(crate) async fn relay_json<T: DeserializeOwned>(
         path: path.to_string(),
         bearer: bearer_secret(Some(bearer)),
         relay: Some((state.get_node_id(), forward.set_id)),
-        headers: Vec::new(),
+        headers,
         json: Some(json),
         timed: false,
         any_status: false,

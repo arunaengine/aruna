@@ -4,14 +4,15 @@
 
 use std::sync::Arc;
 
+use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_core::structs::placement::coverage::CoverageCount;
+use aruna_core::structs::placement::coverage::{CountRelay, CoverageCount};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_drivers::driver::{drive, drive_retry};
 use aruna_operations::blob::migration::count::{
-    MintRunOperation, ReadCountOperation, StartCountError, StartCountOperation, current_run,
-    other_runs,
+    MintRunOperation, ReadCountOperation, SignRelayOperation, StartCountError, StartCountOperation,
+    current_run, other_runs,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -20,16 +21,18 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 use utoipa::{IntoParams, ToSchema};
 
-use super::coordinators::{bucket_path, coordinators};
+use super::coordinators::{bucket_path, coordinators, set_members};
 use crate::auth::{RealmAuth, ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::routes::management_relay::RELAY_HOP_HEADER;
-use crate::routes::storage::relay::{relay_get, relay_json, relayed_set};
+use crate::routes::management_relay::{RELAY_HOP_HEADER, passed_text};
+use crate::routes::storage::relay::{relay_get, relay_json_with, relayed_set};
 use crate::server::state::ServerState;
 
 /// A coordinator's refusal of a start because it keeps a run ordered after it.
 const SUPERSEDED: &str = "a coverage count run ordered after this one holds the bucket";
+/// The relaying node's signature over the bucket, set and run of a start, in hex.
+const COUNT_SIGNATURE_HEADER: &str = "x-aruna-count-signature";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -214,8 +217,9 @@ pub async fn get_coverage_count(
 - When no node took the start, the call fails with 409 and a `missing` answer that names the
   tried `run`, the `superseded` nodes and the `unreached` ones whose outcome is unknown; one of
   those may have started the run, so poll it.
-- Only a node relaying a distributed start names the `run` in the body; any other caller that
-  names one gets 400."#,
+- Only a member of the bucket's set that relays a distributed start names the `run` in the body,
+  with its node signature over bucket, set and run in `x-aruna-count-signature`. A caller
+  without the relay headers that names one gets 400; a missing or wrong signature gets 403."#,
     params(("bucket" = String, Path, description = "Bucket name as used by the S3 surface")),
     request_body(
         content = StartCountRequest,
@@ -284,6 +288,60 @@ fn refused_start(
     }
 }
 
+/// The relay a start that names `run` claims. Only a node relaying it for a distributed bucket
+/// names a run; any other caller gets 400.
+fn claimed_relay(
+    bucket: &str,
+    run: Ulid,
+    headers: &HeaderMap,
+    set_id: Option<Ulid>,
+) -> ServerResult<CountRelay> {
+    match set_id.filter(|_| headers.contains_key(RELAY_HOP_HEADER)) {
+        Some(set_id) => Ok(CountRelay {
+            bucket: bucket.to_string(),
+            set_id,
+            run,
+        }),
+        None => Err(ServerError::BadRequestReason(
+            "only a node relaying a start names its run".to_string(),
+        )),
+    }
+}
+
+/// Whether `headers` carry a signature over `relay` by the node that relayed it, one of `members`.
+fn relay_signed(relay: &CountRelay, headers: &HeaderMap, members: &[NodeId]) -> bool {
+    let signer = (passed_text(headers).split(',').next())
+        .and_then(|node| node.trim().parse::<NodeId>().ok());
+    let signature = (headers.get(COUNT_SIGNATURE_HEADER))
+        .and_then(|value| hex::decode(value.as_bytes()).ok())
+        .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
+        .map(|bytes| iroh::Signature::from_bytes(&bytes));
+    match (signer, signature) {
+        (Some(signer), Some(signature)) => {
+            members.contains(&signer) && relay.signed_by(&signer, &signature)
+        }
+        _ => false,
+    }
+}
+
+/// The header that carries this node's signature over the start of `run`, sent with each relay.
+async fn relay_signature(
+    state: &ServerState,
+    bucket: &str,
+    binding: &DistributionBinding,
+    run: Ulid,
+) -> ServerResult<Vec<(String, String)>> {
+    let relay = CountRelay {
+        bucket: bucket.to_string(),
+        set_id: binding.set_id,
+        run,
+    };
+    let signed = drive(SignRelayOperation::new(relay), &state.get_ctx()).await;
+    let signature = signed.map_err(|error| ServerError::InternalError(error.into()))?;
+    let value = hex::encode(signature.to_bytes());
+    Ok(vec![(COUNT_SIGNATURE_HEADER.to_string(), value)])
+}
+
 /// A run this node mints for a start, kept for every retry of it.
 async fn mint_run(state: &ServerState) -> ServerResult<Ulid> {
     let minted = drive(MintRunOperation::default(), &state.get_ctx()).await;
@@ -312,11 +370,17 @@ async fn count_route(
     let info = bucket_info(state, bucket).await?;
     relayed_set(&info, headers)?;
     let relayed = headers.contains_key(RELAY_HOP_HEADER);
-    // Run ids order the starts, so a caller naming one could pass every later start.
-    if start && run.is_some() && !relayed {
-        return Err(ServerError::BadRequestReason(
-            "only a node relaying a start names its run".to_string(),
-        ));
+    // Run ids order the starts, so a named run needs the signature of a member of the set.
+    if start && let Some(run) = run {
+        let binding = info.distribution.as_ref();
+        let relay = claimed_relay(bucket, run, headers, binding.map(|binding| binding.set_id))?;
+        let members = match binding {
+            Some(binding) => set_members(state, binding).await?,
+            None => Vec::new(),
+        };
+        if !relay_signed(&relay, headers, &members) {
+            return Err(ServerError::Forbidden);
+        }
     }
     let run = match (start, run) {
         (true, None) => Some(mint_run(state).await?),
@@ -381,12 +445,17 @@ async fn count_spread(
     run: Option<Ulid>,
 ) -> ServerResult<CoverageCountResponse> {
     let path = bucket_path(bucket, "coverage/count");
+    let signed = match (start, run) {
+        (true, Some(run)) => relay_signature(state, bucket, binding, run).await?,
+        _ => Vec::new(),
+    };
     let (mut answers, mut unreached, mut superseded) = (Vec::new(), Vec::new(), Vec::new());
     for forward in coordinators(state, binding).await? {
         let answer = if forward.node_id == state.get_node_id() {
             count_here(state, bucket, start, run).await
         } else if start {
-            relay_json(state, &forward, &path, bearer, &StartCountRequest { run })
+            let request = StartCountRequest { run };
+            relay_json_with(state, &forward, &path, bearer, &request, signed.clone())
                 .await
                 .map(|(_, answer)| answer)
         } else {
@@ -567,6 +636,61 @@ mod tests {
         };
         assert!(message.contains(&previous.to_string()));
         assert!(message.contains(&Ulid::from_parts(10, 1).to_string()));
+    }
+
+    fn relayed_by(key: &iroh::SecretKey, relay: &CountRelay) -> HeaderMap {
+        let signature = key.sign(&relay.signing_bytes().unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(RELAY_HOP_HEADER, key.public().to_string().parse().unwrap());
+        let value = hex::encode(signature.to_bytes()).parse().unwrap();
+        headers.insert(COUNT_SIGNATURE_HEADER, value);
+        headers
+    }
+
+    // A public start cannot name its run, on a distributed bucket or a plain one.
+    #[test]
+    fn public_run_refused() {
+        let (run, set_id) = (Ulid::from_parts(2, 2), Ulid::from_parts(1, 1));
+        let public = claimed_relay("photos", run, &HeaderMap::new(), Some(set_id));
+        assert!(matches!(public, Err(ServerError::BadRequestReason(_))));
+
+        let mut relayed = HeaderMap::new();
+        relayed.insert(RELAY_HOP_HEADER, "node".parse().unwrap());
+        let plain = claimed_relay("photos", run, &relayed, None);
+        assert!(matches!(plain, Err(ServerError::BadRequestReason(_))));
+        let relay = claimed_relay("photos", run, &relayed, Some(set_id)).expect("relay claimed");
+        assert_eq!((relay.set_id, relay.run), (set_id, run));
+    }
+
+    // A member's signature over this bucket, set and run starts the run; a missing or forged
+    // signature, one by a node outside the set, or one over another run is refused.
+    #[test]
+    fn relay_needs_signature() {
+        let member = iroh::SecretKey::from_bytes(&[7; 32]);
+        let relay = CountRelay {
+            bucket: "photos".to_string(),
+            set_id: Ulid::from_parts(1, 1),
+            run: Ulid::from_parts(2, 2),
+        };
+        let members = [member.public()];
+        let valid = relayed_by(&member, &relay);
+        assert!(relay_signed(&relay, &valid, &members));
+
+        let mut missing = valid.clone();
+        missing.remove(COUNT_SIGNATURE_HEADER);
+        assert!(!relay_signed(&relay, &missing, &members));
+
+        let outsider = iroh::SecretKey::from_bytes(&[8; 32]);
+        let mut forged = relayed_by(&outsider, &relay);
+        forged.insert(RELAY_HOP_HEADER, member.public().to_string().parse().unwrap());
+        assert!(!relay_signed(&relay, &forged, &members));
+        assert!(!relay_signed(&relay, &relayed_by(&outsider, &relay), &members));
+
+        let moved = CountRelay {
+            run: Ulid::from_parts(3, 3),
+            ..relay.clone()
+        };
+        assert!(!relay_signed(&moved, &valid, &members));
     }
 
     // A start no coordinator took still names its run and where each coordinator stands, so the
