@@ -37,10 +37,7 @@ pub(super) fn missing_index(
     let mut missing = Vec::new();
     for bytes in seen {
         let family = family_of(bytes);
-        if read
-            .get(&index, prune_slot_key(&family).to_vec())?
-            .is_none()
-        {
+        if read.get(&index, prune_slot_key(&family))?.is_none() {
             missing.push(family);
         }
     }
