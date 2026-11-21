@@ -324,39 +324,18 @@ async fn held_topic_origin() {
     )
     .expect("document sync service opens");
 
-    let local_node = service.local_node_id().expect("local node id");
-    let placement = PlacementRef {
+    let shard = |shard| PlacementRef {
         strategy_id: Ulid::from_parts(81, 7),
-        shard: 1,
+        shard,
     };
-    let held_user = UserId::local(Ulid::from_parts(81, 1), realm_id);
-    let ready_user = UserId::local(Ulid::from_parts(81, 2), realm_id);
-    let ready_target = DocumentTarget::User {
-        user_id: ready_user,
-    };
-    let ready_topic = ready_target.sync_topic_id(realm_id, &placement);
+    let (held_shard, ready_shard) = (shard(1), shard(2));
+    let user_id = UserId::local(Ulid::from_parts(81, 1), realm_id);
+    let topic = |placement| DocumentTarget::User { user_id }.sync_topic_id(realm_id, &placement);
+    assert_ne!(topic(held_shard), topic(ready_shard));
     service
-        .ensure_sync_topics(&[ready_topic], Vec::new())
-        .expect("ready topic genesis");
-    let change = DocumentChange {
-        base: None,
-        current: DocumentSyncRevision {
-            generation: 1,
-            event_id: Ulid::from_parts(81, 3),
-            actor: local_node,
-            updated_at_ms: 1,
-        },
-        kind: DocumentChangeKind::Upsert,
-        placement,
-    };
-    let waiting = DocumentSyncPublish::Upsert {
-        event_id: Ulid::from_parts(81, 4),
-        target: DocumentTarget::User { user_id: held_user },
-        bytes: b"user".to_vec(),
-        change,
-        allow_genesis: false,
-    };
-    let admin = |seed: u8, origin_seq: u64, user_id: UserId| {
+        .ensure_sync_topics(&[topic(held_shard), topic(ready_shard)], Vec::new())
+        .expect("shard topic genesis");
+    let admin = |seed: u8, origin_seq: u64, placement: PlacementRef, signed: bool| {
         let event = test_admin_event(
             Ulid::from_parts(81, u128::from(seed) * 10 + u128::from(origin_seq)),
             AdminDocumentTarget::User { user_id },
@@ -366,7 +345,7 @@ async fn held_topic_origin() {
                 name: format!("name-{seed}-{origin_seq}"),
             },
         );
-        let origin_signature = Some(sign_as_origin(&event, &placement));
+        let origin_signature = signed.then(|| sign_as_origin(&event, &placement));
         DocumentSyncPublish::AdminOperation {
             target: DocumentTarget::User { user_id },
             event: Box::new(event),
@@ -376,11 +355,13 @@ async fn held_topic_origin() {
         }
     };
 
+    // The first event comes from a foreign origin without the signature this node cannot add,
+    // so it retries and holds its shard topic.
     let documents = vec![
-        waiting,
-        admin(2, 1, held_user),
-        admin(2, 2, ready_user),
-        admin(3, 1, ready_user),
+        admin(4, 1, held_shard, false),
+        admin(2, 1, held_shard, true),
+        admin(2, 2, ready_shard, true),
+        admin(3, 1, ready_shard, true),
     ];
     match service.publish_documents(documents, Vec::new()).await {
         DocumentNetEvent::DocumentsPartiallyPublished {
