@@ -281,7 +281,7 @@ fn validate_install_target(path: &Path) -> Result<(), PortalArtifactError> {
         }
     }
 
-    if normal_components == 0 || path.is_absolute() && normal_components == 1 {
+    if normal_components == 0 || path.has_root() && normal_components == 1 {
         return Err(PortalArtifactError::InvalidPortalDirectory(
             path.to_path_buf(),
         ));
