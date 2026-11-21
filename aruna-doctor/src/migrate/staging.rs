@@ -3,6 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::walk_cursor::{self, OffsetRow};
 use super::{Rewrites, decode_error};
 use crate::explorer::ExplorerError;
 use aruna_core::id::NodeId;
@@ -176,6 +177,18 @@ pub(super) fn checkpoint_rows(
         scanned += 1;
         if is_lane_bound(&key) {
             continue;
+        }
+        // Alpha.159 kept a listing offset in the slot the walk cursor has now.
+        match walk_cursor::offset_row(&value) {
+            Some(OffsetRow::Finished(bytes)) => {
+                rows.push((key.to_vec(), bytes));
+                continue;
+            }
+            Some(OffsetRow::Unfinished) => {
+                restarted.push(key.to_vec());
+                continue;
+            }
+            None => {}
         }
         if postcard::from_bytes::<StagingJobCheckpoint>(&value)
             .is_ok_and(|current| postcard::to_allocvec(&current).is_ok_and(|bytes| bytes == *value))

@@ -95,6 +95,7 @@ mod uploads;
 mod user_sessions;
 mod vault;
 mod versions;
+mod walk_cursor;
 
 #[derive(Debug, Serialize)]
 pub struct MigrateOutput {
