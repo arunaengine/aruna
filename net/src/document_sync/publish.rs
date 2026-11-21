@@ -544,7 +544,7 @@ impl DocumentSyncService {
     /// Marks locally published ops as applied by advancing the per-topic
     /// cursor, so the origin's own reconcile does not re-emit them. Their
     /// effects are always applied locally before the outbox publish runs.
-    async fn advance_topic_cursors(
+    pub(in crate::document_sync) async fn advance_topic_cursors(
         &self,
         published: BTreeMap<::irokle::TopicId, ::irokle::ActorClock>,
     ) -> Result<()> {

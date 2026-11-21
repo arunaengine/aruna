@@ -3480,8 +3480,8 @@ mod test {
     fn unused_holds_dropped() {
         // An install scope nobody holds leaves the table once another scope is taken.
         let first = HoldScope::PluginInstall(ulid::Ulid::from_bytes([41u8; 16]));
-        let released = std::sync::Arc::downgrade(&local_hold(first));
-        let other = local_hold(HoldScope::PluginInstall(ulid::Ulid::from_bytes([42u8; 16])));
+        let released = std::sync::Arc::downgrade(&super::local_hold(first));
+        let other = super::local_hold(HoldScope::PluginInstall(ulid::Ulid::from_bytes([42u8; 16])));
         assert!(released.upgrade().is_none());
         drop(other);
     }
