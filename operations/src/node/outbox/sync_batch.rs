@@ -40,7 +40,12 @@ impl SyncBatchOperation {
         Self {
             serving,
             generation,
-            entries: batch.topics.iter().copied().zip(batch.origins.iter().copied()).collect(),
+            entries: batch
+                .topics
+                .iter()
+                .copied()
+                .zip(batch.origins.iter().copied())
+                .collect(),
             batch: Some(batch),
             finishing: false,
             started_ms: 0,
@@ -145,6 +150,9 @@ mod tests {
         };
         assert!(done.outcome.blocked_topics.is_empty() && done.outcome.blocked_origins.is_empty());
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
-        assert_eq!(done.outcome.sync_waits, vec![(peer, TopicId::hash(b"topic"))]);
+        assert_eq!(
+            done.outcome.sync_waits,
+            vec![(peer, TopicId::hash(b"topic"))]
+        );
     }
 }
