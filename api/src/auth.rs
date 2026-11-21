@@ -1218,7 +1218,8 @@ mod test {
             exp: chrono::Utc::now().timestamp().max(0) as u64 + 600,
             name: None,
         };
-        let token = encode(&header, &claims, &EncodingKey::from_secret(b"super-secret")).unwrap();
+        let key = EncodingKey::from_secret(b"super-secret").unwrap();
+        let token = encode(&header, &claims, &key).unwrap();
 
         let validator = OidcValidator::new().unwrap();
         let error = validator.validate(&provider, &token).await.unwrap_err();

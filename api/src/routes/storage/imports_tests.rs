@@ -324,7 +324,7 @@ pub(crate) fn bearer(test: &TestState) -> Extension<Option<crate::auth::Validate
         via: None,
         auth_time: None,
     };
-    let key = jsonwebtoken::EncodingKey::from_secret(b"test");
+    let key = jsonwebtoken::EncodingKey::from_secret(b"test").unwrap();
     let token = jsonwebtoken::encode(&jsonwebtoken::Header::default(), &claims, &key).unwrap();
     Extension(Some(crate::auth::ValidatedBearer::new_for_test(token)))
 }
