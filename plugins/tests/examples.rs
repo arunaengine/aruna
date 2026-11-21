@@ -1409,6 +1409,7 @@ async fn zenodo_deposit() {
 }
 
 #[tokio::test]
+#[ignore = "builds an example plugin with its language toolchain"]
 async fn map_reads() {
     // The reads below a bucket path and a sample sheet go to one task; its outputs are linked to
     // the dataset and its report's numbers recorded, or left out without a report.
