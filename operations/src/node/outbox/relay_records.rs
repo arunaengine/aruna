@@ -252,6 +252,15 @@ impl Operation for RelayRecordsOperation {
                 }
                 self.out.relayed.push(record.0);
             }
+            Err(ForwardError::Forbidden) => {
+                // A holder judged the envelope; no retry changes that, so the row is only reported.
+                error!(
+                    event = "pipeline.drain.relay_rejected",
+                    target = ?record.1.target,
+                    "A holder rejected a relayed admin outbox record; leaving it in the outbox"
+                );
+                self.out.left += 1;
+            }
             Err(error) => {
                 warn!(
                     event = "pipeline.drain.relay_failed",
@@ -408,6 +417,22 @@ mod tests {
             ..RelayedRecords::default()
         };
         let answer = run.next(IoResult::Child(ChildOutcome::new(refused)));
+        assert_eq!(answer, Ok(Next::Done(left)));
+    }
+
+    // A holder's explicit rejection judges the envelope: the record is reported and stays, but no
+    // retry is scheduled for it and no later relay waits behind it.
+    #[test]
+    fn rejected_relay_reported() {
+        let records = vec![signed_record(b"admin", node())];
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(holder_config())), records);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let rejected = Err::<(), _>(ForwardError::Forbidden);
+        let left = RelayedRecords {
+            left: 1,
+            ..RelayedRecords::default()
+        };
+        let answer = run.next(IoResult::Child(ChildOutcome::new(rejected)));
         assert_eq!(answer, Ok(Next::Done(left)));
     }
 

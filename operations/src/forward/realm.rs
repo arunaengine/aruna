@@ -92,9 +92,9 @@ impl Operation for RelayAdminOperation {
         match peer_reply(peer, result)? {
             Ok(MetadataTransportMessage::AdminEventQueued) => Ok(Next::Done(())),
             Ok(MetadataTransportMessage::Reject(error)) => {
-                // A rejection is a verdict on the envelope, not on this peer.
+                // A rejection is a verdict on the envelope, not on this peer: no holder takes it.
                 warn!(%peer, %error, "Holder rejected a relayed admin event");
-                Err(ForwardError::Unavailable)
+                Err(ForwardError::Forbidden)
             }
             Ok(_) | Err(_) => self.ask(),
         }
@@ -466,7 +466,7 @@ mod tests {
         let mut operation = relay(None, &holders);
         operation.first().unwrap();
         let rejected = peer_answer(node(1), &reject("invalid"));
-        assert_eq!(operation.next(rejected), Err(ForwardError::Unavailable));
+        assert_eq!(operation.next(rejected), Err(ForwardError::Forbidden));
     }
 
     /// An apply operation at `local` for a signed relay from `peer`, past its first call.
