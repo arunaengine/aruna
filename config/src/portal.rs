@@ -390,6 +390,27 @@ fn exchange_dirs(_staged: &Path, _target: &Path) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
+/// Renames `from` to `to` only while nothing is at `to`, where the file system can refuse a
+/// replacement; elsewhere this is a plain rename.
+#[cfg(not(windows))]
+fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
+    use rustix::io::Errno;
+    let flags = rustix::fs::RenameFlags::NOREPLACE;
+    match rustix::fs::renameat_with(rustix::fs::CWD, from, rustix::fs::CWD, to, flags) {
+        Err(error)
+            if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&error) =>
+        {
+            fs::rename(from, to)
+        }
+        result => result.map_err(io::Error::from),
+    }
+}
+
+#[cfg(windows)]
+fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
 /// Replaces `target` with two renames for file systems without an exchange.
 fn replace_portable(
     staged: TempInstallDir,
@@ -614,7 +635,7 @@ impl TempInstallDir {
     }
 
     fn persist(mut self, dest: &Path) -> io::Result<()> {
-        fs::rename(&self.path, dest)?;
+        rename_new(&self.path, dest)?;
         self.cleanup = false;
         Ok(())
     }
@@ -983,6 +1004,22 @@ mod tests {
             entry.file_name().to_string_lossy().starts_with(".portal-")
                 && entry.path().join(CHECKSUM_FILE).is_file()
         })
+    }
+
+    // A directory another tool creates at the recovery name after the absence check stays.
+    #[cfg(not(windows))]
+    #[test]
+    fn claim_keeps_directory() {
+        let tempdir = tempdir().unwrap();
+        let previous = tempdir.path().join(".portal.previous");
+        let staged = TempInstallDir::create(tempdir.path()).unwrap();
+        let path = staged.path().to_path_buf();
+        fs::create_dir(&previous).unwrap();
+
+        let error = staged.persist(&previous).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(previous.is_dir());
+        assert!(!path.exists());
     }
 
     // A claim interrupted before its marker leaves only its staging directory, so the next
