@@ -1263,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn hides_other_policy_ids() {
+    fn hides_refusal_ids() {
         // Multipart and copy refusals answer like a refused put and name no policy.
         let policy_id = ulid::Ulid::from_bytes([9u8; 16]);
         let multipart = CreateMultipartError::PolicyGateError(PolicyGateError::Denied {
@@ -1287,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_delete_copy_refusal() {
+    fn maps_delete_refusal() {
         // A delete refused by a managed copy answers as the read paths do, not as a 500.
         let error =
             DeleteObjectError::ManagedCopyError(ManagedCopyError::Unregistered).into_s3_error();
