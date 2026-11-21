@@ -111,7 +111,7 @@ chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 # Pinned to craqle 0.3.2 main (data entity removal) and Irokle 0.3.2; resolves the irokle below.
-craqle = { git = "https://github.com/arunaengine/craqle", rev = "18a5f2ea1d0ae690a8d50081e8fee066044e8423", features = [
+craqle = { git = "https://github.com/arunaengine/craqle", rev = "a002de3335dbcca23160164e3eb868f2da4a0358", features = [
     "iroh",
     "shacl-core",
 ] }
