@@ -83,6 +83,7 @@ mod jobs;
 mod layouts;
 mod mappings;
 mod plugin_events;
+mod prune_index;
 mod removals;
 mod session_refs;
 mod sessions;
@@ -186,6 +187,9 @@ pub struct MigrateOutput {
     /// Login sessions from before a session named the linked login it came through.
     pub user_sessions_scanned: usize,
     pub user_sessions_rewritten: usize,
+    /// Job families the family prune index did not name, as alpha.159 wrote no index rows;
+    /// each is scheduled one job retention after the migration.
+    pub families_scheduled: usize,
     /// Finished staging checkpoints from before the directory queue; unfinished ones are
     /// deleted, so their job walks its source again, and count as `staging_job_state` below.
     pub staging_checkpoints_rewritten: usize,
@@ -627,6 +631,11 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     })?;
     // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
     let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
+    let families_scheduled = prune_index::missing_index(
+        &db,
+        [&record_rows, &pending_rows, &conflict_rows],
+        aruna_clock::unix_timestamp_millis(),
+    )?;
     // Each batch commits on its own; a rerun skips the rows an earlier run already rewrote.
     let mut unknown_rows = Vec::new();
     let audits = trailing::missing_fields::<AdminAuditRecord>(
@@ -712,6 +721,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         info_cursors_deleted: info.cursors.len() + fanout_cursors,
         user_sessions_scanned: logins.scanned,
         user_sessions_rewritten: logins.rows.len(),
+        families_scheduled,
         staging_checkpoints_rewritten: staged.rewrites.rows.len(),
         relaid_rows: counts(
             relaid_rows
