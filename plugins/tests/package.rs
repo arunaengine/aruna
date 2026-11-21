@@ -48,7 +48,7 @@ fn module() -> Vec<u8> {
         panic!("a component");
     };
     let mut module = module;
-    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8).unwrap();
+    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false).unwrap();
     module
 }
 
@@ -85,7 +85,7 @@ fn dummy(wit: &str, world: &str) -> Vec<u8> {
     let package = resolve.push_str("test.wit", wit).unwrap();
     let world = resolve.select_world(&[package], Some(world)).unwrap();
     let mut module = wit_component::dummy_module(&resolve, world, ManglingAndAbi::Standard32);
-    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8).unwrap();
+    embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8, false).unwrap();
     ComponentEncoder::default()
         .module(&module)
         .unwrap()
