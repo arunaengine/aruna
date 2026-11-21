@@ -59,6 +59,16 @@ impl CountingListener {
         let task = tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
+                // Answering before the request is read resets the connection, which a client
+                // retries; a real server reads the head first.
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") && head.len() < 65536 {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => head.extend_from_slice(&buf[..read]),
+                    }
+                }
                 let _ = socket
                     .write_all(
                         b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
