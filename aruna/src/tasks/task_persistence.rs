@@ -561,6 +561,27 @@ mod tests {
         }
     }
 
+    // A reset whose row write is answered only after the storage timeout arms at the deadline it
+    // stored, so the live wake does not count the delay again.
+    #[tokio::test(start_paused = true)]
+    async fn late_reset_deadline() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(0, 0);
+        let key = gated_key();
+        let change = spawn_reset(&store, &task_handle, &key, false);
+        arrived.notified().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        release.send(()).expect("the write waits");
+        change.await.expect("the change ends");
+        let (event, _) = task_handle
+            .plan_shorten(key, Duration::from_secs(120), 1)
+            .await;
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
+            panic!("the armed wake is answered");
+        };
+        assert_eq!(after, Duration::from_secs(49));
+    }
+
     // A best-effort reset whose row write times out is armed at once, owned by the admission its
     // late row carries, so a slow storage never holds back the live retry.
     #[tokio::test(start_paused = true)]

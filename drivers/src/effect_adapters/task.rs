@@ -15,6 +15,7 @@ use aruna_storage::task_timers::{
     NO_ADMISSION, hold_change, persist_task_effect, read_timer, timer_has_row, write_owned,
 };
 use aruna_tasks::TaskHandle;
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::clock::next_entropy;
@@ -101,7 +102,7 @@ async fn arm_stored(
 async fn apply_change(
     storage: &StorageHandle,
     task_handle: Option<&TaskHandle>,
-    effect: TaskEffect,
+    mut effect: TaskEffect,
     keep_live: bool,
 ) -> Event {
     let admission = next_admission();
@@ -154,11 +155,15 @@ async fn apply_change(
         return event;
     }
     if timer_has_row(&effect) {
-        let written = match &effect {
+        let written = match &mut effect {
             TaskEffect::ResetTimer { key, after } => {
-                write_settled(storage, key, *after, admission, keep_live)
-                    .await
-                    .map_err(|error| error.to_string())
+                // The scheduler keeps the deadline the row stores, however late the write ends.
+                let deadline = Instant::now().checked_add(*after);
+                let written = write_settled(storage, key, *after, admission, keep_live).await;
+                if let Some(deadline) = deadline {
+                    *after = deadline.saturating_duration_since(Instant::now());
+                }
+                written.map_err(|error| error.to_string())
             }
             _ => persist_task_effect(storage, &effect).await,
         };
