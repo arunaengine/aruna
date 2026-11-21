@@ -6,10 +6,10 @@
 use super::compute;
 use super::jobs::LegacyInput;
 use super::prune_index::family_of;
+use super::session_refs;
 use super::tombstones::{Remains, Stated};
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
-use aruna_core::compute::ExecutionTargetId;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_RECORD_KEYSPACE, JOB_ENTRY_KEYSPACE, JOB_KEYSPACE,
@@ -118,7 +118,7 @@ pub(super) fn scan<T: Held>(
             evidence.add(envelope);
         }
         if matches!(value.get(VARIANT_AT), Some(&SPEC | &LAUNCH | &RECEIPT)) {
-            let historical = exact::<(OldEnvelope, T::Tail)>(&value).map(|(old, _)| old);
+            let historical = old_envelope::<(OldEnvelope, T::Tail)>(&value).map(|(old, _)| old);
             candidates.push(Candidate {
                 key: key.to_vec(),
                 current,
@@ -500,7 +500,7 @@ struct OldLaunch {
     scheduler_seq: u32,
     witness_placement: PlacementRef,
     holder_generation: u64,
-    target: ExecutionTargetId,
+    target: compute::Target,
     inputs: Vec<OldPlanned>,
     output_policies: Vec<PlacementPolicyRef>,
     plan_digest: [u8; 32],
@@ -550,12 +550,18 @@ struct OldEnvelope {
 
 /// The time an alpha.134 spec, claim or launch states, and a spec's submitter.
 pub(super) fn old_stated(value: &[u8]) -> Option<Stated> {
-    Some(match exact::<OldEnvelope>(value)?.record {
+    Some(match old_envelope::<OldEnvelope>(value)?.record {
         OldRecord::Spec(spec) => (Some(spec.created_at_ms), Some(spec.created_by)),
         OldRecord::Claim(claim) => (Some(claim.accepted_at_ms), None),
         OldRecord::Budget(_) => (None, None),
         OldRecord::Launch(launch) => (Some(launch.created_at_ms), None),
     })
+}
+
+/// An alpha.134 envelope: its job payload has no backend name yet, so `ExecutionSpec` is read
+/// with the fields alpha.134 stored.
+fn old_envelope<T: Serialize + DeserializeOwned>(value: &[u8]) -> Option<T> {
+    exact::<T>(value).or_else(|| session_refs::decode::<T>(value, compute::UNNAMED).ok())
 }
 
 #[cfg(test)]
@@ -631,12 +637,47 @@ pub(super) mod tests {
         scheduler_seq: u32,
         witness_placement: PlacementRef,
         holder_generation: u64,
-        target: ExecutionTargetId,
+        target: OldTarget,
         inputs: Vec<OldPlanned>,
         output_policies: Vec<PlacementPolicyRef>,
         plan_digest: [u8; 32],
         spec_digest: [u8; 32],
         created_at_ms: u64,
+    }
+
+    /// `ExecutionTargetId` as alpha.134 stored it, before the backend name.
+    #[derive(Serialize)]
+    struct OldTarget {
+        node_id: NodeId,
+        executor_kind: String,
+    }
+
+    /// `ExecutionSpec` as alpha.134 stored it: the current fields up to `collision_policy`.
+    struct OldExecution(ExecutionSpec);
+
+    impl Serialize for OldExecution {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            use serde::ser::SerializeStruct;
+            let spec = &self.0;
+            let mut state = serializer.serialize_struct("ExecutionSpec", 16)?;
+            state.serialize_field("group_id", &spec.group_id)?;
+            state.serialize_field("name", &spec.name)?;
+            state.serialize_field("description", &spec.description)?;
+            state.serialize_field("tags", &spec.tags)?;
+            state.serialize_field("image", &spec.image)?;
+            state.serialize_field("entrypoint", &spec.entrypoint)?;
+            state.serialize_field("command", &spec.command)?;
+            state.serialize_field("workdir", &spec.workdir)?;
+            state.serialize_field("env", &spec.env)?;
+            state.serialize_field("resources", &spec.resources)?;
+            state.serialize_field("executor_constraint", &spec.executor_constraint)?;
+            state.serialize_field("inputs", &spec.inputs)?;
+            state.serialize_field("file_outputs", &spec.file_outputs)?;
+            state.serialize_field("workspace_outputs", &spec.workspace_outputs)?;
+            state.serialize_field("output_prefixes", &spec.output_prefixes)?;
+            state.serialize_field("collision_policy", &spec.collision_policy)?;
+            state.end()
+        }
     }
 
     /// `CapturedInput` as alpha.134 stored it.
@@ -661,7 +702,7 @@ pub(super) mod tests {
         group_id: GroupId,
         created_by: UserId,
         created_at_ms: u64,
-        payload: ExecutionSpec,
+        payload: OldExecution,
         request_digest: [u8; 32],
         spec_digest: [u8; 32],
         resources: EffectiveResources,
@@ -739,7 +780,10 @@ pub(super) mod tests {
             scheduler_seq: 1,
             witness_placement: PlacementRef::NIL,
             holder_generation: 1,
-            target: target(),
+            target: OldTarget {
+                node_id: secret().public(),
+                executor_kind: "kubernetes".to_string(),
+            },
             inputs: vec![OldPlanned {
                 destination_key: "inputs/table.csv".to_string(),
                 version_id: Ulid::from_bytes([6u8; 16]),
@@ -776,7 +820,7 @@ pub(super) mod tests {
             group_id,
             created_by: user(),
             created_at_ms: 1_000,
-            payload: execution(),
+            payload: OldExecution(execution()),
             request_digest: OLD.request_digest,
             spec_digest: [9u8; 32],
             resources,

@@ -84,6 +84,10 @@ fn upgraded(value: &[u8]) -> Option<JobRecord> {
     {
         return Some(input_record(old));
     }
+    // An alpha.134 execution job stored its spec before the backend name.
+    if let Ok(old) = session_refs::decode::<InputJob>(value, super::compute::UNNAMED) {
+        return Some(input_record(old));
+    }
     if let Ok(legacy) = session_refs::decode::<LegacyJob>(value, &[]) {
         return Some(legacy.into());
     }

@@ -52,7 +52,7 @@ macro_rules! alpha_206 {
     };
 }
 
-const UNNAMED: Layout = alpha_206!();
+pub(super) const UNNAMED: Layout = alpha_206!();
 /// Job rows whose sessions predate the linked login, or the display name too; those releases
 /// stored the rest of a job as alpha.206 did.
 pub(super) const LOGIN_JOBS: Layout = alpha_206!((SESSION_REF, 3));
@@ -170,11 +170,11 @@ pub(super) fn old_outbox(
     Ok(keys)
 }
 
-/// `ExecutionTargetId` as alpha.206 stored it, before the backend name.
+/// `ExecutionTargetId` as alpha.134 and alpha.206 stored it, before the backend name.
 #[derive(Clone, Serialize, Deserialize)]
-struct Target {
-    node_id: NodeId,
-    executor_kind: String,
+pub(super) struct Target {
+    pub(super) node_id: NodeId,
+    pub(super) executor_kind: String,
 }
 
 /// `LaunchIntent` as alpha.206 stored it.

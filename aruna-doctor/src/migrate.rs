@@ -330,14 +330,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let onboarding_rows = db.keyspace(ONBOARDING_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
-    // Queued publishes gain their incarnation first, so every outbox step below reads them.
-    let mut unknown_rows = Vec::new();
-    let incarnations = trailing::missing_fields::<DocumentOutboxRecord>(
-        &db,
-        &outbox_rows,
-        trailing::OUTBOX,
-        &mut unknown_rows,
-    )?;
+    // Old families are read before any write, so an unreadable one stops the run unchanged.
     let mut evidence = families::Evidence::default();
     let specs = [
         (
@@ -354,6 +347,14 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         ),
     ];
     let mut removal = families::old_families(&specs, &evidence)?;
+    // Queued publishes gain their incarnation first, so every outbox step below reads them.
+    let mut unknown_rows = Vec::new();
+    let incarnations = trailing::missing_fields::<DocumentOutboxRecord>(
+        &db,
+        &outbox_rows,
+        trailing::OUTBOX,
+        &mut unknown_rows,
+    )?;
     // Family keyspaces with the byte offset of the family in their keys.
     for (name, offset) in [
         (FAMILY_RECORD_KEYSPACE, 0),
