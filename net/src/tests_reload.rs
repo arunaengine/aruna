@@ -89,7 +89,18 @@ async fn reload_waits_turn() -> Result<()> {
     store_config(&handle, encoded(&handle, &config_with(&handle, peer_a))).await;
     assert_eq!(handle.reload_if_changed().await?, Some(vec![peer_a]));
 
+    // An unchanged config needs no lock, even while another reload holds it.
+    let guard = handle.inner.config_applied.lock().await;
+    let mut unchanged = Box::pin(handle.reload_if_changed());
+    assert!(matches!(
+        poll_once(&mut unchanged).await,
+        Poll::Ready(Ok(None))
+    ));
+    drop(unchanged);
+    drop(guard);
+
     // A reload cancelled while it waits leaves nothing behind.
+    store_config(&handle, encoded(&handle, &config_with(&handle, peer_a))).await;
     let guard = handle.inner.config_applied.lock().await;
     let mut cancelled = Box::pin(handle.reload_if_changed());
     assert!(poll_once(&mut cancelled).await.is_pending());

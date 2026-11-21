@@ -38,6 +38,7 @@ mod tests_reload;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
@@ -124,6 +125,9 @@ struct NetInner {
     realm_peers: Arc<RwLock<Vec<NodeId>>>,
     /// Storage change count of the last realm config reload; `None` forces the next reload.
     config_applied: tokio::sync::Mutex<Option<u64>>,
+    /// A lock-free copy of `config_applied` (`u64::MAX` for `None`), so an unchanged config
+    /// costs a storage commit no lock.
+    config_seen: AtomicU64,
     inbound_admission: streams::InboundAdmission,
     watch_interest: Arc<RwLock<WatchInterestTable>>,
     heartbeats: Arc<heartbeat::HeartbeatTable>,
@@ -432,7 +436,7 @@ impl NetHandle {
     ) -> Result<Vec<NodeId>> {
         let mut applied = self.inner.config_applied.lock().await;
         // A supplied document may be older than storage, so the next check reloads.
-        *applied = None;
+        self.mark_applied(&mut applied, None);
         self.apply_document(document).await
     }
 
@@ -503,6 +507,9 @@ impl NetHandle {
     /// Reloads realm peers only when storage reports a realm config change since the last
     /// successful reload, or when peers came from a supplied document since then.
     pub async fn reload_if_changed(&self) -> Result<Option<Vec<NodeId>>> {
+        if self.inner.config_seen.load(Ordering::Acquire) == self.inner.storage.config_changes() {
+            return Ok(None);
+        }
         let mut applied = self.inner.config_applied.lock().await;
         if *applied == Some(self.inner.storage.config_changes()) {
             return Ok(None);
@@ -513,7 +520,7 @@ impl NetHandle {
     async fn reload_locked(&self, applied: &mut Option<u64>) -> Result<Option<Vec<NodeId>>> {
         // Read before the row, so a change during this reload moves the count past it.
         let seen = self.inner.storage.config_changes();
-        *applied = None;
+        self.mark_applied(applied, None);
         let target = DocumentTarget::RealmConfig {
             realm_id: self.inner.realm_id,
         };
@@ -521,14 +528,21 @@ impl NetHandle {
             .read_storage(target.storage_keyspace().to_string(), target.storage_key())
             .await?
         else {
-            *applied = Some(seen);
+            self.mark_applied(applied, Some(seen));
             return Ok(None);
         };
         let document = RealmConfigDocument::from_bytes(&bytes)
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;
         let peers = self.apply_document(&document).await?;
-        *applied = Some(seen);
+        self.mark_applied(applied, Some(seen));
         Ok(Some(peers))
+    }
+
+    /// Records the applied change count under the `config_applied` lock and in its copy.
+    fn mark_applied(&self, applied: &mut Option<u64>, value: Option<u64>) {
+        *applied = value;
+        let seen = value.unwrap_or(u64::MAX);
+        self.inner.config_seen.store(seen, Ordering::Release);
     }
 
     pub async fn realm_peers(&self) -> Vec<NodeId> {

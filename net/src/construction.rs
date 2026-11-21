@@ -69,6 +69,7 @@ impl NetHandle {
                 relay_method: runtime.relay_method,
                 realm_peers: peers.realm_peers,
                 config_applied: tokio::sync::Mutex::new(None),
+                config_seen: std::sync::atomic::AtomicU64::new(u64::MAX),
                 inbound_admission: peers.inbound_admission,
                 watch_interest: handle_state.watch_interest,
                 heartbeats: Arc::default(),
