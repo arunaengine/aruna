@@ -92,7 +92,10 @@ async fn restore_timer(
     record: PersistedTaskTimer,
 ) -> Result<(), String> {
     let _held = hold_timer(&record.key).await;
-    let Some(current) = read_timer(storage, &record.key).await? else {
+    let Some(current) = read_timer(storage, &record.key)
+        .await
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(());
     };
     let now_ms = unix_timestamp_millis();
@@ -505,6 +508,30 @@ mod tests {
             panic!("the armed wake is answered");
         };
         assert_eq!(after, Duration::from_secs(55));
+    }
+
+    // A shorten whose row write is answered only after the storage timeout reads the stored row
+    // once the write settled, so the committed row has its live wake.
+    #[tokio::test(start_paused = true)]
+    async fn late_write_armed() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(0);
+        let key = gated_key();
+        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+        arrived.notified().await;
+        tokio::time::advance(Duration::from_secs(11)).await;
+        release.send(()).expect("the write waits");
+        let event = change.await.expect("the change ends");
+        assert!(matches!(
+            event,
+            Event::Task(TaskEvent::TimerScheduled { .. })
+        ));
+        let row = read_timer(&store, &key).await.expect("reads");
+        let row = row.expect("the row is stored");
+        let (_, plan) = task_handle
+            .plan_shorten(key, Duration::from_secs(120), 1)
+            .await;
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
     }
 
     /// Deletes the row its firing owns, as a production firing does, and reports start and end.

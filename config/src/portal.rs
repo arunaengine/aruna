@@ -147,6 +147,7 @@ fn install_verified_artifact(
 
     // The old portal stays live until the new one replaces it, and comes back on a failure.
     let previous = previous_install(&portal_dir)?;
+    let _locked = lock_install(&previous)?;
     restore_previous(&portal_dir, &previous)?;
     if !existing_install(&portal_dir)? {
         temp_dir.persist(&portal_dir)?;
@@ -177,7 +178,11 @@ fn load_existing_status(
 ) -> Result<Option<PortalStatus>, PortalArtifactError> {
     let portal_dir = portal_dir(config);
     validate_install_target(&portal_dir)?;
-    restore_previous(&portal_dir, &previous_install(&portal_dir)?)?;
+    let previous = previous_install(&portal_dir)?;
+    if owned_backup(&previous) {
+        let _locked = lock_install(&previous)?;
+        restore_previous(&portal_dir, &previous)?;
+    }
     if !portal_dir.join("index.html").is_file() {
         return Ok(None);
     }
@@ -328,24 +333,36 @@ fn owned_backup(previous: &Path) -> bool {
             .is_ok_and(|metadata| metadata.is_file())
 }
 
-/// Creates the recovery directory `previous` exclusively; another directory there stays.
+/// Holds the install lock of the portal whose recovery directory is `previous` until the file
+/// closes or the process exits, so recovery and replacement run one at a time across processes.
+fn lock_install(previous: &Path) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(previous.with_extension("lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
+/// Publishes the marked recovery directory `previous` whole with one rename of a staged copy, so
+/// an interrupted claim leaves no unmarked directory there; another directory there stays.
 fn claim_backup(previous: &Path) -> Result<(), PortalArtifactError> {
     if owned_backup(previous) {
         fs::remove_dir_all(previous)?;
     }
-    if let Err(error) = fs::create_dir(previous) {
-        return Err(match error.kind() {
-            io::ErrorKind::AlreadyExists => {
-                PortalArtifactError::InvalidPortalDirectory(previous.to_path_buf())
-            }
+    let taken = || PortalArtifactError::InvalidPortalDirectory(previous.to_path_buf());
+    if fs::symlink_metadata(previous).is_ok() {
+        return Err(taken());
+    }
+    let staged = TempInstallDir::create(&install_parent(previous)?)?;
+    fs::File::create_new(staged.path().join(BACKUP_MARKER))?;
+    staged
+        .persist(previous)
+        .map_err(|error| match error.kind() {
+            io::ErrorKind::AlreadyExists | io::ErrorKind::DirectoryNotEmpty => taken(),
             _ => error.into(),
-        });
-    }
-    if let Err(error) = fs::File::create_new(previous.join(BACKUP_MARKER)) {
-        let _ = fs::remove_dir(previous);
-        return Err(error.into());
-    }
-    Ok(())
+        })
 }
 
 /// Swaps the new portal into `target` in one step; the old one is left at `staged`. A file
@@ -659,8 +676,8 @@ mod tests {
     use super::{
         BACKUP_DIR, CHECKSUM_FILE, DownloadedChecksumFile, PortalArtifactError, TempInstallDir,
         claim_backup, existing_install, install_parent, install_verified_artifact,
-        installed_status, portal_dir, prepare_artifact_status, previous_install, replace_portable,
-        safe_archive_path, unpack_archive, verify_sha256,
+        installed_status, lock_install, portal_dir, prepare_artifact_status, previous_install,
+        replace_portable, safe_archive_path, unpack_archive, verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -908,7 +925,68 @@ mod tests {
             fs::read_to_string(target.join("index.html")).unwrap(),
             "new"
         );
-        assert_eq!(fs::read_dir(tempdir.path()).unwrap().count(), 1);
+        // The portal and its lock file.
+        assert_eq!(fs::read_dir(tempdir.path()).unwrap().count(), 2);
+    }
+
+    // An update that starts while another one has moved the old portal away waits for it, so the
+    // first one's failed install still puts the old portal back.
+    #[test]
+    fn overlapping_install_waits() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        write_portal(&target, "old");
+        let locked = lock_install(&previous).unwrap();
+        claim_backup(&previous).unwrap();
+        let backup = previous.join(BACKUP_DIR);
+        fs::rename(&target, &backup).unwrap();
+        let second_config = config(&target);
+        let second = std::thread::spawn(move || {
+            let archive = archive_with_entry("index.html", b"new", EntryType::Regular);
+            let checksum = DownloadedChecksumFile {
+                bytes: b"sum".to_vec(),
+                checksum: "sum".to_string(),
+            };
+            install_verified_artifact(&second_config, &archive, checksum, "now".to_string())
+        });
+
+        // The first install fails and restores its backup, as `replace_portable` does.
+        fs::rename(&backup, &target).unwrap();
+        fs::remove_dir_all(&previous).unwrap();
+        drop(locked);
+        second.join().unwrap().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("index.html")).unwrap(),
+            "new"
+        );
+        assert!(!previous.exists());
+    }
+
+    // A claim interrupted before its marker leaves only its staging directory, so the next
+    // replacement still claims the recovery directory.
+    #[test]
+    fn interrupted_claim_recovers() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        write_portal(&target, "old");
+        std::mem::forget(TempInstallDir::create(tempdir.path()).unwrap());
+        let staged = tempdir.path().join("staged");
+        write_portal(&staged, "new");
+        let staged = TempInstallDir {
+            path: staged,
+            cleanup: true,
+        };
+
+        replace_portable(staged, &target, &previous).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("index.html")).unwrap(),
+            "new"
+        );
+        assert!(!previous.exists());
     }
 
     #[test]

@@ -1,0 +1,22 @@
+# Adds a swap file on /mnt, so a memory peak of a large build or export does not stop the runner.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+name: Add swap space
+description: Creates and enables a swap file of the given size on /mnt and prints the memory.
+inputs:
+  size:
+    description: Size of the swap file, as fallocate takes it.
+    required: false
+    default: 8G
+runs:
+  using: composite
+  steps:
+    - name: Add swap space
+      shell: bash
+      run: |
+        sudo fallocate -l "${{ inputs.size }}" /mnt/swapfile
+        sudo chmod 600 /mnt/swapfile
+        sudo mkswap /mnt/swapfile
+        sudo swapon /mnt/swapfile
+        free -m
