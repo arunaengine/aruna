@@ -56,7 +56,7 @@ pub(super) fn missing_index(
     Ok(missing.len())
 }
 
-fn family_of(bytes: [u8; FAMILY_BYTES]) -> JobFamilyId {
+pub(super) fn family_of(bytes: [u8; FAMILY_BYTES]) -> JobFamilyId {
     let (mut submission, mut digest) = ([0u8; 32], [0u8; 32]);
     submission.copy_from_slice(&bytes[..32]);
     digest.copy_from_slice(&bytes[32..]);

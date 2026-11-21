@@ -93,6 +93,7 @@ mod sessions;
 mod sizes;
 mod staging;
 mod sync_ops;
+mod tombstones;
 pub(crate) mod topic_purge;
 mod trailing;
 mod uploads;
@@ -117,6 +118,9 @@ pub struct MigrateOutput {
     pub old_runs_deleted: BTreeMap<String, usize>,
     /// Run crate documents of the deleted runs; the documents and their status rows stay.
     pub run_crates_kept: usize,
+    /// Deleted families with records that keep a finished prune tombstone and their aliases, so
+    /// the submitter reads "pruned" until the tombstone expires.
+    pub families_tombstoned: usize,
     /// Derived projection rows dropped. The reader rebuilds a missing one from
     /// the immutable records, so clearing them needs no re-encode.
     pub projections_cleared: usize,
@@ -563,6 +567,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         let found = vault::vault_rows(&db, &rows, moved, keys.as_ref(), &mut secrets_skipped)?;
         moves.push((rows, found));
     }
+    let now_ms = aruna_clock::unix_timestamp_millis();
+    let tombstones = removal.tombstones(now_ms)?;
 
     let mut txn = db.write_tx()?;
     for (keyspace, rows) in [
@@ -650,16 +656,17 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
             txn.remove(keyspace.clone(), key.clone());
         }
     }
+    for (name, key, value) in tombstones.iter().flatten() {
+        let keyspace = db.keyspace(name, KeyspaceCreateOptions::default)?;
+        txn.insert(keyspace, key.to_vec(), value.to_vec());
+    }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("migration conflicted with a running node".to_string())
     })?;
     // The node rows go first, so an interrupted purge still finds `/node-info-v2` and resumes.
     let (info_ops, fanout_cursors) = info_topics::purge_topics(sync_path, &info.topics)?;
-    let families_scheduled = prune_index::missing_index(
-        &db,
-        [&record_rows, &pending_rows, &conflict_rows],
-        aruna_clock::unix_timestamp_millis(),
-    )?;
+    let families_scheduled =
+        prune_index::missing_index(&db, [&record_rows, &pending_rows, &conflict_rows], now_ms)?;
     // Each batch commits on its own; a rerun skips the rows an earlier run already rewrote.
     let audits = trailing::missing_fields::<AdminAuditRecord>(
         &db,
@@ -697,6 +704,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         old_families_deleted: removal.family_count(),
         old_runs_deleted: removal.counts(),
         run_crates_kept: removal.run_crates,
+        families_tombstoned: tombstones.len(),
         projections_cleared: projections.len(),
         realm_configs_scanned: configs.scanned,
         realm_configs_rewritten: configs.rows.len(),

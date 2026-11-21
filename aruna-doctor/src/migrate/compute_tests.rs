@@ -9,7 +9,8 @@ use crate::migrate::tests::{read, strip, write};
 use aruna_core::compute::{ExecutionTargetId, ExecutorCapability};
 use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
-    FAMILY_RECORD_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, LAUNCH_RECORD_KEYSPACE,
+    FAMILY_ALIAS_KEYSPACE, FAMILY_PRUNE_KEYSPACE, FAMILY_RECORD_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, LAUNCH_RECORD_KEYSPACE,
     NODE_INFO_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::scheduling::{ExecutionPlan, RejectedTarget};
@@ -19,10 +20,19 @@ use aruna_core::structs::execution::job::family::{
 };
 use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
 use aruna_core::structs::execution::job::local::{AttemptIntent, JobRecord};
+use aruna_core::structs::execution::job::prune::FamilyTombstone;
+use aruna_core::structs::execution::job::record_keys::{alias_key, family_prefix, prune_rows_at};
+use aruna_core::structs::execution::job::record_rows::from_bytes;
 use aruna_core::structs::execution::job::rows::job_insert_entries;
+use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::node_info::node_info_key;
 use aruna_core::user::id::UserId;
+use aruna_drivers::driver::{DriverContext, drive};
+use aruna_operations::jobs::lifecycle::family_reads::FamilyStatusOperation;
+use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::sync::outbox::record::new_identified_record;
+use aruna_storage::storage::worker::FjallStorage;
+use std::collections::BTreeSet;
 use std::path::Path;
 use tempfile::tempdir;
 
@@ -648,4 +658,88 @@ fn keeps_other_jobs() {
     }
     let again = migrate_output(path.to_str().unwrap()).unwrap();
     assert_eq!(again.jobs_rewritten, 0);
+}
+
+// An alpha.159 family leaves the finished tombstone a prune leaves, with its alias and the index
+// rows of its expiry: its submitter reads "pruned", anyone else "not found". A rerun writes none.
+#[tokio::test]
+async fn tombstones_old_families() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("db");
+    let (logical, physical) = (JobId::from_bytes([21u8; 16]), JobId::from_bytes([22u8; 16]));
+    let rows = [
+        (key(OLD, JobRecordKind::Spec, 5), spec_row()),
+        (key(OLD, JobRecordKind::Claim, 21), claim(OLD)),
+        (key(OLD, JobRecordKind::Launch, 1), unnamed(launch())),
+        (
+            key(OLD, JobRecordKind::Receipt, 23),
+            unnamed(receipt(physical, Ulid::from_bytes([23u8; 16]))),
+        ),
+    ];
+    let rows = rows
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.clone()));
+    write(&path, FAMILY_RECORD_KEYSPACE, rows.collect());
+    let alias = alias_key(logical, &OLD);
+    write(
+        &path,
+        FAMILY_ALIAS_KEYSPACE,
+        vec![(alias.as_ref(), vec![1])],
+    );
+    let before = aruna_clock::unix_timestamp_millis();
+
+    let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+    assert_eq!(
+        (output.old_families_deleted, output.families_tombstoned),
+        (1, 1)
+    );
+    assert!(read(&path, FAMILY_RECORD_KEYSPACE).is_empty());
+    let tombstones = read(&path, FAMILY_TOMBSTONE_KEYSPACE);
+    let tombstone: FamilyTombstone = from_bytes(&tombstones[family_prefix(&OLD).as_ref()]).unwrap();
+    assert!(tombstone.pruned_at_ms >= before);
+    let expected = FamilyTombstone {
+        pruned_at_ms: tombstone.pruned_at_ms,
+        last_record_ms: 3_000,
+        finished: true,
+        created_by: Some(user()),
+        aliases: vec![logical],
+    };
+    assert_eq!(tombstone, expected);
+    let due = prune_rows_at(&OLD, tombstone.expires_at_ms()).map(|(_, key, _)| key.to_vec());
+    let index: BTreeSet<_> = read(&path, FAMILY_PRUNE_KEYSPACE).into_keys().collect();
+    assert_eq!(index, BTreeSet::from(due));
+    let aliases = read(&path, FAMILY_ALIAS_KEYSPACE);
+    assert_eq!(aliases.keys().collect::<Vec<_>>(), [&alias.to_vec()]);
+
+    let again = migrate_output(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        (again.old_families_deleted, again.families_tombstoned),
+        (0, 0)
+    );
+    assert_eq!(read(&path, FAMILY_TOMBSTONE_KEYSPACE), tombstones);
+    assert_eq!(
+        read(&path, FAMILY_PRUNE_KEYSPACE)
+            .into_keys()
+            .collect::<BTreeSet<_>>(),
+        index
+    );
+
+    let context = DriverContext {
+        storage_handle: FjallStorage::open(path.to_str().unwrap()).unwrap(),
+        net_handle: None,
+        blob_handle: None,
+        graph_handle: None,
+        task_handle: None,
+        compute_handle: None,
+        outbound_handle: None,
+    };
+    let now_ms = aruna_clock::unix_timestamp_millis();
+    let status =
+        |reader| FamilyStatusOperation::new(&AuthContext::new(reader, REALM), logical, now_ms);
+    let pruned = drive(status(user()), &context).await;
+    assert_eq!(pruned.err(), Some(JobRouteError::Pruned));
+    let other = UserId::new(Ulid::from_bytes([12u8; 16]), REALM);
+    let hidden = drive(status(other), &context).await;
+    assert_eq!(hidden.err(), Some(JobRouteError::NotFound));
 }

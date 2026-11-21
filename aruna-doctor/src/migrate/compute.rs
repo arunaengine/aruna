@@ -6,6 +6,7 @@
 use super::families::exact;
 use super::removals::outbox_record;
 use super::session_refs::{self, Layout, SESSION_REF};
+use super::tombstones::Stated;
 use crate::explorer::ExplorerError;
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeReservationSnapshot, JobReservationRecord,
@@ -85,6 +86,19 @@ pub(super) fn receipt_jobs(value: &[u8]) -> Option<(JobId, Ulid)> {
         Record::Receipt(receipt) => Some((receipt.physical_job_id, receipt.execution_id)),
         _ => None,
     }
+}
+
+/// The time an alpha.206 spec, claim, launch or receipt states, and a spec's submitter.
+pub(super) fn stated(value: &[u8]) -> Option<Stated> {
+    let envelope = exact::<Envelope>(value)
+        .or_else(|| session_refs::decode::<Envelope>(value, UNNAMED).ok())?;
+    Some(match envelope.record {
+        Record::Spec(spec) => (Some(spec.created_at_ms), Some(spec.created_by)),
+        Record::Claim(claim) => (Some(claim.accepted_at_ms), None),
+        Record::Budget(_) => (None, None),
+        Record::Launch(launch) => (Some(launch.created_at_ms), None),
+        Record::Receipt(receipt) => (Some(receipt.accepted_at_ms), None),
+    })
 }
 
 /// A job record stored as alpha.206 stored it, read into the current shape.

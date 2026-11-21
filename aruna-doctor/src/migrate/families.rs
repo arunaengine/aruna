@@ -5,6 +5,8 @@
 
 use super::compute;
 use super::jobs::LegacyInput;
+use super::prune_index::family_of;
+use super::tombstones::{Remains, Stated};
 use super::{Rewrites, decode_error, rewritten};
 use crate::explorer::ExplorerError;
 use aruna_core::compute::ExecutionTargetId;
@@ -29,7 +31,7 @@ use aruna_core::structs::execution::job::rows::prune_delete_entries;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::placement::policy::PlacementPolicyRef;
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key, Value};
 use aruna_core::user::id::UserId;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::de::DeserializeOwned;
@@ -94,6 +96,8 @@ pub(super) struct Removal {
     families: BTreeSet<[u8; 64]>,
     jobs: BTreeSet<JobId>,
     executions: BTreeSet<Ulid>,
+    /// What each removed family with records leaves, as a finished prune leaves it.
+    remains: BTreeMap<[u8; 64], Remains>,
     /// Stored keys to delete, by keyspace.
     pub(super) rows: BTreeMap<String, BTreeSet<Vec<u8>>>,
     /// Run crate documents of deleted jobs, which stay.
@@ -170,7 +174,7 @@ impl Removal {
     }
 
     /// Rows whose key names a removed family at `offset`. Records and aliases also name the
-    /// family's jobs and executions.
+    /// family's jobs and executions; records must go first, so aliases find their tombstone.
     pub(super) fn family_rows(
         &mut self,
         db: &OptimisticTxDatabase,
@@ -184,12 +188,16 @@ impl Removal {
         for entry in db.read_tx().iter(&keyspace) {
             let (key, value) = entry.into_inner()?;
             let family = key.get(offset..offset + 64);
-            if !family.is_some_and(|family| self.families.contains(family)) {
+            let family = family.and_then(|bytes| <[u8; 64]>::try_from(bytes).ok());
+            let Some(family) = family.filter(|family| self.families.contains(family)) else {
                 continue;
-            }
+            };
             match name {
-                FAMILY_ALIAS_KEYSPACE => self.alias_job(&key),
-                FAMILY_RECORD_KEYSPACE => self.record_jobs(&value),
+                FAMILY_ALIAS_KEYSPACE if self.alias_job(&key, &family) => continue,
+                FAMILY_RECORD_KEYSPACE => {
+                    self.record_jobs(&value);
+                    self.remains.entry(family).or_default().record(&value);
+                }
                 _ => {}
             }
             self.add(name, &key);
@@ -325,11 +333,29 @@ impl Removal {
         Ok(())
     }
 
-    /// An alias key starts with the job id it binds.
-    fn alias_job(&mut self, key: &[u8]) {
-        if let Some(Ok(id)) = key.get(..16).map(<[u8; 16]>::try_from) {
-            self.jobs.insert(JobId::from_bytes(id));
-        }
+    /// The rows a finished prune at `now_ms` leaves of each removed family with records.
+    pub(super) fn tombstones(
+        &self,
+        now_ms: u64,
+    ) -> Result<Vec<[(String, Key, Value); 3]>, ExplorerError> {
+        (self.remains.iter())
+            .map(|(family, remains)| remains.rows(&family_of(*family), now_ms))
+            .collect()
+    }
+
+    /// An alias key starts with the job id it binds. Answers whether the alias stays, as the
+    /// tombstone of a family with records keeps answering it until both expire.
+    fn alias_job(&mut self, key: &[u8], family: &[u8; 64]) -> bool {
+        let Some(Ok(id)) = key.get(..16).map(<[u8; 16]>::try_from) else {
+            return false;
+        };
+        let job_id = JobId::from_bytes(id);
+        self.jobs.insert(job_id);
+        let Some(remains) = self.remains.get_mut(family) else {
+            return false;
+        };
+        remains.alias(job_id);
+        true
     }
 
     /// Claims name a logical job; receipts name the physical job and execution on this node.
@@ -520,6 +546,16 @@ struct OldEnvelope {
     record: OldRecord,
     published_by: NodeId,
     signature: iroh::Signature,
+}
+
+/// The time an alpha.134 spec, claim or launch states, and a spec's submitter.
+pub(super) fn old_stated(value: &[u8]) -> Option<Stated> {
+    Some(match exact::<OldEnvelope>(value)?.record {
+        OldRecord::Spec(spec) => (Some(spec.created_at_ms), Some(spec.created_by)),
+        OldRecord::Claim(claim) => (Some(claim.accepted_at_ms), None),
+        OldRecord::Budget(_) => (None, None),
+        OldRecord::Launch(launch) => (Some(launch.created_at_ms), None),
+    })
 }
 
 #[cfg(test)]
@@ -899,9 +935,9 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn deletes_old_families() {
-        // An alpha.134 spec and launch take their whole family, its local jobs and execution
-        // with them. A current family and its job stay, the run crate stays, and the node lists
-        // and recovers jobs from what is left. A second run changes nothing.
+        // An alpha.134 spec and launch take their family, local jobs and execution; the alias
+        // stays with the tombstone. A current family, its job and the run crate stay, the node
+        // lists and recovers jobs from what is left, and a second run changes nothing.
         let temp = tempdir().unwrap();
         let path = temp.path().join("db");
         let kept_job = JobId::from_bytes([21u8; 16]);
@@ -914,9 +950,11 @@ pub(super) mod tests {
         let alias = [kept_job.to_bytes().as_slice(), &KEPT.to_bytes()].concat();
         write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
         store_job(&path, kept_job);
+        let (logical, physical) = (JobId::from_bytes([5u8; 16]), JobId::from_bytes([22u8; 16]));
+        let alias = [logical.to_bytes().as_slice(), &OLD.to_bytes()].concat();
+        write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
         let kept = snapshot(&path);
 
-        let (logical, physical) = (JobId::from_bytes([5u8; 16]), JobId::from_bytes([22u8; 16]));
         let execution = Ulid::from_bytes([23u8; 16]);
         let rows = [
             (
@@ -937,8 +975,6 @@ pub(super) mod tests {
             .iter()
             .map(|(key, value)| (key.as_slice(), value.clone()));
         write(&path, FAMILY_RECORD_KEYSPACE, rows.collect());
-        let alias = [logical.to_bytes().as_slice(), &OLD.to_bytes()].concat();
-        write(&path, FAMILY_ALIAS_KEYSPACE, vec![(&alias, vec![1])]);
         let outbox = key(OLD, JobRecordKind::Claim, 5);
         write(&path, FAMILY_OUTBOX_KEYSPACE, vec![(&outbox, vec![1])]);
         let deadline = [7u64.to_be_bytes().as_slice(), &OLD.to_bytes()].concat();
@@ -963,15 +999,19 @@ pub(super) mod tests {
             (output.old_families_deleted, output.run_crates_kept),
             (1, 1)
         );
+        assert_eq!(output.families_tombstoned, 1);
         assert_eq!(deleted(&output, FAMILY_RECORD_KEYSPACE), 4);
-        assert_eq!(deleted(&output, FAMILY_ALIAS_KEYSPACE), 1);
+        assert_eq!(deleted(&output, FAMILY_ALIAS_KEYSPACE), 0);
         assert_eq!(deleted(&output, JOB_KEYSPACE), 2);
         assert_eq!(deleted(&output, JOB_RESERVATION_KEYSPACE), 1);
         assert_eq!(snapshot(&path), kept);
         assert_eq!(read(&path, RUN_CRATE_KEYSPACE), run_crate);
 
         let again = migrate_output(path.to_str().unwrap()).unwrap();
-        assert_eq!(again.old_families_deleted, 0);
+        assert_eq!(
+            (again.old_families_deleted, again.families_tombstoned),
+            (0, 0)
+        );
         assert!(again.old_runs_deleted.is_empty());
         assert_eq!(snapshot(&path), kept);
 
