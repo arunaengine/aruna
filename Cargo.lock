@@ -2758,7 +2758,7 @@ checksum = "4f016b9994e39cad68107f33fa5b8dcee8fb7e38332bde3f97690e5e8abe1b10"
 [[package]]
 name = "craqle"
 version = "0.3.2"
-source = "git+https://github.com/arunaengine/craqle?rev=d4ac035851529b017418aae01aab29c7246b7c87#d4ac035851529b017418aae01aab29c7246b7c87"
+source = "git+https://github.com/arunaengine/craqle?rev=372e3e3fa8f286cfea7a5cead8b0c9b27d50a147#372e3e3fa8f286cfea7a5cead8b0c9b27d50a147"
 dependencies = [
  "blake3",
  "chrono",
@@ -5196,7 +5196,7 @@ dependencies = [
 [[package]]
 name = "irokle"
 version = "0.3.2"
-source = "git+https://github.com/arunaengine/irokle.git?rev=209f881af3fa4b8ed16e2ca0a0315d663029329e#209f881af3fa4b8ed16e2ca0a0315d663029329e"
+source = "git+https://github.com/arunaengine/irokle.git?rev=45f58d234df1f62e5da6b13414dbf80ee5f758a9#45f58d234df1f62e5da6b13414dbf80ee5f758a9"
 dependencies = [
  "blake3",
  "bytes",
@@ -5217,7 +5217,7 @@ dependencies = [
 [[package]]
 name = "irokle-derive"
 version = "0.1.0"
-source = "git+https://github.com/arunaengine/irokle.git?rev=209f881af3fa4b8ed16e2ca0a0315d663029329e#209f881af3fa4b8ed16e2ca0a0315d663029329e"
+source = "git+https://github.com/arunaengine/irokle.git?rev=45f58d234df1f62e5da6b13414dbf80ee5f758a9#45f58d234df1f62e5da6b13414dbf80ee5f758a9"
 dependencies = [
  "proc-macro2",
  "quote",
