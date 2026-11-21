@@ -31,6 +31,7 @@ use aruna_operations::s3::object::attributes::GetAttributesError;
 use aruna_operations::s3::object::delete::DeleteObjectError;
 use aruna_operations::s3::object::get::GetObjectError;
 use aruna_operations::s3::object::head::HeadObjectError;
+use aruna_operations::s3::object::head_source::HeadSourceError;
 use aruna_operations::s3::object::list::ListBucketError;
 use aruna_operations::s3::object::put::PutObjectError;
 use aruna_operations::s3::object::reference::MaterializeReferenceError;
@@ -154,6 +155,12 @@ fn usage_update_error(error: &UsageUpdateError) -> S3Error {
     let UsageUpdateError::Inventory(inventory) = error else {
         return usage_accounting_error();
     };
+    inventory_error(inventory)
+}
+
+/// The retryable inventory refusals of a distributed bucket; other inventory faults are an
+/// accounting failure.
+fn inventory_error(inventory: &InventoryError) -> S3Error {
     let message = match inventory {
         InventoryError::RangeMissing { .. } => {
             "This node holds no open range of the distributed bucket for the key yet; retry later."
@@ -207,6 +214,38 @@ fn policy_gate_error(error: &PolicyGateError, action: &str) -> S3Error {
         | PolicyGateError::Read(_) => placement_unavailable_error(),
         PolicyGateError::Invalid | PolicyGateError::Policy(_) => placement_denied_error(action),
         PolicyGateError::InvalidEvent | PolicyGateError::Conversion(_) => internal_error(error),
+    }
+}
+
+/// A bucket key that is locked or does not open answers as the read paths do.
+fn bucket_key_error(error: &BucketKeyError) -> S3Error {
+    match error {
+        BucketKeyError::Locked(_) => bucket_locked_error(),
+        BucketKeyError::InvalidToken => s3_error!(
+            InvalidToken,
+            "The security token does not open the bucket key"
+        ),
+        other => internal_error(other),
+    }
+}
+
+/// A reference source that cannot be headed answers as `HeadObject` does.
+fn head_source_error(error: HeadSourceError) -> S3Error {
+    match error {
+        HeadSourceError::Resolve(
+            SourceResolutionError::ResolveFailed | SourceResolutionError::NotFound,
+        ) => s3_error!(
+            ServiceUnavailable,
+            "Reference source is currently unavailable"
+        ),
+        HeadSourceError::Staging(StagingSourceError::NotFound) => {
+            s3_error!(NoSuchKey, "The referenced source object does not exist.")
+        }
+        HeadSourceError::Staging(StagingSourceError::AccessDenied) => {
+            s3_error!(AccessDenied, "Access to the referenced source was denied.")
+        }
+        HeadSourceError::Staging(err) => s3_error!(ServiceUnavailable, "{}", err),
+        err => internal_error(err),
     }
 }
 
@@ -450,7 +489,18 @@ impl IntoS3Error for CreateMultipartError {
                 backend_full_error(&backend.to_string())
             }
             CreateMultipartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            CreateMultipartError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
             CreateMultipartError::Distribution(ref error) => guard_error(error),
+            CreateMultipartError::PolicyGateError(ref error) => {
+                policy_gate_error(error, "CreateMultipartUpload")
+            }
+            error @ CreateMultipartError::UnsupportedChecksum(_) => {
+                s3_error!(InvalidRequest, "{error}")
+            }
+            CreateMultipartError::BucketKey(ref error) => bucket_key_error(error),
+            CreateMultipartError::Inventory(ref error) => inventory_error(error),
             CreateMultipartError::BlobError(BlobError::KeyTooLong) => long_key_error(),
             err => internal_error(err),
         }
@@ -476,6 +526,9 @@ impl IntoS3Error for UploadPartError {
             UploadPartError::WriteFailed(message) => write_failed_error(&message, "UploadPart"),
             UploadPartError::PolicyGateError(ref error) => policy_gate_error(error, "UploadPart"),
             UploadPartError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            UploadPartError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
             UploadPartError::BlobWriteFailed(ref message) => part_store_error(message),
             err => internal_error(err),
         }
@@ -710,9 +763,20 @@ impl IntoS3Error for CopyObjectError {
             CopyObjectError::Reference(MaterializeReferenceError::Usage(err)) => {
                 usage_update_error(&err)
             }
-            CopyObjectError::Reference(err) => {
-                S3Error::with_message(S3ErrorCode::InternalError, err.to_string())
+            // A policy refusal names no rule: the rule ids stay out of the answer.
+            CopyObjectError::Reference(MaterializeReferenceError::Policy(_)) => {
+                placement_denied_error("CopyObject")
             }
+            CopyObjectError::Reference(MaterializeReferenceError::Purge(
+                PurgeFenceError::Suspended,
+            )) => purge_progress_error(),
+            CopyObjectError::Reference(MaterializeReferenceError::Purge(
+                PurgeFenceError::Distribution(err),
+            )) => guard_error(&err),
+            CopyObjectError::Reference(MaterializeReferenceError::Head(err)) => {
+                head_source_error(err)
+            }
+            CopyObjectError::Reference(err) => internal_error(err),
             CopyObjectError::PreconditionFailed => s3_error!(
                 PreconditionFailed,
                 "At least one of the preconditions you specified did not hold."
@@ -768,6 +832,10 @@ impl IntoS3Error for DeleteObjectError {
         match self {
             DeleteObjectError::NoSuchVersion => missing_version_error(),
             DeleteObjectError::PurgeFence(PurgeFenceError::Suspended) => purge_progress_error(),
+            DeleteObjectError::PurgeFence(PurgeFenceError::Distribution(ref error)) => {
+                guard_error(error)
+            }
+            DeleteObjectError::ManagedCopyError(ref error) => managed_copy_error(error),
             DeleteObjectError::UsageUpdateError(ref error) => usage_update_error(error),
             DeleteObjectError::Distribution(ref error) => guard_error(error),
             error @ DeleteObjectError::DistributedVersion => s3_error!(InvalidRequest, "{error}"),
@@ -1163,6 +1231,40 @@ mod tests {
         assert_eq!(denied.status_code(), Some(http::StatusCode::FORBIDDEN));
         let rendered = format!("{denied:?}");
         assert!(!rendered.contains(&policy_id.to_string()));
+    }
+
+    #[test]
+    fn hides_other_policy_ids() {
+        // Multipart and copy refusals answer like a refused put and name no policy.
+        let policy_id = ulid::Ulid::from_bytes([9u8; 16]);
+        let multipart = CreateMultipartError::PolicyGateError(PolicyGateError::Denied {
+            policy_ids: vec![policy_id],
+        })
+        .into_s3_error();
+        let copy = CopyObjectError::Reference(MaterializeReferenceError::Policy(
+            aruna_core::structs::placement::policy::PlacementPolicyError::ConflictingRefs {
+                policy_id,
+            },
+        ))
+        .into_s3_error();
+        for refused in [multipart, copy] {
+            assert_eq!(
+                *refused.code(),
+                S3ErrorCode::Custom("PlacementPolicyDenied".into())
+            );
+            assert_eq!(refused.status_code(), Some(http::StatusCode::FORBIDDEN));
+            assert!(!format!("{refused:?}").contains(&policy_id.to_string()));
+        }
+    }
+
+    #[test]
+    fn maps_delete_copy_refusal() {
+        // A delete refused by a managed copy answers as the read paths do, not as a 500.
+        let error =
+            DeleteObjectError::ManagedCopyError(ManagedCopyError::Unregistered).into_s3_error();
+        let expected = managed_copy_error(&ManagedCopyError::Unregistered);
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.status_code(), expected.status_code());
     }
 
     #[test]
