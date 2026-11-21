@@ -382,63 +382,154 @@ async fn shard_membership_exact() {
     service.shutdown().await;
 }
 
-/// A published cursor advance holds the reconcile lock through its write, so it
-/// cannot overwrite a cursor that a reconcile or an eviction writes meanwhile.
-#[test]
-fn advance_holds_reconcile() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .max_blocking_threads(1)
-        .enable_all()
-        .build()
-        .expect("runtime builds");
-    runtime.block_on(async {
-        let (_dir, storage) = test_storage();
-        let doc = tempfile::tempdir().expect("document sync dir");
-        let service = DocumentSyncService::open_with_policy(
-            test_endpoint(86).await,
-            storage,
-            doc.path().join("document-sync"),
-            &[node(87)],
-            vec![Alpn::DocumentSync.as_bytes().to_vec()],
-            ::irokle::net::IrohRuntimeConfig::default(),
-            FjallPersistPolicy::Buffer,
-            restart_realm(),
-        )
-        .expect("document sync service opens");
-        let (release, held) = std::sync::mpsc::channel::<()>();
-        let (occupied, ready) = tokio::sync::oneshot::channel();
-        let occupier = tokio::task::spawn_blocking(move || {
-            occupied
-                .send(())
-                .expect("test waits for the blocking thread");
-            let _ = held.recv();
-        });
-        ready.await.expect("blocking thread occupied");
-        let advance = tokio::spawn({
-            let service = service.clone();
-            async move {
-                let published =
-                    BTreeMap::from([(restart_topic(), ::irokle::ActorClock::default())]);
-                service.advance_topic_cursors(published).await
+/// A published cursor advance holds the reconcile lock from its cursor read through its write,
+/// so a reconcile that waits meanwhile keeps the position the advance wrote.
+#[tokio::test]
+async fn advance_holds_reconcile() {
+    use ::irokle::{Ed25519Signer, Signer as _};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (_dir, real) = test_storage();
+    // The proxy forwards every effect to the real store and holds the reply of one armed read.
+    let (proxy, receivers) = real.proxy_channels();
+    drop(receivers.bulk);
+    let armed = Arc::new(AtomicBool::new(false));
+    let (admitted, admission) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn({
+        let (armed, real) = (armed.clone(), real.clone());
+        move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("proxy runtime builds");
+            let mut gate = Some((admitted, released));
+            while let Ok((effect, response, _span, _queued, in_flight)) =
+                receivers.foreground.recv()
+            {
+                let gated = matches!(
+                    &effect,
+                    StorageEffect::Read { key_space, .. } if key_space == APPLIED_OPS_KEYSPACE
+                ) && armed.swap(false, Ordering::AcqRel);
+                let Event::Storage(event) = runtime.block_on(real.send_storage_effect(effect))
+                else {
+                    unreachable!("the storage proxy only forwards storage effects");
+                };
+                let Some((admitted, released)) = gate.take_if(|_| gated) else {
+                    let _ = response.send(event);
+                    continue;
+                };
+                // Later effects keep flowing while this reply waits for its release.
+                std::thread::spawn(move || {
+                    let _ = admitted.send(());
+                    let _ = released.recv();
+                    let _ = response.send(event);
+                    drop(in_flight);
+                });
             }
-        });
-        let mut locked = false;
-        for _ in 0..10_000 {
-            if service.reconcile_lock.try_lock().is_err() {
-                locked = true;
-                break;
-            }
-            tokio::task::yield_now().await;
         }
-        assert!(locked, "the cursor advance never took the reconcile lock");
-        release.send(()).expect("blocking thread waits");
-        occupier.await.expect("blocking thread ends");
-        advance
-            .await
-            .expect("advance task ends")
-            .expect("cursor advance succeeds");
-        service.shutdown().await;
     });
+
+    let doc = tempfile::tempdir().expect("document sync dir");
+    let realm_id = restart_realm();
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(86).await,
+        proxy,
+        doc.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+    let (local_node, remote_node) = (service.local_node_id().expect("local node"), node(87));
+    let topic_id = DocumentTarget::NodeInfo {
+        realm_id,
+        node_id: remote_node,
+    }
+    .sync_topic_id(realm_id, &PlacementRef::NIL);
+    service
+        .ensure_sync_topics(&[topic_id], vec![remote_node])
+        .expect("topic exists");
+    let event = |node_id: NodeId, seed: u128| {
+        let event_id = Ulid::from_parts(1_727_000_000_000, seed);
+        let event = DocumentEvent::Upsert {
+            event_id,
+            target: DocumentTarget::NodeInfo { realm_id, node_id },
+            bytes: node_info_bytes(node_id, 1),
+            change: DocumentChange {
+                base: None,
+                current: DocumentSyncRevision {
+                    generation: 1,
+                    event_id,
+                    actor: node_id,
+                    updated_at_ms: 1,
+                },
+                kind: DocumentChangeKind::Upsert,
+                placement: PlacementRef::NIL,
+            },
+        };
+        EventEnvelope::encode_event(&event).expect("event encodes")
+    };
+    let oplog = Oplog::with_storage(service.node().storage().clone());
+    let remote_signer = Ed25519Signer::from_bytes(&[87; 32]);
+    let remote_actor = ::irokle::actor_id_for(topic_id, remote_signer.peer_id());
+    let remote_op = oplog
+        .create_event_op(
+            topic_id,
+            remote_actor,
+            event(remote_node, 1),
+            &remote_signer,
+        )
+        .expect("remote event appends");
+    let local_actor = ::irokle::actor_id_for(topic_id, node_to_peer(&local_node));
+    let local_op = oplog
+        .create_event_op(
+            topic_id,
+            local_actor,
+            event(local_node, 2),
+            service.node().signer(),
+        )
+        .expect("local event appends");
+    let genesis = service.topic_genesis(topic_id).expect("genesis reads");
+    let mut published = PublishedOps::default();
+    let lineage = crate::shard_manifest::lineage_root(&genesis.expect("topic genesis"));
+    published.observe(&local_op, lineage);
+
+    armed.store(true, Ordering::Release);
+    let advance = tokio::spawn({
+        let service = service.clone();
+        async move {
+            let published = BTreeMap::from([(topic_id, published)]);
+            service.advance_topic_cursors(published).await
+        }
+    });
+    admission.await.expect("the advance reads its cursor");
+    assert!(
+        service.reconcile_lock.try_lock().is_err(),
+        "the advance reads its cursor under the reconcile lock"
+    );
+    let reconcile = tokio::spawn({
+        let service = service.clone();
+        async move { service.reconcile_document_topics([topic_id]).await }
+    });
+    release.send(()).expect("the proxy holds the read");
+    advance
+        .await
+        .expect("advance task ends")
+        .expect("cursor advance succeeds");
+    reconcile
+        .await
+        .expect("reconcile task ends")
+        .expect("reconcile succeeds");
+
+    let cursor = read_test_cursor(&real, topic_id)
+        .await
+        .expect("cursor stored");
+    assert_eq!(cursor.get(&local_actor), local_op.signed.body.actor_seq);
+    assert_eq!(cursor.get(&remote_actor), remote_op.signed.body.actor_seq);
+    service.shutdown().await;
 }
 
 /// A cancelled reconcile keeps the reconcile lock until its queued control writes
