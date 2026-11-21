@@ -34,6 +34,18 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
+      # The workspace test build stopped the runner without either; its logs never said which.
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /mnt/build.swap
+          sudo chmod 600 /mnt/build.swap
+          sudo mkswap /mnt/build.swap
+          sudo swapon /mnt/build.swap
+          free -m
+
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
