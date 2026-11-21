@@ -449,6 +449,7 @@ async fn exchange_guarded(
     if !link.is_file() {
         return Err(PlaceError::Refused(LocalFileRefusal::NotRegular));
     }
+    let published = file_identity(&spooled.path);
     swap_in(&spooled.path, kept, target).await?;
     // The displaced file now sits at the kept path, where only its strong
     // hash can answer for it: the exchange renamed away its fingerprint.
@@ -456,7 +457,8 @@ async fn exchange_guarded(
         let _ = tokio::fs::remove_file(kept).await;
         return Ok(());
     }
-    Err(swap_back(kept, target, &spooled.blake3).await)
+    let download = live_download(target, published, &spooled.blake3).await;
+    Err(swap_back(kept, target, download).await)
 }
 
 /// Swaps the spool in for the target through the kept path, so the bytes it
@@ -483,50 +485,53 @@ async fn swap_in(spool: &Path, kept: &Path, target: &Path) -> Result<(), PlaceEr
     Err(PlaceError::Failed(error.to_string()))
 }
 
-/// Puts the displaced owner file at `kept` back at the target.
-#[cfg(not(windows))]
-async fn swap_back(kept: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
-    match exchange(kept, target) {
-        Ok(()) => settle_returned(kept, target, incoming).await,
-        Err(_) => keep_displaced(kept, target).await,
+/// The identity of the live file at `target` while it is still the published
+/// download: the same file, holding the same bytes. An owner save never is.
+async fn live_download(
+    target: &Path,
+    published: Option<FileIdentity>,
+    blake3: &[u8; 32],
+) -> Option<FileIdentity> {
+    let file = std::fs::File::open(target).ok()?;
+    let identity = identity_of(&file).filter(|identity| Some(*identity) == published)?;
+    match hash_file(tokio::fs::File::from_std(file)).await {
+        Ok((_, hash, _)) if hash == *blake3 => Some(identity),
+        _ => None,
     }
 }
 
-#[cfg(windows)]
-async fn swap_back(kept: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
+/// Rolls back a replace whose displaced owner file at `kept` drifted. The live
+/// file leaves the target first, so a save made since then keeps the name.
+async fn swap_back(kept: &Path, target: &Path, download: Option<FileIdentity>) -> PlaceError {
     let returned = kept.with_file_name(Ulid::generate().to_string());
-    match replace_file(target, kept, &returned) {
-        Ok(()) => settle_returned(&returned, target, incoming).await,
-        Err(_) => keep_displaced(kept, target).await,
+    let pulled = match tokio::fs::symlink_metadata(target).await {
+        Ok(link) if link.is_file() => tokio::fs::rename(target, &returned).await.is_ok(),
+        _ => false,
+    };
+    if !pulled {
+        return put_back(kept, target).await;
+    }
+    // Only the very file classified as the download is discarded.
+    if download.is_some() && file_identity(&returned) == download {
+        let restored = put_back(kept, target).await;
+        let _ = tokio::fs::remove_file(&returned).await;
+        return restored;
+    }
+    // The live file was an owner save, newer than the displaced one.
+    let newest = put_back(&returned, target).await;
+    match keep_displaced(kept, target).await {
+        PlaceError::Kept(path) => PlaceError::Kept(path),
+        _ => newest,
     }
 }
 
-/// Discards the file a swap back displaced only when it is the incoming
-/// download. A save the owner made in the meantime is the newest, so it goes
-/// back to the target and the older save is put beside it.
-async fn settle_returned(returned: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
-    if !holds_hash(returned, incoming).await {
-        let older = swap_newest(returned, target).unwrap_or_else(|_| returned.to_path_buf());
-        return keep_displaced(&older, target).await;
+/// Puts the owner's file back at the vacant target. A save that took the name
+/// in the meantime is newer and stays; this file then goes beside it.
+async fn put_back(file: &Path, target: &Path) -> PlaceError {
+    match place_new(file, target) {
+        Ok(()) => PlaceError::Refused(LocalFileRefusal::Drifted),
+        Err(_) => keep_displaced(file, target).await,
     }
-    let _ = tokio::fs::remove_file(returned).await;
-    PlaceError::Refused(LocalFileRefusal::Drifted)
-}
-
-/// Puts the newer save at `returned` back at the target and answers where the
-/// older save it displaced now sits.
-#[cfg(not(windows))]
-fn swap_newest(returned: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
-    exchange(returned, target)?;
-    Ok(returned.to_path_buf())
-}
-
-#[cfg(windows)]
-fn swap_newest(returned: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
-    let older = returned.with_file_name(Ulid::generate().to_string());
-    replace_file(target, returned, &older)
-        .map_err(|error| PlaceError::Failed(error.to_string()))?;
-    Ok(older)
 }
 
 /// Puts the owner's bytes at `kept` beside the target, or names the path they
@@ -541,6 +546,25 @@ async fn keep_displaced(kept: &Path, target: &Path) -> PlaceError {
 /// Whether the file at `path` holds exactly the bytes `blake3` names.
 async fn holds_hash(path: &Path, blake3: &[u8; 32]) -> bool {
     matches!(hash_stable(path).await, Ok((_, hash, _)) if hash == *blake3)
+}
+
+/// Which file a path names, kept across renames: its device and file index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    index: u64,
+}
+
+fn file_identity(path: &Path) -> Option<FileIdentity> {
+    identity_of(&std::fs::File::open(path).ok()?)
+}
+
+fn identity_of(file: &std::fs::File) -> Option<FileIdentity> {
+    let metadata = cap_std::fs::Metadata::from_file(file).ok()?;
+    Some(FileIdentity {
+        device: cap_fs_ext::MetadataExt::dev(&metadata),
+        index: cap_fs_ext::MetadataExt::ino(&metadata),
+    })
 }
 
 /// Swaps two existing paths in one step. Neither file is ever destroyed.
@@ -943,25 +967,50 @@ mod tests {
         }
     }
 
+    /// Saves `bytes` the way an editor does: a new file renamed over the target.
+    async fn editor_save(target: &Path, bytes: &[u8]) -> Option<FileIdentity> {
+        let save = target.with_extension("save");
+        tokio::fs::write(&save, bytes).await.unwrap();
+        let identity = file_identity(&save);
+        tokio::fs::rename(&save, target).await.unwrap();
+        identity
+    }
+
+    /// The paths a listing of the whole folder reports, sorted.
+    async fn listed_paths(root: &Path) -> Vec<String> {
+        let (entries, _) = list_local(&access(root, ""), Vec::new(), 10, true, true)
+            .await
+            .unwrap();
+        let mut paths: Vec<String> = entries.into_iter().map(|entry| entry.path).collect();
+        paths.sort();
+        paths
+    }
+
+    /// A target holding `first save` with the incoming download swapped in,
+    /// and the identity that download was published under.
+    async fn swapped_folder(path: &str) -> (PathBuf, PathBuf, Option<FileIdentity>) {
+        let target = Path::new(path).join("note.txt");
+        tokio::fs::write(&target, b"first save").await.unwrap();
+        let spool = reserved_file(path, SPOOL_DIR).await.unwrap();
+        tokio::fs::write(&spool, b"incoming").await.unwrap();
+        let published = file_identity(&spool);
+        let kept = reserved_file(path, KEPT_DIR).await.unwrap();
+        assert!(swap_in(&spool, &kept, &target).await.is_ok());
+        (target, kept, published)
+    }
+
     // A save the owner makes while the displaced file is checked is what the
     // swap back displaces; both owner versions must survive it.
     #[tokio::test]
     async fn keeps_second_save() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().to_string_lossy().to_string();
-        let target = root.path().join("note.txt");
-        tokio::fs::write(&target, b"first save").await.unwrap();
-        let spool = reserved_file(&path, SPOOL_DIR).await.unwrap();
-        tokio::fs::write(&spool, b"incoming").await.unwrap();
-        let kept = reserved_file(&path, KEPT_DIR).await.unwrap();
-        assert!(swap_in(&spool, &kept, &target).await.is_ok());
-        // An editor saves by renaming a new file over the target.
-        let save = root.path().join("note.txt.save");
-        tokio::fs::write(&save, b"second save").await.unwrap();
-        tokio::fs::rename(&save, &target).await.unwrap();
+        let (target, kept, published) = swapped_folder(&path).await;
+        editor_save(&target, b"second save").await;
 
         let incoming = *::blake3::hash(b"incoming").as_bytes();
-        let refusal = swap_back(&kept, &target, &incoming).await;
+        let download = live_download(&target, published, &incoming).await;
+        let refusal = swap_back(&kept, &target, download).await;
         assert!(matches!(
             refusal,
             PlaceError::Refused(LocalFileRefusal::Drifted)
@@ -981,6 +1030,70 @@ mod tests {
             vec![b"first save".to_vec(), b"second save".to_vec()]
         );
         assert!(!kept.exists());
+    }
+
+    // A third save while the rollback classifies the second wins the target; the
+    // first save stays beside it as a visible copy and nothing stays protected.
+    #[tokio::test]
+    async fn keeps_third_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let (target, kept, published) = swapped_folder(&path).await;
+        editor_save(&target, b"second save").await;
+        let incoming = *::blake3::hash(b"incoming").as_bytes();
+        let download = live_download(&target, published, &incoming).await;
+        assert!(download.is_none(), "an owner save is not the download");
+        editor_save(&target, b"third save").await;
+
+        let refusal = swap_back(&kept, &target, download).await;
+        assert!(matches!(
+            refusal,
+            PlaceError::Refused(LocalFileRefusal::Drifted)
+        ));
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"third save");
+        let paths = listed_paths(root.path()).await;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].starts_with("note (conflicted copy "));
+        assert_eq!(paths[1], "note.txt");
+        let copy = tokio::fs::read(root.path().join(&paths[0])).await.unwrap();
+        assert_eq!(copy, b"first save");
+        assert_eq!(
+            std::fs::read_dir(root.path().join(KEPT_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    // A new file holding exactly the incoming bytes is still the owner's save:
+    // it keeps the target, and the displaced first save goes beside it.
+    #[tokio::test]
+    async fn keeps_identical_save() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let (target, kept, published) = swapped_folder(&path).await;
+        let incoming = *::blake3::hash(b"incoming").as_bytes();
+        let download = live_download(&target, published, &incoming).await;
+        assert!(download.is_some(), "the untouched download is recognised");
+        let saved = editor_save(&target, b"incoming").await;
+        assert!(live_download(&target, published, &incoming).await.is_none());
+
+        let refusal = swap_back(&kept, &target, download).await;
+        assert!(matches!(
+            refusal,
+            PlaceError::Refused(LocalFileRefusal::Drifted)
+        ));
+        assert_eq!(file_identity(&target), saved);
+        let paths = listed_paths(root.path()).await;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        let copy = tokio::fs::read(root.path().join(&paths[0])).await.unwrap();
+        assert_eq!(copy, b"first save");
+        assert_eq!(
+            std::fs::read_dir(root.path().join(KEPT_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     // The file an exchange displaces sits where no folder check sweeps, so a
