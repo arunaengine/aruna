@@ -195,7 +195,9 @@ pub fn hold_relays(
             now.push(relay);
             continue;
         };
-        let after_publish = first_publish.get(&origin).is_some_and(|first| key > first);
+        let after_publish = first_publish
+            .get(&origin)
+            .is_some_and(|first| key.as_slice() > *first);
         if !after_publish && !held_topics.contains(topic) {
             now.push(relay);
             continue;

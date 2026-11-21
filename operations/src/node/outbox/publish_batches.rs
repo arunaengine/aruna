@@ -243,7 +243,9 @@ impl PublishBatchesOperation {
         let expected = |index: usize| {
             let topic = batch.topics.get(index)?;
             let origin = batch.origins.get(index).copied().flatten()?;
-            let wait = waits.iter().find(|(waiting, on, _)| *waiting == origin && on == topic);
+            let wait = waits
+                .iter()
+                .find(|(waiting, on, _)| *waiting == origin && on == topic);
             wait.map(|(.., lineage)| *lineage)
         };
         (0..batch.record_keys.len()).map(expected).collect()
