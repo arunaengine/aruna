@@ -107,7 +107,7 @@ impl Store {
         let names = db.keyspace("names", KeyspaceCreateOptions::default)?;
         let totals = db.keyspace("totals", KeyspaceCreateOptions::default)?;
         let listing = db.keyspace("listing", KeyspaceCreateOptions::default)?;
-        Ok(Self {
+        let store = Self {
             db,
             entries,
             issued,
@@ -117,7 +117,26 @@ impl Store {
             totals,
             listing,
             writer: Mutex::new(()),
-        })
+        };
+        store.fill_listing()?;
+        Ok(store)
+    }
+
+    /// Writes the listing rows of a store an earlier release wrote without them. Every write
+    /// keeps the index, so an index with a row is complete and costs one read here.
+    fn fill_listing(&self) -> Result<(), StoreError> {
+        if !self.listing.is_empty()? {
+            return Ok(());
+        }
+        let mut batch = self.db.batch();
+        for item in self.entries.iter() {
+            let (key, _) = item.into_inner()?;
+            let realm = <[u8; 32]>::try_from(key.as_ref()).map_err(|_| StoreError::NotFound)?;
+            let realm_id = RealmId::from_bytes(realm);
+            let rank = listing_rank(&self.admin(&realm_id)?);
+            self.place_listing(&mut batch, &realm_id, rank);
+        }
+        Ok(batch.commit()?)
     }
 
     /// Refuses an issue time that is not newer than the last accepted one or too far ahead.
@@ -672,6 +691,36 @@ pub(crate) mod tests {
         };
         store.update_admin(&realm, hidden, "test", 102).unwrap();
         assert!(store.listing_page(102, None, 10).unwrap().0.is_empty());
+    }
+
+    // A store an earlier release wrote lists its realms once opened; a hidden one stays out, and
+    // opening it again changes nothing.
+    #[test]
+    fn fills_old_listing() {
+        use crate::admin::RealmStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let (listed, hidden) = (seeded_entry(3, 100), seeded_entry(4, 100));
+        store.register(&listed.0, &listed.1, 100).unwrap();
+        store.register(&hidden.0, &hidden.1, 100).unwrap();
+        let state = AdminState {
+            status: RealmStatus::Hidden,
+            ..AdminState::default()
+        };
+        store.update_admin(&hidden.0, state, "test", 100).unwrap();
+        // The earlier release wrote no listing rows.
+        store.listing.remove(listing_key(LISTED_RANK, &listed.0)).unwrap();
+        assert!(store.listing_page(100, None, 10).unwrap().0.is_empty());
+        drop(store);
+
+        for _ in 0..2 {
+            let store = Store::open(dir.path()).unwrap();
+            let (page, _) = store.listing_page(100, None, 10).unwrap();
+            let realms: Vec<RealmId> = (page.iter())
+                .map(|(entry, _, _)| entry.registration.payload.descriptor.payload.realm_id)
+                .collect();
+            assert_eq!(realms, [listed.0]);
+        }
     }
 
     /// A registration of the realm whose management key has `seed`.
