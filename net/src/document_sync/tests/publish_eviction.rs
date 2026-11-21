@@ -183,6 +183,20 @@ fn unknown_lineage_retries() {
     assert_eq!(confirmed_lineage(unreadable, None), None);
 }
 
+// A later entry of a batch is bound to the lineage an earlier entry of its topic was confirmed
+// on, so a history received between them makes it retry instead of confirming it there.
+#[test]
+fn batch_root_carried() {
+    use crate::document_sync::publish::{bound_lineage, confirmed_lineage};
+    let (topic, other) = (::irokle::TopicId::hash(b"topic"), ::irokle::TopicId::hash(b"other"));
+    let confirmed = BTreeMap::from([(topic, [1; 32])]);
+    let bound = bound_lineage(None, &confirmed, topic);
+    assert_eq!(bound, Some([1; 32]));
+    assert_eq!(confirmed_lineage(Ok(Some([2; 32])), bound), None);
+    assert_eq!(bound_lineage(None, &confirmed, other), None);
+    assert_eq!(bound_lineage(Some([3; 32]), &confirmed, topic), Some([3; 32]));
+}
+
 // An event bound to one lineage whose append a received history moved to another is not
 // reported published, so its row stays and it appends again after the earlier events.
 #[test]

@@ -27,6 +27,16 @@ pub(in crate::document_sync) fn confirmed_lineage(
     }
 }
 
+/// The lineage an entry's topic must keep while it appends: the one the caller bound it to, else
+/// the one an earlier entry of the batch was confirmed on, so a batch never spans two histories.
+pub(in crate::document_sync) fn bound_lineage(
+    expected: Option<[u8; 32]>,
+    confirmed: &BTreeMap<::irokle::TopicId, [u8; 32]>,
+    topic_id: ::irokle::TopicId,
+) -> Option<[u8; 32]> {
+    expected.or_else(|| confirmed.get(&topic_id).copied())
+}
+
 impl DocumentSyncService {
     pub async fn publish_documents(
         &self,
@@ -265,6 +275,8 @@ impl DocumentSyncService {
         // A retryable failure holds back the later events of its topic and admin origin, so none
         // lands in the oplog ahead of it.
         let (mut held_topics, mut held_origins) = (BTreeSet::new(), BTreeSet::new());
+        // The lineage each topic's first confirmed entry of this batch stands on.
+        let mut confirmed = BTreeMap::new();
         for (index, document) in documents.into_iter().enumerate() {
             let allow_genesis = document.allow_genesis();
             let origin = match &document {
@@ -350,7 +362,7 @@ impl DocumentSyncService {
             // Held from the check to the record, so no other publish appends the event between.
             let _lock = self.publish_lock(topic_id);
             // A successor bound to a lineage appends only while its topic still has it.
-            let bound = expected.get(index).copied().flatten();
+            let bound = bound_lineage(expected.get(index).copied().flatten(), &confirmed, topic_id);
             if let Some(expected) = bound
                 && self.current_lineage(topic_id)? != Some(expected)
             {
@@ -404,6 +416,7 @@ impl DocumentSyncService {
                 held_origins.extend(origin);
                 continue;
             };
+            confirmed.entry(topic_id).or_insert(lineage);
             outcome.lineages.insert(index, lineage);
             outcome.published_indices.push(index);
             outcome
