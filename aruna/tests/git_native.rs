@@ -101,7 +101,11 @@ async fn native_clients() -> TestResult<()> {
                 key_space: aruna_core::git::STATUS.into(), key: id.parse::<ulid::Ulid>().expect("document ID").to_bytes().to_vec().into(), txn_id: None,
             }).await, Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }))
         }).await?;
-        assert!(directory.path().join("git").join(format!("{id}.git/refs/heads/main")).is_file(), "automatic ARC snapshot did not publish main");
+        // The status row is stored before the projection writes the refs to disk.
+        let main = directory.path().join("git").join(format!("{id}.git/refs/heads/main"));
+        shared::wait_until("automatic ARC snapshot publishes main", shared::WAIT_CAP, || async {
+            main.is_file()
+        }).await?;
         let repository: serde_json::Value = client.get(format!("{base}/api/v1/metadata/{id}/git")).bearer_auth(&token)
             .send().await?.error_for_status()?.json().await?;
         assert!(repository["error"].is_null(), "ARC conversion failed");
