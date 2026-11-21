@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use byteview::ByteView;
@@ -266,6 +267,32 @@ pub enum DocumentOutboxEvent {
     Delete {
         change: DocumentChange,
     },
+}
+
+/// The topics and admin origins whose later records in one publish batch wait behind an earlier
+/// record that retries, so none of them lands or syncs ahead of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldDomains {
+    topics: BTreeSet<irokle::TopicId>,
+    origins: BTreeSet<NodeId>,
+}
+
+impl HeldDomains {
+    /// Holds the topic and the admin origin of a record that retries.
+    pub fn hold(&mut self, topic: irokle::TopicId, origin: Option<NodeId>) {
+        self.topics.insert(topic);
+        self.origins.extend(origin);
+    }
+
+    /// Whether a record waits behind a held one; a waiting record holds both its domains too.
+    pub fn waits(&mut self, topic: irokle::TopicId, origin: Option<NodeId>) -> bool {
+        let waits = self.topics.contains(&topic)
+            || origin.is_some_and(|origin| self.origins.contains(&origin));
+        if waits {
+            self.hold(topic, origin);
+        }
+        waits
+    }
 }
 
 impl DocumentOutboxEvent {

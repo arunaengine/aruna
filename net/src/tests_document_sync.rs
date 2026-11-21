@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::document_sync::cursor::AppliedCursor;
 use crate::document_sync::storage::batch_write_to;
 use crate::document_sync::tests::runner::apply_admin_operation;
 use crate::document_sync::{DocumentSyncService, node_to_peer};
@@ -16,6 +15,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{
     DocumentChange, DocumentChangeKind, DocumentSyncRevision, DocumentTarget,
 };
+use aruna_core::document_apply::cursor::AppliedCursor;
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};

@@ -621,6 +621,38 @@ async fn lost_eviction_replays() {
             .is_empty(),
         "an unchanged genesis must keep its cursor instead of reapplying"
     );
+
+    // The loser's own advance runs only now, after the reset and the winner's progress: first
+    // with its old position empty on the winner, then with other ops of the loser in it.
+    let read_cursor =
+        || loser.storage_read(APPLIED_OPS_KEYSPACE.to_string(), topic_cursor_key(topic_id));
+    let winning = read_cursor().await.expect("cursor read");
+    let own_seq = own.signed.body.actor_seq;
+    for fill in [false, true] {
+        while fill
+            && loser_node
+                .storage()
+                .actor_clock(&topic_id)
+                .unwrap()
+                .get(&loser_actor)
+                < own_seq
+        {
+            loser
+                .publish_raw_event(topic_id, b"not an event".to_vec())
+                .expect("a later op of the loser appends");
+        }
+        let mut delayed = PublishedOps::default();
+        delayed.observe(&own, losing_root);
+        loser
+            .advance_topic_cursors(BTreeMap::from([(topic_id, delayed)]))
+            .await
+            .expect("the delayed advance ends");
+        assert_eq!(
+            read_cursor().await.expect("cursor read"),
+            winning,
+            "a delayed advance of the lost chain must leave the winning cursor alone"
+        );
+    }
 }
 
 /// Opens a document sync service of node `seed` on `doc_dir` with fresh node storage.

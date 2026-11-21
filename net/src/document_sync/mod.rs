@@ -18,8 +18,9 @@ use ::irokle::{
 use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::document::{
     DocumentEvent, DocumentEvictedDocument, DocumentNetEvent, DocumentOutboxEvent,
-    DocumentSyncPublish,
+    DocumentSyncPublish, HeldDomains,
 };
+use aruna_core::document_apply::cursor::AppliedCursor;
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
@@ -35,7 +36,6 @@ use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -100,7 +100,7 @@ pub struct PendingEviction {
 
 #[derive(Default)]
 struct PublishEventsOutcome {
-    published: BTreeMap<::irokle::TopicId, ::irokle::ActorClock>,
+    published: BTreeMap<::irokle::TopicId, PublishedOps>,
     published_indices: Vec<usize>,
     retry_indices: Vec<usize>,
     retry_error: Option<String>,
@@ -114,6 +114,32 @@ impl PublishEventsOutcome {
         (0..count)
             .map(|index| self.lineages.get(&index).copied())
             .collect()
+    }
+}
+
+/// The ops one publish batch left on a topic: the lineage they were confirmed on and the last op
+/// of each actor, which the cursor advance checks still stand before it covers them.
+#[derive(Debug, Default)]
+struct PublishedOps {
+    lineage: [u8; 32],
+    tips: BTreeMap<::irokle::ActorId, (u64, ::irokle::OpId)>,
+}
+
+impl PublishedOps {
+    /// Takes in `op`, confirmed on `lineage`; the ops of an earlier lineage no longer stand.
+    fn observe(&mut self, op: &::irokle::Op, lineage: [u8; 32]) {
+        if self.lineage != lineage {
+            self.lineage = lineage;
+            self.tips.clear();
+        }
+        let body = &op.signed.body;
+        let tip = self
+            .tips
+            .entry(body.actor_id)
+            .or_insert((body.actor_seq, op.id));
+        if body.actor_seq > tip.0 {
+            *tip = (body.actor_seq, op.id);
+        }
     }
 }
 

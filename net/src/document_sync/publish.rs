@@ -275,7 +275,7 @@ impl DocumentSyncService {
         let mut outcome = PublishEventsOutcome::default();
         // A retryable failure holds back the later events of its topic and admin origin, so none
         // lands in the oplog ahead of it.
-        let (mut held_topics, mut held_origins) = (BTreeSet::new(), BTreeSet::new());
+        let mut held = HeldDomains::default();
         // The lineage each topic's first confirmed entry of this batch stands on.
         let mut confirmed = BTreeMap::new();
         for (index, document) in documents.into_iter().enumerate() {
@@ -329,8 +329,8 @@ impl DocumentSyncService {
                                 );
                                 outcome.retry_indices.push(index);
                                 outcome.retry_error.get_or_insert_with(|| error.to_string());
-                                held_topics.insert(target.sync_topic_id(self.realm_id, &placement));
-                                held_origins.insert(event.origin_node_id);
+                                let topic_id = target.sync_topic_id(self.realm_id, &placement);
+                                held.hold(topic_id, Some(event.origin_node_id));
                                 continue;
                             }
                         },
@@ -348,11 +348,7 @@ impl DocumentSyncService {
             // Shard topics are join-only: only rank-0 creates the genesis, so a
             // publish onto a genesis-less shard defers the outbox record.
             let may_create_topic = !target.uses_shard_topic();
-            let held_origin = origin.is_some_and(|origin| held_origins.contains(&origin));
-            if held_topics.contains(&topic_id) || held_origin {
-                // A held entry holds both its domains for the entries after it.
-                held_topics.insert(topic_id);
-                held_origins.extend(origin);
+            if held.waits(topic_id, origin) {
                 outcome.retry_indices.push(index);
                 continue;
             }
@@ -385,8 +381,7 @@ impl DocumentSyncService {
                 Err(error @ (NetError::TopicNotReady(_) | NetError::LineageMoved(_))) => {
                     outcome.retry_indices.push(index);
                     outcome.retry_error.get_or_insert_with(|| error.to_string());
-                    held_topics.insert(topic_id);
-                    held_origins.extend(origin);
+                    held.hold(topic_id, origin);
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -394,11 +389,8 @@ impl DocumentSyncService {
             confirmed.entry(topic_id).or_insert(lineage);
             outcome.lineages.insert(index, lineage);
             outcome.published_indices.push(index);
-            outcome
-                .published
-                .entry(topic_id)
-                .or_default()
-                .observe(op.signed.body.actor_id, op.signed.body.actor_seq);
+            let published = outcome.published.entry(topic_id).or_default();
+            published.observe(&op, lineage);
         }
         // Member fan-out for admin publishes without explicit peers: the drain
         // sync stage pushes only to record peers, so publishing fans out itself.
@@ -546,7 +538,7 @@ impl DocumentSyncService {
     /// effects are always applied locally before the outbox publish runs.
     pub(in crate::document_sync) async fn advance_topic_cursors(
         &self,
-        published: BTreeMap<::irokle::TopicId, ::irokle::ActorClock>,
+        published: BTreeMap<::irokle::TopicId, PublishedOps>,
     ) -> Result<()> {
         if published.is_empty() {
             return Ok(());
@@ -554,25 +546,60 @@ impl DocumentSyncService {
         // The cursor read and write must not interleave with a reconcile or an eviction.
         let _reconcile_guard = self.reconcile_lock.lock().await;
         let mut writes = Vec::with_capacity(published.len());
-        for (topic_id, clock) in published {
-            // A tie-break between the publish and this write leaves the ops on a
-            // chain that no longer exists; the next reconcile replays the winner.
-            let Some(genesis) = self.topic_genesis(topic_id)? else {
-                continue;
-            };
+        for (topic_id, ops) in published {
             let cursor_key = topic_cursor_key(topic_id);
-            let mut cursor = applied_cursor_clock(
-                self.node.storage(),
-                topic_id,
-                genesis,
-                self.storage_read(APPLIED_OPS_KEYSPACE.to_string(), cursor_key.clone())
-                    .await?,
-            )?;
-            cursor.merge(&clock);
-            let value = applied_cursor_value(self.node.storage(), topic_id, genesis, &cursor)?;
-            writes.push((APPLIED_OPS_KEYSPACE.to_string(), cursor_key, value));
+            let key_space = APPLIED_OPS_KEYSPACE.to_string();
+            let stored = self
+                .storage_read(key_space.clone(), cursor_key.clone())
+                .await?;
+            if let Some(cursor) = self.advanced_cursor(topic_id, &ops, stored)? {
+                writes.push((key_space, cursor_key, cursor_bytes(&cursor)?));
+            }
         }
         self.storage_batch_write(writes).await
+    }
+
+    /// The stored cursor advanced over `ops`, with the genesis and every position read from one
+    /// snapshot. After a tie-break since the publish, `ops` stand on a chain that no longer
+    /// exists: the winning cursor stays as it is (`None`) and the next reconcile replays it.
+    fn advanced_cursor(
+        &self,
+        topic_id: ::irokle::TopicId,
+        ops: &PublishedOps,
+        stored: Option<Value>,
+    ) -> Result<Option<AppliedCursor>> {
+        let (peer, actors) = (self.node.peer_id(), BTreeSet::new());
+        let read = |snapshot: &dyn ::irokle::storage::SnapshotRead| -> ::irokle::Result<_> {
+            let held = |actor_id: &::irokle::ActorId,
+                        actor_seq: u64|
+             -> ::irokle::Result<Option<::irokle::OpId>> {
+                let after = actor_seq.saturating_sub(1);
+                let indexed = snapshot.actor_range(&topic_id, actor_id, after, 1)?;
+                let found = indexed.first().filter(|(seq, _)| *seq == actor_seq);
+                Ok(found.map(|(_, op_id)| *op_id))
+            };
+            let Some(view) = snapshot.request_view(&topic_id, &peer, &actors)? else {
+                return Ok(None);
+            };
+            let mut moved = lineage_root(&view.genesis) != ops.lineage;
+            for (actor_id, (actor_seq, op_id)) in &ops.tips {
+                moved = moved || held(actor_id, *actor_seq)? != Some(*op_id);
+            }
+            if moved {
+                debug!(%topic_id, "Leaving a cursor whose published ops left its lineage");
+                return Ok(None);
+            }
+            let mut clock = match AppliedCursor::decode(stored.as_deref(), view.genesis) {
+                Some(cursor) if cursor.stands(held)? => cursor.clock,
+                _ => ::irokle::ActorClock::default(),
+            };
+            for (actor_id, (actor_seq, _)) in &ops.tips {
+                clock.observe(*actor_id, *actor_seq);
+            }
+            AppliedCursor::marked(view.genesis, clock, held).map(Some)
+        };
+        (self.node.storage().read_snapshot(read))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 
     pub(in crate::document_sync) fn flush_database(&self) -> Result<()> {

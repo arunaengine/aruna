@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod batch;
 pub mod create;
+pub mod cursor;
 pub mod distribution;
 pub mod events;
 #[cfg(test)]
