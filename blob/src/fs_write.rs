@@ -113,8 +113,8 @@ pub(crate) async fn write_conflicted(
 }
 
 /// Answers the placement outcome and removes the spool when it did not publish.
-/// The fingerprint is read at the published path, because the rename that puts
-/// it there moves the change time a spool fingerprint would carry.
+/// The fingerprint is read at the published path, in the same stable read that
+/// checks its bytes, because the rename moves the change time a spool carries.
 async fn finish_write(
     spooled: Spooled,
     placed: Result<(), PlaceError>,
@@ -124,8 +124,10 @@ async fn finish_write(
     match placed {
         // The hash answers for the spool's bytes, so it is only reported with a
         // file that still has exactly those bytes.
-        Ok(()) => match published_stat(published).await {
-            Some((fingerprint, size)) if size == spooled.size => written(fingerprint, &spooled),
+        Ok(()) => match hash_stable(published).await {
+            Ok((fingerprint, blake3, _)) if blake3 == spooled.blake3 => {
+                written(fingerprint, &spooled)
+            }
             _ => LocalFileEvent::Error {
                 message: "the published file is not the one that was written".to_string(),
             },
@@ -145,15 +147,6 @@ async fn finish_write(
             LocalFileEvent::Error { message }
         }
     }
-}
-
-/// The published file's weak fingerprint and its size, read as one stat.
-async fn published_stat(path: &Path) -> Option<(String, u64)> {
-    let metadata = tokio::fs::metadata(path).await.ok()?;
-    Some((
-        weak_fingerprint(&FileStat::from_metadata(&metadata)),
-        metadata.len(),
-    ))
 }
 
 /// Moves one file into the folder's trash. A removal is never an unlink: the
@@ -1247,17 +1240,17 @@ mod tests {
     }
 
     // The reported hash is the spool's, so it may only be paired with a file
-    // that still holds exactly those bytes.
+    // that still holds exactly those bytes, even one of the same length.
     #[tokio::test]
     async fn refuses_replaced_publish() {
         let root = tempfile::tempdir().unwrap();
         let spooled = Spooled {
             path: root.path().join("spool"),
-            blake3: [7u8; 32],
+            blake3: *::blake3::hash(b"hello").as_bytes(),
             size: 5,
         };
         let published = root.path().join("note.txt");
-        tokio::fs::write(&published, b"another").await.unwrap();
+        tokio::fs::write(&published, b"olleh").await.unwrap();
 
         let event = finish_write(spooled, Ok(()), &published, |fingerprint, spooled| {
             LocalFileEvent::Written {
