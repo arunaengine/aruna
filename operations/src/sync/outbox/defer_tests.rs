@@ -177,17 +177,18 @@ fn held_origin_topic() {
 }
 
 // A relay waits while an earlier record of its origin still publishes on this page; a relay of
-// another origin runs.
+// another origin to another shard runs.
 #[test]
 fn later_relay_held() {
     let (origin, other) = (node(4), node(5));
-    let topic = TopicId::hash(b"relay-topic");
+    let (topic, elsewhere) = (TopicId::hash(b"relay-topic"), TopicId::hash(b"other-topic"));
     let to_publish = [(b"admin/1".to_vec(), admin_record(origin, 1), topic)];
     let undeliverable = vec![
         (b"admin/2".to_vec(), admin_record(origin, 2), topic),
-        (b"admin/3".to_vec(), admin_record(other, 1), topic),
+        (b"admin/3".to_vec(), admin_record(other, 1), elsewhere),
     ];
-    let (now, held) = hold_relays(&to_publish, undeliverable);
+    let mut defer = DrainDeferState::default();
+    let (now, held) = hold_relays(&to_publish, undeliverable, &mut defer);
     let keys = |records: &[DrainRecord]| records.iter().map(|(key, ..)| key.clone()).collect();
     let (now, held): (Vec<Vec<u8>>, Vec<Vec<u8>>) = (keys(&now), keys(&held));
     assert_eq!(
@@ -216,6 +217,24 @@ fn sync_wait_topics() {
     };
     assert_eq!(keys(&to_publish), vec![b"first".to_vec()]);
     assert_eq!(keys(&deferred), vec![b"second".to_vec(), b"third".to_vec()]);
+}
+
+// A held relay holds its shard topic, here and on the next pages, so a later relay of another
+// origin to that shard waits behind it.
+#[test]
+fn relay_topic_held() {
+    let (origin, other) = (node(4), node(5));
+    let (published, shard) = (TopicId::hash(b"published"), TopicId::hash(b"shard"));
+    let to_publish = [(b"admin/1".to_vec(), admin_record(origin, 1), published)];
+    let undeliverable = vec![
+        (b"admin/2".to_vec(), admin_record(origin, 2), shard),
+        (b"admin/3".to_vec(), admin_record(other, 1), shard),
+    ];
+    let mut defer = DrainDeferState::default();
+    let (now, held) = hold_relays(&to_publish, undeliverable, &mut defer);
+    assert!(now.is_empty());
+    assert_eq!(held.len(), 2);
+    assert!(defer.deferred_topics.contains(&shard));
 }
 
 // An origin waiting on two topics publishes on neither: the sync of one cannot carry the

@@ -16,6 +16,7 @@ use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use irokle::TopicId;
 use tracing::{error, info, warn};
 
 use crate::forward::realm::RelayAdminOperation;
@@ -24,12 +25,16 @@ use crate::sync::document_outbox::DeleteOutboxPlan;
 use crate::sync::outbox::defer::DrainRecord;
 
 /// Which records left this node's custody and how many stay undeliverable in the outbox, and
-/// whether a relay or its cleanup failed, so the drain runs again.
+/// whether a relay or its cleanup failed, so the drain runs again. A relay that did not go out
+/// holds its shard topic and origin; `held` counts the later relays that wait behind one.
 #[derive(Debug, Default, PartialEq)]
 pub struct RelayedRecords {
     pub relayed: Vec<Vec<u8>>,
     pub left: usize,
     pub retry: bool,
+    pub held: usize,
+    pub held_topics: Vec<TopicId>,
+    pub held_origins: Vec<NodeId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,6 +100,19 @@ impl RelayRecordsOperation {
 
     /// The call that relays `record`, or `None` once it is decided without one.
     fn start(&mut self, record: DrainRecord) -> Option<RelayTurn> {
+        // A relay behind one that did not go out, by origin or shard topic, waits for it.
+        let origin = match &record.1.event {
+            DocumentOutboxEvent::AdminOperation { event, .. } => Some(event.origin_node_id),
+            _ => None,
+        };
+        let out = &self.out;
+        if origin.is_some_and(|origin| {
+            out.held_origins.contains(&origin) || out.held_topics.contains(&record.2)
+        }) {
+            self.hold(&record);
+            self.out.held += 1;
+            return None;
+        }
         let admin = match &record.1.event {
             DocumentOutboxEvent::AdminOperation {
                 event,
@@ -144,6 +162,14 @@ impl RelayRecordsOperation {
         self.current = Some(record);
         self.step = RelayStep::Relay;
         Some(Ok(Next::Call(IoCall::child(relay))))
+    }
+
+    /// Holds the shard topic and admin origin of a relay that did not go out for the later ones.
+    fn hold(&mut self, (_, record, topic): &DrainRecord) {
+        self.out.held_topics.push(*topic);
+        if let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event {
+            self.out.held_origins.push(event.origin_node_id);
+        }
     }
 
     /// A record that stays with this node: a device drops a row no device publishes, any other
@@ -208,6 +234,7 @@ impl Operation for RelayRecordsOperation {
                 Err(error) => {
                     warn!(%error, "Cannot sign an admin event for relay");
                     self.out.retry = true;
+                    self.hold(&record);
                     self.left(record);
                 }
             }
@@ -233,6 +260,7 @@ impl Operation for RelayRecordsOperation {
                     "No holder accepted a relayed admin outbox record"
                 );
                 self.out.retry = true;
+                self.hold(&record);
                 self.left(record);
             }
         }
@@ -246,12 +274,12 @@ mod tests {
     use aruna_core::admin_documents::{
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::document::DocumentTarget;
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::user::id::UserId;
-    use irokle::TopicId;
     use ulid::Ulid;
 
     use crate::sync::outbox::record::new_identified_record;
@@ -301,9 +329,11 @@ mod tests {
         assert!(matches!(*effect, Effect::Net(NetEffect::AdminSign { .. })));
         let refused = Event::Net(NetEvent::AdminSigned(Err("no key".to_string())));
         let left = RelayedRecords {
-            relayed: Vec::new(),
             left: 1,
             retry: true,
+            held_topics: vec![TopicId::hash(b"topic")],
+            held_origins: vec![node()],
+            ..RelayedRecords::default()
         };
         assert_eq!(
             run.next(IoResult::Event(Box::new(refused))),
@@ -316,55 +346,87 @@ mod tests {
     fn unconfigured_record_left() {
         let mut run = RelayRecordsOperation::new(node(), None, vec![admin_record()]);
         let left = RelayedRecords {
-            relayed: Vec::new(),
             left: 1,
-            retry: false,
+            ..RelayedRecords::default()
         };
         assert_eq!(run.first(), Ok(Next::Done(left)));
     }
 
-    // A relay no holder accepted leaves the record and asks for another drain, so the record
-    // keeps a retry when it is the last one in the outbox.
-    #[test]
-    fn failed_relay_retries() {
-        use aruna_core::calls::ChildOutcome;
+    /// A configuration whose one server holds the shard of [`signed_record`].
+    fn holder_config() -> RealmConfigDocument {
         use aruna_core::structs::identity::realm::RealmNodeKind;
         use aruna_core::structs::placement::record::PlacementStrategy;
 
-        let placement = PlacementRef {
-            strategy_id: Ulid::from_bytes([9; 16]),
-            shard: 0,
-        };
         let mut config = RealmConfigDocument::new(RealmId([3; 32]), Vec::new(), 2);
         config.strategies = vec![PlacementStrategy {
-            strategy_id: placement.strategy_id,
+            strategy_id: Ulid::from_bytes([9; 16]),
             name: "default".to_string(),
             replica_count: None,
             distinct_locations: false,
             affinity: Vec::new(),
             shard_count: 1,
         }];
-        config.default_strategy_id = Some(placement.strategy_id);
+        config.default_strategy_id = Some(Ulid::from_bytes([9; 16]));
         let holder = iroh::SecretKey::from_bytes(&[2; 32]).public();
         config.ensure_node(holder, RealmNodeKind::Server);
         config.snapshot_candidate_map();
+        config
+    }
+
+    /// An admin record of `origin` under `key`, signed and placed on the held shard.
+    fn signed_record(key: &[u8], origin: NodeId) -> DrainRecord {
         let mut record = admin_record();
-        record.1.placement = placement;
+        record.0 = key.to_vec();
+        record.1.placement = PlacementRef {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            shard: 0,
+        };
         if let DocumentOutboxEvent::AdminOperation {
-            origin_signature, ..
+            event,
+            origin_signature,
         } = &mut record.1.event
         {
+            event.origin_node_id = origin;
             *origin_signature = Some(iroh::SecretKey::from_bytes(&[1; 32]).sign(b"event"));
         }
-        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(config)), vec![record]);
+        record
+    }
+
+    // A relay no holder accepted leaves the record and asks for another drain, so the record
+    // keeps a retry when it is the last one in the outbox.
+    #[test]
+    fn failed_relay_retries() {
+        let records = vec![signed_record(b"admin", node())];
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(holder_config())), records);
         assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
         let refused = Err::<(), _>(ForwardError::Unavailable);
         let left = RelayedRecords {
-            relayed: Vec::new(),
             left: 1,
             retry: true,
+            held_topics: vec![TopicId::hash(b"topic")],
+            held_origins: vec![node()],
+            ..RelayedRecords::default()
         };
         let answer = run.next(IoResult::Child(ChildOutcome::new(refused)));
         assert_eq!(answer, Ok(Next::Done(left)));
+    }
+
+    // A relay to the shard topic of one that failed waits behind it, also from another origin,
+    // so the holder never takes it first.
+    #[test]
+    fn failed_relay_holds() {
+        let other = iroh::SecretKey::from_bytes(&[5; 32]).public();
+        let records = vec![
+            signed_record(b"admin/1", node()),
+            signed_record(b"admin/2", other),
+        ];
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(holder_config())), records);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let refused = Err::<(), _>(ForwardError::Unavailable);
+        let Ok(Next::Done(out)) = run.next(IoResult::Child(ChildOutcome::new(refused))) else {
+            panic!("the later relay is not attempted");
+        };
+        assert_eq!((out.left, out.held), (1, 1));
+        assert_eq!(out.held_origins, vec![node(), other]);
     }
 }

@@ -172,12 +172,13 @@ pub fn partition_drain_records(
     (to_publish, deferred, undeliverable)
 }
 
-/// Holds back each relay that follows a record of its admin origin this page still publishes, so
-/// a holder never takes the later record first. Answers the relays to run now and the held ones,
-/// which wait as deferred records; keys order a page as it was read.
+/// Holds back each relay that follows a record of its admin origin this page still publishes, and
+/// each later relay to a held one's shard topic, so a holder never takes a later record first.
+/// Answers the relays to run now and the held ones; keys order a page as it was read.
 pub fn hold_relays(
     to_publish: &[DrainRecord],
     undeliverable: Vec<DrainRecord>,
+    defer: &mut DrainDeferState,
 ) -> (Vec<DrainRecord>, Vec<DrainRecord>) {
     let mut first_publish: HashMap<NodeId, &[u8]> = HashMap::new();
     for (key, record, _) in to_publish {
@@ -186,10 +187,27 @@ pub fn hold_relays(
             *first = (*first).min(key.as_slice());
         }
     }
-    undeliverable.into_iter().partition(|(key, record, _)| {
-        let first = admin_origin(record).and_then(|origin| first_publish.get(&origin));
-        first.is_none_or(|first| key.as_slice() < *first)
-    })
+    let (mut now, mut held) = (Vec::new(), Vec::new());
+    let mut held_topics = HashSet::new();
+    for relay in undeliverable {
+        let (key, record, topic) = &relay;
+        let Some(origin) = admin_origin(record) else {
+            now.push(relay);
+            continue;
+        };
+        let after_publish = first_publish.get(&origin).is_some_and(|first| key > first);
+        if !after_publish && !held_topics.contains(topic) {
+            now.push(relay);
+            continue;
+        }
+        // A held relay holds its destination topic too, here and on the next pages, so no relay
+        // of another origin reaches that shard first.
+        held_topics.insert(*topic);
+        defer.deferred_topics.insert(*topic);
+        defer.blocked_origins.insert(origin);
+        held.push(relay);
+    }
+    (now, held)
 }
 
 /// The admin origin stream a record belongs to. Origin sequence is ordered

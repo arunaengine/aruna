@@ -352,9 +352,9 @@ impl DrainPageOperation {
             |topic| existing.contains(&topic),
             |record| classify_deferred_record(config.as_deref(), local, record),
         );
-        // A relay after a record of its origin that still publishes waits; partition blocked the
-        // origin, so its later records wait too.
-        let (undeliverable, held) = hold_relays(&to_publish, undeliverable);
+        // A relay after a record of its origin that still publishes waits and holds its origin and
+        // shard topic, so the later records of either wait too.
+        let (undeliverable, held) = hold_relays(&to_publish, undeliverable, &mut invocation.defer);
         invocation.deferred += deferred.len() + held.len();
         let stuck_after = OUTBOX_STUCK_AFTER.as_millis() as u64;
         for (_, record, topic) in &deferred {
@@ -556,7 +556,12 @@ impl Operation for DrainPageOperation {
                 match result.child::<RelayedRecords, IoError>()? {
                     Ok(relayed) => {
                         invocation.undeliverable += relayed.left;
+                        invocation.deferred += relayed.held;
                         invocation.outcome.retry_needed |= relayed.retry;
+                        // The domains of a relay that did not go out hold on the next pages.
+                        let defer = &mut invocation.defer;
+                        defer.deferred_topics.extend(relayed.held_topics);
+                        defer.blocked_origins.extend(relayed.held_origins);
                     }
                     Err(error) => {
                         warn!(%error, "Relaying undeliverable outbox records broke off");
@@ -669,9 +674,9 @@ mod tests {
     #[test]
     fn failed_relay_retries() {
         let failed = RelayedRecords {
-            relayed: Vec::new(),
             left: 1,
             retry: true,
+            ..RelayedRecords::default()
         };
         let broken = Err::<RelayedRecords, _>(IoError::Unfinished);
         for answer in [
