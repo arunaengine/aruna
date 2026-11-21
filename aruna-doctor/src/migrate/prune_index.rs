@@ -14,46 +14,65 @@ use crate::explorer::ExplorerError;
 
 /// Bytes of the family every record, pending and conflict key starts with.
 const FAMILY_BYTES: usize = 64;
+/// Families one backfill transaction checks and schedules, so memory stays bounded.
+const BATCH_FAMILIES: usize = 256;
 
 /// Schedules each family in `families` without index rows one job retention after `now_ms`, as a
 /// fresh record would be. Runs after the main commit, so a removed family gets no row; answers how
-/// many families it scheduled.
+/// many families it scheduled. Reads keys only; a family's keys are adjacent in each keyspace.
 pub(super) fn missing_index(
     db: &OptimisticTxDatabase,
     families: [&OptimisticTxKeyspace; 3],
     now_ms: u64,
 ) -> Result<usize, ExplorerError> {
     let index = db.keyspace(FAMILY_PRUNE_KEYSPACE, KeyspaceCreateOptions::default)?;
-    let mut seen = BTreeSet::new();
-    let read = db.read_tx();
+    let (mut batch, mut scheduled) = (BTreeSet::new(), 0);
     for keyspace in families {
-        for entry in read.iter(keyspace) {
-            let key = entry.into_inner()?.0;
-            if let Some(Ok(family)) = key.get(..FAMILY_BYTES).map(<[u8; FAMILY_BYTES]>::try_from) {
-                seen.insert(family);
+        let mut last = None;
+        for entry in db.read_tx().iter(keyspace) {
+            let key = entry.key()?;
+            let Some(Ok(family)) = key.get(..FAMILY_BYTES).map(<[u8; FAMILY_BYTES]>::try_from)
+            else {
+                continue;
+            };
+            if last.replace(family) != Some(family) {
+                batch.insert(family);
+            }
+            if batch.len() == BATCH_FAMILIES {
+                scheduled += schedule(db, &index, std::mem::take(&mut batch), now_ms)?;
             }
         }
     }
-    let mut missing = Vec::new();
-    for bytes in seen {
-        let family = family_of(bytes);
-        if read.get(&index, prune_slot_key(&family))?.is_none() {
-            missing.push(family);
-        }
-    }
-    if missing.is_empty() {
-        return Ok(0);
-    }
+    Ok(scheduled + schedule(db, &index, batch, now_ms)?)
+}
+
+/// Writes the index rows of each family in `batch` that has none yet, in one transaction, so a
+/// family another batch or keyspace already scheduled is skipped.
+fn schedule(
+    db: &OptimisticTxDatabase,
+    index: &OptimisticTxKeyspace,
+    batch: BTreeSet<[u8; FAMILY_BYTES]>,
+    now_ms: u64,
+) -> Result<usize, ExplorerError> {
     let mut txn = db.write_tx()?;
-    for family in &missing {
-        for (_, key, value) in prune_rows(family, now_ms) {
+    let mut scheduled = 0;
+    for bytes in batch {
+        let family = family_of(bytes);
+        if txn.get(index, prune_slot_key(&family))?.is_some() {
+            continue;
+        }
+        for (_, key, value) in prune_rows(&family, now_ms) {
             txn.insert(index.clone(), key.to_vec(), value.to_vec());
         }
+        scheduled += 1;
+    }
+    if scheduled == 0 {
+        return Ok(0);
     }
     txn.commit()?.map_err(|_| {
         ExplorerError::Decode("the prune index backfill conflicted with a running node".into())
     })?;
-    Ok(missing.len())
+    Ok(scheduled)
 }
 
 pub(super) fn family_of(bytes: [u8; FAMILY_BYTES]) -> JobFamilyId {

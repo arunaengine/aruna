@@ -18,7 +18,7 @@ use thiserror::Error;
 
 mod commit;
 mod family;
-mod pages;
+pub mod pages;
 pub mod pass;
 
 /// Due index rows one pass reads, and body rows one page transaction deletes.

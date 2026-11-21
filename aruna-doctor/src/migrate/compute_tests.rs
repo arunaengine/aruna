@@ -10,16 +10,17 @@ use aruna_core::compute::{ExecutionTargetId, ExecutorCapability};
 use aruna_core::document::{DocumentChange, DocumentChangeKind, DocumentSyncRevision};
 use aruna_core::keyspaces::{
     FAMILY_ALIAS_KEYSPACE, FAMILY_PRUNE_KEYSPACE, FAMILY_RECORD_KEYSPACE,
-    FAMILY_TOMBSTONE_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, LAUNCH_RECORD_KEYSPACE,
-    NODE_INFO_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    FAMILY_TOMBSTONE_KEYSPACE, INPUT_PAGE_KEYSPACE, JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE,
+    LAUNCH_RECORD_KEYSPACE, NODE_INFO_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
 };
 use aruna_core::scheduling::{ExecutionPlan, RejectedTarget};
 use aruna_core::structs::execution::job::family::{
     EffectiveResources, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordEnvelope,
-    JobRecordKind, JobRetryPolicy,
+    JobRecordKind, JobRetryPolicy, LaunchIntent,
 };
 use aruna_core::structs::execution::job::input::{ExecutionSpec, JobPayload};
 use aruna_core::structs::execution::job::local::{AttemptIntent, JobRecord};
+use aruna_core::structs::execution::job::pages::{InputPage, PageEntries};
 use aruna_core::structs::execution::job::prune::FamilyTombstone;
 use aruna_core::structs::execution::job::record_keys::{alias_key, family_prefix, prune_rows_at};
 use aruna_core::structs::execution::job::record_rows::from_bytes;
@@ -29,6 +30,7 @@ use aruna_core::structs::storage::node_info::node_info_key;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::jobs::lifecycle::family_reads::FamilyStatusOperation;
+use aruna_operations::jobs::records::pages::page_key;
 use aruna_operations::jobs::route::JobRouteError;
 use aruna_operations::sync::outbox::record::new_identified_record;
 use aruna_storage::storage::worker::FjallStorage;
@@ -742,4 +744,121 @@ async fn tombstones_old_families() {
     let other = UserId::new(Ulid::from_bytes([12u8; 16]), REALM);
     let hidden = drive(status(other), &context).await;
     assert_eq!(hidden.err(), Some(JobRouteError::NotFound));
+}
+
+/// An alpha.206 launch of `family` that names `pages`.
+fn paged(family: JobFamilyId, pages: PageManifest) -> Vec<u8> {
+    let Record::Launch(mut launch) = launch() else {
+        unreachable!("a launch");
+    };
+    launch.submission_id = family.submission_id;
+    launch.request_digest = family.request_digest;
+    launch.input_pages = Some(pages);
+    unnamed(Record::Launch(launch))
+}
+
+/// A launch of `family` in the current shape that names `pages`.
+fn current_paged(family: JobFamilyId, pages: PageManifest) -> Vec<u8> {
+    let launch = LaunchIntent {
+        launch_id: Ulid::from_bytes([2u8; 16]),
+        submission_id: family.submission_id,
+        request_digest: family.request_digest,
+        job_id: JobId::from_bytes([6u8; 16]),
+        scheduler_node_id: secret().public(),
+        scheduler_seq: 1,
+        witness_placement: PlacementRef::NIL,
+        holder_generation: 1,
+        target: ExecutionTargetId {
+            node_id: secret().public(),
+            backend: "docker".to_string(),
+            executor_kind: "docker".to_string(),
+        },
+        inputs: Vec::new(),
+        input_pages: Some(pages),
+        output_policies: Vec::new(),
+        plan_digest: [8u8; 32],
+        spec_digest: [9u8; 32],
+        created_at_ms: 1_000,
+        config_clock: Default::default(),
+    };
+    let record = JobFamilyRecord::Launch(Box::new(launch));
+    let envelope = JobRecordEnvelope::sign(REALM, record, &secret()).unwrap();
+    postcard::to_allocvec(&envelope).unwrap()
+}
+
+/// A stored page with its digest; `index` sets it apart from the other pages.
+fn input_page(index: u32, next: Option<[u8; 32]>) -> (Vec<u8>, [u8; 32]) {
+    let page = InputPage {
+        index,
+        entries: PageEntries::Launch(Vec::new()),
+        next,
+    };
+    (
+        postcard::to_allocvec(&page).unwrap(),
+        page.digest().unwrap(),
+    )
+}
+
+// A removed family's private chain goes with it. Of a chain whose suffix a kept family of the
+// same submission also names, only the head goes; the suffix and the kept chain stay.
+#[test]
+fn deletes_owned_pages() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("db");
+    let shared_old = JobFamilyId {
+        submission_id: KEPT.submission_id,
+        request_digest: [3u8; 32],
+    };
+    let (tail, tail_digest) = input_page(1, None);
+    let (head, head_digest) = input_page(0, Some(tail_digest));
+    let (suffix, suffix_digest) = input_page(11, None);
+    let (removed, removed_digest) = input_page(10, Some(suffix_digest));
+    let (kept, kept_digest) = input_page(20, Some(suffix_digest));
+    let manifest = |first, pages| PageManifest {
+        count: 0,
+        pages,
+        first,
+    };
+    let rows = [
+        (
+            key(OLD, JobRecordKind::Launch, 1),
+            paged(OLD, manifest(head_digest, 2)),
+        ),
+        (
+            key(shared_old, JobRecordKind::Launch, 1),
+            paged(shared_old, manifest(removed_digest, 2)),
+        ),
+        (
+            key(KEPT, JobRecordKind::Launch, 1),
+            current_paged(KEPT, manifest(kept_digest, 2)),
+        ),
+    ];
+    let rows = rows
+        .iter()
+        .map(|(key, value)| (key.as_slice(), value.clone()));
+    write(&path, FAMILY_RECORD_KEYSPACE, rows.collect());
+    let pages = [
+        (page_key(&OLD.submission_id, &head_digest), head),
+        (page_key(&OLD.submission_id, &tail_digest), tail),
+        (page_key(&KEPT.submission_id, &removed_digest), removed),
+        (page_key(&KEPT.submission_id, &suffix_digest), suffix),
+        (page_key(&KEPT.submission_id, &kept_digest), kept),
+    ];
+    let pages = pages
+        .iter()
+        .map(|(key, value)| (key.as_ref(), value.clone()));
+    write(&path, INPUT_PAGE_KEYSPACE, pages.collect());
+
+    let output = migrate_output(path.to_str().unwrap()).unwrap();
+
+    assert_eq!(output.old_families_deleted, 2);
+    assert_eq!(output.old_runs_deleted.get(INPUT_PAGE_KEYSPACE), Some(&3));
+    let left: BTreeSet<_> = read(&path, INPUT_PAGE_KEYSPACE).into_keys().collect();
+    let expected =
+        [suffix_digest, kept_digest].map(|digest| page_key(&KEPT.submission_id, &digest).to_vec());
+    assert_eq!(left, BTreeSet::from(expected));
+
+    let again = migrate_output(path.to_str().unwrap()).unwrap();
+    assert_eq!(again.old_runs_deleted.get(INPUT_PAGE_KEYSPACE), None);
+    assert_eq!(read(&path, INPUT_PAGE_KEYSPACE).len(), 2);
 }
