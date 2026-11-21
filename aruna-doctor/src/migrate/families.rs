@@ -168,6 +168,9 @@ pub(super) fn old_families(
     )))
 }
 
+/// The tombstone and the two prune index rows of one removed family, as keyspace, key and value.
+pub(super) type TombstoneRows = [(String, Key, Value); 3];
+
 impl Removal {
     pub(super) fn is_empty(&self) -> bool {
         self.families.is_empty()
@@ -334,10 +337,7 @@ impl Removal {
     }
 
     /// The rows a finished prune at `now_ms` leaves of each removed family with records.
-    pub(super) fn tombstones(
-        &self,
-        now_ms: u64,
-    ) -> Result<Vec<[(String, Key, Value); 3]>, ExplorerError> {
+    pub(super) fn tombstones(&self, now_ms: u64) -> Result<Vec<TombstoneRows>, ExplorerError> {
         (self.remains.iter())
             .map(|(family, remains)| remains.rows(&family_of(*family), now_ms))
             .collect()
