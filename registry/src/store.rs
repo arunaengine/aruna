@@ -262,6 +262,9 @@ impl Store {
         after: Option<&[u8]>,
         limit: usize,
     ) -> Result<(Vec<Listed>, Option<Vec<u8>>), StoreError> {
+        if limit == 0 {
+            return Ok((Vec::new(), None));
+        }
         // Every write holds the writer lock, so the index row and the rows it joins are read
         // as one state: no status or entry change lands inside a page.
         let _guard = self.writer.lock().map_err(|_| StoreError::Poisoned)?;
@@ -781,6 +784,10 @@ pub(crate) mod tests {
         };
         store.update_admin(&last, approved, "test", 101).unwrap();
         let realm = |listed: &Listed| listed.0.registration.payload.descriptor.payload.realm_id;
+        assert_eq!(
+            store.listing_page(101, None, 0).unwrap(),
+            (Vec::new(), None)
+        );
         let (page, next) = store.listing_page(101, None, 1).unwrap();
         assert_eq!(page.iter().map(realm).collect::<Vec<_>>(), [last]);
         let (page, _) = store.listing_page(101, next.as_deref(), 1).unwrap();
