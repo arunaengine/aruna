@@ -116,6 +116,11 @@ impl DocumentSyncService {
         self.store_row(topic_id.as_bytes(), &mark)
     }
 
+    /// Forgets the op the event under `key` became, so its next publish appends it again.
+    pub(in crate::document_sync) fn forget_published(&self, key: &[u8]) -> Result<()> {
+        self.published.remove(key).map_err(failed)
+    }
+
     pub(in crate::document_sync) fn store_row(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.published.insert(key, value).map_err(failed)
     }

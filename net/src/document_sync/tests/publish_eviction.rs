@@ -177,10 +177,19 @@ async fn blocked_allows_ready() {
 #[test]
 fn unknown_lineage_retries() {
     use crate::document_sync::publish::confirmed_lineage;
-    assert_eq!(confirmed_lineage(Ok(Some([1; 32]))), Some([1; 32]));
-    assert_eq!(confirmed_lineage(Ok(None)), None);
+    assert_eq!(confirmed_lineage(Ok(Some([1; 32])), None), Some([1; 32]));
+    assert_eq!(confirmed_lineage(Ok(None), None), None);
     let unreadable = Err(NetError::Bootstrap("down".to_string()));
-    assert_eq!(confirmed_lineage(unreadable), None);
+    assert_eq!(confirmed_lineage(unreadable, None), None);
+}
+
+// An event bound to one lineage whose append a received history moved to another is not
+// reported published, so its row stays and it appends again after the earlier events.
+#[test]
+fn moved_append_retries() {
+    use crate::document_sync::publish::confirmed_lineage;
+    assert_eq!(confirmed_lineage(Ok(Some([2; 32])), Some([1; 32])), None);
+    assert_eq!(confirmed_lineage(Ok(Some([1; 32])), Some([1; 32])), Some([1; 32]));
 }
 
 // An event bound to a lineage appends only while its topic still has that lineage; otherwise it

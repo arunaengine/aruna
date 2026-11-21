@@ -5,12 +5,17 @@
 use super::*;
 
 /// The lineage an appended event may be reported on: the one read after the append, `None` when
-/// the event left it or the read failed.
+/// the event left it, the read failed, or it differs from the lineage the event was `bound` to.
 pub(in crate::document_sync) fn confirmed_lineage(
     read: Result<Option<[u8; 32]>>,
+    bound: Option<[u8; 32]>,
 ) -> Option<[u8; 32]> {
     match read {
-        Ok(Some(lineage)) => Some(lineage),
+        Ok(Some(lineage)) if bound.is_none_or(|bound| bound == lineage) => Some(lineage),
+        Ok(Some(_)) => {
+            warn!("A received history moved a bound publish off its lineage");
+            None
+        }
         Ok(None) => {
             warn!("A published event left its lineage before the read");
             None
@@ -345,7 +350,8 @@ impl DocumentSyncService {
             // Held from the check to the record, so no other publish appends the event between.
             let _lock = self.publish_lock(topic_id);
             // A successor bound to a lineage appends only while its topic still has it.
-            if let Some(expected) = expected.get(index).copied().flatten()
+            let bound = expected.get(index).copied().flatten();
+            if let Some(expected) = bound
                 && self.current_lineage(topic_id)? != Some(expected)
             {
                 outcome.retry_indices.push(index);
@@ -385,8 +391,12 @@ impl DocumentSyncService {
                 Err(error) => return Err(error),
             };
             // Read under the publish lock, so a tie-break after it shows as a lineage change. An
-            // event without that evidence retries and holds the later events of both its domains.
-            let Some(lineage) = confirmed_lineage(self.appended_lineage(&op)) else {
+            // event without that evidence, or moved off its bound lineage by a received history,
+            // retries and holds both its domains; it appends again after the earlier events.
+            let Some(lineage) = confirmed_lineage(self.appended_lineage(&op), bound) else {
+                if let Err(error) = self.forget_published(&key) {
+                    warn!(%topic_id, %error, "Cannot forget a moved publish");
+                }
                 outcome.retry_indices.push(index);
                 let error = || "Published event left its lineage".to_string();
                 outcome.retry_error.get_or_insert_with(error);
