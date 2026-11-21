@@ -574,19 +574,28 @@ async fn boundary_appends_wait() {
     );
 
     harness.append_records().await;
+    // The appended row sorts past its stream's opening tail, so the rotation skips it; reading it
+    // still spends this invocation's one row, and the next invocation goes on after it.
     harness.handler.drain_sync_outbox().await;
-    harness.assert_rotation(2, true, 0);
+    harness.assert_rotation(1, true, 0);
     assert_eq!(
         scheduled_after(&harness.task_handle).await,
         DEFER_RETRY_AFTER
     );
 
-    harness.append_later().await;
     harness.handler.drain_sync_outbox().await;
-    harness.assert_rotation(3, true, 1);
+    harness.assert_rotation(2, true, 1);
     assert_eq!(
         scheduled_after(&harness.task_handle).await,
         OUTBOX_CONTINUATION_AFTER
+    );
+
+    harness.append_later().await;
+    harness.handler.drain_sync_outbox().await;
+    harness.assert_rotation(3, true, 0);
+    assert_eq!(
+        scheduled_after(&harness.task_handle).await,
+        DEFER_RETRY_AFTER
     );
 
     harness.handler.drain_sync_outbox().await;
