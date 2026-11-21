@@ -217,13 +217,18 @@ fn policy_gate_error(error: &PolicyGateError, action: &str) -> S3Error {
     }
 }
 
-/// A bucket key that is locked or does not open answers as the read paths do.
+/// A bucket key that is locked or does not open answers as the read paths do; an encryption
+/// change during the request is a conflict, as `PutBucketEncryption` reports it.
 fn bucket_key_error(error: &BucketKeyError) -> S3Error {
     match error {
         BucketKeyError::Locked(_) => bucket_locked_error(),
         BucketKeyError::InvalidToken => s3_error!(
             InvalidToken,
             "The security token does not open the bucket key"
+        ),
+        BucketKeyError::StaleGeneration { .. } => s3_error!(
+            OperationAborted,
+            "The bucket encryption changed during the request"
         ),
         other => internal_error(other),
     }
@@ -626,6 +631,7 @@ impl IntoS3Error for CompleteUploadError {
             }
             CompleteUploadError::Distribution(ref error) => guard_error(error),
             CompleteUploadError::UsageUpdateError(ref error) => usage_update_error(error),
+            CompleteUploadError::BucketKey(ref error) => bucket_key_error(error),
             CompleteUploadError::BlobError(BlobError::KeyTooLong) => long_key_error(),
             // The parts cannot move to another path, so only a new upload can succeed.
             CompleteUploadError::BlobError(BlobError::PathTaken) => s3_error!(
@@ -650,6 +656,7 @@ impl IntoS3Error for AbortUploadError {
             | AbortUploadError::UploadTargetMismatch
             | AbortUploadError::UploadNotOpen => missing_upload_error(),
             AbortUploadError::CompletionInProgress => completion_lease_error(),
+            AbortUploadError::Inventory(ref error) => inventory_error(error),
             err => internal_error(err),
         }
     }
@@ -1193,6 +1200,39 @@ mod tests {
         assert_eq!(get.code(), &S3ErrorCode::ServiceUnavailable);
         assert_eq!(head.code(), get.code());
         assert_eq!(copy.code(), get.code());
+    }
+
+    // An encryption change during create or complete is a conflict as on `PutBucketEncryption`,
+    // and an abort refused by the inventory retries like a create; other faults stay internal.
+    #[test]
+    fn multipart_conflicts_mapped() {
+        let stale = || BucketKeyError::StaleGeneration {
+            requested: 0,
+            current: 1,
+        };
+        for error in [
+            CreateMultipartError::BucketKey(stale()).into_s3_error(),
+            CompleteUploadError::from(stale()).into_s3_error(),
+        ] {
+            assert_eq!(*error.code(), S3ErrorCode::OperationAborted);
+            assert_eq!(error.status_code(), Some(http::StatusCode::CONFLICT));
+        }
+        let retired = || InventoryError::RangeRetired(ulid::Ulid::from_bytes([7; 16]));
+        let aborted = AbortUploadError::from(retired()).into_s3_error();
+        let created = CreateMultipartError::Inventory(retired()).into_s3_error();
+        let unavailable = S3ErrorCode::Custom("DistributedBucketUnavailable".into());
+        assert_eq!(
+            (aborted.code(), created.code()),
+            (&unavailable, &unavailable)
+        );
+        assert_eq!(
+            aborted.status_code(),
+            Some(http::StatusCode::SERVICE_UNAVAILABLE)
+        );
+        let fault = CompleteUploadError::from(BucketKeyError::Unsupported).into_s3_error();
+        assert_eq!(*fault.code(), S3ErrorCode::InternalError);
+        let fault = AbortUploadError::StorageError(StorageError::KeyNotFound).into_s3_error();
+        assert_eq!(*fault.code(), S3ErrorCode::InternalError);
     }
 
     #[test]
