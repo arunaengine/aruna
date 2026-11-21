@@ -18,7 +18,7 @@ use ::irokle::{
 use aruna_core::admin_documents::AdminDocumentEvent;
 use aruna_core::document::{
     DocumentEvent, DocumentEvictedDocument, DocumentNetEvent, DocumentOutboxEvent,
-    DocumentSyncPublish,
+    DocumentSyncPublish, HeldDomains,
 };
 use aruna_core::document_apply::cursor::AppliedCursor;
 use aruna_core::document_apply::topic_cursor_key;

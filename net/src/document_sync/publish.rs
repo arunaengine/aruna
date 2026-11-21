@@ -275,7 +275,7 @@ impl DocumentSyncService {
         let mut outcome = PublishEventsOutcome::default();
         // A retryable failure holds back the later events of its topic and admin origin, so none
         // lands in the oplog ahead of it.
-        let (mut held_topics, mut held_origins) = (BTreeSet::new(), BTreeSet::new());
+        let mut held = HeldDomains::default();
         // The lineage each topic's first confirmed entry of this batch stands on.
         let mut confirmed = BTreeMap::new();
         for (index, document) in documents.into_iter().enumerate() {
@@ -329,8 +329,8 @@ impl DocumentSyncService {
                                 );
                                 outcome.retry_indices.push(index);
                                 outcome.retry_error.get_or_insert_with(|| error.to_string());
-                                held_topics.insert(target.sync_topic_id(self.realm_id, &placement));
-                                held_origins.insert(event.origin_node_id);
+                                let topic_id = target.sync_topic_id(self.realm_id, &placement);
+                                held.hold(topic_id, Some(event.origin_node_id));
                                 continue;
                             }
                         },
@@ -348,11 +348,7 @@ impl DocumentSyncService {
             // Shard topics are join-only: only rank-0 creates the genesis, so a
             // publish onto a genesis-less shard defers the outbox record.
             let may_create_topic = !target.uses_shard_topic();
-            let held_origin = origin.is_some_and(|origin| held_origins.contains(&origin));
-            if held_topics.contains(&topic_id) || held_origin {
-                // A held entry holds both its domains for the entries after it.
-                held_topics.insert(topic_id);
-                held_origins.extend(origin);
+            if held.waits(topic_id, origin) {
                 outcome.retry_indices.push(index);
                 continue;
             }
@@ -385,8 +381,7 @@ impl DocumentSyncService {
                 Err(error @ (NetError::TopicNotReady(_) | NetError::LineageMoved(_))) => {
                     outcome.retry_indices.push(index);
                     outcome.retry_error.get_or_insert_with(|| error.to_string());
-                    held_topics.insert(topic_id);
-                    held_origins.extend(origin);
+                    held.hold(topic_id, origin);
                     continue;
                 }
                 Err(error) => return Err(error),

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
-use aruna_core::document::{DocumentEffect, DocumentNetEvent};
+use aruna_core::document::{DocumentEffect, DocumentNetEvent, HeldDomains};
 use aruna_core::effects::{Effect, EffectGroup, GroupForm, NetEffect};
 use aruna_core::events::{Event, GroupEvent, GroupResult, NetEvent};
 use aruna_core::id::NodeId;
@@ -80,24 +80,20 @@ fn shares_domain(first: &DrainSubBatch, second: &DrainSubBatch) -> bool {
         || origins.iter().any(|origin| later_origins.contains(origin))
 }
 
-/// The entries of `batch` at `published` whose topic or admin origin no entry at `retried` before
-/// them shares; the others wait unsynced, so no peer receives them ahead of a retried entry.
+/// The entries of `batch` at `published` that wait behind no entry at `retried` before them by
+/// topic or admin origin; the others wait unsynced, so no peer receives them ahead of a retry.
 fn ready_entries(batch: &DrainSubBatch, published: &[usize], retried: &[usize]) -> Vec<usize> {
-    let shares = |first: usize, later: usize| {
-        let topic = |index: usize| batch.topics.get(index);
-        let origin = |index: usize| batch.origins.get(index).copied().flatten();
-        topic(first) == topic(later) || origin(first).is_some_and(|o| origin(later) == Some(o))
-    };
-    let waits = |later: usize| {
-        retried
-            .iter()
-            .any(|&first| first < later && shares(first, later))
-    };
-    published
-        .iter()
-        .copied()
-        .filter(|&index| !waits(index))
-        .collect()
+    let mut held = HeldDomains::default();
+    let mut ready = Vec::with_capacity(published.len());
+    for (index, &topic) in batch.topics.iter().enumerate() {
+        let origin = batch.origins.get(index).copied().flatten();
+        if retried.contains(&index) {
+            held.hold(topic, origin);
+        } else if published.contains(&index) && !held.waits(topic, origin) {
+            ready.push(index);
+        }
+    }
+    ready
 }
 
 type PublishTurn = Result<Next<PublishedBatches>, IoError>;
