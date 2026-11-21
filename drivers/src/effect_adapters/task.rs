@@ -122,7 +122,7 @@ async fn apply_change(
             return event;
         };
         let written = if plan.holder == Some(admission) {
-            write_settled(storage, key, *after, admission).await
+            write_settled(storage, key, *after, admission, keep_live).await
         } else {
             own_row(storage, key, *after, plan.holder).await
         };
@@ -155,9 +155,11 @@ async fn apply_change(
     }
     if timer_has_row(&effect) {
         let written = match &effect {
-            TaskEffect::ResetTimer { key, after } => write_settled(storage, key, *after, admission)
-                .await
-                .map_err(|error| error.to_string()),
+            TaskEffect::ResetTimer { key, after } => {
+                write_settled(storage, key, *after, admission, keep_live)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
             _ => persist_task_effect(storage, &effect).await,
         };
         if let Err(message) = written {
@@ -192,14 +194,16 @@ async fn own_row(
 
 /// [`write_owned`] whose unanswered write is settled by rereading the row, which storage serves
 /// only after the write: the row of `admission` proves it committed, so only a refusal fails.
+/// A `keep_live` write is tried once, as its wake is armed with `admission` anyway.
 async fn write_settled(
     storage: &StorageHandle,
     key: &TaskKey,
     after: Duration,
     admission: u64,
+    keep_live: bool,
 ) -> Result<(), StorageError> {
     let written = write_owned(storage, key, after, admission).await;
-    if written != Err(StorageError::Timeout) {
+    if keep_live || written != Err(StorageError::Timeout) {
         return written;
     }
     let mut refused = 0;

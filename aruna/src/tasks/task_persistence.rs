@@ -497,6 +497,23 @@ mod tests {
         tokio::spawn(async move { change_timer(&store, Some(&task_handle), shorten, false).await })
     }
 
+    /// A durable reset of `key` to sixty seconds, run on its own task.
+    fn spawn_reset(
+        store: &StorageHandle,
+        task_handle: &TaskHandle,
+        key: &TaskKey,
+        keep_live: bool,
+    ) -> tokio::task::JoinHandle<Event> {
+        let (store, task_handle) = (store.clone(), task_handle.clone());
+        let reset = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after: Duration::from_secs(60),
+        };
+        tokio::spawn(
+            async move { change_timer(&store, Some(&task_handle), reset, keep_live).await },
+        )
+    }
+
     // A shorten whose row write took five seconds arms at the deadline it planned, so the live
     // wake does not count its delay again after the write.
     #[tokio::test(start_paused = true)]
@@ -542,6 +559,30 @@ mod tests {
                 .await;
             assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
         }
+    }
+
+    // A best-effort reset whose row write times out is armed at once, owned by the admission its
+    // late row carries, so a slow storage never holds back the live retry.
+    #[tokio::test(start_paused = true)]
+    async fn best_effort_armed() {
+        let task_handle = TaskHandle::new();
+        let (store, arrived, release) = gated_store(0, 0);
+        let key = gated_key();
+        let change = spawn_reset(&store, &task_handle, &key, true);
+        arrived.notified().await;
+        let waited = tokio::time::timeout(Duration::from_secs(30), change).await;
+        let event = waited.expect("armed without waiting");
+        assert!(matches!(
+            event.expect("the change ends"),
+            Event::Task(TaskEvent::TimerScheduled { .. })
+        ));
+        release.send(()).expect("the write waits");
+        let row = read_timer(&store, &key).await.expect("reads");
+        let row = row.expect("the row is stored");
+        let (_, plan) = task_handle
+            .plan_shorten(key, Duration::from_secs(120), 1)
+            .await;
+        assert_eq!(plan.and_then(|plan| plan.holder), Some(row.admission));
     }
 
     /// Deletes the row its firing owns, as a production firing does, and reports start and end.
