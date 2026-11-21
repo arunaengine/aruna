@@ -762,16 +762,21 @@ mod tests {
             let answer = run.next(IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(
                 relayed,
             ))));
-            let invocation = &run.page.as_ref().unwrap().invocation;
+            // A page with nothing to publish ends and hands its invocation out.
+            let (published, invocation) = match answer {
+                Ok(Next::Call(IoCall::Group(_))) => {
+                    let page = run.page.take().expect("a publishing page keeps its state");
+                    (true, page.invocation)
+                }
+                Ok(Next::Done(page)) => (false, page.invocation),
+                _ => panic!("the page publishes or ends"),
+            };
+            assert_eq!(published, publishes);
             assert_eq!(
                 invocation.defer.blocked_origins.contains(&origin),
                 !publishes
             );
             assert_eq!(invocation.deferred, usize::from(!publishes));
-            assert_eq!(
-                matches!(answer, Ok(Next::Call(IoCall::Group(_)))),
-                publishes
-            );
         }
     }
 
