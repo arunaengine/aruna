@@ -80,20 +80,39 @@ fn shares_domain(first: &DrainSubBatch, second: &DrainSubBatch) -> bool {
         || origins.iter().any(|origin| later_origins.contains(origin))
 }
 
-/// The entries of `batch` at `published` that wait behind no entry at `retried` before them by
-/// topic or admin origin; the others wait unsynced, so no peer receives them ahead of a retry.
-fn ready_entries(batch: &DrainSubBatch, published: &[usize], retried: &[usize]) -> Vec<usize> {
+/// Splits the entries of `batch` at `published` into those that wait behind no entry at `retried`
+/// before them by topic or admin origin, and the others, which wait unsynced so no peer receives
+/// them ahead of a retry.
+fn ready_entries(
+    batch: &DrainSubBatch,
+    published: &[usize],
+    retried: &[usize],
+) -> (Vec<usize>, Vec<usize>) {
+    let marked = |indices: &[usize]| {
+        let mut marks = vec![false; batch.topics.len()];
+        for &index in indices {
+            if let Some(mark) = marks.get_mut(index) {
+                *mark = true;
+            }
+        }
+        marks
+    };
+    let (retry, mut ready) = (marked(retried), marked(published));
     let mut held = HeldDomains::default();
-    let mut ready = Vec::with_capacity(published.len());
     for (index, &topic) in batch.topics.iter().enumerate() {
         let origin = batch.origins.get(index).copied().flatten();
-        if retried.contains(&index) {
+        if retry[index] {
             held.hold(topic, origin);
-        } else if published.contains(&index) && !held.waits(topic, origin) {
-            ready.push(index);
+            ready[index] = false;
+        } else if ready[index] && held.waits(topic, origin) {
+            ready[index] = false;
         }
     }
-    ready
+    let waiting = (published.iter().copied())
+        .filter(|&index| !ready.get(index).is_some_and(|&mark| mark))
+        .collect();
+    let ready = (0..ready.len()).filter(|&index| ready[index]).collect();
+    (ready, waiting)
 }
 
 type PublishTurn = Result<Next<PublishedBatches>, IoError>;
@@ -330,10 +349,7 @@ impl PublishBatchesOperation {
                 // Every published entry is in the oplog, but only those no retried entry before
                 // them shares a topic or origin with sync now.
                 self.out.published.extend(evidence(&published));
-                let ready = ready_entries(&batch, &published_indices, &retry_indices);
-                let waiting: Vec<usize> = (published_indices.iter().copied())
-                    .filter(|index| !ready.contains(index))
-                    .collect();
+                let (ready, waiting) = ready_entries(&batch, &published_indices, &retry_indices);
                 if let Some(waiting) = batch.sync_subset(&waiting) {
                     self.block(waiting.ordering_domains());
                 }
@@ -817,6 +833,20 @@ mod tests {
         };
         assert_eq!(done.published, vec![kept(b"later", b"one")]);
         assert!(done.outcome.retry_needed);
+    }
+
+    // A published entry after a retried one of its topic waits and holds its origin, so a later
+    // entry of that origin waits too; the others and earlier entries are ready, in index order.
+    #[test]
+    fn ready_split_order() {
+        let origin = iroh::SecretKey::from_bytes(&[4; 32]).public();
+        let mut joined = batch(b"one");
+        let names: [&[u8]; 5] = [b"one", b"two", b"one", b"three", b"four"];
+        joined.topics = names.map(TopicId::hash).to_vec();
+        joined.origins = vec![None, Some(origin), Some(origin), Some(origin), None];
+        let (ready, waiting) = ready_entries(&joined, &[4, 3, 2, 1, 9], &[0]);
+        assert_eq!(ready, vec![1, 4]);
+        assert_eq!(waiting, vec![3, 2, 9]);
     }
 
     // After a failed publish, a later sub-batch leaves out the entries of the blocked topic and

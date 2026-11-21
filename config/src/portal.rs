@@ -11,13 +11,16 @@ use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Cursor};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tar::Archive;
 use thiserror::Error;
 
 const MANIFEST_FILE: &str = "portal-manifest.json";
 const CHECKSUM_FILE: &str = "aruna-portal-dist.tar.gz.sha256";
+/// Marks a recovery directory this installer created; the old portal waits beside it.
+const BACKUP_MARKER: &str = "aruna-portal-backup";
+const BACKUP_DIR: &str = "portal";
 /// Bounds of one portal download, so a stalled or oversized answer cannot hang or exhaust a node.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
@@ -147,7 +150,10 @@ fn install_verified_artifact(
     restore_previous(&portal_dir, &previous)?;
     if !existing_install(&portal_dir)? {
         temp_dir.persist(&portal_dir)?;
-    } else if exchange_dirs(temp_dir.path(), &portal_dir).is_err() {
+    } else if let Err(error) = exchange_dirs(temp_dir.path(), &portal_dir) {
+        if error.kind() != io::ErrorKind::Unsupported {
+            return Err(error.into());
+        }
         replace_portable(temp_dir, &portal_dir, &previous)?;
     }
 
@@ -260,6 +266,8 @@ fn validate_install_target(path: &Path) -> Result<(), PortalArtifactError> {
         match component {
             Component::Normal(_) => normal_components += 1,
             Component::CurDir | Component::RootDir => {}
+            Component::Prefix(prefix)
+                if path.is_absolute() && matches!(prefix.kind(), Prefix::Disk(_)) => {}
             Component::ParentDir | Component::Prefix(_) => {
                 return Err(PortalArtifactError::InvalidPortalDirectory(
                     path.to_path_buf(),
@@ -289,7 +297,7 @@ fn existing_install(path: &Path) -> Result<bool, PortalArtifactError> {
     }
 }
 
-/// The one place where a portable replacement keeps the old portal of `path`.
+/// The one recovery directory where a portable replacement keeps the old portal of `path`.
 fn previous_install(path: &Path) -> Result<PathBuf, PortalArtifactError> {
     let name = path
         .file_name()
@@ -302,17 +310,49 @@ fn previous_install(path: &Path) -> Result<PathBuf, PortalArtifactError> {
 
 /// Puts the old portal back when an interrupted replacement left `path` missing.
 fn restore_previous(path: &Path, previous: &Path) -> Result<(), PortalArtifactError> {
+    let backup = previous.join(BACKUP_DIR);
     if fs::symlink_metadata(path).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-        && previous.join("index.html").is_file()
+        && owned_backup(previous)
+        && fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_dir())
     {
-        fs::rename(previous, path)?;
+        fs::rename(&backup, path)?;
+        let _ = fs::remove_dir_all(previous);
     }
     Ok(())
 }
 
-/// Swaps the new portal into `target` in one step; the old one is left at `staged`.
+/// Answers whether this installer created the recovery directory `previous`.
+fn owned_backup(previous: &Path) -> bool {
+    fs::symlink_metadata(previous).is_ok_and(|metadata| metadata.is_dir())
+        && fs::symlink_metadata(previous.join(BACKUP_MARKER))
+            .is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Creates the recovery directory `previous` exclusively; another directory there stays.
+fn claim_backup(previous: &Path) -> Result<(), PortalArtifactError> {
+    if owned_backup(previous) {
+        fs::remove_dir_all(previous)?;
+    }
+    if let Err(error) = fs::create_dir(previous) {
+        return Err(match error.kind() {
+            io::ErrorKind::AlreadyExists => {
+                PortalArtifactError::InvalidPortalDirectory(previous.to_path_buf())
+            }
+            _ => error.into(),
+        });
+    }
+    if let Err(error) = fs::File::create_new(previous.join(BACKUP_MARKER)) {
+        let _ = fs::remove_dir(previous);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+/// Swaps the new portal into `target` in one step; the old one is left at `staged`. A file
+/// system without an exchange answers `Unsupported`.
 #[cfg(not(windows))]
 fn exchange_dirs(staged: &Path, target: &Path) -> io::Result<()> {
+    use rustix::io::Errno;
     rustix::fs::renameat_with(
         rustix::fs::CWD,
         staged,
@@ -320,7 +360,12 @@ fn exchange_dirs(staged: &Path, target: &Path) -> io::Result<()> {
         target,
         rustix::fs::RenameFlags::EXCHANGE,
     )
-    .map_err(io::Error::from)
+    .map_err(|error| {
+        match [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&error) {
+            true => io::Error::from(io::ErrorKind::Unsupported),
+            false => io::Error::from(error),
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -334,15 +379,20 @@ fn replace_portable(
     target: &Path,
     previous: &Path,
 ) -> Result<(), PortalArtifactError> {
-    if existing_install(previous)? {
-        fs::remove_dir_all(previous)?;
+    claim_backup(previous)?;
+    let backup = previous.join(BACKUP_DIR);
+    if let Err(error) = fs::rename(target, &backup) {
+        let _ = fs::remove_dir_all(previous);
+        return Err(error.into());
     }
-    fs::rename(target, previous)?;
     if let Err(install) = staged.persist(target) {
-        return match fs::rename(previous, target) {
-            Ok(()) => Err(install.into()),
+        return match fs::rename(&backup, target) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(previous);
+                Err(install.into())
+            }
             Err(restore) => Err(PortalArtifactError::RollbackFailed {
-                backup: previous.to_path_buf(),
+                backup,
                 install,
                 restore,
             }),
@@ -607,10 +657,10 @@ pub enum PortalArtifactError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECKSUM_FILE, DownloadedChecksumFile, PortalArtifactError, TempInstallDir,
-        existing_install, install_parent, install_verified_artifact, installed_status, portal_dir,
-        prepare_artifact_status, previous_install, replace_portable, safe_archive_path,
-        unpack_archive, verify_sha256,
+        BACKUP_DIR, CHECKSUM_FILE, DownloadedChecksumFile, PortalArtifactError, TempInstallDir,
+        claim_backup, existing_install, install_parent, install_verified_artifact,
+        installed_status, portal_dir, prepare_artifact_status, previous_install, replace_portable,
+        safe_archive_path, unpack_archive, verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -734,12 +784,32 @@ mod tests {
         assert!(!existing_install(&tempdir.path().join("missing")).unwrap());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn parent_allows_drive() {
+        for path in [r"C:portal", r"C:\", r"C:\run", r"\\server\share\portal"] {
+            assert!(
+                matches!(
+                    install_parent(Path::new(path)),
+                    Err(PortalArtifactError::InvalidPortalDirectory(_))
+                ),
+                "expected {path:?} to be rejected"
+            );
+        }
+        assert_eq!(
+            install_parent(Path::new(r"C:\run\portal")).unwrap(),
+            Path::new(r"C:\run")
+        );
+    }
+
     #[tokio::test]
     async fn startup_restores_previous() {
         let tempdir = tempdir().unwrap();
         let target = tempdir.path().join("portal");
         let previous = previous_install(&target).unwrap();
-        write_portal(&previous, "old");
+        write_portal(&target, "old");
+        claim_backup(&previous).unwrap();
+        fs::rename(&target, previous.join(BACKUP_DIR)).unwrap();
         let mut config = config(&target);
         config.artifact_url = None;
 
@@ -749,6 +819,74 @@ mod tests {
         assert_eq!(
             fs::read_to_string(target.join("index.html")).unwrap(),
             "old"
+        );
+        assert!(!previous.exists());
+    }
+
+    #[tokio::test]
+    async fn startup_ignores_sibling() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        fs::create_dir_all(&previous).unwrap();
+        fs::write(previous.join("index.html"), "saved site").unwrap();
+        let mut config = config(&target);
+        config.artifact_url = None;
+
+        let status = prepare_artifact_status(config).await;
+
+        assert!(!status.installed);
+        assert!(!target.exists());
+        assert_eq!(
+            fs::read_to_string(previous.join("index.html")).unwrap(),
+            "saved site"
+        );
+    }
+
+    #[test]
+    fn replace_keeps_backup() {
+        // An operator's backup at the recovery name stays, and so does the live portal.
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        write_portal(&target, "old");
+        write_portal(&previous, "backup");
+        let staged = tempdir.path().join("staged");
+        write_portal(&staged, "new");
+        let staged = TempInstallDir {
+            path: staged,
+            cleanup: true,
+        };
+
+        assert!(matches!(
+            replace_portable(staged, &target, &previous),
+            Err(PortalArtifactError::InvalidPortalDirectory(_))
+        ));
+        for (dir, index) in [(&target, "old"), (&previous, "backup")] {
+            assert_eq!(fs::read_to_string(dir.join("index.html")).unwrap(), index);
+        }
+    }
+
+    #[test]
+    fn replace_reuses_backup() {
+        // A recovery directory this installer left behind does not block the next replacement.
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        write_portal(&target, "old");
+        claim_backup(&previous).unwrap();
+        let staged = tempdir.path().join("staged");
+        write_portal(&staged, "new");
+        let staged = TempInstallDir {
+            path: staged,
+            cleanup: true,
+        };
+
+        replace_portable(staged, &target, &previous).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target.join("index.html")).unwrap(),
+            "new"
         );
         assert!(!previous.exists());
     }

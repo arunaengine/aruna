@@ -44,7 +44,8 @@ const REFRESH_COOLDOWN_SECS: u64 = 30;
 pub struct OidcValidator {
     client: reqwest::Client,
     provider_metadata_cache: RwLock<HashMap<String, CachedProviderMetadata>>,
-    /// Per discovery URL, the end of its last provider call. Holding the slot runs the only call.
+    /// Per discovery URL, the end of its last failed provider call. Holding the slot runs the
+    /// only call.
     refresh_slots: Mutex<HashMap<String, Arc<Mutex<Option<Instant>>>>>,
 }
 
@@ -212,21 +213,23 @@ impl OidcValidator {
             .entry(provider.discovery_url.clone())
             .or_default()
             .clone();
-        let mut attempted_at = slot.lock().await;
+        let mut failed_at = slot.lock().await;
         if let Some(metadata) = self.cached_metadata(provider, &usable).await {
             return Ok(metadata);
         }
-        // A load shares the failure of a call that ended while it waited; a key refresh waits
-        // out the cooldown after every call.
-        let shared = attempted_at.is_some_and(|at| match stale {
-            None => at >= asked_at,
-            Some(_) => at.elapsed() < Duration::from_secs(REFRESH_COOLDOWN_SECS),
+        // A failed call that ended while this request waited, or within the cooldown, stands
+        // for every load and refresh; a successful call cools refreshes through `fetched_at`.
+        let shared = failed_at.is_some_and(|at| {
+            at >= asked_at || at.elapsed() < Duration::from_secs(REFRESH_COOLDOWN_SECS)
         });
         if shared {
-            return Err(OidcError::SigningNotFound);
+            return Err(match stale {
+                None => OidcError::ProviderUnavailable,
+                Some(_) => OidcError::SigningNotFound,
+            });
         }
         let fetched = self.fetch_provider_metadata(provider).await;
-        *attempted_at = Some(Instant::now());
+        *failed_at = fetched.is_err().then(Instant::now);
         let metadata = fetched?;
         self.provider_metadata_cache
             .write()
@@ -1544,7 +1547,7 @@ mod test {
         task.abort();
     }
 
-    /// Moves the last fetch and the last provider call of a provider past the refresh cooldown.
+    /// Moves the last fetch and the last failed call of a provider past the refresh cooldown.
     async fn cool_down(validator: &OidcValidator, discovery_url: &str) {
         let cooled_at = Instant::now()
             .checked_sub(Duration::from_secs(REFRESH_COOLDOWN_SECS + 1))
@@ -1555,6 +1558,15 @@ mod test {
         }
         let slots = validator.refresh_slots.lock().await;
         *slots.get(discovery_url).unwrap().lock().await = Some(cooled_at);
+    }
+
+    /// Moves the last fetch of a provider past the cache lifetime.
+    async fn expire_cache(validator: &OidcValidator, discovery_url: &str) {
+        let expired_at = Instant::now()
+            .checked_sub(Duration::from_secs(CACHE_TTL_SECS + 1))
+            .unwrap();
+        let mut cache = validator.provider_metadata_cache.write().await;
+        cache.get_mut(discovery_url).unwrap().fetched_at = expired_at;
     }
 
     #[tokio::test]
@@ -1662,6 +1674,67 @@ mod test {
         let identity = validator.validate(&provider, &rotated).await.unwrap();
         assert_eq!(identity.subject_id, "subject-1");
         assert_eq!(calls(), (3, 3));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_load_cools() {
+        // Without usable keys, a failed load cools later logins with an unavailable provider,
+        // for an empty and for an expired cache, and expired keys stay unused.
+        let issuer = "https://issuer.example";
+        let audience = "aruna-api";
+        let kid = "main-key";
+        let signing_key = generate_signing_key();
+        let (discovery_url, _jwks_uri, metrics, task) =
+            spawn_oidc_provider(issuer, kid, serde_json::Value::Null).await;
+        let provider = OidcProviderConfig {
+            id: "main".to_string(),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+            discovery_url,
+        };
+        let validator = OidcValidator::new().unwrap();
+        let token = sign_oidc_token(
+            issuer,
+            audience,
+            "subject-1",
+            kid,
+            &signing_key,
+            Algorithm::EdDSA,
+            None,
+        );
+        let calls = || {
+            (
+                metrics.discovery_requests.load(Ordering::Relaxed),
+                metrics.jwks_requests.load(Ordering::Relaxed),
+            )
+        };
+
+        let failed = validator.validate(&provider, &token).await;
+        assert!(matches!(failed, Err(OidcError::Http(_))));
+        let cooling = validator.validate(&provider, &token).await;
+        assert!(matches!(cooling, Err(OidcError::ProviderUnavailable)));
+        assert_eq!(calls(), (1, 1));
+
+        *metrics.jwks.write().await = eddsa_jwk(kid, &signing_key);
+        cool_down(&validator, &provider.discovery_url).await;
+        validator.validate(&provider, &token).await.unwrap();
+        assert_eq!(calls(), (2, 2));
+        *metrics.jwks.write().await = serde_json::Value::Null;
+        expire_cache(&validator, &provider.discovery_url).await;
+
+        let failed = validator.validate(&provider, &token).await;
+        assert!(matches!(failed, Err(OidcError::Http(_))));
+        let cooling = validator.validate(&provider, &token).await;
+        assert!(matches!(cooling, Err(OidcError::ProviderUnavailable)));
+        assert_eq!(calls(), (3, 3));
+
+        *metrics.jwks.write().await = eddsa_jwk(kid, &signing_key);
+        cool_down(&validator, &provider.discovery_url).await;
+        expire_cache(&validator, &provider.discovery_url).await;
+        validator.validate(&provider, &token).await.unwrap();
+        assert_eq!(calls(), (4, 4));
 
         task.abort();
     }

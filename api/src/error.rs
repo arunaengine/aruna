@@ -166,6 +166,8 @@ pub enum OidcError {
     MissingKeyId,
     #[error("OIDC signing key not found")]
     SigningNotFound,
+    #[error("OIDC provider unavailable")]
+    ProviderUnavailable,
     #[error("OIDC token subject is missing")]
     MissingSubject,
     #[error("OIDC configuration error: {0}")]
