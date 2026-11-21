@@ -502,13 +502,31 @@ async fn swap_back(kept: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceErro
 }
 
 /// Discards the file a swap back displaced only when it is the incoming
-/// download; a save the owner made in the meantime is put beside the target.
+/// download. A save the owner made in the meantime is the newest, so it goes
+/// back to the target and the older save is put beside it.
 async fn settle_returned(returned: &Path, target: &Path, incoming: &[u8; 32]) -> PlaceError {
     if !holds_hash(returned, incoming).await {
-        return keep_displaced(returned, target).await;
+        let older = swap_newest(returned, target).unwrap_or_else(|_| returned.to_path_buf());
+        return keep_displaced(&older, target).await;
     }
     let _ = tokio::fs::remove_file(returned).await;
     PlaceError::Refused(LocalFileRefusal::Drifted)
+}
+
+/// Puts the newer save at `returned` back at the target and answers where the
+/// older save it displaced now sits.
+#[cfg(not(windows))]
+fn swap_newest(returned: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
+    exchange(returned, target)?;
+    Ok(returned.to_path_buf())
+}
+
+#[cfg(windows)]
+fn swap_newest(returned: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
+    let older = returned.with_file_name(Ulid::generate().to_string());
+    replace_file(target, returned, &older)
+        .map_err(|error| PlaceError::Failed(error.to_string()))?;
+    Ok(older)
 }
 
 /// Puts the owner's bytes at `kept` beside the target, or names the path they
@@ -948,7 +966,8 @@ mod tests {
             refusal,
             PlaceError::Refused(LocalFileRefusal::Drifted)
         ));
-        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"first save");
+        // The last writer wins: the second save is at the target, the first beside it.
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second save");
         let mut versions = Vec::new();
         for entry in std::fs::read_dir(root.path()).unwrap() {
             let entry = entry.unwrap();
