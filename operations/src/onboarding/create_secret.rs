@@ -17,7 +17,7 @@ use ulid::Ulid;
 
 use crate::onboarding::secret_state::{resolve_secret_state, secret_state_entry, secret_state_key};
 
-pub(crate) const SECRET_RECORD_PREFIX: &str = "secret:";
+pub const SECRET_RECORD_PREFIX: &str = "secret:";
 /// Prefixes the expiry index: one row per secret, soonest expiry first.
 pub const SECRET_EXPIRY_PREFIX: &str = "secret-expiry:";
 /// Secrets one page of the outstanding-secret scan reads. The scan follows its

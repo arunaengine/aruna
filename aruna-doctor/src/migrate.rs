@@ -19,13 +19,14 @@ use aruna_core::keyspaces::{
     FAMILY_RECORD_KEYSPACE, GIT_RECORD_KEYSPACE, ID_MAPPING_KEYSPACE, IRI_INDEX_KEYSPACE,
     JOB_KEYSPACE, JOB_RESERVATION_KEYSPACE, JOB_STATE_KEYSPACE, LAUNCH_RECORD_KEYSPACE,
     NODE_INFO_KEYSPACE, NODE_STATE_KEY, NODE_STATE_KEYSPACE, NODE_STATS_KEYSPACE,
-    NODE_VAULT_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE, PLUGIN_OUTBOX_KEYSPACE,
-    PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE, QUARANTINE_USAGE_KEYSPACE,
-    REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE, REPLICATION_JOB_KEYSPACE,
-    REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE, S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE,
-    SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE, SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE,
-    STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE, SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE,
-    UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE, USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
+    NODE_VAULT_KEYSPACE, ONBOARDING_KEYSPACE, PLAINTEXT_COPY_KEYSPACE, PLAN_EXPLAIN_KEYSPACE,
+    PLUGIN_OUTBOX_KEYSPACE, PLUGIN_RUNS_KEYSPACE, PLUGIN_WAITING_KEYSPACE,
+    QUARANTINE_USAGE_KEYSPACE, REALM_CONFIG_KEYSPACE, REFRESH_JOB_KEYSPACE,
+    REPLICATION_JOB_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, ROOT_RECORD_KEYSPACE,
+    S3_BUCKET_KEYSPACE, S3_SESSION_KEYSPACE, SECONDARY_ID_KEYSPACE, SESSION_EXPIRY_KEYSPACE,
+    SESSION_OWNER_KEYSPACE, SOURCE_INDEX_KEYSPACE, STAGING_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    SYNC_QUARANTINE_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE, USAGE_STATS_KEYSPACE,
+    USER_SESSION_KEYSPACE, WITNESS_DEADLINE_KEYSPACE,
 };
 use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::plugin_installs::PluginInstall;
@@ -83,6 +84,7 @@ mod installs;
 mod jobs;
 mod layouts;
 mod mappings;
+mod onboarding;
 mod plugin_events;
 mod removals;
 mod session_refs;
@@ -211,6 +213,9 @@ pub struct MigrateOutput {
     /// Persisted timers from before the admission, which gain no admission.
     pub timers_scanned: usize,
     pub timers_rewritten: usize,
+    /// Onboarding secrets read, and the expiry index rows written for those that had none.
+    pub onboarding_secrets_scanned: usize,
+    pub expiry_rows_written: usize,
     /// Rows of those keyspaces that match no known shape, left unchanged, as
     /// `keyspace/key: reason`. Any such row makes the command fail after it prints this output.
     pub unknown_rows: Vec<String>,
@@ -313,6 +318,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     let harvest_rows = db.keyspace(trailing::HARVEST.0, KeyspaceCreateOptions::default)?;
     let mirror_rows = db.keyspace(trailing::MIRROR.0, KeyspaceCreateOptions::default)?;
     let timer_rows = db.keyspace(trailing::TIMERS.0, KeyspaceCreateOptions::default)?;
+    let onboarding_rows = db.keyspace(ONBOARDING_KEYSPACE, KeyspaceCreateOptions::default)?;
 
     sync_ops::unread_ops(&db, sync_path, &applied_rows)?;
     // Queued publishes gain their incarnation first, so every outbox step below reads them.
@@ -369,6 +375,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
     )?;
     let projections = keys(&db, &cache_rows)?;
     let configs = realm_configs(&db, &config_rows)?;
+    let expiries = onboarding::expiry_rows(&db, &onboarding_rows, &mut unknown_rows)?;
     let mappings =
         rewrites::<PersistentIdMapping, LegacyMapping>(&db, &mapping_rows, ID_MAPPING_KEYSPACE)?;
     let mapping =
@@ -558,6 +565,7 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         (&pending_rows, &pending.rows),
         (&conflict_rows, &conflicts.rows),
         (&config_rows, &configs.rows),
+        (&onboarding_rows, &expiries.rows),
         (&mapping_rows, &mappings.rows),
         (&outbox_rows, &outbox.rows),
         (&outbox_rows, &git_outbox.rows),
@@ -749,6 +757,8 @@ fn migrate_stores(database_path: &str, sync_path: &Path) -> Result<MigrateOutput
         outbox_incarnations_rewritten: incarnations.rewritten,
         timers_scanned: timers.scanned,
         timers_rewritten: timers.rewritten,
+        onboarding_secrets_scanned: expiries.scanned,
+        expiry_rows_written: expiries.rows.len(),
         unknown_rows,
     })
 }
