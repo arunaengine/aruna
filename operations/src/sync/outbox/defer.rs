@@ -29,8 +29,8 @@ pub struct DrainDeferState {
 }
 
 /// Admin origins whose already published records must sync again, with the topics those records
-/// ride. A later record of such an origin goes out only on one of these topics, whose sync
-/// carries the earlier record in order; on any other topic it waits.
+/// ride. A later record of such an origin goes out only while every wait of the origin is on its
+/// own topic, whose sync carries the earlier records in order; otherwise it waits.
 pub type SyncWaits = HashMap<NodeId, HashSet<TopicId>>;
 
 /// Adds the origin and topic of each record whose sync must retry to `waits`.
@@ -89,8 +89,10 @@ pub fn partition_drain_records(
     let mut deferred = Vec::new();
     let mut undeliverable = Vec::new();
     for (record_key, record, topic) in records {
-        // Origin order is the contract, whatever topic the later records ride.
+        // Origin order is the contract, whatever topic the later records ride; a held record
+        // holds its topic too.
         if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
+            defer.deferred_topics.insert(topic);
             deferred.push((record_key, record, topic));
             continue;
         }
@@ -100,9 +102,10 @@ pub fn partition_drain_records(
             && defer
                 .sync_waits
                 .get(&origin)
-                .is_some_and(|topics| !topics.contains(&topic))
+                .is_some_and(|topics| topics.iter().any(|waiting| *waiting != topic))
         {
             defer.blocked_origins.insert(origin);
+            defer.deferred_topics.insert(topic);
             deferred.push((record_key, record, topic));
             continue;
         }

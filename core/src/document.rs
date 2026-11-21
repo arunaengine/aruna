@@ -908,13 +908,17 @@ pub enum DocumentEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DocumentNetEvent {
+    /// `lineages` hold, by document position, the lineage root each event was found or
+    /// appended on; `None` where it is unknown.
     DocumentsPublished {
         targets: Vec<DocumentTarget>,
+        lineages: Vec<Option<[u8; 32]>>,
     },
     DocumentsPartiallyPublished {
         published_indices: Vec<usize>,
         retry_indices: Vec<usize>,
         error: String,
+        lineages: Vec<Option<[u8; 32]>>,
     },
     DocumentsReconciled {
         applied: usize,

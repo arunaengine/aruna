@@ -104,6 +104,17 @@ struct PublishEventsOutcome {
     published_indices: Vec<usize>,
     retry_indices: Vec<usize>,
     retry_error: Option<String>,
+    /// The lineage root each published event was found or appended on, by document position.
+    lineages: BTreeMap<usize, [u8; 32]>,
+}
+
+impl PublishEventsOutcome {
+    /// The lineage of each of `count` documents, `None` where it is unknown.
+    fn lineage_list(&self, count: usize) -> Vec<Option<[u8; 32]>> {
+        (0..count)
+            .map(|index| self.lineages.get(&index).copied())
+            .collect()
+    }
 }
 
 #[derive(Debug)]

@@ -403,6 +403,7 @@ pub(super) async fn dispatch_net(effect: NetEffect, context: &DriverContext) -> 
                 Event::Net(NetEvent::DocumentSync(
                     DocumentNetEvent::DocumentsPublished {
                         targets: publication_targets(&documents),
+                        lineages: vec![None; documents.len()],
                     },
                 ))
             }

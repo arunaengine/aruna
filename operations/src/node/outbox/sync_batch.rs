@@ -76,12 +76,18 @@ impl Operation for SyncBatchOperation {
     fn next(&mut self, result: IoResult) -> SyncTurn {
         if self.finishing {
             let mut finished = result.child::<FinishedBatch, IoError>()??;
-            // The records are in the oplog already, so a later record on their topic goes out:
-            // its sync carries them in order. Only other topics of their origins wait.
+            // A record in the oplog lets a later record of its topic go out, as that sync carries
+            // it in order; one off the current lineage is lost and holds its topic and origin.
             if finished.outcome.retry_needed {
-                let waits = self.entries.iter().copied();
-                let waits = waits.filter_map(|(topic, origin)| Some((origin?, topic)));
-                finished.outcome.sync_waits.extend(waits);
+                for (index, &(topic, origin)) in self.entries.iter().enumerate() {
+                    let outcome = &mut finished.outcome;
+                    if finished.lost.contains(&index) {
+                        outcome.blocked_topics.push(topic);
+                        outcome.blocked_origins.extend(origin);
+                    } else if let Some(origin) = origin {
+                        outcome.sync_waits.push((origin, topic));
+                    }
+                }
             }
             return Ok(Next::Done(finished));
         }
@@ -154,5 +160,27 @@ mod tests {
             done.outcome.sync_waits,
             vec![(peer, TopicId::hash(b"topic"))]
         );
+    }
+
+    // A record the finish found off its lineage is no longer in the oplog: it blocks its topic
+    // and origin instead of letting a same-topic successor go out.
+    #[test]
+    fn lost_record_blocks() {
+        let local = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let serving = (local, RealmId::from_bytes([3; 32]));
+        let mut run = SyncBatchOperation::new(serving, Ulid::from_parts(1, 1), batch());
+        run.first().unwrap();
+        let synced = Ok::<_, ApplyError>(DocumentReconcileResult::default());
+        run.next(IoResult::Child(ChildOutcome::new(synced))).unwrap();
+        let mut finished = FinishedBatch::default();
+        (finished.outcome.retry_needed, finished.lost) = (true, vec![0]);
+        let finished = Ok::<_, IoError>(finished);
+        let Ok(Next::Done(done)) = run.next(IoResult::Child(ChildOutcome::new(finished))) else {
+            panic!("the batch finishes");
+        };
+        let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();
+        assert_eq!(done.outcome.blocked_topics, vec![TopicId::hash(b"topic")]);
+        assert_eq!(done.outcome.blocked_origins, vec![peer]);
+        assert!(done.outcome.sync_waits.is_empty());
     }
 }
