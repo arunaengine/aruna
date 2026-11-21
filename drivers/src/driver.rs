@@ -68,15 +68,20 @@ pub fn node_facts(context: &DriverContext) -> NodeFacts {
 }
 
 /// 1-minute OS load average scaled to permille of logical core capacity, or
-/// `None` (with a warning) when the core count is unavailable.
+/// `None` when the core count (with a warning) or the load average is unavailable.
 fn read_load_permille() -> Option<u32> {
-    match std::thread::available_parallelism() {
-        Ok(cores) => Some(permille_of(
-            sysinfo::System::load_average().one,
-            cores.get() as u64,
-        )),
+    let cores = match std::thread::available_parallelism() {
+        Ok(cores) => cores,
         Err(error) => {
             warn!(%error, "failed to read logical core count for node info load");
+            return None;
+        }
+    };
+    match sysinfo::System::load_average() {
+        Ok(load) => Some(permille_of(load.one, cores.get() as u64)),
+        // Windows has no load average; logged at debug so each node info read stays quiet.
+        Err(error) => {
+            debug!(%error, "no load average for node info load");
             None
         }
     }
