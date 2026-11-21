@@ -176,6 +176,29 @@ fn held_origin_topic() {
     assert_eq!(deferred.len(), 2);
 }
 
+// A later record of an origin whose earlier record this page relays is relayed in order after it,
+// so a holder decides each one; it is no deferred work that wakes the drain again.
+#[test]
+fn later_relays_ordered() {
+    let origin = node(4);
+    let (first, second) = (TopicId::hash(b"first-shard"), TopicId::hash(b"second-shard"));
+    let records = vec![
+        (b"admin/1".to_vec(), admin_record(origin, 1), first),
+        (b"admin/2".to_vec(), admin_record(origin, 2), second),
+    ];
+    let mut defer = DrainDeferState::default();
+    let (to_publish, deferred, undeliverable) = partition_drain_records(
+        records,
+        &mut defer,
+        true,
+        |_| true,
+        |_| DeferOutcome::Undeliverable,
+    );
+    assert!(to_publish.is_empty() && deferred.is_empty());
+    let keys: Vec<Vec<u8>> = undeliverable.into_iter().map(|(key, ..)| key).collect();
+    assert_eq!(keys, vec![b"admin/1".to_vec(), b"admin/2".to_vec()]);
+}
+
 // A relay waits while an earlier record of its origin still publishes on this page; a relay of
 // another origin to another shard runs.
 #[test]

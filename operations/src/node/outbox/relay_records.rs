@@ -448,6 +448,21 @@ mod tests {
         assert_eq!(answer, Ok(Next::Done(left)));
     }
 
+    // After a holder rejects a record, the later record of its origin still gets its own verdict
+    // instead of waiting behind the rejected one.
+    #[test]
+    fn rejected_relay_releases() {
+        let records = vec![
+            signed_record(b"admin/1", node()),
+            signed_record(b"admin/2", node()),
+        ];
+        let mut run = RelayRecordsOperation::new(node(), Some(Arc::new(holder_config())), records);
+        assert!(matches!(run.first(), Ok(Next::Call(IoCall::Child(_)))));
+        let rejected = Err::<(), _>(ForwardError::Forbidden);
+        let later = run.next(IoResult::Child(ChildOutcome::new(rejected)));
+        assert!(matches!(later, Ok(Next::Call(IoCall::Child(_)))));
+    }
+
     // An origin this node's own config no longer admits gets no holder's verdict: the record is
     // reported and stays, without a retry.
     #[test]

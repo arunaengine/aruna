@@ -91,10 +91,17 @@ pub fn partition_drain_records(
     let mut to_publish = Vec::with_capacity(records.len());
     let mut deferred = Vec::new();
     let mut undeliverable = Vec::new();
+    // Origins only a relay of this page blocked: the relay run decides their later relays in order.
+    let mut relaying = HashSet::new();
     for (record_key, record, topic) in records {
         // Origin order is the contract, whatever topic the later records ride; a held record
         // holds its topic too.
         if admin_origin(&record).is_some_and(|origin| defer.blocked_origins.contains(&origin)) {
+            let relayed = admin_origin(&record).is_some_and(|origin| relaying.contains(&origin));
+            if relayed && relay_only(&record, topic, defer, &mut classify_defer) {
+                undeliverable.push((record_key, record, topic));
+                continue;
+            }
             defer.deferred_topics.insert(topic);
             deferred.push((record_key, record, topic));
             continue;
@@ -131,6 +138,7 @@ pub fn partition_drain_records(
         if defer.undeliverable_topics.contains(&topic) {
             if let Some(origin) = admin_origin(&record) {
                 defer.blocked_origins.insert(origin);
+                relaying.insert(origin);
             }
             undeliverable.push((record_key, record, topic));
             continue;
@@ -143,6 +151,7 @@ pub fn partition_drain_records(
             defer.undeliverable_topics.insert(topic);
             if let Some(origin) = admin_origin(&record) {
                 defer.blocked_origins.insert(origin);
+                relaying.insert(origin);
             }
             undeliverable.push((record_key, record, topic));
             continue;
@@ -170,6 +179,30 @@ pub fn partition_drain_records(
         deferred.push((record_key, record, topic));
     }
     (to_publish, deferred, undeliverable)
+}
+
+/// Whether this node can only relay `record`: a shard record on a topic it does not hold and no
+/// failure deferred.
+fn relay_only(
+    record: &DocumentOutboxRecord,
+    topic: TopicId,
+    defer: &mut DrainDeferState,
+    classify_defer: &mut impl FnMut(&DocumentOutboxRecord) -> DeferOutcome,
+) -> bool {
+    if defer.deferred_topics.contains(&topic) || !record.target.uses_shard_topic() {
+        return false;
+    }
+    if defer.undeliverable_topics.contains(&topic) {
+        return true;
+    }
+    let held = *defer
+        .topic_held
+        .entry(topic)
+        .or_insert_with(|| classify_defer(record) == DeferOutcome::Retry);
+    if !held {
+        defer.undeliverable_topics.insert(topic);
+    }
+    !held
 }
 
 /// Holds back each relay that follows a record of its admin origin this page still publishes, and
