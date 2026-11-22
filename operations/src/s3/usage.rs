@@ -2896,7 +2896,7 @@ mod call_tests {
         assert!(marking.next(IoResult::Values(vec![None])).is_err());
         let mut waking = MarkDirtyOperation::wake();
         waking.first().unwrap();
-        let stray = IoResult::Event(Box::new(Event::Search()));
+        let stray = IoResult::Event(Box::new(Event::Delayed));
         assert!(matches!(
             waking.next(stray),
             Err(MarkDirtyError::UnexpectedEvent(_))

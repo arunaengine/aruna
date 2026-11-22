@@ -24,7 +24,7 @@ pub(super) async fn dispatch_storage(effect: StorageEffect, context: &DriverCont
         _ => None,
     };
     let refresh_after_commit = matches!(&effect, StorageEffect::CommitTransaction { .. });
-    let event = Box::pin(context.storage_handle.send_storage_effect(effect)).await;
+    let event = context.storage_handle.send_storage_effect(effect).await;
     if let Some(net_handle) = context.net_handle.as_ref() {
         match (&event, realm_config_write) {
             (Event::Storage(StorageEvent::WriteResult { .. }), Some(bytes)) => {

@@ -1265,7 +1265,7 @@ mod tests {
         let mut operation = QueueBlobOperation::new(on_demand_input(), None);
         operation.first().unwrap();
 
-        let turn = operation.next(IoResult::Event(Box::new(Event::Search())));
+        let turn = operation.next(IoResult::Event(Box::new(Event::Delayed)));
 
         assert!(matches!(turn, Err(BlobQueueError::Io(_))));
     }

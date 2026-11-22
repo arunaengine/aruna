@@ -78,14 +78,27 @@ impl InspectSecretOperation {
         record: OnboardingSecretRecord,
         state: OnboardingSecretState,
     ) -> Result<OnboardingSecretRecord, InspectSecretError> {
-        let claimed_by = match &state {
-            OnboardingSecretState::Finalizing { node_id } => Some(node_id),
-            _ => None,
+        let own_claim = match &state {
+            OnboardingSecretState::Available => false,
+            OnboardingSecretState::Reserved {
+                node_id,
+                expires_at,
+            } => {
+                if node_id != &self.input.node_id && *expires_at >= self.input.now {
+                    return Err(InspectSecretError::AlreadyClaimed);
+                }
+                false
+            }
+            OnboardingSecretState::Finalizing { node_id } => {
+                if node_id != &self.input.node_id {
+                    return Err(InspectSecretError::AlreadyClaimed);
+                }
+                true
+            }
+            OnboardingSecretState::Consumed { .. } => {
+                return Err(InspectSecretError::AlreadyClaimed);
+            }
         };
-        let own_claim = claimed_by == Some(&self.input.node_id);
-        if claimed_by.is_some() && !own_claim {
-            return Err(InspectSecretError::AlreadyClaimed);
-        }
         if record.expires_at < self.input.now && !own_claim {
             return Err(InspectSecretError::Expired);
         }
@@ -229,5 +242,39 @@ mod tests {
         .await;
 
         assert_eq!(inspected, Err(InspectSecretError::AlreadyClaimed));
+    }
+
+    #[test]
+    fn rejects_consumed_secret() {
+        let input = InspectSecretInput {
+            enrollment_id: Ulid::generate(),
+            secret_hash: "abc".to_string(),
+            node_id: "node-a".to_string(),
+            now: 10,
+        };
+        let record = OnboardingSecretRecord {
+            enrollment_id: input.enrollment_id,
+            secret_hash: "abc".to_string(),
+            mode: OnboardingMode::Server,
+            purpose: OnboardingPurpose::NodeEnrollment,
+            expires_at: 100,
+            claimed_node_id: Some("node-a".to_string()),
+        };
+        let op = InspectSecretOperation::new(input);
+        let consumed = aruna_core::onboarding::OnboardingSecretState::Consumed {
+            node_id: "node-a".to_string(),
+        };
+        assert_eq!(
+            op.check(record.clone(), consumed),
+            Err(InspectSecretError::AlreadyClaimed)
+        );
+        let reserved = aruna_core::onboarding::OnboardingSecretState::Reserved {
+            node_id: "node-b".to_string(),
+            expires_at: 50,
+        };
+        assert_eq!(
+            op.check(record, reserved),
+            Err(InspectSecretError::AlreadyClaimed)
+        );
     }
 }

@@ -149,7 +149,9 @@ impl OutboundHandle {
         let response = tokio::time::timeout(call.deadline, request.send())
             .await
             .map_err(|_| OutboundError::Retryable("the receiver did not answer in time".into()))?
-            .map_err(|error| OutboundError::Retryable(format!("request: {error}")))?;
+            .map_err(|error| {
+                OutboundError::Retryable(format!("request: {}", error.without_url()))
+            })?;
         Ok(response.status().as_u16())
     }
 

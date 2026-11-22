@@ -238,12 +238,18 @@ impl Operation for Writes {
 
     fn first(&mut self) -> Result<Next<()>, StoreError> {
         let rows = self.rows.take().unwrap_or_default();
-        Ok(Next::Call(IoCall::Write(rows)))
+        if !rows.is_empty() {
+            return Ok(Next::Call(IoCall::Write(rows)));
+        }
+        Ok(match self.deletes.take().filter(|keys| !keys.is_empty()) {
+            Some(deletes) => Next::Call(delete_call(deletes)),
+            None => Next::Done(()),
+        })
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<()>, StoreError> {
         done(answer)?;
-        Ok(match self.deletes.take() {
+        Ok(match self.deletes.take().filter(|keys| !keys.is_empty()) {
             Some(deletes) => Next::Call(delete_call(deletes)),
             None => Next::Done(()),
         })

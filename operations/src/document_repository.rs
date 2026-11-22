@@ -138,7 +138,7 @@ pub enum GetGroupError {
     GroupNotFound,
     #[error("No group found")]
     DocNotFound,
-    #[error("Creating Group did not finish")]
+    #[error("Document repository operation did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {

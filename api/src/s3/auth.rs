@@ -382,11 +382,11 @@ fn request_extras(cx: &S3AccessContext<'_>, operation_name: &str) -> PolicyReque
     }
     let mut headers = BTreeMap::new();
     for (name, value) in cx.headers() {
-        let name = name.as_str().to_ascii_lowercase();
-        if header_allowed(&name)
+        let name = name.as_str();
+        if header_allowed(name)
             && let Ok(value) = value.to_str()
         {
-            headers.insert(name, value.to_string());
+            headers.insert(name.to_string(), value.to_string());
         }
     }
     PolicyRequestExtras {

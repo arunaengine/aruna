@@ -199,7 +199,7 @@ pub enum GetObjectError {
     /// The bytes cannot be verified: a spool that large never fits the node's spool budget.
     #[error("Reference reads above {limit} bytes need a source that enforces ETag conditions.")]
     ReferenceTooLarge { limit: u64 },
-    #[error("GetObject failed (miserably)")]
+    #[error("GetObject failed")]
     GetObjectFailed,
     #[error("operation did not finish")]
     NotFinished,

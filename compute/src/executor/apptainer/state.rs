@@ -140,7 +140,11 @@ impl StateRoot {
     }
 
     pub fn verify(&self) -> Result<(), BackendError> {
-        let path = self.root.join("health.tmp");
+        static PROBE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = self
+            .root
+            .join(format!("health-{}-{seq}.tmp", std::process::id()));
         let mut file = File::create(&path).map_err(state_error)?;
         file.write_all(b"ok").map_err(state_error)?;
         file.sync_all().map_err(state_error)?;

@@ -244,9 +244,11 @@ impl Operation for PullMemberOperation {
                     .map(|candidate| candidate.node_id)
                     .collect();
                 if !fresh.is_empty() {
-                    self.member()?
-                        .holders
-                        .retain(|holder| fresh.contains(holder));
+                    let holders = &mut self.member()?.holders;
+                    let (mut preferred, mut fallback): (Vec<NodeId>, Vec<NodeId>) =
+                        holders.drain(..).partition(|holder| fresh.contains(holder));
+                    preferred.append(&mut fallback);
+                    *holders = preferred;
                 }
                 self.step = MemberStep::Encryption;
                 let key = self.request.bucket.as_bytes().to_vec();

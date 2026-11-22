@@ -94,8 +94,8 @@ impl Supervisor {
 
     /// Forgets `run` after its attempt ended.
     pub fn finish(&self, run: Ulid) {
-        self.reasons().remove(&run);
         self.running().remove(&run);
+        self.reasons().remove(&run);
     }
 
     /// Compiles an artifact, or answers its cached compilation.

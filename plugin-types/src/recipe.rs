@@ -119,7 +119,10 @@ fn substitute(part: &str, values: &BTreeMap<String, String>) -> String {
     while let Some(start) = rest.find('{') {
         filled.push_str(&rest[..start]);
         let tail = &rest[start..];
-        let end = tail.find('}').unwrap_or(tail.len() - 1);
+        let Some(end) = tail.find('}') else {
+            filled.push_str(tail);
+            return filled;
+        };
         let value = values.get(&tail[1..end]);
         filled.push_str(value.map_or(&tail[..=end], String::as_str));
         rest = &tail[end + 1..];
@@ -128,7 +131,7 @@ fn substitute(part: &str, values: &BTreeMap<String, String>) -> String {
     filled
 }
 
-/// The names of the `{name}` parts of `command`, in order without repeats.
+/// The names of the `{name}` parts of `command`, sorted without repeats.
 pub fn placeholders(command: &[String]) -> Result<BTreeSet<String>, &'static str> {
     let mut names = BTreeSet::new();
     for part in command {
@@ -152,7 +155,7 @@ pub fn matcher(pattern: &str) -> Option<regex::Regex> {
     if pattern.len() > MAX_PATTERN {
         return None;
     }
-    regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+    regex::RegexBuilder::new(&format!(r"\A(?:{pattern})\z"))
         .size_limit(1 << 20)
         .build()
         .ok()
@@ -182,4 +185,24 @@ pub fn container_path(path: &str) -> bool {
         && rest
             .split('/')
             .all(|segment| !matches!(segment, "" | "." | ".."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{matcher, substitute};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn substitute_handles_utf8() {
+        let values = BTreeMap::from([("name".to_string(), "ok".to_string())]);
+        assert_eq!(substitute("a-{é", &values), "a-{é");
+        assert_eq!(substitute("{name}-{é", &values), "ok-{é");
+    }
+
+    #[test]
+    fn matcher_rejects_multiline() {
+        let regex = matcher("(?m)ok").expect("pattern compiles");
+        assert!(regex.is_match("ok"));
+        assert!(!regex.is_match("ok\nbad"));
+    }
 }

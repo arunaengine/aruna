@@ -587,7 +587,7 @@ mod tests {
     // An answer of another family than the pending call fails the copy.
     #[test]
     fn spool_rejects_unexpected() {
-        let refused = at(SpoolStep::Read).next(event(Event::Search()));
+        let refused = at(SpoolStep::Read).next(event(Event::Delayed));
         assert_eq!(
             refused,
             Err(spool_error("unexpected answer to the source read"))

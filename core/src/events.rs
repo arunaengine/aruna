@@ -50,8 +50,6 @@ pub enum Event {
     Metadata(MetadataEvent),
     SubOperation(SubOperationEvent),
     Task(TaskEvent),
-    Search(),
-    Stream(),
     Index(IndexEvent),
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
@@ -1179,8 +1177,6 @@ impl Event {
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
             Event::Plugin(_) => "Event::Plugin",
-            Event::Search() => "Event::Search",
-            Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(
                 event,
                 IndexEvent {
@@ -1240,7 +1236,7 @@ mod tests {
             message: "private detail".to_string(),
         });
         assert_eq!(event.label(), "TaskEvent::Error");
-        assert_eq!(Event::Search().label(), "Event::Search");
+        assert_eq!(Event::Delayed.label(), "Event::Delayed");
     }
 
     #[test]

@@ -195,6 +195,7 @@ impl ApptainerBackend {
         loop {
             if cancel.is_cancelled() {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(BackendError::Cancelled);
             }
             if directory.join("supervisor.json").exists() {
@@ -207,6 +208,7 @@ impl ApptainerBackend {
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
+                let _ = child.wait();
                 return Err(BackendError::Timeout(
                     "Apptainer supervisor readiness timed out".to_string(),
                 ));

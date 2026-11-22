@@ -356,9 +356,8 @@ impl Operation for ForwardUploadOperation {
         let recheck = Ok(Next::Done(ForwardOutcome::Recheck));
         match self.step {
             UploadStep::Folder => {
-                let stored = outside_answer(result).and_then(|read| read.value());
-                let folder =
-                    (stored.ok().flatten()).and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok());
+                let stored = outside_answer(result).and_then(IoResult::value)?;
+                let folder = stored.and_then(|bytes| SyncedFolder::from_bytes(&bytes).ok());
                 self.foldered(folder)
             }
             UploadStep::Drop => {

@@ -11,14 +11,18 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// This process's key for sealed positions; a restart makes older sealed cursors invalid.
-static POSITION_KEY: LazyLock<[u8; 32]> = LazyLock::new(rand::random);
+/// This process's cipher for sealed positions; a restart makes older sealed cursors invalid.
+static POSITION_CIPHER: LazyLock<XChaCha20Poly1305> = LazyLock::new(|| {
+    let key: [u8; 32] = rand::random();
+    XChaCha20Poly1305::new((&key).into())
+});
 
 /// `position` encrypted and authenticated with this process's key; only it opens it again.
 pub fn seal_position(position: &[u8]) -> Option<Vec<u8>> {
     let nonce: [u8; 24] = rand::random();
-    let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
-    let sealed = cipher.encrypt(&XNonce::from(nonce), position).ok()?;
+    let sealed = POSITION_CIPHER
+        .encrypt(&XNonce::from(nonce), position)
+        .ok()?;
     Some([&[SEALED_POSITION][..], &nonce, &sealed].concat())
 }
 
@@ -29,8 +33,7 @@ pub fn open_position(position: &[u8]) -> Option<Vec<u8>> {
     };
     let (nonce, sealed) = sealed.split_at_checked(24)?;
     let nonce: [u8; 24] = nonce.try_into().ok()?;
-    let cipher = XChaCha20Poly1305::new((&*POSITION_KEY).into());
-    cipher.decrypt(&XNonce::from(nonce), sealed).ok()
+    POSITION_CIPHER.decrypt(&XNonce::from(nonce), sealed).ok()
 }
 
 /// A listing position sealed as cursor text, so it names no entry.

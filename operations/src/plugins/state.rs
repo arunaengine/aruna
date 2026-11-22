@@ -128,6 +128,10 @@ impl Operation for PutState {
     }
 
     fn first(&mut self) -> Result<Next<u64>, PutError> {
+        if self.put.key.len() > MAX_STATE_KEY {
+            let message = "a state key has at most 256 bytes".to_string();
+            return Err(PutError::Refused(message, StateRefusal::Limit));
+        }
         if self.put.value.len() > MAX_STATE_VALUE {
             let message = "a state value has at most 256 KiB".to_string();
             return Err(PutError::Refused(message, StateRefusal::Limit));

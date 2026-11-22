@@ -634,8 +634,7 @@ struct ParentRun<'a, P: Operation>(&'a mut CallRun<P>, Option<u64>);
 
 impl<P: Operation> Drive for ParentRun<'_, P> {
     fn start(&mut self) -> Effects {
-        let entropy = clock::next_entropy();
-        let now = clock::stamp_time();
+        let (now, entropy) = clock::start_stamp();
         self.1 = recorder::begin(type_name::<CallRun<P>>(), now, &*self.0, entropy);
         self.0.stamp(now);
         self.0.seed(entropy);
@@ -663,8 +662,7 @@ struct SubRun<'a>(&'a mut dyn SubOperation, Option<u64>);
 
 impl Drive for SubRun<'_> {
     fn start(&mut self) -> Effects {
-        let entropy = clock::next_entropy();
-        let now = clock::stamp_time();
+        let (now, entropy) = clock::start_stamp();
         let name = type_name_of_val(&*self.0);
         self.1 = recorder::begin(name, now, &*self.0, entropy);
         self.0.stamp(now);
@@ -796,9 +794,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Group(_)
         | Effect::Delay(_)
         | Effect::Job(_)
-        | Effect::Git(_)
-        | Effect::Search()
-        | Effect::Stream() => None,
+        | Effect::Git(_) => None,
     }
 }
 
@@ -813,12 +809,7 @@ async fn dispatch_bounded(
 ) -> Event {
     let limit = hang_limit(&effect, limits);
     let kind = effect_adapters::effect_kind(&effect);
-    let dispatch: BoxFuture<'_, Event> = match until {
-        Some(_) => Box::pin(effect_adapters::dispatch_effect_until(
-            effect, context, depth, until,
-        )),
-        None => Box::pin(effect_adapters::dispatch_effect(effect, context, depth)),
-    };
+    let dispatch = effect_adapters::dispatch_effect_until(effect, context, depth, until);
     match limit {
         Some(limit) => tokio::time::timeout(limit, dispatch)
             .await
@@ -1064,6 +1055,7 @@ async fn drive_effects(
 ) -> RunState {
     let mut queue: VecDeque<Effect> = executable.start().into_iter().collect();
     let mut state = RunState::new(context);
+    let limits = hang_limits();
 
     // A run that fails in its first step is complete at once; its cleanup effects still run.
     while !executable.is_complete() || !queue.is_empty() {
@@ -1133,13 +1125,7 @@ async fn drive_effects(
                 // Managed effects own their timeout, and a child applies this deadline itself and
                 // then runs its cleanup; cutting either here would drop that work.
                 let managed = managed_effect(&effect) || matches!(effect, Effect::SubOperation(_));
-                let dispatch: BoxFuture<'_, Event> = Box::pin(dispatch_bounded(
-                    effect,
-                    context,
-                    depth,
-                    Some(deadline),
-                    hang_limits(),
-                ));
+                let dispatch = dispatch_bounded(effect, context, depth, Some(deadline), limits);
                 if managed {
                     dispatch.await
                 } else {
@@ -1166,14 +1152,7 @@ async fn drive_effects(
                     }
                 }
             } else {
-                Box::pin(dispatch_bounded(
-                    effect,
-                    context,
-                    depth,
-                    None,
-                    hang_limits(),
-                ))
-                .await
+                dispatch_bounded(effect, context, depth, None, limits).await
             };
             state.record_outcome(transaction, &event);
             if !executable.is_complete() {
@@ -1204,7 +1183,7 @@ pub(crate) fn drive_suboperation<'a>(
     depth: usize,
     deadline: Option<tokio::time::Instant>,
 ) -> Pin<Box<dyn Future<Output = Event> + Send + 'a>> {
-    let operation_name = type_name_of_val(&*operation).to_string();
+    let operation_name = type_name_of_val(&*operation);
     Box::pin(async move {
         let span = debug_span!("suboperation", operation = %operation_name, depth);
         async move {
@@ -1887,12 +1866,12 @@ mod test {
             &mut queue,
             smallvec::smallvec![
                 Effect::Storage(StorageEffect::AbortTransaction { txn_id: id }),
-                Effect::Search(),
+                Effect::Delay(Duration::ZERO),
             ],
             &tracker,
         );
         assert_eq!(queue.len(), 1);
-        assert!(matches!(queue.pop_front(), Some(Effect::Search())));
+        assert!(matches!(queue.pop_front(), Some(Effect::Delay(_))));
     }
 
     #[tokio::test]

@@ -27,7 +27,7 @@ pub enum AuthorizationError {
     GroupNotFound,
     #[error("Authorization document not found")]
     DocNotFound,
-    #[error("Creating Group did not finish")]
+    #[error("Authorization did not finish")]
     NotFinished,
     #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
     UnexpectedEvent {

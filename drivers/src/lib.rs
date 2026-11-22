@@ -3,8 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh (non-incremental) builds overflow the default query depth in the
-// deeply nested async state machines; incremental builds mask it.
+// Deep effect adapter dispatch chains exceed the default recursion limit on fresh builds.
 #![recursion_limit = "512"]
 #![allow(clippy::large_enum_variant, clippy::result_large_err)]
 

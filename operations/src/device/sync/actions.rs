@@ -484,8 +484,7 @@ impl Operation for EntryActionOperation {
             EntryStep::Base => {
                 let row = outside_answer(result)
                     .and_then(IoResult::value)
-                    .ok()
-                    .flatten();
+                    .map_err(|_| ActionError::Unavailable)?;
                 let base = row.and_then(|bytes| SyncBase::from_bytes(&bytes).ok());
                 self.decide(base.ok_or(ActionError::NotFound)?)
             }
@@ -493,15 +492,20 @@ impl Operation for EntryActionOperation {
                 let fetched = result.child::<Blob, FetchError>()?;
                 self.write(fetched.map_err(|_| ActionError::RemoteUnavailable)?)
             }
-            // Anything but the guarded write keeps the file and is audited as stale.
+            // Anything but the guarded write keeps the file and is audited as stale or failed.
             EntryStep::Write => {
                 let outcome = result.child::<MaterializeOutcome, MaterializeError>()?;
                 let outcome = outcome.map_err(|_| ActionError::Unavailable)?;
                 let record = self.take_record()?;
                 Ok(Next::Done(SyncActionRecord {
                     outcome: match outcome {
+                        MaterializeOutcome::Written | MaterializeOutcome::Copied { .. } => {
+                            ActionOutcome::Applied
+                        }
                         MaterializeOutcome::Refused { .. } => ActionOutcome::Stale,
-                        _ => ActionOutcome::Applied,
+                        MaterializeOutcome::Failed { message } => {
+                            ActionOutcome::Failed { reason: message }
+                        }
                     },
                     ..record
                 }))

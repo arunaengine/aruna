@@ -186,9 +186,9 @@ mod pure_tests {
     fn list_rejects_event() {
         let mut operation = ListStagingOperation::new(sample_input());
         operation.first().unwrap();
-        let search = IoResult::Event(Box::new(Event::Search()));
+        let delayed = IoResult::Event(Box::new(Event::Delayed));
         assert!(matches!(
-            operation.next(search),
+            operation.next(delayed),
             Err(ListStagingError::UnexpectedEvent(_))
         ));
     }

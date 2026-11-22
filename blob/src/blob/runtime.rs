@@ -399,7 +399,14 @@ impl BlobHandle {
             None => None,
         };
 
+        struct InflightGuard<'a>(&'a AtomicUsize);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _inflight = InflightGuard(&self.handler.inflight);
         let started = Instant::now();
         // Its own task, so the effect starts on a fresh stack instead of under the caller's frames.
         let handler = self.handler.clone();
@@ -412,7 +419,7 @@ impl BlobHandle {
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
             Err(_) => BlobEvent::Error(BlobError::Closed),
         };
-        self.handler.inflight.fetch_sub(1, Ordering::Relaxed);
+        drop(_inflight);
         // Read events carry a lazy stream, so the slot follows the stream.
         let blob_event = if class == EffectClass::Read {
             attach_permit(blob_event, permit)
@@ -737,7 +744,7 @@ impl BlobHandler {
         }
     }
 
-    // Effects run concurrently on their caller's task; per-operation ordering
+    // Effects run on their own spawned task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
         // A settlement of a recorded upload names its backend only in the record.

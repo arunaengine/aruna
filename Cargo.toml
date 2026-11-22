@@ -204,7 +204,7 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 ] }
 oxrdf = "0.3.4"
 oxttl = "0.2.4"
-parking_lot = { version = "0.13.0", features = ["deadlock_detection"] }
+parking_lot = "0.13.0"
 pbkdf2 = "0.13.0"
 percent-encoding = "2.3.2"
 pithos_lib = { git = "https://github.com/arunaengine/pithos", rev = "2996df4269dd93fff3421e516fdd11f1a47c3be7", default-features = false, features = ["async"] }

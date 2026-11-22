@@ -216,7 +216,7 @@ pub enum PutObjectError {
     PurgeFence(#[from] PurgeFenceError),
     #[error("group storage quota exceeded: {usage} bytes would exceed limit of {limit} bytes")]
     QuotaExceeded { limit: u64, usage: u64 },
-    #[error("Something went wrong ...")]
+    #[error("PutObject failed")]
     PutObjectFailed,
     #[error("the object key changed since it was read")]
     HeadChanged,
@@ -258,7 +258,8 @@ pub struct PutObjectConfig {
     pub request: PutObjectInput,
     pub expected_checksums: Vec<ExpectedChecksum>,
     pub checksum_type: Option<String>,
-    pub exists: bool, //Note: For version shenanigans which will be implemented later
+    /// Whether the object key already existed before this write.
+    pub exists: bool,
     pub version_source: Option<VersionSourceBinding>,
     /// Retry fence. Must be a freshly minted, time-meaningful ULID because its
     /// timestamp defines `created_at` and ULID ordering defines version order.

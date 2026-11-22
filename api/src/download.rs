@@ -124,11 +124,27 @@ async fn pump(
     tokio::pin!(idle);
 
     loop {
-        let Some(item) = (tokio::select! {
-            _ = &mut deadline => None,
-            _ = &mut idle => None,
+        let item = tokio::select! {
+            _ = sender.closed() => break,
+            _ = &mut deadline => {
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "download stream exceeded lifetime limit",
+                );
+                let _ = sender.try_send(Err(StreamError(Box::new(err))));
+                break;
+            }
+            _ = &mut idle => {
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "download stream timed out waiting for data",
+                );
+                let _ = sender.try_send(Err(StreamError(Box::new(err))));
+                break;
+            }
             item = source.next() => item,
-        }) else {
+        };
+        let Some(item) = item else {
             break;
         };
         let failed = item.is_err();

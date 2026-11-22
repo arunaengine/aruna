@@ -430,6 +430,9 @@ impl Operation for KeepReports {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        if self.reports.is_empty() {
+            return Ok(Next::Done(Vec::new()));
+        }
         let reads = (self.reports.iter())
             .map(|(install_id, report)| {
                 let key = reported_key(self.sender, *install_id, report.kind, report.reason);
@@ -456,6 +459,9 @@ impl Operation for KeepReports {
                 let key = reported_key(self.sender, install_id, kind, reason);
                 writes.push(row_of(PLUGIN_GAPS_KEYSPACE, key, encode(&report)?));
             }
+        }
+        if writes.is_empty() {
+            return Ok(Next::Done(acked));
         }
         self.acked = Some(acked);
         Ok(Next::Call(IoCall::Write(writes)))

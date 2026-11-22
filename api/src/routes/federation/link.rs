@@ -244,7 +244,12 @@ pub async fn list_links(
     let read = aruna_operations::users::read_document::ReadUserOperation::new(auth.user_id);
     let user = drive(read, &state.get_ctx())
         .await
-        .map_err(|_| ServerError::NotFound)?;
+        .map_err(|error| match error {
+            aruna_operations::users::read_document::ReadUserError::NotFound => {
+                ServerError::NotFound
+            }
+            other => ServerError::InternalError(other.into()),
+        })?;
     Ok(Json(linked_logins(&user)))
 }
 

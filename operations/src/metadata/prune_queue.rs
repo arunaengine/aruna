@@ -12,9 +12,7 @@ use aruna_core::keyspaces::{
     DATA_LINK_KEYSPACE, DOCUMENT_IRI_KEYSPACE, DOCUMENT_LINK_KEYSPACE, IRI_INDEX_KEYSPACE,
     PRUNE_JOB_KEYSPACE,
 };
-use aruna_core::metadata::{
-    GraphLifecycleRecord, GraphPruneRecord, MetadataEffect, MetadataError, MetadataEvent,
-};
+use aruna_core::metadata::{GraphLifecycleRecord, GraphPruneRecord, MetadataEffect, MetadataError};
 use aruna_core::operation::Operation;
 use aruna_core::repository::link::{link_change_entry, schedule_drain};
 use aruna_core::repository::remote::NodeScope;
@@ -30,7 +28,7 @@ use tracing::{info, warn};
 use ulid::Ulid;
 
 use super::prune_jobs::{DuePrune, DuePruneOperation, RescheduleOperation};
-use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::deletion_guard::{PruneGraphOperation, metadata_call};
 use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
 use crate::metadata::repository::schedule_prune_drain;
 use crate::queue_backoff::due_after;
@@ -84,87 +82,6 @@ impl From<IoError> for MetadataGraphError {
             IoError::Storage(error) => Self::Storage(error),
             IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
             other => Self::UnexpectedEvent(other.to_string()),
-        }
-    }
-}
-
-fn graph_effect(effect: MetadataEffect) -> IoCall {
-    metadata_call(effect)
-}
-
-/// A graph answer, or the error it carries.
-fn graph_answer(result: IoResult) -> Result<MetadataEvent, MetadataError> {
-    match result.event()? {
-        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error),
-        Event::Metadata(event) => Ok(event),
-        other => Err(MetadataError::Backend(format!(
-            "unexpected graph answer: {}",
-            other.label()
-        ))),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum PruneStage {
-    Lifecycle,
-    Contains,
-    Delete,
-}
-
-/// Removes the local copy of a graph once its lifecycle marks it deleted; answers whether it
-/// was deleted. A node without the graph store fails with `HandleMissing`.
-#[derive(Debug, PartialEq)]
-pub(crate) struct PruneGraphOperation {
-    graph_iri: String,
-    stage: PruneStage,
-}
-
-impl PruneGraphOperation {
-    pub(crate) fn new(graph_iri: &str) -> Self {
-        Self {
-            graph_iri: graph_iri.to_string(),
-            stage: PruneStage::Lifecycle,
-        }
-    }
-}
-
-impl Operation for PruneGraphOperation {
-    type Output = bool;
-    type Error = MetadataError;
-
-    fn first(&mut self) -> Result<Next<bool>, MetadataError> {
-        Ok(Next::Call(IoCall::child(GraphDeletedOperation::new(
-            &self.graph_iri,
-        ))))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<bool>, MetadataError> {
-        match self.stage {
-            PruneStage::Lifecycle => {
-                let deleted = result
-                    .child::<bool, GraphDeletedError>()?
-                    .map_err(MetadataError::from)?;
-                if !deleted {
-                    return Ok(Next::Done(false));
-                }
-                self.stage = PruneStage::Contains;
-                Ok(Next::Call(graph_effect(MetadataEffect::ContainsGraph {
-                    graph_iri: self.graph_iri.clone(),
-                })))
-            }
-            PruneStage::Contains => match graph_answer(result)? {
-                MetadataEvent::ContainsGraphResult { exists: false, .. } => Ok(Next::Done(true)),
-                _ => {
-                    self.stage = PruneStage::Delete;
-                    Ok(Next::Call(graph_effect(MetadataEffect::DeleteGraph {
-                        graph_iri: self.graph_iri.clone(),
-                    })))
-                }
-            },
-            PruneStage::Delete => {
-                graph_answer(result)?;
-                Ok(Next::Done(true))
-            }
         }
     }
 }
@@ -397,7 +314,7 @@ impl TombstonesOperation {
         };
         self.current = Some(tombstone);
         self.stage = TombstoneStage::Uncache;
-        Ok(Next::Call(graph_effect(uncache)))
+        Ok(Next::Call(metadata_call(uncache)))
     }
 
     fn graph_iri(&self) -> String {
@@ -439,7 +356,7 @@ impl Operation for TombstonesOperation {
                 self.result.enqueued = self.result.enqueued.saturating_add(1);
                 self.stage = TombstoneStage::Prune;
                 Ok(Next::Call(IoCall::child(PruneGraphOperation::new(
-                    &graph_iri,
+                    graph_iri,
                 ))))
             }
             TombstoneStage::Prune => {
@@ -655,7 +572,7 @@ impl Operation for PruneBatchOperation {
                 self.processed = self.processed.saturating_add(1);
                 self.stage = BatchStage::Prune;
                 Ok(Next::Call(IoCall::child(PruneGraphOperation::new(
-                    &self.graph_iri(),
+                    self.graph_iri(),
                 ))))
             }
             BatchStage::Prune => match result.child::<bool, MetadataError>()? {

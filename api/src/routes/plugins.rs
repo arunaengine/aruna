@@ -216,7 +216,12 @@ pub async fn list_plugins(
         &state.get_ctx(),
     )
     .await
-    .map_err(|_| ServerError::NotFound)?;
+    .map_err(|error| match error {
+        aruna_operations::document_repository::GetConfigError::DocumentNotFound => {
+            ServerError::NotFound
+        }
+        other => ServerError::InternalError(other.into()),
+    })?;
     Ok(Json(page(config.plugins, &query, limit)))
 }
 

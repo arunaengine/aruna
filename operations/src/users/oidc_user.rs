@@ -115,11 +115,12 @@ impl From<IoError> for ResolveOidcError {
 
 impl ResolveOidcOperation {
     pub fn new(input: ResolveOidcInput) -> Self {
+        let realm_id = input.actor.realm_id;
         Self {
             input,
             realm_config: None,
             fence: Default::default(),
-            users: PrefixPages::new(USER_KEYSPACE, Vec::new(), MATCH_PAGE),
+            users: PrefixPages::new(USER_KEYSPACE, UserId::storage_prefix(realm_id), MATCH_PAGE),
             stage: Stage::Subject,
             user: None,
             announce: false,

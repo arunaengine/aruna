@@ -71,6 +71,7 @@ type Turn = Result<Next<BucketInfo>, CreateBucketError>;
 #[derive(Debug, PartialEq)]
 pub struct CreateBucketOperation {
     now_ms: u64,
+    entropy: u128,
     ids: IdMint,
     bucket: String,
     bucket_info: BucketInfo,
@@ -91,6 +92,7 @@ impl CreateBucketOperation {
     pub fn new(bucket: String, bucket_info: BucketInfo) -> Self {
         Self {
             now_ms: 0,
+            entropy: 0,
             ids: IdMint::default(),
             bucket,
             bucket_info,
@@ -182,7 +184,10 @@ impl CreateBucketOperation {
                 move_existing: false,
                 import_roots: Default::default(),
             };
-            self.link = Some(CreateImportOperation::within(input));
+            let mut link = CreateImportOperation::within(input);
+            link.stamp(self.now_ms);
+            link.seed(self.entropy.wrapping_add(1));
+            self.link = Some(link);
             self.provider = Some((storage.backend_id, provider));
             return self.scan_links(None);
         }
@@ -333,10 +338,17 @@ impl Operation for CreateBucketOperation {
 
     fn stamp(&mut self, now_ms: u64) {
         self.now_ms = now_ms;
+        if let Some(link) = self.link.as_mut() {
+            link.stamp(now_ms);
+        }
     }
 
     fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy;
         self.ids = IdMint::new(entropy);
+        if let Some(link) = self.link.as_mut() {
+            link.seed(entropy.wrapping_add(1));
+        }
     }
 }
 

@@ -395,12 +395,16 @@ pub async fn create_share(
 ) -> ServerResult<(StatusCode, Json<ShareDetails>)> {
     let auth = require_creator(auth)?;
     let now = unix_timestamp_secs();
+    if let Some(password) = request.password.as_deref()
+        && (password.is_empty() || password.len() > MAX_PASSWORD)
+    {
+        return Err(ServerError::BadRequestReason(format!(
+            "a password has 1 to {MAX_PASSWORD} bytes"
+        )));
+    }
+    let (group_id, target, path) = resolve_target(&state, &auth, &request.target).await?;
+    share_policies(&state, &auth, &path, &request).await?;
     let password = match request.password.as_deref() {
-        Some(password) if password.is_empty() || password.len() > MAX_PASSWORD => {
-            return Err(ServerError::BadRequestReason(format!(
-                "a password has 1 to {MAX_PASSWORD} bytes"
-            )));
-        }
         Some(password) => {
             // Hashing is CPU work; it runs off the request threads.
             let (password, salt) = (password.to_string(), rand::random());
@@ -413,8 +417,6 @@ pub async fn create_share(
         }
         None => None,
     };
-    let (group_id, target, path) = resolve_target(&state, &auth, &request.target).await?;
-    share_policies(&state, &auth, &path, &request).await?;
     let link = ShareLink {
         id: Ulid::generate(),
         group_id,

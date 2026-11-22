@@ -85,9 +85,9 @@ impl Operation for GetCentralOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<CentralRead>, CentralStoreError> {
-        let values = result.values()?;
-        let central = decode_central(values[0].as_ref())?;
-        let usage = decode_usage(values[1].as_ref())?;
+        let [central, usage] = aruna_core::rows::values::<2>(result)?;
+        let central = decode_central(central.as_ref())?;
+        let usage = decode_usage(usage.as_ref())?;
         Ok(Next::Done((central, usage)))
     }
 }

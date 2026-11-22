@@ -79,6 +79,8 @@ struct RefreshApply {
     version_key: Vec<u8>,
     refreshed: Option<Vec<u8>>,
     minted: bool,
+    now_ms: u64,
+    entropy: u128,
 }
 
 type ApplyTurn = Result<Next<bool>, RefreshRunError>;
@@ -91,6 +93,8 @@ impl RefreshApply {
             version_key: Vec::new(),
             refreshed: None,
             minted: false,
+            now_ms: 0,
+            entropy: 0,
         }
     }
 
@@ -123,6 +127,8 @@ impl RefreshApply {
         }
         let refresh = self.refresh.clone();
         let mut mint = Box::new(MintSuccessorOperation::new(refresh, observation, version));
+        mint.stamp(self.now_ms);
+        mint.seed(self.entropy);
         let turn = mint.first();
         self.state = ApplyState::Mint(mint);
         self.mint_turn(turn)
@@ -189,6 +195,20 @@ impl Operation for RefreshApply {
 
     fn transaction(&self) -> TransactionMode {
         TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+        if let ApplyState::Mint(mint) = &mut self.state {
+            mint.stamp(now_ms);
+        }
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.entropy = entropy;
+        if let ApplyState::Mint(mint) = &mut self.state {
+            mint.seed(entropy);
+        }
     }
 }
 

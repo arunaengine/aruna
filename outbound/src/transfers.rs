@@ -127,8 +127,9 @@ impl OutboundHandle {
         upload: UploadBody,
         max_reply: usize,
     ) -> Result<UploadAnswer, TransferError> {
-        let method = reqwest::Method::from_bytes(request.method.as_bytes());
-        let method = method.unwrap_or(reqwest::Method::PUT);
+        let method = reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| {
+            TransferError::Refused(format!("invalid HTTP method `{}`", request.method))
+        })?;
         let builder = self.transfer(method, request)?;
         let UploadBody { bytes, size, form } = upload;
         let body = reqwest::Body::wrap_stream(bytes);

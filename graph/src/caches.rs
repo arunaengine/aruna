@@ -311,7 +311,9 @@ impl VisibilityCache {
 
     /// Marks every entry expired, so the next read takes the stale path.
     pub(crate) fn expire_now(&self) {
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
         if let Some(entry) = locked(&self.registry).as_mut() {
             entry.expires_at = expired;
         }

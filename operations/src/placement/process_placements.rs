@@ -656,7 +656,7 @@ impl Operation for PruneReleasedOperation {
         };
         let before = stored.placement_transitions.len();
         overlay_reducer_state(&mut stored, &state, self.now_ms);
-        let pruned = before - stored.placement_transitions.len();
+        let pruned = before.saturating_sub(stored.placement_transitions.len());
         if pruned == 0 {
             return Ok(Next::Done(()));
         }

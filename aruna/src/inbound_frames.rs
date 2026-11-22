@@ -58,19 +58,21 @@ where
     let permit = (budget.clone())
         .try_acquire_many_owned(permits)
         .map_err(|_| "metadata inbound frame budget unavailable".to_string())?;
-    let mut bytes = vec![0u8; length];
+    let mut prefix = [0u8; POSTCARD_VARIANT_BYTES];
     let variant_end = length.min(POSTCARD_VARIANT_BYTES);
     let mut read = 0;
-    while read < variant_end && (read == 0 || !variant_read(&bytes[..read])) {
+    while read < variant_end && (read == 0 || !variant_read(&prefix[..read])) {
         reader
-            .read_exact(&mut bytes[read..read + 1])
+            .read_exact(&mut prefix[read..read + 1])
             .await
             .map_err(|error| error.to_string())?;
         read += 1;
     }
     if read > 0 {
-        check_variant(&bytes[..read], length)?;
+        check_variant(&prefix[..read], length)?;
     }
+    let mut bytes = vec![0u8; length];
+    bytes[..read].copy_from_slice(&prefix[..read]);
     reader
         .read_exact(&mut bytes[read..])
         .await
@@ -149,19 +151,26 @@ pub(crate) async fn write_answer(
         stream.0.write_all(&frame).await?;
         stream.0.flush().await
     })
-    .await;
-    if let (Ok(Ok(())), Some(body)) = (written, body) {
-        let _ = timeout_at(step_deadline(audit), async {
+    .await
+    .map_err(|_| backend("timed out writing metadata answer"))
+    .and_then(|write| write.map_err(backend));
+    let mut result = written;
+    if result.is_ok()
+        && let Some(body) = body
+    {
+        result = timeout_at(step_deadline(audit), async {
             for chunk in body.chunks(BODY_CHUNK_BYTES) {
                 stream.0.write_all(chunk).await?;
             }
             Ok::<(), std::io::Error>(())
         })
-        .await;
+        .await
+        .map_err(|_| backend("timed out writing metadata answer body"))
+        .and_then(|write| write.map_err(backend));
     }
     record_elapsed_ms(&span, "write_ms", write_started);
     close(&mut stream, step_deadline(audit));
-    Ok(())
+    result
 }
 
 #[cfg(test)]

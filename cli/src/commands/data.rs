@@ -23,16 +23,21 @@ pub async fn buckets(context: &mut Context<'_>, command: BucketsCommand) -> Resu
             }
             let mut hits: Vec<BucketHit> = Vec::new();
             let mut failed = 0;
+            let mut last_cursor: Option<String> = None;
             loop {
                 let page: BucketPage = api.get("search/buckets", &query).await?;
                 failed = failed.max(page.nodes_failed);
                 hits.extend(page.hits);
                 match page.next_cursor {
-                    Some(cursor) => {
+                    Some(cursor)
+                        if !cursor.is_empty()
+                            && last_cursor.as_deref() != Some(cursor.as_str()) =>
+                    {
+                        last_cursor = Some(cursor.clone());
                         query.retain(|(name, _)| *name != "cursor");
                         query.push(("cursor", cursor));
                     }
-                    None => break,
+                    _ => break,
                 }
             }
             if failed > 0 {
@@ -113,15 +118,23 @@ pub async fn list(context: &mut Context<'_>, path: &str, recursive: bool) -> Res
         prefixes: Vec::new(),
         objects: Vec::new(),
     };
-    let mut cursor = None;
+    let mut cursor: Option<String> = None;
     loop {
-        let page =
-            remote::list_page(&node_api, &target.bucket, &prefix, !recursive, cursor).await?;
+        let page = remote::list_page(
+            &node_api,
+            &target.bucket,
+            &prefix,
+            !recursive,
+            cursor.clone(),
+        )
+        .await?;
         listing.prefixes.extend(page.prefixes);
         listing.objects.extend(page.objects);
         match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
+            Some(next) if !next.is_empty() && cursor.as_deref() != Some(next.as_str()) => {
+                cursor = Some(next)
+            }
+            _ => break,
         }
     }
     if listing.objects.is_empty() && listing.prefixes.is_empty() && !target.key.is_empty() {
@@ -141,7 +154,7 @@ pub async fn list(context: &mut Context<'_>, path: &str, recursive: bool) -> Res
             entry.last_modified.clone().unwrap_or_default(),
             entry
                 .blake3()
-                .map(|digest| digest[..12.min(digest.len())].to_string())
+                .map(|digest| digest.chars().take(12).collect())
                 .unwrap_or_default(),
             entry.key.clone(),
         ]
@@ -410,12 +423,15 @@ pub fn parse_expiry(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Result<Str
             .with_timezone(&chrono::Utc)
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
     }
-    let (number, unit) = raw.split_at(raw.len().saturating_sub(1));
+    let Some(unit) = raw.chars().last() else {
+        return Err(invalid());
+    };
+    let number = &raw[..raw.len() - unit.len_utf8()];
     let amount: i64 = number.parse().map_err(|_| invalid())?;
     let span = match unit {
-        "d" => chrono::Duration::try_days(amount),
-        "h" => chrono::Duration::try_hours(amount),
-        "m" => chrono::Duration::try_minutes(amount),
+        'd' => chrono::Duration::try_days(amount),
+        'h' => chrono::Duration::try_hours(amount),
+        'm' => chrono::Duration::try_minutes(amount),
         _ => None,
     }
     .filter(|span| *span > chrono::Duration::zero())

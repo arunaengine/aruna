@@ -67,28 +67,41 @@ impl From<IoError> for ListPoliciesError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListStage {
+    Authorize,
+    List,
+}
+
 /// Checks the caller's permission, then reads one page of policy rows.
 #[derive(Debug, PartialEq)]
 pub struct ListPoliciesOperation {
     input: ListPoliciesInput,
+    stage: ListStage,
 }
 
 impl ListPoliciesOperation {
     pub fn new(input: ListPoliciesInput) -> Self {
-        Self { input }
+        Self {
+            input,
+            stage: ListStage::Authorize,
+        }
     }
 
-    fn authorized(&self, event: Event) -> Result<Next<PolicyListPage>, ListPoliciesError> {
+    fn authorized(&mut self, event: Event) -> Result<Next<PolicyListPage>, ListPoliciesError> {
         let Event::SubOperation(SubOperationEvent::AuthorizationResult { allowed }) = event else {
             return Err(ListPoliciesError::InvalidEvent);
         };
         match allowed {
-            Ok(true) => Ok(Next::Call(IoCall::Page {
-                space: PLACEMENT_POLICY_KEYSPACE.to_string(),
-                prefix: Key::from(Vec::new()),
-                after: self.input.start_after.clone(),
-                limit: self.input.limit.clamp(1, POLICY_LIST_LIMIT),
-            })),
+            Ok(true) => {
+                self.stage = ListStage::List;
+                Ok(Next::Call(IoCall::Page {
+                    space: PLACEMENT_POLICY_KEYSPACE.to_string(),
+                    prefix: Key::from(Vec::new()),
+                    after: self.input.start_after.clone(),
+                    limit: self.input.limit.clamp(1, POLICY_LIST_LIMIT),
+                }))
+            }
             Ok(false) => Err(ListPoliciesError::Unauthorized),
             Err(error) => {
                 warn!(error = %error, "Policy listing authorization check failed");
@@ -147,9 +160,11 @@ impl Operation for ListPoliciesOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<PolicyListPage>, ListPoliciesError> {
-        match result {
-            IoResult::Event(event) => self.authorized(*event),
-            IoResult::Page { rows, next } => self.collect(rows, next).map(Next::Done),
+        match (self.stage, result) {
+            (ListStage::Authorize, IoResult::Event(event)) => self.authorized(*event),
+            (ListStage::List, IoResult::Page { rows, next }) => {
+                self.collect(rows, next).map(Next::Done)
+            }
             _ => Err(ListPoliciesError::InvalidEvent),
         }
     }
@@ -372,5 +387,16 @@ mod pure_tests {
             operation.next(authorized(false)),
             Err(ListPoliciesError::Unauthorized)
         );
+    }
+
+    #[test]
+    fn rejects_early_page() {
+        let mut operation = operation();
+        operation.first().unwrap();
+        let early = IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        };
+        assert_eq!(operation.next(early), Err(ListPoliciesError::InvalidEvent));
     }
 }

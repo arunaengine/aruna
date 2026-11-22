@@ -1005,8 +1005,8 @@ impl NetHandle {
                 // Document sync closes the same endpoint and would wait unbounded for close
                 // acknowledgements a departed peer never sends; once started, its close returns.
                 self.start_close().await;
-                self.inner.document_sync.shutdown().await;
                 self.inner.eviction_shutdown.cancel();
+                self.inner.document_sync.shutdown().await;
                 if let Err(err) = self.inner.connection_pool.shutdown().await {
                     warn!(error = %err, "Connection pool shutdown returned error");
                 }
@@ -1213,8 +1213,6 @@ fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Background(_) => "background",
         Effect::Detached(_) => "detached",
         Effect::Task(_) => "task",
-        Effect::Search() => "search",
-        Effect::Stream() => "stream",
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",

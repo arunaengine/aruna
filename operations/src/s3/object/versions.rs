@@ -682,7 +682,7 @@ mod test {
         let mut listing = ListVersionsOperation::new(input(1));
         assert_eq!(listing.transaction(), TransactionMode::ReadSnapshot);
         assert!(matches!(listing.first(), Ok(Next::Call(IoCall::Effect(_)))));
-        let stray = IoResult::Event(Box::new(Event::Search()));
+        let stray = IoResult::Event(Box::new(Event::Delayed));
         assert!(matches!(
             listing.next(stray),
             Err(ListVersionsError::UnexpectedEvent(_))

@@ -41,7 +41,7 @@ pub enum ListGroupError {
     StorageError(#[from] StorageError),
     #[error(transparent)]
     ConversionError(#[from] ConversionError),
-    #[error("Creating Group did not finish")]
+    #[error("Listing groups did not finish")]
     NotFinished,
     #[error("Unexpected event: expected {expected}, got {got}")]
     UnexpectedEvent {

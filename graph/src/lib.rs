@@ -218,11 +218,15 @@ impl GraphHandle {
 
     /// Removes the local copy of one graph.
     pub async fn delete_graph(&self, graph_iri: String) -> Result<(), MetadataError> {
+        let graph = graph_iri.clone();
         self.blocking(move |node| {
-            node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+            node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph))
                 .map_err(Box::new)
         })
-        .await
+        .await?;
+        self.inner.summaries.remove(&graph_iri);
+        self.inner.queries.bump_apply();
+        Ok(())
     }
 
     /// The IRIs of every graph in the store.

@@ -42,7 +42,7 @@ pub struct CreateTokenOperation {
 pub enum CreateTokenError {
     #[error("Node has no capability to create tokens")]
     NotEnoughCapabilities,
-    #[error("Creating Group did not finish")]
+    #[error("Creating token did not finish")]
     NotFinished,
     #[error("Invalid timestamp")]
     InvalidTimestamp,

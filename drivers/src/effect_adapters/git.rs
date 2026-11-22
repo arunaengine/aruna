@@ -4,12 +4,11 @@
 
 use std::time::{Duration, Instant};
 
-use aruna_core::effects::Effect;
 use aruna_core::git::{GitAnswer, GitCall, GitEffect, record_writes, record_written};
 use aruna_core::telemetry::{RequestStages, record_stage};
 use futures_util::StreamExt;
 
-use super::{dispatch_effect_until, start_background};
+use super::{dispatch_suboperation, start_background};
 use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_git(
@@ -27,9 +26,13 @@ pub(super) async fn dispatch_git(
         }
         GitCall::Canonicalize(jsonld) => {
             let started = Instant::now();
-            let canonical = craqle::canonicalize_jsonld(&jsonld);
+            let canonical =
+                tokio::task::spawn_blocking(move || craqle::canonicalize_jsonld(&jsonld))
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
             record_stage("git_canonicalize", started.elapsed());
-            return GitAnswer::Canonical(canonical.ok().map(|canonical| canonical.digest));
+            return GitAnswer::Canonical(canonical.map(|canonical| canonical.digest));
         }
         GitCall::RecordWrites(document_id) => {
             return GitAnswer::RecordWrites(record_writes(document_id));
@@ -47,7 +50,7 @@ pub(super) async fn dispatch_git(
         }
         GitCall::Timed(child) => {
             let stages = RequestStages::default();
-            let run = dispatch_effect_until(Effect::SubOperation(child), context, depth, deadline);
+            let run = dispatch_suboperation(child, context, depth, deadline);
             let event = stages.clone().scope(run).await;
             return GitAnswer::Timed {
                 event: Box::new(event),
@@ -82,9 +85,13 @@ pub(super) async fn dispatch_git(
         GitCall::Busy(document_id) => GitAnswer::Busy(store.try_lock(document_id).is_none()),
         GitCall::Collect { mut blob, limit } => {
             let mut bytes = Vec::new();
+            let cap = limit.saturating_add(1);
             while let Some(chunk) = blob.next().await {
                 match chunk {
-                    Ok(chunk) => bytes.extend_from_slice(&chunk),
+                    Ok(chunk) => {
+                        let remaining = cap.saturating_sub(bytes.len() as u64) as usize;
+                        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
                     Err(error) => return GitAnswer::Failed(error.to_string()),
                 }
                 if bytes.len() as u64 > limit {

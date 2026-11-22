@@ -285,7 +285,7 @@ impl Operation for ListProviderOperation {
     }
 
     fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
+        TransactionMode::ReadSnapshot
     }
 }
 

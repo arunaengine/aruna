@@ -150,19 +150,18 @@ impl PortalSecurity {
     /// Cached OIDC origins; a stale window triggers a point-read, and a failed
     /// read reuses the last-known-good set so a loaded portal keeps its IdP.
     async fn oidc_origins(&self) -> BTreeSet<String> {
-        if let Some(cached) = self.fresh_oidc().await {
-            return cached;
-        }
+        let prev_tokens = {
+            let cache = self.oidc_cache.read().await;
+            if cache
+                .refreshed_at
+                .is_some_and(|refreshed_at| refreshed_at.elapsed() < OIDC_ORIGIN_TTL)
+            {
+                return cache.origins.clone();
+            }
+            cache.token_origins.clone()
+        };
 
-        let mut cache = self.oidc_cache.write().await;
-        if cache
-            .refreshed_at
-            .is_some_and(|refreshed_at| refreshed_at.elapsed() < OIDC_ORIGIN_TTL)
-        {
-            return cache.origins.clone();
-        }
-
-        match drive(
+        let refreshed = match drive(
             GetConfigOperation::new(self.state.get_realm_id()),
             &self.state.get_ctx(),
         )
@@ -183,7 +182,7 @@ impl PortalSecurity {
                                 discovery_url = %provider.discovery_url,
                                 "Portal CSP reuses cached OIDC token endpoint"
                             );
-                            cache.token_origins.get(&provider.discovery_url).cloned()
+                            prev_tokens.get(&provider.discovery_url).cloned()
                         }
                     };
                     if let Some(token_origin) = token_origin {
@@ -191,23 +190,23 @@ impl PortalSecurity {
                         token_origins.insert(provider.discovery_url, token_origin);
                     }
                 }
-                cache.origins = origins.clone();
-                cache.token_origins = token_origins;
-                cache.refreshed_at = Some(Instant::now());
-                origins
+                Some((origins, token_origins))
             }
             Err(error) => {
                 debug!(error = %error, "Portal CSP reuses cached OIDC origins");
-                cache.refreshed_at = Some(Instant::now());
-                cache.origins.clone()
+                None
             }
-        }
-    }
+        };
 
-    async fn fresh_oidc(&self) -> Option<BTreeSet<String>> {
-        let cache = self.oidc_cache.read().await;
-        let refreshed_at = cache.refreshed_at?;
-        (refreshed_at.elapsed() < OIDC_ORIGIN_TTL).then(|| cache.origins.clone())
+        let mut cache = self.oidc_cache.write().await;
+        cache.refreshed_at = Some(Instant::now());
+        if let Some((origins, token_origins)) = refreshed {
+            cache.origins = origins.clone();
+            cache.token_origins = token_origins;
+            origins
+        } else {
+            cache.origins.clone()
+        }
     }
 
     async fn oidc_token_endpoint(&self, discovery_url: &str) -> reqwest::Result<String> {

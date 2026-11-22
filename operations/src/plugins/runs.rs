@@ -717,7 +717,7 @@ impl Operation for EnqueueTimer {
                 // Occurrences count from the last activation, so a pause is never replayed.
                 let base =
                     (row.last_due_ms).max(self.install.active_since_ms.unwrap_or(self.now_ms));
-                if self.now_ms < base.saturating_add(self.interval_ms) {
+                if self.interval_ms == 0 || self.now_ms < base.saturating_add(self.interval_ms) {
                     return Ok(Next::Done(false));
                 }
                 let occurrence = base + (self.now_ms - base) / self.interval_ms * self.interval_ms;

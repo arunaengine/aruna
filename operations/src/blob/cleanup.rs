@@ -787,10 +787,19 @@ impl Operation for CleanupWorkOperation {
                 let owned = result.child::<Option<bool>, IoError>()?.unwrap_or(None);
                 self.owner_known(owner, *location, owned)
             }
-            WorkStep::Reservation(owner) => {
-                result.event()?;
-                self.reservation_cleared(owner)
-            }
+            WorkStep::Reservation(owner) => match result.event()? {
+                Event::Blob(
+                    BlobEvent::ReservationReleased { .. }
+                    | BlobEvent::Error(aruna_core::errors::BlobError::HandleMissing),
+                ) => self.reservation_cleared(owner),
+                event => {
+                    warn!(
+                        event = event.label(),
+                        "Deferred blob reservation release failed"
+                    );
+                    Ok(Next::Done(RowOutcome::Failed))
+                }
+            },
             WorkStep::Delete => Ok(Next::Done(deleted(result.event()?))),
             WorkStep::Reconcile => Ok(Next::Done(match result.event()? {
                 Event::Blob(BlobEvent::ReservationReconciled { done }) => done.into(),

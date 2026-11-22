@@ -505,6 +505,13 @@ where
         }
     }
 
+    fn hold_scope(&self) -> Option<HoldScope> {
+        match self.attempt.as_ref() {
+            Some(Attempt::Running(run) | Attempt::Waiting(run)) => run.hold_scope(),
+            Some(Attempt::Ended(_)) | None => None,
+        }
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -611,5 +618,39 @@ mod tests {
         assert!(child.abort().is_empty());
         assert!(child.is_complete());
         assert_eq!(child.finalize(), outcome(Err(IoError::Unfinished)));
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct HeldRecheck;
+
+    impl Operation for HeldRecheck {
+        type Output = ();
+        type Error = IoError;
+
+        fn hold_scope(&self) -> Option<HoldScope> {
+            Some(HoldScope::GraphFence(1))
+        }
+
+        fn first(&mut self) -> Result<Next<Self::Output>, IoError> {
+            Err(IoError::Conflict)
+        }
+
+        fn next(&mut self, _: IoResult) -> Result<Next<Self::Output>, IoError> {
+            Err(IoError::Conflict)
+        }
+
+        fn on_conflict(&mut self, _: u32) -> AfterConflict<Self::Output> {
+            AfterConflict::Rerun
+        }
+    }
+
+    #[test]
+    fn retry_keeps_hold() {
+        let mut child = boxed_retry(|| HeldRecheck, &SEED, |_| Event::Delayed);
+        assert_eq!(child.hold_scope(), Some(HoldScope::GraphFence(1)));
+        assert_eq!(child.start().len(), 1);
+        assert_eq!(child.hold_scope(), Some(HoldScope::GraphFence(1)));
+        assert!(child.abort().is_empty());
+        assert_eq!(child.hold_scope(), None);
     }
 }

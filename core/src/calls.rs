@@ -353,8 +353,6 @@ impl From<IoError> for StorageError {
     }
 }
 
-/// A runner failure as an authorization error: storage faults stay storage errors, a conflict
-/// stays the storage conflict, so the conflict check finds it.
 impl From<IoError> for crate::metadata::MetadataError {
     /// A storage failure stays typed; any other runner failure is a backend error naming it.
     fn from(error: IoError) -> Self {
@@ -366,6 +364,8 @@ impl From<IoError> for crate::metadata::MetadataError {
     }
 }
 
+/// A runner failure as an authorization error: storage faults stay storage errors, a conflict
+/// stays the storage conflict, so the conflict check finds it.
 impl From<IoError> for crate::errors::AuthorizationError {
     fn from(error: IoError) -> Self {
         match error {
@@ -967,8 +967,6 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::SubOperation(_) => Err(unexpected(expected, "Effect::SubOperation")),
         Effect::Group(_) => Err(unexpected(expected, "Effect::Group")),
         Effect::Delay(_) => Err(unexpected(expected, "Effect::Delay")),
-        Effect::Search() => Err(unexpected(expected, "Effect::Search")),
-        Effect::Stream() => Err(unexpected(expected, "Effect::Stream")),
     }
 }
 
@@ -989,8 +987,6 @@ fn event_family(event: &Event) -> Option<Family> {
         Event::Git(_) => Some(Family::Git),
         Event::Plugin(_) => Some(Family::Plugin),
         Event::SubOperation(_)
-        | Event::Search()
-        | Event::Stream()
         | Event::Group(_)
         | Event::Delayed
         | Event::Hung { .. }

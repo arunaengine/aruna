@@ -476,7 +476,9 @@ impl BackendStatusOperation {
                 BlobCleanupWork::DeleteBlob { location }
                 | BlobCleanupWork::ReconcileWrite { location, .. }
                 | BlobCleanupWork::ReconcileReservation { location }
-                | BlobCleanupWork::ReleaseRenamed { location, .. },
+                | BlobCleanupWork::ReleaseRenamed { location, .. }
+                | BlobCleanupWork::ReleasePlanned { location, .. }
+                | BlobCleanupWork::SettleUpload { location, .. },
             ) = BlobCleanupWork::from_bytes(value.as_ref())
             else {
                 continue;

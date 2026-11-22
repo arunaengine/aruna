@@ -381,7 +381,7 @@ impl Operation for ListReplicasOperation {
 /// replica row is gone still counts: nothing removes it locally yet.
 #[derive(Debug, Default, PartialEq)]
 pub struct CacheUsageOperation {
-    replicas: ListReplicasOperation,
+    replicas: u64,
     /// The bytes counted so far, once the replica rows are counted.
     graphs: Option<u64>,
 }
@@ -397,23 +397,23 @@ impl Operation for CacheUsageOperation {
     type Error = ReplicaScanError;
 
     fn first(&mut self) -> Result<Next<u64>, ReplicaScanError> {
-        self.replicas
-            .first()
-            .map(|_| Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, None)))
+        Ok(Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, None)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, ReplicaScanError> {
         let Some(counted) = self.graphs else {
-            return Ok(match self.replicas.next(result)? {
-                Next::Done(replicas)
-                | Next::Then {
-                    output: replicas, ..
-                } => {
-                    self.graphs = Some(replicas.iter().map(replica_size).sum());
+            let (rows, next) = result.page()?;
+            let bytes = rows
+                .into_iter()
+                .filter(|(_, bytes)| ReplicaRecord::from_bytes(bytes).is_ok())
+                .map(|(_, bytes)| bytes.len() as u64);
+            self.replicas = bytes.fold(self.replicas, u64::saturating_add);
+            return Ok(match next {
+                Some(next) => Next::Call(scan_page(DEVICE_REPLICA_KEYSPACE, Some(next))),
+                None => {
+                    self.graphs = Some(self.replicas);
                     Next::Call(scan_page(DEVICE_GRAPH_KEYSPACE, None))
                 }
-                Next::Call(call) => Next::Call(call),
-                Next::Wait => Next::Wait,
             });
         };
         let (rows, next) = result.page()?;
@@ -430,6 +430,7 @@ impl Operation for CacheUsageOperation {
 }
 
 /// The bytes one replica record takes, its render included.
+#[cfg(test)]
 pub(crate) fn replica_size(replica: &ReplicaRecord) -> u64 {
     replica
         .to_bytes()

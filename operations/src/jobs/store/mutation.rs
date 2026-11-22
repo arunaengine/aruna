@@ -37,6 +37,7 @@ pub(crate) struct MutateJobCalls<F, G> {
     old: Option<JobRecord>,
     record: Option<JobRecord>,
     digest: blake3::Hasher,
+    pending_deletes: JobDeletes,
     terminal_deletes: JobDeletes,
     step: Step,
 }
@@ -76,6 +77,7 @@ where
             old: None,
             record: None,
             digest: blake3::Hasher::new(),
+            pending_deletes: Vec::new(),
             terminal_deletes: Vec::new(),
             step: Step::Read,
         }
@@ -130,9 +132,12 @@ where
             }
             Step::Write => {
                 result.done()?;
-                let (_, mut deletes) = self.deltas()?;
-                self.step = Step::Delete;
+                let mut deletes = std::mem::take(&mut self.pending_deletes);
                 deletes.extend(std::mem::take(&mut self.terminal_deletes));
+                if deletes.is_empty() {
+                    return self.obligations();
+                }
+                self.step = Step::Delete;
                 Ok(Next::Call(IoCall::Delete(deletes)))
             }
             Step::Delete => {
@@ -292,7 +297,8 @@ where
     }
 
     fn write(&mut self) -> Mutated {
-        let (writes, _) = self.deltas()?;
+        let (writes, deletes) = self.deltas()?;
+        self.pending_deletes = deletes;
         self.step = Step::Write;
         Ok(Next::Call(IoCall::Write(writes)))
     }
@@ -304,6 +310,9 @@ where
             let record = self.record.as_ref().ok_or_else(missing)?;
             writes.extend(crate_obligation(record)?);
             writes.extend(cleanup_obligation(record)?);
+        }
+        if writes.is_empty() {
+            return self.crate_read();
         }
         self.step = Step::Obligations;
         Ok(Next::Call(IoCall::Write(writes)))

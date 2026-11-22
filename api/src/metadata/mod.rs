@@ -383,7 +383,8 @@ pub(crate) async fn ensure_readable_files(
     let context = state.get_ctx();
     match drive(unreadable_file(context.node_id(), auth, entities), &context).await {
         Ok(None) => Ok(()),
-        _ => Err(ServerError::Forbidden),
+        Ok(Some(_)) => Err(ServerError::Forbidden),
+        Err(_) => Err(ServerError::ServiceUnavailable),
     }
 }
 
@@ -400,14 +401,12 @@ async fn ensure_device_owner(state: &ServerState, auth: &AuthContext) -> ServerR
     if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
         return Ok(());
     }
-    let Ok(config) = drive(
+    let config = drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
-    else {
-        return Ok(());
-    };
+    .map_err(|_| ServerError::ServiceUnavailable)?;
     let node_id = state.get_node_id().to_string();
     let owner = config
         .nodes
@@ -415,10 +414,8 @@ async fn ensure_device_owner(state: &ServerState, auth: &AuthContext) -> ServerR
         .find(|node| node.node_id == node_id)
         .and_then(|node| node.kind.owner());
     match owner {
-        Some(owner) if owner != auth.user_id || auth.path_restrictions.is_some() => {
-            Err(ServerError::Forbidden)
-        }
-        _ => Ok(()),
+        Some(owner) if owner == auth.user_id && auth.path_restrictions.is_none() => Ok(()),
+        _ => Err(ServerError::Forbidden),
     }
 }
 

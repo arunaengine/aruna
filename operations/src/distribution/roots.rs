@@ -514,10 +514,10 @@ mod tests {
         let (row, _) = unchecked_row("one");
         let mut operation = probing(row);
         operation.next(resolved(Ok(access()))).unwrap();
-        let other = IoResult::Event(Box::new(Event::Search()));
+        let other = IoResult::Event(Box::new(Event::Delayed));
         assert_eq!(
             operation.next(other),
-            Err(RootsError::UnexpectedEvent("Event::Search"))
+            Err(RootsError::UnexpectedEvent("Event::Delayed"))
         );
     }
 }

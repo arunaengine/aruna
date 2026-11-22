@@ -409,18 +409,8 @@ async fn fill(
             .as_deref()
             .ok_or("missing onboarding sync ticket")?;
         let ticket = aruna_core::onboarding::OnboardingTicket::decode(ticket)?;
-        let context = DriverContext {
-            storage_handle: acquired.storage_handle.clone(),
-            net_handle: None,
-            blob_handle: None,
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
+        let context = DriverContext::storage_only(acquired.storage_handle.clone());
+        let now = aruna_clock::unix_timestamp_secs();
         let install =
             InstallOnboardingOperation::new(&ticket, config.realm_id, config.node_id, now);
         aruna_drivers::driver::drive(install, &context).await?;

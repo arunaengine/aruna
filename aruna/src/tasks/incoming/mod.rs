@@ -37,6 +37,9 @@ impl Drop for OutboxBarrier {
     }
 }
 
+use crate::tasks::task_persistence::restore_task_timers;
+use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
+use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
 use aruna_drivers::effect_adapters::task::{arm_unless_stored, change_timer};
 use aruna_drivers::jobs::runtime::JobsRuntime;
@@ -56,6 +59,28 @@ use aruna_operations::metadata::materialization_queue::{
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
+use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
+use aruna_operations::notifications::prune::RestorePruneOperation;
+use aruna_operations::notifications::watch::digest::InterestOperation;
+use aruna_operations::notifications::watch::table::RebuildTableOperation;
+use aruna_operations::queue_backoff::retry_delay_ms;
+use aruna_operations::replication::drain::RestoreDrainOperation;
+use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
+use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
+use aruna_operations::sync::document_outbox::OutboxTimerOperation;
+use aruna_operations::sync::outbox::batches::OutboxLimits;
+use aruna_operations::sync::outbox::rotation::OutboxRotation;
+use aruna_operations::triggers::{
+    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
+};
+use aruna_storage::task_timers::delete_persisted_timer;
+use folder_pass::{restore_publish_timer, restore_sync_timers};
+
+pub(crate) mod drained;
+pub mod folder_pass;
+pub mod git_drain;
+pub mod outbox;
+pub mod restore;
 
 /// The logical cores this host offers, as the operating system reports them.
 fn host_cores() -> usize {
@@ -86,31 +111,6 @@ async fn restore_graph_prune(
         Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
     }
 }
-use crate::tasks::task_persistence::restore_task_timers;
-use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use aruna_drivers::driver::node_facts;
-use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
-use aruna_operations::notifications::prune::RestorePruneOperation;
-use aruna_operations::notifications::watch::digest::InterestOperation;
-use aruna_operations::notifications::watch::table::RebuildTableOperation;
-use aruna_operations::queue_backoff::retry_delay_ms;
-use aruna_operations::replication::drain::RestoreDrainOperation;
-use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
-use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::sync::document_outbox::OutboxTimerOperation;
-use aruna_operations::sync::outbox::batches::OutboxLimits;
-use aruna_operations::sync::outbox::rotation::OutboxRotation;
-use aruna_operations::triggers::{
-    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
-};
-use aruna_storage::task_timers::delete_persisted_timer;
-use folder_pass::{restore_publish_timer, restore_sync_timers};
-
-pub(crate) mod drained;
-pub mod folder_pass;
-pub mod git_drain;
-pub mod outbox;
-pub mod restore;
 
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
 
@@ -124,7 +124,7 @@ const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_TICKS: usize = 12;
 
-/// One drained outbox record with its resolved publish topic.
+/// Dispatches scheduled tasks and background drains to their operations.
 pub(crate) struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -136,7 +136,6 @@ pub(crate) struct OperationsTaskHandler {
     // When a device may next fetch the realm documents, and how many attempts
     // have failed. Loss on restart is fine: a restart fetches them anyway.
     realm_documents: std::sync::Mutex<(u32, u64)>,
-    // Signs registry publications; `None` where no node identity was supplied.
 }
 
 impl OperationsTaskHandler {

@@ -196,8 +196,8 @@ mod tests {
         let mut operation = HeadSourceOperation::new(sample_input());
         operation.first().unwrap();
         assert_eq!(
-            operation.next(answer(Event::Search())),
-            Err(HeadSourceError::UnexpectedEvent("Event::Search"))
+            operation.next(answer(Event::Delayed)),
+            Err(HeadSourceError::UnexpectedEvent("Event::Delayed"))
         );
     }
 

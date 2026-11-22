@@ -82,20 +82,33 @@ impl<E: IdEnvironment> DhtClock<E> {
     }
 
     fn sample_time(env: &E) -> ClockAnchor {
-        loop {
+        const MAX_SAMPLES: usize = 64;
+        let mut best: Option<(u64, ClockAnchor)> = None;
+        for _ in 0..MAX_SAMPLES {
             let monotonic_before = env.monotonic_ms();
             let wall_ms = env.now_ms();
             let monotonic_after = env.monotonic_ms();
             let Some(elapsed) = monotonic_after.checked_sub(monotonic_before) else {
                 continue;
             };
+            let anchor = ClockAnchor {
+                wall_ms,
+                monotonic_ms: monotonic_before.saturating_add(elapsed / 2),
+            };
             if elapsed <= SAMPLE_WINDOW_MS {
-                return ClockAnchor {
-                    wall_ms,
-                    monotonic_ms: monotonic_before.saturating_add(elapsed / 2),
-                };
+                return anchor;
+            }
+            if best.is_none_or(|(best_elapsed, _)| elapsed < best_elapsed) {
+                best = Some((elapsed, anchor));
             }
         }
+        best.map(|(_, anchor)| anchor).unwrap_or_else(|| {
+            let monotonic_ms = env.monotonic_ms();
+            ClockAnchor {
+                wall_ms: env.now_ms(),
+                monotonic_ms,
+            }
+        })
     }
 
     pub(crate) fn current_secs(&self) -> u64 {
@@ -261,10 +274,20 @@ pub(super) fn parse_deadline(index: DeadlineIndex, key: &[u8]) -> Option<Deadlin
 pub fn merge_entry(
     key: &DhtKeyId,
     entries: Vec<StoredEntry>,
-    mut new_entry: StoredEntry,
+    new_entry: StoredEntry,
     now: u64,
 ) -> Result<Vec<StoredEntry>, MergeError> {
     validate_entries(key, &entries, now)?;
+    merge_validated(key, entries, new_entry, now)
+}
+
+/// Merges `new_entry` into `entries` that were already validated on load or earlier merges.
+pub(crate) fn merge_validated(
+    key: &DhtKeyId,
+    entries: Vec<StoredEntry>,
+    mut new_entry: StoredEntry,
+    now: u64,
+) -> Result<Vec<StoredEntry>, MergeError> {
     if new_entry.expires_at
         > now
             .saturating_add(MAX_TTL_SECS)

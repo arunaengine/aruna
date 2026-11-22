@@ -584,6 +584,7 @@ fn timer_turn<O: TimerRun>(
         Ok(Next::Then { output, calls }) => {
             O::rearm(Ok(output)).map(|output| Next::Then { output, calls })
         }
+        Err(error) if O::is_conflict(&error) => Err(TimerFailure::from(IoError::Conflict)),
         Err(error) => O::rearm(Err(error)).map(Next::Done),
     }
 }
@@ -634,6 +635,10 @@ impl Operation for TimerOperation {
 
     fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output> {
         each_timer!(self, operation => timer_conflict(operation, attempt))
+    }
+
+    fn rolled_back(&mut self) {
+        each_timer!(self, operation => operation.rolled_back());
     }
 }
 
@@ -1383,6 +1388,7 @@ fn peer_turn<O: PeerRun>(
         Ok(Next::Then { output, calls }) => {
             O::answer(Ok(output)).map(|output| Next::Then { output, calls })
         }
+        Err(error) if O::is_conflict(&error) => Err(PeerFailure::from(IoError::Conflict)),
         Err(error) => O::answer(Err(error)).map(Next::Done),
     }
 }
@@ -1444,6 +1450,10 @@ impl Operation for PeerOperation {
 
     fn on_conflict(&mut self, attempt: u32) -> AfterConflict<Self::Output> {
         each_peer!(self, operation => peer_conflict(operation, attempt))
+    }
+
+    fn rolled_back(&mut self) {
+        each_peer!(self, operation => operation.rolled_back());
     }
 }
 

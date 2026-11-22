@@ -391,10 +391,14 @@ impl ReadExactOperation {
             });
             return Ok(Next::Call(IoCall::child(head)));
         }
-        let range = request.range.map(|range| ObjectRangeRequest::StartEnd {
-            start: range.start,
-            end: range.end.saturating_sub(1),
-        });
+        let range = match request.range {
+            Some(range) if range.start < range.end => Some(ObjectRangeRequest::StartEnd {
+                start: range.start,
+                end: range.end - 1,
+            }),
+            Some(_) => return Err(Reject::Unavailable("invalid source range".to_string())),
+            None => None,
+        };
         let get = GetObjectOperation::new(GetObjectInput {
             bucket: request.bucket.clone(),
             key: request.key.clone(),

@@ -960,7 +960,7 @@ pub(crate) async fn read_text(
                 .and_then(|metadata| metadata.content_type.clone())
         })
         .unwrap_or_else(|| "application/octet-stream".to_string());
-    let mut bytes = Vec::with_capacity(max_bytes.saturating_add(1));
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
     while let Some(chunk) = result.blob.next().await {
         let chunk = chunk.map_err(internal_error)?;
         let remaining = max_bytes.saturating_add(1).saturating_sub(bytes.len());
@@ -971,13 +971,27 @@ pub(crate) async fn read_text(
     }
     let truncated = bytes.len() > max_bytes;
     bytes.truncate(max_bytes);
-    let byte_count = bytes.len();
-    let text = String::from_utf8(bytes).map_err(|_| {
-        bad_request(format!(
-            "the object is not UTF-8 text and its content type is {content_type}; this tool \
-             returns text only, so fetch binary content through the S3 surface"
-        ))
-    })?;
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut valid_bytes = error.into_bytes();
+            valid_bytes.truncate(valid);
+            String::from_utf8(valid_bytes).map_err(|_| {
+                bad_request(format!(
+                    "the object is not UTF-8 text and its content type is {content_type}; this tool \
+                     returns text only, so fetch binary content through the S3 surface"
+                ))
+            })?
+        }
+        Err(_) => {
+            return Err(bad_request(format!(
+                "the object is not UTF-8 text and its content type is {content_type}; this tool \
+                 returns text only, so fetch binary content through the S3 surface"
+            )));
+        }
+    };
+    let byte_count = text.len();
     Ok(ReadObjectOutput {
         node_id: server.state.get_node_id().to_string(),
         bucket: input.bucket,

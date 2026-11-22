@@ -199,7 +199,7 @@ impl DeleteBucketOperation {
         self.group_id = Some(info.group_id);
         self.incarnation = incarnation(creation.as_deref());
         let prefix = BlobHeadKey::bucket_prefix(&self.bucket)?;
-        let limit = (None, Self::SCAN_LIMIT);
+        let limit = (None, 1);
         let state = DeleteBucketState::CheckCurrentObjects;
         self.page(state, BLOB_HEAD_KEYSPACE, prefix, limit)
     }
@@ -209,7 +209,7 @@ impl DeleteBucketOperation {
             return Err(DeleteBucketError::NotEmpty);
         }
         let prefix = VersionKey::bucket_prefix(&self.bucket)?;
-        let limit = (None, Self::SCAN_LIMIT);
+        let limit = (None, 1);
         let state = DeleteBucketState::CheckVersions;
         self.page(state, BLOB_VERSIONS_KEYSPACE, prefix, limit)
     }

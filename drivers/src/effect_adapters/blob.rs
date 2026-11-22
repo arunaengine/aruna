@@ -11,7 +11,7 @@ use crate::driver::DriverContext;
 
 pub(super) async fn dispatch_blob(effect: BlobEffect, context: &DriverContext) -> Event {
     if let Some(blob_handle) = &context.blob_handle {
-        Box::pin(blob_handle.send_blob_effect(effect)).await
+        blob_handle.send_blob_effect(effect).await
     } else {
         Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
     }
@@ -22,7 +22,7 @@ pub(super) async fn dispatch_staging_source(
     context: &DriverContext,
 ) -> Event {
     if let Some(blob_handle) = &context.blob_handle {
-        Box::pin(blob_handle.send_staging_effect(effect)).await
+        blob_handle.send_staging_effect(effect).await
     } else {
         Event::StagingSource(StagingSourceEvent::Error {
             error: StagingSourceError::HandleMissing,
@@ -32,7 +32,7 @@ pub(super) async fn dispatch_staging_source(
 
 pub(super) async fn dispatch_local_file(effect: LocalFileEffect, context: &DriverContext) -> Event {
     if let Some(blob_handle) = &context.blob_handle {
-        Box::pin(blob_handle.send_file_effect(effect)).await
+        blob_handle.send_file_effect(effect).await
     } else {
         Event::LocalFile(LocalFileEvent::Error {
             message: "this node has no local file adapter".to_string(),

@@ -58,8 +58,6 @@ pub enum Effect {
     /// `TaskEvent::BackgroundStarted { started: true }`. The child's result goes nowhere.
     Detached(Box<dyn SubOperation>),
     Task(TaskEffect),
-    Search(),
-    Stream(),
     Index(Box<crate::key_index::IndexEffect>),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
@@ -101,7 +99,6 @@ pub enum GroupForm {
 
 #[derive(Debug, PartialEq)]
 pub enum BlobEffect {
-    //GetOperator { bucket: Option<String>, },
     // ----- Blob read & write -----
     Write {
         bucket: String,
@@ -981,8 +978,6 @@ pub enum NetEffect {
     },
 }
 
-/// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
-/// sends it to `peer`, waits at most `timeout`, and never routes or retries.
 /// The exact membership a set of shard topics should have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardMembership {
