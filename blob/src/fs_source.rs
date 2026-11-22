@@ -61,7 +61,7 @@ pub(crate) async fn check_root(root: &str, recover: bool) -> Result<(), StagingS
     // Those bytes are this node's own, never the owner's.
     crate::fs_write::sweep_spool(root).await;
     if recover {
-        crate::fs_write::recover_kept(root)
+        crate::fs_write::recover_kept(root, &resolved)
             .await
             .map_err(StagingSourceError::CheckError)?;
     }
