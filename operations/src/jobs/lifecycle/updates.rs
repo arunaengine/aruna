@@ -274,16 +274,17 @@ impl PublishStateOperation {
             return self.pending("Execution update exceeds the record bounds");
         };
         self.stage = PublishState::Append;
-        Ok(Next::Call(IoCall::child(AppendRecordOperation::new(
-            AppendRecordConfig {
-                realm_id,
-                local_node_id: local,
-                record: frame,
-                local: None,
-                origin: RecordOrigin::Local,
-                now_ms: self.now_ms,
-            },
-        ))))
+        let config = AppendRecordConfig {
+            realm_id,
+            local_node_id: local,
+            record: frame,
+            local: None,
+            origin: RecordOrigin::Local,
+            now_ms: self.now_ms,
+        };
+        let build = move || AppendRecordOperation::new(config.clone());
+        let seed = self.chain.execution_id.to_bytes();
+        Ok(Next::Call(IoCall::retry_with(build, &seed)))
     }
 
     fn appended(&mut self, result: IoResult, (local, realm_id): (NodeId, RealmId)) -> PublishStep {
@@ -317,8 +318,9 @@ impl PublishStateOperation {
         // An infrastructure error ends this execution without deciding the
         // job, so the family must be planned again from here too.
         if self.state == PhysicalExecutionState::Error {
-            let arm = ArmFamilyOperation::new(chain.family, local, realm_id, self.now_ms);
-            calls.push(IoCall::child(arm));
+            let now_ms = self.now_ms;
+            let build = move || ArmFamilyOperation::new(chain.family, local, realm_id, now_ms);
+            calls.push(IoCall::retry_with(build, &chain.family.to_bytes()));
         }
         calls.push(IoCall::Effect(Box::new(schedule_outbox_drain(
             Duration::ZERO,
@@ -477,8 +479,11 @@ impl Operation for PublishTerminalOperation {
                     return Ok(Next::Done(false));
                 }
                 self.stage = TerminalState::Release;
-                let release = ReleaseExecutionOperation::new(execution_id);
-                Ok(Next::Call(IoCall::child(release)))
+                let build = move || ReleaseExecutionOperation::new(execution_id);
+                Ok(Next::Call(IoCall::retry_with(
+                    build,
+                    &execution_id.to_bytes(),
+                )))
             }
             TerminalState::Release => {
                 if let Err(error) = result.child::<bool, LifecycleError>()? {

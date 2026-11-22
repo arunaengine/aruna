@@ -3,13 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::VaultQuery;
-use aruna_core::events::{Event, PeerAuthRefusal};
+use aruna_core::events::PeerAuthRefusal;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::placement::{holds_placement, target_placement_ref};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -51,9 +51,7 @@ fn append_call(config: &AppendVaultConfig) -> IoCall {
     let seed = config.record_id.to_bytes();
     let config = config.clone();
     let build = move || AppendVaultOperation::new(config.clone());
-    IoCall::Child(boxed_retry(build, &seed, |result| {
-        Event::Child(ChildOutcome::new(result))
-    }))
+    IoCall::retry_with(build, &seed)
 }
 
 /// Appends on this node when it holds the user's vault, otherwise on one of the

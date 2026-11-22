@@ -2,11 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::harvest::HarvestJobSpec;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::input::{
@@ -130,10 +129,7 @@ impl Operation for QueueJobOperation {
     fn first(&mut self) -> SubmitNext {
         let (spec, job_id) = (self.spec.clone(), self.job_id);
         let build = move || SubmitJobOperation::new(spec.clone(), job_id);
-        let child = boxed_retry(build, &job_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 
     fn next(&mut self, result: IoResult) -> SubmitNext {
@@ -607,6 +603,7 @@ impl Operation for DedupLookupOperation {
 mod tests {
     use super::*;
     use crate::tests::records::{Family, REALM, node, user};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::errors::StorageError;
 
     fn spec(owner: NodeId) -> SubmitJobSpec {

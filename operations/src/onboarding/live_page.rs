@@ -5,10 +5,9 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::onboarding::OnboardingSecretState;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use byteview::ByteView;
 
 use crate::onboarding::expiry_page::ExpiryPageOperation;
@@ -51,11 +50,9 @@ impl LivePageOperation {
             if self.stale(&entry) {
                 let (id, now) = (entry.record.enrollment_id, self.now);
                 let build = move || PruneSecretOperation::new(id, now);
-                let prune = boxed_retry(build, &id.to_bytes(), |result| {
-                    Event::Child(ChildOutcome::new(result))
-                });
+                let prune = IoCall::retry_with(build, &id.to_bytes());
                 self.pruning = Some(entry);
-                return Next::Call(IoCall::Child(prune));
+                return Next::Call(prune);
             }
             self.kept.push(entry);
         }
@@ -92,9 +89,10 @@ impl Operation for LivePageOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::Effect;
     use aruna_core::errors::StorageError;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
     use ulid::Ulid;
 

@@ -8,6 +8,7 @@ use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::*;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::{NodeCoordinates, NodePlace};
 
 const REALM: RealmId = RealmId([5; 32]);

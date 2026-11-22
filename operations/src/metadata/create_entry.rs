@@ -5,12 +5,11 @@
 
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::metadata::MetadataError;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
@@ -195,13 +194,9 @@ impl CreateEntryOperation {
             .take()
             .ok_or_else(|| MetadataError::Backend("the create was already started".into()))?;
         let seed = template.config.document_id.to_bytes();
-        let create = boxed_retry(
-            move || template.fresh_copy(),
-            &seed,
-            |result| Event::Child(ChildOutcome::new(result)),
-        );
+        let create = IoCall::retry_with(move || template.fresh_copy(), &seed);
         self.stage = EntryStage::Create;
-        Ok(Next::Call(IoCall::Child(create)))
+        Ok(Next::Call(create))
     }
 }
 
@@ -245,6 +240,7 @@ mod tests {
     //! Drives the create entry through its mint, Profile verdict and create children without I/O.
 
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::metadata::{
         ProfileValidationFinding, ProfileValidationSeverity, ProfileValidationState,
     };

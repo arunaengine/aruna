@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
@@ -19,7 +19,7 @@ use aruna_core::keyspaces::{
 use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{PrefixPages, read_row};
 use aruna_core::structs::storage::backend_import::{
-    BackendImport, ImportedObject, claim_key, object_key, version_key,
+    BackendImport, ExternalObject, ImportedObject, claim_key, object_key, version_key,
 };
 use aruna_core::structs::storage::blob::{
     BackendLocation, BlobCleanupWork, BlobVersion, BlobVersionState, ManagedCopyKey,
@@ -57,15 +57,28 @@ pub enum Unified {
 /// The job row a unification must still find, and the row it writes instead.
 pub type JobFence = (LinkedJob, LinkedJob);
 
-/// Reads the rules that may record a copy, then unifies the key in one transaction. With a
-/// fence, the bucket's job must still be stored as its first value and gets its second.
+/// The first object a listing of the kept file's path found, `None` when it found none or no
+/// blob storage could tell, or the label of the answer that failed it.
+type KeptListing = Result<Option<ExternalObject>, &'static str>;
+
+#[derive(Debug, PartialEq)]
+enum UnifyStep {
+    Rules,
+    Provider(Vec<BackendImport>),
+    Listing(Vec<BackendImport>),
+    Stage,
+}
+
+/// Reads the rules that may record a copy and lists a kept file without a backend version, then
+/// unifies the key in one transaction. With a fence, the bucket's job must still be stored as
+/// its first value and gets its second.
 #[derive(Debug, PartialEq)]
 pub struct UnifyOperation {
     bucket: String,
     group_id: GroupId,
     found: Option<Duplicate>,
     fence: Option<JobFence>,
-    staging: bool,
+    step: UnifyStep,
 }
 
 impl UnifyOperation {
@@ -79,8 +92,52 @@ impl UnifyOperation {
             group_id,
             found: Some(found),
             fence,
-            staging: false,
+            step: UnifyStep::Rules,
         }
+    }
+
+    fn found(&self) -> Result<&Duplicate, MigrationError> {
+        let missing = || MigrationError::Failed("no copies to unify".to_string());
+        self.found.as_ref().ok_or_else(missing)
+    }
+
+    /// Lists outside the transaction, which rereads the backend version before it trusts this.
+    fn provider_read(
+        &mut self,
+        rules: Vec<BackendImport>,
+        provider: Option<Value>,
+    ) -> Turn<Unified> {
+        if provider.is_some() {
+            return self.stage(rules, None);
+        }
+        let keep = &self.found()?.keep;
+        let list = IoCall::blob(BlobEffect::ListExternal {
+            backend: keep.backend.clone(),
+            prefix: keep.backend_path.clone(),
+            start_after: None,
+            limit: 1,
+        });
+        self.step = UnifyStep::Listing(rules);
+        Ok(Next::Call(list))
+    }
+
+    fn stage(&mut self, rules: Vec<BackendImport>, listing: Option<KeptListing>) -> Turn<Unified> {
+        let (Some(found), fence) = (self.found.take(), self.fence.take()) else {
+            return Err(MigrationError::Failed("no copies to unify".to_string()));
+        };
+        self.step = UnifyStep::Stage;
+        let stage = UnifyStageOperation::new(&self.bucket, rules, found, fence, listing);
+        Ok(Next::Call(IoCall::child(stage)))
+    }
+}
+
+fn kept_object(event: Event) -> KeptListing {
+    match event.into_blob() {
+        Ok(BlobEvent::ExternalListed { objects, .. }) => Ok(objects.into_iter().next()),
+        // A node without blob storage cannot tell.
+        Ok(BlobEvent::Error(BlobError::HandleMissing)) => Ok(None),
+        Ok(other) => Err(other.label()),
+        Err(other) => Err(other.label()),
     }
 }
 
@@ -89,30 +146,35 @@ impl Operation for UnifyOperation {
     type Error = MigrationError;
 
     fn first(&mut self) -> Turn<Unified> {
-        let Some(found) = self.found.as_ref() else {
-            return Err(MigrationError::Failed("no copies to unify".to_string()));
-        };
-        let rules = BackendRulesOperation::new(self.group_id, found.keep.backend.clone());
+        let backend = self.found()?.keep.backend.clone();
+        let rules = BackendRulesOperation::new(self.group_id, backend);
         Ok(Next::Call(IoCall::child(rules)))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<Unified> {
-        if self.staging {
+        match std::mem::replace(&mut self.step, UnifyStep::Stage) {
+            UnifyStep::Rules => {
+                let rules = (result.child::<Vec<BackendImport>, ImportRowsError>()?)
+                    .map_err(MigrationError::failed)?;
+                let ulid = self.found()?.keep.ulid;
+                self.step = UnifyStep::Provider(rules);
+                Ok(Next::Call(read_row(
+                    BACKEND_VERSION_KEYSPACE,
+                    version_key(ulid),
+                )))
+            }
+            UnifyStep::Provider(rules) => self.provider_read(rules, result.value()?),
+            UnifyStep::Listing(rules) => {
+                let listing = kept_object(result.event()?);
+                self.stage(rules, Some(listing))
+            }
             // A transaction that lost to a concurrent change wrote nothing.
-            return match result.child::<Unified, MigrationError>()? {
+            UnifyStep::Stage => match result.child::<Unified, MigrationError>()? {
                 Ok(unified) => Ok(Next::Done(unified)),
                 Err(MigrationError::Io(IoError::Conflict)) => Ok(Next::Done(Unified::Changed)),
                 Err(error) => Err(error),
-            };
+            },
         }
-        let rules = (result.child::<Vec<BackendImport>, ImportRowsError>()?)
-            .map_err(MigrationError::failed)?;
-        let Some(found) = self.found.take() else {
-            return Err(MigrationError::Failed("no copies to unify".to_string()));
-        };
-        self.staging = true;
-        let stage = UnifyStageOperation::new(&self.bucket, rules, found, self.fence.take());
-        Ok(Next::Call(IoCall::child(stage)))
     }
 }
 
@@ -133,7 +195,6 @@ enum StageStep {
     Provider,
     Claim(bool),
     KeptRows,
-    KeptListing(String),
     TwinRow(CopyWork),
     Managed(
         CopyWork,
@@ -157,6 +218,8 @@ struct UnifyStageOperation {
     rules: Vec<BackendImport>,
     found: Duplicate,
     fence: Option<JobFence>,
+    /// The listing of the kept file taken before the transaction, when it had no backend version.
+    listing: Option<KeptListing>,
     step: StageStep,
     writes: Vec<Row>,
     deletes: Vec<(String, Key)>,
@@ -175,6 +238,7 @@ impl UnifyStageOperation {
         rules: Vec<BackendImport>,
         found: Duplicate,
         fence: Option<JobFence>,
+        listing: Option<KeptListing>,
     ) -> Self {
         Self {
             now_ms: 0,
@@ -183,6 +247,7 @@ impl UnifyStageOperation {
             rules,
             found,
             fence,
+            listing,
             step: StageStep::Rows,
             writes: Vec::new(),
             deletes: Vec::new(),
@@ -332,7 +397,7 @@ impl UnifyStageOperation {
         self.call(StageStep::KeptRows, IoCall::Read(reads))
     }
 
-    /// Lists the kept file's path, to compare it with the size and ETag its row recorded.
+    /// Compares the kept file's listing with the size and ETag its row recorded.
     fn kept_rows(&mut self, values: Vec<Option<Value>>) -> Turn<Unified> {
         let mut recorded = None;
         for row in values.into_iter().flatten() {
@@ -345,39 +410,18 @@ impl UnifyStageOperation {
             return Ok(Next::Done(Unified::Changed));
         };
         let keep = &self.found.keep;
-        let list = Effect::blob(BlobEffect::ListExternal {
-            backend: keep.backend.clone(),
-            prefix: keep.backend_path.clone(),
-            start_after: None,
-            limit: 1,
-        });
-        self.call(StageStep::KeptListing(recorded), list.into())
-    }
-
-    fn kept_listed(&mut self, recorded: &str, event: Event) -> Turn<Unified> {
-        let keep = &self.found.keep;
         let unquoted = |etag: &str| etag.trim_matches('"').to_string();
-        let unchanged = match event.into_blob() {
-            Ok(BlobEvent::ExternalListed { objects, .. }) => {
-                objects.first().is_some_and(|object| {
-                    object.key == keep.backend_path
-                        && object.size == keep.blob_size
-                        && object.etag.as_deref().map(unquoted) == Some(unquoted(recorded))
-                })
-            }
-            // A node without blob storage cannot tell.
-            Ok(BlobEvent::Error(BlobError::HandleMissing)) => false,
-            Ok(other) => {
+        let unchanged = match self.listing.take() {
+            // The kept file had a backend version when the listing was skipped.
+            None => false,
+            Some(Ok(object)) => object.is_some_and(|object| {
+                object.key == keep.backend_path
+                    && object.size == keep.blob_size
+                    && object.etag.as_deref().map(unquoted) == Some(unquoted(&recorded))
+            }),
+            Some(Err(label)) => {
                 return Err(MigrationError::Failed(format!(
-                    "could not list the kept file: {}",
-                    other.label()
-                )));
-            }
-
-            Err(other) => {
-                return Err(MigrationError::Failed(format!(
-                    "could not list the kept file: {}",
-                    other.label()
+                    "could not list the kept file: {label}"
                 )));
             }
         };
@@ -612,7 +656,6 @@ impl Operation for UnifyStageOperation {
             StageStep::Provider => self.provider_read(result.value()?),
             StageStep::Claim(unversioned) => self.claim_read(unversioned, result.value()?),
             StageStep::KeptRows => self.kept_rows(result.values()?),
-            StageStep::KeptListing(recorded) => self.kept_listed(&recorded, result.event()?),
             StageStep::TwinRow(work) => self.twin_row(work, result.value()?),
             StageStep::Managed(work, key, version, mut pages, mut rows) => {
                 rows.extend(pages.take(result)?);
@@ -730,7 +773,102 @@ mod tests {
     }
 
     fn stage() -> UnifyStageOperation {
-        UnifyStageOperation::new("bucket", Vec::new(), duplicate(), None)
+        UnifyStageOperation::new("bucket", Vec::new(), duplicate(), None, None)
+    }
+
+    fn child<T, E>(result: Result<T, E>) -> IoResult
+    where
+        T: Send + std::fmt::Debug + PartialEq + 'static,
+        E: Send + std::fmt::Debug + PartialEq + 'static,
+    {
+        IoResult::Child(aruna_core::calls::ChildOutcome::new(result))
+    }
+
+    fn rule() -> BackendImport {
+        BackendImport {
+            import_id: Ulid::from_bytes([7; 16]),
+            group_id: Ulid::nil(),
+            backend_id: Ulid::nil(),
+            backend_prefix: String::new(),
+            bucket: "bucket".to_string(),
+            key_prefix: String::new(),
+            schedule: None,
+            created_by: Default::default(),
+            created_at: SystemTime::UNIX_EPOCH,
+            updated_at: SystemTime::UNIX_EPOCH,
+            last_job: None,
+            last_started_ms: None,
+            write_backend_id: None,
+            write_prefix: None,
+            write_pattern: String::new(),
+        }
+    }
+
+    /// A stage over a kept file without a backend version whose row recorded ETag `e1`, walked
+    /// to its outcome; every call it makes is a storage read.
+    fn walk_unversioned(listing: KeptListing) -> Turn<Unified> {
+        let mut stage =
+            UnifyStageOperation::new("bucket", vec![rule()], duplicate(), None, Some(listing));
+        let keep = Value::from(location(1).to_bytes().unwrap());
+        assert!(matches!(stage.first(), Ok(Next::Call(IoCall::Read(_)))));
+        // The rows, the kept file's backend version and its delete claim.
+        for values in [vec![Some(keep), None, None], vec![None], vec![None]] {
+            let turn = stage.next(IoResult::Values(values));
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))), "{turn:?}");
+        }
+        let etag = Some("\"e1\"".to_string());
+        let recorded = ImportedObject::written(Ulid::nil(), "key".to_string(), 10, etag);
+        let recorded = Value::from(recorded.to_bytes().unwrap());
+        stage.next(IoResult::Values(vec![Some(recorded)]))
+    }
+
+    #[test]
+    fn stage_never_lists() {
+        // The stage compares the listing taken before its transaction and lists nothing itself.
+        let object = |etag: &str| ExternalObject {
+            key: location(1).backend_path,
+            size: 10,
+            etag: Some(etag.to_string()),
+            modified_ms: None,
+        };
+        let same = walk_unversioned(Ok(Some(object("e1"))));
+        assert_eq!(same, Ok(Next::Done(Unified::Kept)));
+        let other = walk_unversioned(Ok(Some(object("e2"))));
+        assert_eq!(other, Ok(Next::Done(Unified::Changed)));
+        assert_eq!(walk_unversioned(Ok(None)), Ok(Next::Done(Unified::Changed)));
+        assert!(matches!(
+            walk_unversioned(Err("PlainWritten")),
+            Err(MigrationError::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn unify_lists_unversioned() {
+        // Only a kept file without a backend version is listed, before the transaction.
+        let mut unify = UnifyOperation::new(("bucket", Ulid::nil()), duplicate(), None);
+        unify.first().unwrap();
+        let read = unify.next(child::<_, ImportRowsError>(Ok(Vec::<BackendImport>::new())));
+        let provider = version_key(location(1).ulid);
+        assert_eq!(
+            read,
+            Ok(Next::Call(read_row(BACKEND_VERSION_KEYSPACE, provider)))
+        );
+        let keep = location(1);
+        let list = IoCall::blob(BlobEffect::ListExternal {
+            backend: keep.backend,
+            prefix: keep.backend_path,
+            start_after: None,
+            limit: 1,
+        });
+        assert_eq!(
+            unify.next(IoResult::Values(vec![None])),
+            Ok(Next::Call(list))
+        );
+        let missing = Event::blob(BlobEvent::Error(BlobError::HandleMissing));
+        let staged = unify.next(IoResult::Event(Box::new(missing)));
+        let stage =
+            UnifyStageOperation::new("bucket", Vec::new(), duplicate(), None, Some(Ok(None)));
+        assert_eq!(staged, Ok(Next::Call(IoCall::child(stage))));
     }
 
     #[test]
@@ -767,13 +905,16 @@ mod tests {
         let mut unify = UnifyOperation::new(("bucket", Ulid::nil()), duplicate(), None);
         assert!(matches!(unify.first(), Ok(Next::Call(IoCall::Child(_)))));
         let rules: Result<Vec<BackendImport>, ImportRowsError> = Ok(Vec::new());
-        let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(rules));
         assert!(matches!(
-            unify.next(answer),
+            unify.next(child(rules)),
+            Ok(Next::Call(IoCall::Read(_)))
+        ));
+        let provider = IoResult::Values(vec![Some(Value::from(b"v1".to_vec()))]);
+        assert!(matches!(
+            unify.next(provider),
             Ok(Next::Call(IoCall::Child(_)))
         ));
         let lost: Result<Unified, MigrationError> = Err(MigrationError::Io(IoError::Conflict));
-        let answer = IoResult::Child(aruna_core::calls::ChildOutcome::new(lost));
-        assert_eq!(unify.next(answer), Ok(Next::Done(Unified::Changed)));
+        assert_eq!(unify.next(child(lost)), Ok(Next::Done(Unified::Changed)));
     }
 }

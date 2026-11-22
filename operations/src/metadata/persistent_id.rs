@@ -6,11 +6,10 @@
 #[path = "persistent_id_forward.rs"]
 pub mod forward;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::ID_MAPPING_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::persistent_id::{PersistentIdMapping, persistent_id_key};
@@ -127,10 +126,9 @@ impl PidChangeOperation {
         let document_id = self.document_id;
         let seed = document_id.to_bytes();
         let child = match change {
-            PidChange::Transition(transition) => boxed_retry(
+            PidChange::Transition(transition) => IoCall::retry_with(
                 move || PidTransitionOperation::new(route.clone(), document_id, transition.clone()),
                 &seed,
-                |result| Event::Child(ChildOutcome::new(result)),
             ),
             PidChange::AddIdentifiers {
                 identifiers,
@@ -142,15 +140,11 @@ impl PidChangeOperation {
                     route,
                     occurred_at_ms,
                 };
-                boxed_retry(
-                    move || AddIdentifiersOperation::new(input.clone()),
-                    &seed,
-                    |result| Event::Child(ChildOutcome::new(result)),
-                )
+                IoCall::retry_with(move || AddIdentifiersOperation::new(input.clone()), &seed)
             }
         };
         self.stage = ChangeStage::Change;
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(child))
     }
 
     /// The result, with a drain wake once a change committed.
@@ -222,6 +216,7 @@ impl Operation for PidChangeOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::handle::Handle;
     use aruna_core::user::id::UserId;
     use aruna_drivers::driver::{DriverContext, drive};

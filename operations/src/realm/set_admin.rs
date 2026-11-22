@@ -7,12 +7,11 @@ use aruna_core::id_mint::IdMint;
 use std::collections::HashSet;
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget, roles_narrowed};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, decode_reducer_state};
 use aruna_core::storage_entries::{
     conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
@@ -114,10 +113,7 @@ impl SetAdminOperation {
         let config = self.config.clone();
         let seed = self.config.user_id.to_bytes();
         let build = move || SetAdminWrite::new(config.clone());
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        IoCall::Child(child)
+        IoCall::retry_with(build, &seed)
     }
 }
 

@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, dirty_marker_write,
@@ -667,11 +667,9 @@ impl RetryDrainOperation {
             let events = retry.events.clone();
             WatchExpandOperation::new(realm_id, config.clone(), local, events, resume)
         };
-        let expand = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
+        let expand = IoCall::retry_with(build, &seed);
         self.state = DrainState::Expand;
-        Ok(Next::Call(IoCall::Child(expand)))
+        Ok(Next::Call(expand))
     }
 
     /// Keeps the realm's interest marker, so the queued work runs again, and fails with `error`.

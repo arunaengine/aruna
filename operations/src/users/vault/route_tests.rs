@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::user::vault::VaultChange;
 

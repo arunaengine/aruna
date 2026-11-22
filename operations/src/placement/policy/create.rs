@@ -159,8 +159,10 @@ impl Operation for CreatePolicyOperation {
         match result.child::<bool, AuthorizationError>()? {
             Ok(true) => {
                 self.authorized = true;
-                let write = PolicyWrite::new(self.config.clone());
-                Ok(Next::Call(IoCall::child(write)))
+                let config = self.config.clone();
+                let seed = config.policy.policy_id.to_bytes();
+                let build = move || PolicyWrite::new(config.clone());
+                Ok(Next::Call(IoCall::retry_with(build, &seed)))
             }
             Ok(false) => Err(CreatePolicyError::Unauthorized),
             Err(error) => {

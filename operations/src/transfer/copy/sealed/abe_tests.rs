@@ -428,10 +428,6 @@ impl Operation for RacedPage {
             (turn, _) => Ok(turn),
         }
     }
-
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
-    }
 }
 
 #[tokio::test]
@@ -474,7 +470,7 @@ async fn copy_resets_page() {
         race: Some(RaceWrite(vec![written])),
         held: None,
     };
-    assert_eq!(drive(raced, &context).await, Err(KeyError::Conflict));
+    assert!(drive(raced, &context).await.is_ok());
     let kept = get(storage, ABE_REKEY_KEYSPACE, id).await.unwrap();
     assert_eq!(kept, reset);
 }

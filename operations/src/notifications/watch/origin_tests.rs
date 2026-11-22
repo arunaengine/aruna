@@ -6,6 +6,7 @@
 use super::*;
 use crate::tests::locations::node_id;
 use crate::tests::notifications::user;
+use aruna_core::calls::ChildOutcome;
 use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::notification::InboxWriteOutcome;
 use aruna_core::structs::execution::notification_watch::{

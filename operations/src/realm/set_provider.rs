@@ -4,13 +4,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::federation::valid_federation_url;
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::paths::config_oidc_path;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -146,10 +145,7 @@ impl SetProviderOperation {
         let config = Arc::clone(&self.config);
         let seed = self.config.actor.user_id.to_bytes();
         let build = move || ProviderWrite::new(Arc::clone(&config));
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        IoCall::Child(child)
+        IoCall::retry_with(build, &seed)
     }
 }
 
@@ -383,6 +379,7 @@ fn apply_reducer_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
     use aruna_core::user::id::UserId;
     use ulid::Ulid;

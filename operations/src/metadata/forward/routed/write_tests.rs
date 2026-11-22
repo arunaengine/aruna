@@ -3,7 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use aruna_core::events::{MetadataAnswer, NetEvent};
+use aruna_core::calls::ChildOutcome;
+use aruna_core::events::{Event, MetadataAnswer, NetEvent};
 use aruna_core::metadata::MetadataError;
 use aruna_core::user::id::UserId;
 

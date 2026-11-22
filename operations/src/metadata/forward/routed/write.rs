@@ -5,11 +5,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::{Event, PeerRequestError};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::events::PeerRequestError;
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{AuthToken, MetadataBatch, MetadataBatchSource, MetadataEffect};
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::placement::resolve_shard_holders;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
@@ -120,13 +120,9 @@ impl RouteDeleteOperation {
         {
             let delete =
                 DeleteDocumentOperation::new(self.actor.clone(), record.group_id, document_id);
-            let retried = boxed_retry(
-                move || delete.fresh_copy(),
-                &document_id.to_bytes(),
-                |result| Event::Child(ChildOutcome::new(result)),
-            );
+            let retried = IoCall::retry_with(move || delete.fresh_copy(), &document_id.to_bytes());
             self.stage = DeleteStage::Local;
-            return Ok(Next::Call(IoCall::Child(retried)));
+            return Ok(Next::Call(retried));
         }
         let message = MetadataTransportMessage::ForwardDeleteDocument {
             auth_token: self.auth_token.clone(),

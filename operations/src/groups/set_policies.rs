@@ -3,13 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::paths::GROUP_POLICIES_PATH;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::request_policy::{RequestPolicy, policy_set_hash, validate_policy_set};
@@ -119,10 +118,7 @@ impl SetGroupOperation {
         let config = self.config.clone();
         let seed = self.config.group_id.to_bytes();
         let build = move || GroupPoliciesWrite::new(config.clone());
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        IoCall::Child(child)
+        IoCall::retry_with(build, &seed)
     }
 }
 

@@ -4,12 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::paths::CONFIG_COMPUTE_PATH;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::storage_entries::{
@@ -106,10 +105,7 @@ impl SetComputeOperation {
         let config = Arc::clone(&self.config);
         let seed = self.config.actor.user_id.to_bytes();
         let build = move || ComputeWrite::new(Arc::clone(&config));
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        IoCall::Child(child)
+        IoCall::retry_with(build, &seed)
     }
 }
 
@@ -314,9 +310,10 @@ fn apply_reducer_compute(document: &mut RealmConfigDocument, reducer_state: &Adm
 mod tests {
     use super::*;
     use crate::document_repository::GetConfigOperation;
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::compute::quota::ComputeQuota;
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::StorageEvent;
+    use aruna_core::events::{Event, StorageEvent};
     use aruna_core::keyspaces::AUTH_KEYSPACE;
     use aruna_core::structs::identity::realm::{
         RealmAuthorizationDocument, RealmId, RealmNodeKind,

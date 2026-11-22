@@ -6,13 +6,13 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobEffect, JobEvent, JobReport, JobStops};
 use aruna_core::keyspaces::{BUCKET_CREATION_KEYSPACE, RENAMED_ROW_KEYSPACE, S3_BUCKET_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::local::{JobError, JobProgress, JobResultPayload};
 use aruna_core::structs::identity::auth::Permission;
@@ -1160,10 +1160,7 @@ impl Operation for PurgeJobOperation {
     fn first(&mut self) -> JobNext {
         let (job_id, scope) = (self.job_id, self.scope.clone());
         let build = move || AcquireFenceOperation::new(job_id, scope.clone());
-        let fence = boxed_retry(build, &job_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(fence)))
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 
     fn next(&mut self, result: IoResult) -> JobNext {

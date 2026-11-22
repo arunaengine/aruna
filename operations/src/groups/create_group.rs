@@ -8,15 +8,14 @@ use crate::sync::outbox::record::{
 use aruna_core::admin_documents::{
     AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
 };
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, GROUP_KEYSPACE, OWNER_INDEX_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{conflict_write_entries, reducer_state_entry};
@@ -75,10 +74,7 @@ impl Operation for CreateGroupOperation {
         let config = self.config.clone();
         let seed = self.config.actor.user_id.to_bytes();
         let build = move || GroupCreate::new(config.clone());
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::retry_with(build, &seed)))
     }
 
     fn next(&mut self, result: IoResult) -> CreateTurn {

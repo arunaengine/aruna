@@ -203,7 +203,8 @@ impl RekeyOperation {
             fresh,
             claimed: None,
         };
-        self.call(Step::Claim, IoCall::child(claim))
+        let call = IoCall::retry(claim, &self.id);
+        self.call(Step::Claim, call)
     }
 
     fn claimed(&mut self, claim: Result<(RekeyProgress, Value), KeyError>) -> RekeyTurn {
@@ -265,7 +266,7 @@ impl Operation for RekeyOperation {
 
 /// Stores the pass before any rewrite, so a call for another prefix finds it and stops. Outputs
 /// the pass and its stored row.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ClaimRekey {
     id: Key,
     prefix: String,
@@ -318,8 +319,7 @@ impl Operation for ClaimRekey {
     }
 }
 
-/// One scan of the bucket's version rows. It stays outside the page's transaction, whose
-/// conflicts must come only from the pass rows it read.
+/// One scan of the bucket's version rows.
 #[derive(Debug, PartialEq)]
 struct VersionScan {
     prefix: Key,
@@ -351,7 +351,6 @@ enum PageStep {
     Hold,
     Scan,
     Run,
-    Check,
     Save,
 }
 
@@ -365,8 +364,8 @@ pub(crate) struct PageEnd {
 
 type PageTurn = Result<Next<PageEnd>, KeyError>;
 
-/// Walks one page in the transaction that read the pass row before the scan, so any write to the
-/// rows it read makes its save conflict.
+/// Walks one page outside any transaction, so slow rewrites hold no rows open; its save checks
+/// that the pass row is still the one it started from.
 #[derive(Debug, PartialEq)]
 pub(crate) struct RekeyPage {
     scope: PageScope,
@@ -448,14 +447,19 @@ impl RekeyPage {
         self.save()
     }
 
-    /// Reads in the transaction that read the row before the scan, so any write to it conflicts.
+    fn saving(&self) -> SaveRekey {
+        SaveRekey {
+            id: self.id.clone(),
+            seen: self.seen.clone(),
+            progress: self.progress.clone(),
+            more: self.stopped.is_some() || self.handled < self.rows.len() || self.next,
+            saved: None,
+        }
+    }
+
     fn save(&mut self) -> PageTurn {
-        let reads = vec![
-            (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
-            (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
-            (ABE_DUE_KEYSPACE.to_string(), self.id.clone()),
-        ];
-        self.call(PageStep::Check, IoCall::Read(reads))
+        let call = IoCall::retry(self.saving(), &self.id);
+        self.call(PageStep::Save, call)
     }
 
     fn advance(&mut self) {
@@ -500,32 +504,6 @@ impl RekeyPage {
         self.advance();
         self.run_next()
     }
-
-    /// Saves the cursor while the row is still the one this page read. The last page finishes the
-    /// pass only without a raise or due removal since it began; otherwise the pass starts again.
-    fn check_read(&mut self, [row, epoch, due]: [Option<Value>; 3]) -> PageTurn {
-        // Another call moved the pass meanwhile; its own save stands.
-        if row.as_ref() != Some(&self.seen) {
-            return self.end();
-        }
-        let more = self.stopped.is_some() || self.handled < self.rows.len() || self.next;
-        // A removal during the walk is not covered by it, so the subtree is walked again.
-        let moved_epoch = epoch_of(epoch.as_ref()) != Some(self.progress.epoch);
-        let restart = !more && (moved_epoch || due.is_some());
-        if restart {
-            self.progress.cursor.clear();
-            self.progress.rekeyed = 0;
-        }
-        self.done = !more && !restart;
-        let call = if self.done {
-            IoCall::Delete(vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone())])
-        } else {
-            let row = postcard::to_allocvec(&self.progress).map_err(|_| KeyError::Storage)?;
-            let write = (ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row.into());
-            IoCall::Write(vec![write])
-        };
-        self.call(PageStep::Save, call)
-    }
 }
 
 impl Operation for RekeyPage {
@@ -552,11 +530,79 @@ impl Operation for RekeyPage {
                 let rewritten = result.child::<RewriteOutcome, RewriteError>()?;
                 self.version_done(rewritten)
             }
-            PageStep::Check => self.check_read(values::<3>(result)?),
             PageStep::Save => {
-                result.done()?;
+                // Without an outcome another call moved the pass meanwhile; its own save stands.
+                let saved = result.child::<Option<(RekeyProgress, bool)>, KeyError>()??;
+                if let Some((progress, done)) = saved {
+                    (self.progress, self.done) = (progress, done);
+                }
                 self.end()
             }
+        }
+    }
+}
+
+type SaveTurn = Result<Next<Option<(RekeyProgress, bool)>>, KeyError>;
+
+/// Saves a page's cursor in one short transaction while the pass row is still `seen`. The last
+/// page finishes the pass only without a raise or due removal since it began; otherwise the pass
+/// starts again. Outputs the saved progress and whether the pass is done.
+#[derive(Clone, Debug, PartialEq)]
+struct SaveRekey {
+    id: Key,
+    seen: Value,
+    progress: RekeyProgress,
+    /// Whether versions remain after this page.
+    more: bool,
+    saved: Option<(RekeyProgress, bool)>,
+}
+
+impl SaveRekey {
+    fn check(&mut self, [row, epoch, due]: [Option<Value>; 3]) -> SaveTurn {
+        if row.as_ref() != Some(&self.seen) {
+            return Ok(Next::Done(None));
+        }
+        let mut progress = self.progress.clone();
+        // A removal during the walk is not covered by it, so the subtree is walked again.
+        let moved_epoch = epoch_of(epoch.as_ref()) != Some(progress.epoch);
+        let restart = !self.more && (moved_epoch || due.is_some());
+        if restart {
+            progress.cursor.clear();
+            progress.rekeyed = 0;
+        }
+        let done = !self.more && !restart;
+        let call = if done {
+            IoCall::Delete(vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone())])
+        } else {
+            let row = postcard::to_allocvec(&progress).map_err(|_| KeyError::Storage)?;
+            let write = (ABE_REKEY_KEYSPACE.to_string(), self.id.clone(), row.into());
+            IoCall::Write(vec![write])
+        };
+        self.saved = Some((progress, done));
+        Ok(Next::Call(call))
+    }
+}
+
+impl Operation for SaveRekey {
+    type Output = Option<(RekeyProgress, bool)>;
+    type Error = KeyError;
+
+    fn first(&mut self) -> SaveTurn {
+        let reads = vec![
+            (ABE_REKEY_KEYSPACE.to_string(), self.id.clone()),
+            (ABE_EPOCH_KEYSPACE.to_string(), self.id.clone()),
+            (ABE_DUE_KEYSPACE.to_string(), self.id.clone()),
+        ];
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> SaveTurn {
+        match self.saved.take() {
+            Some(saved) => {
+                result.done()?;
+                Ok(Next::Done(Some(saved)))
+            }
+            None => self.check(values::<3>(result)?),
         }
     }
 
@@ -603,7 +649,7 @@ mod tests {
         let scope = PageScope::new("bucket", "foo/", page, None, UNIX_EPOCH);
         let id = Key::from(vec![1; 16]);
         let mut operation = RekeyPage::new(scope, unit(), id, progress("foo/"), seen_row());
-        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert_eq!(operation.transaction(), TransactionMode::None);
         operation.first().unwrap();
         let turn = operation.next(IoResult::Values(vec![Some(seen_row())]));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
@@ -621,25 +667,38 @@ mod tests {
         operation.next(IoResult::Child(ChildOutcome::new(answer)))
     }
 
-    /// Answers the save reads with the progress row `seen`, epoch 2 and no due marker.
-    fn saved(operation: &mut RekeyPage, seen: Option<Value>) -> PageTurn {
+    /// The page's save, its reads answered with the progress row `seen`, epoch 2 and no due marker.
+    fn saved(operation: &RekeyPage, seen: Option<Value>) -> (SaveRekey, SaveTurn) {
+        let mut save = operation.saving();
+        assert!(matches!(save.first(), Ok(Next::Call(IoCall::Read(_)))));
         let epoch = Some(2u64.to_be_bytes().to_vec().into());
-        operation.next(IoResult::Values(vec![seen, epoch, None]))
+        let turn = save.next(IoResult::Values(vec![seen, epoch, None]));
+        (save, turn)
     }
 
     /// The progress a save writes.
-    fn written(turn: PageTurn) -> RekeyProgress {
+    fn written(turn: SaveTurn) -> RekeyProgress {
         let Ok(Next::Call(IoCall::Write(writes))) = turn else {
             panic!("one progress write: {turn:?}");
         };
         postcard::from_bytes(&writes[0].2).unwrap()
     }
 
-    fn page_end(operation: &mut RekeyPage) -> PageEnd {
-        let Ok(Next::Done(end)) = operation.next(IoResult::Done) else {
+    /// Hands the save's outcome to the page, which ends.
+    fn finish(operation: &mut RekeyPage, saved: Option<(RekeyProgress, bool)>) -> PageEnd {
+        let answer = Ok::<_, KeyError>(saved);
+        let Ok(Next::Done(end)) = operation.next(IoResult::Child(ChildOutcome::new(answer))) else {
             panic!("the saved page ends");
         };
         end
+    }
+
+    /// Commits the save, then ends the page with its outcome.
+    fn page_end(operation: &mut RekeyPage, mut save: SaveRekey) -> PageEnd {
+        let Ok(Next::Done(saved)) = save.next(IoResult::Done) else {
+            panic!("the save commits");
+        };
+        finish(operation, saved)
     }
 
     #[test]
@@ -649,13 +708,14 @@ mod tests {
         let turn = scanned(&mut operation, &["foo/a", "bar/x", "foo/b"]);
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let turn = ended(&mut operation, RewriteOutcome::Moved);
-        assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
-        let progress = written(saved(&mut operation, Some(seen_row())));
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+        let (save, turn) = saved(&operation, Some(seen_row()));
+        let progress = written(turn);
         assert_eq!(
             (progress.cursor, progress.rekeyed),
             (row("foo/a").to_vec(), 1)
         );
-        let end = page_end(&mut operation);
+        let end = page_end(&mut operation, save);
         assert_eq!(
             (end.progress.rekeyed, end.done, end.stopped),
             (1, false, None)
@@ -669,9 +729,12 @@ mod tests {
         scanned(&mut operation, &["foo/a", "foo/b"]).unwrap();
         ended(&mut operation, RewriteOutcome::Moved).unwrap();
         ended(&mut operation, RewriteOutcome::AwaitingKey).unwrap();
-        let progress = written(saved(&mut operation, Some(seen_row())));
-        assert_eq!(progress.cursor, row("foo/a").to_vec());
-        assert_eq!(page_end(&mut operation).stopped, Some(KeyError::Locked));
+        let (save, turn) = saved(&operation, Some(seen_row()));
+        assert_eq!(written(turn).cursor, row("foo/a").to_vec());
+        assert_eq!(
+            page_end(&mut operation, save).stopped,
+            Some(KeyError::Locked)
+        );
     }
 
     #[test]
@@ -681,12 +744,14 @@ mod tests {
         scanned(&mut operation, &["foo/a", "foo/b", "foo/c"]).unwrap();
         ended(&mut operation, RewriteOutcome::Moved).unwrap();
         ended(&mut operation, RewriteOutcome::Unfinished).unwrap();
-        let progress = written(saved(&mut operation, Some(seen_row())));
+        let (save, turn) = saved(&operation, Some(seen_row()));
+        let progress = written(turn);
         assert_eq!(
             (progress.cursor, progress.rekeyed),
             (row("foo/a").to_vec(), 1)
         );
-        assert_eq!(page_end(&mut operation).stopped, Some(KeyError::Unfinished));
+        let end = page_end(&mut operation, save);
+        assert_eq!(end.stopped, Some(KeyError::Unfinished));
     }
 
     #[test]
@@ -698,8 +763,12 @@ mod tests {
         operation
             .next(IoResult::Child(ChildOutcome::new(failed)))
             .unwrap();
-        written(saved(&mut operation, Some(seen_row())));
-        assert_eq!(page_end(&mut operation).stopped, Some(KeyError::Storage));
+        let (save, turn) = saved(&operation, Some(seen_row()));
+        written(turn);
+        assert_eq!(
+            page_end(&mut operation, save).stopped,
+            Some(KeyError::Storage)
+        );
     }
 
     fn claiming(prefix: &str) -> ClaimRekey {
@@ -754,19 +823,29 @@ mod tests {
         let mut operation = scanning(4);
         scanned(&mut operation, &["bar/x", "foo/a"]).unwrap();
         ended(&mut operation, RewriteOutcome::Skipped).unwrap();
-        let turn = saved(&mut operation, Some(seen_row()));
+        let (save, turn) = saved(&operation, Some(seen_row()));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Delete(_)))));
-        assert!(page_end(&mut operation).done);
+        assert!(page_end(&mut operation, save).done);
+    }
+
+    #[test]
+    fn only_save_writes() {
+        // The rewrites run outside any transaction; only the short save holds one.
+        let operation = scanning(4);
+        assert_eq!(operation.transaction(), TransactionMode::None);
+        assert_eq!(operation.saving().transaction(), TransactionMode::Write);
     }
 
     #[test]
     fn moved_pass_stands() {
         // Another call saved the pass during this page, so this page writes nothing.
         let mut operation = scanning(4);
-        scanned(&mut operation, &[]).unwrap();
+        let turn = scanned(&mut operation, &[]);
+        assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let other = Value::from(vec![9]);
-        let turn = saved(&mut operation, Some(other));
-        assert!(matches!(turn, Ok(Next::Done(PageEnd { done: false, .. }))));
+        let (_, turn) = saved(&operation, Some(other));
+        assert_eq!(turn, Ok(Next::Done(None)));
+        assert!(!finish(&mut operation, None).done);
     }
 
     #[test]

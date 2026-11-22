@@ -3,13 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::reducer::paths::DISPLAY_NAME_PATH;
 use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
 use aruna_core::rows::values;
@@ -160,10 +159,7 @@ impl UpdateGroupOperation {
         let config = self.config.clone();
         let seed = self.config.actor.user_id.to_bytes();
         let build = move || GroupUpdate::new(config.clone());
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Next::Call(IoCall::Child(child))
+        Next::Call(IoCall::retry_with(build, &seed))
     }
 
     fn handle_auth(&mut self, allowed: Result<bool, AuthorizationError>) -> UpdateTurn {

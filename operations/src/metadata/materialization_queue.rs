@@ -22,7 +22,7 @@ use aruna_core::metadata::{
     MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord, MetadataRawRevision,
     MetadataRequestDurability, ProfileValidationStatus, deterministic_materialization_actor,
 };
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry, boxed_suboperation};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::repository::link::{link_change_entry, schedule_drain};
 use aruna_core::rows::values;
 use aruna_core::storage_entries::{
@@ -416,10 +416,10 @@ impl MaterializationBatchOperation {
         };
         self.stage = BatchStage::Commit;
         let build = move || CommitFinishOperation::new(chunk.clone());
-        let commit = boxed_retry(build, b"materialization-finish", |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(commit)))
+        Ok(Next::Call(IoCall::retry_with(
+            build,
+            b"materialization-finish",
+        )))
     }
 
     fn finish_failed(

@@ -3,13 +3,12 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::SecretBytes;
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::realm_vault::{
     RealmSecretRef, RealmVaultEntry, RealmVaultError, RealmVaultKey, RealmVaultPurpose,
     RealmVaultRecord,
@@ -125,10 +124,7 @@ impl SetEmailOperation {
         let config = Arc::clone(&self.config);
         let seed = self.config.actor.user_id.to_bytes();
         let build = move || EmailWrite::new(Arc::clone(&config));
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        IoCall::Child(child)
+        IoCall::retry_with(build, &seed)
     }
 }
 

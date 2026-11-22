@@ -3,11 +3,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::metadata::{MetadataEffect, MetadataError};
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
@@ -206,12 +205,10 @@ impl WriteServeOperation {
             }
             Some(Message::ForwardDeleteDocument { document_id, .. }) => {
                 let delete = DeleteDocumentOperation::new(actor, record.group_id, document_id);
-                let retried = boxed_retry(
-                    move || delete.fresh_copy(),
-                    &document_id.to_bytes(),
-                    |result| Event::Child(ChildOutcome::new(result)),
-                );
-                self.call(WriteStage::Delete(document_id), IoCall::Child(retried))
+                self.call(
+                    WriteStage::Delete(document_id),
+                    IoCall::retry_with(move || delete.fresh_copy(), &document_id.to_bytes()),
+                )
             }
             _ => done(reject("unexpected forwarded metadata message")),
         }

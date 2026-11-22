@@ -5,12 +5,11 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::FAMILY_TOMBSTONE_KEYSPACE;
 use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{
     ExecutionRole, JobFamilyId, JobFamilyRecord, JobProjection, JobRecordEnvelope, JobRecordKind,
     LogicalJobSpec, PhysicalExecutionState, ProjectedExecution,
@@ -154,10 +153,7 @@ impl FamilyProjectionOperation {
                 rebuild: false,
             })
         };
-        let child = boxed_retry(build, &job_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 
     fn projected(&mut self, read: Result<ProjectedFamily, RecordStoreError>) -> ProjectionNext {
@@ -766,6 +762,7 @@ impl Operation for AuditEndpointsOperation {
 mod tests {
     use super::*;
     use crate::tests::records::{Family, REALM, node, user};
+    use aruna_core::calls::ChildOutcome;
 
     fn job() -> JobId {
         JobId::from_bytes([3; 16])

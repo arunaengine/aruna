@@ -11,14 +11,13 @@ use aruna_core::rows::{outside_answer, outside_call};
 use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     DISTRIBUTION_FENCE_KEYSPACE, DISTRIBUTION_LIFECYCLE_KEYSPACE, RANGE_ACCOUNT_KEYSPACE,
     RANGE_COUNTER_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::rows::{SettleMarkerOperation, read_row};
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::RealmId;
@@ -328,10 +327,7 @@ impl SetScope {
     fn fence(&self, change: FenceChange) -> IoCall {
         let set_id = self.set_id;
         let build = move || UpdateFenceOperation::new(set_id, change.clone());
-        let child = boxed_retry(build, &set_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        IoCall::Child(child)
+        IoCall::retry_with(build, &set_id.to_bytes())
     }
 
     /// Clears what this node keeps of the set besides its bucket, within `pages`.

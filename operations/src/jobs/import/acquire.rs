@@ -3,11 +3,11 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::jobs::{ByteStream, JobEffect, JobEvent};
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::repository::RepositoryPull;
 use aruna_core::structs::execution::job::input::{
     ImportRoCrateSource, RoCrateMediaType, RoCrateUploadRecord,
@@ -162,10 +162,7 @@ impl Operation for AcquireSourceOperation {
                 let (job_id, now_ms) = (self.run.job_id, self.now_ms);
                 let build = move || ClaimUploadOperation::new(upload_id, owner, job_id, now_ms);
                 let seed = upload_id.to_bytes();
-                let claim = boxed_retry(build, &seed, |result| {
-                    Event::Child(ChildOutcome::new(result))
-                });
-                Ok(Next::Call(IoCall::Child(claim)))
+                Ok(Next::Call(IoCall::retry_with(build, &seed)))
             }
             ImportRoCrateSource::Object { bucket, .. } => {
                 self.step = Step::Bucket;

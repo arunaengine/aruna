@@ -240,9 +240,10 @@ impl RefreshReferenceOperation {
 
     fn apply(&mut self) -> RefreshTurn {
         self.step = RefreshStep::Apply;
-        Ok(Next::Call(IoCall::child(RefreshApply::new(
-            self.refresh.clone(),
-        ))))
+        let refresh = self.refresh.clone();
+        let seed = refresh.version_id.to_bytes();
+        let build = move || RefreshApply::new(refresh.clone());
+        Ok(Next::Call(IoCall::retry_with(build, &seed)))
     }
 
     fn observed(&mut self, observed: Result<SourceMetadata, ObserveError>) -> RefreshTurn {

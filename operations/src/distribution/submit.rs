@@ -3,14 +3,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent, StatementSignEvent};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::CATCH_UP_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::rows::{outside_answer, outside_call};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::distribution::DistributionRevision;
@@ -91,10 +91,7 @@ impl Operation for PublishLocalOperation {
         };
         let build = move || PublishOperation::new(config.clone());
         let seed = self.request_id.to_bytes();
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::retry_with(build, &seed)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<DistributionRevision>, PublishRefusal> {

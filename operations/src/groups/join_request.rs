@@ -8,10 +8,9 @@ use crate::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
 use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
 use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
-use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::join_request::{
     JoinDecision, JoinDecisionKind, JoinRequest, JoinRequestState, valid_message,
@@ -20,7 +19,7 @@ use aruna_core::keyspaces::{
     AUTH_KEYSPACE, DOCUMENT_STATE_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE,
 };
 use aruna_core::notification_routing::{RoutingContext, route_resource_event};
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::placement::fence::WriteFence;
 use aruna_core::placement::target_placement_ref;
 use aruna_core::reducer::{AdminDocumentError, decode_reducer_state};
@@ -121,10 +120,7 @@ impl GroupJoinOperation {
         let input = self.input.clone();
         let seed = self.input.actor.user_id.to_bytes();
         let build = move || JoinWrite::new(input.clone());
-        let child = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Next::Call(IoCall::Child(child))
+        Next::Call(IoCall::retry_with(build, &seed))
     }
 }
 

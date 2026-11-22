@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::key_wait::KeyWait;
@@ -474,10 +474,7 @@ impl RemoteWakesOperation {
     fn queue_page(&self) -> Next<()> {
         let key = self.key;
         let build = move || QueueWakesOperation::new(key);
-        let child = boxed_retry(build, &key.key(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Next::Call(IoCall::Child(child))
+        Next::Call(IoCall::retry_with(build, &key.key()))
     }
 }
 

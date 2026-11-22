@@ -201,8 +201,9 @@ impl SubmitExecutionOperation {
             active_cap: submission.active_cap,
         };
         let admission = submission.local_admission.clone();
-        let submit = SubmitJobOperation::new(spec, job_id).with_admission(admission);
-        Ok(Next::Call(IoCall::child(submit)))
+        let build =
+            move || SubmitJobOperation::new(spec.clone(), job_id).with_admission(admission.clone());
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 }
 
