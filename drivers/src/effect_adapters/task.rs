@@ -102,7 +102,7 @@ async fn arm_stored(
 async fn apply_change(
     storage: &StorageHandle,
     task_handle: Option<&TaskHandle>,
-    mut effect: TaskEffect,
+    effect: TaskEffect,
     keep_live: bool,
 ) -> Event {
     let admission = next_admission();
@@ -153,15 +153,13 @@ async fn apply_change(
         }
         return event;
     }
+    let mut deadline = None;
     if timer_has_row(&effect) {
-        let written = match &mut effect {
+        let written = match &effect {
             TaskEffect::ResetTimer { key, after } => {
                 // The scheduler keeps the deadline the row stores, however late the write ends.
-                let deadline = Instant::now().checked_add(*after);
+                deadline = Instant::now().checked_add(*after);
                 let written = write_settled(storage, key, *after, admission, keep_live).await;
-                if let Some(deadline) = deadline {
-                    *after = deadline.saturating_duration_since(Instant::now());
-                }
                 written.map_err(|error| error.to_string())
             }
             _ => persist_task_effect(storage, &effect).await,
@@ -174,7 +172,11 @@ async fn apply_change(
         }
     }
     match task_handle {
-        Some(task_handle) => task_handle.send_stamped(effect, Some(admission)).await,
+        Some(task_handle) => {
+            task_handle
+                .send_stamped(effect, Some(admission), deadline)
+                .await
+        }
         None => refused_handle(),
     }
 }

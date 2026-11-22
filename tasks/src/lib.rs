@@ -56,6 +56,9 @@ enum TaskCommand {
         key: TaskKey,
         after: Duration,
         stamp: Option<u64>,
+        /// The deadline planned before the row write; the wake keeps it however long this
+        /// command waited, else it is due `after` from when the scheduler reads the command.
+        deadline: Option<Instant>,
         response: oneshot::Sender<TaskEvent>,
     },
     ShortenTimer {
@@ -653,8 +656,10 @@ impl SchedulerState {
                 key,
                 after,
                 stamp,
+                deadline,
                 response,
             } => {
+                let after = deadline.map_or(after, |due| due.saturating_duration_since(now));
                 let _ = response.send(self.reset_timer((key, stamp), after, now));
             }
             TaskCommand::ShortenTimer {
@@ -886,11 +891,17 @@ impl TaskHandle {
             .unwrap_or_else(|_| scheduler_unavailable(command_key))
     }
 
-    async fn reset_timer(&self, key: TaskKey, after: Duration, stamp: Option<u64>) -> TaskEvent {
+    async fn reset_timer(
+        &self,
+        key: TaskKey,
+        after: Duration,
+        (stamp, deadline): (Option<u64>, Option<Instant>),
+    ) -> TaskEvent {
         self.dispatch_command(key, |key, response| TaskCommand::ResetTimer {
             key,
             after,
             stamp,
+            deadline,
             response,
         })
         .await
@@ -972,10 +983,17 @@ impl TaskHandle {
     }
 
     /// Hands a timer change to the scheduler with the due time of the durable row it wrote, so
-    /// the firing it arms deletes only that row and never a newer one.
-    pub async fn send_stamped(&self, effect: TaskEffect, stamp: Option<u64>) -> Event {
+    /// the firing it arms deletes only that row and never a newer one. A reset keeps `deadline`.
+    pub async fn send_stamped(
+        &self,
+        effect: TaskEffect,
+        stamp: Option<u64>,
+        deadline: Option<Instant>,
+    ) -> Event {
         let event = match effect {
-            TaskEffect::ResetTimer { key, after } => self.reset_timer(key, after, stamp).await,
+            TaskEffect::ResetTimer { key, after } => {
+                self.reset_timer(key, after, (stamp, deadline)).await
+            }
             TaskEffect::ShortenTimer { key, after } => {
                 self.shorten_timer(key, after, (stamp, Shorten::Arm, None))
                     .await
@@ -1175,7 +1193,7 @@ impl Handle for TaskHandle {
             Effect::Task(task_effect) => {
                 let event = match task_effect {
                     TaskEffect::ResetTimer { key, after } => {
-                        self.reset_timer(key, after, None).await
+                        self.reset_timer(key, after, (None, None)).await
                     }
                     TaskEffect::ShortenTimer { key, after } => {
                         self.shorten_timer(key, after, (None, Shorten::Arm, None))
@@ -1240,11 +1258,41 @@ mod tests {
             key: test_key(),
             after: Duration::ZERO,
         };
-        handle.send_stamped(reset, Some(42)).await;
+        handle.send_stamped(reset, Some(42), None).await;
         tokio::time::timeout(Duration::from_secs(5), notify.notified())
             .await
             .expect("the timer fires");
         assert_eq!(*seen.lock().expect("stamp lock"), Some(Some(42)));
+    }
+
+    // A reset that waits eleven seconds for the scheduler keeps the deadline planned before it.
+    #[tokio::test(start_paused = true)]
+    async fn queued_reset_deadline() {
+        let (command_tx, command_rx) = mpsc::channel(TASK_COMMAND_BUFFER);
+        let admission_closed = Arc::new(AtomicBool::new(false));
+        let handle = TaskHandle {
+            command_tx: command_tx.clone(),
+            admission_closed: admission_closed.clone(),
+            pulls: Arc::default(),
+        };
+        let after = Duration::from_secs(60);
+        let deadline = Instant::now().checked_add(after);
+        let reset = TaskEffect::ResetTimer {
+            key: test_key(),
+            after,
+        };
+        let sent = tokio::spawn(async move { handle.send_stamped(reset, Some(1), deadline).await });
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::spawn(run_scheduler(
+            command_rx,
+            command_tx.downgrade(),
+            admission_closed,
+        ));
+        let event = sent.await.expect("the reset ends");
+        let Event::Task(TaskEvent::TimerScheduled { after, .. }) = event else {
+            panic!("the reset is armed");
+        };
+        assert_eq!(after, Duration::from_secs(49));
     }
 
     #[derive(Clone)]
