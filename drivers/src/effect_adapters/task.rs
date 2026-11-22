@@ -102,7 +102,7 @@ async fn arm_stored(
 async fn apply_change(
     storage: &StorageHandle,
     task_handle: Option<&TaskHandle>,
-    mut effect: TaskEffect,
+    effect: TaskEffect,
     keep_live: bool,
 ) -> Event {
     let admission = next_admission();
@@ -136,33 +136,30 @@ async fn apply_change(
         if plan.holder != Some(admission) {
             return event;
         }
-        if written.is_err() {
-            return task_handle
-                .arm_planned(key.clone(), plan, admission)
+        let (event, holder) = if written.is_err() {
+            task_handle.arm_planned(key.clone(), plan, admission).await
+        } else {
+            task_handle
+                .claim_shorten(key.clone(), plan, admission)
                 .await
-                .0;
-        }
-        let (event, holder) = task_handle
-            .claim_shorten(key.clone(), plan, admission)
-            .await;
+        };
         // The wake that held the key fired since the plan and serves this change, so its run
-        // owns the row and deletes it.
-        if let Some(holder) = holder.filter(|holder| *holder != admission)
+        // owns the row, which an unanswered write may have stored too, and deletes it.
+        if matches!(written, Ok(()) | Err(StorageError::Timeout))
+            && let Some(holder) = holder.filter(|holder| *holder != admission)
             && let Err(message) = write_owned(storage, key, Duration::ZERO, holder).await
         {
             warn!(key = ?key, %message, "Timer row kept for the next restart");
         }
         return event;
     }
+    let mut deadline = None;
     if timer_has_row(&effect) {
-        let written = match &mut effect {
+        let written = match &effect {
             TaskEffect::ResetTimer { key, after } => {
                 // The scheduler keeps the deadline the row stores, however late the write ends.
-                let deadline = Instant::now().checked_add(*after);
+                deadline = Instant::now().checked_add(*after);
                 let written = write_settled(storage, key, *after, admission, keep_live).await;
-                if let Some(deadline) = deadline {
-                    *after = deadline.saturating_duration_since(Instant::now());
-                }
                 written.map_err(|error| error.to_string())
             }
             _ => persist_task_effect(storage, &effect).await,
@@ -175,7 +172,11 @@ async fn apply_change(
         }
     }
     match task_handle {
-        Some(task_handle) => task_handle.send_stamped(effect, Some(admission)).await,
+        Some(task_handle) => {
+            task_handle
+                .send_stamped(effect, Some(admission), deadline)
+                .await
+        }
         None => refused_handle(),
     }
 }

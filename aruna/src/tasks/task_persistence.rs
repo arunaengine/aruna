@@ -488,13 +488,16 @@ mod tests {
         task_handle: &TaskHandle,
         key: &TaskKey,
         after: Duration,
+        keep_live: bool,
     ) -> tokio::task::JoinHandle<Event> {
         let (store, task_handle) = (store.clone(), task_handle.clone());
         let shorten = TaskEffect::ShortenTimer {
             key: key.clone(),
             after,
         };
-        tokio::spawn(async move { change_timer(&store, Some(&task_handle), shorten, false).await })
+        tokio::spawn(
+            async move { change_timer(&store, Some(&task_handle), shorten, keep_live).await },
+        )
     }
 
     /// A durable reset of `key` to sixty seconds, run on its own task.
@@ -521,7 +524,7 @@ mod tests {
         let task_handle = TaskHandle::new();
         let (store, arrived, release) = gated_store(0, 0);
         let key = gated_key();
-        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60), false);
         arrived.notified().await;
         tokio::time::advance(Duration::from_secs(5)).await;
         release.send(()).expect("the write waits");
@@ -543,7 +546,7 @@ mod tests {
             let task_handle = TaskHandle::new();
             let (store, arrived, release) = gated_store(0, refused);
             let key = gated_key();
-            let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+            let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60), false);
             arrived.notified().await;
             tokio::time::advance(Duration::from_secs(11)).await;
             release.send(()).expect("the write waits");
@@ -625,36 +628,46 @@ mod tests {
     }
 
     // A later wake that fires while a shorten's row write is held serves that shorten: no second
-    // wake is armed, and the fired run owns the row and deletes it.
+    // wake is armed, and the fired run owns the row and deletes it, also after a best-effort
+    // write timed out and committed late.
     #[tokio::test(start_paused = true)]
     async fn fired_wake_owns() {
-        let task_handle = TaskHandle::new();
-        let (store, arrived, release) = gated_store(1, 0);
-        let (started, ended) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
-        let firing = DeletingFiring {
-            storage: store.clone(),
-            started: started.clone(),
-            ended: ended.clone(),
-        };
-        task_handle.set_inbound_handler(Arc::new(firing)).await;
-        let key = gated_key();
-        let reset = TaskEffect::ResetTimer {
-            key: key.clone(),
-            after: Duration::from_secs(3),
-        };
-        change_timer(&store, Some(&task_handle), reset, false).await;
-        let change = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(1));
-        arrived.notified().await;
-        tokio::time::advance(Duration::from_secs(4)).await;
-        started.notified().await;
-        release.send(()).expect("the write waits");
-        change.await.expect("the change ends");
-        ended.notified().await;
-        assert_eq!(read_timer(&store, &key).await.expect("reads"), None);
-        let (_, plan) = task_handle
-            .plan_shorten(key, Duration::from_secs(60), 1)
-            .await;
-        assert_eq!(plan.and_then(|plan| plan.holder), Some(1), "no second wake");
+        for keep_live in [false, true] {
+            let task_handle = TaskHandle::new();
+            let (store, arrived, release) = gated_store(1, 0);
+            let (started, ended) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+            let firing = DeletingFiring {
+                storage: store.clone(),
+                started: started.clone(),
+                ended: ended.clone(),
+            };
+            task_handle.set_inbound_handler(Arc::new(firing)).await;
+            let key = gated_key();
+            let reset = TaskEffect::ResetTimer {
+                key: key.clone(),
+                after: Duration::from_secs(3),
+            };
+            change_timer(&store, Some(&task_handle), reset, false).await;
+            let after = Duration::from_secs(1);
+            let change = spawn_shorten(&store, &task_handle, &key, after, keep_live);
+            arrived.notified().await;
+            tokio::time::advance(Duration::from_secs(4)).await;
+            started.notified().await;
+            if keep_live {
+                // Unanswered until the change ends, so the write times out and commits late.
+                change.await.expect("the change ends");
+                release.send(()).expect("the write waits");
+            } else {
+                release.send(()).expect("the write waits");
+                change.await.expect("the change ends");
+            }
+            ended.notified().await;
+            assert_eq!(read_timer(&store, &key).await.expect("reads"), None);
+            let (_, plan) = task_handle
+                .plan_shorten(key, Duration::from_secs(60), 1)
+                .await;
+            assert_eq!(plan.and_then(|plan| plan.holder), Some(1), "no second wake");
+        }
     }
 
     // A caller that goes away after its row write committed still leaves one live wake, owned by
@@ -664,7 +677,7 @@ mod tests {
         let task_handle = TaskHandle::new();
         let (store, arrived, release) = gated_store(0, 0);
         let key = gated_key();
-        let caller = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60));
+        let caller = spawn_shorten(&store, &task_handle, &key, Duration::from_secs(60), false);
         arrived.notified().await;
         caller.abort();
         let cancelled = caller.await.expect_err("the caller is cancelled");

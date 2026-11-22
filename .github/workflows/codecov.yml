@@ -60,7 +60,8 @@ jobs:
       # The measured target set matches the main tests job, so a coverage move
       # cannot come from a different target selection.
       - name: Build the instrumented test archive
-        # Four parallel instrumented crates outgrew memory and swap, and the runner stopped answering.
+        # With four build jobs and 8 GB swap the runner lost contact after 66 minutes, for an
+        # unknown cause. Two jobs lower the memory peak.
         env:
           CARGO_BUILD_JOBS: 2
         run: >-
