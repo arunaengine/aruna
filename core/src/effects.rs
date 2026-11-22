@@ -54,6 +54,9 @@ pub enum Effect {
     /// Starts a child beside the caller while a background slot is free; answered at once by
     /// `TaskEvent::BackgroundStarted`. The child's result goes nowhere.
     Background(Box<dyn SubOperation>),
+    /// Starts a child beside the caller without a slot limit; answered at once by
+    /// `TaskEvent::BackgroundStarted { started: true }`. The child's result goes nowhere.
+    Detached(Box<dyn SubOperation>),
     Task(TaskEffect),
     Search(),
     Stream(),

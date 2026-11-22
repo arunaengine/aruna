@@ -121,6 +121,18 @@ impl IoCall {
         let child = boxed_suboperation(operation, |_| Event::Delayed);
         Self::Effect(Box::new(Effect::Background(child)))
     }
+
+    /// Starts `operation` beside the caller without a slot limit; the caller gets only
+    /// `TaskEvent::BackgroundStarted` and never the child's result.
+    pub fn detached<O>(operation: O) -> Self
+    where
+        O: Operation + 'static,
+        O::Output: Send + 'static,
+        O::Error: Send + 'static,
+    {
+        let child = boxed_suboperation(operation, |_| Event::Delayed);
+        Self::Effect(Box::new(Effect::Detached(child)))
+    }
 }
 
 /// A child's `Result<Output, Error>`, boxed so events stay free of operation types. The value
@@ -935,7 +947,7 @@ fn effect_family(effect: &Effect) -> Result<Family, IoError> {
         Effect::LocalFile(_) => Ok(Family::LocalFile),
         Effect::Net(_) => Ok(Family::Net),
         Effect::Metadata(_) => Ok(Family::Metadata),
-        Effect::Task(_) | Effect::Background(_) => Ok(Family::Task),
+        Effect::Task(_) | Effect::Background(_) | Effect::Detached(_) => Ok(Family::Task),
         Effect::Index(_) => Ok(Family::Index),
         Effect::Session(_) => Ok(Family::Session),
         Effect::Outbound(_) => Ok(Family::Outbound),

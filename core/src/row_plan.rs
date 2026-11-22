@@ -7,8 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::calls::{IoCall, IoError, IoResult, Next};
 use crate::effects::{Effect, IterStart, StorageEffect};
+use crate::errors::ConversionError;
 use crate::events::{Event, StorageEvent};
 use crate::operation::{Operation, TransactionMode};
+use crate::structs::identity::realm::RealmConfigDocument;
 use crate::types::{Key, KeySpace, Value};
 
 /// A plan asked for rows that are not known yet.
@@ -51,6 +53,8 @@ pub struct PlanRows {
     scans: BTreeMap<ScanRequest, Vec<(Key, Value)>>,
     wanted_scan: Option<ScanRequest>,
     now_ms: u64,
+    /// The realm config decoded from its row; decoding checks every node key, so replays reuse it.
+    config: Option<(Value, RealmConfigDocument)>,
 }
 
 impl PlanRows {
@@ -68,6 +72,18 @@ impl PlanRows {
 
     pub fn now_ms(&self) -> u64 {
         self.now_ms
+    }
+
+    /// The realm config `bytes` hold, decoded once for every replay of the plan.
+    pub fn decode_config(&mut self, bytes: Value) -> Result<RealmConfigDocument, ConversionError> {
+        if let Some((known, config)) = &self.config
+            && *known == bytes
+        {
+            return Ok(config.clone());
+        }
+        let config = RealmConfigDocument::from_bytes(&bytes)?;
+        self.config = Some((bytes, config.clone()));
+        Ok(config)
     }
 
     /// The row, or a stop that asks for it and for every row wanted before.
@@ -417,5 +433,28 @@ mod tests {
         operation.stamp(5);
         operation.stamp(9);
         assert_eq!(operation.rows.now_ms(), 5);
+    }
+
+    #[test]
+    fn config_decodes_once() {
+        use crate::structs::identity::realm::RealmId;
+        let first = RealmConfigDocument::new(RealmId::from_bytes([1; 32]), Vec::new(), 2);
+        let second = RealmConfigDocument::new(RealmId::from_bytes([2; 32]), Vec::new(), 3);
+        let bytes =
+            |config: &RealmConfigDocument| Value::from(postcard::to_allocvec(config).unwrap());
+        let mut rows = PlanRows::default();
+        assert_eq!(rows.decode_config(bytes(&first)), Ok(first.clone()));
+        assert_eq!(
+            rows.config,
+            Some((bytes(&first), first.clone())),
+            "a replay reuses it"
+        );
+        assert_eq!(rows.decode_config(bytes(&first)), Ok(first));
+        assert_eq!(
+            rows.decode_config(bytes(&second)),
+            Ok(second.clone()),
+            "new bytes decode"
+        );
+        assert_eq!(rows.config, Some((bytes(&second), second)));
     }
 }

@@ -26,7 +26,7 @@ pub fn realm_config(rows: &mut PlanRows, realm_id: RealmId) -> Step<Option<Realm
     let target = DocumentTarget::RealmConfig { realm_id };
     let value = target_row(rows, &target)?;
     Ok(value
-        .map(|bytes| RealmConfigDocument::from_bytes(&bytes))
+        .map(|bytes| rows.decode_config(bytes))
         .transpose()
         .map_err(invalid)?)
 }

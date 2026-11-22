@@ -278,8 +278,6 @@ enum BatchStage {
     Groups,
     Commit,
     Sync(CompletedMaterializationSync),
-    /// A sync that found no free background slot and runs in this pass instead.
-    SyncInline(String),
     Timer,
     Captures,
 }
@@ -440,7 +438,7 @@ impl MaterializationBatchOperation {
         };
         let graph_sync = GraphSyncOperation::new(sync.graph_iri.clone(), sync.peers.clone());
         self.stage = BatchStage::Sync(sync);
-        Ok(Next::Call(IoCall::background(graph_sync)))
+        Ok(Next::Call(IoCall::detached(graph_sync)))
     }
 
     // Finished jobs may queue link pushes and Git snapshots, and both drains stop once their
@@ -525,26 +523,14 @@ impl Operation for MaterializationBatchOperation {
                 Ok(Err(error)) => self.finish_failed(error),
                 Err(error) => self.finish_failed(error.into()),
             },
-            // A sync without a free background slot runs inline, so no materialization skips it.
+            // Each sync runs detached without a slot limit, so the drain never waits for one.
             BatchStage::Sync(sync) => match result.event() {
                 Ok(Event::Task(TaskEvent::BackgroundStarted { started: true })) => self.sync(),
-                Ok(Event::Task(TaskEvent::BackgroundStarted { started: false })) => {
-                    warn!(graph_iri = %sync.graph_iri, "No background slot for the metadata graph sync after materialization; waiting for it");
-                    let inline = GraphSyncOperation::new(sync.graph_iri.clone(), sync.peers);
-                    self.stage = BatchStage::SyncInline(sync.graph_iri);
-                    Ok(Next::Call(IoCall::child(inline)))
-                }
                 other => {
                     warn!(event = ?other, graph_iri = %sync.graph_iri, "Unexpected metadata graph sync result after materialization");
                     self.sync()
                 }
             },
-            BatchStage::SyncInline(graph_iri) => {
-                if let Ok(Err(error)) = result.child::<(), MetadataError>() {
-                    warn!(error = ?error, graph_iri = %graph_iri, "Metadata graph sync after materialization failed");
-                }
-                self.sync()
-            }
             BatchStage::Timer => {
                 match result.event() {
                     Ok(Event::Task(TaskEvent::Error { message, .. })) => {
