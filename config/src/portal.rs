@@ -341,15 +341,8 @@ fn lock_install(previous: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .write(true)
         .open(previous.with_extension("lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => {
-            #[cfg(test)]
-            tests::CONTENDED.store(true, std::sync::atomic::Ordering::SeqCst);
-            file.lock().map(|()| file)
-        }
-        Err(fs::TryLockError::Error(error)) => Err(error),
-    }
+    file.lock()?;
+    Ok(file)
 }
 
 /// Publishes the marked recovery directory `previous` whole with one rename of a staged copy, so
@@ -406,13 +399,28 @@ fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
         .map_err(io::Error::from)
 }
 
-/// Without `MOVEFILE_REPLACE_EXISTING` the move refuses any entry at `to`.
+/// Without `MOVEFILE_REPLACE_EXISTING` the move refuses any entry at `to`. Both operands are
+/// spelled under the canonical parent of `to`, an extended-length path past the legacy limit.
 #[cfg(windows)]
 fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    let wide =
-        |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
-    let (from, to) = (wide(from), wide(to));
+    let parent = to.parent().unwrap_or(Path::new(""));
+    let base = match parent.as_os_str().is_empty() {
+        true => fs::canonicalize(".")?,
+        false => fs::canonicalize(parent)?,
+    };
+    let wide = |path: &Path| -> io::Result<Vec<u16>> {
+        let rest = path
+            .strip_prefix(parent)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        Ok(base
+            .join(rest)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect())
+    };
+    let (from, to) = (wide(from)?, wide(to)?);
     let moved = unsafe {
         windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0)
     };
@@ -428,8 +436,18 @@ fn replace_portable(
     target: &Path,
     previous: &Path,
 ) -> Result<(), PortalArtifactError> {
-    claim_backup(previous)?;
     let backup = previous.join(BACKUP_DIR);
+    // After a failed rollback the backup holds the only usable old portal; keep it.
+    if owned_backup(previous)
+        && backup.join("index.html").is_file()
+        && !target.join("index.html").is_file()
+    {
+        return Err(PortalArtifactError::BackupKept {
+            backup,
+            target: target.to_path_buf(),
+        });
+    }
+    claim_backup(previous)?;
     if let Err(error) = fs::rename(target, &backup) {
         let _ = fs::remove_dir_all(previous);
         return Err(error.into());
@@ -700,6 +718,8 @@ pub enum PortalArtifactError {
         #[source]
         restore: io::Error,
     },
+    #[error("the previous portal is kept at {backup:?}; move the entry at {target:?} away first")]
+    BackupKept { backup: PathBuf, target: PathBuf },
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -716,7 +736,8 @@ mod tests {
         BACKUP_DIR, CHECKSUM_FILE, DownloadedChecksumFile, PortalArtifactError, TempInstallDir,
         claim_backup, existing_install, install_parent, install_verified_artifact,
         installed_status, lock_install, portal_dir, prepare_artifact_status, previous_install,
-        replace_portable, restore_backup, safe_archive_path, unpack_archive, verify_sha256,
+        rename_new, replace_portable, restore_backup, safe_archive_path, unpack_archive,
+        verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -725,12 +746,8 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tar::{Builder, EntryType, Header};
     use tempfile::tempdir;
-
-    /// Set when an installer finds the install lock held and starts waiting for it.
-    pub(super) static CONTENDED: AtomicBool = AtomicBool::new(false);
 
     fn config(portal_dir: &Path) -> PortalArtifactConfig {
         PortalArtifactConfig {
@@ -842,6 +859,22 @@ mod tests {
         write_portal(&installed, "old");
         assert!(existing_install(&installed).unwrap());
         assert!(!existing_install(&tempdir.path().join("missing")).unwrap());
+    }
+
+    #[test]
+    fn rename_allows_deep() {
+        let tempdir = tempdir().unwrap();
+        let parent = (0..4).fold(tempdir.path().to_path_buf(), |dir, _| {
+            dir.join("d".repeat(80))
+        });
+        let (from, to) = (parent.join("staged"), parent.join("portal"));
+        write_portal(&from, "new");
+        assert!(to.as_os_str().len() > 260);
+
+        rename_new(&from, &to).unwrap();
+
+        assert_eq!(fs::read_to_string(to.join("index.html")).unwrap(), "new");
+        assert!(!from.exists());
     }
 
     #[cfg(windows)]
@@ -972,8 +1005,24 @@ mod tests {
         assert_eq!(fs::read_dir(tempdir.path()).unwrap().count(), 2);
     }
 
-    // An update that starts while another one has moved the old portal away waits for it, so the
-    // first one's failed install still puts the old portal back.
+    // The install lock refuses a second handle on its file until the guard closes.
+    #[test]
+    fn lock_excludes_others() {
+        let tempdir = tempdir().unwrap();
+        let previous = previous_install(&tempdir.path().join("portal")).unwrap();
+        let locked = lock_install(&previous).unwrap();
+        let other = fs::File::open(previous.with_extension("lock")).unwrap();
+
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(locked);
+        other.try_lock().unwrap();
+    }
+
+    // An update that starts while another one has moved the old portal away still ends with the
+    // old portal recovered and the new one installed.
     #[test]
     fn overlapping_install_waits() {
         let tempdir = tempdir().unwrap();
@@ -993,13 +1042,6 @@ mod tests {
             };
             install_verified_artifact(&second_config, &archive, checksum, "now".to_string())
         });
-
-        // The second install has tried the lock and is waiting for it.
-        while !CONTENDED.load(Ordering::SeqCst) {
-            assert!(!second.is_finished());
-            std::thread::yield_now();
-        }
-        assert!(!second.is_finished());
 
         // The first install fails and restores its backup, as `replace_portable` does.
         fs::rename(&backup, &target).unwrap();
@@ -1068,6 +1110,19 @@ mod tests {
 
         let error = restore_backup(&previous, &target, std::io::Error::other("install"));
         assert!(matches!(error, PortalArtifactError::RollbackFailed { .. }));
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_to_string(previous.join(BACKUP_DIR).join("index.html")).unwrap(),
+            "old"
+        );
+
+        // The next portable install refuses to discard that backup while the occupant stays.
+        let staged = TempInstallDir::create(tempdir.path()).unwrap();
+        write_portal(staged.path(), "new");
+        assert!(matches!(
+            replace_portable(staged, &target, &previous),
+            Err(PortalArtifactError::BackupKept { .. })
+        ));
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         assert_eq!(
             fs::read_to_string(previous.join(BACKUP_DIR).join("index.html")).unwrap(),
