@@ -341,15 +341,8 @@ fn lock_install(previous: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .write(true)
         .open(previous.with_extension("lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(fs::TryLockError::WouldBlock) => {
-            #[cfg(test)]
-            tests::CONTENDED.store(true, std::sync::atomic::Ordering::SeqCst);
-            file.lock().map(|()| file)
-        }
-        Err(fs::TryLockError::Error(error)) => Err(error),
-    }
+    file.lock()?;
+    Ok(file)
 }
 
 /// Publishes the marked recovery directory `previous` whole with one rename of a staged copy, so
@@ -725,12 +718,8 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use tar::{Builder, EntryType, Header};
     use tempfile::tempdir;
-
-    /// Set when an installer finds the install lock held and starts waiting for it.
-    pub(super) static CONTENDED: AtomicBool = AtomicBool::new(false);
 
     fn config(portal_dir: &Path) -> PortalArtifactConfig {
         PortalArtifactConfig {
@@ -972,8 +961,24 @@ mod tests {
         assert_eq!(fs::read_dir(tempdir.path()).unwrap().count(), 2);
     }
 
-    // An update that starts while another one has moved the old portal away waits for it, so the
-    // first one's failed install still puts the old portal back.
+    // The install lock refuses a second handle on its file until the guard closes.
+    #[test]
+    fn lock_excludes_others() {
+        let tempdir = tempdir().unwrap();
+        let previous = previous_install(&tempdir.path().join("portal")).unwrap();
+        let locked = lock_install(&previous).unwrap();
+        let other = fs::File::open(previous.with_extension("lock")).unwrap();
+
+        assert!(matches!(
+            other.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(locked);
+        other.try_lock().unwrap();
+    }
+
+    // An update that starts while another one has moved the old portal away still ends with the
+    // old portal recovered and the new one installed.
     #[test]
     fn overlapping_install_waits() {
         let tempdir = tempdir().unwrap();
@@ -993,13 +998,6 @@ mod tests {
             };
             install_verified_artifact(&second_config, &archive, checksum, "now".to_string())
         });
-
-        // The second install has tried the lock and is waiting for it.
-        while !CONTENDED.load(Ordering::SeqCst) {
-            assert!(!second.is_finished());
-            std::thread::yield_now();
-        }
-        assert!(!second.is_finished());
 
         // The first install fails and restores its backup, as `replace_portable` does.
         fs::rename(&backup, &target).unwrap();
