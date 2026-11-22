@@ -287,17 +287,16 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
   progress.
 - `two_way` syncs both directions; `upload_only` never writes to disk; `download_only` never
   publishes: local edits and deletions stay local, and `propagate_deletes` is always false.
-- Local data always wins locally: a file is replaced automatically only while its fingerprint and
-  its blake3 still equal the recorded synced base. Anything else is preserved and reported, and
-  replacing or removing local bytes is an explicit action.
-- A file that changed before the pass planned its download keeps its name, and the incoming version
-  lands beside it as a conflicted copy, which the entry's `conflicted_copy` names.
-- A file that changes while its replacement runs is kept as well. On Linux and macOS it keeps its
-  name and the incoming version lands beside it as a conflicted copy. On Windows the incoming
-  version keeps the name and the local edit is the conflicted copy beside it. A replacement cut
-  short by a restart ends the same way as on Windows. `conflicted_copy` does not name these copies.
-- A conflicted copy whose descriptive name is too long for the file system gets a short name made
-  of a digest of the original name, the copy marker and the extension.
+- The pass plans an automatic replacement only when the local fingerprint and BLAKE3 digest
+  match the recorded synced base. A local edit detected while planning keeps its name.
+- If the pass plans a conflicted copy, the incoming version lands beside the local file.
+  The entry's `conflicted_copy` names only copies planned at this stage.
+- If the local file changes during replacement, Linux and macOS restore it at its name and keep
+  the displaced version beside it. On Windows the download keeps the name and the local edit
+  becomes the conflict copy. After an interrupted swap, the next download-capable pass publishes
+  any file left in recovery beside the version at the original name.
+- If a conflict name is too long, a digest of the original name replaces its stem.
+  The extension is kept when it fits.
 - A remote deletion never deletes a local file. A local deletion becomes a realm delete marker while
   `propagate_deletes` is set.
 

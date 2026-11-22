@@ -479,6 +479,12 @@ impl BlobHandle {
                     SourceConnectorKind::ArunaNative.to_string(),
                 ))
             }
+            StagingSourceEffect::PrepareFolder { root } => {
+                match crate::fs_source::check_root(&root, true).await {
+                    Ok(()) => StagingSourceEvent::CheckResult,
+                    Err(error) => source_error(error),
+                }
+            }
             StagingSourceEffect::Check { access } => {
                 self.handler.check_staging_source(access).await
             }

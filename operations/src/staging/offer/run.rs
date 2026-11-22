@@ -83,12 +83,14 @@ fn offer_key(bucket: &str) -> Key {
 pub(crate) fn check_root(root: &str) -> CheckRootOperation {
     CheckRootOperation {
         root: root.to_string(),
+        recover_kept: false,
     }
 }
 
 #[derive(Debug, PartialEq)]
 pub(crate) struct CheckRootOperation {
     root: String,
+    recover_kept: bool,
 }
 
 impl Operation for CheckRootOperation {
@@ -96,9 +98,16 @@ impl Operation for CheckRootOperation {
     type Error = OfferError;
 
     fn first(&mut self) -> Result<Next<()>, OfferError> {
-        let access = local_access(&self.root);
-        let check = StagingSourceEffect::Check { access };
-        Ok(Next::Call(source_call(check)))
+        let effect = if self.recover_kept {
+            StagingSourceEffect::PrepareFolder {
+                root: self.root.clone(),
+            }
+        } else {
+            StagingSourceEffect::Check {
+                access: local_access(&self.root),
+            }
+        };
+        Ok(Next::Call(source_call(effect)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, OfferError> {
@@ -115,6 +124,7 @@ impl Operation for CheckRootOperation {
 pub fn offer_directory(input: OfferDirectoryInput) -> OfferDirectoryOperation {
     OfferDirectoryOperation {
         input,
+        recover_kept: false,
         step: OfferStep::Check,
         entries: Vec::new(),
         observed: Vec::new(),
@@ -133,6 +143,7 @@ enum OfferStep {
 
 #[derive(Debug, PartialEq)]
 pub struct OfferDirectoryOperation {
+    pub(crate) recover_kept: bool,
     input: OfferDirectoryInput,
     step: OfferStep,
     entries: Vec<SourceEntry>,
@@ -215,7 +226,9 @@ impl Operation for OfferDirectoryOperation {
     type Error = OfferError;
 
     fn first(&mut self) -> OfferTurn {
-        Ok(Next::Call(IoCall::child(check_root(&self.input.root))))
+        let mut check = check_root(&self.input.root);
+        check.recover_kept = self.recover_kept;
+        Ok(Next::Call(IoCall::child(check)))
     }
 
     fn next(&mut self, result: IoResult) -> OfferTurn {

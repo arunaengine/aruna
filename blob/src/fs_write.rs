@@ -343,7 +343,12 @@ async fn jailed_ancestor(root: &Path, relative: &Path) -> Result<PathBuf, LocalF
             Ok(metadata) if metadata.is_dir() => anchor = next,
             Ok(_) => return Err(escaped),
             // The rest of the path does not exist yet, so the anchor is final.
-            Err(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(LocalFileEvent::Error {
+                    message: error.to_string(),
+                });
+            }
         }
     }
     tokio::fs::canonicalize(&anchor)
@@ -471,21 +476,18 @@ async fn prune_kept(kept: &Path, relative: &str) {
 
 /// Publishes what ended writes left in the kept directory as conflict copies
 /// beside their original paths. Kept ids of writes still running stay.
-pub(crate) async fn recover_kept(root: &str) -> Result<(), String> {
-    let Ok(resolved) = canonical_root(root).await else {
-        return Ok(());
-    };
-    let Ok(kept) = jailed_ancestor(&resolved, Path::new(KEPT_DIR)).await else {
-        return Ok(());
-    };
-    if kept != resolved.join(KEPT_DIR) {
+pub(crate) async fn recover_kept(root: &str, resolved: &Path) -> Result<(), String> {
+    let directory = resolved.join(KEPT_DIR);
+    let kept = jailed_ancestor(resolved, Path::new(KEPT_DIR))
+        .await
+        .map_err(|event| format!("cannot inspect {}: {event:?}", directory.display()))?;
+    if kept != directory {
         return Ok(());
     }
-    let Ok(mut reader) = tokio::fs::read_dir(kept).await else {
-        return Ok(());
-    };
+    let scan_error = |error| format!("cannot read {}: {error}", kept.display());
+    let mut reader = tokio::fs::read_dir(&kept).await.map_err(scan_error)?;
     let mut recovered = Ok(());
-    while let Ok(Some(entry)) = reader.next_entry().await {
+    while let Some(entry) = reader.next_entry().await.map_err(scan_error)? {
         let ended = (entry.file_name().to_str())
             .and_then(|name| Ulid::from_string(name).ok())
             .is_some_and(|id| !writing().contains(&id));
@@ -504,8 +506,11 @@ async fn publish_kept(root: &str, id: &Path) -> Result<(), String> {
     let mut emptied = Vec::new();
     let mut published = Ok(());
     while let Some((path, relative)) = pending.pop() {
-        let Ok(entry) = tokio::fs::symlink_metadata(&path).await else {
-            continue;
+        let scan_error = |error| format!("cannot inspect {}: {error}", path.display());
+        let entry = match tokio::fs::symlink_metadata(&path).await {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(scan_error(error)),
         };
         if entry.is_file() {
             let rescued = match jailed_target(root, &relative).await {
@@ -519,15 +524,14 @@ async fn publish_kept(root: &str, id: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
-        } else if entry.is_dir()
-            && let Ok(mut reader) = tokio::fs::read_dir(&path).await
-        {
-            emptied.push(path);
-            while let Ok(Some(child)) = reader.next_entry().await {
+        } else if entry.is_dir() {
+            let mut reader = tokio::fs::read_dir(&path).await.map_err(scan_error)?;
+            while let Some(child) = reader.next_entry().await.map_err(scan_error)? {
                 if let Some(name) = child.file_name().to_str() {
                     pending.push((child.path(), join_path(&relative, name)));
                 }
             }
+            emptied.push(path);
         }
     }
     for directory in emptied.iter().rev() {
@@ -1144,9 +1148,7 @@ mod tests {
                 reason: LocalFileRefusal::Drifted
             }
         );
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_eq!(
             listed_bytes(root.path()).await,
             vec![b"newer".to_vec(), b"owner edit".to_vec()]
@@ -1227,9 +1229,7 @@ mod tests {
             PlaceError::Refused(LocalFileRefusal::Drifted)
         ));
         assert_rolled_back(root.path(), b"second save").await;
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_rolled_back(root.path(), b"second save").await;
     }
 
@@ -1349,9 +1349,7 @@ mod tests {
             refusal,
             PlaceError::Refused(LocalFileRefusal::Drifted)
         ));
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second save");
         assert_eq!(tokio::fs::read(&taken).await.unwrap(), b"other copy");
         assert_eq!(
@@ -1429,9 +1427,7 @@ mod tests {
         let running = kept_file(&path, "other.txt").await.unwrap();
         tokio::fs::write(&running.path, b"in flight").await.unwrap();
 
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         let paths = listed_paths(root.path()).await;
         assert_eq!(paths.len(), 2, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));
@@ -1467,14 +1463,15 @@ mod tests {
         assert!(matches!(refusal, PlaceError::Kept(_)));
         tokio::fs::remove_file(&docs).await.unwrap();
 
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_eq!(tokio::fs::read(&hidden).await.unwrap(), b"owner edit");
         drop(kept);
         crate::fs_source::check_local(&access(root.path(), ""))
             .await
             .unwrap();
+        assert_eq!(tokio::fs::read(&hidden).await.unwrap(), b"owner edit");
+        assert_eq!(listed_paths(root.path()).await, vec!["moved/note.txt"]);
+        crate::fs_source::check_root(&path, true).await.unwrap();
         let paths = listed_paths(root.path()).await;
         assert_eq!(paths.len(), 2, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));
@@ -1497,7 +1494,7 @@ mod tests {
         let docs = root.path().join("docs");
         tokio::fs::write(&docs, b"obstacle").await.unwrap();
 
-        let checked = crate::fs_source::check_local(&access(root.path(), "")).await;
+        let checked = crate::fs_source::check_root(&path, true).await;
         let Err(StagingSourceError::CheckError(message)) = checked else {
             panic!("the blocked recovery must fail the check: {checked:?}");
         };
@@ -1505,9 +1502,7 @@ mod tests {
         assert!(message.contains(&kept.display().to_string()), "{message}");
         assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
         tokio::fs::remove_file(&docs).await.unwrap();
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         let paths = listed_paths(root.path()).await;
         assert_eq!(paths.len(), 1, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));
@@ -1515,6 +1510,24 @@ mod tests {
         assert_eq!(copy.unwrap(), b"owner edit");
         let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
         assert_eq!(ids.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reports_blocked_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_str().unwrap();
+        crate::fs_source::check_root(path, true).await.unwrap();
+        let kept = tokio::fs::canonicalize(root.path())
+            .await
+            .unwrap()
+            .join(KEPT_DIR);
+        tokio::fs::create_dir(kept.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&kept, b"obstacle").await.unwrap();
+        let error = crate::fs_source::check_root(path, true).await.unwrap_err();
+        assert!(error.to_string().contains(&kept.display().to_string()));
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"obstacle");
+        tokio::fs::remove_file(&kept).await.unwrap();
+        crate::fs_source::check_root(path, true).await.unwrap();
     }
 
     #[tokio::test]
