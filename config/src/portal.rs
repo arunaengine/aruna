@@ -421,8 +421,18 @@ fn replace_portable(
     target: &Path,
     previous: &Path,
 ) -> Result<(), PortalArtifactError> {
-    claim_backup(previous)?;
     let backup = previous.join(BACKUP_DIR);
+    // After a failed rollback the backup holds the only usable old portal; keep it.
+    if owned_backup(previous)
+        && backup.join("index.html").is_file()
+        && !target.join("index.html").is_file()
+    {
+        return Err(PortalArtifactError::BackupKept {
+            backup,
+            target: target.to_path_buf(),
+        });
+    }
+    claim_backup(previous)?;
     if let Err(error) = fs::rename(target, &backup) {
         let _ = fs::remove_dir_all(previous);
         return Err(error.into());
@@ -693,6 +703,8 @@ pub enum PortalArtifactError {
         #[source]
         restore: io::Error,
     },
+    #[error("the previous portal is kept at {backup:?}; move the entry at {target:?} away first")]
+    BackupKept { backup: PathBuf, target: PathBuf },
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -1066,6 +1078,19 @@ mod tests {
 
         let error = restore_backup(&previous, &target, std::io::Error::other("install"));
         assert!(matches!(error, PortalArtifactError::RollbackFailed { .. }));
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_to_string(previous.join(BACKUP_DIR).join("index.html")).unwrap(),
+            "old"
+        );
+
+        // The next portable install refuses to discard that backup while the occupant stays.
+        let staged = TempInstallDir::create(tempdir.path()).unwrap();
+        write_portal(staged.path(), "new");
+        assert!(matches!(
+            replace_portable(staged, &target, &previous),
+            Err(PortalArtifactError::BackupKept { .. })
+        ));
         assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
         assert_eq!(
             fs::read_to_string(previous.join(BACKUP_DIR).join("index.html")).unwrap(),
