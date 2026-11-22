@@ -136,18 +136,17 @@ async fn apply_change(
         if plan.holder != Some(admission) {
             return event;
         }
-        if written.is_err() {
-            return task_handle
-                .arm_planned(key.clone(), plan, admission)
+        let (event, holder) = if written.is_err() {
+            task_handle.arm_planned(key.clone(), plan, admission).await
+        } else {
+            task_handle
+                .claim_shorten(key.clone(), plan, admission)
                 .await
-                .0;
-        }
-        let (event, holder) = task_handle
-            .claim_shorten(key.clone(), plan, admission)
-            .await;
+        };
         // The wake that held the key fired since the plan and serves this change, so its run
-        // owns the row and deletes it.
-        if let Some(holder) = holder.filter(|holder| *holder != admission)
+        // owns the row, which an unanswered write may have stored too, and deletes it.
+        if matches!(written, Ok(()) | Err(StorageError::Timeout))
+            && let Some(holder) = holder.filter(|holder| *holder != admission)
             && let Err(message) = write_owned(storage, key, Duration::ZERO, holder).await
         {
             warn!(key = ?key, %message, "Timer row kept for the next restart");
