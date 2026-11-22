@@ -10,8 +10,9 @@ use aruna_core::structs::execution::offered_directory::{FileStat, weak_fingerpri
 use aruna_core::structs::synced_folder::{SYNC_TRASH_DIR, WriteGuard};
 use bytes::Bytes;
 use futures::StreamExt;
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
@@ -64,8 +65,8 @@ pub(crate) async fn write_guarded(
         // adapter re-verifies under the swap is the strong hash.
         WriteGuard::MatchesBase { blake3, .. } => match kept_file(root, relative).await {
             Ok(kept) => {
-                let placed = exchange_guarded(&spooled, &kept, &target, blake3).await;
-                prune_kept(&kept, relative).await;
+                let placed = exchange_guarded(&spooled, &kept.path, &target, blake3).await;
+                prune_kept(&kept.path, relative).await;
                 placed
             }
             Err(message) => Err(PlaceError::Failed(message)),
@@ -420,19 +421,41 @@ async fn reserved_file(root: &str, directory: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// When this process first reserved or recovered a kept path, in Unix milliseconds.
-/// A kept id older than this belongs to a write that can no longer finish.
-static STARTED: LazyLock<u64> = LazyLock::new(aruna_clock::unix_timestamp_millis);
+/// Kept ids whose write in this process has not yet disposed of or rescued them.
+static WRITING: Mutex<BTreeSet<Ulid>> = Mutex::new(BTreeSet::new());
+
+fn writing() -> MutexGuard<'static, BTreeSet<Ulid>> {
+    WRITING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One reserved kept path. Its id stays in `WRITING` until the write that owns
+/// it ends, also when that write is dropped.
+struct KeptSlot {
+    id: Ulid,
+    path: PathBuf,
+}
+
+impl Drop for KeptSlot {
+    fn drop(&mut self) {
+        writing().remove(&self.id);
+    }
+}
 
 /// A fresh kept path that mirrors `relative` under its own id, so a restart can
 /// still tell where the displaced file came from.
-async fn kept_file(root: &str, relative: &str) -> Result<PathBuf, String> {
-    LazyLock::force(&STARTED);
-    let reserved = format!("{KEPT_DIR}/{}/{relative}", Ulid::generate());
+async fn kept_file(root: &str, relative: &str) -> Result<KeptSlot, String> {
+    let mut slot = KeptSlot {
+        id: Ulid::generate(),
+        path: PathBuf::new(),
+    };
+    // Listed before the id directory exists, so recovery never sees it unowned.
+    writing().insert(slot.id);
+    let reserved = format!("{KEPT_DIR}/{}/{relative}", slot.id);
     let (_, path) = jailed_target(root, &reserved)
         .await
         .map_err(|event| format!("reserved path refused: {event:?}"))?;
-    Ok(path)
+    slot.path = path;
+    Ok(slot)
 }
 
 /// Removes the emptied directories of one kept path, up to and including its id.
@@ -446,43 +469,55 @@ async fn prune_kept(kept: &Path, relative: &str) {
     }
 }
 
-/// Publishes what writes of an earlier process left in the kept directory as
-/// conflict copies beside their original paths. Kept ids of this process stay.
-pub(crate) async fn recover_kept(root: &str) {
+/// Publishes what ended writes left in the kept directory as conflict copies
+/// beside their original paths. Kept ids of writes still running stay.
+pub(crate) async fn recover_kept(root: &str) -> Result<(), String> {
     let Ok(resolved) = canonical_root(root).await else {
-        return;
+        return Ok(());
     };
     let Ok(kept) = jailed_ancestor(&resolved, Path::new(KEPT_DIR)).await else {
-        return;
+        return Ok(());
     };
     if kept != resolved.join(KEPT_DIR) {
-        return;
+        return Ok(());
     }
     let Ok(mut reader) = tokio::fs::read_dir(kept).await else {
-        return;
+        return Ok(());
     };
+    let mut recovered = Ok(());
     while let Ok(Some(entry)) = reader.next_entry().await {
-        let earlier = (entry.file_name().to_str())
+        let ended = (entry.file_name().to_str())
             .and_then(|name| Ulid::from_string(name).ok())
-            .is_some_and(|id| id.timestamp_ms() < *STARTED);
-        if earlier {
-            publish_kept(root, &entry.path()).await;
+            .is_some_and(|id| !writing().contains(&id));
+        if ended {
+            recovered = recovered.and(publish_kept(root, &entry.path()).await);
         }
     }
+    recovered
 }
 
 /// Moves each file under one kept id to a free conflict copy name beside the path
 /// it mirrors, never following a link, then removes the emptied directories.
-async fn publish_kept(root: &str, id: &Path) {
+/// A file that cannot be published stays and is named in the error.
+async fn publish_kept(root: &str, id: &Path) -> Result<(), String> {
     let mut pending = vec![(id.to_path_buf(), String::new())];
     let mut emptied = Vec::new();
+    let mut published = Ok(());
     while let Some((path, relative)) = pending.pop() {
         let Ok(entry) = tokio::fs::symlink_metadata(&path).await else {
             continue;
         };
         if entry.is_file() {
-            if let Ok((_, target)) = jailed_target(root, &relative).await {
-                let _ = rescue_displaced(&path, &target).await;
+            let rescued = match jailed_target(root, &relative).await {
+                Ok((_, target)) => rescue_displaced(&path, &target).await.is_ok(),
+                Err(_) => false,
+            };
+            if !rescued && published.is_ok() {
+                published = Err(format!(
+                    "the displaced local file for {relative} could not be published \
+                     and stays at {}",
+                    path.display()
+                ));
             }
         } else if entry.is_dir()
             && let Ok(mut reader) = tokio::fs::read_dir(&path).await
@@ -498,6 +533,7 @@ async fn publish_kept(root: &str, id: &Path) {
     for directory in emptied.iter().rev() {
         let _ = tokio::fs::remove_dir(directory).await;
     }
+    published
 }
 
 async fn write_temp(
@@ -1391,7 +1427,7 @@ mod tests {
         let (_, kept) = jailed_target(&path, &earlier).await.unwrap();
         assert!(swap_in(&spool, &kept, &target).await.is_ok());
         let running = kept_file(&path, "other.txt").await.unwrap();
-        tokio::fs::write(&running, b"in flight").await.unwrap();
+        tokio::fs::write(&running.path, b"in flight").await.unwrap();
 
         crate::fs_source::check_local(&access(root.path(), ""))
             .await
@@ -1403,9 +1439,82 @@ mod tests {
         let copy = tokio::fs::read(root.path().join(&paths[0])).await;
         assert_eq!(copy.unwrap(), b"owner edit");
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"incoming");
-        assert_eq!(tokio::fs::read(&running).await.unwrap(), b"in flight");
+        assert_eq!(tokio::fs::read(&running.path).await.unwrap(), b"in flight");
         let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
         assert_eq!(ids.count(), 1, "only the write in flight keeps its id");
+    }
+
+    // A write of this process whose rescue failed has ended: a later pass publishes
+    // its kept file, while the kept file of a write still running stays.
+    #[tokio::test]
+    async fn recovers_ended_write() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let docs = root.path().join("docs");
+        tokio::fs::create_dir(&docs).await.unwrap();
+        let target = docs.join("note.txt");
+        tokio::fs::write(&target, b"owner edit").await.unwrap();
+        let spool = reserved_file(&path, SPOOL_DIR).await.unwrap();
+        tokio::fs::write(&spool, b"incoming").await.unwrap();
+        let kept = kept_file(&path, "docs/note.txt").await.unwrap();
+        let hidden = kept.path.clone();
+        assert!(swap_in(&spool, &hidden, &target).await.is_ok());
+        tokio::fs::rename(&docs, root.path().join("moved"))
+            .await
+            .unwrap();
+        tokio::fs::write(&docs, b"obstacle").await.unwrap();
+        let refusal = keep_displaced(&hidden, &target).await;
+        assert!(matches!(refusal, PlaceError::Kept(_)));
+        tokio::fs::remove_file(&docs).await.unwrap();
+
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&hidden).await.unwrap(), b"owner edit");
+        drop(kept);
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        let paths = listed_paths(root.path()).await;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].starts_with("docs/note (conflicted copy "));
+        assert_eq!(paths[1], "moved/note.txt");
+        let copy = tokio::fs::read(root.path().join(&paths[0])).await;
+        assert_eq!(copy.unwrap(), b"owner edit");
+        let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
+        assert_eq!(ids.count(), 0);
+    }
+
+    // A kept file whose parent is now a file fails the check with both paths
+    // named, and the pass after the obstacle is gone publishes it.
+    #[tokio::test]
+    async fn reports_blocked_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let earlier = format!("{KEPT_DIR}/{}/docs/note.txt", Ulid::from_parts(1, 0));
+        let (_, kept) = jailed_target(&path, &earlier).await.unwrap();
+        tokio::fs::write(&kept, b"owner edit").await.unwrap();
+        let docs = root.path().join("docs");
+        tokio::fs::write(&docs, b"obstacle").await.unwrap();
+
+        let checked = crate::fs_source::check_local(&access(root.path(), "")).await;
+        let Err(StagingSourceError::CheckError(message)) = checked else {
+            panic!("the blocked recovery must fail the check: {checked:?}");
+        };
+        assert!(message.contains("docs/note.txt"), "{message}");
+        assert!(message.contains(&kept.display().to_string()), "{message}");
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
+        tokio::fs::remove_file(&docs).await.unwrap();
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        let paths = listed_paths(root.path()).await;
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].starts_with("docs/note (conflicted copy "));
+        let copy = tokio::fs::read(root.path().join(&paths[0])).await;
+        assert_eq!(copy.unwrap(), b"owner edit");
+        let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
+        assert_eq!(ids.count(), 0);
     }
 
     #[tokio::test]
