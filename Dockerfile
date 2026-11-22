@@ -15,21 +15,11 @@ ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN apt-get update \
     && apt-get install -y --no-install-recommends clang cmake mold git gpg gpg-agent python3 python3-venv \
     && rm -rf /var/lib/apt/lists/*
-# Stage the website build in .portal-embed, as the image helper does.
-# An absent staging directory produces a headless image; PORTAL_EMBED_DIR can override it.
-ARG PORTAL_EMBED_DIR=.portal-embed
-COPY . .
+# Install Python ARC dependencies and copy host runtime tools before `COPY . .`
+# so Rust source edits keep these layers cached.
+COPY blob/arc-requirements.txt blob/arc-requirements.txt
 RUN python3 -m venv /opt/arctrl \
     && /opt/arctrl/bin/pip install --no-cache-dir -r blob/arc-requirements.txt
-# One build for both binaries: separate builds unify features differently and rebuild shared crates.
-# CI passes binaries it already built in .prebuilt/, so the image build skips the compile.
-RUN if [ -x .prebuilt/aruna ] && [ -x .prebuilt/aruna-doctor ]; then \
-        mkdir -p target/release && cp .prebuilt/aruna .prebuilt/aruna-doctor target/release/; \
-    else \
-        cargo build --release --locked -p aruna -p aruna-doctor; \
-    fi
-# The runtime image has no shell, so copy the staged portal in the builder.
-RUN mkdir -p /portal ${PORTAL_EMBED_DIR} && cp -r ${PORTAL_EMBED_DIR}/. /portal/
 RUN mkdir -p /git-runtime/usr/bin /git-runtime/usr/lib/git-core \
     && cp /usr/bin/git /usr/bin/gpg /usr/bin/gpg-agent /usr/bin/gpgconf /git-runtime/usr/bin/ \
     && cp -L /usr/bin/python3 /git-runtime/usr/bin/python3 \
@@ -44,6 +34,19 @@ RUN mkdir -p /git-runtime/usr/bin /git-runtime/usr/lib/git-core \
            dir="$(realpath "$(dirname "$lib")")" \
            && mkdir -p "/git-runtime$dir" && cp -L "$lib" "/git-runtime$dir/"; \
          done
+# Stage the website build in .portal-embed, as the image helper does.
+# An absent staging directory produces a headless image; PORTAL_EMBED_DIR can override it.
+ARG PORTAL_EMBED_DIR=.portal-embed
+COPY . .
+# One build for both binaries: separate builds unify features differently and rebuild shared crates.
+# CI passes binaries it already built in .prebuilt/, so the image build skips the compile.
+RUN if [ -x .prebuilt/aruna ] && [ -x .prebuilt/aruna-doctor ]; then \
+        mkdir -p target/release && cp .prebuilt/aruna .prebuilt/aruna-doctor target/release/; \
+    else \
+        cargo build --release --locked -p aruna -p aruna-doctor; \
+    fi
+# The runtime image has no shell, so copy the staged portal in the builder.
+RUN mkdir -p /portal ${PORTAL_EMBED_DIR} && cp -r ${PORTAL_EMBED_DIR}/. /portal/
 
 FROM gcr.io/distroless/cc-debian13@sha256:ed7c407fd64eb0af9dddb9456b94cee188a40a7f53cf38c9836e1e9ae14fca02
 WORKDIR /run

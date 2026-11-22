@@ -103,9 +103,13 @@ jobs:
           --profile ci --partition hash:${{ matrix.shard }}/4
 
       # The node's Docker cases are ignored by default; this runner has a daemon.
+      # Reuse the extracted archive metadata from the shard run above.
       - name: Run the node Docker cases
         run: >-
-          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          cargo-nextest nextest run
+          --cargo-metadata target/nextest/cargo-metadata.json
+          --binaries-metadata target/nextest/binaries-metadata.json
+          --target-dir-remap target --workspace-remap .
           --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
           -E 'package(aruna) & binary(integration) & test(/^(compute_execution|mcp_artifacts)::/)'
 
@@ -162,15 +166,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install cargo-nextest
+      - name: Install cargo-nextest and uv
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Install uv
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: uv@0.11.28
+          tool: cargo-nextest@0.9.140,uv@0.11.28
 
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -228,15 +227,10 @@ jobs:
       - name: Add the WASM target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Install cargo-nextest
+      - name: Install cargo-nextest and uv
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Install uv
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: uv@0.11.28
+          tool: cargo-nextest@0.9.140,uv@0.11.28
 
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -255,7 +249,8 @@ jobs:
       - name: Run the examples in the plugin runtime
         run: >-
           cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored all --no-tests fail -E "package(aruna-plugins) & (binary(examples) | binary(elabftw_python))"
+          --profile ci --run-ignored all --no-tests fail
+          -E "package(aruna-plugins) & binary(integration) & test(/^(examples|elabftw_python)::/)"
 
   restart-stress:
     name: Restart scale stress
@@ -299,6 +294,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # Start MinIO detached before downloading the archive so container boot overlaps setup.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
@@ -306,15 +302,6 @@ jobs:
             -e MINIO_ROOT_PASSWORD=aruna-test-secret \
             cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
             server /data
-          for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "MinIO did not become ready" >&2
-          docker logs minio >&2 || true
-          exit 1
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -325,6 +312,18 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: nextest-archive
+
+      - name: Wait for MinIO
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready" >&2
+          docker logs minio >&2 || true
+          exit 1
 
       - name: Run the s3 backend cases
         run: >-
@@ -387,6 +386,7 @@ jobs:
       matrix:
         include:
           - name: default and compute
+            cache-key: default-compute
             run: |
               cargo check --workspace --locked
               cargo check -p aruna-compute --all-targets --no-default-features --locked
@@ -395,12 +395,16 @@ jobs:
               done
           # The node compiles its own configuration under each feature, so it is checked apart.
           - name: node
+            cache-key: node
             run: cargo check -p aruna --all-targets --no-default-features --locked
           - name: node docker
+            cache-key: node-docker
             run: cargo check -p aruna --all-targets --no-default-features --features docker --locked
           - name: node apptainer
+            cache-key: node-apptainer
             run: cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
           - name: node kubernetes
+            cache-key: node-kubernetes
             run: cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
 
     steps:
@@ -410,7 +414,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: feature-checks
+          # Separate cache per leg so parallel runs on main do not overwrite each other's crates.
+          shared-key: feature-checks-${{ matrix.cache-key }}
 
       - name: Check the feature selection
         run: |
@@ -483,12 +488,12 @@ jobs:
         run: python3 scripts/dev/check_layers.py
 
       # The official action builds a container from Docker Hub, whose rate
-      # limited pulls time out on hosted runners; install the binary instead.
-      - name: Install cargo-deny
+      # limited pulls time out on hosted runners; install the binaries instead.
+      - name: Install cargo-deny and just
         if: ${{ !cancelled() }}
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny@0.20.2,just@1.58.0
 
       - name: Run cargo-deny
         if: ${{ !cancelled() }}
@@ -500,8 +505,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/*.sh scripts/tests/*.sh
-          shellcheck --shell=sh scripts/compute-helper/build.sh scripts/session-deno/build.sh \
-            scripts/session-python/build.sh scripts/session-helper/session-start
+          shellcheck --shell=sh scripts/compute-helper/build.sh scripts/dev/rustc_coverage.sh \
+            scripts/session-deno/build.sh scripts/session-python/build.sh \
+            scripts/session-helper/session-start
 
       - name: Run Python helper tests
         if: ${{ !cancelled() }}
@@ -533,12 +539,6 @@ jobs:
           }
           promtool check rules /rules/alerts.yml
           promtool test rules /rules/alerts.test.yml
-
-      - name: Install just
-        if: ${{ !cancelled() }}
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: just@1.58.0
 
       - name: Run recipe contract tests
         if: ${{ !cancelled() }}
@@ -575,6 +575,10 @@ jobs:
     runs-on: ubuntu-latest
     # Hang cap for one release build, not a performance budget.
     timeout-minutes: 60
+    env:
+      # Startup smoke checks do not need -O3; opt-level 1 cuts build time
+      # while keeping the release profile and target/release/ layout intact.
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: 1
 
     steps:
       - name: Check out repository
@@ -583,7 +587,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: release
+          shared-key: release-smoke
 
       - name: Build the deployment binaries
         run: |
@@ -597,6 +601,7 @@ jobs:
           name: release-binaries
           path: release-binaries.tar
           if-no-files-found: error
+          compression-level: 1
           retention-days: 1
 
   cluster-start:

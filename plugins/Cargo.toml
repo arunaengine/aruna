@@ -9,6 +9,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
+autotests = false
 
 [features]
 default = ["build", "runtime"]
@@ -62,3 +64,7 @@ wit-parser = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"

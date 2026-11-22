@@ -22,8 +22,6 @@ env:
   # Source-based coverage reads __llvm_covmap from the binary, so DWARF is dead weight.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the mold linker is named again.
-  RUSTFLAGS: -Cinstrument-coverage -Clink-arg=-fuse-ld=mold
 
 jobs:
   # Compiles every instrumented test binary once; the shards below run parts of it.
@@ -46,7 +44,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: coverage
+          shared-key: coverage-ws
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -60,10 +58,10 @@ jobs:
       # The measured target set matches the main tests job, so a coverage move
       # cannot come from a different target selection.
       - name: Build the instrumented test archive
-        # With four build jobs and 8 GB swap the runner lost contact after 66 minutes, for an
-        # unknown cause. Two jobs lower the memory peak.
+        # Instrument workspace crates only so third-party crates skip coverage
+        # codegen, shrinking compile time, archive size, and grcov memory.
         env:
-          CARGO_BUILD_JOBS: 2
+          RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/scripts/dev/rustc_coverage.sh
         run: >-
           cargo nextest archive --workspace --all-targets --all-features --locked
           --archive-file coverage-archive.tar.zst
@@ -120,27 +118,17 @@ jobs:
         # rust-toolchain.toml supplies the channel, so the tools match the compiler.
         run: rustup component add llvm-tools-preview
 
-      - name: Install grcov
+      - name: Install coverage tools
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: grcov@0.10.7
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Install uv
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: uv@0.11.28
+          tool: grcov@0.10.7,cargo-nextest@0.9.140,uv@0.11.28
 
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: coverage-archive
 
-      # S3 multipart code only runs against a real S3 endpoint, so it is measured here too.
+      # Start MinIO detached before the main suite so it boots while tests run.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
@@ -148,48 +136,73 @@ jobs:
             -e MINIO_ROOT_PASSWORD=aruna-test-secret \
             cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
             server /data
-          for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "MinIO did not become ready" >&2
-          docker logs minio >&2 || true
-          exit 1
 
       # Shows whether the coverage export stays within memory at four threads.
       - name: Sample memory use
         run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
 
+      # Extract once; the three follow-up runs reuse the extracted metadata.
       - name: Run instrumented tests
         run: >-
           cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --partition hash:${{ matrix.shard }}/4
 
       # The same native Git run as the tests workflow, split across the shards too;
-      # with two such tests, some shards get none.
+      # with two such tests, some shards get none and skip Python setup.
       - name: Run instrumented native Git tests
-        run: >-
-          uv run --no-project --python 3.13
-          --with-requirements scripts/arc-native/requirements.txt
-          sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
-          exec cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
-          -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
+        run: |
+          set -euo pipefail
+          if [ -z "$(cargo-nextest nextest list --no-pager \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --target-dir-remap target --workspace-remap . \
+            --profile ci --run-ignored only --partition hash:${{ matrix.shard }}/4 \
+            -E 'package(aruna) & binary(integration) & test(/^git_native::/)')" ]; then
+            echo "no native Git tests in shard ${{ matrix.shard }}/4"
+            exit 0
+          fi
+          uv run --no-project --python 3.13 \
+            --with-requirements scripts/arc-native/requirements.txt \
+            sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
+            exec cargo-nextest nextest run \
+              --cargo-metadata target/nextest/cargo-metadata.json \
+              --binaries-metadata target/nextest/binaries-metadata.json \
+              --target-dir-remap target --workspace-remap . \
+              --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4 \
+              -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
 
       # The S3 backend cases of the tests workflow, split across the shards like the Git tests.
       - name: Run instrumented S3 backend tests
-        run: >-
-          cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
-          -E '(package(aruna-blob) & kind(lib) & test(/^blob::tests::s3_/))
-          | (package(aruna) & binary(operations) & test(/^multipart::s3_/))'
+        run: |
+          set -euo pipefail
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "MinIO did not become ready" >&2
+            docker logs minio >&2 || true
+            exit 1
+          fi
+          cargo-nextest nextest run \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --target-dir-remap target --workspace-remap . \
+            --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4 \
+            -E '(package(aruna-blob) & kind(lib) & test(/^blob::tests::s3_/))
+            | (package(aruna) & binary(operations) & test(/^multipart::s3_/))'
 
       # The node's Docker cases of the tests workflow, split across the shards like the Git tests.
       - name: Run instrumented node Docker tests
         run: >-
-          cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          cargo-nextest nextest run
+          --cargo-metadata target/nextest/cargo-metadata.json
+          --binaries-metadata target/nextest/binaries-metadata.json
+          --target-dir-remap target --workspace-remap .
           --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
           -E 'package(aruna) & binary(integration) & test(/^(compute_execution|mcp_artifacts)::/)'
 

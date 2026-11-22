@@ -153,4 +153,4 @@ uv run --no-project --python 3.12 python -m unittest discover -s tests -t . -p '
 ```
 
 `plugins/tests/elabftw_python.rs` builds the plugin and runs it in the plugin runtime; it is
-ignored by default and runs with `cargo test -p aruna-plugins --test elabftw_python -- --ignored`.
+ignored by default and runs with `cargo test -p aruna-plugins --test integration -- --ignored elabftw_python::`.
