@@ -105,22 +105,29 @@ enum Write {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
-    Generation,
     Read,
     Write,
 }
 
-type Turn = Result<Next<bool>, InfoWriteError>;
+/// The stored row after a write, and whether this write changed it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InfoWritten {
+    pub(crate) written: bool,
+    pub(crate) document: Option<NodeInfoDocument>,
+}
+
+type Turn = Result<Next<InfoWritten>, InfoWriteError>;
 
 /// Writes the info row and its owed revision marker in one transaction. A revision reads the
-/// membership generation, the row and the operator drain inside it, so no publisher carries a
-/// stale drain forward; its lost conflict is retried by the runner. True when a row was written.
+/// membership generation, the row and the operator drain in one read inside it, so no publisher
+/// carries a stale drain forward; its lost conflict is retried by the runner.
 #[derive(Debug, PartialEq)]
 pub(crate) struct InfoWriteOperation {
     realm_id: RealmId,
     write: Write,
     now_ms: u64,
     generation: u64,
+    written: Option<InfoWritten>,
     phase: Phase,
 }
 
@@ -144,7 +151,8 @@ impl InfoWriteOperation {
             write,
             now_ms,
             generation: 0,
-            phase: Phase::Generation,
+            written: None,
+            phase: Phase::Read,
         }
     }
 
@@ -168,13 +176,20 @@ impl InfoWriteOperation {
         ])
     }
 
-    /// The info row and the operator drain of the revised node.
-    fn row_reads(&self) -> Vec<(KeySpace, Key)> {
+    /// The realm config revision, the info row and the operator drain of the revised node.
+    fn reads(&self) -> Vec<(KeySpace, Key)> {
         let node_id = match &self.write {
             Write::Seed(document) => document.node_id,
             Write::Revise { node_id, .. } => *node_id,
         };
+        let target = DocumentTarget::RealmConfig {
+            realm_id: self.realm_id,
+        };
         vec![
+            (
+                SYNC_REVISION_KEYSPACE.to_string(),
+                sync_revision_key(&target),
+            ),
             (
                 NODE_INFO_KEYSPACE.to_string(),
                 Key::from(node_info_key(node_id)),
@@ -186,24 +201,31 @@ impl InfoWriteOperation {
         ]
     }
 
-    /// The revised row, or `None` when there is no row or nothing durable changed.
+    /// The revised row, or the stored one unwritten when there is no row or nothing durable
+    /// changed.
     fn revised(
         &self,
         row: Option<Value>,
         drain: Option<Value>,
-    ) -> Result<Option<NodeInfoDocument>, InfoWriteError> {
+    ) -> Result<InfoWritten, InfoWriteError> {
         let (Write::Revise { change, .. }, Some(row)) = (&self.write, row) else {
-            return Ok(None);
+            return Ok(InfoWritten {
+                written: false,
+                document: None,
+            });
         };
-        let mut document = postcard::from_bytes::<NodeInfoDocument>(row.as_ref())
+        let stored = postcard::from_bytes::<NodeInfoDocument>(row.as_ref())
             .map_err(|error| InfoWriteError::Document(error.to_string()))?;
-        let stored = durable_view(&document);
+        let mut document = stored.clone();
         change.apply(&mut document);
         // The published drain is exactly the operator's durable flag or a departure.
         document.compute_draining = drain.is_some() || document.leaving;
         document.epoch.membership_generation = self.generation;
-        if durable_view(&document) == stored {
-            return Ok(None);
+        if durable_view(&document) == durable_view(&stored) {
+            return Ok(InfoWritten {
+                written: false,
+                document: Some(stored),
+            });
         }
         document.epoch = AdvertisementEpoch {
             membership_generation: self.generation,
@@ -213,7 +235,10 @@ impl InfoWriteOperation {
         document.demand.epoch = document.epoch;
         document.reservation.epoch = document.epoch;
         document.updated_at_ms = self.now_ms;
-        Ok(Some(document))
+        Ok(InfoWritten {
+            written: true,
+            document: Some(document),
+        })
     }
 }
 
@@ -248,42 +273,42 @@ fn durable_view(document: &NodeInfoDocument) -> NodeInfoDocument {
 }
 
 impl Operation for InfoWriteOperation {
-    type Output = bool;
+    type Output = InfoWritten;
     type Error = InfoWriteError;
 
     fn first(&mut self) -> Turn {
         if let Write::Seed(document) = &self.write {
             let writes = Self::writes(document)?;
+            self.written = Some(InfoWritten {
+                written: true,
+                document: Some(NodeInfoDocument::clone(document)),
+            });
             self.phase = Phase::Write;
             return Ok(Next::Call(IoCall::Write(writes)));
         }
-        let target = DocumentTarget::RealmConfig {
-            realm_id: self.realm_id,
-        };
-        let read = (
-            SYNC_REVISION_KEYSPACE.to_string(),
-            sync_revision_key(&target),
-        );
-        Ok(Next::Call(IoCall::Read(vec![read])))
+        Ok(Next::Call(IoCall::Read(self.reads())))
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
         match (self.phase, result) {
-            (Phase::Generation, IoResult::Values(values)) => {
-                self.generation = revision_generation(values.into_iter().next().flatten());
-                self.phase = Phase::Read;
-                Ok(Next::Call(IoCall::Read(self.row_reads())))
-            }
             (Phase::Read, IoResult::Values(values)) => {
                 let mut values = values.into_iter();
+                self.generation = revision_generation(values.next().flatten());
                 let (row, drain) = (values.next().flatten(), values.next().flatten());
-                let Some(document) = self.revised(row, drain)? else {
-                    return Ok(Next::Done(false));
-                };
+                let revised = self.revised(row, drain)?;
+                if !revised.written {
+                    return Ok(Next::Done(revised));
+                }
+                let document = revised.document.as_ref().ok_or(IoError::Unfinished)?;
+                let writes = Self::writes(document)?;
+                self.written = Some(revised);
                 self.phase = Phase::Write;
-                Ok(Next::Call(IoCall::Write(Self::writes(&document)?)))
+                Ok(Next::Call(IoCall::Write(writes)))
             }
-            (Phase::Write, IoResult::Done) => Ok(Next::Done(true)),
+            (Phase::Write, IoResult::Done) => {
+                let written = self.written.take().ok_or(IoError::Unfinished)?;
+                Ok(Next::Done(written))
+            }
             _ => Err(IoError::Unexpected {
                 expected: "the answer to the node info call",
                 got: "another result",
@@ -345,18 +370,14 @@ mod state_machine_tests {
         }
     }
 
-    fn generation_read() -> Turn {
-        let target = DocumentTarget::RealmConfig { realm_id: REALM };
-        let read = (
-            SYNC_REVISION_KEYSPACE.to_string(),
-            sync_revision_key(&target),
-        );
-        Ok(Next::Call(IoCall::Read(vec![read])))
-    }
-
     fn rows(row: Option<&NodeInfoDocument>, drained: bool) -> IoResult {
         let row = row.map(|document| Value::from(document.to_bytes().unwrap()));
-        IoResult::Values(vec![row, drained.then(|| Value::from(vec![1]))])
+        IoResult::Values(vec![None, row, drained.then(|| Value::from(vec![1]))])
+    }
+
+    fn unwritten(document: Option<NodeInfoDocument>) -> Turn {
+        let written = false;
+        Ok(Next::Done(InfoWritten { written, document }))
     }
 
     fn written(document: &NodeInfoDocument) -> Turn {
@@ -379,12 +400,19 @@ mod state_machine_tests {
         }
     }
 
-    /// A revision at the row read, generation zero.
+    /// A revision at its one read; the revision row is absent, so generation zero.
     fn reading(change: InfoChange) -> InfoWriteOperation {
         let mut operation = InfoWriteOperation::revise(REALM, node(), change, NOW);
-        assert_eq!(operation.first(), generation_read());
-        let row_reads = Ok(Next::Call(IoCall::Read(operation.row_reads())));
-        assert_eq!(operation.next(IoResult::Values(vec![None])), row_reads);
+        let target = DocumentTarget::RealmConfig { realm_id: REALM };
+        let revision = (
+            SYNC_REVISION_KEYSPACE.to_string(),
+            sync_revision_key(&target),
+        );
+        let first = operation.first();
+        let Ok(Next::Call(IoCall::Read(reads))) = &first else {
+            panic!("a revision reads first, got {first:?}");
+        };
+        assert_eq!((reads.len(), &reads[0]), (3, &revision));
         operation
     }
 
@@ -397,7 +425,11 @@ mod state_machine_tests {
             aruna_core::operation::TransactionMode::Write
         );
         assert_eq!(operation.first(), written(&seeded));
-        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+        let done = InfoWritten {
+            written: true,
+            document: Some(seeded),
+        };
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(done)));
     }
 
     #[test]
@@ -416,16 +448,20 @@ mod state_machine_tests {
         expected.updated_at_ms = NOW;
         let answer = operation.next(rows(Some(&document(4)), false));
         assert_eq!(answer, written(&expected));
-        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(true)));
+        let done = InfoWritten {
+            written: true,
+            document: Some(expected),
+        };
+        assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(done)));
     }
 
     #[test]
     fn unchanged_writes_nothing() {
-        // No row, or a change that alters nothing durable, writes nothing.
+        // No row, or a change that alters nothing durable, writes nothing and names the row.
         for (row, change) in [(None, leaving()), (Some(document(2)), snapshots())] {
             let mut operation = reading(change);
             let answer = operation.next(rows(row.as_ref(), false));
-            assert_eq!(answer, Ok(Next::Done(false)));
+            assert_eq!(answer, unwritten(row));
         }
         // The operator's flag drains the advertisement although the change does not.
         let mut drained = reading(snapshots());
@@ -446,7 +482,7 @@ mod state_machine_tests {
     #[test]
     fn refuses_bad_answers() {
         let mut garbled = reading(leaving());
-        let row = IoResult::Values(vec![Some(Value::from(vec![0xff; 3])), None]);
+        let row = IoResult::Values(vec![None, Some(Value::from(vec![0xff; 3])), None]);
         assert!(matches!(
             garbled.next(row),
             Err(InfoWriteError::Document(_))

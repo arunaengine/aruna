@@ -290,10 +290,22 @@ fn document_of(
     }
 }
 
+/// The read grants of `install` that cover `path`, authorized as one call under the admission
+/// the listing already counted, so the call is checked and rated once.
+fn read_check(install: &PluginInstall, path: &str) -> Result<IoCall, CallError> {
+    let patterns = matching(install, Permission::MetadataRead, path)?;
+    let check = Authorize::call(install, Permission::MetadataRead, path, &patterns);
+    Ok(authorize_call(check))
+}
+
+fn authorized(result: IoResult) -> Result<(), CallError> {
+    result.child::<(), CallError>()?
+}
+
 #[derive(Debug, PartialEq)]
 enum ReadPhase {
     Listing,
-    Export,
+    Export(Box<PluginInstall>),
     Check(Box<MetadataRegistryRecord>, String),
 }
 
@@ -328,23 +340,22 @@ impl Operation for ReadDataset {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Document>, CallError> {
-        match std::mem::replace(&mut self.phase, ReadPhase::Export) {
+        match std::mem::replace(&mut self.phase, ReadPhase::Listing) {
             ReadPhase::Listing => {
-                let auth = granted(result)?.auth;
+                let Granted { install, auth } = granted(result)?;
                 let document = parse_document(&self.resource)?;
                 let read = (document, self.view);
+                self.phase = ReadPhase::Export(Box::new(install));
                 Ok(Next::Call(self.place.export(read, auth, (None, None))))
             }
-            ReadPhase::Export => {
+            ReadPhase::Export(install) => {
                 let (record, jsonld) = document_of(exported(result)?)?;
-                let path = &record.permission_path;
-                let scope = &self.place.scope;
-                let check = GrantedCall::target(scope, Permission::MetadataRead, path);
+                let check = read_check(&install, &record.permission_path)?;
                 self.phase = ReadPhase::Check(Box::new(record), jsonld);
-                Ok(Next::Call(granted_call(check)))
+                Ok(Next::Call(check))
             }
             ReadPhase::Check(record, jsonld) => {
-                granted(result)?;
+                authorized(result)?;
                 Ok(Next::Done(Document {
                     resource: self.resource.clone(),
                     revision: record.last_event_id.to_string(),
@@ -358,7 +369,7 @@ impl Operation for ReadDataset {
 #[derive(Debug, PartialEq)]
 enum FilesPhase {
     Listing,
-    Export,
+    Export(Box<PluginInstall>),
     Check(PageDraft),
 }
 
@@ -400,28 +411,27 @@ impl Operation for ReadFiles {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<FilePage>, CallError> {
-        match std::mem::replace(&mut self.phase, FilesPhase::Export) {
+        match std::mem::replace(&mut self.phase, FilesPhase::Listing) {
             FilesPhase::Listing => {
-                let auth = granted(result)?.auth;
+                let Granted { install, auth } = granted(result)?;
                 let read = (parse_document(&self.resource)?, RoCrateExportView::Page);
                 let page = (Some(FILE_PAGE), self.cursor.take());
+                self.phase = FilesPhase::Export(Box::new(install));
                 Ok(Next::Call(self.place.export(read, auth, page)))
             }
-            FilesPhase::Export => {
+            FilesPhase::Export(install) => {
                 let ExportMetadataResult::Page { record, page } = exported(result)? else {
                     return Err(CallError(unavailable("the document has no page export")));
                 };
-                let path = &record.permission_path;
-                let scope = &self.place.scope;
-                let check = GrantedCall::target(scope, Permission::MetadataRead, path);
+                let check = read_check(&install, &record.permission_path)?;
                 self.phase = FilesPhase::Check(PageDraft {
                     jsonld: page.jsonld,
                     cursor: page.next_cursor,
                 });
-                Ok(Next::Call(granted_call(check)))
+                Ok(Next::Call(check))
             }
             FilesPhase::Check(page) => {
-                granted(result)?;
+                authorized(result)?;
                 Ok(Next::Done(FilePage {
                     files: file_entities(&page.jsonld)?,
                     cursor: page.cursor,

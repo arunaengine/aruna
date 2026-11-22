@@ -100,7 +100,7 @@ pub struct DrainPageOperation {
     config: Option<Arc<RealmConfigDocument>>,
     rotation: OutboxRotation,
     limit: usize,
-    published_before: BTreeMap<Vec<u8>, Publication>,
+    published_before: Arc<BTreeMap<Vec<u8>, Publication>>,
     digests: BTreeMap<Vec<u8>, [u8; 32]>,
     topics: Vec<TopicId>,
     page: Option<DrainedPage>,
@@ -126,7 +126,7 @@ impl DrainPageOperation {
         rotation: OutboxRotation,
         invocation: DrainInvocation,
         limit: usize,
-        published_before: BTreeMap<Vec<u8>, Publication>,
+        published_before: Arc<BTreeMap<Vec<u8>, Publication>>,
     ) -> Self {
         let page = DrainedPage {
             invocation,
@@ -642,7 +642,7 @@ mod tests {
         let serving = (local, RealmId::from_bytes([3; 32]));
         let rotation = OutboxRotation::default();
         let invocation = DrainInvocation::new(&rotation);
-        DrainPageOperation::new(serving, None, rotation, invocation, 8, BTreeMap::new())
+        DrainPageOperation::new(serving, None, rotation, invocation, 8, Arc::default())
     }
 
     fn read(result: Result<OutboxReadBatch, ApplyError>) -> IoResult {

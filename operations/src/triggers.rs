@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
@@ -117,7 +118,7 @@ pub struct TimerMemory {
     pub rotation: OutboxRotation,
     /// Outbox records whose op this process already created, with the lineage of the topic and
     /// the row they were published from, so a retry of that row on that lineage only syncs.
-    pub published: BTreeMap<Vec<u8>, Publication>,
+    pub published: Arc<BTreeMap<Vec<u8>, Publication>>,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.

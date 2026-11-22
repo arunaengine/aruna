@@ -377,7 +377,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let group_id = parse_group(&input.group_id)?;
-        let jsonld = rocrate_json(&input.rocrate.0)?;
+        let jsonld = stored_crate(self, &auth, &input.rocrate.0).await?;
         let ctx = self.state.get_ctx();
         let resolved = drive(
             aruna_operations::git::location::resolve(ctx.node_id(), &auth, group_id, None),
@@ -429,7 +429,7 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let document_id = parse_document(&input.id)?;
-        let jsonld = rocrate_json(&input.rocrate.0)?;
+        let jsonld = stored_crate(self, &auth, &input.rocrate.0).await?;
         let extras = tool_extras("replace_dataset", &input)?;
         let record =
             crate::metadata::local_write_record(&self.state, &auth, document_id, extras.clone())
@@ -611,6 +611,31 @@ fn rocrate_json(value: &Value) -> Result<String, CallToolResult> {
              the object itself, not a bare array of entities and not a JSON string",
         )
     })
+}
+
+/// The crate as the REST routes store it: a restricted token may name only files it can read,
+/// and local objects are named by their global ids.
+async fn stored_crate(
+    server: &McpServer,
+    auth: &AuthContext,
+    rocrate: &Value,
+) -> Result<String, CallToolResult> {
+    let entities = crate::metadata::crate_entities(rocrate);
+    let readable = crate::metadata::ensure_readable_files(&server.state, auth, &entities).await;
+    readable.map_err(files_error)?;
+    let normalized = crate::metadata::with_global_ids(&server.state, rocrate).await;
+    rocrate_json(&normalized.map_err(server_error)?)
+}
+
+fn files_error(error: crate::error::ServerError) -> CallToolResult {
+    match error {
+        crate::error::ServerError::Forbidden => explained(
+            error,
+            "the token's path restrictions do not let it read every file the crate names; name \
+             only objects it may read",
+        ),
+        error => server_error(error),
+    }
 }
 
 fn missing_document() -> CallToolResult {

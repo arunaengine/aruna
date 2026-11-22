@@ -4,13 +4,12 @@
 
 use std::collections::BTreeMap;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::ExecutorCapability;
 use aruna_core::compute::quota::{
     ComputeDemandSnapshot, ComputeDepartureReport, ComputeReservationSnapshot,
     MAX_UNRESOLVED_EXECUTIONS, ResourceTotals,
 };
-use aruna_core::events::Event;
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::COMPUTE_DEPARTURE_KEYSPACE;
@@ -19,7 +18,7 @@ use aruna_core::node::state::{
     DEPARTURE_KEY, DrainState, DrainStateError, DrainStateOperation, NodeInfoError,
     ReadInfoOperation, SetDrainOperation,
 };
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::rows::encoded_row;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::node_info::{
@@ -37,7 +36,7 @@ use crate::node::info::inputs::{
     advertises_executors, child_answer,
 };
 use crate::node::info::publish::{PublishInfoError, PublishInfoOperation};
-use crate::node::info::write::{InfoChange, InfoWriteError, InfoWriteOperation};
+use crate::node::info::write::{InfoChange, InfoWriteError, InfoWriteOperation, InfoWritten};
 use crate::placement::policy::reconcile::{SubjectSync, SubjectSyncOperation, SubjectTrigger};
 use crate::placement::policy::subject::{SubjectScanError, SubjectScanMode, SubjectScanResult};
 
@@ -111,9 +110,7 @@ fn publish_call(realm_id: RealmId, node_id: NodeId, only_owed: bool) -> IoCall {
 /// Applies `change` to the stored row in its own transaction, rerun after a lost conflict.
 fn revise_call(realm_id: RealmId, node_id: NodeId, change: InfoChange, now_ms: u64) -> IoCall {
     let build = move || InfoWriteOperation::revise(realm_id, node_id, change.clone(), now_ms);
-    IoCall::Child(boxed_retry(build, node_id.as_bytes(), |result| {
-        Event::Child(ChildOutcome::new(result))
-    }))
+    IoCall::retry_with(build, node_id.as_bytes())
 }
 
 #[derive(Debug, PartialEq)]
@@ -139,6 +136,8 @@ pub struct SeedInfoOperation {
     publish: bool,
     clock: FlowClock,
     config: Option<RealmConfigDocument>,
+    /// The publish after the write, set up with the config read here.
+    publisher: Option<PublishInfoOperation>,
     leaving: bool,
     compute_draining: bool,
     inputs: Option<RevisionInputs>,
@@ -161,6 +160,7 @@ impl SeedInfoOperation {
             publish,
             clock: FlowClock::default(),
             config: None,
+            publisher: None,
             leaving: false,
             compute_draining: false,
             inputs: None,
@@ -218,7 +218,12 @@ impl Operation for SeedInfoOperation {
     fn next(&mut self, result: IoResult) -> Result<Next<()>, InfoFlowError> {
         match self.step {
             SeedStep::Config => {
-                self.config = Some(config_answer(result)?);
+                let config = config_answer(result)?;
+                self.publisher = (self.publish).then(|| {
+                    PublishInfoOperation::new(self.realm_id, self.node_id, false)
+                        .with_config(&config)
+                });
+                self.config = Some(config);
                 self.step = SeedStep::Row;
                 Ok(Next::Call(row_call(self.node_id)))
             }
@@ -246,13 +251,12 @@ impl Operation for SeedInfoOperation {
             }
             SeedStep::Telemetry => self.write(child_answer::<_, InfoFlowError>(result)?),
             SeedStep::Write => {
-                child_answer::<bool, InfoWriteError>(result)?;
-                if !self.publish {
+                child_answer::<InfoWritten, InfoWriteError>(result)?;
+                let Some(publisher) = self.publisher.take() else {
                     return Ok(Next::Done(()));
-                }
+                };
                 self.step = SeedStep::Publish;
-                let publish = publish_call(self.realm_id, self.node_id, false);
-                Ok(Next::Call(publish))
+                Ok(Next::Call(IoCall::child(publisher)))
             }
             SeedStep::Publish => {
                 child_answer::<(), PublishInfoError>(result)?;
@@ -274,7 +278,6 @@ enum RefreshStep {
     Telemetry,
     Revise,
     Publish,
-    Stored,
     Send,
 }
 
@@ -300,6 +303,7 @@ pub struct RefreshInfoOperation {
     clock: FlowClock,
     stored: Option<NodeInfoDocument>,
     config: Option<RealmConfigDocument>,
+    publisher: Option<PublishInfoOperation>,
     eligible: bool,
     inputs: Option<RevisionInputs>,
     parts: Option<HeartbeatParts>,
@@ -323,6 +327,7 @@ impl RefreshInfoOperation {
             clock: FlowClock::default(),
             stored: None,
             config: None,
+            publisher: None,
             eligible: false,
             inputs: None,
             parts: None,
@@ -409,6 +414,8 @@ impl Operation for RefreshInfoOperation {
             RefreshStep::Config => {
                 let config = config_answer(result)?;
                 self.eligible = advertises_executors(&config, self.node_id);
+                let publish = PublishInfoOperation::new(self.realm_id, self.node_id, true);
+                self.publisher = Some(publish.with_config(&config));
                 self.config = Some(config);
                 self.step = RefreshStep::Inputs;
                 let (stored, now_ms) = (self.stored.take(), self.clock.started());
@@ -431,18 +438,16 @@ impl Operation for RefreshInfoOperation {
             }
             RefreshStep::Telemetry => self.revise(child_answer::<_, InfoFlowError>(result)?),
             RefreshStep::Revise => {
-                child_answer::<bool, InfoWriteError>(result)?;
+                // The publish never changes the row, so the revision's row is the committed one.
+                let written = child_answer::<InfoWritten, InfoWriteError>(result)?;
+                self.stored = written.document;
+                let publisher = self.publisher.take().ok_or_else(unfinished)?;
                 self.step = RefreshStep::Publish;
-                Ok(Next::Call(publish_call(self.realm_id, self.node_id, true)))
+                Ok(Next::Call(IoCall::child(publisher)))
             }
             RefreshStep::Publish => {
                 child_answer::<(), PublishInfoError>(result)?;
-                self.step = RefreshStep::Stored;
-                Ok(Next::Call(row_call(self.node_id)))
-            }
-            RefreshStep::Stored => {
-                let stored = row_answer(result, self.node_id)?;
-                match stored {
+                match self.stored.take() {
                     Some(stored) if self.facts.serving.is_some() && self.eligible => {
                         self.send(stored)
                     }
@@ -588,7 +593,7 @@ impl Operation for DepartureStateOperation {
                 self.revise()
             }
             DepartureStep::Revise => {
-                let revised = child_answer::<bool, InfoWriteError>(result)?;
+                let revised = child_answer::<InfoWritten, InfoWriteError>(result)?.written;
                 let inputs = self.inputs.take().ok_or_else(unfinished)?;
                 info!(
                     leaving = self.departing,
@@ -701,7 +706,7 @@ impl Operation for OperatorDrainOperation {
                 Ok(Next::Call(call))
             }
             DrainStep::Revise => {
-                let revised = child_answer::<bool, InfoWriteError>(result)?;
+                let revised = child_answer::<InfoWritten, InfoWriteError>(result)?.written;
                 info!(
                     operator_draining = self.draining,
                     leaving = self.leaving,
@@ -934,8 +939,14 @@ mod tests {
         }))
     }
 
-    fn written(revised: bool) -> IoResult {
-        child::<_, InfoWriteError>(Ok(revised))
+    fn written(written: bool) -> IoResult {
+        let document = Some(document(false));
+        child::<_, InfoWriteError>(Ok(InfoWritten { written, document }))
+    }
+
+    fn publisher(only_owed: bool) -> IoCall {
+        let publish = PublishInfoOperation::new(REALM, node(), only_owed);
+        IoCall::child(publish.with_config(&config()))
     }
 
     fn published() -> IoResult {
@@ -1015,7 +1026,7 @@ mod tests {
         };
         let write = IoCall::child(InfoWriteOperation::seed(REALM, document));
         assert_eq!(answer, Ok(Next::Call(write)));
-        let publish = publish_call(REALM, node(), false);
+        let publish = publisher(false);
         assert_eq!(operation.next(written(true)), Ok(Next::Call(publish)));
         assert_eq!(operation.next(published()), Ok(Next::Done(())));
     }
@@ -1081,12 +1092,9 @@ mod tests {
         let revise = revise_call(REALM, node(), change, NOW + 5);
         let answer = operation.next(child::<_, InfoFlowError>(Ok(telemetry())));
         assert_eq!(answer, Ok(Next::Call(revise)));
-        let publish = publish_call(REALM, node(), true);
-        assert_eq!(operation.next(written(true)), Ok(Next::Call(publish)));
-        assert_eq!(
-            operation.next(published()),
-            Ok(Next::Call(row_call(node())))
-        );
+        // The publish takes the config read above, and the revision names the committed row.
+        let publish = Ok(Next::Call(publisher(true)));
+        assert_eq!(operation.next(written(true)), publish);
         let sent_epoch = AdvertisementEpoch {
             observed_at_ms: NOW,
             ..stored.epoch
@@ -1108,7 +1116,7 @@ mod tests {
             jobs: Some(RunningJobs::default()),
         };
         let send = IoCall::child(SendHeartbeatOperation::new(heartbeat));
-        assert_eq!(operation.next(row(Some(stored))), Ok(Next::Call(send)));
+        assert_eq!(operation.next(published()), Ok(Next::Call(send)));
         let answer = operation.next(child::<(), HeartbeatError>(Ok(())));
         assert_eq!(answer, Ok(Next::Done(())));
     }
@@ -1119,11 +1127,13 @@ mod tests {
         let mut offline = refresh();
         offline.facts.serving = None;
         offline.eligible = true;
-        offline.step = RefreshStep::Stored;
-        assert_eq!(offline.next(row(Some(document(false)))), Ok(Next::Done(())));
+        offline.stored = Some(document(false));
+        offline.step = RefreshStep::Publish;
+        assert_eq!(offline.next(published()), Ok(Next::Done(())));
         let mut device = refresh();
-        device.step = RefreshStep::Stored;
-        assert_eq!(device.next(row(Some(document(false)))), Ok(Next::Done(())));
+        device.stored = Some(document(false));
+        device.step = RefreshStep::Publish;
+        assert_eq!(device.next(published()), Ok(Next::Done(())));
     }
 
     fn departure(departing: bool) -> DepartureStateOperation {

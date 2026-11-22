@@ -172,11 +172,8 @@ pub(crate) fn is_exempt(matched: Option<&str>) -> bool {
 }
 
 async fn rest_timeout(request: Request, next: Next) -> Response {
-    let matched = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|matched| matched.as_str().to_string());
-    if is_exempt(matched.as_deref()) {
+    let matched = request.extensions().get::<MatchedPath>();
+    if is_exempt(matched.map(MatchedPath::as_str)) {
         return next.run(request).await;
     }
     match tokio::time::timeout(REST_REQUEST_TIMEOUT, next.run(request)).await {

@@ -88,49 +88,99 @@ pub struct MatchPage {
     phase: MatchPhase,
 }
 
+type DoneKeys = Vec<(&'static str, Vec<u8>)>;
+
 #[derive(Debug, PartialEq)]
 enum MatchPhase {
     Reading,
-    Counting(Rows, Counting),
-    Gaps(Box<Outbox>, Vec<(&'static str, Vec<u8>)>, usize),
-    Writing(Vec<(&'static str, Vec<u8>)>, usize),
+    Counting(Vec<PendingRow>, Counting),
+    Gaps(Box<Outbox>, DoneKeys, usize),
+    Writing(DoneKeys, usize),
     Deleting(usize),
 }
 
+/// A pending row decoded once: its event, when it decodes, and the installs it matches.
+#[derive(Debug, PartialEq)]
+struct PendingRow {
+    key: Vec<u8>,
+    event: Option<SourceEvent>,
+    installs: Vec<(Ulid, u64)>,
+}
+
 impl MatchPage {
+    /// Decodes each row and matches it to the targets; a user node keeps no journal, so it
+    /// matches nothing.
+    fn pending(&self, rows: Rows) -> Vec<PendingRow> {
+        let row = |(key, value): (Vec<u8>, Vec<u8>)| {
+            let event = SourceEvent::from_bytes(&value).ok();
+            let matched = (event.as_ref()).filter(|_| self.keep).map(|event| {
+                let targets = self.targets.iter().filter(|target| target.matches(event));
+                let installs = targets.map(|target| (target.install_id, target.revision));
+                installs.collect()
+            });
+            let installs = matched.unwrap_or_default();
+            PendingRow {
+                key,
+                event,
+                installs,
+            }
+        };
+        rows.into_iter().map(row).collect()
+    }
+
     /// The outbox of the page's matches once every touched install is counted.
     fn matched(
         &mut self,
-        rows: Rows,
+        rows: Vec<PendingRow>,
         queued: BTreeMap<Ulid, usize>,
     ) -> Result<Next<usize>, StoreError> {
         let stale = self.now_ms.saturating_sub(JOURNAL_RETENTION_MS);
         let (mut done, mut outbox) = (Vec::new(), Outbox::new(self.now_ms, queued));
         let read = rows.len();
-        for (key, value) in &rows {
-            done.push((EVENT_JOURNAL_KEYSPACE, key.clone()));
-            let event = SourceEvent::from_bytes(value);
+        for PendingRow {
+            key,
+            event,
+            installs,
+        } in rows
+        {
             if !self.keep {
-                done.push((
-                    EVENT_JOURNAL_KEYSPACE,
-                    [&[JOURNAL_ROW][..], &key[1..]].concat(),
-                ));
-                let source = event.ok().map(|event| source_key(&event.source));
+                let kept = [&[JOURNAL_ROW][..], &key[1..]].concat();
+                let source = event.map(|event| source_key(&event.source));
+                done.push((EVENT_JOURNAL_KEYSPACE, key));
+                done.push((EVENT_JOURNAL_KEYSPACE, kept));
                 done.extend(source.map(|key| (EVENT_JOURNAL_KEYSPACE, key)));
                 continue;
             }
-            let Ok(event) = event else {
-                continue;
-            };
-            for target in self.targets.iter().filter(|target| target.matches(&event)) {
-                let install = (target.install_id, target.revision);
-                let stale = event.journaled_ms < stale;
-                outbox.offer(install, key, &event, stale, self.bound)?;
+            if let Some(event) = &event {
+                for install in installs {
+                    let stale = event.journaled_ms < stale;
+                    outbox.offer(install, &key, event, stale, self.bound)?;
+                }
             }
+            done.push((EVENT_JOURNAL_KEYSPACE, key));
+        }
+        if !outbox.counts_gaps() {
+            return self.write(outbox.rows(Vec::new())?, done, read);
         }
         let ask = outbox.gap_ask();
         self.phase = MatchPhase::Gaps(Box::new(outbox), done, read);
         Ok(Next::Call(ask))
+    }
+
+    /// Writes the page's forward and gap rows, then deletes its done rows; nothing to write
+    /// goes straight to the delete.
+    fn write(
+        &mut self,
+        rows: Vec<Row>,
+        done: DoneKeys,
+        read: usize,
+    ) -> Result<Next<usize>, StoreError> {
+        if rows.is_empty() {
+            self.phase = MatchPhase::Deleting(read);
+            return Ok(Next::Call(delete_call(done)));
+        }
+        self.phase = MatchPhase::Writing(done, read);
+        Ok(Next::Call(IoCall::Write(rows)))
     }
 }
 
@@ -158,14 +208,9 @@ impl Operation for MatchPage {
                 if rows.is_empty() {
                     return Ok(Next::Done(0));
                 }
+                let rows = self.pending(rows);
                 let installs = (rows.iter())
-                    .filter_map(|(_, value)| SourceEvent::from_bytes(value).ok())
-                    .flat_map(|event| {
-                        let targets = self.targets.iter();
-                        let matched = targets.filter(move |target| target.matches(&event));
-                        matched.map(|target| target.install_id).collect::<Vec<_>>()
-                    })
-                    .filter(|_| self.keep)
+                    .flat_map(|row| row.installs.iter().map(|(install_id, _)| *install_id))
                     .collect();
                 let counting = Counting::new(installs, self.bound);
                 match counting.ask() {
@@ -188,8 +233,7 @@ impl Operation for MatchPage {
             }
             MatchPhase::Gaps(outbox, done, read) => {
                 let values = all_values(answer)?;
-                self.phase = MatchPhase::Writing(done, read);
-                Ok(Next::Call(IoCall::Write(outbox.rows(values)?)))
+                self.write(outbox.rows(values)?, done, read)
             }
             MatchPhase::Writing(done_keys, read) => {
                 done(answer)?;
@@ -325,6 +369,11 @@ impl Outbox {
         let key = gap_key(install_id, kind, reason);
         self.gaps
             .push((key, kind, reason, Lost::Range(from_ms, to_ms)));
+    }
+
+    /// Whether the outbox counts any gap, so [`Outbox::gap_ask`] reads a row.
+    pub(crate) fn counts_gaps(&self) -> bool {
+        !self.gaps.is_empty()
     }
 
     /// The read of every gap row the outbox counts in, each once.

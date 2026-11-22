@@ -21,8 +21,6 @@ use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::types::Value;
 use aruna_core::user::id::UserId;
 use base64::Engine;
-use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use jsonwebtoken::dangerous::insecure_decode;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
@@ -324,10 +322,12 @@ pub enum IssuerKeys {
 #[derive(PartialEq)]
 enum DecodeStage {
     Trust,
-    /// Waits for the net handle's answer on this issuer key.
-    Key([u8; 32]),
-    Config,
-    Link,
+    /// Waits for the net handle's answer on this issuer key of a trusted realm.
+    Key([u8; 32], RealmId),
+    /// Waits for the issuing realm's config.
+    Config(RealmId),
+    /// Waits for the owner of the linked login, which must be this user.
+    Link(UserId),
 }
 
 /// Verifies a bearer token and answers its claims when it is still valid. The operation never
@@ -338,7 +338,6 @@ pub struct DecodeTokenOperation {
     checks: TokenChecks,
     now_ms: u64,
     stage: DecodeStage,
-    trusted: HashSet<RealmId>,
     claims: Option<TokenClaims>,
 }
 
@@ -358,7 +357,6 @@ impl DecodeTokenOperation {
             checks,
             now_ms: 0,
             stage: DecodeStage::Trust,
-            trusted: HashSet::new(),
             claims: None,
         }
     }
@@ -374,46 +372,52 @@ impl DecodeTokenOperation {
             _ => &unverified.iss,
         };
         // Only trusted realm or delegated issuers may reach the net handle's bounded key cache;
-        // untrusted issuers are verified with an ephemeral key that is discarded.
-        let key = match (&self.checks.keys, issuer_trusted(&trusted, &unverified)) {
-            (IssuerKeys::Net, Ok(())) => {
+        // untrusted issuers are verified with an ephemeral key that is discarded. The payload
+        // is the one the signature covers, so its trust is judged once, here.
+        let trust = issuer_trusted(&trusted, &unverified);
+        let key = match (&self.checks.keys, &trust) {
+            (IssuerKeys::Net, Ok(realm)) => {
                 let key = issuer_bytes(issuer)?;
-                self.trusted = trusted;
-                self.stage = DecodeStage::Key(key);
+                self.stage = DecodeStage::Key(key, *realm);
                 let check = Effect::Net(NetEffect::IssuerKey { key });
                 return Ok(Next::Call(IoCall::Effect(Box::new(check))));
             }
             _ => bearer_decoding_key(issuer)?,
         };
-        self.check_signed(&trusted, &key)
+        self.check_signed(&key, trust)
     }
 
-    /// Checks the signature with `key`, then the claims and the revocation state.
-    fn check_signed(&mut self, trusted: &HashSet<RealmId>, key: &DecodingKey) -> DecodeTurn {
+    /// Checks the signature with `key`, then the claims, the issuer `trust` and the revocation
+    /// state. The issuing realm is judged, so a foreign token meets its origin's revocations.
+    fn check_signed(
+        &mut self,
+        key: &DecodingKey,
+        trust: Result<RealmId, ArunaBearerError>,
+    ) -> DecodeTurn {
         let mut validation = Validation::new(Algorithm::EdDSA);
         // The library would judge expiry by the host clock; the claims are judged at the stamp.
         validation.validate_exp = false;
         let claims = decode::<TokenClaims>(&self.token, key, &validation)?.claims;
-        validate_bearer_claims(trusted, now_secs(self.now_ms), &claims)?;
-        // The issuing realm from the verified claims, so a foreign token is judged
-        // by its origin realm's revocation set and not by the serving node's.
-        let issuer_realm = issuer_realm(&claims)?;
-
+        token_lifetime(now_secs(self.now_ms), &claims)?;
+        let realm = trust?;
         match &self.checks.revocation {
             RevocationCheck::Realm => {
                 self.claims = Some(claims);
-                self.stage = DecodeStage::Config;
-                Ok(Next::Call(config_call(issuer_realm)))
+                self.stage = DecodeStage::Config(realm);
+                Ok(Next::Call(config_call(realm)))
             }
             RevocationCheck::Listed(hashes) if hashes.contains(&bearer_token_hash(&self.token)) => {
                 Err(ArunaBearerError::TokenRevoked)
             }
-            _ => self.check_link(claims),
+            _ => {
+                let users = token_users(&claims)?;
+                self.check_link(claims, realm, users)
+            }
         }
     }
 
     /// Applies the issuing realm's revocations and the cutoffs of both ids.
-    fn config_read(&mut self, config: Option<RealmConfigDocument>) -> DecodeTurn {
+    fn config_read(&mut self, realm: RealmId, config: Option<RealmConfigDocument>) -> DecodeTurn {
         let claims = self
             .claims
             .take()
@@ -426,27 +430,36 @@ impl DecodeTokenOperation {
         let cut = |user: &UserId| {
             (config.user_cutoff(user, now)).is_some_and(|cutoff| claims.iat < cutoff)
         };
-        let via = claims.via.as_deref().map(UserId::from_string).transpose()?;
-        if cut(&UserId::from_string(&claims.sub)?) || via.as_ref().is_some_and(cut) {
+        let (user, via) = token_users(&claims)?;
+        if cut(&user) || via.as_ref().is_some_and(cut) {
             return Err(ArunaBearerError::TokenRevoked);
         }
-        self.check_link(claims)
+        self.check_link(claims, realm, (user, via))
     }
 
     /// A linked login lives only while its link still resolves to the token's user.
-    fn check_link(&mut self, claims: TokenClaims) -> DecodeTurn {
-        UserId::from_string(&claims.sub)?;
-        let Some(via) = claims.via.as_deref() else {
+    fn check_link(
+        &mut self,
+        claims: TokenClaims,
+        realm: RealmId,
+        (user, via): (UserId, Option<UserId>),
+    ) -> DecodeTurn {
+        let Some(via) = via else {
             return Ok(Next::Done(claims));
         };
-        let via = UserId::from_string(via)?;
-        if self.checks.linked_realm != Some(issuer_realm(&claims)?) {
+        if self.checks.linked_realm != Some(realm) {
             return Err(ArunaBearerError::TokenRevoked);
         }
         self.claims = Some(claims);
-        self.stage = DecodeStage::Link;
+        self.stage = DecodeStage::Link(user);
         Ok(Next::Call(IoCall::child(LinkedOwnerOperation::new(via))))
     }
+}
+
+/// The token's user and its linked login.
+fn token_users(claims: &TokenClaims) -> Result<(UserId, Option<UserId>), ArunaBearerError> {
+    let via = claims.via.as_deref().map(UserId::from_string).transpose()?;
+    Ok((UserId::from_string(&claims.sub)?, via))
 }
 
 impl Operation for DecodeTokenOperation {
@@ -473,20 +486,19 @@ impl Operation for DecodeTokenOperation {
                 let trusted = stored_realms(result.value());
                 self.verify(trusted)
             }
-            DecodeStage::Key(bytes) => {
+            DecodeStage::Key(bytes, realm) => {
                 // A key the net handle has not checked is built here, which rejects a bad one.
                 let key = match checked_key(result) {
                     true => DecodingKey::from_ed_der(&bytes),
                     false => raw_decoding_key(bytes)?,
                 };
-                let trusted = std::mem::take(&mut self.trusted);
-                self.check_signed(&trusted, &key)
+                self.check_signed(&key, Ok(realm))
             }
-            DecodeStage::Config => self.config_read(read_config(result.value()?)?),
-            DecodeStage::Link => {
+            DecodeStage::Config(realm) => self.config_read(realm, read_config(result.value()?)?),
+            DecodeStage::Link(user) => {
                 let owner = linked_owner(result)?;
                 let claims = self.claims.take().ok_or(ArunaBearerError::TokenRevoked)?;
-                match owner == Some(UserId::from_string(&claims.sub)?) {
+                match owner == Some(user) {
                     true => Ok(Next::Done(claims)),
                     false => Err(ArunaBearerError::TokenRevoked),
                 }
@@ -519,20 +531,23 @@ pub fn claims_auth(claims: TokenClaims) -> Result<AuthContext, ArunaBearerError>
     Ok(claims.try_into()?)
 }
 
+/// The issuing realm when it is trusted and a delegated issuer carries its realm's signature.
 fn issuer_trusted(
     trusted: &HashSet<RealmId>,
     claims: &TokenClaims,
-) -> Result<(), ArunaBearerError> {
-    if !trusted.contains(&issuer_realm(claims)?) {
+) -> Result<RealmId, ArunaBearerError> {
+    let realm = issuer_realm(claims)?;
+    if !trusted.contains(&realm) {
         return Err(ArunaBearerError::RealmNotTrusted);
     }
     match (&claims.delegation_signature, &claims.issuer_pubkey) {
         (Some(delegation_signature), Some(issuer_pubkey)) => {
-            verify_realm_delegation(&claims.iss, issuer_pubkey, delegation_signature)
+            verify_realm_delegation(realm, issuer_pubkey, delegation_signature)?;
         }
-        (None, None) => Ok(()),
-        (_, _) => Err(ArunaBearerError::InvalidServerToken),
+        (None, None) => {}
+        (_, _) => return Err(ArunaBearerError::InvalidServerToken),
     }
+    Ok(realm)
 }
 
 /// Judges verified claims at `now`: their lifetime, and that a trusted realm issued them.
@@ -541,6 +556,12 @@ pub fn validate_bearer_claims(
     now: u64,
     claims: &TokenClaims,
 ) -> Result<(), ArunaBearerError> {
+    token_lifetime(now, claims)?;
+    issuer_trusted(trusted, claims).map(drop)
+}
+
+/// Judges the lifetime of verified claims at `now`.
+fn token_lifetime(now: u64, claims: &TokenClaims) -> Result<(), ArunaBearerError> {
     if now > claims.exp {
         return Err(ArunaBearerError::Expired);
     }
@@ -550,16 +571,16 @@ pub fn validate_bearer_claims(
     {
         return Err(ArunaBearerError::LifetimeTooLong);
     }
-    issuer_trusted(trusted, claims)
+    Ok(())
 }
 
+/// Checks that `realm`, whose id is its public key, signed the delegated issuer key.
 fn verify_realm_delegation(
-    realm_iss: &str,
+    realm: RealmId,
     issuer_pubkey: &str,
     delegation_signature: &str,
 ) -> Result<(), ArunaBearerError> {
-    let realm_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(realm_iss)?;
-    let realm_verifying_key = VerifyingKey::from_bytes(realm_key.as_slice().try_into()?)?;
+    let realm_verifying_key = VerifyingKey::from_bytes(realm.as_bytes())?;
     let signature = Signature::from_str(delegation_signature)?;
     realm_verifying_key.verify(issuer_pubkey.as_bytes(), &signature)?;
     Ok(())
@@ -575,10 +596,10 @@ fn issuer_bytes(issuer_pubkey: &str) -> Result<[u8; 32], ArunaBearerError> {
         .map_err(|_| ArunaBearerError::InvalidIssuerKey)
 }
 
+/// The decoding key of a checked Ed25519 point; the library's key is its raw 32 bytes.
 fn raw_decoding_key(issuer_pubkey: [u8; 32]) -> Result<DecodingKey, ArunaBearerError> {
-    let public_key = VerifyingKey::from_bytes(&issuer_pubkey)?;
-    let public_key_pem = public_key.to_public_key_pem(LineEnding::default())?;
-    Ok(DecodingKey::from_ed_pem(public_key_pem.as_bytes())?)
+    VerifyingKey::from_bytes(&issuer_pubkey)?;
+    Ok(DecodingKey::from_ed_der(&issuer_pubkey))
 }
 
 // Whether the net handle answered that the issuer key is a checked public key.

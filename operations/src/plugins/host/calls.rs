@@ -269,12 +269,18 @@ impl Operation for StateCall {
                     }));
                 }
                 self.phase = StatePhase::Writing;
-                let ids = (self.run_id, self.install_id);
+                let (run_id, install_id) = (self.run_id, self.install_id);
+                // Each write is one transaction; a lost conflict reruns its version check.
+                let seed = run_id.to_bytes();
                 Ok(Next::Call(
                     match self.change.take().ok_or(IoError::Unfinished)? {
-                        StateChange::Put(put) => IoCall::child(put_state(ids.0, ids.1, put)),
+                        StateChange::Put(put) => {
+                            let build = move || put_state(run_id, install_id, put.clone());
+                            IoCall::retry_with(build, &seed)
+                        }
                         StateChange::Remove(remove) => {
-                            IoCall::child(remove_state(ids.0, ids.1, remove))
+                            let build = move || remove_state(run_id, install_id, remove.clone());
+                            IoCall::retry_with(build, &seed)
                         }
                     },
                 ))

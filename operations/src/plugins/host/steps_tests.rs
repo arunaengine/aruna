@@ -145,8 +145,38 @@ fn read_checks_path() {
     assert!(is_child(&read.first()));
     assert!(is_child(&read.next(granted_result())));
     assert!(is_child(&read.next(summary(&jsonld.to_string()))));
-    let denied = child_result(Err::<Granted, _>(refusal()));
+    let denied = child_result(Err::<(), _>(refusal()));
     assert_eq!(read.next(denied).unwrap_err(), refusal());
+}
+
+#[test]
+fn read_reuses_admission() {
+    // The exported path is matched against the install the listing admitted, so the call is
+    // checked and rated once: a covered path needs only its authorization.
+    let jsonld = json!({"@graph": [{"@id": "ro-crate-metadata.json"}, {"@id": "./"}]});
+    let view = RoCrateExportView::Summary;
+    let mut read = ReadDataset::new(place(), &resource(), view);
+    read.first().unwrap();
+    read.next(granted_result()).unwrap();
+    read.next(summary(&jsonld.to_string())).unwrap();
+    let Ok(Next::Done(document)) = read.next(child_result(Ok::<_, CallError>(()))) else {
+        panic!("an authorized path reads the dataset");
+    };
+    assert_eq!(document.revision, record().last_event_id.to_string());
+    // A path outside the grants is refused at once, without another call.
+    let mut outside = ReadDataset::new(place(), &resource(), view);
+    outside.first().unwrap();
+    outside.next(granted_result()).unwrap();
+    let mut elsewhere = record();
+    elsewhere.permission_path = "/elsewhere".to_string();
+    let export = child_result(Ok::<_, MetadataApiError>(ExportMetadataResult::Summary {
+        record: elsewhere,
+        jsonld: jsonld.to_string(),
+    }));
+    let Err(CallError(error)) = outside.next(export) else {
+        panic!("an uncovered path is refused");
+    };
+    assert_eq!(error.kind, ErrorKind::NotGranted);
 }
 
 #[test]

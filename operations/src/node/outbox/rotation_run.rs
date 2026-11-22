@@ -47,7 +47,7 @@ pub struct RotationRunOperation {
     serving: Option<(NodeId, RealmId)>,
     limits: OutboxLimits,
     rotation: OutboxRotation,
-    published: BTreeMap<Vec<u8>, Publication>,
+    published: Arc<BTreeMap<Vec<u8>, Publication>>,
     config: Option<Arc<RealmConfigDocument>>,
     invocation: Option<DrainInvocation>,
     before: Option<DrainInvocation>,
@@ -125,12 +125,13 @@ impl RotationRunOperation {
 
     /// Takes in a drained page: keeps which records were published and reads on or finishes.
     fn paged(&mut self, page: DrainedPage) -> RunTurn {
-        if self.published.len() + page.published.len() > MAX_PUBLISHED_RECORDS {
-            self.published.clear();
+        let published = Arc::make_mut(&mut self.published);
+        if published.len() + page.published.len() > MAX_PUBLISHED_RECORDS {
+            published.clear();
         }
-        self.published.extend(page.published);
+        published.extend(page.published);
         for record_key in &page.deleted {
-            self.published.remove(record_key);
+            published.remove(record_key);
         }
         let mut invocation = page.invocation;
         match page.end {
