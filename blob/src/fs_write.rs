@@ -587,8 +587,10 @@ fn wide(path: &Path) -> Vec<u16> {
 /// answers that path, so they stay on the owner's disk under a findable name.
 async fn rescue_displaced(spool: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
     for candidate in copy_paths(target)? {
-        if place_new(spool, &candidate).is_ok() {
-            return Ok(candidate);
+        match place_new(spool, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(PlaceError::Refused(LocalFileRefusal::Exists)) => {}
+            Err(error) => return Err(error),
         }
     }
     Err(PlaceError::Failed(
@@ -704,15 +706,26 @@ fn conflict_stamp(at_ms: u64) -> String {
 }
 
 /// `note (conflicted copy 2026-08-25 1032, realm).txt`, with a numeric suffix
-/// from the second attempt on.
+/// from the second attempt on. A name too long for one path component drops its
+/// stem, then its extension.
 fn copy_name(relative: &str, stamp: &str, attempt: usize) -> String {
     let (stem, extension) = split_name(relative);
     let suffix = match attempt {
         1 => String::new(),
         other => format!(" ({other})"),
     };
-    format!("{stem} (conflicted copy {stamp}, realm){suffix}{extension}")
+    let marker = format!("(conflicted copy {stamp}, realm){suffix}");
+    [
+        format!("{stem} {marker}{extension}"),
+        format!("{marker}{extension}"),
+    ]
+    .into_iter()
+    .find(|name| name.len() <= MAX_NAME_BYTES)
+    .unwrap_or(marker)
 }
+
+/// The longest file name in bytes that every supported file system accepts.
+const MAX_NAME_BYTES: usize = 255;
 
 /// The same file name, with a numeric suffix from the second attempt on.
 fn suffixed_name(relative: &str, attempt: usize) -> String {
@@ -957,6 +970,44 @@ mod tests {
         assert_eq!(
             listed_bytes(root.path()).await,
             vec![b"newer".to_vec(), b"the owner's own edit".to_vec()]
+        );
+    }
+
+    // A valid name at the length limit still gets a visible copy on a drift, and a
+    // restart pass finds both versions in the listing.
+    #[tokio::test]
+    async fn keeps_long_name() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let name = format!("{}.txt", "n".repeat(MAX_NAME_BYTES - 4));
+        let file = root.path().join(&name);
+        tokio::fs::write(&file, b"base").await.unwrap();
+        let (fingerprint, blake3) = identity(&file).await;
+        tokio::fs::write(&file, b"owner edit").await.unwrap();
+
+        let guard = WriteGuard::MatchesBase {
+            fingerprint,
+            blake3,
+        };
+        let event = write_guarded(&path, &name, &guard, body(b"newer")).await;
+        assert_eq!(
+            event,
+            LocalFileEvent::Refused {
+                reason: LocalFileRefusal::Drifted
+            }
+        );
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed_bytes(root.path()).await,
+            vec![b"newer".to_vec(), b"owner edit".to_vec()]
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join(KEPT_DIR))
+                .unwrap()
+                .count(),
+            0
         );
     }
 
@@ -1553,6 +1604,13 @@ mod tests {
         assert_eq!(
             copy_name("note", "s", 2),
             "note (conflicted copy s, realm) (2)"
+        );
+        let long = format!("a/{}.txt", "n".repeat(MAX_NAME_BYTES - 4));
+        assert_eq!(copy_name(&long, "s", 1), "(conflicted copy s, realm).txt");
+        let extension = format!("a.{}", "x".repeat(MAX_NAME_BYTES - 2));
+        assert_eq!(
+            copy_name(&extension, "s", 2),
+            "(conflicted copy s, realm) (2)"
         );
         assert_eq!(suffixed_name("a/note.txt", 3), "note (3).txt");
         assert_eq!(sibling_path("a/note.txt", "other.txt"), "a/other.txt");
