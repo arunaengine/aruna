@@ -423,10 +423,23 @@ mod tests {
         stale.request_id = Ulid::from_bytes([2; 16]);
         stale.bucket = "other".into();
         let values = vec![grant_row(&request), grant_row(&stale)];
-        let turn = operation.next(IoResult::Page {
+        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+        let page = || IoResult::Page {
             rows: values.clone(),
             next: None,
-        });
+        };
+        // The snapshot listing answers at once and leaves the stale grant to a write sweep.
+        let turn = operation.next(page());
+        let Ok(Next::Then { output, calls }) = turn else {
+            panic!("the listing, then the sweep: {turn:?}");
+        };
+        assert_eq!(output, KeyResult::Grants(Vec::new(), None));
+        assert!(matches!(calls.as_slice(), [IoCall::Child(_)]));
+        assert!(operation.deletes.is_empty());
+        let (mut operation, _) = assistant(KeyAction::Grants(None));
+        operation.sweep = true;
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        let turn = operation.next(page());
         let Ok(Next::Call(IoCall::Delete(deletes))) = turn else {
             panic!("one delete batch: {turn:?}");
         };

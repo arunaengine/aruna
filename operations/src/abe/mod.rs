@@ -159,6 +159,8 @@ pub struct KeyOperation {
     role_holders: std::collections::VecDeque<aruna_core::user::id::UserId>,
     explicit_started: bool,
     quiet: bool,
+    /// A listing that runs in a write transaction to delete the stale rows it finds.
+    sweep: bool,
     managed: bool,
     result: Option<KeyResult>,
     ids: IdMint,
@@ -200,6 +202,7 @@ impl KeyOperation {
             role_holders: Default::default(),
             explicit_started: false,
             quiet: false,
+            sweep: false,
             managed: false,
             result: None,
             ids: IdMint::default(),
@@ -384,6 +387,13 @@ impl KeyOperation {
         }
     }
     fn flush(&mut self) -> KeyTurn {
+        // A listing snapshot cannot delete: a write rerun rechecks and drops the stale rows.
+        if !self.deletes.is_empty() && self.transaction() == TransactionMode::ReadSnapshot {
+            self.deletes.clear();
+            let output = self.result.take().ok_or(AbeError::Context)?;
+            let calls = vec![self.sweep_call()];
+            return Ok(Next::Then { output, calls });
+        }
         if !self.deletes.is_empty() {
             self.state = State::Cleanup;
             let deletes = std::mem::take(&mut self.deletes);
@@ -427,6 +437,17 @@ impl KeyOperation {
         }
         Ok(Next::Then { output, calls })
     }
+    /// A write run of this listing that deletes the stale rows it still finds.
+    fn sweep_call(&self) -> IoCall {
+        let (bucket, auth, node) = (self.bucket.clone(), self.auth.clone(), self.node);
+        let (action, now) = (self.action.clone(), self.now);
+        let seed = bucket.clone().into_bytes();
+        let build = move || KeyOperation {
+            sweep: true,
+            ..KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
+        };
+        IoCall::retry_with(build, &seed)
+    }
     /// Answers the issuance: a key unlocked after the locked status read cannot issue before the
     /// due raise, so that run retries.
     fn issue_read(&mut self, event: Event) -> KeyTurn {
@@ -458,8 +479,12 @@ impl Operation for KeyOperation {
     fn seed(&mut self, entropy: u128) {
         self.ids = IdMint::new(entropy);
     }
+    /// Listings read one snapshot and write nothing; their stale rows go in a later sweep.
     fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
+        match (&self.action, self.sweep) {
+            (KeyAction::Open(_) | KeyAction::Grants(_), false) => TransactionMode::ReadSnapshot,
+            _ => TransactionMode::Write,
+        }
     }
     fn first(&mut self) -> KeyTurn {
         if self.auth.user_id.is_nil() {
@@ -566,6 +591,37 @@ mod tests {
         let mut operation = KeyOperation::new("bucket".into(), auth, node, action, 1);
         assert_eq!(operation.transaction(), TransactionMode::Write);
         assert!(matches!(operation.first(), Ok(Next::Call(IoCall::Read(_)))));
+    }
+
+    #[test]
+    fn listings_read_snapshot() {
+        // Listings never open a write transaction; their sweep and the other actions do.
+        let realm_id = RealmId([1; 32]);
+        let user_id = aruna_core::user::id::UserId::new(Ulid::from_bytes([5; 16]), realm_id);
+        let auth = AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+        let node = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let mode = |action, sweep| {
+            let operation = KeyOperation::new("bucket".into(), auth.clone(), node, action, 1);
+            KeyOperation { sweep, ..operation }.transaction()
+        };
+        assert_eq!(
+            mode(KeyAction::Open(None), false),
+            TransactionMode::ReadSnapshot
+        );
+        assert_eq!(
+            mode(KeyAction::Grants(None), false),
+            TransactionMode::ReadSnapshot
+        );
+        assert_eq!(mode(KeyAction::Grants(None), true), TransactionMode::Write);
+        assert_eq!(
+            mode(KeyAction::Member(user_id), false),
+            TransactionMode::Write
+        );
     }
 
     #[test]

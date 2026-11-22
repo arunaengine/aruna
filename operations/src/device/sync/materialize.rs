@@ -82,7 +82,8 @@ pub enum MaterializeError {
     UnexpectedEvent(&'static str),
 }
 
-/// Writes the file, then commits the base row and the audit row in one transaction.
+/// Writes the file outside any transaction, then commits the base row and the audit row in a
+/// short write child.
 #[derive(Debug)]
 pub struct MaterializeEntryOperation {
     input: MaterializeInput,
@@ -223,8 +224,8 @@ impl MaterializeEntryOperation {
         Ok(rows)
     }
 
-    /// Turns the file answer into the outcome and the rows it commits.
-    fn written(&mut self, event: Event) -> Result<IoCall, MaterializeError> {
+    /// Turns the file answer into the outcome and the commit of its rows.
+    fn written(&mut self, event: Event) -> Result<CommitMaterialize, MaterializeError> {
         let Event::LocalFile(event) = event else {
             return Err(MaterializeError::UnexpectedEvent(event.label()));
         };
@@ -250,9 +251,49 @@ impl MaterializeEntryOperation {
                 ));
             }
         };
-        let rows = self.rows_for(&outcome, written)?;
+        let writes = self.rows_for(&outcome, written)?;
         self.outcome = Some(outcome);
-        Ok(IoCall::Write(rows))
+        Ok(CommitMaterialize {
+            writes,
+            deletes: Vec::new(),
+        })
+    }
+}
+
+/// Commits the rows of one finished file change in a short write transaction; a lost conflict
+/// reruns it from a clone.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct CommitMaterialize {
+    pub(super) writes: Vec<(String, Key, Value)>,
+    /// Rows dropped after the writes, in the same transaction.
+    pub(super) deletes: Vec<(String, Key)>,
+}
+
+impl CommitMaterialize {
+    /// Runs this commit as a conflict-retrying child keyed by `seed`.
+    pub(super) fn call(self, seed: &str) -> IoCall {
+        IoCall::retry(self, seed.as_bytes())
+    }
+}
+
+impl Operation for CommitMaterialize {
+    type Output = ();
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<()>, IoError> {
+        Ok(Next::Call(IoCall::Write(std::mem::take(&mut self.writes))))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<()>, IoError> {
+        result.done()?;
+        Ok(match self.deletes.is_empty() {
+            true => Next::Done(()),
+            false => Next::Call(IoCall::Delete(std::mem::take(&mut self.deletes))),
+        })
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
     }
 }
 
@@ -289,16 +330,19 @@ impl Operation for MaterializeEntryOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<MaterializeOutcome>, MaterializeError> {
         match self.outcome.take() {
-            None => Ok(Next::Call(self.written(result.event()?)?)),
+            None => {
+                let commit = self.written(result.event()?)?;
+                Ok(Next::Call(commit.call(&self.input.relative)))
+            }
             Some(outcome) => {
-                result.done()?;
+                result.child::<(), IoError>()??;
                 Ok(Next::Done(outcome))
             }
         }
     }
 
     fn transaction(&self) -> TransactionMode {
-        TransactionMode::Write
+        TransactionMode::None
     }
 }
 
@@ -306,6 +350,7 @@ impl Operation for MaterializeEntryOperation {
 mod tests {
     use super::*;
     use crate::device::sync::reconcile::pure_tests::folder;
+    use aruna_core::calls::ChildOutcome;
 
     fn materialize() -> MaterializeEntryOperation {
         MaterializeEntryOperation::new(MaterializeInput {
@@ -323,29 +368,59 @@ mod tests {
         })
     }
 
-    // The file is written first, then its base row is committed in the transaction.
+    fn refused() -> Event {
+        Event::LocalFile(LocalFileEvent::Refused {
+            reason: LocalFileRefusal::Drifted,
+        })
+    }
+
+    // The file is written outside any transaction, then a write child commits its base row.
     #[test]
     fn writes_then_commits() {
         let mut materialize = materialize();
-        assert_eq!(
-            materialize.transaction(),
-            aruna_core::operation::TransactionMode::Write
-        );
+        assert_eq!(materialize.transaction(), TransactionMode::None);
         assert!(matches!(
             materialize.first(),
             Ok(Next::Call(IoCall::Effect(_)))
         ));
-        let refused = IoResult::Event(Box::new(Event::LocalFile(LocalFileEvent::Refused {
-            reason: LocalFileRefusal::Drifted,
-        })));
-        let Ok(Next::Call(IoCall::Write(rows))) = materialize.next(refused) else {
-            panic!("expected the base row");
-        };
-        assert_eq!(rows.len(), 1);
+        let answer = IoResult::Event(Box::new(refused()));
+        assert!(matches!(
+            materialize.next(answer),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let committed = IoResult::Child(ChildOutcome::new(Ok::<(), IoError>(())));
         let kept = MaterializeOutcome::Refused {
             reason: LocalFileRefusal::Drifted,
         };
-        assert_eq!(materialize.next(IoResult::Done), Ok(Next::Done(kept)));
+        assert_eq!(materialize.next(committed), Ok(Next::Done(kept)));
+    }
+
+    // The commit child writes the base row alone in its own write transaction.
+    #[test]
+    fn commit_writes_rows() {
+        let mut commit = materialize().written(refused()).unwrap();
+        assert_eq!(commit.transaction(), TransactionMode::Write);
+        assert!(commit.deletes.is_empty());
+        let Ok(Next::Call(IoCall::Write(rows))) = commit.first() else {
+            panic!("expected the base row");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(commit.next(IoResult::Done), Ok(Next::Done(())));
+    }
+
+    // A failed commit fails the materialization instead of reporting the outcome.
+    #[test]
+    fn commit_failure_fails() {
+        let mut materialize = materialize();
+        materialize.first().unwrap();
+        materialize
+            .next(IoResult::Event(Box::new(refused())))
+            .unwrap();
+        let lost = IoResult::Child(ChildOutcome::new(Err::<(), IoError>(IoError::Conflict)));
+        assert_eq!(
+            materialize.next(lost),
+            Err(MaterializeError::Io(IoError::Conflict))
+        );
     }
 
     // A file answer of another kind fails before any row is written.

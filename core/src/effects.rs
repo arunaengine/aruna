@@ -568,6 +568,31 @@ pub enum BlobEffect {
     Remote(Box<crate::repository::remote::RemoteRequest>),
 }
 
+impl BlobEffect {
+    /// Whether this effect does disk, object-store, or network I/O rather than in-memory
+    /// keystore, ABE, or reservation-table work.
+    pub fn is_external_io(&self) -> bool {
+        !matches!(
+            self,
+            Self::Abe(_)
+                | Self::GenerateBucketKey
+                | Self::SealHolderCopies { .. }
+                | Self::SealUnlocked { .. }
+                | Self::PrepareKey { .. }
+                | Self::ActivateKey { .. }
+                | Self::DiscardKey { .. }
+                | Self::ReadKeyStatus { .. }
+                | Self::ExtendKey { .. }
+                | Self::LockKey { .. }
+                | Self::AdmitRead { .. }
+                | Self::ReadUnlockedKey { .. }
+                | Self::ReserveCompose { .. }
+                | Self::ReleaseReservation { .. }
+                | Self::ReadHeld { .. }
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagingSourceEffect {
     /// Checks a download-capable local folder and publishes displaced files before listing it.
