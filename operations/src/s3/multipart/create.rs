@@ -1322,7 +1322,7 @@ mod pure_tests {
     /// The provider upload `calls` abort.
     fn aborted(calls: &[IoCall]) -> Option<&BackendUpload> {
         match calls {
-            [IoCall::Effect(effect)] => match (&**effect).as_blob() {
+            [IoCall::Effect(effect)] => match effect.as_blob() {
                 Some(BlobEffect::AbortUpload { backend_upload }) => Some(&**backend_upload),
                 _ => None,
             },

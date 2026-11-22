@@ -608,8 +608,8 @@ impl MergeUsersOperation {
         Ok(Next::Done(outcome))
     }
 
-    fn vault_held(event: Box<Event>) -> Result<Vec<[u8; 32]>, MergeError> {
-        match *event {
+    fn vault_held(event: Event) -> Result<Vec<[u8; 32]>, MergeError> {
+        match event {
             Event::SubOperation(SubOperationEvent::VaultHeld { result }) => {
                 result.map_err(MergeError::Vault)
             }
@@ -625,7 +625,7 @@ impl MergeUsersOperation {
         match (self.state.clone(), result) {
             (MergeState::ReadAccounts, IoResult::Values(values)) => self.accept_accounts(values),
             (MergeState::CheckVault, IoResult::Event(event)) => {
-                let merged = Self::vault_held(event)?;
+                let merged = Self::vault_held(*event)?;
                 if merged.is_empty() {
                     return Ok(self.transaction());
                 }
@@ -634,7 +634,7 @@ impl MergeUsersOperation {
                 Ok(Next::Call(self.read_vault(self.survivor_id(), token)))
             }
             (MergeState::CheckCopy { merged }, IoResult::Event(event)) => {
-                let held = Self::vault_held(event)?;
+                let held = Self::vault_held(*event)?;
                 if !merged.iter().all(|digest| held.contains(digest)) {
                     return Err(MergeError::VaultPresent);
                 }

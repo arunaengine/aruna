@@ -181,7 +181,7 @@ fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
 
 fn released(calls: &[IoCall]) -> Option<Ulid> {
     calls.iter().find_map(|call| match call {
-        IoCall::Effect(effect) => match (&**effect).as_blob() {
+        IoCall::Effect(effect) => match effect.as_blob() {
             Some(BlobEffect::ReleaseReservation { id }) => Some(*id),
             _ => None,
         },
