@@ -29,8 +29,8 @@ pub(crate) const RESERVED_DIR: &str = ".aruna";
 /// files and never one the owner happens to have named like a spool.
 pub(crate) const SPOOL_DIR: &str = ".aruna/tmp";
 
-/// Directory a guarded write moves the owner's displaced file into. No sweep
-/// reads it, so those bytes are removed only once they are known to be disposable.
+/// Directory a guarded write moves the owner's displaced file into, under an id that
+/// mirrors its path. No sweep removes it; a restart publishes it as a conflict copy.
 pub(crate) const KEPT_DIR: &str = ".aruna/kept";
 
 /// How long a spool file is left alone. A sweep runs on every folder check and
@@ -56,6 +56,7 @@ pub(crate) async fn check_local(access: &ResolvedSourceAccess) -> Result<(), Sta
     // Every sweep starts by dropping the spool a crashed write left behind.
     // Those bytes are this node's own, never the owner's.
     crate::fs_write::sweep_spool(&root).await;
+    crate::fs_write::recover_kept(&root).await;
     match tokio::fs::metadata(&resolved).await {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(StagingSourceError::CheckError(
