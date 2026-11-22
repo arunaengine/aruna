@@ -23,9 +23,11 @@ use super::super::objects::LocalObject;
 use super::super::rows::{StoreError, delete_rows, mapped_child, write_rows};
 use super::super::state::{PutError, put_state, remove_state};
 use super::super::unavailable;
-use crate::auth::install_access::Authorize;
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use crate::s3::object::list::{ListBucketInput, ListBucketOperation, ListContinuationToken};
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::s3::object::list::{
+    ListBucketInput, ListBucketOperation, ListContinuationToken,
+};
+use aruna_ops_identity::auth::install_access::Authorize;
 
 /// Entries of one object listing page.
 pub(crate) const OBJECT_PAGE: usize = 100;

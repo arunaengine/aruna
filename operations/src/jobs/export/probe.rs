@@ -16,7 +16,7 @@ use super::sources::{
 };
 use super::{CandidateOpen, ExportEntity, ExportFailure, OpenStatus, ProbedEntry, SourceScope};
 use crate::jobs::import::{job_call, stops_of};
-use crate::replication::bao_read::BaoReadOutput;
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
 
 /// Candidates that failed while the archive was written, by entity and candidate.
 pub type CandidateFailures = BTreeMap<usize, BTreeMap<usize, OpenStatus>>;

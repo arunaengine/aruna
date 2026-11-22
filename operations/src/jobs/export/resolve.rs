@@ -31,11 +31,11 @@ use aruna_core::types::{GroupId, Key, Value};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
-use crate::auth::error::PolicyEnforcementError;
-use crate::replication::plaintext::{HolderCheckOperation, PlaintextError};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_ops_data::replication::plaintext::{HolderCheckOperation, PlaintextError};
+use aruna_ops_identity::auth::check_permissions::CheckPermissionsConfig;
+use aruna_ops_identity::auth::enforcement::{compiled_policies, policy_reads, read_policies};
+use aruna_ops_identity::auth::error::PolicyEnforcementError;
 
 #[derive(Debug, PartialEq)]
 pub(super) enum ResolveResult {

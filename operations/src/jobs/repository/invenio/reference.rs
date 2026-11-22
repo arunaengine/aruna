@@ -23,11 +23,11 @@ use serde_json::Value;
 use ulid::Ulid;
 
 use super::{Session, finished, head_metadata, invalid};
-use crate::connectors::descriptor::build_source_binding;
 use crate::jobs::repository::connector::{ConnectOperation, ConnectRequest};
 use crate::jobs::repository::link_store::time_of;
 use crate::jobs::repository::{JobScope, TransferError, not_supported, remote_call};
-use crate::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
+use aruna_ops_data::connectors::descriptor::build_source_binding;
+use aruna_ops_data::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
 
 #[derive(Debug, PartialEq)]
 enum ReferenceStep {

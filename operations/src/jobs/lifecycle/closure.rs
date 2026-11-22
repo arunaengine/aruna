@@ -32,7 +32,6 @@ use ulid::Ulid;
 
 use super::LifecycleError;
 use super::launch_admit::existing_receipt;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::append::{
     AppendOutcome, AppendRecordConfig, AppendRecordOperation, RecordOrigin,
 };
@@ -41,6 +40,7 @@ use crate::jobs::records::{RECORD_PAGE_SIZE, RecordStoreError};
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// How long one closure or record question to a node may take.
 pub(crate) const ASK_DEADLINE: Duration = Duration::from_secs(10);

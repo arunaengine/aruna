@@ -27,7 +27,6 @@ use super::input_walk::InputCaller;
 use super::plan::missing_label;
 use super::resolve_inputs::{ResolveInputsOperation, ResolveScope, ResolvedInputs};
 use super::submission_rules::{caller_of, family_view, is_device, pin_outputs, reference_shape};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::pages::{PageReadError, StoreEntriesOperation};
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::execution::validate_execution;
@@ -35,6 +34,7 @@ use aruna_core::job_request::{
     self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError, mint_configured_job,
     store_workspace,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// This node as a submission sees it: its identity, its clock and its fresh heartbeats.
 #[derive(Clone, Debug, PartialEq)]

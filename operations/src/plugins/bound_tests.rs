@@ -15,12 +15,12 @@ use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::install::{pick_version, read_manifest};
 use crate::plugins::secret_use::slot_kind;
-use crate::secrets::SecretChange;
-use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::plugins::{Refusal, ReleaseError};
 use aruna_core::secrets::UseRule;
 use aruna_drivers::driver::drive;
+use aruna_ops_identity::secrets::SecretChange;
+use aruna_ops_identity::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_test_support::plugins::Fixture;
 #[allow(unused_imports)]
 use aruna_test_support::plugins::{TOKEN, bound, hold_keys, rule_for, secret};
@@ -74,7 +74,7 @@ async fn selects_group_secret() {
 
 #[tokio::test]
 async fn node_binding_checks() {
-    use crate::secrets::node::{NodeChange, NodeSecretOperation};
+    use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
     let fixture = Fixture::keyed().await;
     fixture
         .ctx
@@ -166,7 +166,7 @@ async fn slots_bind() {
         .ctx
         .storage_handle
         .open_vault(aruna_core::node::vault::NodeVaultKey::random());
-    let input = crate::secrets::node::NodeChange {
+    let input = aruna_ops_identity::secrets::node::NodeChange {
         realm_id: fixture.actor.realm_id,
         node_id: fixture.actor.node_id,
         actor: fixture.actor.user_id,
@@ -186,7 +186,7 @@ async fn slots_bind() {
         write_id: Ulid::from_parts(66, 3),
     };
     drive(
-        crate::secrets::node::NodeSecretOperation::new(input),
+        aruna_ops_identity::secrets::node::NodeSecretOperation::new(input),
         &fixture.ctx,
     )
     .await
@@ -284,13 +284,13 @@ mod operations {
     use aruna_core::plugins::NodeCheckError;
 
     use super::*;
-    use crate::document_repository::GetConfigError;
     use crate::plugins::entry::EntryError;
     use crate::plugins::fixtures::{
         self, config_result, is_child, is_effect, node, peer_says, peer_silent,
     };
     use crate::plugins::rows::tests::{child_result, values_result};
     use aruna_core::metadata::protocol::MetadataTransportMessage;
+    use aruna_ops_identity::document_repository::GetConfigError;
 
     fn key() -> (SecretName, SecretKind) {
         let name = SecretName::try_from("key".to_string()).unwrap();

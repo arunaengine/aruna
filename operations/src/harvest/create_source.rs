@@ -18,11 +18,11 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::harvest_rows::connector_key;
-use crate::groups::fence::{group_write_result, write_group_new};
 use crate::harvest::oai_pmh::request::{normalize_metadata_prefix, normalize_set};
 use crate::harvest::repository::source_key;
 use crate::harvest::target_path::{normalize_target_prefix, prefix_is_blank};
+use aruna_ops_data::connectors::harvest_rows::connector_key;
+use aruna_ops_identity::groups::fence::{group_write_result, write_group_new};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateSourceInput {

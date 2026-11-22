@@ -15,7 +15,7 @@ use aruna_core::structs::execution::job::membership::{NotRun, not_run};
 use aruna_core::structs::identity::realm::RealmId;
 use tracing::warn;
 
-use crate::secrets::owner::WriterView;
+use aruna_ops_identity::secrets::owner::WriterView;
 
 /// The realm config clock and node history this node has applied. `None` when the reducer
 /// state is unreadable; a node without any state has an empty view.

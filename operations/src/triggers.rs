@@ -3,49 +3,74 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use std::collections::BTreeMap;
 use std::fmt::Display;
-use std::sync::Arc;
 use std::time::Duration;
 
 use aruna_core::alpn::Alpn;
-use aruna_core::backoff::capped_backoff;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::compute::offer::BackendLimits;
 use aruna_core::document::ShardTransportMessage;
 use aruna_core::federation::PUBLISH_INTERVAL;
 use aruna_core::git::GitNode;
-use aruna_core::heartbeat::{HeldHeartbeat, INFO_PUBLISH_INTERVAL, RunningJobs};
+use aruna_core::heartbeat::INFO_PUBLISH_INTERVAL;
 use aruna_core::id::NodeId;
 use aruna_core::jobs::JobRequest;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
 use aruna_core::native_reference::{
     NativeReferenceReject, NativeReferenceRequest, NativeReferenceResponse,
 };
-use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation, TransactionMode};
 use aruna_core::repository::remote::NodeScope;
-use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::WATCH_PUBLISH_DEBOUNCE;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::task::TaskKey;
 use aruna_core::types::Key;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::blob::cleanup_timer::CleanupTimerOperation;
-use crate::blob::hidden::{HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation};
-use crate::blob::holders::HoldersTimerOperation;
-use crate::blob::migration::drain::ProcessMigrationsOperation;
-use crate::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
-use crate::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
-use crate::device::publish_queue::DrainOutcome;
-use crate::device::sync::outbox::{UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox};
+pub use aruna_ops_data::timer::{
+    TIMER_RETRY_AFTER, TimerFailure, TimerInput, TimerMemory, TimerNeeds, TimerPlan, keeps_earlier,
+    timer_needs,
+};
+
+/// A timer operation decides when its timer runs again and what it keeps until then.
+pub trait TimerRun: Operation + Sized {
+    /// The plan of the next run; a failure runs the timer again after its delay, keeping its
+    /// memory as it was.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure>;
+}
+
+/// A timer run that only plans the next run, for a node that lacks what the timer needs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaitOperation {
+    plan: TimerPlan,
+}
+
+impl WaitOperation {
+    pub fn after(after: Option<Duration>) -> Self {
+        let plan = TimerPlan::from(after);
+        Self { plan }
+    }
+}
+
+impl Operation for WaitOperation {
+    type Output = TimerPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<TimerPlan>, IoError> {
+        Ok(Next::Done(self.plan.clone()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<TimerPlan>, IoError> {
+        Err(IoError::Unexpected {
+            expected: "no call",
+            got: result.label(),
+        })
+    }
+}
+
 use crate::federation::registration::RenewalTimerOperation;
-use crate::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
 use crate::jobs::backend_import::schedule::RunDueOperation;
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::timers::FamilyTimerOperation;
@@ -57,14 +82,6 @@ use crate::jobs::records::prune::pass::PruneFamiliesOperation;
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::repository::link_queue::LinkRunOperation;
 use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
-use crate::metadata::device::drain::{
-    DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
-};
-use crate::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
-use crate::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
-use crate::metadata::prune_queue::GRAPH_RETRY_AFTER;
-use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
-use crate::metadata::serve::ServedReply;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::catch_up::{CATCH_UP_REFRESH, CatchUpOperation, next_pass};
 use crate::node::folder_timer::FolderTimerOperation;
@@ -87,196 +104,37 @@ use crate::notifications::watch::drain::WatchDrainOperation;
 use crate::notifications::watch::interest::PublishInterestOperation;
 use crate::notifications::watch::remove::RemoveWatchOperation;
 use crate::plugins::work::PruneKeepingWork;
-use crate::replication::catch_up::CatchUpCursors;
-use crate::replication::drain_timer::ReplicationTimerOperation;
-use crate::replication::mirror_repair::REPAIR_RETRY_AFTER;
-use crate::replication::mirror_repair::drain::DrainRepairsOperation;
-use crate::s3::bucket::audit_retry::AuditTimerOperation;
-use crate::s3::object::metadata::REFRESH_RETRY_AFTER;
-use crate::s3::object::metadata_drain::DrainRefreshOperation;
-use crate::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
-use crate::shard::incoming::{ManifestAnswer, ServeManifestOperation};
-use crate::staging::native_source::{NativeAnswer, NativeAnswerOperation};
-use crate::sync::outbox::batches::OutboxLimits;
-use crate::sync::outbox::cleanup::Publication;
-use crate::sync::outbox::rotation::OutboxRotation;
-use crate::transfer::sharding::{MaintainCursors, maintain_retry};
-
-/// What a timer keeps on this node between its runs, in memory only: its attempts since the last
-/// clean run and where its work goes on. The shell stores it per key and hands it back unread, so
-/// every decision about it stays with the timer's operation; a restart starts it afresh.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TimerMemory {
-    pub attempts: u32,
-    pub cursor: Option<Vec<u8>>,
-    /// A count the timer advances on every run, such as a heartbeat sequence.
-    pub sequence: u64,
-    /// Where the replication drain's bootstrap work goes on.
-    pub catch_up: CatchUpCursors,
-    /// Where range maintenance goes on.
-    pub ranges: MaintainCursors,
-    /// The open document sync outbox rotation.
-    pub rotation: OutboxRotation,
-    /// Outbox records whose op this process already created, with the lineage of the topic and
-    /// the row they were published from, so a retry of that row on that lineage only syncs.
-    pub published: Arc<BTreeMap<Vec<u8>, Publication>>,
-    /// Earliest timestamp in milliseconds when a throttled pass may run again.
-    pub due_ms: u64,
-}
-
-/// Retry steps after which a timer's retry ladder stops doubling.
-const LADDER_STEPS: u32 = 7;
-
-impl TimerMemory {
-    /// The wait after a failed run: `base` for the first, then doubled per further attempt up to
-    /// `max`. The returned memory counts the attempt and keeps the cursor.
-    pub fn next_retry(&self, base: Duration, max: Duration) -> (Duration, TimerMemory) {
-        let after = capped_backoff(base, max, self.attempts.min(LADDER_STEPS), 0);
-        let memory = TimerMemory {
-            attempts: self.attempts.saturating_add(1),
-            ..self.clone()
-        };
-        (after, memory)
-    }
-}
-
-/// When a timer runs again, `None` while it waits for work, and what it keeps until then.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct TimerPlan {
-    pub after: Option<Duration>,
-    pub memory: TimerMemory,
-}
-
-impl From<Option<Duration>> for TimerPlan {
-    fn from(after: Option<Duration>) -> Self {
-        Self {
-            after,
-            memory: TimerMemory::default(),
-        }
-    }
-}
-
-/// What the timer shell knows when a timer fires.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TimerInput {
-    pub now_ms: u64,
-    /// This node, `None` on a node without a net transport.
-    pub local_node: Option<NodeId>,
-    /// This node and its realm while a net transport runs.
-    pub serving: Option<(NodeId, RealmId)>,
-    /// What the timer kept from its last run.
-    pub memory: TimerMemory,
-    /// What only this node's handles and host know, filled only where [`timer_needs`] says.
-    pub facts: NodeFacts,
-    /// This node's routing rules and backend catalog, filled like `facts`.
-    pub routing: NodeRouting,
-    /// Whether this node has blob storage.
-    pub has_blob: bool,
-    /// The jobs running on this node, for its heartbeat, filled like `facts`.
-    pub running: Option<RunningJobs>,
-    /// Whether this node runs a task handle.
-    pub has_tasks: bool,
-    /// The logical cores the host offers, filled like `facts`.
-    pub host_cores: usize,
-    /// The fresh heartbeats this node holds, filled like `facts`.
-    pub heartbeats: BTreeMap<NodeId, HeldHeartbeat>,
-    /// What each local executor backend advertises, filled like `heartbeats`.
-    pub limits: BackendLimits,
-    /// This node's ROCrate limits, such as the artifact retention and the holder refresh.
-    pub rocrate_limits: RoCrateLimits,
-    /// The bounds of one document sync outbox invocation.
-    pub outbox: OutboxLimits,
-}
-
-/// Which costly inputs a timer reads; the shell builds only these, since most runs never look
-/// at host telemetry, routing, job counts or other nodes' heartbeats.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TimerNeeds {
-    pub facts: bool,
-    pub routing: bool,
-    pub running: bool,
-    /// The fresh heartbeats and executor limits.
-    pub cluster: bool,
-    pub cores: bool,
-}
-
-/// Whether the timer of `key` rearms after a run only without a row stored while it ran, so a
-/// newer wake, such as the prompt publication of a settings change, is never postponed.
-pub fn keeps_earlier(key: &TaskKey) -> bool {
-    matches!(key, TaskKey::PublishRegistration)
-}
-
-/// The costly inputs the timer of `key` reads.
-pub fn timer_needs(key: &TaskKey) -> TimerNeeds {
-    let routing = matches!(
-        key,
-        TaskKey::MigrateCompression
-            | TaskKey::DrainCaptures
-            | TaskKey::DrainCleanupQueue
-            | TaskKey::DrainReplicationQueue
-            | TaskKey::DrainMaterializationQueue
-            | TaskKey::MaintainRanges
-    );
-    TimerNeeds {
-        facts: matches!(
-            key,
-            TaskKey::SyncPlacements { .. } | TaskKey::PublishNodeInfo
-        ),
-        routing,
-        running: matches!(key, TaskKey::PublishNodeInfo),
-        cluster: matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges),
-        cores: matches!(key, TaskKey::DrainMaterializationQueue),
-    }
-}
-
-impl TimerInput {
-    /// A timer firing with nothing kept from an earlier run and no node facts.
-    pub fn new(now_ms: u64, local_node: Option<NodeId>) -> Self {
-        Self {
-            now_ms,
-            local_node,
-            serving: None,
-            memory: TimerMemory::default(),
-            facts: NodeFacts::default(),
-            routing: NodeRouting::default(),
-            has_blob: false,
-            running: None,
-            has_tasks: false,
-            host_cores: 1,
-            heartbeats: BTreeMap::new(),
-            limits: BTreeMap::new(),
-            rocrate_limits: RoCrateLimits::default(),
-            outbox: OutboxLimits::default(),
-        }
-    }
-}
-
-/// A timer run that failed; the shell logs it and runs the timer again after `retry_after`.
-#[derive(Debug, Error, PartialEq, Eq)]
-#[error("{reason}")]
-pub struct TimerFailure {
-    pub retry_after: Duration,
-    pub reason: String,
-}
-
-/// When a timer runs again after the runner failed its run, for example on a storage error.
-const TIMER_RETRY_AFTER: Duration = Duration::from_secs(30);
-
-impl From<IoError> for TimerFailure {
-    fn from(error: IoError) -> Self {
-        Self {
-            retry_after: TIMER_RETRY_AFTER,
-            reason: error.to_string(),
-        }
-    }
-}
-
-/// A timer operation decides when its timer runs again and what it keeps until then.
-pub trait TimerRun: Operation + Sized {
-    /// The plan of the next run; a failure runs the timer again after its delay, keeping its
-    /// memory as it was.
-    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure>;
-}
+use aruna_ops_data::blob::cleanup_timer::CleanupTimerOperation;
+use aruna_ops_data::blob::hidden::{
+    HIDDEN_SWEEP_AFTER, HIDDEN_SWEEP_RETRY, ProcessHiddenOperation,
+};
+use aruna_ops_data::blob::holders::HoldersTimerOperation;
+use aruna_ops_data::blob::migration::drain::ProcessMigrationsOperation;
+use aruna_ops_data::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
+use aruna_ops_data::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
+use aruna_ops_data::device::publish_queue::DrainOutcome;
+use aruna_ops_data::device::sync::outbox::{
+    UPLOAD_CONTINUE_AFTER, UPLOAD_DEFER_AFTER, drain_sync_outbox,
+};
+use aruna_ops_data::git::capture_drain::{CAPTURE_RETRY_AFTER, CaptureDrainOperation};
+use aruna_ops_data::metadata::device::drain::{
+    DrainPublishOperation, PUBLISH_CONTINUE_AFTER, PUBLISH_DEFER_AFTER, drain_publish_queue,
+};
+use aruna_ops_data::metadata::materialization_queue::MATERIALIZATION_RETRY_AFTER;
+use aruna_ops_data::metadata::projection::{PROJECTION_RETRY_AFTER, ProjectionRunOperation};
+use aruna_ops_data::metadata::prune_queue::GRAPH_RETRY_AFTER;
+use aruna_ops_data::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperation};
+use aruna_ops_data::metadata::serve::ServedReply;
+use aruna_ops_data::replication::drain_timer::ReplicationTimerOperation;
+use aruna_ops_data::replication::mirror_repair::REPAIR_RETRY_AFTER;
+use aruna_ops_data::replication::mirror_repair::drain::DrainRepairsOperation;
+use aruna_ops_data::s3::bucket::audit_retry::AuditTimerOperation;
+use aruna_ops_data::s3::object::metadata::REFRESH_RETRY_AFTER;
+use aruna_ops_data::s3::object::metadata_drain::DrainRefreshOperation;
+use aruna_ops_data::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
+use aruna_ops_data::staging::native_source::{NativeAnswer, NativeAnswerOperation};
+use aruna_ops_data::transfer::sharding::maintain_retry;
+use aruna_ops_identity::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 
 /// The operation of one timer run. Its output is when the timer runs again and what it keeps;
 /// the shell persists and arms that timer and stores the memory.
@@ -316,40 +174,11 @@ pub enum TimerOperation {
     RecordAudit(AuditTimerOperation),
     DrainSyncOutbox(RotationRunOperation),
     RefreshBlobHolders(HoldersTimerOperation),
-    DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
+    DrainUploadOutbox(aruna_ops_data::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
     ReconcileSyncedFolders(FolderTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
-}
-
-/// A timer run that only plans the next run, for a node that lacks what the timer needs.
-#[derive(Clone, Debug, PartialEq)]
-pub struct WaitOperation {
-    plan: TimerPlan,
-}
-
-impl WaitOperation {
-    pub fn after(after: Option<Duration>) -> Self {
-        let plan = TimerPlan::from(after);
-        Self { plan }
-    }
-}
-
-impl Operation for WaitOperation {
-    type Output = TimerPlan;
-    type Error = IoError;
-
-    fn first(&mut self) -> Result<Next<TimerPlan>, IoError> {
-        Ok(Next::Done(self.plan.clone()))
-    }
-
-    fn next(&mut self, result: IoResult) -> Result<Next<TimerPlan>, IoError> {
-        Err(IoError::Unexpected {
-            expected: "no call",
-            got: result.label(),
-        })
-    }
 }
 
 /// The operation that runs when `key` fires, or `None` while the key is not converted.
@@ -1020,7 +849,7 @@ fn device_plan(outcome: DrainOutcome, defer: Duration, again: Duration) -> Timer
     TimerPlan::from(after)
 }
 
-impl TimerRun for crate::device::sync::outbox::DrainOutboxOperation {
+impl TimerRun for aruna_ops_data::device::sync::outbox::DrainOutboxOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         let outcome = result.unwrap_or(DrainOutcome::Deferred);
         Ok(device_plan(
@@ -1475,18 +1304,18 @@ impl Operation for PeerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::hidden::HiddenSweepOutcome;
-    use crate::blob::migration::drain::MigrationRun;
-    use crate::blob::migration::shared::MigrationError;
-    use crate::connectors::reference_prune::PruneError;
     use crate::jobs::lifecycle::LifecycleError;
     use crate::jobs::prune::JobPruneOutcome;
-    use crate::metadata::materialization_queue::group_concurrency;
     use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
-    use crate::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
-    use crate::s3::object::metadata::ReferenceRefreshError;
-    use crate::s3::object::metadata_drain::ReferenceDrainResult;
     use aruna_core::native_reference::NativeAuthority;
+    use aruna_ops_data::blob::hidden::HiddenSweepOutcome;
+    use aruna_ops_data::blob::migration::drain::MigrationRun;
+    use aruna_ops_data::blob::migration::shared::MigrationError;
+    use aruna_ops_data::connectors::reference_prune::PruneError;
+    use aruna_ops_data::metadata::materialization_queue::group_concurrency;
+    use aruna_ops_data::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
+    use aruna_ops_data::s3::object::metadata::ReferenceRefreshError;
+    use aruna_ops_data::s3::object::metadata_drain::ReferenceDrainResult;
     use ulid::Ulid;
 
     fn input() -> TimerInput {
@@ -1730,7 +1559,7 @@ mod tests {
     #[test]
     fn device_drains_plan() {
         // A broken pass retries after the defer delay, a recheck goes on soon, idle waits.
-        type Upload = crate::device::sync::outbox::DrainOutboxOperation;
+        type Upload = aruna_ops_data::device::sync::outbox::DrainOutboxOperation;
         let deferred = Upload::rearm(Err(IoError::Unfinished));
         assert_eq!(deferred, Ok(TimerPlan::from(Some(UPLOAD_DEFER_AFTER))));
         let recheck = DrainPublishOperation::rearm(Ok(DrainOutcome::Recheck));

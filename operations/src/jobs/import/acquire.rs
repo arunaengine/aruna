@@ -30,11 +30,13 @@ use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::import::{AcquireOperation, AcquireRequest, Acquired};
 use crate::jobs::repository::pull::PullProgress;
 use crate::jobs::repository::{Action, TransferError, ensure_supported};
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
-use crate::staging::read_source::{
+use aruna_core::job_request::UploadClaimError;
+use aruna_ops_data::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
+};
+use aruna_ops_data::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
-use aruna_core::job_request::UploadClaimError;
 
 /// What acquiring a source leaves.
 #[derive(Debug, PartialEq)]

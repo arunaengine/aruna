@@ -20,7 +20,7 @@ use super::{
     PlannedEntry, ProbedEntry, REPORT_PATH, SourceScope,
 };
 use crate::jobs::import::{hidden_delete, job_call, stops_of, unexpected};
-use crate::replication::bao_read::BaoReadOutput;
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
 
 /// The archive parts an export writes, in entry order after sorting by path.
 #[derive(Debug, PartialEq)]

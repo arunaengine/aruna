@@ -22,10 +22,10 @@ use super::artifacts::ServingNode;
 use super::entry::{EntryError, ReadEntry};
 use super::peer::{ask_peer, peer_answer};
 use super::rows::{read_call, values};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::realm::mutate_placement::node_kind;
-use crate::secrets::node::record_key;
 use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::mutate_placement::node_kind;
+use aruna_ops_identity::secrets::node::record_key;
 
 /// The vault kind a manifest slot kind names.
 pub fn vault_kind(kind: aruna_plugin_types::manifest::SecretKind) -> Option<SecretKind> {

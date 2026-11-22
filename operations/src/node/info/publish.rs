@@ -14,8 +14,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 use crate::node::info::write::PUBLISH_OWED_KEY;
-use crate::realm::mutate_placement::node_kind;
-use crate::sync::replicate_documents::{
+use aruna_ops_identity::realm::mutate_placement::node_kind;
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
 };
 

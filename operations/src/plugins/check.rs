@@ -23,10 +23,10 @@ use ulid::Ulid;
 
 use super::rows::{StoreError, mapped_child};
 use super::unavailable;
-use crate::auth::error::AuthorizeError;
-use crate::auth::install_access::{Authorize, granted};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::users::install_account::{owns_install, read_user_call, read_user_result};
+use aruna_ops_identity::auth::error::AuthorizeError;
+use aruna_ops_identity::auth::install_access::{Authorize, granted};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::users::install_account::{owns_install, read_user_call, read_user_result};
 
 /// A host call's refusal or fault, as the operations behind the call report it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

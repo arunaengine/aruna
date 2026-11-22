@@ -20,7 +20,7 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository::GetConfigError;
+use aruna_ops_identity::document_repository::GetConfigError;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum TransferAdmitError {

@@ -29,8 +29,6 @@ use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::jobs::key_locks::{
     AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, MAX_AWAITED,
     VersionWaitOperation,
@@ -42,6 +40,10 @@ use crate::jobs::store::remote_wait::{
     OwedPage, OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
 };
 use crate::jobs::store::row_calls::{read_job_record, read_key_waits, satisfy_key_wait};
+use aruna_ops_data::blob::unlocked::KeyUnlockedOperation;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
 
 fn stored(error: JobMutationError) -> KeyCheckError {
     KeyCheckError(error.to_string())

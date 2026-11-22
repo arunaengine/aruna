@@ -4,9 +4,6 @@
 
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::submit::local::SubmitLocalOperation;
-use crate::s3::imports::cron::next_due;
-use crate::s3::imports::remove::RemoveImportOperation;
-use crate::s3::imports::{ImportRuleError, ListImportsOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::events::Event;
@@ -19,6 +16,9 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::{BackendImport, BackendImportSpec};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
+use aruna_ops_data::s3::imports::cron::next_due;
+use aruna_ops_data::s3::imports::remove::RemoveImportOperation;
+use aruna_ops_data::s3::imports::{ImportRuleError, ListImportsOperation};
 use std::collections::VecDeque;
 use std::time::{Duration, UNIX_EPOCH};
 use tracing::warn;
@@ -335,7 +335,7 @@ impl Operation for WakeScheduleOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::s3::imports::cron::parse_schedule;
+    use aruna_ops_data::s3::imports::cron::parse_schedule;
 
     const HOUR_MS: u64 = 3_600_000;
 
@@ -357,8 +357,8 @@ mod tests {
         assert_eq!(next_due("not cron", after), None);
     }
 
-    use crate::s3::bucket::rename::tests::rule;
     use aruna_core::calls::ChildOutcome;
+    use aruna_ops_data::testing::import_rule as rule;
 
     const NOW: u64 = 10 * HOUR_MS;
 

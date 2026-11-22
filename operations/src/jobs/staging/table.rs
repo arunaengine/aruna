@@ -40,36 +40,36 @@ use super::walk::{
     record_failure, rules_call, rules_result, source_permission_path,
 };
 use super::{ItemFailure, PageFailure, StagingRun, committed, pinned, queue_key};
-use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::get_connector::{
-    GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
-};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::gate::{
-    GateContext, GateContextError, GateOperation, PolicyGateError,
-};
-use crate::placement::policy::read::ReadPolicyError;
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
-use crate::s3::object::head::{
-    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
-};
-use crate::s3::object::head_source::{
-    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
-};
-use crate::s3::object::put::{
-    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
-};
-use crate::s3::purge_fence::PurgeFenceError;
-use crate::s3::usage::QuotaGateError;
-use crate::staging::page::rows::MAX_PAGE_ENTRIES;
-use crate::staging::read_source::{
-    ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
-};
-use crate::transfer::read::GetRoutedOperation;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_ops_data::connectors::get_connector::{
+    GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
+};
+use aruna_ops_data::s3::object::get::{GetObjectError, GetObjectInput, GetObjectResult};
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use aruna_ops_data::s3::object::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
+};
+use aruna_ops_data::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use aruna_ops_data::s3::purge_fence::PurgeFenceError;
+use aruna_ops_data::s3::usage::QuotaGateError;
+use aruna_ops_data::staging::page::rows::MAX_PAGE_ENTRIES;
+use aruna_ops_data::staging::read_source::{
+    ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
+};
+use aruna_ops_data::transfer::read::GetRoutedOperation;
+use aruna_ops_identity::auth::permission_rules::PermissionRules;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
+use aruna_ops_identity::placement::policy::gate::{
+    GateContext, GateContextError, GateOperation, PolicyGateError,
+};
+use aruna_ops_identity::placement::policy::read::ReadPolicyError;
 
 /// Directories the queue holds before the table is read further.
 const QUEUE_PAUSE: u64 = 1024;

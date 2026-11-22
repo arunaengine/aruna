@@ -1,0 +1,258 @@
+//! Checks deletion blockers without network peers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::check::CheckOperation;
+use super::check::{CheckNodeOperation, ScanOperation};
+use aruna_core::calls::{IoCall, IoResult, Next};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{GROUP_DELETE_KEYSPACE, GROUP_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::group_delete::GroupDeletionError;
+use aruna_core::structs::identity::group_delete::MembershipFence;
+use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::user::id::UserId;
+use aruna_drivers::driver::drive;
+use aruna_test_support::groups::{Fixture, buckets, node, read, write};
+use std::sync::Arc;
+use std::time::SystemTime;
+use ulid::Ulid;
+
+fn keyspaces(fixture: &Fixture) -> usize {
+    std::fs::read_dir(fixture.dir.path().join("keyspaces"))
+        .unwrap()
+        .count()
+}
+
+fn stranger(fixture: &Fixture) -> AuthContext {
+    let mut auth = fixture.auth.clone();
+    auth.user_id = UserId::local(Ulid::from_bytes([8; 16]), auth.realm_id);
+    auth
+}
+
+fn blocked(names: &[&str], more: bool, hidden: u64) -> Result<(), GroupDeletionError> {
+    Err(GroupDeletionError::NotEmpty {
+        kinds: vec!["S3 buckets".into()],
+        buckets: names.iter().map(|name| name.to_string()).collect(),
+        more,
+        hidden,
+    })
+}
+
+#[tokio::test]
+async fn check_changes_nothing() {
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    let before = keyspaces(&fixture);
+    assert_eq!(
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
+        Ok(())
+    );
+    assert_eq!(keyspaces(&fixture), before);
+    buckets(&fixture, 1, &["shown", "hidden"]).await;
+    let before = keyspaces(&fixture);
+    // The denied name is dropped and counted as hidden.
+    assert_eq!(
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
+        blocked(&["shown"], false, 1)
+    );
+    let fence = MembershipFence::key(fixture.plan.realm_id).to_vec();
+    for key in [group_id.to_bytes().to_vec(), fence] {
+        assert!(
+            read(&fixture.context, GROUP_DELETE_KEYSPACE, key)
+                .await
+                .is_none()
+        );
+    }
+    assert_eq!(keyspaces(&fixture), before);
+}
+
+#[tokio::test]
+async fn check_names_buckets() {
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    buckets(&fixture, 1, &["b-1", "b-2"]).await;
+    assert_eq!(
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
+        blocked(&["b-1", "b-2"], false, 0)
+    );
+    buckets(&fixture, 1, &["b-3", "b-4", "b-5", "b-6"]).await;
+    assert_eq!(
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context
+        )
+        .await,
+        blocked(&["b-1", "b-2", "b-3", "b-4", "b-5"], true, 0)
+    );
+}
+
+#[tokio::test]
+async fn check_refuses_strangers() {
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    let config = fixture.config.clone();
+    let auth = fixture.auth.clone();
+    let outsider = stranger(&fixture);
+    let context = Arc::new(fixture.context);
+    assert_eq!(
+        drive(
+            CheckNodeOperation::new(&config, &outsider, group_id, node(1)),
+            &context
+        )
+        .await,
+        Err(GroupDeletionError::Unauthorized)
+    );
+    assert_eq!(
+        drive(
+            CheckNodeOperation::new(&config, &auth, group_id, node(1)),
+            &context
+        )
+        .await,
+        Ok(())
+    );
+}
+
+#[tokio::test]
+async fn check_scans_devices() {
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    buckets(&fixture, 1, &["owned"]).await;
+    let event = fixture
+        .context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Delete {
+            key_space: GROUP_KEYSPACE.into(),
+            key: group_id.to_bytes().to_vec().into(),
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::DeleteResult { .. })
+    ));
+    let auth = stranger(&fixture);
+    let mut config = fixture.config.clone();
+    let context = Arc::new(fixture.context);
+    // A server without the group row refuses, as Prepare does.
+    assert!(matches!(
+        drive(
+            CheckNodeOperation::new(&config, &auth, group_id, node(1)),
+            &context
+        )
+        .await,
+        Err(GroupDeletionError::Unavailable(_))
+    ));
+    config.nodes[0].kind = RealmNodeKind::User {
+        owner: auth.user_id,
+    };
+    // A device without the row still scans; the stranger may not read the name.
+    assert_eq!(
+        drive(
+            CheckNodeOperation::new(&config, &auth, group_id, node(1)),
+            &context
+        )
+        .await,
+        blocked(&[], false, 1)
+    );
+}
+
+#[test]
+fn check_scans_snapshot() {
+    // Every table is paged in one read snapshot; empty pages throughout end the check.
+    let mut check = CheckOperation::new(Ulid::from_bytes([4; 16]), SystemTime::UNIX_EPOCH);
+    assert_eq!(check.transaction(), TransactionMode::ReadSnapshot);
+    let mut turn = check.first();
+    while let Ok(Next::Call(IoCall::Page { .. })) = turn {
+        turn = check.next(IoResult::Page {
+            rows: Vec::new(),
+            next: None,
+        });
+    }
+    assert_eq!(turn, Ok(Next::Done(())));
+}
+
+#[tokio::test]
+async fn finished_jobs_pass() {
+    // A purge job a bucket delete leaves behind must not block the group until it expires.
+    use aruna_core::keyspaces::JOB_KEYSPACE;
+    use aruna_core::structs::execution::job::identity::{JobId, JobState};
+    use aruna_core::structs::execution::job::input::{
+        ImportMetadataTarget, ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget,
+        JobPayload, RoCrateLimits,
+    };
+    use aruna_core::structs::execution::job::local::JobRecord;
+    use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+    use aruna_core::structured_id::{BucketId, PlacementHandle};
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = fixture.plan.group_id;
+    let job_id = JobId::from_parts(
+        1_000,
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+        0,
+    )
+    .unwrap();
+    let payload = JobPayload::ImportRoCrate(ImportRoCrateSpec {
+        auth_context: fixture.auth.clone(),
+        source: ImportRoCrateSource::Upload {
+            upload_id: Ulid::from_bytes([3; 16]),
+        },
+        target: ImportRoCrateTarget {
+            bucket: "target".to_string(),
+            prefix: "crate".to_string(),
+        },
+        metadata: ImportMetadataTarget {
+            group_id,
+            path: "crate".to_string(),
+            public: false,
+        },
+        limits: RoCrateLimits::default(),
+        document_id: Ulid::from_bytes([5; 16]),
+    });
+    let mut record = JobRecord::new(
+        job_id,
+        payload,
+        fixture.auth.user_id,
+        node(1),
+        1_000,
+        1_000,
+        None,
+    );
+    let key = job_id.to_bytes().to_vec();
+    for (state, expected) in [
+        (JobState::Queued, Err(super::tests::empty("job records"))),
+        (JobState::Succeeded, Ok(())),
+    ] {
+        record.state = state;
+        write(
+            &fixture.context,
+            JOB_KEYSPACE,
+            key.clone(),
+            record.to_bytes().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            drive(
+                ScanOperation::new(&fixture.auth, group_id, node(1)),
+                &fixture.context
+            )
+            .await,
+            expected
+        );
+    }
+}

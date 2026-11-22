@@ -17,13 +17,13 @@ use aruna_core::structs::storage::distribution::route::ReadRoute;
 use thiserror::Error;
 
 use super::{Holder, RouteError, add_holder, pick_node, search_done};
-use crate::distribution::guard::GuardError;
-use crate::distribution::resolve::key_holders;
-use crate::distribution::routing::route_read;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::bucket_search::search_buckets_distributed;
-use crate::metadata::api::search_types::{BucketSearchExecution, BucketSearchRequest};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_ops_data::distribution::guard::GuardError;
+use aruna_ops_data::distribution::resolve::key_holders;
+use aruna_ops_data::distribution::routing::route_read;
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_ops_data::metadata::api::search_types::{BucketSearchExecution, BucketSearchRequest};
 
 const SEARCH_PAGE: usize = 50;
 /// How long finding the node that holds a bucket may take, every search page included.

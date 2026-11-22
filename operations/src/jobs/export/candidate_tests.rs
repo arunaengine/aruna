@@ -4,16 +4,11 @@
 
 use super::tests::hash_lookup;
 use super::*;
-use crate::auth::enforcement::PolicyBulkOperation;
-use crate::auth::permission_rules::PermissionRulesConfig;
-use crate::auth::permission_rules::PermissionRulesOperation;
 use crate::jobs::export::archive::failure_outcome;
 use crate::jobs::export::consent::UnheldBucketOperation;
 use crate::jobs::export::resolve::CandidateSource;
 use crate::jobs::export::resolve::ExportCandidate;
 use crate::jobs::export::sources::{AliasState, ResolveEntriesOperation, alias_allowed};
-use crate::replication::bao_read::BaoReadOutput;
-use crate::replication::plaintext::HolderCheckOperation;
 use crate::tests::export::{
     crate_document, job_context, open_candidate, probe_sources, recognized_entities, scope_of,
 };
@@ -44,6 +39,11 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
+use aruna_ops_data::replication::plaintext::HolderCheckOperation;
+use aruna_ops_identity::auth::enforcement::PolicyBulkOperation;
+use aruna_ops_identity::auth::permission_rules::PermissionRulesConfig;
+use aruna_ops_identity::auth::permission_rules::PermissionRulesOperation;
 use aruna_test_support::export::{
     BaoNode, FIXTURE_BYTES, byte_stream, encrypting_bucket, export_node, remote_spec, seed_bao,
 };

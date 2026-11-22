@@ -23,7 +23,7 @@ use super::matcher::event_trigger;
 use super::receiver::{eligible, lost_reason};
 use super::rows::StoreError;
 use super::runs::{Ended, RunError, conclude, read_run, save_run, unfinished};
-use crate::auth::install_access::{parse_grants, patterns_for};
+use aruna_ops_identity::auth::install_access::{parse_grants, patterns_for};
 
 const INSTALL_REMOVED: &str = "the install was removed";
 

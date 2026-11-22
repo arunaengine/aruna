@@ -16,12 +16,12 @@ use ulid::Ulid;
 
 use super::walk::{connector_permission_path, record_failure, rules_call, rules_result};
 use super::{ItemFailure, PageFailure, StagingRun};
-use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::descriptor::build_source_descriptor;
-use crate::connectors::get_connector::{
+use aruna_ops_data::connectors::descriptor::build_source_descriptor;
+use aruna_ops_data::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
 };
-use crate::staging::page::rows::PageEntry;
+use aruna_ops_data::staging::page::rows::PageEntry;
+use aruna_ops_identity::auth::permission_rules::PermissionRules;
 
 fn connector_call(run: &StagingRun, connector_id: Ulid) -> IoCall {
     IoCall::child(GetSourceOperation::new(GetSourceInput {

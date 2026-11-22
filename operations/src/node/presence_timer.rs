@@ -9,12 +9,12 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::error;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::realm::announce_presence::{
+use crate::triggers::TimerPlan;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceError, AnnouncePresenceOperation,
     PRESENCE_REFRESH_AFTER,
 };
-use crate::triggers::TimerPlan;
 
 /// One run of the presence timer. A failed announce is refreshed on the same beat as a good one.
 #[derive(Clone, Debug, PartialEq)]

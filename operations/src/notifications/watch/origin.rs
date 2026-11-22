@@ -18,7 +18,6 @@ use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::client::{HolderRequestOperation, RemoteError};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::unexpected_event;
@@ -26,6 +25,7 @@ use crate::notifications::watch::digest::{InterestError, InterestOperation};
 use crate::notifications::watch::expansion::{ExpandError, ExpandOutcome, WatchExpandOperation};
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 #[derive(Debug, Default, PartialEq)]
 enum EmitState {

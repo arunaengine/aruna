@@ -21,11 +21,11 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::document_repository::GetConfigError;
-use crate::session::create::{
+use aruna_ops_identity::document_repository::GetConfigError;
+use aruna_ops_identity::session::create::{
     CreateSessionConfig, CreateSessionError, CreateSessionOperation, CreatedSession,
 };
-use crate::users::read_document::ReadUserError;
+use aruna_ops_identity::users::read_document::ReadUserError;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct IssueHandoffConfig {

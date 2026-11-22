@@ -34,7 +34,7 @@ They start an operation in the same way as an HTTP request does.
 | Inputs | `api`, `wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
 | Inputs | `aruna`, `config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
 | Inputs | `aruna-doctor`, `cli`, `registry` | operator tool on a stopped node; user client; standalone identifier registry |
-| Operations | `operations` | pure sans-IO use-case state machines and trigger tables by domain |
+| Operations | `ops-identity`, `ops-data`, `operations` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-operations` facade + triggers) |
 | Drivers | `drivers` (`aruna-drivers`) | the drive loop, effect routing to the backends and the job runtime |
 | Backends | `storage`, `net`, `blob`, `graph`, `tasks`, `compute`, `outbound`, `plugins` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host |
 | Foundations | `core`, `kpabe`, `plugin-types` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers, plugin manifests/recipes |

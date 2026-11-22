@@ -23,8 +23,8 @@ use crate::node::applied_drain::SettleAppliedOperation;
 use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
-use crate::sync::outbox::batches::{DrainSyncOutcome, RowStamp};
-use crate::sync::outbox::cleanup::{DeleteUnchanged, lineage_call, lineages};
+use aruna_ops_identity::sync::outbox::batches::{DrainSyncOutcome, RowStamp};
+use aruna_ops_identity::sync::outbox::cleanup::{DeleteUnchanged, lineage_call, lineages};
 
 /// What finishing a sub-batch left, and the records it deleted, which the drain forgets as
 /// published.

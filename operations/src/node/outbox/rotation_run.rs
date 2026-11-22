@@ -18,13 +18,13 @@ use aruna_core::task::{TaskEvent, TaskKey};
 use tracing::{error, warn};
 
 use crate::node::outbox::drain_page::{DrainPageOperation, DrainedPage, PageEnd};
-use crate::sync::document_outbox::OutboxTailsOperation;
-use crate::sync::outbox::batches::{DrainInvocation, OutboxLimits};
-use crate::sync::outbox::cleanup::Publication;
-use crate::sync::outbox::record::OUTBOX_DRAIN_SIZE;
-use crate::sync::outbox::rotation::OutboxRotation;
-use crate::sync::shard_placement::schedule_retry_after;
 use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
+use aruna_ops_identity::sync::document_outbox::OutboxTailsOperation;
+use aruna_ops_identity::sync::outbox::batches::{DrainInvocation, OutboxLimits};
+use aruna_ops_identity::sync::outbox::cleanup::Publication;
+use aruna_ops_identity::sync::outbox::record::OUTBOX_DRAIN_SIZE;
+use aruna_ops_identity::sync::outbox::rotation::OutboxRotation;
+use aruna_ops_identity::sync::shard_placement::schedule_retry_after;
 
 /// Outbox records remembered as published; past it they are forgotten and published once
 /// more, which only costs log space.
@@ -288,7 +288,7 @@ mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
 
-    use crate::queue_backoff::retry_delay_ms;
+    use aruna_ops_identity::queue_backoff::retry_delay_ms;
 
     fn input(serving: Option<(NodeId, RealmId)>, retry_attempts: u32) -> TimerInput {
         let mut input = TimerInput::new(1_000, None);

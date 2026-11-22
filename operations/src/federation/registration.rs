@@ -19,12 +19,12 @@ use thiserror::Error;
 use tracing::warn;
 use url::Url;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::federation::publish::{Publication, PublishError, PublishOperation, still_due};
 use crate::federation::totals::{DataTotalsError, DataTotalsOperation};
-use crate::metadata::realm_counts::{
+use aruna_ops_data::metadata::realm_counts::{
     RealmCountError, RealmDocumentsOperation, RealmGroupsOperation,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 

@@ -20,17 +20,17 @@ use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
 use super::submission_rules::{input_reference, source_error};
-use crate::distribution::guard::GuardError;
-use crate::distribution::routing::read_coordinator;
-use crate::s3::object::head::{
-    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
-};
-use crate::s3::object::list::{
-    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
-};
-use crate::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::job_request::SubmitJobError;
+use aruna_ops_data::distribution::guard::GuardError;
+use aruna_ops_data::distribution::routing::read_coordinator;
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use aruna_ops_data::s3::object::list::{
+    ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
+};
+use aruna_ops_data::s3::object::read_access::{SourceObject, SourceReadError, SourceReadOperation};
 
 /// Who walks the inputs, in the realm this node serves, and where.
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -5,10 +5,10 @@
 use aruna_core::metadata::{MetadataError, MetadataValidationViolation};
 use aruna_core::structs::placement::binding_directory::BindingError;
 
-use crate::metadata::create_document::CreateDocumentError;
-use crate::metadata::delete_document::DeleteDocumentError;
-use crate::metadata::forward::write::MetadataWriteError;
-use crate::metadata::update_document::UpdateDocumentError;
+use aruna_ops_data::metadata::create_document::CreateDocumentError;
+use aruna_ops_data::metadata::delete_document::DeleteDocumentError;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::update_document::UpdateDocumentError;
 
 /// What a job should do about a failed metadata write, shared by every job that
 /// writes through the metadata seam: a document the backend will never accept

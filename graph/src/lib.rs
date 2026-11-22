@@ -13,7 +13,7 @@ use aruna_core::metadata::{MetadataError, MetadataGraphPolicy};
 use aruna_core::profile_shapes::ProfileShaclError;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleIrokleOptions, CraqleNode, CraqleOptions,
-    GraphId, SearchStorage,
+    GraphId,
 };
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 

@@ -9,13 +9,13 @@ use serde_json::json;
 
 use super::*;
 use crate::jobs::repository::test_support::registry_record;
-use crate::metadata::api::list_types::ListedMetadataDocument;
 use crate::plugins::check::tests::access_rows;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
 use crate::plugins::rate::tests::rate_answer;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::submit::CopyRequest;
 use crate::tests::calls::compiled;
+use aruna_ops_data::metadata::api::list_types::ListedMetadataDocument;
 use aruna_test_support::plugins::queued;
 
 fn meta_root() -> String {

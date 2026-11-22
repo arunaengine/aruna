@@ -21,11 +21,11 @@ use super::walk::{
     start_queued_walk,
 };
 use super::{ClearQueueOperation, PageFailure, StagingRun, StagingStoreError, committed};
-use crate::connectors::get_connector::{
-    GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
-};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::staging_checkpoint::{decode_main, initial_checkpoint, main_read};
+use aruna_ops_data::connectors::get_connector::{
+    GetSourceError, GetSourceInput, GetSourceOperation, GetSourceResult,
+};
 
 #[derive(Debug, PartialEq)]
 enum Step {

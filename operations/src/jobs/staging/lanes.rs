@@ -26,11 +26,11 @@ use super::walk::{
 use super::{PageFailure, StagingRun, committed};
 use crate::jobs::run_rows::SettledRowsOperation;
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::staging::list_source::{
-    ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
-};
 use aruna_core::staging_checkpoint::{
     LANE_LIMIT, Lane, PARTS, checkpoint_key, fold, lanes_page, parse_lanes,
+};
+use aruna_ops_data::staging::list_source::{
+    ListStagingError, ListStagingInput, ListStagingOperation, ListStagingResult,
 };
 
 /// One-key listings that split one prefix, whatever its key space looks like.

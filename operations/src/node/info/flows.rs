@@ -28,7 +28,6 @@ use aruna_core::types::GroupId;
 use tracing::{info, warn};
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::demand::{DemandError, DemandSnapshotOperation, merge_view};
 use crate::node::heartbeat::{HeartbeatError, SendHeartbeatOperation};
 use crate::node::info::inputs::{
@@ -37,8 +36,13 @@ use crate::node::info::inputs::{
 };
 use crate::node::info::publish::{PublishInfoError, PublishInfoOperation};
 use crate::node::info::write::{InfoChange, InfoWriteError, InfoWriteOperation, InfoWritten};
-use crate::placement::policy::reconcile::{SubjectSync, SubjectSyncOperation, SubjectTrigger};
-use crate::placement::policy::subject::{SubjectScanError, SubjectScanMode, SubjectScanResult};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::placement::policy::reconcile::{
+    SubjectSync, SubjectSyncOperation, SubjectTrigger,
+};
+use aruna_ops_identity::placement::policy::subject::{
+    SubjectScanError, SubjectScanMode, SubjectScanResult,
+};
 
 /// The runner's clock: the flow's start for its snapshots, the latest time for its revision.
 #[derive(Debug, Default, PartialEq)]

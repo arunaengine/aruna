@@ -34,10 +34,10 @@ use super::rows::{
     read_call, row as row_of, unexpected, values,
 };
 use super::runs::{Admission, RunError, event_run};
-use crate::document_repository::GetConfigOperation;
-use crate::realm::mutate_placement::node_kind;
 use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::plugin_runs::Outcome;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 /// The decision a resend of an event gets, with its anchor for the dedup retention.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

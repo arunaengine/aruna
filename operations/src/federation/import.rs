@@ -38,13 +38,13 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::federation::access::{AccessCheckOperation, access_granted};
 use crate::federation::records::{
     ImportRecord, RecordChange, RecordError, RecordOutcome, StaleUpload, change_call,
 };
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 const IMPORT_OPERATION: &str = "federation.import";
 

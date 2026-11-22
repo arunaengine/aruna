@@ -30,7 +30,7 @@ use super::rows::{
     Row, Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected, values,
 };
-use crate::realm::mutate_placement::node_kind;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 pub(crate) const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';

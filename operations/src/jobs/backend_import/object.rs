@@ -33,7 +33,7 @@ use super::{
     trusted_listing,
 };
 use crate::jobs::import_listing::ListingNote;
-use crate::s3::object::put::{PutObjectError, PutObjectResult};
+use aruna_ops_data::s3::object::put::{PutObjectError, PutObjectResult};
 
 #[derive(Debug, PartialEq)]
 enum Step {

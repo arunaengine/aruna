@@ -40,8 +40,8 @@ use crate::jobs::records::project::{
 use crate::jobs::route::{JobRouteError, RoutedJobStatus};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
-use crate::secrets::owner::WriterView;
 use aruna_core::job_request::session_of;
+use aruna_ops_identity::secrets::owner::WriterView;
 
 /// A projection that lost its transaction every time is busy, not failed: the
 /// caller reads again rather than seeing a storage error.

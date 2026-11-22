@@ -30,9 +30,9 @@ use super::outgoing::outgoing;
 use super::peer::{ask_peer, peer_answer};
 use super::secret_use::{ReleaseFailure, ReleaseSecret};
 use super::unavailable;
-use crate::realm::mutate_placement::is_management;
 use aruna_core::install_work::{RequestContext, WorkRow};
 use aruna_core::metadata::protocol::MetadataTransportMessage;
+use aruna_ops_identity::realm::mutate_placement::is_management;
 
 /// The fields of a release that brought them; one that names a held value is refused.
 pub(crate) fn fresh_fields(

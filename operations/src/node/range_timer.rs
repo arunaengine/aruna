@@ -13,11 +13,11 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::NodeRealm;
 use tracing::warn;
 
-use crate::distribution::imports::KeptStart;
 use crate::jobs::handed_imports::{StartKeptError, StartKeptOperation};
-use crate::metadata::data_links::{DataLinkError, RetryUnverifiedOperation};
-use crate::transfer::sharding::{MaintainPass, maintain_ranges, maintain_retry};
 use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
+use aruna_ops_data::distribution::imports::KeptStart;
+use aruna_ops_data::metadata::data_links::{DataLinkError, RetryUnverifiedOperation};
+use aruna_ops_data::transfer::sharding::{MaintainPass, maintain_ranges, maintain_retry};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum RangeStage {

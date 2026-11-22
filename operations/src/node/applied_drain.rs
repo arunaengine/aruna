@@ -17,10 +17,10 @@ use aruna_core::types::Key;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::metadata::after_sync::{AfterSyncError, AfterSyncOperation, MetadataTimings};
 use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
+use aruna_ops_data::metadata::after_sync::{AfterSyncError, AfterSyncOperation, MetadataTimings};
 
 /// Rows one page of the drain reads at most.
 pub(crate) const APPLIED_DRAIN_PAGE: usize = 16;
@@ -557,7 +557,7 @@ mod tests {
     fn batch(id: Ulid, event: Ulid) -> AppliedSync {
         let mut row = applied(Some(realm()), AppliedStep::Metadata);
         row.id = id;
-        let created = crate::metadata::raw_revision::tests::test_event(event, 1);
+        let created = aruna_ops_data::testing::metadata_event(event, 1);
         row.result.metadata_create_events = vec![created];
         row
     }

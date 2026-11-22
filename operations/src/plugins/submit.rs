@@ -23,8 +23,8 @@ use super::objects::{LocalObject, Unmarked};
 use super::rows::encode;
 use super::unavailable;
 use super::work::{Reserve, ReserveWork, WorkError, reserve};
-use crate::auth::install_access::Authorize;
 use aruna_core::install_work::{Identity, RequestContext, WorkKind, WorkRow, WorkState};
+use aruna_ops_identity::auth::install_access::Authorize;
 
 /// Unfinished in-process work one install may have at a time.
 pub const WORK_ACTIVE: u32 = 8;

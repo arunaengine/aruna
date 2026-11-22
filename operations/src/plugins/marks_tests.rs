@@ -12,9 +12,9 @@ use crate::plugins::rows::tests::child_result;
 use crate::plugins::rows::tests::values_result;
 use crate::plugins::rows::write_rows;
 use crate::plugins::test_support::edit_work;
-use crate::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_core::calls::IoCall;
 use aruna_drivers::driver::DriverContext;
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::ready_copy;
 

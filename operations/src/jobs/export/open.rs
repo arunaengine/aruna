@@ -20,9 +20,9 @@ use super::resolve::{
 };
 use super::sources::export_failure;
 use super::{CandidateOpen, ExportFailure, OpenStatus, SourceScope};
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::ManagedReadOperation;
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
+use aruna_ops_data::replication::managed_read::ManagedReadOperation;
 
 /// What a local open needs after the access check.
 #[derive(Debug, PartialEq)]

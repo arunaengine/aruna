@@ -12,10 +12,10 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::holder::HolderAnswer;
 use crate::notifications::placement::resolve_inbox_holder;
 use crate::notifications::user_call::{UserAnswer, WatchDispatchError};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Outcome of serving a user's inbox call through the resolved holder.
 #[derive(Debug, Error, PartialEq)]

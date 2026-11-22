@@ -11,10 +11,12 @@ use aruna_core::types::{GroupId, Key};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::harvest_rows::{connector_key, connector_prefix, connector_secret_key};
 use crate::harvest::repository::HARVEST_PAGE_SIZE;
 use aruna_core::errors::StorageReadError;
 use aruna_core::storage_read::decode_row;
+use aruna_ops_data::connectors::harvest_rows::{
+    connector_key, connector_prefix, connector_secret_key,
+};
 
 /// A stored connector and whether a secret row exists for it; the secret itself stays hidden.
 #[derive(Clone, Debug, PartialEq, Eq)]

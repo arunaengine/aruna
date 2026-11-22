@@ -14,21 +14,21 @@ use aruna_core::structs::synced_folder::{FolderState, SyncedFolder};
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::device::publish_queue::DrainOutcome;
-use crate::device::sync::folders::FolderError;
-use crate::device::sync::folders::bind::finish_binding;
-use crate::device::sync::folders::reads::list_folders;
-use crate::device::sync::folders::unbind::finish_unbind;
-use crate::device::sync::reconcile::ReconcilePlan;
-use crate::device::sync::{
+use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
+use aruna_ops_data::device::publish_queue::DrainOutcome;
+use aruna_ops_data::device::sync::folders::FolderError;
+use aruna_ops_data::device::sync::folders::bind::finish_binding;
+use aruna_ops_data::device::sync::folders::reads::list_folders;
+use aruna_ops_data::device::sync::folders::unbind::finish_unbind;
+use aruna_ops_data::device::sync::reconcile::ReconcilePlan;
+use aruna_ops_data::device::sync::{
     RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER, ReconcileFolderError,
     folder_pass,
 };
-use crate::device_node::realm_documents::fetch_realm_documents;
-use crate::device_node::sync_note::{NoteError, NoteSyncOperation, SyncNote};
-use crate::metadata::device::refresh::refresh_replicas;
-use crate::queue_backoff::retry_delay_ms;
-use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
+use aruna_ops_data::metadata::device::refresh::refresh_replicas;
+use aruna_ops_identity::device_node::realm_documents::fetch_realm_documents;
+use aruna_ops_identity::device_node::sync_note::{NoteError, NoteSyncOperation, SyncNote};
+use aruna_ops_identity::queue_backoff::retry_delay_ms;
 
 /// How long a device keeps its copy of the realm documents before asking for them again.
 const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);

@@ -21,13 +21,13 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::user::id::UserId;
 use tracing::warn;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::opt_in::EmailError;
 use crate::notifications::setting_rows::{
     ReadSettingOperation, SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
 use crate::notifications::unexpected_event;
-use crate::realm_vault::{PruneCacheOperation, RealmSecretError};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm_vault::{PruneCacheOperation, RealmSecretError};
 
 /// Whether a mail sender can be built from `settings`: a valid sender address and host. The
 /// output is the reason it cannot.

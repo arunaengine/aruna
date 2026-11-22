@@ -21,16 +21,16 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::device_admission::{BackendAdmission, select_offer};
 use crate::jobs::store::list_jobs::{ListJobsError, ListJobsOperation};
 use crate::jobs::submit::execution::{ExecutionSubmission, SubmitExecutionOperation};
 use crate::jobs::workflow::compute::{compute_answer, compute_call};
-use crate::realm::mutate_placement::node_kind;
-use crate::s3::object::head::{
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 /// Unfinished runs one status scan counts before it stops. A device queues its
 /// owner's work, not a realm's, so the count is bounded instead of paged.

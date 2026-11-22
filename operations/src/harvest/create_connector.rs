@@ -15,8 +15,8 @@ use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
 use thiserror::Error;
 
-use crate::connectors::harvest_rows::{INVENIO_TOKEN, connector_writes};
-use crate::endpoint_screening;
+use aruna_ops_data::connectors::harvest_rows::{INVENIO_TOKEN, connector_writes};
+use aruna_ops_identity::endpoint_screening;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct CreateConnectorInput {
@@ -225,12 +225,13 @@ impl Operation for CreateConnectorOperation {
             connector,
             has_secret_config: secret.is_some(),
         });
-        let write = crate::groups::fence::write_group_records(self.input.group_id, writes);
+        let write =
+            aruna_ops_identity::groups::fence::write_group_records(self.input.group_id, writes);
         Ok(Next::Call(write.into()))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CreateConnectorError> {
-        crate::groups::fence::group_write_result(result.event()?)?;
+        aruna_ops_identity::groups::fence::group_write_result(result.event()?)?;
         let result = self.result.take().ok_or(CreateConnectorError::Failed)?;
         Ok(Next::Done(result))
     }
@@ -239,11 +240,11 @@ impl Operation for CreateConnectorOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectors::harvest_rows::{parse_connector_read, read_connector_effect};
     use aruna_core::calls::IoCall;
     use aruna_core::events::{Event, StorageEvent};
     use aruna_core::handle::Handle;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_ops_data::connectors::harvest_rows::{parse_connector_read, read_connector_effect};
     use aruna_storage::storage;
     use tempfile::tempdir;
 

@@ -16,7 +16,7 @@ use aruna_core::types::Key;
 use tracing::warn;
 
 use super::origin::EmitEventOperation;
-use crate::queue_backoff::due_after;
+use aruna_ops_identity::queue_backoff::due_after;
 
 /// Rows one page of the drain reads at most.
 pub(crate) const WATCH_DRAIN_PAGE: usize = 64;

@@ -30,7 +30,7 @@ use super::rows::StoreError;
 use super::runs::{RunError, admit, declared_trigger, enqueue_timer, new_run};
 use super::secret_use::{ReleaseFailure, SelectSecret, Selected};
 use super::settings::{SettingError, check_fields};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 #[derive(Debug, PartialEq, thiserror::Error)]
 pub enum StartError {

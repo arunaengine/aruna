@@ -23,9 +23,9 @@ use super::copy::rows::{
 };
 use super::peer::{ask_peer, peer_answer};
 use super::rows::StoreError;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::realm::mutate_placement::{is_management, node_kind};
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::mutate_placement::{is_management, node_kind};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum ArtifactError {

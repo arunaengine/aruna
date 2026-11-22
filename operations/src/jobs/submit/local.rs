@@ -29,8 +29,8 @@ use super::super::store::mutation_error::JobMutationError;
 use super::super::store::row_calls::{find_dedup_plan, read_job_record};
 use super::execution::mint_unplaced;
 use super::{SubmitJobOperation, SubmitJobSpec};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 fn unavailable(reason: &str) -> SubmitJobError {
     SubmitJobError::PlacementUnavailable(reason.to_string())

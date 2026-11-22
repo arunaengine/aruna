@@ -18,6 +18,8 @@ members = [
     "storage",
     "net",
     "tasks",
+    "ops-identity",
+    "ops-data",
     "operations",
     "drivers",
     "outbound",
@@ -59,6 +61,8 @@ aruna-core = { path = "core" }
 aruna-graph = { path = "graph" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
+aruna-ops-data = { path = "ops-data" }
+aruna-ops-identity = { path = "ops-identity" }
 aruna-drivers = { path = "drivers" }
 aruna-outbound = { path = "outbound" }
 aruna-plugin = { path = "plugins/sdk" }

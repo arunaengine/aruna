@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use crate::plugins::account::{EnsureAccount, EnsureRole};
 use crate::plugins::calls::*;
 use crate::plugins::test_support::{
@@ -14,6 +13,7 @@ use aruna_core::effects::StorageEffect;
 use aruna_core::structs::identity::auth::{Permission as Access, Role};
 use aruna_core::structs::identity::user::User;
 use aruna_drivers::driver::drive;
+use aruna_ops_identity::groups::add_role::{AddRoleConfig, AddRoleOperation};
 use aruna_storage::storage::handle::StorageHandle;
 #[allow(unused_imports)]
 use aruna_test_support::plugins::Fixture;
@@ -288,7 +288,7 @@ async fn serializes_retries() {
 
 #[test]
 fn accesses_per_action() {
-    use crate::auth::install_access::accesses;
+    use aruna_ops_identity::auth::install_access::accesses;
     use aruna_plugin_types::permission::Permission;
     assert_eq!(
         accesses(Permission::ObjectsCopy),

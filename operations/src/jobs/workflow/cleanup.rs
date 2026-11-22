@@ -24,8 +24,8 @@ use super::super::store::job_calls::{authorize_cleanup, record_stop_tombstone};
 use super::super::store::mutation_error::JobMutationError;
 use super::compute::{attempt_call, compute_answer, compute_call};
 use super::stop_record::StopRecordOperation;
-use crate::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_core::jobs::JobRunOutcome;
+use aruna_ops_data::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 
 #[derive(Debug, PartialEq)]
 enum CleanupStep {
@@ -389,12 +389,12 @@ mod tests {
     use ulid::Ulid;
 
     use super::*;
-    use crate::s3::access::get::GetAccessOperation;
-    use crate::s3::bucket::create::CreateBucketOperation;
     use aruna_core::bucket_read::GetBucketOperation;
     use aruna_core::jobs::ProgressReporter;
     use aruna_drivers::driver::{DriverContext, drive};
     use aruna_drivers::jobs::context::JobContext;
+    use aruna_ops_data::s3::access::get::GetAccessOperation;
+    use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
     use aruna_test_support::jobs::insert_job;
 
     async fn run_terminal_cleanup(
@@ -828,7 +828,7 @@ mod tests {
         let stored = drive(GetAccessOperation::new(access.access_key), &ctx.driver).await;
         assert!(matches!(
             stored,
-            Err(crate::s3::access::get::GetAccessError::NotFound)
+            Err(aruna_ops_data::s3::access::get::GetAccessError::NotFound)
         ));
     }
 

@@ -42,14 +42,16 @@ use byteview::ByteView;
 use ulid::Ulid;
 
 use super::page_intents::PathIntents;
-use crate::placement::policy::gate::{GateContext, PolicyGateError};
-use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use crate::s3::imports::shared::{self, SharedRule, claim_file};
-use crate::s3::object::put::plain::intent_keys;
-use crate::s3::object::put::sharing::RuleScan;
-use crate::s3::object::put::{PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation};
-use crate::s3::purge_fence::PurgeFenceError;
 use aruna_core::jobs::JobRunOutcome;
+use aruna_ops_data::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use aruna_ops_data::s3::imports::shared::{self, SharedRule, claim_file};
+use aruna_ops_data::s3::object::put::plain::intent_keys;
+use aruna_ops_data::s3::object::put::sharing::RuleScan;
+use aruna_ops_data::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
+};
+use aruna_ops_data::s3::purge_fence::PurgeFenceError;
+use aruna_ops_identity::placement::policy::gate::{GateContext, PolicyGateError};
 
 /// What every operation of one import job knows about its run.
 #[derive(Clone, Debug, PartialEq)]

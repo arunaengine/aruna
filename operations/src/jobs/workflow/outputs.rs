@@ -46,28 +46,32 @@ use super::workspace::{
     output_object, output_read_error, output_replication_error, output_stage_bucket,
     put_object_error, routing_error,
 };
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::groups::routing::{BucketRules, QuotaOperation, RoutingInputsError, SnapshotOperation};
 use crate::jobs::store::job_calls::reserve_output_commits;
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
-use crate::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use crate::replication::managed_read::LocalUserOperation;
-use crate::replication::source_rules::SourceAuthOperation;
-use crate::replication::version_replication::{
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_ops_data::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use aruna_ops_data::replication::managed_read::LocalUserOperation;
+use aruna_ops_data::replication::source_rules::SourceAuthOperation;
+use aruna_ops_data::replication::version_replication::{
     ReplicateScopeError, ReplicateScopeOperation, ReplicateScopeResult, SourceAuthorization,
     SourceAuthorizationError,
 };
-use crate::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
-use crate::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
-use crate::s3::object::delete::{
+use aruna_ops_data::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
+use aruna_ops_data::s3::bucket::delete::{DeleteBucketError, DeleteBucketOperation};
+use aruna_ops_data::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use crate::s3::object::put::{
+use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::groups::routing::{
+    BucketRules, QuotaOperation, RoutingInputsError, SnapshotOperation,
+};
+use aruna_ops_identity::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 
 /// What an output capture works with.
 #[derive(Clone, Debug, PartialEq)]

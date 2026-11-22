@@ -36,9 +36,9 @@ use super::records::pages::ServingNode;
 use super::records::verify::FamilyView;
 use super::remote_key::{AcceptWakeOperation, RegisterWaitsOperation};
 use super::route::{JobRouteError, RoutedJobStatus};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::write_peer::WritePeerOperation;
-use crate::realm::load_config::config_unavailable;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::forward::write_peer::WritePeerOperation;
+use aruna_ops_identity::realm::load_config::config_unavailable;
 
 /// What a job-control request is answered with. `running` names the local attempts the
 /// receiving node must signal, because a cancel reached them.

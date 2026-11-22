@@ -30,16 +30,16 @@ use super::walk::{
     record_failure, rules_call, rules_result, with_manifest,
 };
 use super::{ItemFailure, PageFailure, StagingRun, committed, pinned};
-use crate::auth::permission_rules::PermissionRules;
-use crate::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
-use crate::s3::object::head_source::{
+use aruna_core::staging_checkpoint::checkpoint_key;
+use aruna_ops_data::connectors::resolver::{ResolveConnectorInput, ResolveConnectorOperation};
+use aruna_ops_data::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
-use crate::staging::page::import::{PageImportOperation, PreparePageOperation};
-use crate::staging::page::rows::{
+use aruna_ops_data::staging::page::import::{PageImportOperation, PreparePageOperation};
+use aruna_ops_data::staging::page::rows::{
     PageEntry, PageImportError, PageImportInput, PageImportResult, PreparedRows,
 };
-use aruna_core::staging_checkpoint::checkpoint_key;
+use aruna_ops_identity::auth::permission_rules::PermissionRules;
 
 /// Page transactions one listed page runs at most while their commits conflict.
 const PAGE_ATTEMPTS: u32 = 8;

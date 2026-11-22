@@ -26,11 +26,11 @@ use aruna_core::types::{Key, Value};
 use byteview::ByteView;
 use ulid::Ulid;
 
-use crate::metadata::id_mapping::MappingRoute;
-use crate::sync::outbox::record::{
+use aruna_core::placement::fence;
+use aruna_ops_data::metadata::id_mapping::MappingRoute;
+use aruna_ops_identity::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use aruna_core::placement::fence;
 
 /// How often a check waits for a running push before it looks again.
 pub(super) const ACTIVE_RETRY_MS: u64 = 30_000;

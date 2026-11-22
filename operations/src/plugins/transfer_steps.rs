@@ -24,11 +24,11 @@ use super::outgoing::whole_text;
 use super::rows::StoreError;
 use super::work::calls::TransferGrants;
 use super::work::{Send, WorkChange, decided, retried, update_work};
-use crate::s3::object::head::{
+use aruna_core::install_work::WorkRow;
+use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::s3::object::put::PutObjectError;
-use aruna_core::install_work::WorkRow;
+use aruna_ops_data::s3::object::put::PutObjectError;
 
 /// The install's account restricted to `patterns` with WRITE, which also reads.
 pub fn account(install: &PluginInstall, patterns: &BTreeSet<String>) -> AuthContext {

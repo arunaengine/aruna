@@ -29,7 +29,6 @@ use super::append::{AppendOutcome, AppendRecordConfig, AppendRecordOperation, Re
 use super::audit::{AuditPage, AuditScope, FamilyAuditConfig, FamilyAuditOperation};
 use super::family::{FamilyReadError, LoadFamilyOperation};
 use super::pages::{KeepPagesOperation, PageReadError, ServingNode};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::cancel::CancelRunsOperation;
 use crate::jobs::lifecycle::launch_admit::{
@@ -37,11 +36,12 @@ use crate::jobs::lifecycle::launch_admit::{
 };
 use crate::jobs::lifecycle::membership::MembershipViewOperation;
 use crate::jobs::lifecycle::witness::arm::ArmFamilyOperation;
-use crate::realm::load_config::config_unavailable;
-use crate::secrets::owner::WriterView;
 use aruna_core::metadata::protocol::{
     JobPageReply, MetadataTransportMessage, transport_message_kind,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::load_config::config_unavailable;
+use aruna_ops_identity::secrets::owner::WriterView;
 
 #[derive(Debug, PartialEq)]
 struct PageRequest {

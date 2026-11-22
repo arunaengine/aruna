@@ -183,7 +183,7 @@ fn enrollment_miss_advances() {
 fn promotion_fits_relay() {
     // A relayed promotion answers, ready or not, well before the relay gives up on it.
     let margin = Duration::from_secs(5);
-    let budget = crate::realm::promote_node::CALL_BUDGET;
+    let budget = aruna_ops_identity::realm::promote_node::CALL_BUDGET;
     assert!(budget + margin <= RELAY_TIMEOUT);
 }
 

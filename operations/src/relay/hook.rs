@@ -19,9 +19,9 @@ use super::call::{
     MAX_REPLY_BYTES, NodeCall, NodeCallOperation, RawHeader, RelayFailure, RelayReply,
 };
 use super::management::next_hops;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::plugins::dispatch::HookAuthorization;
-use crate::s3::object::member::rest::{RELAY_HOP_HEADER, rest_url};
+use aruna_ops_data::s3::object::member::rest::{RELAY_HOP_HEADER, rest_url};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 const HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 /// The answer headers a webhook provider gets back.

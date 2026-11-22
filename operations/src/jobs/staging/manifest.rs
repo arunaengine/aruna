@@ -18,10 +18,10 @@ use byteview::ByteView;
 
 use super::walk::{canonical_walker_path, read_check_call, record_failure, source_permission_path};
 use super::{ClearRowsOperation, PageFailure, StagingRun, committed};
-use crate::s3::object::head_source::{
+use aruna_ops_data::s3::object::head_source::{
     HeadSourceError, HeadSourceInput, HeadSourceOperation, HeadSourceResult,
 };
-use crate::staging::read_source::{
+use aruna_ops_data::staging::read_source::{
     ReadSourceError, ReadSourceInput, ReadSourceOperation, ReadSourceResult,
 };
 

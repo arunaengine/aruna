@@ -15,10 +15,10 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use tracing::warn;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::submit::execution::mint_unplaced;
 use crate::jobs::submit::{SubmitJobOperation, SubmitJobSpec};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// A job a repository link starts.
 #[derive(Clone, Debug, PartialEq)]

@@ -13,8 +13,8 @@ use aruna_core::types::GroupId;
 use byteview::ByteView;
 use ulid::Ulid;
 
-use crate::connectors::harvest_rows::{connector_key, connector_secret_key};
 use crate::harvest::update_connector::UpdateConnectorError;
+use aruna_ops_data::connectors::harvest_rows::{connector_key, connector_secret_key};
 
 /// The call a delete waits for.
 #[derive(Debug, PartialEq)]

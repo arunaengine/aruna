@@ -14,12 +14,12 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::jobs::records::pages::ServingNode;
 use crate::jobs::workflow::workspace::LOCKED_INPUT;
-use crate::replication::bao_read::{BaoReadError, BaoReadOutput};
-use crate::replication::managed_read::ManagedReadOperation;
 use aruna_core::replication_protocol::{BaoReadRefusal, BaoReadRequest, BaoReadTarget};
+use aruna_ops_data::blob::holders::{GetHoldersError, GetHoldersOperation};
+use aruna_ops_data::replication::bao_read::{BaoReadError, BaoReadOutput};
+use aruna_ops_data::replication::managed_read::ManagedReadOperation;
 
 /// The staged bytes of one input plus the size the caller writes with.
 #[derive(Debug, PartialEq)]

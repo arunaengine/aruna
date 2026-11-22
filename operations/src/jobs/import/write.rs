@@ -25,17 +25,17 @@ use super::{
     bucket_call, bucket_result, classify_gate, classify_put, entry_arn, entry_report, job_call,
     permission_call, permission_result, stopped_failure, stops_of, transfer_failure, unexpected,
 };
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
 use crate::harvest::read_connector::ConnectorView;
 use crate::jobs::repository::connector::ConnectorViewOperation;
 use crate::jobs::repository::invenio::reference::WriteRepositoryReference;
 use crate::jobs::repository::{TransferError, is_reference, reference_source};
-use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
-use crate::s3::object::put::{
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
+use aruna_ops_identity::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 
 /// The connector kind of a repository import in reference mode, read through its connector.
 pub(super) fn reference_kind_call(run: &ImportRun) -> Option<IoCall> {

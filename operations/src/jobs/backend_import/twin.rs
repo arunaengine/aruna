@@ -23,7 +23,7 @@ use super::{
     moved_away, observed, put_failure, put_operation, rule_guard, shared_guards, sharing,
 };
 use crate::jobs::import_listing::ListingNote;
-use crate::s3::object::put::{PutObjectError, PutObjectResult};
+use aruna_ops_data::s3::object::put::{PutObjectError, PutObjectResult};
 
 #[derive(Debug, PartialEq)]
 enum Step {

@@ -21,11 +21,11 @@ use super::plan::missing_label;
 use super::resolve_inputs::{ResolveInputsOperation, ResolvedInputs};
 use super::submission_rules::{family_view, is_device, pin_outputs};
 use super::submit_external::IngressNode;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::submit::execution::validate_execution;
 use aruna_core::job_request::{
     self, RequestIdentity, SubmissionRequest, SubmissionScope, SubmitJobError, store_workspace,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// A plugin task's request, resolved at the receiver and not yet paged, with its identity and
 /// the nodes it goes to: this node when it holds the family, else the holders.

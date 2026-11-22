@@ -39,10 +39,10 @@ use crate::jobs::demand::{DemandError, DemandSnapshotOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::updates::SettleTerminalsOperation;
-use crate::metadata::repository::FILL_PAGE_SIZE;
 use crate::node::info::write::revision_generation;
-use crate::realm::mutate_placement::node_kind;
-use crate::s3::usage::{LoadCountersError, LoadCountersOperation};
+use aruna_ops_data::metadata::repository::FILL_PAGE_SIZE;
+use aruna_ops_data::s3::usage::{LoadCountersError, LoadCountersOperation};
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 #[derive(Debug, Error, PartialEq)]
 pub enum InfoFlowError {

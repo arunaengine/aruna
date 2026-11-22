@@ -267,7 +267,7 @@ where
         match record.payload.purge_spec().filter(|_| self.settled()) {
             Some(spec) => {
                 self.step = Step::Fence;
-                let bucket = crate::s3::purge_fence::fence_key(spec.scope.bucket());
+                let bucket = aruna_ops_data::s3::purge_fence::fence_key(spec.scope.bucket());
                 let row = (PURGE_FENCE_KEYSPACE.to_string(), bucket);
                 Ok(Next::Call(IoCall::Read(vec![row])))
             }
@@ -280,8 +280,9 @@ where
         let Some(spec) = record.payload.purge_spec() else {
             return Ok(());
         };
-        let owned = crate::s3::fence_store::owned_fence_delete(value, record.job_id, &spec.scope)
-            .map_err(|error| JobMutationError::Storage(error.to_string()))?;
+        let owned =
+            aruna_ops_data::s3::fence_store::owned_fence_delete(value, record.job_id, &spec.scope)
+                .map_err(|error| JobMutationError::Storage(error.to_string()))?;
         self.terminal_deletes.extend(owned);
         self.terminal_deletes.push((
             PURGE_CHECKPOINT_KEYSPACE.to_string(),

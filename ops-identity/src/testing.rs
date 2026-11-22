@@ -1,0 +1,34 @@
+//! Builds pure fixtures for tests: fresh job ids and group backends.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::id_mint::IdMint;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structured_id::clock_health::ClockHealthError;
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_core::time::unix_timestamp_millis;
+
+/// A fresh job id for `(handle, bucket)` at the current time, as a submit would mint it.
+pub fn fresh_job_id(handle: PlacementHandle, bucket: BucketId) -> Result<JobId, ClockHealthError> {
+    let mut ids = IdMint::new(ulid::Ulid::generate().random());
+    aruna_core::job_request::mint_job_id(handle, bucket, &mut ids, unix_timestamp_millis())
+}
+
+/// An enabled or `disabled` S3 backend of group 1 that keeps its data on removal.
+pub fn group_storage(
+    backend_id: ulid::Ulid,
+    disabled: bool,
+) -> aruna_core::structs::storage::group_backend::GroupStorage {
+    aruna_core::structs::storage::group_backend::GroupStorage {
+        backend_id,
+        group_id: ulid::Ulid::from_bytes([1u8; 16]),
+        name: "tenant".to_string(),
+        kind: aruna_core::structs::storage::group_backend::GroupBackendKind::S3,
+        public_config: std::collections::HashMap::new(),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        updated_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        disabled,
+        cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
+    }
+}

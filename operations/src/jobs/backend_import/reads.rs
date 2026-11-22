@@ -32,14 +32,14 @@ use super::{
     Claim, Exact, Hashed, ImportJob, ItemError, LIST_PAGE, PageReads, TWIN_SCAN, etag_differs,
     free_path, hash_failure, item, parse, read_listed, write_intents,
 };
-use crate::blob::request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::jobs::page_intents::intent_path;
-use crate::s3::imports::shared::SharedRule;
-use crate::s3::object::delete::{
+use aruna_ops_data::blob::request::BlobRequest;
+use aruna_ops_data::s3::imports::shared::SharedRule;
+use aruna_ops_data::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use crate::s3::object::put::trail::{Trail, trail_ranges};
+use aruna_ops_data::s3::object::put::trail::{Trail, trail_ranges};
 
 /// Reads these rows in one batch.
 pub(super) fn read_call<'a>(reads: impl IntoIterator<Item = (&'a str, Key)>) -> IoCall {

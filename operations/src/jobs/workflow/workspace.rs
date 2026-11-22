@@ -26,14 +26,14 @@ use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::replication::ReplicationFailure;
 use ulid::Ulid;
 
-use crate::groups::routing::RoutingInputsError;
 use crate::jobs::lifecycle::stage::stage_error;
-use crate::placement::policy::gate::GateContextError;
-use crate::replication::bao_read::BaoReadError;
-use crate::s3::object::get::GetObjectError;
-use crate::s3::object::put::{PutObjectError, PutObjectResult};
 use aruna_core::bucket_read::GetBucketError;
 use aruna_core::replication_protocol::BaoReadRefusal;
+use aruna_ops_data::replication::bao_read::BaoReadError;
+use aruna_ops_data::s3::object::get::GetObjectError;
+use aruna_ops_data::s3::object::put::{PutObjectError, PutObjectResult};
+use aruna_ops_identity::groups::routing::RoutingInputsError;
+use aruna_ops_identity::placement::policy::gate::GateContextError;
 
 /// One declared input resolved to the object it names.
 #[derive(Clone, Debug, PartialEq)]
@@ -248,7 +248,7 @@ pub struct StagedSource {
 }
 
 impl StagedSource {
-    pub(super) fn from_local(get: crate::s3::object::get::GetObjectResult) -> Self {
+    pub(super) fn from_local(get: aruna_ops_data::s3::object::get::GetObjectResult) -> Self {
         Self {
             blob: get.blob,
             location: get.location,
@@ -468,8 +468,8 @@ mod tests {
     use super::super::inventory::CollectOutputsOperation;
     use super::super::outputs::{input_refs, uncaptured_input};
     use super::*;
-    use crate::s3::access::get::GetAccessOperation;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_ops_data::s3::access::get::GetAccessOperation;
 
     fn run_of(
         context: &DriverContext,

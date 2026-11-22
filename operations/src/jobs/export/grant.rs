@@ -35,8 +35,8 @@ use url::Url;
 use super::ExportCheckpoint;
 use crate::federation::access::{AccessCheckOperation, access_granted};
 use crate::federation::records::{RecordChange, RecordError, RecordOutcome, change_call};
-use crate::replication::plaintext::{HolderCheckOperation, PlaintextError};
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_ops_data::replication::plaintext::{HolderCheckOperation, PlaintextError};
 
 const EXPORT_OPERATION: &str = "federation.export";
 

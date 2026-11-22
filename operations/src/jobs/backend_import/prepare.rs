@@ -26,15 +26,17 @@ use aruna_core::types::Value;
 
 use super::reads::read_call;
 use super::{ImportJob, ImportRun, PageReads, permanent, retryable};
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::groups::backends::query::{GetBackendOperation, GroupQueryError};
-use crate::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
-use crate::placement::policy::gate::{GateContext, GateContextError, GateOperation};
-use crate::s3::imports::folders::shares_folder;
-use crate::s3::imports::shared::SharedRule;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
+use aruna_ops_data::s3::imports::folders::shares_folder;
+use aruna_ops_data::s3::imports::shared::SharedRule;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::groups::backends::query::{GetBackendOperation, GroupQueryError};
+use aruna_ops_identity::groups::routing::{BucketRules, RoutingInputsError, SnapshotOperation};
+use aruna_ops_identity::placement::policy::gate::{GateContext, GateContextError, GateOperation};
 
 /// Rule rows one page of the group's rules reads.
 const RULE_PAGE: usize = 256;

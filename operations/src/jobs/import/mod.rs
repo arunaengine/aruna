@@ -45,15 +45,17 @@ use ulid::Ulid;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document};
 use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::metadata::forward::write::MetadataWriteError;
-use crate::placement::policy::gate::GateContextError;
-use crate::s3::object::get::GetObjectError;
-use crate::s3::object::put::PutObjectError;
-use crate::staging::read_source::ReadSourceError;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::remote::NodeScope;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::s3::object::get::GetObjectError;
+use aruna_ops_data::s3::object::put::PutObjectError;
+use aruna_ops_data::staging::read_source::ReadSourceError;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::placement::policy::gate::GateContextError;
 
 /// What every operation of one import run knows about it.
 #[derive(Clone, Debug, PartialEq)]
@@ -993,7 +995,7 @@ pub(crate) mod tests {
             completeness: aruna_core::metadata::ProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::metadata::create_document::CreateDocumentError::MetadataError(
+            aruna_ops_data::metadata::create_document::CreateDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));

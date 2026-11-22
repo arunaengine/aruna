@@ -7,8 +7,8 @@ use std::time::SystemTime;
 use aruna_core::user::id::UserId;
 use ulid::Ulid;
 
-use crate::metadata::api::fanout_types::MetadataFanoutStats;
 use aruna_core::search::BucketSearchHit;
+use aruna_ops_data::metadata::api::fanout_types::MetadataFanoutStats;
 
 use super::*;
 

@@ -17,10 +17,12 @@ use aruna_core::types::{GroupId, Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::connectors::harvest_rows::{connector_key, connector_secret_key, connector_writes};
-use crate::groups::fence::group_fence_key;
 use crate::harvest::create_connector::{CreateConnectorError, validate_connector};
 use crate::harvest::read_connector::ConnectorView;
+use aruna_ops_data::connectors::harvest_rows::{
+    connector_key, connector_secret_key, connector_writes,
+};
+use aruna_ops_identity::groups::fence::group_fence_key;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct UpdateConnectorInput {

@@ -22,7 +22,7 @@ use super::rows::{
     Row, Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected,
 };
-use crate::auth::install_access::covers;
+use aruna_ops_identity::auth::install_access::covers;
 
 /// An active install with event triggers, as the matcher sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]

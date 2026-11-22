@@ -9,9 +9,9 @@ use aruna_core::operation::Operation;
 
 use super::artifacts::{ServingNode, served_config};
 use super::peer::{ask_peer, peer_answer};
-use crate::document_repository::GetConfigOperation;
-use crate::realm::mutate_placement::node_kind;
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 /// Supported clock skew between nodes; a replay starts this much before its mapped boundary.
 pub const SKEW_MARGIN_MS: u64 = 5 * 60 * 1000;

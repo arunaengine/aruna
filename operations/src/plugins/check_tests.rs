@@ -4,11 +4,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::auth::install_access::covers;
 use crate::plugins::calls::*;
 use crate::plugins::test_support::{install_as, install_request};
 use crate::tests::calls::{compiled, values_of};
 use aruna_drivers::driver::drive;
+use aruna_ops_identity::auth::install_access::covers;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::queued;
 

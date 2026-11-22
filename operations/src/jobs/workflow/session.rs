@@ -26,13 +26,13 @@ use ulid::Ulid;
 
 use super::credential::{MintCredentialOperation, RunIdentity, WorkspaceCredential};
 use super::input_view::{view_bucket, view_entries};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::session::SessionOperation;
 use crate::jobs::store::job_calls::put_job_entry;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls::read_job_record;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// What a session's start needs to know beyond the job itself.
 #[derive(Debug, PartialEq)]

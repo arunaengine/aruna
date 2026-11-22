@@ -34,7 +34,7 @@ use super::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
 use super::store::mutation_error::JobMutationError;
 use super::store::park_wake::AwaitOutcome;
 use super::store::row_calls::{park_job, satisfy_key_wait};
-use crate::blob::unlocked::KeyUnlockedOperation;
+use aruna_ops_data::blob::unlocked::KeyUnlockedOperation;
 
 /// Aliases of one content checked on this node; a content beyond them stays unknown.
 pub(crate) const ALIAS_PAGE: usize = 64;

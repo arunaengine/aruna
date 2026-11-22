@@ -44,7 +44,6 @@ use super::membership::MembershipViewOperation;
 use super::outbox::schedule_outbox_drain;
 use super::plan::network_access;
 use super::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::fence::{fence_read, fence_up};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
@@ -58,8 +57,9 @@ use crate::jobs::records::pages::{
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::records::verify::FamilyView;
 use crate::jobs::submit::schedule_drain_effect;
-use crate::secrets::owner::WriterView;
 use aruna_core::job_request::{mint_configured_job, workspace_of};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::secrets::owner::WriterView;
 
 /// Wall-clock budget of the record fetch that pulls a missing stored spec.
 const FETCH_DEADLINE: Duration = Duration::from_secs(10);

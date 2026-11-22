@@ -23,11 +23,11 @@ test:
 	cargo nextest run --workspace --all-targets --all-features --locked --profile ci
 	cargo test --workspace --all-features --locked --doc
 
-# The fast editing loop: selects the aruna-core and aruna-operations lib test
+# The fast editing loop: selects the core and operations crate lib test
 # targets, still compiles their transitive dependencies, and executes only the
 # audited no-I/O state-machine, pure, decision and reducer tests.
 test-fast:
-	cargo nextest run -p aruna-core -p aruna-operations --lib --locked --profile fast
+	cargo nextest run -p aruna-core -p aruna-ops-identity -p aruna-ops-data -p aruna-operations --lib --locked --profile fast
 
 # The same selection across every workspace target; compiles more than it runs.
 test-fast-workspace:
