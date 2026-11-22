@@ -30,7 +30,7 @@ pub(crate) const RESERVED_DIR: &str = ".aruna";
 pub(crate) const SPOOL_DIR: &str = ".aruna/tmp";
 
 /// Directory a guarded write moves the owner's displaced file into, under an id that
-/// mirrors its path. No sweep removes it; a restart publishes it as a conflict copy.
+/// mirrors its path. No sweep removes it; a check after its write ended publishes it.
 pub(crate) const KEPT_DIR: &str = ".aruna/kept";
 
 /// How long a spool file is left alone. A sweep runs on every folder check and
