@@ -588,6 +588,14 @@ impl<P: Operation> CallRun<P> {
     }
 
     fn request(&mut self, mut call: IoCall) -> Effects {
+        if self.txn_id.is_some()
+            && let Some(got) = forbidden_in_txn(&call, self.mode)
+        {
+            return self.fail_io(unexpected(
+                "no slow external call inside a transaction",
+                got,
+            ));
+        }
         let txn_id = self.txn_for(&mut call);
         match call_effect(call, txn_id) {
             Ok((wait, effect)) => {
@@ -610,6 +618,14 @@ impl<P: Operation> CallRun<P> {
                 ..
             }))) => members.into_iter().collect(),
             Ok(Next::Call(mut call)) => {
+                if self.txn_id.is_some()
+                    && let Some(got) = forbidden_in_txn(&call, self.mode)
+                {
+                    return self.fail_io(unexpected(
+                        "no slow external call inside a transaction",
+                        got,
+                    ));
+                }
                 let txn_id = self.txn_for(&mut call);
                 match call_effect(call, txn_id) {
                     Ok((_, effect)) => smallvec![effect],
@@ -899,6 +915,25 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
         IoCall::Read(reads) if reads.is_empty() => Some(IoResult::Values(Vec::new())),
         IoCall::Write(rows) if rows.is_empty() => Some(IoResult::Done),
         IoCall::Delete(keys) if keys.is_empty() => Some(IoResult::Done),
+        _ => None,
+    }
+}
+
+/// Slow external calls refused while a storage transaction is open.
+fn forbidden_in_txn(call: &IoCall, mode: TransactionMode) -> Option<&'static str> {
+    match call {
+        IoCall::Delay(_) => Some("IoCall::Delay inside a transaction"),
+        IoCall::Effect(effect) => match effect.as_ref() {
+            Effect::StagingSource(_) => Some("Effect::StagingSource inside a transaction"),
+            Effect::Outbound(_) => Some("Effect::Outbound inside a transaction"),
+            Effect::Compute(_) => Some("Effect::Compute inside a transaction"),
+            Effect::Git(_) => Some("Effect::Git inside a transaction"),
+            Effect::Plugin(_) => Some("Effect::Plugin inside a transaction"),
+            Effect::Blob(_) if mode == TransactionMode::Write => {
+                Some("Effect::Blob inside a write transaction")
+            }
+            _ => None,
+        },
         _ => None,
     }
 }

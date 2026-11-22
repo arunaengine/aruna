@@ -498,6 +498,50 @@ fn refuses_control_effect() {
 }
 
 #[test]
+fn refuses_slow_calls() {
+    // Delays and blob calls are refused while a write transaction is open, aborting it.
+    let abort = || storage(StorageEffect::AbortTransaction { txn_id: txn() });
+    let delay = IoCall::Delay(Duration::from_secs(1));
+    let mut operation = run(script(vec![read_a(), delay]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "IoCall::Delay inside a transaction",
+        })
+    );
+
+    let id = ulid::Ulid::from(8u128);
+    let release = IoCall::blob(BlobEffect::ReleaseReservation { id });
+    let mut operation = run(script(vec![read_a(), release]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "Effect::Blob inside a write transaction",
+        })
+    );
+
+    // Before the transaction opens, a blob call still runs normally.
+    let before = IoCall::blob(BlobEffect::ReleaseReservation { id });
+    let mut operation = run(script(vec![before, read_a()]), true);
+    assert_eq!(
+        operation.start().as_slice(),
+        &[Effect::blob(BlobEffect::ReleaseReservation { id })]
+    );
+}
+
+#[test]
 fn abort_ends_transaction() {
     let mut operation = run(script(vec![read_a()]), true);
     operation.start();

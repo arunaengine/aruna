@@ -67,6 +67,7 @@ use crate::metadata::queue_timer::{MaterializationRunOperation, PruneRunOperatio
 use crate::metadata::serve::ServedReply;
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::catch_up::{CATCH_UP_REFRESH, CatchUpOperation, next_pass};
+use crate::node::folder_timer::FolderTimerOperation;
 use crate::node::heartbeat::ReceiveHeartbeatOperation;
 use crate::node::info_timer::InfoTimerOperation;
 use crate::node::outbox::rotation_run::RotationRunOperation;
@@ -119,6 +120,8 @@ pub struct TimerMemory {
     /// Outbox records whose op this process already created, with the lineage of the topic and
     /// the row they were published from, so a retry of that row on that lineage only syncs.
     pub published: Arc<BTreeMap<Vec<u8>, Publication>>,
+    /// Earliest timestamp in milliseconds when a throttled pass may run again.
+    pub due_ms: u64,
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -315,6 +318,7 @@ pub enum TimerOperation {
     RefreshBlobHolders(HoldersTimerOperation),
     DrainUploadOutbox(crate::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
+    ReconcileSyncedFolders(FolderTimerOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -515,6 +519,9 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::DrainDeviceIntake => Some(TimerOperation::DrainDeviceIntake(drain_publish_queue(
             input.serving,
         ))),
+        TaskKey::ReconcileSyncedFolders => Some(TimerOperation::ReconcileSyncedFolders(
+            FolderTimerOperation::new(input),
+        )),
         _ => None,
     }
 }
@@ -569,6 +576,7 @@ macro_rules! each_timer {
             TimerOperation::RefreshBlobHolders($operation) => $body,
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
+            TimerOperation::ReconcileSyncedFolders($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -707,6 +715,12 @@ impl TimerRun for CleanupTimerOperation {
 }
 
 impl TimerRun for PresenceTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for FolderTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
     }
