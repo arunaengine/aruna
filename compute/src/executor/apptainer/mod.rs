@@ -120,9 +120,14 @@ impl ApptainerBackend {
             .unwrap_or_default();
         let temp =
             directory.with_file_name(format!("{}.{}.tmp", name, context.controller_generation));
-        remove_staging_temps(&directory)?;
-        std::fs::create_dir_all(temp.join("workspace/root")).map_err(io_error)?;
-        std::fs::create_dir_all(temp.join("logs")).map_err(io_error)?;
+        let (target, staging) = (directory.clone(), temp.clone());
+        tokio::task::spawn_blocking(move || -> Result<(), BackendError> {
+            remove_staging_temps(&target)?;
+            std::fs::create_dir_all(staging.join("workspace/root")).map_err(io_error)?;
+            std::fs::create_dir_all(staging.join("logs")).map_err(io_error)
+        })
+        .await
+        .map_err(|error| BackendError::Api(format!("Apptainer staging task failed: {error}")))??;
         let layout_digest = plan.layout.digest();
         let binds = stage_files(&temp, plan).await?;
         let argv = command_argv(spec, &metadata)?;
@@ -155,17 +160,21 @@ impl ApptainerBackend {
             cpu_cores: u32::try_from(cores).unwrap_or(u32::MAX),
             isolated_network: spec.security.network == NetworkAccess::Isolated,
         };
-        write_json(&temp.join("attempt.json"), &record)?;
-        write_json(&temp.join("launch.json"), &launch)?;
-        sync_dir(&temp)?;
-        remove_tree(&directory)?;
-        std::fs::rename(&temp, &directory).map_err(io_error)?;
-        sync_dir(
-            directory
-                .parent()
-                .ok_or_else(|| BackendError::Api("attempt path has no parent".to_string()))?,
-        )?;
-        Ok(directory)
+        tokio::task::spawn_blocking(move || -> Result<PathBuf, BackendError> {
+            write_json(&temp.join("attempt.json"), &record)?;
+            write_json(&temp.join("launch.json"), &launch)?;
+            sync_dir(&temp)?;
+            remove_tree(&directory)?;
+            std::fs::rename(&temp, &directory).map_err(io_error)?;
+            sync_dir(
+                directory
+                    .parent()
+                    .ok_or_else(|| BackendError::Api("attempt path has no parent".to_string()))?,
+            )?;
+            Ok(directory)
+        })
+        .await
+        .map_err(|error| BackendError::Api(format!("Apptainer attempt task failed: {error}")))?
     }
 
     async fn spawn_supervisor(
@@ -194,8 +203,7 @@ impl ApptainerBackend {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if cancel.is_cancelled() {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap(child).await;
                 return Err(BackendError::Cancelled);
             }
             if directory.join("supervisor.json").exists() {
@@ -207,8 +215,7 @@ impl ApptainerBackend {
                 )));
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                reap(child).await;
                 return Err(BackendError::Timeout(
                     "Apptainer supervisor readiness timed out".to_string(),
                 ));
@@ -1146,6 +1153,12 @@ fn validate_env_key(key: &str) -> Result<(), BackendError> {
         )));
     }
     Ok(())
+}
+
+/// Kills a supervisor process and waits for its exit on the blocking pool.
+async fn reap(mut child: std::process::Child) {
+    let _ = child.kill();
+    let _ = tokio::task::spawn_blocking(move || child.wait()).await;
 }
 
 /// Staging temps are generation-keyed, so a handoff strands foreign generations

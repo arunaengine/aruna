@@ -257,6 +257,7 @@ impl FjallStorage {
         self.txn_rows.remove(&txn_id);
         self.usage_views.remove(&txn_id);
         self.config_txns.remove(&txn_id);
+        self.cache.take(txn_id);
         // A read still running in the transaction drops the last handle, which rolls it back.
         match self.txns.remove(&txn_id) {
             Some(Txn::Write(_) | Txn::Read(_)) => StorageEvent::TransactionAborted { txn_id },
@@ -304,6 +305,7 @@ impl FjallStorage {
         }
 
         let config_txn = self.config_txns.remove(&txn_id);
+        let cached = self.cache.take(txn_id);
         self.usage_views.remove(&txn_id);
         let rows = self.txn_rows.remove(&txn_id).unwrap_or_default();
         match self.txns.remove(&txn_id) {
@@ -329,7 +331,9 @@ impl FjallStorage {
                     let error = StorageError::RolledBack(Box::new(error));
                     return StorageEvent::Error { error };
                 }
+                self.cache.begin(&cached);
                 let committed = txn.commit();
+                self.cache.finish(&cached);
                 self.take_txn_deletes(txn_id, matches!(committed, Ok(Ok(()))));
                 // An unknown outcome may still have committed.
                 if config_txn && !matches!(committed, Ok(Err(_))) {

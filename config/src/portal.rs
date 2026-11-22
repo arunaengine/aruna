@@ -10,7 +10,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tar::Archive;
@@ -26,6 +26,10 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_ARTIFACT_BYTES: usize = 256 << 20;
 const MAX_CHECKSUM_BYTES: usize = 4 << 10;
+/// Unpacked tar stream bytes and entries an archive may have, so a small download cannot
+/// expand without bound.
+const MAX_EXTRACT_BYTES: u64 = 512 << 20;
+const MAX_ARCHIVE_ENTRIES: usize = 16_384;
 
 pub async fn update_artifact(
     config: PortalArtifactConfig,
@@ -36,7 +40,11 @@ pub async fn update_artifact(
 /// The installed artifact, or a fresh install of it; a failure is reported in the status.
 pub async fn prepare_artifact_status(config: PortalArtifactConfig) -> PortalStatus {
     let mut cache_error = None;
-    match load_existing_status(&config) {
+    let cached = config.clone();
+    let existing = tokio::task::spawn_blocking(move || load_existing_status(&cached))
+        .await
+        .unwrap_or_else(|error| Err(error.into()));
+    match existing {
         Ok(Some(status)) => return status,
         Ok(None) => {}
         Err(error) => cache_error = Some(error.to_string()),
@@ -504,10 +512,36 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<(), PortalArtifactError
 }
 
 fn unpack_archive(archive_bytes: &[u8], dest: &Path) -> Result<(), PortalArtifactError> {
-    let decoder = GzDecoder::new(Cursor::new(archive_bytes));
-    let mut archive = Archive::new(decoder);
+    unpack_bounded(archive_bytes, dest, MAX_EXTRACT_BYTES, MAX_ARCHIVE_ENTRIES)
+}
 
-    for entry in archive.entries()? {
+/// Unpacks at most `max_bytes` of decompressed tar stream, which bounds every file whatever
+/// its header claims, and at most `max_entries` entries.
+fn unpack_bounded(
+    archive_bytes: &[u8],
+    dest: &Path,
+    max_bytes: u64,
+    max_entries: usize,
+) -> Result<(), PortalArtifactError> {
+    let decoder = GzDecoder::new(Cursor::new(archive_bytes)).take(max_bytes.saturating_add(1));
+    let mut archive = Archive::new(decoder);
+    let unpacked = unpack_entries(&mut archive, dest, max_entries);
+    // Reading the extra byte means the stream is too large, whatever error it caused.
+    if archive.into_inner().limit() == 0 {
+        return Err(PortalArtifactError::ArchiveTooLarge(max_bytes));
+    }
+    unpacked
+}
+
+fn unpack_entries<R: Read>(
+    archive: &mut Archive<R>,
+    dest: &Path,
+    max_entries: usize,
+) -> Result<(), PortalArtifactError> {
+    for (index, entry) in archive.entries()?.enumerate() {
+        if index >= max_entries {
+            return Err(PortalArtifactError::TooManyEntries(max_entries));
+        }
         let mut entry = entry?;
         let raw_path = entry.path()?.into_owned();
         let entry_type = entry.header().entry_type();
@@ -711,6 +745,10 @@ pub enum PortalArtifactError {
     MissingIndexHtml,
     #[error("portal download is larger than {0} bytes")]
     TooLarge(usize),
+    #[error("portal artifact archive unpacks to more than {0} bytes")]
+    ArchiveTooLarge(u64),
+    #[error("portal artifact archive has more than {0} entries")]
+    TooManyEntries(usize),
     #[error("portal install failed ({install}); the previous portal is kept at {backup:?}")]
     RollbackFailed {
         backup: PathBuf,
@@ -737,7 +775,7 @@ mod tests {
         claim_backup, existing_install, install_parent, install_verified_artifact,
         installed_status, lock_install, portal_dir, prepare_artifact_status, previous_install,
         rename_new, replace_portable, restore_backup, safe_archive_path, unpack_archive,
-        verify_sha256,
+        unpack_bounded, verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -785,6 +823,33 @@ mod tests {
             unpack_archive(&archive, tempdir.path()),
             Err(PortalArtifactError::ArchiveLink(_))
         ));
+    }
+
+    #[test]
+    fn unpack_limits_entries() {
+        let archive = archive_of(&["a.txt", "b.txt", "c.txt", "d.txt"], 1);
+        let tempdir = tempdir().unwrap();
+
+        assert!(matches!(
+            unpack_bounded(&archive, tempdir.path(), 1 << 20, 3),
+            Err(PortalArtifactError::TooManyEntries(3))
+        ));
+        unpack_bounded(&archive, tempdir.path().join("all").as_path(), 1 << 20, 4).unwrap();
+    }
+
+    #[test]
+    fn unpack_limits_bytes() {
+        // Zeros compress to almost nothing, like an archive bomb, yet unpack past the limit.
+        let archive = archive_of(&["index.html"], 64 << 10);
+        let tempdir = tempdir().unwrap();
+
+        assert!(archive.len() < 1 << 10);
+        assert!(matches!(
+            unpack_bounded(&archive, tempdir.path(), 1 << 10, 16),
+            Err(PortalArtifactError::ArchiveTooLarge(1024))
+        ));
+        let unpacked = fs::metadata(tempdir.path().join("index.html")).map_or(0, |file| file.len());
+        assert!(unpacked <= 1 << 10);
     }
 
     #[test]
@@ -1208,6 +1273,24 @@ mod tests {
             verify_sha256(bytes, &"0".repeat(64)),
             Err(PortalArtifactError::ChecksumMismatch { .. })
         ));
+    }
+
+    /// A gzip tar of regular files, each holding `size` zero bytes.
+    fn archive_of(paths: &[&str], size: usize) -> Vec<u8> {
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = Builder::new(&mut gz);
+            for path in paths {
+                let mut header = Header::new_gnu();
+                header.set_entry_type(EntryType::Regular);
+                header.set_path(path).unwrap();
+                header.set_size(size as u64);
+                header.set_cksum();
+                builder.append(&header, Cursor::new(vec![0; size])).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        gz.finish().unwrap()
     }
 
     fn archive_with_entry(path: &str, data: &[u8], entry_type: EntryType) -> Vec<u8> {

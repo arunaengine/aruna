@@ -374,3 +374,35 @@ async fn reopening_starts_again() {
     session.reopening();
     assert_eq!(session.snapshot().state, SessionPhase::Starting);
 }
+
+/// Polls `future` once, without waiting.
+async fn poll_once<F: Future + Unpin>(future: &mut F) -> std::task::Poll<F::Output> {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *future).poll(cx)))
+        .await
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_ask_cleans() {
+    // A caller that stops waiting leaves no pending reply behind.
+    let (session, _channel) = ready(600_000);
+    let mut asked = Box::pin(session.list_scratch("data"));
+    assert!(poll_once(&mut asked).await.is_pending());
+    assert_eq!(session.replies.lock().unwrap().len(), 1);
+    drop(asked);
+    assert!(session.replies.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn end_wakes_ask() {
+    // Ending the session answers a waiting ask at once instead of after its reply timeout.
+    let (session, _channel) = ready(600_000);
+    let mut asked = Box::pin(session.read_scratch("data/out", 0, 16));
+    assert!(poll_once(&mut asked).await.is_pending());
+    session.end(EndReason::Ended);
+    let woken = poll_once(&mut asked).await;
+    assert!(matches!(
+        woken,
+        std::task::Poll::Ready(Err(SessionError::NoReply))
+    ));
+    assert!(session.replies.lock().unwrap().is_empty());
+}

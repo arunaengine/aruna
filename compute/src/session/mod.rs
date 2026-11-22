@@ -430,6 +430,10 @@ impl Session {
             let _ = self.events.send(event);
         }
         self.done.cancel();
+        // Dropping the pending reply senders wakes every waiting `ask` at once.
+        if let Ok(mut replies) = self.replies.lock() {
+            replies.clear();
+        }
         self.bumped.notify_waiters();
     }
 
@@ -473,25 +477,25 @@ impl Session {
     }
 
     async fn ask(&self, request: HelperRequest) -> Result<Map<String, Value>, SessionError> {
-        if self.lock().phase == SessionPhase::Ended {
-            return Err(SessionError::Ended);
-        }
         let id = request.id();
         let (sender, receiver) = oneshot::channel();
         if let Ok(mut replies) = self.replies.lock() {
             replies.insert(id, sender);
         }
+        let _slot = ReplySlot {
+            replies: &self.replies,
+            id,
+        };
+        // Checked once the slot exists, so an `end` after this check drains it and wakes us.
+        if self.lock().phase == SessionPhase::Ended {
+            return Err(SessionError::Ended);
+        }
         self.requests
             .send(request)
             .await
             .map_err(|_| SessionError::Ended)?;
-        let answered = timeout(REPLY_TIMEOUT, receiver).await;
-        if answered.is_err()
-            && let Ok(mut replies) = self.replies.lock()
-        {
-            replies.remove(&id);
-        }
-        let body = answered
+        let body = timeout(REPLY_TIMEOUT, receiver)
+            .await
             .map_err(|_| SessionError::NoReply)?
             .map_err(|_| SessionError::NoReply)?;
         match body.get("error").and_then(Value::as_str) {
@@ -592,6 +596,20 @@ impl Session {
                     let _ = sender.send(body);
                 }
             }
+        }
+    }
+}
+
+/// Removes a pending reply when its `ask` returns, times out or is dropped.
+struct ReplySlot<'a> {
+    replies: &'a Mutex<HashMap<u64, oneshot::Sender<Map<String, Value>>>>,
+    id: u64,
+}
+
+impl Drop for ReplySlot<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut replies) = self.replies.lock() {
+            replies.remove(&self.id);
         }
     }
 }

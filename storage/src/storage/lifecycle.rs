@@ -12,6 +12,7 @@ use crate::compaction::Compactor;
 use crate::errors::StorageLibError;
 
 use super::handle::{EFFECT_QUEUE_CAPACITY, OpenDatabase, QUEUE_CAPACITY, StorageHandle};
+use super::hot_cache::{CacheWriter, HotCache};
 use super::metrics::WorkerLifecycleGuard;
 use super::persistence::FjallPersistPolicy;
 use super::preimage::flush_empty;
@@ -69,7 +70,8 @@ impl FjallStorage {
             .cache_size(cache_bytes)
             .open()?;
 
-        let (sender, receivers) = StorageHandle::new();
+        let (mut sender, receivers) = StorageHandle::new();
+        sender.cache = Some(Arc::new(HotCache::default()));
         let database = db.inner().clone();
         let _ = sender
             .database
@@ -139,6 +141,7 @@ impl FjallStorage {
             usage_shadow,
             usage_views: HashSet::new(),
             txn_rows: HashMap::new(),
+            cache: CacheWriter::new(handle.cache.clone()),
         }
     }
 }
