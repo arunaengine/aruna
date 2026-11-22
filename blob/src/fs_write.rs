@@ -471,41 +471,53 @@ async fn prune_kept(kept: &Path, relative: &str) {
 
 /// Publishes what ended writes left in the kept directory as conflict copies
 /// beside their original paths. Kept ids of writes still running stay.
-pub(crate) async fn recover_kept(root: &str) {
+pub(crate) async fn recover_kept(root: &str) -> Result<(), String> {
     let Ok(resolved) = canonical_root(root).await else {
-        return;
+        return Ok(());
     };
     let Ok(kept) = jailed_ancestor(&resolved, Path::new(KEPT_DIR)).await else {
-        return;
+        return Ok(());
     };
     if kept != resolved.join(KEPT_DIR) {
-        return;
+        return Ok(());
     }
     let Ok(mut reader) = tokio::fs::read_dir(kept).await else {
-        return;
+        return Ok(());
     };
+    let mut recovered = Ok(());
     while let Ok(Some(entry)) = reader.next_entry().await {
         let ended = (entry.file_name().to_str())
             .and_then(|name| Ulid::from_string(name).ok())
             .is_some_and(|id| !writing().contains(&id));
         if ended {
-            publish_kept(root, &entry.path()).await;
+            recovered = recovered.and(publish_kept(root, &entry.path()).await);
         }
     }
+    recovered
 }
 
 /// Moves each file under one kept id to a free conflict copy name beside the path
 /// it mirrors, never following a link, then removes the emptied directories.
-async fn publish_kept(root: &str, id: &Path) {
+/// A file that cannot be published stays and is named in the error.
+async fn publish_kept(root: &str, id: &Path) -> Result<(), String> {
     let mut pending = vec![(id.to_path_buf(), String::new())];
     let mut emptied = Vec::new();
+    let mut published = Ok(());
     while let Some((path, relative)) = pending.pop() {
         let Ok(entry) = tokio::fs::symlink_metadata(&path).await else {
             continue;
         };
         if entry.is_file() {
-            if let Ok((_, target)) = jailed_target(root, &relative).await {
-                let _ = rescue_displaced(&path, &target).await;
+            let rescued = match jailed_target(root, &relative).await {
+                Ok((_, target)) => rescue_displaced(&path, &target).await.is_ok(),
+                Err(_) => false,
+            };
+            if !rescued && published.is_ok() {
+                published = Err(format!(
+                    "the displaced local file for {relative} could not be published \
+                     and stays at {}",
+                    path.display()
+                ));
             }
         } else if entry.is_dir()
             && let Ok(mut reader) = tokio::fs::read_dir(&path).await
@@ -521,6 +533,7 @@ async fn publish_kept(root: &str, id: &Path) {
     for directory in emptied.iter().rev() {
         let _ = tokio::fs::remove_dir(directory).await;
     }
+    published
 }
 
 async fn write_temp(
@@ -1466,6 +1479,38 @@ mod tests {
         assert_eq!(paths.len(), 2, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));
         assert_eq!(paths[1], "moved/note.txt");
+        let copy = tokio::fs::read(root.path().join(&paths[0])).await;
+        assert_eq!(copy.unwrap(), b"owner edit");
+        let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
+        assert_eq!(ids.count(), 0);
+    }
+
+    // A kept file whose parent is now a file fails the check with both paths
+    // named, and the pass after the obstacle is gone publishes it.
+    #[tokio::test]
+    async fn reports_blocked_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let earlier = format!("{KEPT_DIR}/{}/docs/note.txt", Ulid::from_parts(1, 0));
+        let (_, kept) = jailed_target(&path, &earlier).await.unwrap();
+        tokio::fs::write(&kept, b"owner edit").await.unwrap();
+        let docs = root.path().join("docs");
+        tokio::fs::write(&docs, b"obstacle").await.unwrap();
+
+        let checked = crate::fs_source::check_local(&access(root.path(), "")).await;
+        let Err(StagingSourceError::CheckError(message)) = checked else {
+            panic!("the blocked recovery must fail the check: {checked:?}");
+        };
+        assert!(message.contains("docs/note.txt"), "{message}");
+        assert!(message.contains(&kept.display().to_string()), "{message}");
+        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
+        tokio::fs::remove_file(&docs).await.unwrap();
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        let paths = listed_paths(root.path()).await;
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(paths[0].starts_with("docs/note (conflicted copy "));
         let copy = tokio::fs::read(root.path().join(&paths[0])).await;
         assert_eq!(copy.unwrap(), b"owner edit");
         let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
