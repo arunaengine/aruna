@@ -16,7 +16,7 @@ use aruna_plugin_types::calls::{ErrorKind, HostError, Intent, ObjectInfo, Object
 use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
 
-use super::super::check::{CallError, authorize_call, matching};
+use super::super::check::{CallError, Checked, SharedChecks, matching};
 use super::super::intents::{Begun, begin, intent_row_key, settled_row, unknown_row};
 use super::super::marks::is_marked;
 use super::super::objects::LocalObject;
@@ -62,7 +62,7 @@ impl From<IoError> for CallFailure {
 
 impl From<StoreError> for CallFailure {
     fn from(error: StoreError) -> Self {
-        unavailable(error.0).into()
+        unavailable(error.detail()).into()
     }
 }
 
@@ -153,7 +153,7 @@ impl Operation for RecordCall {
                     self.phase = Some(RecordPhase::Settling(reply));
                     Ok(Next::Call(IoCall::child(write_rows(vec![row]))))
                 }
-                Err(error) => self.mark_unknown(error.0),
+                Err(error) => self.mark_unknown(error.detail()),
             },
             Err(CallEnd::None(error)) => {
                 self.phase = Some(RecordPhase::Clearing(error));
@@ -169,7 +169,7 @@ impl Operation for RecordCall {
         match self.phase.take().ok_or(IoError::Unfinished)? {
             RecordPhase::Settling(reply) => match written {
                 Ok(()) => Ok(Next::Done(reply)),
-                Err(error) => self.mark_unknown(error.0),
+                Err(error) => self.mark_unknown(error.detail()),
             },
             RecordPhase::Clearing(error) => {
                 written?;
@@ -243,7 +243,7 @@ impl StateCall {
                 };
                 self.record(CallEnd::None(HostError::new(kind, message)))
             }
-            Err(PutError::Store(error)) => self.record(CallEnd::Maybe(error.0)),
+            Err(PutError::Store(error)) => self.record(CallEnd::Maybe(error.detail())),
         }
     }
 }
@@ -438,6 +438,7 @@ pub struct VisibleObjects {
     bucket: String,
     listed: VecDeque<ListedObject>,
     visible: Vec<ObjectInfo>,
+    checks: SharedChecks,
     phase: Option<VisiblePhase>,
 }
 
@@ -454,12 +455,14 @@ impl VisibleObjects {
             bucket: bucket.to_string(),
             listed: listed.into(),
             visible: Vec::new(),
+            checks: SharedChecks::default(),
             phase: None,
         }
     }
 
-    /// The authorization of the next object the grants cover, or the finished list.
-    fn advance(&mut self) -> Next<Vec<ObjectInfo>> {
+    /// The authorization of the next object the grants cover, or the finished list. The checks
+    /// of a page share their reads and compile.
+    fn advance(&mut self) -> Result<Next<Vec<ObjectInfo>>, CallFailure> {
         let read = Permission::ObjectsRead;
         while let Some((key, size, version)) = self.listed.pop_front() {
             let (realm, node) = self.place;
@@ -469,10 +472,53 @@ impl VisibleObjects {
                 continue;
             };
             let check = Authorize::call(&self.install, read, &path, &patterns);
-            self.phase = Some(VisiblePhase::Authorizing((key, size, version)));
-            return Next::Call(authorize_call(check));
+            let object = (key, size, version);
+            match self.checks.start(check) {
+                Checked::Ask(call) => {
+                    self.phase = Some(VisiblePhase::Authorizing(object));
+                    return Ok(Next::Call(call));
+                }
+                Checked::Done(decided) => {
+                    if let Some(next) = self.decided(object, decided)? {
+                        return Ok(next);
+                    }
+                }
+            }
         }
-        Next::Done(std::mem::take(&mut self.visible))
+        Ok(Next::Done(std::mem::take(&mut self.visible)))
+    }
+
+    /// Shows an authorized object, after its mark when the version has one; `None` checks the
+    /// next. Only an unavailable check fails the page.
+    fn decided(
+        &mut self,
+        (key, size, version): ListedObject,
+        decided: Result<(), CallError>,
+    ) -> Result<Option<Next<Vec<ObjectInfo>>>, CallFailure> {
+        match decided {
+            Ok(()) => {}
+            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
+                return Err(error.into());
+            }
+            Err(_) => return Ok(None),
+        }
+        let call = marked_call(&self.bucket, &key, &version)?;
+        let info = ObjectInfo {
+            path: format!("{}/{key}", self.bucket),
+            size,
+            version,
+            marked: false,
+        };
+        match call {
+            Some(call) => {
+                self.phase = Some(VisiblePhase::Marking(Box::new(info)));
+                Ok(Some(Next::Call(call)))
+            }
+            None => {
+                self.visible.push(info);
+                Ok(None)
+            }
+        }
     }
 }
 
@@ -481,41 +527,25 @@ impl Operation for VisibleObjects {
     type Error = CallFailure;
 
     fn first(&mut self) -> Result<Next<Self::Output>, CallFailure> {
-        Ok(self.advance())
+        self.advance()
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Self::Output>, CallFailure> {
         match self.phase.take().ok_or(IoError::Unfinished)? {
-            VisiblePhase::Authorizing((key, size, version)) => {
-                match result.child::<(), CallError>()? {
-                    Ok(()) => {}
-                    Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
-                        return Err(error.into());
-                    }
-                    Err(_) => return Ok(self.advance()),
+            VisiblePhase::Authorizing(object) => match self.checks.answer(result)? {
+                Checked::Ask(call) => {
+                    self.phase = Some(VisiblePhase::Authorizing(object));
+                    Ok(Next::Call(call))
                 }
-                let call = marked_call(&self.bucket, &key, &version)?;
-                let info = ObjectInfo {
-                    path: format!("{}/{key}", self.bucket),
-                    size,
-                    version,
-                    marked: false,
-                };
-                match call {
-                    Some(call) => {
-                        self.phase = Some(VisiblePhase::Marking(Box::new(info)));
-                        Ok(Next::Call(call))
-                    }
-                    None => {
-                        self.visible.push(info);
-                        Ok(self.advance())
-                    }
-                }
-            }
+                Checked::Done(decided) => match self.decided(object, decided)? {
+                    Some(next) => Ok(next),
+                    None => self.advance(),
+                },
+            },
             VisiblePhase::Marking(mut info) => {
                 info.marked = result.child::<bool, StoreError>()??;
                 self.visible.push(*info);
-                Ok(self.advance())
+                self.advance()
             }
         }
     }

@@ -327,7 +327,7 @@ fn prune_refuses_failure() {
     };
     let read = IoResult::Child(ChildOutcome::new(Ok::<_, PruneError>(due)));
     prune.next(read).unwrap();
-    let failed = Err::<bool, _>(StoreError("down".into()));
+    let failed = Err::<bool, _>(StoreError::Message("down".into()));
     let failed = prune.next(IoResult::Child(ChildOutcome::new(failed)));
     assert_eq!(failed, Err(PruneError("down".into())), "nothing is pruned");
 }

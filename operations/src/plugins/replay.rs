@@ -192,7 +192,7 @@ impl Operation for StartReplay {
     fn first(&mut self) -> Result<Next<()>, StoreError> {
         match &self.phase {
             StartPhase::Gaps(outbox) => Ok(Next::Call(outbox.gap_ask())),
-            _ => Err(StoreError("started twice".into())),
+            _ => Err(StoreError::Message("started twice".into())),
         }
     }
 

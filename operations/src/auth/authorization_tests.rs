@@ -85,9 +85,87 @@ fn missing_target_denied() {
     );
 }
 
-fn either() -> AuthorizeEitherOperation {
-    let paths = ("/a", "/b");
+fn admin_group() -> GroupId {
+    Ulid::from_bytes([3; 16])
+}
+
+/// The group admin path, and `alternative` in the same realm.
+fn either_with(alternative: &str) -> AuthorizeEitherOperation {
+    let path = format!("/{}/g/{}/admin", auth().realm_id, admin_group());
+    let paths = (path.as_str(), alternative);
     AuthorizeEitherOperation::new(auth().realm_id, &auth(), paths, &Permission::WRITE)
+}
+
+/// The group admin path, or else the realm groups administration path, as the route asks.
+fn either() -> AuthorizeEitherOperation {
+    either_with(&format!("/{}/admin/groups", auth().realm_id))
+}
+
+/// The realm and the group authorization rows, the caller holding WRITE on `granted`.
+fn rule_rows(granted: &str) -> IoResult {
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::identity::group::GroupAuthorizationDocument;
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use std::collections::HashSet;
+    let realm_id = auth().realm_id;
+    let actor = Actor {
+        node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        user_id: auth().user_id,
+        realm_id,
+    };
+    let role = Role {
+        role_id: Ulid::from_bytes([9; 16]),
+        name: "admins".to_string(),
+        permissions: HashMap::from([(granted.to_string(), Permission::WRITE)]),
+        assigned_users: HashSet::from([auth().user_id]),
+    };
+    let realm = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::from([(role.role_id, role)]),
+        operation_restrictions: HashMap::new(),
+    };
+    let group = GroupAuthorizationDocument {
+        group_id: admin_group(),
+        roles: HashMap::new(),
+        policies: Vec::new(),
+    };
+    IoResult::Values(vec![
+        Some(realm.to_bytes(&actor).unwrap().into()),
+        Some(group.to_bytes(&actor).unwrap().into()),
+    ])
+}
+
+/// A policy evaluator of a realm without request policies, which allows every request.
+fn open_policies() -> IoResult {
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmConfigDocument;
+    let realm_id = auth().realm_id;
+    let actor = Actor {
+        node_id: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+        user_id: auth().user_id,
+        realm_id,
+    };
+    let bytes = RealmConfigDocument::new(realm_id, Vec::new(), 3).to_bytes(&actor);
+    let mut load = PolicyLoadOperation::new(realm_id, None);
+    load.first().unwrap();
+    let Ok(Next::Call(compile)) = load.next(IoResult::Values(vec![Some(bytes.unwrap().into())]))
+    else {
+        panic!("the realm policies compile");
+    };
+    let Ok(Next::Done(evaluator)) = load.next(crate::tests::calls::compiled(compile)) else {
+        panic!("the realm policies load");
+    };
+    let answer: Result<PolicyEvaluator, PolicyEnforcementError> = Ok(evaluator);
+    IoResult::Child(ChildOutcome::new(answer))
+}
+
+#[test]
+fn either_reads_once() {
+    // The realm administration path needs no row the group admin path does not read.
+    let Ok(Next::Call(IoCall::Read(reads))) = either().first() else {
+        panic!("both paths are decided from one read");
+    };
+    assert_eq!(reads.len(), 2);
 }
 
 #[test]
@@ -95,30 +173,57 @@ fn either_direct_grant() {
     // A direct grant enforces only the policies of its own path.
     let mut operation = either();
     operation.first().unwrap();
-    assert!(is_child(&operation.next(checked(true))));
-    assert_eq!(operation.next(policy_passed()), Ok(Next::Done(())));
+    let granted = format!("/{}/g/{}/admin", auth().realm_id, admin_group());
+    assert!(is_child(&operation.next(rule_rows(&granted))));
+    assert_eq!(operation.next(open_policies()), Ok(Next::Done(())));
 }
 
 #[test]
 fn either_alternative_grant() {
-    // A grant on the alternative enforces both paths' policies.
+    // A grant on the alternative enforces both paths' policies, each group loaded on its own.
     let mut operation = either();
     operation.first().unwrap();
-    assert!(is_child(&operation.next(checked(false))));
-    assert!(is_child(&operation.next(checked(true))));
-    assert!(is_child(&operation.next(policy_passed())));
-    assert_eq!(operation.next(policy_passed()), Ok(Next::Done(())));
+    let granted = format!("/{}/admin/groups", auth().realm_id);
+    assert!(is_child(&operation.next(rule_rows(&granted))));
+    assert!(is_child(&operation.next(open_policies())));
+    assert_eq!(operation.next(open_policies()), Ok(Next::Done(())));
+}
+
+#[test]
+fn either_group_shared() {
+    // Both paths of one group are enforced after one policy load.
+    let other = format!("/{}/g/{}/other", auth().realm_id, admin_group());
+    let mut operation = either_with(&other);
+    operation.first().unwrap();
+    assert!(is_child(&operation.next(rule_rows(&other))));
+    assert_eq!(operation.next(open_policies()), Ok(Next::Done(())));
 }
 
 #[test]
 fn either_neither_denied() {
     let mut operation = either();
     operation.first().unwrap();
-    operation.next(checked(false)).unwrap();
+    let elsewhere = format!("/{}/other", auth().realm_id);
     assert_eq!(
-        operation.next(checked(false)),
+        operation.next(rule_rows(&elsewhere)),
         Err(AuthorizeError::PermissionDenied)
     );
+}
+
+#[test]
+fn either_policy_final() {
+    let mut operation = either();
+    operation.first().unwrap();
+    operation
+        .next(rule_rows(&format!("/{}/admin/groups", auth().realm_id)))
+        .unwrap();
+    let denied: Result<PolicyEvaluator, PolicyEnforcementError> =
+        Err(PolicyEnforcementError::Denied {
+            name: "rule".to_string(),
+            reason: "no".to_string(),
+        });
+    let answer = operation.next(IoResult::Child(ChildOutcome::new(denied)));
+    assert!(matches!(answer, Err(AuthorizeError::Policy(_))));
 }
 
 #[test]

@@ -340,7 +340,7 @@ fn intents_decide_first() {
         Ended::Output(None),
     ] {
         let mut held = run.clone();
-        let unreadable = Err(StoreError("read failed".into()));
+        let unreadable = Err(StoreError::Message("read failed".into()));
         conclude(&mut held, ended, false, unreadable, 9);
         assert_eq!(
             (held.state, held.attempts),

@@ -22,12 +22,11 @@ use aruna_core::node::facts::NodeFacts;
 use aruna_core::operation::Operation;
 use aruna_core::placement::held_buckets;
 use aruna_core::placement::resolver::build_view;
-use aruna_core::rows::{PrefixPages, decode, read_row, values};
+use aruna_core::rows::{PrefixPages, read_row, values};
 use aruna_core::storage_entries::sync_revision_key;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
 use aruna_core::structs::placement::record::PlacementRef;
-use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::{AdvertisementEpoch, NodeUtilization};
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::types::Key;
@@ -141,6 +140,26 @@ pub(in crate::node) fn held_placement_set(
     held
 }
 
+/// The fields of a stored `MetadataRegistryRecord` up to its placement, in stored order. Strings
+/// stay borrowed and the fields after the placement, such as its holder keys, are never decoded.
+type PlacedRecord<'a> = (
+    RealmId,
+    Ulid,
+    Ulid,
+    &'a str,
+    &'a str,
+    bool,
+    &'a str,
+    PlacementRef,
+);
+
+/// The placement of a stored registry record.
+fn placement_of(bytes: &[u8]) -> Result<PlacementRef, IoError> {
+    let placed: PlacedRecord<'_> =
+        postcard::from_bytes(bytes).map_err(|error| IoError::Codec(error.to_string()))?;
+    Ok(placed.7)
+}
+
 /// Counts the registry documents in `held` buckets, one page at a time.
 #[derive(Debug, PartialEq)]
 pub struct HeldDocumentsOperation {
@@ -170,11 +189,11 @@ impl Operation for HeldDocumentsOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<u64>, IoError> {
         for (_, value) in self.pages.take(result)? {
-            let record: MetadataRegistryRecord = decode(&value)?;
+            let placement = placement_of(&value)?;
             // NIL placements predate any strategy and are held by every local
             // node, matching holds_placement; count them alongside held buckets.
-            if record.placement == PlacementRef::NIL
-                || (self.held).contains(&(record.placement.strategy_id, record.placement.shard))
+            if placement == PlacementRef::NIL
+                || (self.held).contains(&(placement.strategy_id, placement.shard))
             {
                 self.count += 1;
             }
@@ -449,6 +468,7 @@ pub(super) mod tests {
 
     use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
     use super::*;
 
@@ -671,6 +691,33 @@ pub(super) mod tests {
             next: None,
         };
         assert_eq!(operation.next(last), Ok(Next::Done(2)));
+    }
+
+    // The placement read alone matches the whole record, whatever its strings and holders hold.
+    #[test]
+    fn placement_matches_record() {
+        let placement = PlacementRef {
+            strategy_id: Ulid::from_parts(4, 4),
+            shard: 7,
+        };
+        let record = MetadataRegistryRecord {
+            realm_id: REALM,
+            group_id: Ulid::from_parts(1, 1),
+            document_id: Ulid::from_parts(2, 2),
+            document_path: "meta/doc".to_string(),
+            graph_iri: "urn:graph".to_string(),
+            public: true,
+            permission_path: format!("/{REALM}/g/x/meta/doc"),
+            placement,
+            holder_node_ids: vec![node(), node()],
+            created_at_ms: 5,
+            updated_at_ms: 6,
+            establishing_event_id: Ulid::from_parts(3, 3),
+            last_event_id: Ulid::from_parts(3, 4),
+        };
+        let bytes = postcard::to_allocvec(&record).unwrap();
+        assert_eq!(placement_of(&bytes), Ok(placement));
+        assert!(matches!(placement_of(&bytes[..9]), Err(IoError::Codec(_))));
     }
 
     #[test]

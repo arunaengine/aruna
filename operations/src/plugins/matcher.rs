@@ -392,7 +392,7 @@ impl Outbox {
         let keys: BTreeSet<_> = self.gaps.iter().map(|(key, ..)| key.clone()).collect();
         if keys.len() != values.len() {
             let counts = (values.len(), keys.len());
-            return Err(StoreError(format!(
+            return Err(StoreError::Message(format!(
                 "{} gap rows for {} keys",
                 counts.0, counts.1
             )));

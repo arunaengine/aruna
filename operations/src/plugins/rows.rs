@@ -9,21 +9,35 @@ use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
 use aruna_core::rows;
 use aruna_core::types::{Key, KeySpace, Value};
 
-/// A storage failure, with the answer that was not expected.
+/// A storage failure: the runner's own error, a row that did not encode, an answer that was not
+/// asked for, or a step that failed for another reason.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("plugin run storage failed: {0}")]
-pub struct StoreError(pub String);
+pub enum StoreError {
+    #[error("plugin run storage failed: {0}")]
+    Io(#[from] IoError),
+    #[error("plugin run storage failed: {0}")]
+    Codec(String),
+    #[error("plugin run storage failed: unexpected answer {0}")]
+    Unexpected(&'static str),
+    #[error("plugin run storage failed: {0}")]
+    Message(String),
+}
 
-impl From<IoError> for StoreError {
-    fn from(error: IoError) -> Self {
-        Self(error.to_string())
+impl StoreError {
+    /// What failed, without the storage prefix.
+    pub fn detail(self) -> String {
+        match self {
+            Self::Io(error) => error.to_string(),
+            Self::Codec(message) | Self::Message(message) => message,
+            Self::Unexpected(label) => format!("unexpected answer {label}"),
+        }
     }
 }
 
 pub type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
-    postcard::to_allocvec(value).map_err(|error| StoreError(error.to_string()))
+    postcard::to_allocvec(value).map_err(|error| StoreError::Codec(error.to_string()))
 }
 
 pub fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StoreError> {
@@ -181,7 +195,7 @@ impl Operation for ReadRows {
         let read = self
             .0
             .take()
-            .ok_or_else(|| StoreError("read twice".into()))?;
+            .ok_or_else(|| StoreError::Message("read twice".into()))?;
         Ok(Next::Call(read))
     }
 
@@ -283,7 +297,7 @@ impl Operation for Change {
         let ask = self
             .0
             .take()
-            .ok_or_else(|| StoreError("no change".into()))?;
+            .ok_or_else(|| StoreError::Message("no change".into()))?;
         Ok(Next::Call(ask))
     }
 
@@ -306,7 +320,7 @@ pub fn done(result: IoResult) -> Result<(), StoreError> {
 
 /// An answer the operation did not ask for.
 pub fn unexpected(result: IoResult) -> StoreError {
-    StoreError(format!("unexpected answer {}", result.label()))
+    StoreError::Unexpected(result.label())
 }
 
 #[cfg(test)]

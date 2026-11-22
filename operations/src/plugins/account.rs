@@ -43,7 +43,7 @@ impl From<IoError> for AccountError {
 
 impl From<StoreError> for AccountError {
     fn from(error: StoreError) -> Self {
-        Self(error.0)
+        Self(error.detail())
     }
 }
 

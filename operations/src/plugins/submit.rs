@@ -261,7 +261,7 @@ impl PrepareWork {
     /// The row this request proposes, with what names its arguments.
     fn proposed(&self, install: &PluginInstall, work_id: Ulid) -> Result<WorkRow, CallError> {
         let ids = (self.scope.run.run_id, work_id);
-        let stored = |error: super::rows::StoreError| CallError(unavailable(error.0));
+        let stored = |error: super::rows::StoreError| CallError(unavailable(error.detail()));
         let reserved = |kind| WorkRow::reserved(install, kind, ids, self.now_ms);
         Ok(match &self.request {
             WorkRequest::Copy(copy) => {
@@ -340,7 +340,7 @@ impl PrepareWork {
                 HostError::new(ErrorKind::Conflict, message)
             }
             WorkError::Limit(_) => HostError::new(ErrorKind::Limit, error.to_string()),
-            WorkError::Store(error) => unavailable(error.0),
+            WorkError::Store(error) => unavailable(error.detail()),
         })
     }
 

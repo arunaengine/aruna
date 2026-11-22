@@ -279,7 +279,7 @@ impl Operation for JobRow {
 
     fn next(&mut self, result: IoResult) -> Result<Next<WorkRow>, CallError> {
         let row = result.child::<Option<WorkRow>, StoreError>()?;
-        let row = row.map_err(|error| CallError(unavailable(error.0)))?;
+        let row = row.map_err(|error| CallError(unavailable(error.detail())))?;
         let row = row.filter(|row| row.account == self.account);
         Ok(Next::Done(row.ok_or_else(|| self.missing())?))
     }

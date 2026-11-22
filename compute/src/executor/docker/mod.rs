@@ -125,6 +125,18 @@ impl DockerBackend {
             .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
     }
 
+    /// The attempt's control record, read on the blocking pool.
+    async fn control_record(
+        &self,
+        context: &FenceContext,
+    ) -> Result<Option<ControlRecord>, BackendError> {
+        let daemon_lock = Arc::clone(&self.daemon_lock);
+        let context = context.clone();
+        tokio::task::spawn_blocking(move || daemon_lock.read(&context))
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
+    }
+
     async fn probe_disk_limit(&self, bytes: u64) -> Result<(), BackendError> {
         let image = self
             .docker
@@ -889,7 +901,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn status(&self, context: &FenceContext) -> Result<AttemptStatus, BackendError> {
-        let control = self.daemon_lock.read(context)?;
+        let control = self.control_record(context).await?;
         validate_control(control.clone(), context)?;
         let inspect = match self.inspect_matching_attempt(&context.attempt).await {
             Ok(inspect) => inspect,
@@ -914,7 +926,7 @@ impl ExecutorBackend for DockerBackend {
         // The daemon's wait endpoint answers instantly for a created-but-never-started
         // container; poll inspect to terminal evidence or the cancel token instead.
         loop {
-            let control = self.daemon_lock.read(context)?;
+            let control = self.control_record(context).await?;
             validate_control(control.clone(), context)?;
             let inspect = match self.inspect_matching_attempt(&context.attempt).await {
                 Ok(inspect) => inspect,
@@ -989,7 +1001,7 @@ impl ExecutorBackend for DockerBackend {
         context: &FenceContext,
         limits: &LogLimits,
     ) -> Result<LogTails, BackendError> {
-        validate_control(self.daemon_lock.read(context)?, context)?;
+        validate_control(self.control_record(context).await?, context)?;
         let attempt = &context.attempt;
         attempt.validate().map_err(BackendError::InvalidSpec)?;
         let inspect = self.inspect_matching_attempt(attempt).await?;
@@ -1182,7 +1194,7 @@ impl ExecutorBackend for DockerBackend {
     }
 
     async fn reconcile(&self, context: &FenceContext) -> ReconcileEvidence {
-        let control = match self.daemon_lock.read(context) {
+        let control = match self.control_record(context).await {
             Ok(control) => control,
             Err(error) => return ReconcileEvidence::Unavailable(error),
         };
@@ -1294,11 +1306,12 @@ impl ExecutorBackend for DockerBackend {
             Err(BackendError::NotFound(_)) => {}
             Err(error) => return Err(error),
         }
-        guard.store(format!(
+        let backend_ref = format!(
             "{}/docker/attempts/{}/control.json",
             self.config.state_root.display(),
             context.attempt.external_name()
-        ))
+        );
+        guard.store(backend_ref).await
     }
 
     async fn cleanup(&self, context: &FenceContext) -> Result<(), BackendError> {

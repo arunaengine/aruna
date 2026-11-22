@@ -67,7 +67,7 @@ fn reserve_error(error: WorkError) -> CallError {
             HostError::new(ErrorKind::Conflict, message)
         }
         WorkError::Limit(_) => HostError::new(ErrorKind::Limit, error.to_string()),
-        WorkError::Store(error) => unavailable(error.0),
+        WorkError::Store(error) => unavailable(error.detail()),
     })
 }
 
@@ -181,7 +181,7 @@ impl StartTask {
             &request.files,
             &request.outputs,
         );
-        let stable = encode(&stable).map_err(|error| CallError(unavailable(error.0)))?;
+        let stable = encode(&stable).map_err(|error| CallError(unavailable(error.detail())))?;
         let now_ms = self.node.now_ms;
         let ids = (self.scope.run.run_id, self.ids.mint(now_ms));
         let mut proposed = WorkRow::reserved(&checked.install, WorkKind::Recipe, ids, now_ms);
@@ -266,7 +266,10 @@ impl Operation for StartTask {
             },
             StartPhase::Drop(error) => {
                 if let Err(dropped) = result.child::<Changed, StoreError>()? {
-                    tracing::warn!(error = %dropped.0, "A task that was never sent kept its row");
+                    tracing::warn!(
+                        error = %dropped.detail(),
+                        "A task that was never sent kept its row"
+                    );
                 }
                 Err(error)
             }

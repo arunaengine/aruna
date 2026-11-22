@@ -74,7 +74,7 @@ impl From<CallError> for TransferEnd {
 
 impl From<StoreError> for TransferEnd {
     fn from(error: StoreError) -> Self {
-        Self::Retry(error.0)
+        Self::Retry(error.detail())
     }
 }
 

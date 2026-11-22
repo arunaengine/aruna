@@ -49,7 +49,7 @@ impl From<IoError> for ArtifactError {
 
 impl From<StoreError> for ArtifactError {
     fn from(error: StoreError) -> Self {
-        Self::Storage(error.0)
+        Self::Storage(error.detail())
     }
 }
 

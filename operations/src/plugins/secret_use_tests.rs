@@ -95,7 +95,7 @@ fn failed_audit_refuses() {
     let install = bound_install("group:api");
     let mut release = release_of(&install, other_node());
     release.first().unwrap();
-    let failed = child_result(Err::<(), _>(StoreError("down".into())));
+    let failed = child_result(Err::<(), _>(StoreError::Message("down".into())));
     assert_eq!(release.next(failed), Err(refused(Refusal::Peer)));
 }
 
@@ -137,7 +137,7 @@ fn audit_precedes_opening() {
     let value = Ulid::from_parts(5, 5);
     let mut release = release_of(&install, install.receiver);
     release.phase = ReleasePhase::Auditing(admitted(value));
-    let failed = child_result(Err::<(), _>(StoreError("down".into())));
+    let failed = child_result(Err::<(), _>(StoreError::Message("down".into())));
     let answer = release.next(failed).unwrap_err();
     assert!(matches!(answer.0, ReleaseError::Unavailable(_)));
     release.phase = ReleasePhase::Auditing(admitted(value));

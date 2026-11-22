@@ -195,7 +195,7 @@ impl Operation for DecideEvent {
                 Ok(Next::Call(ask))
             }
             DecidePhase::Denying(reason) => self.decided(Outcome::Denied(reason), Vec::new()),
-            DecidePhase::Writing(_) => Err(StoreError("decided twice".into())),
+            DecidePhase::Writing(_) => Err(StoreError::Message("decided twice".into())),
         }
     }
 
@@ -210,7 +210,7 @@ impl Operation for DecideEvent {
                 Ok(Some(rows)) => self.decided(Outcome::Queued, rows),
                 Err(RunError::Full(_)) => Ok(Next::Done(Outcome::Busy)),
                 Err(RunError::Store(error)) => Err(error),
-                Err(error) => Err(StoreError(error.to_string())),
+                Err(error) => Err(StoreError::Message(error.to_string())),
             },
             DecidePhase::Holding(mut hold) => match hold.take(answer)? {
                 Slot::More(ask) => {
@@ -510,7 +510,7 @@ impl Operation for EventDelivery {
     fn first(&mut self) -> Result<Next<Delivery>, StoreError> {
         match &self.phase {
             DeliveryPhase::Waiting(scan) => Ok(Next::Call(scan.ask())),
-            _ => Err(StoreError("read twice".into())),
+            _ => Err(StoreError::Message("read twice".into())),
         }
     }
 
@@ -657,7 +657,7 @@ impl Operation for Judge {
         match std::mem::replace(&mut self.phase, JudgePhase::Prerequisites) {
             JudgePhase::Prerequisites => {
                 let held = answer.child::<bool, AccountError>()?;
-                match held.map_err(|error| StoreError(error.0))? {
+                match held.map_err(|error| StoreError::Message(error.0))? {
                     true => self.check(),
                     false => Ok(Next::Done(Verdict::Unready)),
                 }

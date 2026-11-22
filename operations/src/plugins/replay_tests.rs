@@ -410,7 +410,7 @@ fn failed_replay_waits() {
     replays.first().unwrap();
     replays.next(key_page(&[b"r1", b"r2"])).unwrap();
     let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(
-        Err::<(usize, bool), _>(StoreError("unreadable".into())),
+        Err::<(usize, bool), _>(StoreError::Message("unreadable".into())),
     ));
     replays.next(failed).unwrap();
     assert_eq!(

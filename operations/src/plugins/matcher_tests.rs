@@ -360,7 +360,7 @@ fn journal_reads_pages() {
     let last = child_result(Ok::<usize, StoreError>(3));
     assert_eq!(matching.next(last), Ok(Next::Done(JOURNAL_PAGE + 3)));
     let mut failed = MatchJournal::new((Vec::new(), true), 5, 9);
-    let error = StoreError("down".into());
+    let error = StoreError::Message("down".into());
     let refused = failed.next(child_result(Err::<usize, _>(error.clone())));
     assert_eq!(refused, Err(error));
 }

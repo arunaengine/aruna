@@ -159,7 +159,7 @@ fn finish_then_sync() {
     assert_eq!(finish.next(applied_ok()), Ok(Next::Call(IoCall::Sync)));
     assert_eq!(finish.next(IoResult::Done), Ok(Next::Done(())));
     let mut failed = FinishCopy::new(DIGEST.to_string(), 4, NOW);
-    let error = StoreError("down".into());
+    let error = StoreError::Message("down".into());
     let answer = IoResult::Child(ChildOutcome::new(Err::<(), _>(error)));
     assert_eq!(failed.next(answer), Err(storage("down")));
 }

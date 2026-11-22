@@ -246,7 +246,7 @@ pub async fn upload_work(
             }
         }
         Ok(None) => return permanent("the plugin work is no longer recorded"),
-        Err(error) => return retryable(error.0),
+        Err(error) => return retryable(error.detail()),
     }
     let backend = match outbound(ctx) {
         Ok(backend) => backend,
@@ -270,7 +270,7 @@ pub async fn upload_work(
             // Nothing reached the service, so the boundary goes back and a later attempt sends.
             let reopened = drive(update_work(ids, WorkChange::Reopened), &ctx.driver);
             if let Err(error) = reopened.await {
-                return retryable(error.0);
+                return retryable(error.detail());
             }
             return retryable(why);
         }

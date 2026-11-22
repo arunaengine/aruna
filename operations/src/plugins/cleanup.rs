@@ -185,13 +185,15 @@ impl Operation for SweepEvents {
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {
             SweepPhase::Scanning(_, scan) => Ok(Next::Call(scan.ask())),
-            SweepPhase::Deleting(_) | SweepPhase::Finished => Err(StoreError("swept twice".into())),
+            SweepPhase::Deleting(_) | SweepPhase::Finished => {
+                Err(StoreError::Message("swept twice".into()))
+            }
         }
     }
 
     fn next(&mut self, answer: IoResult) -> Result<Next<usize>, StoreError> {
         match std::mem::replace(&mut self.phase, SweepPhase::Finished) {
-            SweepPhase::Finished => Err(StoreError("swept twice".into())),
+            SweepPhase::Finished => Err(StoreError::Message("swept twice".into())),
             SweepPhase::Deleting(next) => {
                 done(answer)?;
                 Ok(self.advance(next))

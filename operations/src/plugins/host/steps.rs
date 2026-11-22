@@ -27,7 +27,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use ulid::Ulid;
 
-use super::super::check::{CallError, CheckCall, RunScope, authorize_call, matching};
+use super::super::check::{
+    CallError, CheckCall, Checked as CheckStep, RunScope, SharedChecks, authorize_call, matching,
+};
 use super::super::creates::write_outcome;
 use super::super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, parse_document,
@@ -459,6 +461,7 @@ pub struct ListDatasets {
     current: Option<String>,
     resources: Vec<String>,
     next_cursor: Option<String>,
+    checks: SharedChecks,
     phase: ListPhase,
 }
 
@@ -472,25 +475,44 @@ impl ListDatasets {
             current: None,
             resources: Vec::new(),
             next_cursor: None,
+            checks: SharedChecks::default(),
             phase: ListPhase::Listing,
         }
     }
 
-    fn advance(&mut self, install: Box<PluginInstall>) -> Next<Listing> {
+    /// Checks the next covered document; the checks of a page share their reads and compile.
+    fn advance(&mut self, install: Box<PluginInstall>) -> Result<Next<Listing>, CallError> {
         while let Some((path, id)) = self.documents.pop_front() {
             let permission = Permission::MetadataRead;
             let Ok(patterns) = matching(&install, permission, &path) else {
                 continue;
             };
             let check = Authorize::call(&install, permission, &path, &patterns);
-            self.current = Some(id);
-            self.phase = ListPhase::Checking(install);
-            return Next::Call(authorize_call(check));
+            match self.checks.start(check) {
+                CheckStep::Ask(call) => {
+                    self.current = Some(id);
+                    self.phase = ListPhase::Checking(install);
+                    return Ok(Next::Call(call));
+                }
+                CheckStep::Done(decided) => self.decided(id, decided)?,
+            }
         }
-        Next::Done(Listing {
+        Ok(Next::Done(Listing {
             resources: std::mem::take(&mut self.resources),
             cursor: self.next_cursor.take(),
-        })
+        }))
+    }
+
+    /// Keeps an authorized document; only an unavailable check fails the page.
+    fn decided(&mut self, id: String, decided: Result<(), CallError>) -> Result<(), CallError> {
+        match decided {
+            Ok(()) => self.resources.push(id),
+            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
+                return Err(CallError(error));
+            }
+            Err(_) => {}
+        }
+        Ok(())
     }
 }
 
@@ -537,19 +559,19 @@ impl Operation for ListDatasets {
                         (record.permission_path.clone(), id)
                     })
                     .collect();
-                Ok(self.advance(install))
+                self.advance(install)
             }
-            ListPhase::Checking(install) => {
-                let id = self.current.take().ok_or(IoError::Unfinished)?;
-                match result.child::<(), CallError>()? {
-                    Ok(()) => self.resources.push(id),
-                    Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
-                        return Err(CallError(error));
-                    }
-                    Err(_) => {}
+            ListPhase::Checking(install) => match self.checks.answer(result)? {
+                CheckStep::Ask(call) => {
+                    self.phase = ListPhase::Checking(install);
+                    Ok(Next::Call(call))
                 }
-                Ok(self.advance(install))
-            }
+                CheckStep::Done(decided) => {
+                    let id = self.current.take().ok_or(IoError::Unfinished)?;
+                    self.decided(id, decided)?;
+                    self.advance(install)
+                }
+            },
         }
     }
 }

@@ -41,7 +41,7 @@ impl Operation for JournalPage {
         let page = self
             .0
             .take()
-            .ok_or_else(|| StoreError("paged twice".into()))?;
+            .ok_or_else(|| StoreError::Message("paged twice".into()))?;
         Ok(Next::Call(page))
     }
 

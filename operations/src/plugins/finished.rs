@@ -399,7 +399,7 @@ impl Operation for DueCompletions {
         };
         let state = answer
             .child::<Option<RunState>, String>()?
-            .map_err(StoreError)?;
+            .map_err(StoreError::Message)?;
         if state.is_none_or(|state| state == RunState::Succeeded) {
             let Candidate { install, row } = *candidate;
             let event = finished_event(&install, &row, self.now_ms);

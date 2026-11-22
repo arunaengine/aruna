@@ -101,7 +101,7 @@ fn prepare_error(error: SubmitJobError) -> CallError {
 }
 
 fn stored(error: StoreError) -> CallError {
-    CallError(unavailable(error.0))
+    CallError(unavailable(error.detail()))
 }
 
 #[derive(Debug, PartialEq)]

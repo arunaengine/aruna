@@ -115,8 +115,8 @@ impl Operation for SettleTasks {
     fn next(&mut self, result: IoResult) -> PassNext {
         match std::mem::replace(&mut self.phase, PassPhase::Mark) {
             PassPhase::Config => {
-                let config =
-                    config_answer(result).map_err(|error| StoreError(error.to_string()))?;
+                let config = config_answer(result)
+                    .map_err(|error| StoreError::Message(error.to_string()))?;
                 self.config = Some(Arc::new(config));
                 self.phase = PassPhase::Scan;
                 Ok(Next::Call(IoCall::child(scan_rows(work_scan()))))

@@ -6,13 +6,17 @@
 use std::collections::BTreeSet;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::events::{Event, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::{InstallState, PluginInstall};
 use aruna_core::plugin_runs::PluginRun;
+use aruna_core::request_policy::{CompiledSets, RequestPolicy};
 use aruna_core::structs::identity::auth::Permission as Access;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
+use aruna_core::types::{Key, KeySpace, Value};
 use aruna_plugin_types::calls::{ErrorKind, HostError};
 use aruna_plugin_types::permission::Permission;
 use ulid::Ulid;
@@ -49,7 +53,7 @@ impl From<IoError> for CallError {
 
 impl From<StoreError> for CallError {
     fn from(error: StoreError) -> Self {
-        Self(unavailable(error.0))
+        Self(unavailable(error.detail()))
     }
 }
 
@@ -147,6 +151,127 @@ fn refusal(error: AuthorizeError) -> CallError {
 
 fn authorized(result: IoResult) -> Result<(), CallError> {
     result.child::<(), CallError>()?
+}
+
+/// The rows a check read, by the keys it named.
+type KeptRead = (Vec<(KeySpace, Key)>, Vec<Option<Value>>);
+
+/// What the check in progress asked for, kept to remember its answer.
+#[derive(Debug, PartialEq)]
+enum Asked {
+    Read(Vec<(KeySpace, Key)>),
+    Compile(Vec<Vec<RequestPolicy>>),
+    Other,
+}
+
+impl Asked {
+    fn of(call: &IoCall) -> Self {
+        match call {
+            IoCall::Read(keys) => Self::Read(keys.clone()),
+            IoCall::Effect(effect) => match &**effect {
+                Effect::Storage(StorageEffect::CompilePolicies(sets)) => {
+                    Self::Compile(sets.clone())
+                }
+                _ => Self::Other,
+            },
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The next step of a shared check: a call to answer, or its decision as a call.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Checked {
+    Ask(IoCall),
+    Done(Result<(), CallError>),
+}
+
+/// Runs authorizations in place and keeps the rows and compiled policies they read, so the
+/// checks of one page read and compile them once. Each check still decides as [`Authorize`].
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SharedChecks {
+    check: Option<Authorize>,
+    asked: Option<Asked>,
+    reads: Vec<KeptRead>,
+    compiled: Vec<(Vec<Vec<RequestPolicy>>, CompiledSets)>,
+}
+
+impl SharedChecks {
+    /// Starts `check`, answered from what earlier checks read wherever it can be.
+    pub(crate) fn start(&mut self, mut check: Authorize) -> Checked {
+        let step = check.first();
+        self.check = Some(check);
+        self.step(step)
+    }
+
+    /// Hands the answer to the call of the last [`Checked::Ask`] to the check in progress.
+    pub(crate) fn answer(&mut self, result: IoResult) -> Result<Checked, IoError> {
+        let asked = self.asked.take().ok_or(IoError::Unfinished)?;
+        let result = self.keep(asked, result);
+        let check = self.check.as_mut().ok_or(IoError::Unfinished)?;
+        let step = check.next(result);
+        Ok(self.step(step))
+    }
+
+    fn step(&mut self, mut step: Result<Next<()>, AuthorizeError>) -> Checked {
+        loop {
+            let call = match step {
+                Ok(Next::Call(call)) => call,
+                Ok(Next::Done(())) => return self.decided(Ok(())),
+                Ok(Next::Wait | Next::Then { .. }) => {
+                    return self.decided(Err(IoError::Unfinished.into()));
+                }
+                Err(error) => return self.decided(Err(error)),
+            };
+            let Some(answer) = self.known(&call) else {
+                self.asked = Some(Asked::of(&call));
+                return Checked::Ask(call);
+            };
+            step = match self.check.as_mut() {
+                Some(check) => check.next(answer),
+                None => Err(IoError::Unfinished.into()),
+            };
+        }
+    }
+
+    fn decided(&mut self, result: Result<(), AuthorizeError>) -> Checked {
+        self.check = None;
+        Checked::Done(result.map_err(refusal))
+    }
+
+    /// The answer an earlier check already got for `call`.
+    fn known(&self, call: &IoCall) -> Option<IoResult> {
+        match call {
+            IoCall::Read(keys) => (self.reads.iter())
+                .find(|(read, _)| read == keys)
+                .map(|(_, values)| IoResult::Values(values.clone())),
+            IoCall::Effect(effect) => match &**effect {
+                Effect::Storage(StorageEffect::CompilePolicies(sets)) => (self.compiled.iter())
+                    .find(|(asked, _)| asked == sets)
+                    .map(|(_, compiled)| {
+                        let event = StorageEvent::PoliciesCompiled(compiled.clone());
+                        IoResult::Event(Box::new(Event::Storage(event)))
+                    }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn keep(&mut self, asked: Asked, result: IoResult) -> IoResult {
+        match (asked, &result) {
+            (Asked::Read(keys), IoResult::Values(values)) => {
+                self.reads.push((keys, values.clone()));
+            }
+            (Asked::Compile(sets), IoResult::Event(event)) => {
+                if let Event::Storage(StorageEvent::PoliciesCompiled(compiled)) = &**event {
+                    self.compiled.push((sets, compiled.clone()));
+                }
+            }
+            _ => {}
+        }
+        result
+    }
 }
 
 /// The patterns a copy reads `source` and writes `target` under: read on the source and write
@@ -289,4 +414,4 @@ fn denied(message: &str) -> HostError {
 
 #[cfg(test)]
 #[path = "check_tests.rs"]
-mod tests;
+pub(crate) mod tests;

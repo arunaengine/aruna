@@ -7,6 +7,7 @@ use super::*;
 use crate::auth::install_access::covers;
 use crate::plugins::calls::*;
 use crate::plugins::test_support::{install_as, install_request};
+use crate::tests::calls::{compiled, values_of};
 use aruna_drivers::driver::drive;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::queued;
@@ -86,5 +87,113 @@ async fn checks_each_step() {
     assert_eq!(
         kind(drive(CheckCall::new(&scope, None), ctx).await),
         Some(ErrorKind::Denied)
+    );
+}
+
+/// The rows that let the account of `install` read below `pattern`: the realm and group
+/// authorization, then the realm config, the group and its authorization without policies.
+pub(crate) fn access_rows(install: &PluginInstall, pattern: &str) -> [IoResult; 2] {
+    use aruna_core::structs::identity::auth::{Actor, Role};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
+    use std::collections::{HashMap, HashSet};
+    let realm_id = install.account.realm_id;
+    let actor = Actor {
+        node_id: install.receiver,
+        user_id: install.account,
+        realm_id,
+    };
+    let realm = RealmAuthorizationDocument {
+        realm_id,
+        roles: HashMap::new(),
+        operation_restrictions: HashMap::new(),
+    };
+    let role = Role {
+        role_id: Ulid::from_parts(9, 9),
+        name: "readers".to_string(),
+        permissions: HashMap::from([(pattern.to_string(), Access::READ)]),
+        assigned_users: HashSet::from([install.account]),
+    };
+    let auth = GroupAuthorizationDocument {
+        group_id: install.group_id,
+        roles: HashMap::from([(role.role_id, role)]),
+        policies: Vec::new(),
+    };
+    let group = Group {
+        display_name: "readers".to_string(),
+        group_id: install.group_id,
+        realm_id,
+        roles: HashSet::new(),
+        owner: install.account,
+    };
+    let config = RealmConfigDocument::new(realm_id, Vec::new(), 3);
+    let auth = auth.to_bytes(&actor).unwrap();
+    let rows = |rows: Vec<Vec<u8>>| values_of(rows.into_iter().map(Some).collect());
+    [
+        rows(vec![realm.to_bytes(&actor).unwrap(), auth.clone()]),
+        rows(vec![
+            config.to_bytes(&actor).unwrap(),
+            group.to_bytes(&actor).unwrap(),
+            auth,
+        ]),
+    ]
+}
+
+/// The test install with read on everything below `root`.
+fn reader(root: &str) -> PluginInstall {
+    let mut install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let pattern = vec![format!("{root}/**")];
+    install.grants = std::collections::BTreeMap::from([("read".to_string(), pattern)]);
+    install
+}
+
+fn read_check(install: &PluginInstall, path: &str) -> Authorize {
+    let patterns = matching(install, Permission::MetadataRead, path).unwrap();
+    Authorize::call(install, Permission::MetadataRead, path, &patterns)
+}
+
+fn meta_root() -> String {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    format!("/{}/g/{}/meta", install.account.realm_id, install.group_id)
+}
+
+// The second check of a group decides from the rows and the policies the first one read.
+#[test]
+fn checks_share_reads() {
+    let root = meta_root();
+    let install = reader(&root);
+    let [rules, policies] = access_rows(&install, &format!("{root}/**"));
+    let mut checks = SharedChecks::default();
+    let first = checks.start(read_check(&install, &format!("{root}/a")));
+    assert!(matches!(first, Checked::Ask(IoCall::Read(_))));
+    let Ok(Checked::Ask(IoCall::Read(_))) = checks.answer(rules) else {
+        panic!("allowed rules read the policies next");
+    };
+    let Ok(Checked::Ask(compile)) = checks.answer(policies) else {
+        panic!("read policies compile next");
+    };
+    assert_eq!(checks.answer(compiled(compile)), Ok(Checked::Done(Ok(()))));
+    let second = checks.start(read_check(&install, &format!("{root}/b")));
+    assert_eq!(second, Checked::Done(Ok(())));
+}
+
+// A refusal for missing rules refuses the next check of the group without a second read.
+#[test]
+fn refusals_share_reads() {
+    let root = meta_root();
+    let install = reader(&root);
+    let mut checks = SharedChecks::default();
+    checks.start(read_check(&install, &format!("{root}/a")));
+    let Ok(Checked::Done(Err(CallError(first)))) = checks.answer(values_of(vec![None, None]))
+    else {
+        panic!("missing rules decide the check");
+    };
+    let second = checks.start(read_check(&install, &format!("{root}/b")));
+    let Checked::Done(Err(CallError(second))) = second else {
+        panic!("the second check reads nothing");
+    };
+    assert_eq!(
+        (first.kind, second.kind),
+        (ErrorKind::Denied, ErrorKind::Denied)
     );
 }

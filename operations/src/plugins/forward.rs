@@ -484,9 +484,9 @@ impl Operation for Unreadable {
             let applied = match answer.event()? {
                 Event::Metadata(MetadataEvent::ContainsDotResult { contains, .. }) => contains,
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
-                    return Err(StoreError(error.to_string()));
+                    return Err(StoreError::Message(error.to_string()));
                 }
-                other => return Err(StoreError(format!("unexpected {}", other.label()))),
+                other => return Err(StoreError::Message(format!("unexpected {}", other.label()))),
             };
             return Ok(Next::Done(!applied && !deleted));
         }

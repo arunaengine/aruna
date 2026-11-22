@@ -128,11 +128,7 @@ impl ControlGuard {
             return Ok(());
         }
         record.started = true;
-        let record = record.clone();
-        tokio::task::spawn_blocking(move || control_store::write_json(&path, &record))
-            .await
-            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
-            .map_err(control_error)
+        write_record(path, record.clone()).await
     }
 
     pub fn tombstone(&self) -> Option<TombstoneEvidence> {
@@ -146,17 +142,27 @@ impl ControlGuard {
         })
     }
 
-    pub fn store(&mut self, backend_ref: String) -> Result<TombstoneEvidence, BackendError> {
+    /// Records the tombstone durably; the write runs on the blocking pool under this guard's lock.
+    pub async fn store(&mut self, backend_ref: String) -> Result<TombstoneEvidence, BackendError> {
+        let path = self.0.path().to_path_buf();
         let record = self.0.record_mut().ok_or_else(missing_record)?;
         record.tombstone = true;
         record.tombstone_ref = Some(backend_ref.clone());
         let attempt_epoch = record.attempt_epoch;
-        self.0.persist().map_err(control_error)?;
+        write_record(path, record.clone()).await?;
         Ok(TombstoneEvidence {
             backend_ref,
             attempt_epoch,
         })
     }
+}
+
+/// Writes `record` to `path` on the blocking pool.
+async fn write_record(path: PathBuf, record: ControlRecord) -> Result<(), BackendError> {
+    tokio::task::spawn_blocking(move || control_store::write_json(&path, &record))
+        .await
+        .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
+        .map_err(control_error)
 }
 
 fn missing_record() -> BackendError {
@@ -240,12 +246,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retains_tombstone() {
+    #[tokio::test]
+    async fn retains_tombstone() {
         let directory = tempdir().unwrap();
         let daemon = DaemonLock::acquire(directory.path()).unwrap();
         let mut control = daemon.control(&fence(1)).unwrap();
-        control.store("control.json".to_string()).unwrap();
+        control.store("control.json".to_string()).await.unwrap();
         drop(control);
         assert!(daemon.control(&fence(2)).unwrap().tombstone().is_some());
     }

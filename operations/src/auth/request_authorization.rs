@@ -4,7 +4,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{EnforcePolicyOperation, PolicyEvaluator, PolicyLoadOperation};
+use crate::auth::enforcement::{
+    EnforcePolicyOperation, PolicyEvaluator, PolicyLoadOperation, group_from_path,
+};
 use crate::auth::error::{AuthorizeError, PolicyEnforcementError, check_error};
 use crate::auth::permission_rules::{
     GroupPermissionRules, PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
@@ -18,7 +20,7 @@ use aruna_core::request_policy::{PolicyRequest, PolicyRequestExtras, policy_requ
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_core::types::GroupId;
+use aruna_core::types::{GroupId, Key, KeySpace, Value};
 use std::collections::{BTreeSet, HashMap};
 
 type AuthorizeTurn = Result<Next<()>, AuthorizeError>;
@@ -108,6 +110,7 @@ impl Operation for AuthorizeOperation {
 
 /// Authorizes `permission` by RBAC on `path` or else on `alternative`, then always enforces the
 /// policies of `path`, and of `alternative` when only it granted. A policy denial is final.
+/// One read holds the rules of both paths, and paths of one group share one policy load.
 #[derive(Debug, PartialEq)]
 pub struct AuthorizeEitherOperation {
     realm_id: RealmId,
@@ -115,6 +118,8 @@ pub struct AuthorizeEitherOperation {
     path: String,
     alternative: String,
     permission: Permission,
+    /// The rule rows of both paths, in the order of the one read.
+    reads: Vec<(KeySpace, Key)>,
     stage: EitherStage,
     /// Policy requests still to enforce; the next one pops off the end.
     requests: Vec<PolicyRequest>,
@@ -122,8 +127,7 @@ pub struct AuthorizeEitherOperation {
 
 #[derive(Debug, PartialEq)]
 enum EitherStage {
-    Direct,
-    Alternative,
+    Rules,
     Policies,
 }
 
@@ -140,9 +144,30 @@ impl AuthorizeEitherOperation {
             path: path.to_string(),
             alternative: alternative.to_string(),
             permission: permission.clone(),
-            stage: EitherStage::Direct,
+            reads: Vec::new(),
+            stage: EitherStage::Rules,
             requests: Vec::new(),
         }
+    }
+
+    fn check(&self, path: &str) -> CheckPermissionsConfig {
+        CheckPermissionsConfig {
+            auth_context: self.auth.clone(),
+            path: path.to_string(),
+            required_permission: self.permission.clone(),
+        }
+    }
+
+    /// Whether the rules of `path` allow it, decided from the rows of the one read.
+    fn allowed(&self, path: &str, rows: &[Option<Value>]) -> Result<bool, AuthorizeError> {
+        let check = self.check(path);
+        let values = (check.reads().map_err(check_error)?.iter())
+            .map(|key| {
+                let index = self.reads.iter().position(|read| read == key);
+                index.and_then(|index| rows.get(index).cloned().flatten())
+            })
+            .collect();
+        check.allowed(values).map_err(check_error)
     }
 
     fn request(&self, path: &str) -> PolicyRequest {
@@ -150,10 +175,11 @@ impl AuthorizeEitherOperation {
         policy_request_with(path, &self.permission, Some(&self.auth), extras)
     }
 
+    /// Loads the policies of the next request; one load serves every request of its group.
     fn enforce(&mut self) -> AuthorizeTurn {
         self.stage = EitherStage::Policies;
-        Ok(match self.requests.pop() {
-            Some(request) => Next::Call(IoCall::child(EnforcePolicyOperation::new(
+        Ok(match self.requests.last() {
+            Some(request) => Next::Call(IoCall::child(PolicyLoadOperation::for_request(
                 self.realm_id,
                 request,
             ))),
@@ -166,37 +192,39 @@ impl Operation for AuthorizeEitherOperation {
     type Output = ();
     type Error = AuthorizeError;
 
+    /// Reads the rules of `path`, and those of `alternative` it adds, at once; an alternative
+    /// whose rows cannot be named fails only when its check is needed.
     fn first(&mut self) -> AuthorizeTurn {
-        Ok(Next::Call(check_call(
-            &self.auth,
-            &self.path,
-            &self.permission,
-        )))
+        self.reads = self.check(&self.path).reads().map_err(check_error)?;
+        for key in self.check(&self.alternative).reads().unwrap_or_default() {
+            if !self.reads.contains(&key) {
+                self.reads.push(key);
+            }
+        }
+        Ok(Next::Call(IoCall::Read(self.reads.clone())))
     }
 
     fn next(&mut self, result: IoResult) -> AuthorizeTurn {
         match self.stage {
-            EitherStage::Direct => {
+            EitherStage::Rules => {
+                let rows = result.values()?;
                 self.requests = vec![self.request(&self.path)];
-                if check_answer(result)? {
-                    return self.enforce();
+                if !self.allowed(&self.path, &rows)? {
+                    if !self.allowed(&self.alternative, &rows)? {
+                        return Err(AuthorizeError::PermissionDenied);
+                    }
+                    self.requests.insert(0, self.request(&self.alternative));
                 }
-                self.stage = EitherStage::Alternative;
-                Ok(Next::Call(check_call(
-                    &self.auth,
-                    &self.alternative,
-                    &self.permission,
-                )))
-            }
-            EitherStage::Alternative => {
-                if !check_answer(result)? {
-                    return Err(AuthorizeError::PermissionDenied);
-                }
-                self.requests.insert(0, self.request(&self.alternative));
                 self.enforce()
             }
             EitherStage::Policies => {
-                enforced(result)?;
+                let policies = result.child::<PolicyEvaluator, PolicyEnforcementError>()??;
+                let group = (self.requests.last()).map(|request| group_from_path(&request.path));
+                while let Some(request) =
+                    (self.requests).pop_if(|request| Some(group_from_path(&request.path)) == group)
+                {
+                    policies.evaluate(&request)?;
+                }
                 self.enforce()
             }
         }

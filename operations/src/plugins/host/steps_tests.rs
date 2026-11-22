@@ -10,10 +10,12 @@ use serde_json::json;
 use super::*;
 use crate::jobs::repository::test_support::registry_record;
 use crate::metadata::api::list_types::ListedMetadataDocument;
+use crate::plugins::check::tests::access_rows;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
 use crate::plugins::rate::tests::rate_answer;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::submit::CopyRequest;
+use crate::tests::calls::compiled;
 use aruna_test_support::plugins::queued;
 
 fn meta_root() -> String {
@@ -211,18 +213,24 @@ fn listed(paths: &[String]) -> IoResult {
     child_result(Ok::<_, MetadataApiError>(result))
 }
 
+// The documents of a page share one read of the rules and the policies and one compile.
 #[test]
 fn list_keeps_authorized() {
-    let covered = format!("{}/doc", meta_root());
+    let covered = |name: &str| format!("{}/{name}", meta_root());
     let mut list = ListDatasets::new(&scope(), None);
     assert!(is_child(&list.first()));
     assert!(is_child(&list.next(granted_result())));
-    let answer = listed(&["/outside".to_string(), covered]);
-    assert!(is_child(&list.next(answer)));
-    let Ok(Next::Done(listing)) = list.next(child_result(Ok::<(), CallError>(()))) else {
-        panic!("the last check ends the page");
+    let answer = listed(&["/outside".to_string(), covered("a"), covered("b")]);
+    let [rules, policies] = access_rows(&install(), &format!("{}/**", meta_root()));
+    assert!(matches!(list.next(answer), Ok(Next::Call(IoCall::Read(_)))));
+    assert!(matches!(list.next(rules), Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(compile)) = list.next(policies) else {
+        panic!("the read policies compile");
     };
-    assert_eq!(listing.resources.len(), 1);
+    let Ok(Next::Done(listing)) = list.next(compiled(compile)) else {
+        panic!("the second document needs no more reads");
+    };
+    assert_eq!(listing.resources.len(), 2);
     assert_eq!(listing.cursor, None);
 }
 
@@ -240,9 +248,10 @@ fn list_stops_unavailable() {
     list.next(granted_result()).unwrap();
     list.next(listed(&[format!("{}/doc", meta_root())]))
         .unwrap();
-    let down = CallError(unavailable("down"));
-    let answer = child_result(Err::<(), _>(down.clone()));
-    assert_eq!(list.next(answer).unwrap_err(), down);
+    let Err(CallError(error)) = list.next(IoResult::Done) else {
+        panic!("a failed check fails the page");
+    };
+    assert_eq!(error.kind, ErrorKind::Unavailable);
 }
 
 fn object_path() -> String {

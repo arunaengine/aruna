@@ -431,7 +431,7 @@ impl Operation for FinishCreate {
                     (self.pinned, self.claim) = (Some(Box::new(pinned)), claim);
                     self.step()
                 }
-                Err(error) => Ok(self.record(Err(CallEnd::None(unavailable(error.0))))),
+                Err(error) => Ok(self.record(Err(CallEnd::None(unavailable(error.detail()))))),
             },
             CreatePhase::Lookup => {
                 let found = result.child::<MetadataRegistryRecord, MetadataApiError>()?;
