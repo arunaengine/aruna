@@ -288,9 +288,16 @@ folder checks the owner's WRITE on the remote bucket on every pull and refuses t
 - `two_way` syncs both directions; `upload_only` never writes to disk; `download_only` never
   publishes: local edits and deletions stay local, and `propagate_deletes` is always false.
 - Local data always wins locally: a file is replaced automatically only while its fingerprint and
-  its blake3 still equal the recorded synced base. Anything else is preserved and reported, the
-  incoming version lands beside it as a conflicted copy, and replacing or removing local bytes is an
-  explicit action.
+  its blake3 still equal the recorded synced base. Anything else is preserved and reported, and
+  replacing or removing local bytes is an explicit action.
+- A file that changed before the pass planned its download keeps its name, and the incoming version
+  lands beside it as a conflicted copy, which the entry's `conflicted_copy` names.
+- A file that changes while its replacement runs is kept as well. On Linux and macOS it keeps its
+  name and the incoming version lands beside it as a conflicted copy. On Windows the incoming
+  version keeps the name and the local edit is the conflicted copy beside it. A replacement cut
+  short by a restart ends the same way as on Windows. `conflicted_copy` does not name these copies.
+- A conflicted copy whose descriptive name is too long for the file system gets a short name made
+  of a digest of the original name, the copy marker and the extension.
 - A remote deletion never deletes a local file. A local deletion becomes a realm delete marker while
   `propagate_deletes` is set.
 

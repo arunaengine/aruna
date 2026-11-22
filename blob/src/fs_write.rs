@@ -11,18 +11,22 @@ use aruna_core::structs::synced_folder::{SYNC_TRASH_DIR, WriteGuard};
 use bytes::Bytes;
 use futures::StreamExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
 use crate::fs_source::{
     KEPT_DIR, MAX_COPY_ATTEMPTS, SPOOL_DIR, SPOOL_GRACE, canonical_root, jailed_file, map_io_error,
 };
+use crate::walk::join_path;
 
 /// Why a spooled file could not be published. A refusal is the owner's data
 /// winning; a failure is this node's problem.
 enum PlaceError {
     Refused(LocalFileRefusal),
     Failed(String),
+    /// The target name is longer than the file system accepts for one component.
+    TooLong,
     /// The owner's displaced bytes could not be put aside and stay at this path,
     /// which must survive the cleanup of a failed write.
     Kept(PathBuf),
@@ -58,8 +62,12 @@ pub(crate) async fn write_guarded(
         WriteGuard::MustNotExist => place_new(&spooled.path, &target),
         // The weak fingerprint is the operation's own pre-check; what the
         // adapter re-verifies under the swap is the strong hash.
-        WriteGuard::MatchesBase { blake3, .. } => match reserved_file(root, KEPT_DIR).await {
-            Ok(kept) => exchange_guarded(&spooled, &kept, &target, blake3).await,
+        WriteGuard::MatchesBase { blake3, .. } => match kept_file(root, relative).await {
+            Ok(kept) => {
+                let placed = exchange_guarded(&spooled, &kept, &target, blake3).await;
+                prune_kept(&kept, relative).await;
+                placed
+            }
             Err(message) => Err(PlaceError::Failed(message)),
         },
     };
@@ -89,26 +97,21 @@ pub(crate) async fn write_conflicted(
         Ok(spooled) => spooled,
         Err(message) => return LocalFileEvent::Error { message },
     };
-    let stamp = conflict_stamp(at_ms);
-    let mut placed = Err(PlaceError::Refused(LocalFileRefusal::Exists));
-    let mut chosen = String::new();
-    for attempt in 1..=MAX_COPY_ATTEMPTS {
-        chosen = copy_name(relative, &stamp, attempt);
-        placed = place_new(&spooled.path, &parent.join(&chosen));
-        if !matches!(placed, Err(PlaceError::Refused(LocalFileRefusal::Exists))) {
-            break;
-        }
-    }
+    let placed = place_copy(&spooled.path, &parent, relative, &conflict_stamp(at_ms));
+    let chosen = placed.as_ref().cloned().unwrap_or_default();
     let published = parent.join(&chosen);
     let relative = sibling_path(relative, &chosen);
-    finish_write(spooled, placed, &published, move |fingerprint, spooled| {
-        LocalFileEvent::Copied {
+    finish_write(
+        spooled,
+        placed.map(drop),
+        &published,
+        move |fingerprint, spooled| LocalFileEvent::Copied {
             relative: relative.clone(),
             fingerprint,
             blake3: spooled.blake3,
             size: spooled.size,
-        }
-    })
+        },
+    )
     .await
 }
 
@@ -145,6 +148,12 @@ async fn finish_write(
         Err(PlaceError::Failed(message)) => {
             let _ = tokio::fs::remove_file(&spooled.path).await;
             LocalFileEvent::Error { message }
+        }
+        Err(PlaceError::TooLong) => {
+            let _ = tokio::fs::remove_file(&spooled.path).await;
+            LocalFileEvent::Error {
+                message: TOO_LONG.to_string(),
+            }
         }
     }
 }
@@ -216,6 +225,10 @@ pub(crate) async fn move_aside(root: &str, relative: &str, guard: &WriteGuard) -
             Err(PlaceError::Refused(LocalFileRefusal::Exists)) => continue,
             Err(PlaceError::Refused(reason)) => return LocalFileEvent::Refused { reason },
             Err(PlaceError::Failed(message)) => return LocalFileEvent::Error { message },
+            Err(PlaceError::TooLong) => {
+                let message = TOO_LONG.to_string();
+                return LocalFileEvent::Error { message };
+            }
             Err(PlaceError::Kept(path)) => {
                 let message = format!("the file was kept at {}", path.display());
                 return LocalFileEvent::Error { message };
@@ -407,6 +420,86 @@ async fn reserved_file(root: &str, directory: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// When this process first reserved or recovered a kept path, in Unix milliseconds.
+/// A kept id older than this belongs to a write that can no longer finish.
+static STARTED: LazyLock<u64> = LazyLock::new(aruna_clock::unix_timestamp_millis);
+
+/// A fresh kept path that mirrors `relative` under its own id, so a restart can
+/// still tell where the displaced file came from.
+async fn kept_file(root: &str, relative: &str) -> Result<PathBuf, String> {
+    LazyLock::force(&STARTED);
+    let reserved = format!("{KEPT_DIR}/{}/{relative}", Ulid::generate());
+    let (_, path) = jailed_target(root, &reserved)
+        .await
+        .map_err(|event| format!("reserved path refused: {event:?}"))?;
+    Ok(path)
+}
+
+/// Removes the emptied directories of one kept path, up to and including its id.
+/// A directory that still holds a file stays.
+async fn prune_kept(kept: &Path, relative: &str) {
+    let depth = Path::new(relative).components().count();
+    for directory in kept.ancestors().skip(1).take(depth) {
+        if tokio::fs::remove_dir(directory).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Publishes what writes of an earlier process left in the kept directory as
+/// conflict copies beside their original paths. Kept ids of this process stay.
+pub(crate) async fn recover_kept(root: &str) {
+    let Ok(resolved) = canonical_root(root).await else {
+        return;
+    };
+    let Ok(kept) = jailed_ancestor(&resolved, Path::new(KEPT_DIR)).await else {
+        return;
+    };
+    if kept != resolved.join(KEPT_DIR) {
+        return;
+    }
+    let Ok(mut reader) = tokio::fs::read_dir(kept).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = reader.next_entry().await {
+        let earlier = (entry.file_name().to_str())
+            .and_then(|name| Ulid::from_string(name).ok())
+            .is_some_and(|id| id.timestamp_ms() < *STARTED);
+        if earlier {
+            publish_kept(root, &entry.path()).await;
+        }
+    }
+}
+
+/// Moves each file under one kept id to a free conflict copy name beside the path
+/// it mirrors, never following a link, then removes the emptied directories.
+async fn publish_kept(root: &str, id: &Path) {
+    let mut pending = vec![(id.to_path_buf(), String::new())];
+    let mut emptied = Vec::new();
+    while let Some((path, relative)) = pending.pop() {
+        let Ok(entry) = tokio::fs::symlink_metadata(&path).await else {
+            continue;
+        };
+        if entry.is_file() {
+            if let Ok((_, target)) = jailed_target(root, &relative).await {
+                let _ = rescue_displaced(&path, &target).await;
+            }
+        } else if entry.is_dir()
+            && let Ok(mut reader) = tokio::fs::read_dir(&path).await
+        {
+            emptied.push(path);
+            while let Ok(Some(child)) = reader.next_entry().await {
+                if let Some(name) = child.file_name().to_str() {
+                    pending.push((child.path(), join_path(&relative, name)));
+                }
+            }
+        }
+    }
+    for directory in emptied.iter().rev() {
+        let _ = tokio::fs::remove_dir(directory).await;
+    }
+}
+
 async fn write_temp(
     path: &Path,
     blob: BackendStream<Result<Bytes, StreamError>>,
@@ -586,29 +679,37 @@ fn wide(path: &Path) -> Vec<u16> {
 /// Puts displaced bytes beside the target under a free conflict copy name and
 /// answers that path, so they stay on the owner's disk under a findable name.
 async fn rescue_displaced(spool: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
-    for candidate in copy_paths(target)? {
-        match place_new(spool, &candidate) {
-            Ok(()) => return Ok(candidate),
-            Err(PlaceError::Refused(LocalFileRefusal::Exists)) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Err(PlaceError::Failed(
-        "the displaced file could not be put aside".to_string(),
-    ))
-}
-
-/// The conflict copy names beside the target, in the order a copy tries them.
-fn copy_paths(target: &Path) -> Result<impl Iterator<Item = PathBuf>, PlaceError> {
-    let Some(parent) = target.parent().map(Path::to_path_buf) else {
+    let Some(parent) = target.parent() else {
         return Err(PlaceError::Failed(
             "the target has no directory".to_string(),
         ));
     };
-    let relative = target.to_string_lossy().to_string();
     let stamp = conflict_stamp(aruna_clock::unix_timestamp_millis());
-    Ok((1..=MAX_COPY_ATTEMPTS)
-        .map(move |attempt| parent.join(copy_name(&relative, &stamp, attempt))))
+    let name = place_copy(spool, parent, &target.to_string_lossy(), &stamp)?;
+    Ok(parent.join(name))
+}
+
+/// Moves `source` beside `relative` in `parent` under the first free conflict copy
+/// name and answers it. Only a name the file system refuses as too long is shortened.
+fn place_copy(
+    source: &Path,
+    parent: &Path,
+    relative: &str,
+    stamp: &str,
+) -> Result<String, PlaceError> {
+    let (mut attempt, mut form) = (1, 0);
+    while attempt <= MAX_COPY_ATTEMPTS {
+        let Some(name) = copy_name(relative, stamp, attempt, form) else {
+            return Err(PlaceError::TooLong);
+        };
+        match place_new(source, &parent.join(&name)) {
+            Ok(()) => return Ok(name),
+            Err(PlaceError::Refused(LocalFileRefusal::Exists)) => attempt += 1,
+            Err(PlaceError::TooLong) => form += 1,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(PlaceError::Refused(LocalFileRefusal::Exists))
 }
 
 /// Hashes one file and refuses the result when the file changed while it was
@@ -657,6 +758,7 @@ fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
     ) {
         Ok(()) => Ok(()),
         Err(rustix::io::Errno::EXIST) => Err(PlaceError::Refused(LocalFileRefusal::Exists)),
+        Err(rustix::io::Errno::NAMETOOLONG) => Err(PlaceError::TooLong),
         // A filesystem without the atomic flag still must not overwrite: a hard
         // link fails when the name is taken, and the spool is removed after.
         Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS | rustix::io::Errno::OPNOTSUPP) => {
@@ -680,6 +782,7 @@ fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
         error if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(PlaceError::Refused(LocalFileRefusal::Exists))
         }
+        error if error.kind() == std::io::ErrorKind::InvalidFilename => Err(PlaceError::TooLong),
         error => Err(PlaceError::Failed(error.to_string())),
     }
 }
@@ -694,6 +797,9 @@ fn link_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Err(PlaceError::Refused(LocalFileRefusal::Exists))
         }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidFilename => {
+            Err(PlaceError::TooLong)
+        }
         Err(error) => Err(PlaceError::Failed(error.to_string())),
     }
 }
@@ -706,26 +812,29 @@ fn conflict_stamp(at_ms: u64) -> String {
 }
 
 /// `note (conflicted copy 2026-08-25 1032, realm).txt`, with a numeric suffix
-/// from the second attempt on. A name too long for one path component drops its
-/// stem, then its extension.
-fn copy_name(relative: &str, stamp: &str, attempt: usize) -> String {
+/// from the second attempt on. Each later `form` is shorter: the stem gives way
+/// to a digest of the file name, then the extension goes.
+fn copy_name(relative: &str, stamp: &str, attempt: usize, form: usize) -> Option<String> {
     let (stem, extension) = split_name(relative);
     let suffix = match attempt {
         1 => String::new(),
         other => format!(" ({other})"),
     };
     let marker = format!("(conflicted copy {stamp}, realm){suffix}");
-    [
-        format!("{stem} {marker}{extension}"),
-        format!("{marker}{extension}"),
-    ]
-    .into_iter()
-    .find(|name| name.len() <= MAX_NAME_BYTES)
-    .unwrap_or(marker)
+    let digest = || {
+        let name = Path::new(relative).file_name().unwrap_or_default();
+        blake3::hash(name.as_encoded_bytes()).to_hex()[..8].to_string()
+    };
+    match form {
+        0 => Some(format!("{stem} {marker}{extension}")),
+        1 => Some(format!("{} {marker}{extension}", digest())),
+        2 => Some(format!("{} {marker}", digest())),
+        _ => None,
+    }
 }
 
-/// The longest file name in bytes that every supported file system accepts.
-const MAX_NAME_BYTES: usize = 255;
+/// Why a name that does not fit one path component could not be placed.
+const TOO_LONG: &str = "the file name is too long for this file system";
 
 /// The same file name, with a numeric suffix from the second attempt on.
 fn suffixed_name(relative: &str, attempt: usize) -> String {
@@ -760,6 +869,9 @@ fn sibling_path(relative: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The longest file name in bytes that every supported file system accepts.
+    const MAX_NAME_BYTES: usize = 255;
     use crate::fs_source::list_local;
     use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 
@@ -1189,9 +1301,11 @@ mod tests {
         let path = root.path().to_string_lossy().to_string();
         let (target, kept) = swapped_folder(&path).await;
         editor_save(&target, b"second save").await;
-        let Some(taken) = copy_paths(&target).ok().and_then(|mut paths| paths.next()) else {
+        let stamp = conflict_stamp(aruna_clock::unix_timestamp_millis());
+        let Some(name) = copy_name("note.txt", &stamp, 1, 0) else {
             panic!("no copy name");
         };
+        let taken = target.with_file_name(name);
         tokio::fs::write(&taken, b"other copy").await.unwrap();
 
         let refusal = keep_displaced(&kept, &target).await;
@@ -1260,29 +1374,38 @@ mod tests {
         );
     }
 
-    // The file an exchange displaces sits where no folder check sweeps, so a
-    // crash before the guard decided still leaves the owner's bytes in place.
+    // A process that exited mid swap left the owner's file in the kept directory:
+    // the restart pass lists it beside the download, and a write in flight stays.
     #[tokio::test]
-    async fn sweep_keeps_displaced() {
+    async fn publishes_after_restart() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().to_string_lossy().to_string();
-        let target = root.path().join("note.txt");
+        let target = root.path().join("docs/note.txt");
+        tokio::fs::create_dir(root.path().join("docs"))
+            .await
+            .unwrap();
         tokio::fs::write(&target, b"owner edit").await.unwrap();
         let spool = reserved_file(&path, SPOOL_DIR).await.unwrap();
         tokio::fs::write(&spool, b"incoming").await.unwrap();
-        let kept = reserved_file(&path, KEPT_DIR).await.unwrap();
+        let earlier = format!("{KEPT_DIR}/{}/docs/note.txt", Ulid::from_parts(1, 0));
+        let (_, kept) = jailed_target(&path, &earlier).await.unwrap();
         assert!(swap_in(&spool, &kept, &target).await.is_ok());
-        let stale = std::time::SystemTime::now() - SPOOL_GRACE - std::time::Duration::from_secs(60);
-        let file = std::fs::File::options().write(true).open(&kept).unwrap();
-        file.set_times(std::fs::FileTimes::new().set_modified(stale))
-            .unwrap();
-        drop(file);
+        let running = kept_file(&path, "other.txt").await.unwrap();
+        tokio::fs::write(&running, b"in flight").await.unwrap();
 
         crate::fs_source::check_local(&access(root.path(), ""))
             .await
             .unwrap();
-        assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
+        let paths = listed_paths(root.path()).await;
+        assert_eq!(paths.len(), 2, "{paths:?}");
+        assert!(paths[0].starts_with("docs/note (conflicted copy "));
+        assert_eq!(paths[1], "docs/note.txt");
+        let copy = tokio::fs::read(root.path().join(&paths[0])).await;
+        assert_eq!(copy.unwrap(), b"owner edit");
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"incoming");
+        assert_eq!(tokio::fs::read(&running).await.unwrap(), b"in flight");
+        let ids = std::fs::read_dir(root.path().join(KEPT_DIR)).unwrap();
+        assert_eq!(ids.count(), 1, "only the write in flight keeps its id");
     }
 
     #[tokio::test]
@@ -1595,23 +1718,50 @@ mod tests {
         );
     }
 
+    // Long names with one extension and one stamp still get their own first copy
+    // name: the short form keeps a digest of each original name.
+    #[tokio::test]
+    async fn separates_long_names() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let mut copies = Vec::new();
+        for letter in ["a", "b"] {
+            let name = format!("{}.txt", letter.repeat(MAX_NAME_BYTES - 4));
+            tokio::fs::write(root.path().join(&name), b"mine")
+                .await
+                .unwrap();
+            let event = write_conflicted(&path, &name, 1_756_000_000_000, body(b"theirs")).await;
+            let LocalFileEvent::Copied { relative, .. } = event else {
+                panic!("the copy must land beside {name}: {event:?}");
+            };
+            let digest = blake3::hash(name.as_bytes()).to_hex()[..8].to_string();
+            assert_eq!(relative, copy_name(&name, "2025-08-24 0146", 1, 1).unwrap());
+            assert!(relative.starts_with(&digest), "{relative}");
+            copies.push(relative);
+        }
+        assert_ne!(copies[0], copies[1]);
+    }
+
     #[test]
     fn splits_copy_names() {
         assert_eq!(
-            copy_name("a/note.txt", "s", 1),
+            copy_name("a/note.txt", "s", 1, 0).unwrap(),
             "note (conflicted copy s, realm).txt"
         );
         assert_eq!(
-            copy_name("note", "s", 2),
+            copy_name("note", "s", 2, 0).unwrap(),
             "note (conflicted copy s, realm) (2)"
         );
-        let long = format!("a/{}.txt", "n".repeat(MAX_NAME_BYTES - 4));
-        assert_eq!(copy_name(&long, "s", 1), "(conflicted copy s, realm).txt");
-        let extension = format!("a.{}", "x".repeat(MAX_NAME_BYTES - 2));
+        let digest = blake3::hash(b"note.txt").to_hex()[..8].to_string();
         assert_eq!(
-            copy_name(&extension, "s", 2),
-            "(conflicted copy s, realm) (2)"
+            copy_name("a/note.txt", "s", 1, 1).unwrap(),
+            format!("{digest} (conflicted copy s, realm).txt")
         );
+        assert_eq!(
+            copy_name("a/note.txt", "s", 2, 2).unwrap(),
+            format!("{digest} (conflicted copy s, realm) (2)")
+        );
+        assert_eq!(copy_name("a/note.txt", "s", 1, 3), None);
         assert_eq!(suffixed_name("a/note.txt", 3), "note (3).txt");
         assert_eq!(sibling_path("a/note.txt", "other.txt"), "a/other.txt");
         assert_eq!(sibling_path("note.txt", "other.txt"), "other.txt");
