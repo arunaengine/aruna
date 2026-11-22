@@ -13,8 +13,6 @@ rust-version.workspace = true
 [dependencies]
 aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
-aruna-drivers = { workspace = true }
-aruna-graph = { workspace = true }
 aruna-net = { workspace = true }
 aruna-storage = { workspace = true }
 aruna-wire = { workspace = true }

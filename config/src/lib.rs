@@ -34,10 +34,10 @@ use crate::identity::enrollment::{
 };
 use crate::identity::{IdentityError, IdentityStore};
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
+use aruna_core::search::MetadataSearchStorage;
 use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeState, PersistedNodeStatus,
 };
-use aruna_graph::MetadataSearchStorage;
 use aruna_storage::errors::StorageLibError;
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;

@@ -119,3 +119,20 @@ pub struct SearchNodePage {
     #[serde(default)]
     pub layout: Option<(ulid::Ulid, [u8; 32])>,
 }
+
+/// Where craqle keeps its full-text search index.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MetadataSearchStorage {
+    #[default]
+    Disk,
+    Memory,
+}
+
+impl From<MetadataSearchStorage> for craqle::SearchStorage {
+    fn from(search_storage: MetadataSearchStorage) -> Self {
+        match search_storage {
+            MetadataSearchStorage::Disk => Self::Disk,
+            MetadataSearchStorage::Memory => Self::Memory,
+        }
+    }
+}

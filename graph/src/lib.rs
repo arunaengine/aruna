@@ -40,22 +40,7 @@ const SLOW_CALL: Duration = Duration::from_millis(100);
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
 
-/// Where craqle keeps its full-text search index.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MetadataSearchStorage {
-    #[default]
-    Disk,
-    Memory,
-}
-
-impl From<MetadataSearchStorage> for SearchStorage {
-    fn from(search_storage: MetadataSearchStorage) -> Self {
-        match search_storage {
-            MetadataSearchStorage::Disk => SearchStorage::Disk,
-            MetadataSearchStorage::Memory => SearchStorage::Memory,
-        }
-    }
-}
+pub use aruna_core::search::MetadataSearchStorage;
 
 /// How the graph store is opened.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

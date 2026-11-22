@@ -731,34 +731,7 @@ fn adapter_dispatch(context: &DriverContext, depth: usize) -> Box<Dispatch<'_>> 
     Box::new(move |effect, until| Box::pin(dispatch_bounded(effect, context, depth, until, limits)))
 }
 
-/// How long the runner waits for the adapter of each effect kind before it answers
-/// `Event::Hung`; `None` waits without a limit. Blob streams, local files, sub operations,
-/// groups, delays and managed effects have no limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HangLimits {
-    pub storage: Option<Duration>,
-    pub net: Option<Duration>,
-    pub metadata: Option<Duration>,
-    pub task: Option<Duration>,
-    pub staging_source: Option<Duration>,
-}
-
-impl HangLimits {
-    /// Generous bounds far above every adapter's own timeouts; they only catch a hung adapter.
-    pub const DEFAULT: Self = Self {
-        storage: Some(Duration::from_secs(60)),
-        net: Some(Duration::from_secs(30 * 60)),
-        metadata: Some(Duration::from_secs(30 * 60)),
-        task: Some(Duration::from_secs(60)),
-        staging_source: Some(Duration::from_secs(15 * 60)),
-    };
-}
-
-impl Default for HangLimits {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
+pub use aruna_core::calls::HangLimits;
 
 static HANG_LIMITS: std::sync::RwLock<HangLimits> = std::sync::RwLock::new(HangLimits::DEFAULT);
 

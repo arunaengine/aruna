@@ -607,8 +607,6 @@ version = "3.0.0-alpha.208"
 dependencies = [
  "aruna-clock",
  "aruna-core",
- "aruna-drivers",
- "aruna-graph",
  "aruna-net",
  "aruna-storage",
  "aruna-wire",
