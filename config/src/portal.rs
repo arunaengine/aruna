@@ -341,8 +341,15 @@ fn lock_install(previous: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .write(true)
         .open(previous.with_extension("lock"))?;
-    file.lock()?;
-    Ok(file)
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            tests::CONTENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+            file.lock().map(|()| file)
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 /// Publishes the marked recovery directory `previous` whole with one rename of a staged copy, so
@@ -718,8 +725,12 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tar::{Builder, EntryType, Header};
     use tempfile::tempdir;
+
+    /// Set when an installer finds the install lock held and starts waiting for it.
+    pub(super) static CONTENDED: AtomicBool = AtomicBool::new(false);
 
     fn config(portal_dir: &Path) -> PortalArtifactConfig {
         PortalArtifactConfig {
@@ -983,16 +994,11 @@ mod tests {
             install_verified_artifact(&second_config, &archive, checksum, "now".to_string())
         });
 
-        // The second install has staged its portal and is waiting for the lock.
-        while !staged_checksum(tempdir.path()) {
+        // The second install has tried the lock and is waiting for it.
+        while !CONTENDED.load(Ordering::SeqCst) {
             assert!(!second.is_finished());
             std::thread::yield_now();
         }
-        let probe = fs::File::open(previous.with_extension("lock")).unwrap();
-        assert!(matches!(
-            probe.try_lock(),
-            Err(fs::TryLockError::WouldBlock)
-        ));
         assert!(!second.is_finished());
 
         // The first install fails and restores its backup, as `replace_portable` does.
@@ -1006,15 +1012,6 @@ mod tests {
             "new"
         );
         assert!(!previous.exists());
-    }
-
-    /// Whether an installer staged a portal with its checksum file under `parent`.
-    fn staged_checksum(parent: &Path) -> bool {
-        fs::read_dir(parent).unwrap().any(|entry| {
-            let entry = entry.unwrap();
-            entry.file_name().to_string_lossy().starts_with(".portal-")
-                && entry.path().join(CHECKSUM_FILE).is_file()
-        })
     }
 
     // A directory another tool creates at the recovery name after the absence check stays.
