@@ -188,6 +188,13 @@ async fn dispatch_unboxed(
             let started = start_background(child, context, ());
             Event::Task(TaskEvent::BackgroundStarted { started })
         }
+        Effect::Detached(child) => {
+            let context = context.clone();
+            tokio::spawn(async move {
+                dispatch_effect(Effect::SubOperation(child), &context, 0).await;
+            });
+            Event::Task(TaskEvent::BackgroundStarted { started: true })
+        }
         Effect::Task(task_effect) => task::dispatch_task(task_effect, context).await,
         Effect::Index(index_effect) => Event::Index(match context.storage_handle.range_indexes() {
             Some(indexes) => indexes.execute(*index_effect).await,
@@ -259,6 +266,7 @@ pub(crate) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Background(_) => "background",
+        Effect::Detached(_) => "detached",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",

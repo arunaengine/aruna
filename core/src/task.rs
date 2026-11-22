@@ -194,7 +194,8 @@ pub enum TaskEvent {
         key: TaskKey,
         count: usize,
     },
-    /// Answers `Effect::Background`: whether a free slot let the child start.
+    /// Answers `Effect::Background`, whether a free slot let the child start, and
+    /// `Effect::Detached`, which always starts.
     BackgroundStarted {
         started: bool,
     },

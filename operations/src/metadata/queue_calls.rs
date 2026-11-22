@@ -640,7 +640,7 @@ fn group_answer(outcome: MaterializationGroupOutcome) -> IoResult {
     })
 }
 
-// Walks a drain of one completed job to the background start of its graph sync.
+// Walks a drain of one completed job to the detached start of its graph sync.
 fn syncing(graph_iri: &str) -> MaterializationBatchOperation {
     let mut batch = MaterializationBatchOperation::new(GitNode::default(), 2, true);
     batch.stamp(100);
@@ -663,7 +663,7 @@ fn syncing(graph_iri: &str) -> MaterializationBatchOperation {
     };
     assert!(is_child(&batch.next(group_answer(outcome))));
     let sync = GraphSyncOperation::new(graph_iri.to_string(), vec![node(2)]);
-    let call = IoCall::background(sync);
+    let call = IoCall::detached(sync);
     same_call(batch.next(child(Ok::<(), Error>(()))), Ok(Next::Call(call)));
     batch
 }
@@ -704,19 +704,6 @@ fn batch_syncs_graphs() {
     let result = drain_result(batch.next(armed));
     assert_eq!(result.processed, 1);
     assert_eq!(result.next_due_after, None);
-}
-
-#[test]
-fn busy_slot_waits() {
-    // Without a free background slot the drain waits for the sync instead of dropping it.
-    let graph_iri = event().record.graph_iri;
-    let mut batch = syncing(&graph_iri);
-    let inline = IoCall::child(GraphSyncOperation::new(graph_iri, vec![node(2)]));
-    same_call(batch.next(started(false)), Ok(Next::Call(inline)));
-    let turn = batch.next(child(Ok::<(), MetadataError>(())));
-    let armed = armed(&mut batch, turn);
-    let result = drain_result(batch.next(armed));
-    assert_eq!(result.processed, 1);
 }
 
 #[test]

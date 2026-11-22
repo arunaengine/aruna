@@ -207,6 +207,7 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Metadata(_) => "metadata",
         Effect::SubOperation(_) => "suboperation",
         Effect::Background(_) => "background",
+        Effect::Detached(_) => "detached",
         Effect::Task(_) => "task",
         Effect::Search() => "search",
         Effect::Stream() => "stream",
