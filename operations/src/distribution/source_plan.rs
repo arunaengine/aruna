@@ -6,7 +6,9 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
 use aruna_core::errors::SourceResolutionError;
-use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
+#[cfg(test)]
+use aruna_core::events::Event;
+use aruna_core::events::{BlobEvent, StagingSourceEvent};
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, DISTRIBUTION_KEYSPACE, S3_BUCKET_KEYSPACE,
 };
@@ -310,7 +312,7 @@ impl SpoolSourceOperation {
             range: None,
             expected: bound.then_some(cached),
         };
-        self.call(SpoolStep::Read, Effect::StagingSource(read))
+        self.call(SpoolStep::Read, Effect::staging(read))
     }
 
     fn spool(
@@ -334,7 +336,7 @@ impl SpoolSourceOperation {
             deadline: None,
             blob: stream,
         };
-        self.call(SpoolStep::Spool, Effect::Blob(spool))
+        self.call(SpoolStep::Spool, Effect::blob(spool))
     }
 
     fn check(&mut self, copy: SpooledCopy) -> SpoolNext {
@@ -345,7 +347,7 @@ impl SpoolSourceOperation {
         }
         let key = HiddenBlobKey::try_from(location).map_err(|_| spool_error(MISMATCH))?;
         let drop = BlobEffect::DeleteHidden { key };
-        self.call(SpoolStep::Drop, Effect::Blob(drop))
+        self.call(SpoolStep::Drop, Effect::blob(drop))
     }
 }
 
@@ -370,26 +372,22 @@ impl Operation for SpoolSourceOperation {
                 let resolved = result.child::<ResolvedSourceAccess, SourceResolutionError>()?;
                 self.read(resolved.map_err(|error| spool_error(error.to_string()))?)
             }
-            SpoolStep::Read => match result.event()? {
-                Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
-                    self.spool(metadata, stream)
-                }
-                Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                    Err(spool_error(error.to_string()))
-                }
+            SpoolStep::Read => match result.staging()? {
+                StagingSourceEvent::ReadResult { metadata, stream } => self.spool(metadata, stream),
+                StagingSourceEvent::Error { error } => Err(spool_error(error.to_string())),
                 _ => Err(spool_error("unexpected answer to the source read")),
             },
-            SpoolStep::Spool => match result.event()? {
-                Event::Blob(BlobEvent::HiddenSpooled {
+            SpoolStep::Spool => match result.blob()? {
+                BlobEvent::HiddenSpooled {
                     location,
                     blake3,
                     size,
-                }) => self.check((location, blake3, size)),
-                Event::Blob(BlobEvent::Error(error)) => Err(spool_error(error.to_string())),
+                } => self.check((location, blake3, size)),
+                BlobEvent::Error(error) => Err(spool_error(error.to_string())),
                 _ => Err(spool_error("unexpected answer to the copy write")),
             },
             SpoolStep::Drop => {
-                if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
+                if let Ok(BlobEvent::Error(error)) = (result.event()?).into_blob() {
                     warn!(%error, "A dropped kept copy is left to the hidden sweep");
                 }
                 Err(spool_error(MISMATCH))
@@ -543,7 +541,7 @@ mod tests {
     fn source_read_spooled() {
         let read = |length: u64| {
             let stream = futures_util::stream::empty::<Result<Bytes, std::io::Error>>();
-            event(Event::StagingSource(StagingSourceEvent::ReadResult {
+            event(Event::staging(StagingSourceEvent::ReadResult {
                 metadata: metadata(length),
                 stream: BackendStream::new(stream),
             }))
@@ -552,8 +550,8 @@ mod tests {
             panic!("expected the spool");
         };
         assert!(matches!(
-            *spool,
-            Effect::Blob(BlobEffect::SpoolHidden {
+            (*spool).as_blob(),
+            Some(BlobEffect::SpoolHidden {
                 max_bytes: Some(4),
                 ..
             })
@@ -567,7 +565,7 @@ mod tests {
     fn mismatched_copy_dropped() {
         let spooled_event = |size: u64| {
             let (location, blake3, size) = spooled(size);
-            event(Event::Blob(BlobEvent::HiddenSpooled {
+            event(Event::blob(BlobEvent::HiddenSpooled {
                 location,
                 blake3,
                 size,
@@ -578,9 +576,9 @@ mod tests {
 
         let mut spool = at(SpoolStep::Spool);
         let key = HiddenBlobKey::try_from(&spooled(3).0).unwrap();
-        let delete = IoCall::Effect(Box::new(Effect::Blob(BlobEffect::DeleteHidden { key })));
+        let delete = IoCall::blob(BlobEffect::DeleteHidden { key });
         assert_eq!(spool.next(spooled_event(3)), Ok(Next::Call(delete)));
-        let deleted = event(Event::Blob(BlobEvent::HiddenDeleted));
+        let deleted = event(Event::blob(BlobEvent::HiddenDeleted));
         assert_eq!(spool.next(deleted), Err(spool_error(MISMATCH)));
     }
 

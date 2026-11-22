@@ -230,9 +230,10 @@ impl LocalQueryOperation {
             }
             QueryStage::Cached(graph_iris) => match cache_answer(result)? {
                 MetadataEvent::QueryCacheEntry {
-                    entry: Some((results, _)),
+                    entry: Some(cached),
                     ..
                 } => {
+                    let (results, _) = *cached;
                     self.timing.note("cache", "hit");
                     Ok(Next::Done(results))
                 }

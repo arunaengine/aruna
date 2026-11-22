@@ -199,8 +199,8 @@ pub async fn content(context: &TestContext, version: &BlobVersion) -> Vec<u8> {
     let location = read(context, BLOB_LOCATIONS_KEYSPACE, key).await.unwrap();
     let location = BackendLocation::from_bytes(&location).unwrap();
     let blob = context.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) =
-        blob.send_blob_effect(BlobEffect::Read { location }).await
+    let Ok(BlobEvent::ReadFinished { blob, .. }) =
+        (blob.send_blob_effect(BlobEffect::Read { location }).await).into_blob()
     else {
         panic!("read failed")
     };

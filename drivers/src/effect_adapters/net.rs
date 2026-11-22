@@ -159,7 +159,7 @@ fn record_watch(effect: NetEffect, net_handle: Option<&NetHandle>) -> Result<Eve
             entry,
         } => {
             if let Some(net_handle) = net_handle {
-                net_handle.register_local_interest(watch_id, realm_id, holder, entry);
+                net_handle.register_local_interest(watch_id, realm_id, holder, *entry);
             }
         }
         NetEffect::RetractInterest(watch_id) => {

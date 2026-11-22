@@ -4,9 +4,9 @@
 
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::credential_encryption::CredentialEncryptionKey;
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::id::NodeId;
 use aruna_core::repository::ImportMode;
 use aruna_core::repository::credential::RepositoryCredential;
@@ -86,23 +86,19 @@ impl PartialEq for JobScope {
 
 /// The call that runs `call` in the blob backend, ending early when `stop` fires.
 pub(crate) fn remote_call(call: RemoteCall, stop: Option<JobStop>) -> IoCall {
-    IoCall::Effect(Box::new(Effect::Blob(BlobEffect::Remote(Box::new(
-        RemoteRequest { stop, call },
-    )))))
+    IoCall::blob(BlobEffect::Remote(Box::new(RemoteRequest { stop, call })))
 }
 
 /// The answer to a [`remote_call`].
 pub(crate) fn remote_answer(
     result: IoResult,
 ) -> Result<Result<RemoteAnswer, RemoteFailure>, IoError> {
-    match result.event()? {
-        Event::Blob(BlobEvent::Remote(answer)) => Ok(answer),
-        Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Ok(Err(
-            RemoteFailure::Retryable("blob handle unavailable".to_string()),
-        )),
-        Event::Blob(BlobEvent::Error(error)) => {
-            Ok(Err(RemoteFailure::Retryable(error.to_string())))
-        }
+    match result.blob()? {
+        BlobEvent::Remote(answer) => Ok(answer),
+        BlobEvent::Error(BlobError::HandleMissing) => Ok(Err(RemoteFailure::Retryable(
+            "blob handle unavailable".to_string(),
+        ))),
+        BlobEvent::Error(error) => Ok(Err(RemoteFailure::Retryable(error.to_string()))),
         other => Err(IoError::Unexpected {
             expected: "BlobEvent::Remote",
             got: other.label(),

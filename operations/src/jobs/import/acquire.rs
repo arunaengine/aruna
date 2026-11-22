@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::jobs::{ByteStream, JobEffect, JobEvent};
 use aruna_core::operation::{Operation, boxed_retry};
@@ -393,14 +393,14 @@ impl Operation for SpoolSourceOperation {
                     deadline: None,
                     blob,
                 };
-                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(spool)))))
+                Ok(Next::Call(IoCall::blob(spool)))
             }
-            SpoolStep::Spool => match result.event()? {
-                Event::Blob(BlobEvent::HiddenSpooled {
+            SpoolStep::Spool => match result.blob()? {
+                BlobEvent::HiddenSpooled {
                     location,
                     blake3,
                     size,
-                }) => {
+                } => {
                     self.spooled = Some(ImportInput {
                         location,
                         size,
@@ -411,7 +411,7 @@ impl Operation for SpoolSourceOperation {
                     self.step = SpoolStep::Stops;
                     Ok(Next::Call(job_call(JobEffect::Stops)))
                 }
-                Event::Blob(BlobEvent::Error(error)) => {
+                BlobEvent::Error(error) => {
                     self.step = SpoolStep::StopsAfterError(Box::new(error));
                     Ok(Next::Call(job_call(JobEffect::Stops)))
                 }

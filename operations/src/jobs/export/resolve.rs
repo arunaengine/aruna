@@ -7,7 +7,7 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
 use aruna_core::errors::AuthorizationError;
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, S3_BUCKET_KEYSPACE,
@@ -643,7 +643,7 @@ impl OpenLocalOperation {
         };
         self.step = OpenStep::Admission;
         let archive = ArchiveKey::of(&self.candidate.location);
-        let admit = Effect::Blob(BlobEffect::AdmitRead { key, archive });
+        let admit = Effect::blob(BlobEffect::AdmitRead { key, archive });
         Ok(Next::Call(IoCall::Effect(Box::new(admit))))
     }
 }
@@ -698,19 +698,21 @@ impl Operation for OpenLocalOperation {
                         result.label()
                     )));
                 };
-                match *event {
-                    Event::Blob(BlobEvent::ReadAdmitted { lease }) => {
+                match (*event).into_blob() {
+                    Ok(BlobEvent::ReadAdmitted { lease }) => {
                         Ok(Next::Done(LocalOpen::Admitted(Some(lease))))
                     }
-                    Event::Blob(BlobEvent::Error(BlobError::BucketKey(
-                        BucketKeyError::Locked(_),
-                    ))) => {
+                    Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                         let key = self
                             .bucket_key
                             .ok_or_else(|| retryable("the key was lost"))?;
                         Ok(Next::Done(LocalOpen::Locked(key)))
                     }
-                    event => Err(retryable(format!(
+                    Ok(event) => Err(retryable(format!(
+                        "read admission failed: {}",
+                        event.label()
+                    ))),
+                    Err(event) => Err(retryable(format!(
                         "read admission failed: {}",
                         event.label()
                     ))),

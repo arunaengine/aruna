@@ -208,7 +208,10 @@ impl Operation for DeviceExportOperation {
                 Ok(Next::Done(ExportMetadataResult::Summary { jsonld, record }))
             }
             Event::Metadata(MetadataEvent::RoCratePageResult { page, .. }) => {
-                Ok(Next::Done(ExportMetadataResult::Page { page, record }))
+                Ok(Next::Done(ExportMetadataResult::Page {
+                    page: *page,
+                    record,
+                }))
             }
             _ => Err(MetadataApiError::ServiceUnavailable),
         }

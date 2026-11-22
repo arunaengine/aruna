@@ -100,7 +100,7 @@ fn cache_hit_answers() {
     ));
     let hit = MetadataEvent::QueryCacheEntry {
         stamp: [4, 5],
-        entry: Some((MetadataQueryResults::Boolean(true), 3)),
+        entry: Some(Box::new((MetadataQueryResults::Boolean(true), 3))),
     };
     let answer = done(query.next(metadata(hit)));
     assert_eq!(

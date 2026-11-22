@@ -7,7 +7,9 @@ use super::{backend_key, index_prefix};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{BACKEND_INDEX_KEYSPACE, STORAGE_BACKEND_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::storage::blob::BackendRef;
@@ -158,7 +160,7 @@ impl Operation for BucketCheckOperation {
     type Error = BucketCheckError;
 
     fn first(&mut self) -> Result<Next<Self::Output>, Self::Error> {
-        let head = Effect::Blob(BlobEffect::HeadBucket {
+        let head = Effect::blob(BlobEffect::HeadBucket {
             backend: BackendRef::Group(self.backend_id),
             bucket: self.bucket.clone(),
         });
@@ -171,17 +173,19 @@ impl Operation for BucketCheckOperation {
                 "unexpected bucket check answer".to_string(),
             )));
         };
-        match *event {
-            Event::Blob(BlobEvent::BucketExists { exists, writable }) => {
-                Ok(Next::Done((exists, writable)))
-            }
+        match (*event).into_blob() {
+            Ok(BlobEvent::BucketExists { exists, writable }) => Ok(Next::Done((exists, writable))),
             // Kept from the direct handle call: a node without blob access says so this way.
-            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => {
+            Ok(BlobEvent::Error(BlobError::HandleMissing)) => {
                 let missing = BlobError::UnknownBackend("blob handle unavailable".to_string());
                 Err(BucketCheckError::Blob(missing))
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(BucketCheckError::Blob(error)),
-            other => Err(BucketCheckError::Blob(BlobError::UnknownBackend(format!(
+            Ok(BlobEvent::Error(error)) => Err(BucketCheckError::Blob(error)),
+            Ok(other) => Err(BucketCheckError::Blob(BlobError::UnknownBackend(format!(
+                "unexpected bucket check answer: {}",
+                other.label()
+            )))),
+            Err(other) => Err(BucketCheckError::Blob(BlobError::UnknownBackend(format!(
                 "unexpected bucket check answer: {}",
                 other.label()
             )))),
@@ -294,7 +298,7 @@ mod pure_tests {
     fn checks_one_bucket() {
         // One head request on the group storage; its answer is the result.
         let mut operation = bucket_check();
-        let head = Effect::Blob(BlobEffect::HeadBucket {
+        let head = Effect::blob(BlobEffect::HeadBucket {
             backend: BackendRef::Group(Ulid::from_bytes([9u8; 16])),
             bucket: "data".to_string(),
         });
@@ -302,7 +306,7 @@ mod pure_tests {
             operation.first(),
             Ok(Next::Call(IoCall::Effect(Box::new(head))))
         );
-        let answer = Event::Blob(BlobEvent::BucketExists {
+        let answer = Event::blob(BlobEvent::BucketExists {
             exists: true,
             writable: Some(false),
         });
@@ -316,10 +320,10 @@ mod pure_tests {
         let down = || BlobError::ConnectionFailed("down".to_string());
         let mut operation = bucket_check();
         operation.first().unwrap();
-        let error = Event::Blob(BlobEvent::Error(down()));
+        let error = Event::blob(BlobEvent::Error(down()));
         let answer = operation.next(IoResult::Event(Box::new(error)));
         assert_eq!(answer, Err(BucketCheckError::Blob(down())));
-        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let missing = Event::blob(BlobEvent::Error(BlobError::HandleMissing));
         let mut operation = bucket_check();
         operation.first().unwrap();
         let unknown = BlobError::UnknownBackend("blob handle unavailable".to_string());

@@ -181,9 +181,13 @@ impl ChangeEncryptionOperation {
     }
 
     fn refused(&self, received: Event) -> ChangeTurn {
-        match received {
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => Err(ChangeError::InvalidStateEvent {
+        match received.into_blob() {
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => Err(ChangeError::InvalidStateEvent {
+                state: self.state,
+                received: other.label(),
+            }),
+            Err(other) => Err(ChangeError::InvalidStateEvent {
                 state: self.state,
                 received: other.label(),
             }),
@@ -288,11 +292,11 @@ impl ChangeEncryptionOperation {
         self.active = Some(record);
         if leaves_vault {
             // Leaving `vault_locked` needs the unlocked key for the node vault copy.
-            let read = Effect::Blob(BlobEffect::ReadUnlockedKey { key });
+            let read = Effect::blob(BlobEffect::ReadUnlockedKey { key });
             return self.call(ChangeState::ReadUnlocked, read.into());
         }
         // Every other change moves archives that only the unlocked source key opens.
-        let status = Effect::Blob(BlobEffect::ReadKeyStatus {
+        let status = Effect::blob(BlobEffect::ReadKeyStatus {
             bucket_id: key.bucket_id,
         });
         self.call(ChangeState::CheckUnlocked, status.into())
@@ -356,7 +360,7 @@ impl ChangeEncryptionOperation {
             node_id: self.input.node_id,
             holders,
         };
-        self.call(ChangeState::SealCopies, Effect::Blob(seal).into())
+        self.call(ChangeState::SealCopies, Effect::blob(seal).into())
     }
 
     fn report(&self, copies: &[SealedCopy]) -> HolderReport {
@@ -415,7 +419,7 @@ impl ChangeEncryptionOperation {
             .iter()
             .map(|(_, value)| BucketHolder::from_bytes(value.as_ref()))
             .collect::<Result<Vec<_>, _>>()?;
-        let generate = Effect::Blob(BlobEffect::GenerateBucketKey);
+        let generate = Effect::blob(BlobEffect::GenerateBucketKey);
         self.call(ChangeState::GenerateKey, generate.into())
     }
 
@@ -443,32 +447,46 @@ impl Operation for ChangeEncryptionOperation {
             ChangeState::ReadBucket => self.read_bucket(result.values()?),
             ChangeState::CheckUploads => self.check_uploads(&result.page()?.0),
             ChangeState::ReadKey => self.read_key(row_values::<2>(result)?),
-            ChangeState::CheckUnlocked => match result.event()? {
-                Event::Blob(BlobEvent::KeyStatus { generations }) => {
-                    self.check_unlocked(&generations)
+            ChangeState::CheckUnlocked => match (result.event()?).into_blob() {
+                Ok(BlobEvent::KeyStatus { generations }) => self.check_unlocked(&generations),
+                Ok(other) => {
+                    let other = Event::blob(other);
+                    self.refused(other)
                 }
-                other => self.refused(other),
+                Err(other) => self.refused(other),
             },
             ChangeState::ReadGrants => self.grants_read(result.page()?.0),
-            ChangeState::GenerateKey => match result.event()? {
-                Event::Blob(BlobEvent::BucketKeyGenerated {
+            ChangeState::GenerateKey => match (result.event()?).into_blob() {
+                Ok(BlobEvent::BucketKeyGenerated {
                     public_key,
                     private_key,
                 }) => self.seal(public_key, private_key),
-                other => self.refused(other),
+                Ok(other) => {
+                    let other = Event::blob(other);
+                    self.refused(other)
+                }
+                Err(other) => self.refused(other),
             },
             ChangeState::PrepareAbe => self.prepare_abe(result),
-            ChangeState::SealCopies => match result.event()? {
-                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.copies_sealed(copies),
-                other => self.refused(other),
+            ChangeState::SealCopies => match (result.event()?).into_blob() {
+                Ok(BlobEvent::CopiesSealed { copies }) => self.copies_sealed(copies),
+                Ok(other) => {
+                    let other = Event::blob(other);
+                    self.refused(other)
+                }
+                Err(other) => self.refused(other),
             },
-            ChangeState::ReadUnlocked => match result.event()? {
-                Event::Blob(BlobEvent::UnlockedKeyRead { key, private_key })
+            ChangeState::ReadUnlocked => match (result.event()?).into_blob() {
+                Ok(BlobEvent::UnlockedKeyRead { key, private_key })
                     if self.settings.active_key() == Some(key) =>
                 {
                     self.write_rows(Some(private_key), Vec::new())
                 }
-                other => self.refused(other),
+                Ok(other) => {
+                    let other = Event::blob(other);
+                    self.refused(other)
+                }
+                Err(other) => self.refused(other),
             },
             ChangeState::WriteRows => {
                 result.done()?;

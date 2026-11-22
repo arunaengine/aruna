@@ -142,7 +142,7 @@ async fn locked_source_waits() {
     // A locked source parks the work on its key; once unlocked, the same work copies.
     use aruna_core::compute::{SecretBytes, SharedSecret};
     use aruna_core::effects::{BlobEffect, StorageEffect};
-    use aruna_core::events::{BlobEvent, Event};
+    use aruna_core::events::BlobEvent;
     use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
     use aruna_core::structs::storage::encryption::{
         BucketEncryption, BucketKeyRef, EncryptionMode, public_key_of,
@@ -179,7 +179,7 @@ async fn locked_source_waits() {
         max: None,
     };
     let handle = blob.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::KeyPrepared { ticket }) = handle.send_blob_effect(prepare).await
+    let Ok(BlobEvent::KeyPrepared { ticket }) = handle.send_blob_effect(prepare).await.into_blob()
     else {
         panic!("prepare failed")
     };

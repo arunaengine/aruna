@@ -179,12 +179,12 @@ struct RejoinedPeer {
 
 async fn announce_peer(peer: &NetHandle, realm_id: RealmId) -> TestResult<()> {
     let event = peer
-        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
             key: realm_presence_key(&realm_id),
             realm_id,
             value: peer.node_id().as_bytes().to_vec(),
             ttl: Duration::from_secs(60),
-        })))
+        }))))
         .await;
     if !matches!(
         event,

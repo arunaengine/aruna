@@ -222,13 +222,14 @@ impl CreateMultipartOperation {
     }
 
     fn unexpected(&self, expected: &'static str, event: Event) -> CreateMultipartError {
-        if let Event::Blob(BlobEvent::Error(error)) = event {
+        let received = event.label();
+        if let Ok(BlobEvent::Error(error)) = event.into_blob() {
             return error.into();
         }
         CreateMultipartError::InvalidStateEvent {
             state: self.state.clone(),
             expected,
-            received: event.label(),
+            received,
         }
     }
 
@@ -330,14 +331,18 @@ impl CreateMultipartOperation {
             backend: self.resolved()?.backend,
             path,
         };
-        self.call(CreateMultipartState::StatPlain, Effect::Blob(stat).into())
+        self.call(CreateMultipartState::StatPlain, Effect::blob(stat).into())
     }
 
     fn plain_stat(&mut self, event: Event) -> Turn {
         let plain = self.plain.take();
         let plain = plain.ok_or(CreateMultipartError::CreateUploadFailed)?;
-        let Event::Blob(BlobEvent::PlainStat { exists, version }) = event else {
-            return Err(self.unexpected("Event::Blob(BlobEvent::PlainStat)", event));
+        let (exists, version) = match event.into_blob() {
+            Ok(BlobEvent::PlainStat { exists, version }) => (exists, version),
+            Ok(blob) => {
+                return Err(self.unexpected("Event::Blob(BlobEvent::PlainStat)", Event::blob(blob)));
+            }
+            Err(event) => return Err(self.unexpected("Event::Blob(BlobEvent::PlainStat)", event)),
         };
         let replaces = version.is_some() && self.plain_owned;
         let (path, if_not_exists) = same_name_path(&plain.path, plain.ulid, exists, replaces);
@@ -358,12 +363,20 @@ impl CreateMultipartOperation {
             created_by: self.input.created_by,
             plain,
         };
-        self.call(CreateMultipartState::OpenUpload, Effect::Blob(open).into())
+        self.call(CreateMultipartState::OpenUpload, Effect::blob(open).into())
     }
 
     fn upload_opened(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::UploadOpened { backend_upload }) = event else {
-            return Err(self.unexpected("Event::Blob(BlobEvent::UploadOpened)", event));
+        let backend_upload = match event.into_blob() {
+            Ok(BlobEvent::UploadOpened { backend_upload }) => backend_upload,
+            Ok(blob) => {
+                return Err(
+                    self.unexpected("Event::Blob(BlobEvent::UploadOpened)", Event::blob(blob))
+                );
+            }
+            Err(event) => {
+                return Err(self.unexpected("Event::Blob(BlobEvent::UploadOpened)", event));
+            }
         };
         self.backend_upload = backend_upload;
         self.check_purge_fence()
@@ -385,13 +398,17 @@ impl CreateMultipartOperation {
             object_key: self.input.key.clone(),
             bucket_public: plan.public_key,
         });
-        let create = Effect::Blob(BlobEffect::Abe(Box::new(envelope)));
+        let create = Effect::blob(BlobEffect::Abe(Box::new(envelope)));
         self.call(CreateMultipartState::CreateEnvelope, create.into())
     }
 
     fn envelope_created(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::Abe(abe)) = event else {
-            return Err(self.unexpected("Event::Blob(BlobEvent::Abe)", event));
+        let abe = match event.into_blob() {
+            Ok(BlobEvent::Abe(abe)) => abe,
+            Ok(blob) => {
+                return Err(self.unexpected("Event::Blob(BlobEvent::Abe)", Event::blob(blob)));
+            }
+            Err(event) => return Err(self.unexpected("Event::Blob(BlobEvent::Abe)", event)),
         };
         let AbeEvent::Envelope(envelope) = *abe else {
             return Err(CreateMultipartError::CreateUploadFailed);
@@ -746,7 +763,7 @@ impl Operation for CreateMultipartOperation {
             let abort = BlobEffect::AbortUpload {
                 backend_upload: Box::new(backend_upload),
             };
-            IoCall::from(Effect::Blob(abort))
+            IoCall::from(Effect::blob(abort))
         });
         calls.into_iter().collect()
     }
@@ -839,7 +856,7 @@ mod pure_tests {
     }
 
     fn opened(backend_upload: Option<BackendUpload>) -> IoResult {
-        event(Event::Blob(BlobEvent::UploadOpened { backend_upload }))
+        event(Event::blob(BlobEvent::UploadOpened { backend_upload }))
     }
 
     fn call(turn: Turn) -> IoCall {
@@ -960,10 +977,9 @@ mod pure_tests {
         // A plain key checks its exact key before the provider upload opens there.
         let (mut operation, _) = created("data/a.csv");
         let turn = owner_answer(&mut operation, None);
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "team-a-bucket/data/a.csv"
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path, .. }) if path == "team-a-bucket/data/a.csv")
+        );
         // A folder key or a key without a plain path never opens an upload.
         for key in ["reports/", "reports//a.csv"] {
             let (_, turn) = created(key);
@@ -994,7 +1010,7 @@ mod pure_tests {
 
         let turn = operation.next(fence_clear());
 
-        let Effect::Blob(BlobEffect::OpenUpload { resolved, .. }) = asked(&turn) else {
+        let Some(BlobEffect::OpenUpload { resolved, .. }) = asked(&turn).as_blob() else {
             panic!("expected the upload to open, got {turn:?}")
         };
         assert_eq!(resolved.compression, Compression::Zstd { level: 3 });
@@ -1125,7 +1141,7 @@ mod pure_tests {
             Some(1u64.to_be_bytes().to_vec()),
         ]);
         let turn = operation.next(answer);
-        let Effect::Blob(BlobEffect::Abe(effect)) = asked(&turn) else {
+        let Some(BlobEffect::Abe(effect)) = asked(&turn).as_blob() else {
             panic!("expected the envelope effect, got {turn:?}")
         };
         let AbeEffect::Envelope(plan) = effect.as_ref() else {
@@ -1138,7 +1154,7 @@ mod pure_tests {
         )
         .unwrap();
         let created = AbeEvent::Envelope(envelope);
-        operation.next(event(Event::Blob(BlobEvent::Abe(Box::new(created)))))
+        operation.next(event(Event::blob(BlobEvent::Abe(Box::new(created)))))
     }
 
     #[test]
@@ -1256,8 +1272,8 @@ mod pure_tests {
         operation.next(ungoverned_bucket()).unwrap();
         let turn = operation.next(fence_clear());
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::OpenUpload { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::OpenUpload { .. })
         ));
         operation.next(opened(upload)).unwrap();
         operation.next(fence_clear()).unwrap();
@@ -1306,8 +1322,8 @@ mod pure_tests {
     /// The provider upload `calls` abort.
     fn aborted(calls: &[IoCall]) -> Option<&BackendUpload> {
         match calls {
-            [IoCall::Effect(effect)] => match &**effect {
-                Effect::Blob(BlobEffect::AbortUpload { backend_upload }) => Some(&**backend_upload),
+            [IoCall::Effect(effect)] => match (&**effect).as_blob() {
+                Some(BlobEffect::AbortUpload { backend_upload }) => Some(&**backend_upload),
                 _ => None,
             },
             _ => None,
@@ -1436,8 +1452,8 @@ mod pure_tests {
     }
 
     fn opened_plain(turn: &Turn) -> PlainPath {
-        match asked(turn) {
-            Effect::Blob(BlobEffect::OpenUpload {
+        match asked(turn).as_blob() {
+            Some(BlobEffect::OpenUpload {
                 plain: Some(plain), ..
             }) => plain.clone(),
             other => panic!("expected a plain provider upload, got {other:?}"),
@@ -1461,14 +1477,11 @@ mod pure_tests {
             assert_eq!(outside(&mut turn).len(), 1, "expected the owner read");
             let turn = owner_answer(&mut operation, owner);
             assert!(
-                matches!(
-                    asked(&turn),
-                    Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/one"
-                ),
+                matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path, .. }) if path == "raw/one"),
                 "expected the path stat, got {turn:?}"
             );
             let stat = BlobEvent::PlainStat { exists, version };
-            let plain = opened_plain(&operation.next(event(Event::Blob(stat))));
+            let plain = opened_plain(&operation.next(event(Event::blob(stat))));
             let expected = match tagged {
                 true => tagged_path("raw/one", plain.ulid),
                 false => "raw/one".to_string(),
@@ -1483,17 +1496,14 @@ mod pure_tests {
         // A separate write folder has no record to prove the file there the upload's own.
         let (mut operation, turn) = plain_create_at("{dir}{name}", Some("out/"));
         assert!(
-            matches!(
-                asked(&turn),
-                Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "out/one"
-            ),
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path, .. }) if path == "out/one"),
             "expected the path stat, got {turn:?}"
         );
         let stat = BlobEvent::PlainStat {
             exists: true,
             version: Some("v1".to_string()),
         };
-        let plain = opened_plain(&operation.next(event(Event::Blob(stat))));
+        let plain = opened_plain(&operation.next(event(Event::blob(stat))));
         assert_eq!(plain.path, tagged_path("out/one", plain.ulid));
     }
 
@@ -1510,7 +1520,7 @@ mod pure_tests {
         let (mut operation, _) = plain_create("{dir}{name}");
         owner_answer(&mut operation, None).unwrap();
         let failed = BlobEvent::Error(BlobError::KeyTooLong);
-        let turn = operation.next(event(Event::Blob(failed)));
+        let turn = operation.next(event(Event::blob(failed)));
         assert_eq!(
             turn.err(),
             Some(CreateMultipartError::BlobError(BlobError::KeyTooLong))

@@ -9,7 +9,9 @@ use crate::s3::bucket::key::rows::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
@@ -157,7 +159,7 @@ impl GrantHolderOperation {
             return self.write(Vec::new());
         }
         self.step = GrantStep::SealCopies;
-        let seal = Effect::Blob(BlobEffect::SealUnlocked {
+        let seal = Effect::blob(BlobEffect::SealUnlocked {
             key,
             realm_id: self.input.realm_id,
             node_id: self.input.node_id,
@@ -236,13 +238,13 @@ impl Operation for GrantHolderOperation {
         match self.step {
             GrantStep::ReadBucket => self.read_grant(keyless(result.values()?)),
             GrantStep::ReadGrant => self.seal(result.value()?),
-            GrantStep::SealCopies => match result.event()? {
-                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.write(copies),
+            GrantStep::SealCopies => match result.blob()? {
+                BlobEvent::CopiesSealed { copies } => self.write(copies),
                 // A locked generation cannot seal now; the next unlock seals the pending grant.
-                Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+                BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_))) => {
                     self.write(Vec::new())
                 }
-                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+                BlobEvent::Error(error) => Err(error.into()),
                 other => Err(IoError::Unexpected {
                     expected: "BlobEvent::CopiesSealed",
                     got: other.label(),

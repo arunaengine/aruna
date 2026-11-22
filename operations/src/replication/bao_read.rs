@@ -149,7 +149,7 @@ pub struct BaoReadOperation {
 }
 
 fn blob_call<T>(effect: BlobEffect) -> Next<T> {
-    Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
+    Next::Call(IoCall::blob(effect))
 }
 
 impl BaoReadOperation {
@@ -246,27 +246,27 @@ impl Operation for BaoReadOperation {
     }
 
     fn next(&mut self, result: IoResult) -> ReadStep {
-        let event = result.event()?;
-        if let Event::Blob(BlobEvent::Error(error)) = event {
-            return Err(error.into());
-        }
+        let event = match result.event()?.into_blob() {
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(event) => event,
+            Err(other) => return Err(self.unexpected(&other)),
+        };
         match (self.state, event) {
-            (BaoReadState::Open, Event::Blob(BlobEvent::ConnectionEstablished { stream_id })) => {
+            (BaoReadState::Open, BlobEvent::ConnectionEstablished { stream_id }) => {
                 self.stream_id = Some(stream_id);
                 self.state = BaoReadState::Send;
                 let message = VersionReplicationMessage::BaoReadRequest(self.request.clone());
                 let payload = message.to_bytes()?;
                 Ok(blob_call(BlobEffect::SendMessage { stream_id, payload }))
             }
-            (BaoReadState::Send, Event::Blob(BlobEvent::MessageSent { stream_id })) => {
+            (BaoReadState::Send, BlobEvent::MessageSent { stream_id }) => {
                 self.state = BaoReadState::ReadResponse;
                 Ok(blob_call(BlobEffect::ReadMessage { stream_id }))
             }
-            (
-                BaoReadState::ReadResponse,
-                Event::Blob(BlobEvent::MessageReceived { stream_id, payload }),
-            ) => self.response(stream_id, &payload),
-            (BaoReadState::Receive, Event::Blob(BlobEvent::ReadFinished { blob, stream_size })) => {
+            (BaoReadState::ReadResponse, BlobEvent::MessageReceived { stream_id, payload }) => {
+                self.response(stream_id, &payload)
+            }
+            (BaoReadState::Receive, BlobEvent::ReadFinished { blob, stream_size }) => {
                 // The byte stream owns the connection now.
                 self.stream_id = None;
                 let blake3 = self
@@ -281,19 +281,19 @@ impl Operation for BaoReadOperation {
                     hashes: std::mem::take(&mut self.accepted_hashes),
                 }))
             }
-            (BaoReadState::CloseMetadata, Event::Blob(BlobEvent::ConnectionClosed { .. })) => {
+            (BaoReadState::CloseMetadata, BlobEvent::ConnectionClosed { .. }) => {
                 self.stream_id = None;
                 let metadata = self.metadata.take().ok_or(BaoReadError::NotFinished)?;
                 Ok(Next::Done(metadata))
             }
-            (_, event) => Err(self.unexpected(&event)),
+            (_, event) => Err(self.unexpected(&Event::blob(event))),
         }
     }
 
     /// A deadline or failure must release the stream; only `CloseConnection` unregisters it.
     fn abort(&mut self) -> Vec<IoCall> {
         let close = |stream_id| {
-            let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+            let close = Effect::blob(BlobEffect::CloseConnection { stream_id });
             IoCall::Effect(Box::new(close))
         };
         self.stream_id.take().map(close).into_iter().collect()
@@ -720,18 +720,22 @@ impl IncomingBaoOperation {
             }
             (None, None) => return self.fail(BaoReadError::NotFinished),
         };
-        match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease })
+        match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease })
                 if (lease.key, lease.archive.clone()) == target =>
             {
                 self.lease = Some(lease);
                 self.offer_admitted(location)
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(id)))) => {
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(id)))) => {
                 self.send_refusal(BaoReadRefusal::BucketLocked(id))
             }
-            Event::Blob(BlobEvent::Error(_)) => self.send_refusal(BaoReadRefusal::BackendFailure),
-            other => self.unexpected(other),
+            Ok(BlobEvent::Error(_)) => self.send_refusal(BaoReadRefusal::BackendFailure),
+            Ok(other) => {
+                let other = Event::blob(other);
+                self.unexpected(other)
+            }
+            Err(other) => self.unexpected(other),
         }
     }
 
@@ -796,12 +800,16 @@ impl IncomingBaoOperation {
 
     /// The event answering a stream call; a failed stream ends the serve.
     fn stream_event(&mut self, result: IoResult) -> Result<Event, BaoReadError> {
-        match result.event()? {
-            Event::Blob(BlobEvent::Error(error)) => {
+        match (result.event()?).into_blob() {
+            Ok(BlobEvent::Error(error)) => {
                 self.failed = true;
                 Err(error.into())
             }
-            event => Ok(event),
+            Ok(event) => {
+                let event = Event::blob(event);
+                Ok(event)
+            }
+            Err(event) => Ok(event),
         }
     }
 
@@ -1434,24 +1442,25 @@ impl IncomingBaoOperation {
 
     /// The next step after a stream call answered.
     fn stream_step(&mut self, event: Event) -> ServeTurn {
-        match (self.state, event) {
-            (IncomingBaoState::SendAccepted, Event::Blob(BlobEvent::MessageSent { .. })) => {
+        match (self.state, event.into_blob()) {
+            (IncomingBaoState::SendAccepted, Ok(BlobEvent::MessageSent { .. })) => {
                 self.serve_accepted()
             }
-            (IncomingBaoState::ServeRead, Event::Blob(BlobEvent::ReadServed { .. })) => {
+            (IncomingBaoState::ServeRead, Ok(BlobEvent::ReadServed { .. })) => {
                 Ok(Next::Done(IncomingBaoResult::Served))
             }
-            (IncomingBaoState::CloseMetadata, Event::Blob(BlobEvent::ConnectionClosed { .. })) => {
+            (IncomingBaoState::CloseMetadata, Ok(BlobEvent::ConnectionClosed { .. })) => {
                 Ok(Next::Done(IncomingBaoResult::Probed))
             }
-            (IncomingBaoState::SendRefusal, Event::Blob(BlobEvent::MessageSent { .. })) => {
+            (IncomingBaoState::SendRefusal, Ok(BlobEvent::MessageSent { .. })) => {
                 self.close(IncomingBaoState::CloseRefusal)
             }
-            (IncomingBaoState::CloseRefusal, Event::Blob(BlobEvent::ConnectionClosed { .. })) => {
+            (IncomingBaoState::CloseRefusal, Ok(BlobEvent::ConnectionClosed { .. })) => {
                 let refusal = self.refusal.unwrap_or(BaoReadRefusal::BackendFailure);
                 Ok(Next::Done(IncomingBaoResult::Refused(refusal)))
             }
-            (_, event) => self.unexpected(event),
+            (_, Ok(event)) => self.unexpected(Event::blob(event)),
+            (_, Err(event)) => self.unexpected(event),
         }
     }
 }
@@ -1479,15 +1488,15 @@ impl Operation for IncomingBaoOperation {
             IncomingBaoState::ReadKept => self.handle_kept(result.values()?),
             IncomingBaoState::ReadExactBucket => self.handle_exact_bucket(result.value()?),
             IncomingBaoState::ResolveSource => match result.event()? {
-                Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                    result: Ok(access),
-                }) => {
-                    self.source_access = Some(access);
-                    self.observation_settings()
+                Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) => {
+                    match *result {
+                        Ok(access) => {
+                            self.source_access = Some(access);
+                            self.observation_settings()
+                        }
+                        Err(_) => self.send_refusal(BaoReadRefusal::NotFound),
+                    }
                 }
-                Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                    result: Err(_),
-                }) => self.send_refusal(BaoReadRefusal::NotFound),
                 other => self.unexpected(other),
             },
             IncomingBaoState::ReadPolicy => self.handle_policy(result.values()?),
@@ -1532,10 +1541,10 @@ impl Operation for IncomingBaoOperation {
             let refusal = VersionReplicationMessage::BaoReadRefused(BaoReadRefusal::BackendFailure);
             if let Ok(payload) = refusal.to_bytes() {
                 let send = BlobEffect::SendMessage { stream_id, payload };
-                calls.push(Effect::Blob(send).into());
+                calls.push(Effect::blob(send).into());
             }
         }
-        calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
+        calls.push(Effect::blob(BlobEffect::CloseConnection { stream_id }).into());
         calls
     }
 }
@@ -1843,7 +1852,7 @@ mod pure_tests {
     }
 
     fn refusal_from(turn: &ServeTurn) -> BaoReadRefusal {
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(turn).as_blob() else {
             panic!("expected refusal frame")
         };
         let VersionReplicationMessage::BaoReadRefused(reason) =
@@ -1858,9 +1867,9 @@ mod pure_tests {
     fn abort_shape(calls: &[IoCall]) -> (Option<BaoReadRefusal>, bool) {
         fn effect(call: &IoCall) -> &BlobEffect {
             match call {
-                IoCall::Effect(effect) => match effect.as_ref() {
-                    Effect::Blob(effect) => effect,
-                    other => panic!("expected a stream call, got {other:?}"),
+                IoCall::Effect(effect) => match effect.as_blob() {
+                    Some(effect) => effect,
+                    None => panic!("expected a stream call, got {effect:?}"),
                 },
                 other => panic!("expected a stream call, got {other:?}"),
             }
@@ -1941,7 +1950,7 @@ mod pure_tests {
     }
 
     fn blob(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     /// The blob effect a requester step asks for, if it asks for one.
@@ -1949,10 +1958,7 @@ mod pure_tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = step else {
             return None;
         };
-        match effect.as_ref() {
-            Effect::Blob(effect) => Some(effect),
-            _ => None,
-        }
+        effect.as_blob()
     }
 
     /// Drives a requester read to the response frame and returns its outcome there; the
@@ -1967,7 +1973,7 @@ mod pure_tests {
         let _ = operation.next(blob(BlobEvent::MessageSent { stream_id }));
         let payload = message.to_bytes().unwrap();
         let answer = operation.next(blob(BlobEvent::MessageReceived { stream_id, payload }));
-        let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+        let close = Effect::blob(BlobEffect::CloseConnection { stream_id });
         assert_eq!(operation.abort(), vec![IoCall::Effect(Box::new(close))]);
         answer
     }
@@ -2064,7 +2070,7 @@ mod pure_tests {
         // though every ref was echoed back.
         let (location, _) = location_value([4u8; 32]);
         let turn = operation.challenge_destination(location);
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected a policy frame")
         };
         assert!(matches!(
@@ -2109,7 +2115,7 @@ mod pure_tests {
 
         let (location, _) = location_value([4u8; 32]);
         let turn = operation.challenge_destination(location.clone());
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected a policy frame")
         };
         assert!(matches!(
@@ -2245,7 +2251,7 @@ mod pure_tests {
         let (location, _) = location_value([4u8; 32]);
         let turn = operation.challenge_destination(location);
 
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected a policy frame")
         };
         assert!(matches!(
@@ -2530,7 +2536,7 @@ mod pure_tests {
             .next(rows(vec![Some(attached.to_bytes().unwrap().into()), None]))
             .unwrap();
         let turn = operation.next(row(None));
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected accepted frame")
         };
         assert!(matches!(
@@ -2679,7 +2685,7 @@ mod pure_tests {
             .next(rows(vec![None, Some(entry.to_bytes().unwrap().into())]))
             .unwrap();
         let turn = operation.next(row(None));
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected accepted frame")
         };
         assert!(matches!(
@@ -2708,7 +2714,7 @@ mod pure_tests {
         operation.next(row(Some(value))).unwrap();
         // The bucket has no encryption settings, so the plain copy is offered without a lease.
         let turn = operation.next(row(None));
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected accepted frame")
         };
         assert_eq!(
@@ -2722,15 +2728,14 @@ mod pure_tests {
         );
 
         let turn = operation.next(blob(BlobEvent::MessageSent { stream_id }));
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::ServeRead {
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::ServeRead {
                 stream_id: id,
                 location: selected,
                 expected_blake3,
                 range: None,
-            }) if *id == stream_id && selected == &location && expected_blake3 == &hash
-        ));
+            }) if *id == stream_id && selected == &location && expected_blake3 == &hash)
+        );
         assert_eq!(
             operation.next(blob(BlobEvent::ReadServed { stream_id })),
             Ok(Next::Done(IncomingBaoResult::Served))
@@ -2820,10 +2825,9 @@ mod pure_tests {
         let bucket_id = Ulid::from(30u128);
         let (mut operation, location) = sealed_serve(bucket_id);
         let turn = operation.send_accepted(location);
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::AdmitRead { key, .. }) if key.bucket_id == bucket_id
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::AdmitRead { key, .. }) if key.bucket_id == bucket_id)
+        );
         let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
         let turn = operation.next(blob(BlobEvent::Error(locked)));
         assert_eq!(refusal_from(&turn), BaoReadRefusal::BucketLocked(bucket_id));
@@ -2846,7 +2850,7 @@ mod pure_tests {
             Arc::new(()),
         );
         let turn = operation.next(blob(BlobEvent::ReadAdmitted { lease }));
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected the accepted frame, got {turn:?}")
         };
         assert!(matches!(
@@ -2856,10 +2860,9 @@ mod pure_tests {
         let turn = operation.next(blob(BlobEvent::MessageSent {
             stream_id: Ulid::from(9u128),
         }));
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key)
+        );
     }
 
     #[test]
@@ -2897,11 +2900,10 @@ mod pure_tests {
         let turn = operation.send_accepted(location);
         assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
         let turn = operation.next(settings_row());
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
-                if *admitted == key && *named == archive
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::AdmitRead { key: admitted, archive: named })
+                if *admitted == key && *named == archive)
+        );
         let locked = BlobError::BucketKey(BucketKeyError::Locked(bucket_id));
         let turn = operation.next(blob(BlobEvent::Error(locked)));
         assert_eq!(refusal_from(&turn), BaoReadRefusal::BucketLocked(bucket_id));
@@ -2917,10 +2919,9 @@ mod pure_tests {
         let turn = operation.next(blob(BlobEvent::MessageSent {
             stream_id: Ulid::from(9u128),
         }));
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::ServeSealedRead { lease, .. }) if lease.key == key)
+        );
     }
 
     #[test]
@@ -2953,15 +2954,16 @@ mod pure_tests {
                 path: "file.txt".to_string(),
                 version: None,
             };
-            let resolved = SubOperationEvent::VersionAccessResolved { result: Ok(access) };
+            let resolved = SubOperationEvent::VersionAccessResolved {
+                result: Box::new(Ok(access)),
+            };
             let event = Event::SubOperation(resolved);
             let turn = operation.next(IoResult::Event(Box::new(event)));
             assert!(matches!(&turn, Ok(Next::Call(IoCall::Read(_)))));
             let turn = operation.next(row(Some(settings.to_bytes().unwrap().into())));
-            assert!(matches!(
-                asked(&turn),
-            Effect::Blob(BlobEffect::AdmitRead { key, .. }) if key.bucket_id == bucket_id
-            ));
+            assert!(
+                matches!((asked(&turn)).as_blob(), Some(BlobEffect::AdmitRead { key, .. }) if key.bucket_id == bucket_id)
+            );
             operation
         };
 
@@ -2984,8 +2986,8 @@ mod pure_tests {
             stream_id: Ulid::from(9u128),
         }));
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::ServeSourceRead { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::ServeSourceRead { .. })
         ));
         assert_eq!(Arc::strong_count(&guard), 2);
     }

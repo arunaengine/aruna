@@ -661,16 +661,16 @@ impl CompleteUploadOperation {
         let reserve = BlobEffect::ReserveCompose {
             content: parts.saturating_mul(MAX_PART_SIZE),
         };
-        self.effect(CompleteUploadState::ReserveCompose, Effect::Blob(reserve))
+        self.effect(CompleteUploadState::ReserveCompose, Effect::blob(reserve))
     }
 
     fn compose_reserved(&mut self, event: Event) -> Turn {
-        match event {
-            Event::Blob(BlobEvent::ComposeReserved { share }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::ComposeReserved { share }) => {
                 self.compose_share = Some(share);
                 self.read_parts(None)
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
             _ => Err(CompleteUploadError::InvalidOperationState),
         }
     }
@@ -869,7 +869,7 @@ impl CompleteUploadOperation {
                 parts: self.resolved_parts.clone(),
                 share,
             };
-            return self.compose(Effect::Blob(compose).into());
+            return self.compose(Effect::blob(compose).into());
         }
         if let Some(turn) = self.plain_compose() {
             return turn;
@@ -903,7 +903,7 @@ impl CompleteUploadOperation {
             compression: self.compression,
             if_not_exists,
         };
-        Some(Effect::Blob(complete).into())
+        Some(Effect::blob(complete).into())
     }
 
     fn compose_parts(&self, parts: Vec<BackendLocation>) -> Result<IoCall, CompleteUploadError> {
@@ -919,13 +919,13 @@ impl CompleteUploadOperation {
             parts,
             plain: None,
         };
-        Ok(Effect::Blob(compose).into())
+        Ok(Effect::blob(compose).into())
     }
 
     fn handle_blob_composed(&mut self, event: Event) -> Turn {
-        let mut location = match event {
-            Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten {
+        let mut location = match event.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => location,
+            Ok(BlobEvent::PlainWritten {
                 location,
                 version,
                 etag,
@@ -934,13 +934,13 @@ impl CompleteUploadOperation {
                 self.plain_etag = etag;
                 location
             }
-            Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.plain_taken(),
-            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
+            Ok(BlobEvent::Error(BlobError::PathTaken)) => return self.plain_taken(),
+            Ok(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup.set_release(location.ulid);
                 self.delete_location = Some(location);
                 return Err(CompleteUploadError::CompleteUploadFailed);
             }
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
             _ => return Err(CompleteUploadError::InvalidOperationState),
         };
         // A compression changed since the upload opened composes the bytes again, except at a
@@ -1061,7 +1061,7 @@ impl CompleteUploadOperation {
         let mut calls = Vec::new();
         if let Some(location) = self.composed_location.take() {
             let release = BlobEffect::ReleaseReservation { id: location.ulid };
-            calls.push(Effect::Blob(release).into());
+            calls.push(Effect::blob(release).into());
         }
         calls.push(schedule_snapshot_publish().into());
         calls.push(schedule_cleanup_effect().into());
@@ -1249,7 +1249,7 @@ impl Operation for CompleteUploadOperation {
             }
         }
         if let Some(id) = self.cleanup.take_release() {
-            calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
+            calls.push(Effect::blob(BlobEffect::ReleaseReservation { id }).into());
         }
         calls
     }

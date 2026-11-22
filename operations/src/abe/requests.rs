@@ -396,7 +396,7 @@ impl KeyOperation {
         self.state = State::Issue;
         let issuer = KeyIssuer::Node(self.node);
         let context = GrantContext { request, issuer };
-        let issue = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Issue(context))));
+        let issue = Effect::blob(BlobEffect::Abe(Box::new(AbeEffect::Issue(context))));
         Ok(Next::Call(IoCall::Effect(Box::new(issue))))
     }
     pub(super) fn publish_grant(&mut self, grant: KeyGrant) -> KeyTurn {

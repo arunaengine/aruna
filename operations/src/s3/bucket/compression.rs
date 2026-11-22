@@ -7,7 +7,9 @@ use crate::s3::imports::LinkScan;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BUCKET_ENCRYPTION_KEYSPACE, BUCKET_KEY_KEYSPACE, COMPRESSION_MIGRATION_KEYSPACE,
     COMPRESSION_QUEUE_KEYSPACE, S3_BUCKET_KEYSPACE, TRANSITION_KEYSPACE, TRANSITION_QUEUE_KEYSPACE,
@@ -175,7 +177,7 @@ impl PutCompressionOperation {
         };
         self.call(
             PutCompressionState::CheckUnlocked,
-            Effect::Blob(status).into(),
+            Effect::blob(status).into(),
         )
     }
 
@@ -327,10 +329,8 @@ impl Operation for PutCompressionOperation {
                 self.links_scanned(rows, next)
             }
             PutCompressionState::ReadMigration => self.read_rows(values::<3>(result)?),
-            PutCompressionState::CheckUnlocked => match result.event()? {
-                Event::Blob(BlobEvent::KeyStatus { generations }) => {
-                    self.check_unlocked(&generations)
-                }
+            PutCompressionState::CheckUnlocked => match result.blob()? {
+                BlobEvent::KeyStatus { generations } => self.check_unlocked(&generations),
                 other => Err(PutCompressionError::InvalidStateEvent {
                     state: "CheckUnlocked",
                     expected: "KeyStatus",
@@ -528,7 +528,7 @@ mod tests {
             max_remaining: None,
         };
         let generations = if unlocked { vec![session] } else { Vec::new() };
-        IoResult::Event(Box::new(Event::Blob(BlobEvent::KeyStatus { generations })))
+        IoResult::Event(Box::new(Event::blob(BlobEvent::KeyStatus { generations })))
     }
 
     #[test]

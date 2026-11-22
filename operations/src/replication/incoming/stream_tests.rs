@@ -90,14 +90,14 @@ fn is_close(turn: &StreamTurn) -> bool {
         return false;
     };
     matches!(
-        effect.as_ref(),
-        Effect::Blob(BlobEffect::CloseConnection { .. })
+        effect.as_ref().as_blob(),
+        Some(BlobEffect::CloseConnection { .. })
     )
 }
 
 fn connection_closed() -> IoResult {
     let stream_id = peer_stream().stream_id;
-    let event = Event::Blob(BlobEvent::ConnectionClosed { stream_id });
+    let event = Event::blob(BlobEvent::ConnectionClosed { stream_id });
     IoResult::Event(Box::new(event))
 }
 
@@ -142,7 +142,7 @@ fn failed_lookup_answers() {
     let Next::Call(IoCall::Effect(effect)) = sent else {
         panic!("the lookup answers");
     };
-    let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = *effect else {
+    let Ok(BlobEffect::SendMessage { payload, .. }) = (*effect).into_blob() else {
         panic!("the lookup sends its answer");
     };
     assert_eq!(
@@ -150,7 +150,7 @@ fn failed_lookup_answers() {
         VersionReplicationMessage::VersionKeyResponse(None)
     );
     let stream_id = peer_stream().stream_id;
-    let event = Event::Blob(BlobEvent::MessageSent { stream_id });
+    let event = Event::blob(BlobEvent::MessageSent { stream_id });
     assert!(is_close(&op.next(IoResult::Event(Box::new(event)))));
 }
 

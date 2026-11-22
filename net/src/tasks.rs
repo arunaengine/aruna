@@ -265,11 +265,11 @@ mod tests {
 
     fn presence_effect_for(seed: u8) -> NetEffect {
         let realm_id = RealmId::from_bytes([seed; 32]);
-        NetEffect::Dht(DhtEffect::Get {
+        NetEffect::Dht(Box::new(DhtEffect::Get {
             key: realm_presence_key(&realm_id),
             realm_filter: Some(realm_id),
             options: DhtGetOptions::presence(Duration::from_secs(1), realm_id),
-        })
+        }))
     }
 
     // An accepted effect future is part of the completion boundary: after the

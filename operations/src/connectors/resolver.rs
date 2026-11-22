@@ -309,7 +309,11 @@ pub fn resolve_connector_effect(input: ResolveConnectorInput) -> Effect {
 pub fn resolve_binding_effect(input: ResolveBindingInput) -> Effect {
     Effect::SubOperation(boxed_suboperation(
         ResolveBindingOperation::new(input),
-        |result| Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }),
+        |result| {
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
+                result: Box::new(result),
+            })
+        },
     ))
 }
 

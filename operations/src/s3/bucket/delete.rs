@@ -553,7 +553,7 @@ impl DeleteBucketOperation {
                 bucket_id,
                 session: None,
             };
-            calls.push(Effect::Blob(lock).into());
+            calls.push(Effect::blob(lock).into());
         }
         let wake = |key| {
             let after = std::time::Duration::ZERO;
@@ -1169,7 +1169,7 @@ mod test {
         let Ok(Next::Then { calls, .. }) = operation.deleted() else {
             panic!("expected the end of the delete");
         };
-        let lock = IoCall::from(Effect::Blob(BlobEffect::LockKey {
+        let lock = IoCall::from(Effect::blob(BlobEffect::LockKey {
             bucket_id,
             session: None,
         }));

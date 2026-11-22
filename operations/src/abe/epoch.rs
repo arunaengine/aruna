@@ -71,7 +71,7 @@ impl KeyOperation {
         };
         let bucket_id = snapshot.parameters.key.bucket_id;
         self.state = State::Unlock;
-        let status = Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id });
+        let status = Effect::blob(BlobEffect::ReadKeyStatus { bucket_id });
         Ok(Next::Call(IoCall::Effect(Box::new(status))))
     }
     pub(super) fn raise_first(&mut self) -> KeyTurn {

@@ -179,7 +179,7 @@ impl Operation for CreateBackendOperation {
         };
 
         self.state = CreateState::Probe;
-        let effect = Effect::Blob(BlobEffect::CheckGroupBackend {
+        let effect = Effect::blob(BlobEffect::CheckGroupBackend {
             record: record.clone(),
             secret: secret.clone(),
         });
@@ -194,12 +194,22 @@ impl Operation for CreateBackendOperation {
                 let IoResult::Event(event) = result else {
                     return Err(CreateBackendError::Failed);
                 };
-                match *event {
-                    Event::Blob(BlobEvent::GroupBackendChecked) => {}
-                    Event::Blob(BlobEvent::Error(error)) => {
+                match (*event).into_blob() {
+                    Ok(BlobEvent::GroupBackendChecked) => {}
+                    Ok(BlobEvent::Error(error)) => {
                         return Err(CreateBackendError::Unreachable(error));
                     }
-                    received => {
+                    Ok(received) => {
+                        let received = Event::blob(received);
+                        {
+                            return Err(CreateBackendError::InvalidStateEvent {
+                                state: "Probe",
+                                expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
+                                received,
+                            });
+                        }
+                    }
+                    Err(received) => {
                         return Err(CreateBackendError::InvalidStateEvent {
                             state: "Probe",
                             expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
@@ -275,11 +285,11 @@ mod pure_tests {
             panic!("expected the probe");
         };
         assert!(matches!(
-            *effect,
-            Effect::Blob(BlobEffect::CheckGroupBackend { .. })
+            (*effect).as_blob(),
+            Some(BlobEffect::CheckGroupBackend { .. })
         ));
 
-        let written = operation.next(event(Event::Blob(BlobEvent::GroupBackendChecked)));
+        let written = operation.next(event(Event::blob(BlobEvent::GroupBackendChecked)));
         formatted.push(format!("{written:?} {operation:?}"));
         assert!(matches!(written, Ok(Next::Call(IoCall::Child(_)))));
         let mut write = operation.group_write().unwrap();
@@ -315,7 +325,7 @@ mod pure_tests {
 
     #[test]
     fn probe_failure_aborts() {
-        let failed = Event::Blob(BlobEvent::Error(BlobError::WriteError(
+        let failed = Event::blob(BlobEvent::Error(BlobError::WriteError(
             "denied".to_string(),
         )));
         assert!(matches!(

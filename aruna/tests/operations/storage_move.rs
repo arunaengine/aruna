@@ -10,7 +10,7 @@ use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::egress::EgressPolicy;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::structs::storage::blob::{
     Backend, BackendConfig, BackendLocation, BackendRef, VersionKey,
@@ -226,7 +226,7 @@ async fn settles_missing_copies() {
     let location = BackendLocation::from_bytes(&location).unwrap();
     let blob = context.driver.blob_handle.as_ref().unwrap();
     let deleted = blob.send_blob_effect(BlobEffect::Delete { location }).await;
-    assert!(matches!(deleted, Event::Blob(BlobEvent::DeleteFinished)));
+    assert!(matches!(deleted.as_blob(), Some(BlobEvent::DeleteFinished)));
     route_cold(&context, "data/").await;
     let intent = WriteIntent {
         key: "data/a.txt".to_string(),

@@ -11,7 +11,9 @@ use std::collections::VecDeque;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::{ConversionError, SourceResolutionError};
-use aruna_core::events::{Event, StagingSourceEvent};
+#[cfg(test)]
+use aruna_core::events::Event;
+use aruna_core::events::StagingSourceEvent;
 use aruna_core::keyspaces::SOURCE_ROOT_KEYSPACE;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
@@ -242,14 +244,14 @@ impl Operation for RootsCheckOperation {
                     Ok(access) => {
                         self.state = State::Check;
                         let check = StagingSourceEffect::Check { access };
-                        let check = Effect::StagingSource(check);
+                        let check = Effect::staging(check);
                         Ok(Next::Call(IoCall::Effect(Box::new(check))))
                     }
                     Err(error) => self.probed(Some(error.to_string())),
                 }
             }
-            State::Check => match result.event()? {
-                Event::StagingSource(StagingSourceEvent::CheckResult) => {
+            State::Check => match result.staging()? {
+                StagingSourceEvent::CheckResult => {
                     let (digest, _) = self.probing.as_ref().ok_or(RootsError::NotFinished)?;
                     let row = (
                         SOURCE_ROOT_KEYSPACE.to_string(),
@@ -259,9 +261,7 @@ impl Operation for RootsCheckOperation {
                     self.state = State::Mark;
                     Ok(Next::Call(IoCall::Write(vec![row])))
                 }
-                Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                    self.probed(Some(error.to_string()))
-                }
+                StagingSourceEvent::Error { error } => self.probed(Some(error.to_string())),
                 other => Err(RootsError::UnexpectedEvent(other.label())),
             },
             State::Mark => {
@@ -423,7 +423,7 @@ mod tests {
     }
 
     fn staged(event: StagingSourceEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::StagingSource(event)))
+        IoResult::Event(Box::new(Event::staging(event)))
     }
 
     fn probing(row: (Vec<u8>, Vec<u8>)) -> RootsCheckOperation {
@@ -444,7 +444,7 @@ mod tests {
         );
         let mut operation = probing(row);
         let check = StagingSourceEffect::Check { access: access() };
-        let check = IoCall::Effect(Box::new(Effect::StagingSource(check)));
+        let check = IoCall::staging(check);
         assert_eq!(
             operation.next(resolved(Ok(access()))),
             Ok(Next::Call(check))

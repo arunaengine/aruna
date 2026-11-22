@@ -13,7 +13,7 @@ pub(super) async fn dispatch_blob(effect: BlobEffect, context: &DriverContext) -
     if let Some(blob_handle) = &context.blob_handle {
         blob_handle.send_blob_effect(effect).await
     } else {
-        Event::Blob(BlobEvent::Error(BlobError::HandleMissing))
+        Event::blob(BlobEvent::Error(BlobError::HandleMissing))
     }
 }
 
@@ -24,7 +24,7 @@ pub(super) async fn dispatch_staging_source(
     if let Some(blob_handle) = &context.blob_handle {
         blob_handle.send_staging_effect(effect).await
     } else {
-        Event::StagingSource(StagingSourceEvent::Error {
+        Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::HandleMissing,
         })
     }

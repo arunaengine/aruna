@@ -228,7 +228,7 @@ impl RewriteVersionOperation {
         let Some(new) = self.new.as_ref() else {
             return Vec::new();
         };
-        let release = Effect::Blob(BlobEffect::ReleaseReservation { id: new.ulid });
+        let release = Effect::blob(BlobEffect::ReleaseReservation { id: new.ulid });
         let mut calls = vec![IoCall::from(release)];
         if !self.owns_row {
             calls.push(IoCall::from(schedule_cleanup_effect()));
@@ -271,21 +271,25 @@ impl RewriteVersionOperation {
 
     fn admit(&mut self, key: BucketKeyRef, archive: ArchiveKey) -> Step {
         self.state = RewriteState::Admit;
-        let admit = Effect::Blob(BlobEffect::AdmitRead { key, archive });
+        let admit = Effect::blob(BlobEffect::AdmitRead { key, archive });
         Ok(Next::Call(admit.into()))
     }
 
     fn handle_admit(&mut self, event: Event) -> Step {
-        match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease }) => {
                 self.lease = Some(lease);
                 self.rewrite()
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 self.end(RewriteOutcome::AwaitingKey)
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => Err(self.unexpected(other)),
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                Err(self.unexpected(other))
+            }
+            Err(other) => Err(self.unexpected(other)),
         }
     }
 
@@ -298,7 +302,7 @@ impl RewriteVersionOperation {
             .with_compression(target.compression)
             .with_encryption(target.plan);
         self.state = RewriteState::Rewrite;
-        let rewrite = Effect::Blob(BlobEffect::RewriteCopy {
+        let rewrite = Effect::blob(BlobEffect::RewriteCopy {
             bucket: self.version_key.bucket.clone(),
             key: self.version_key.key.clone(),
             source: old,
@@ -314,13 +318,17 @@ impl RewriteVersionOperation {
 
     /// The first publication read opens the transaction.
     fn handle_rewritten(&mut self, event: Event) -> Step {
-        let new = match event {
-            Event::Blob(BlobEvent::CopyRewritten { location }) => location,
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+        let new = match event.into_blob() {
+            Ok(BlobEvent::CopyRewritten { location }) => location,
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 return self.end(RewriteOutcome::AwaitingKey);
             }
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
-            other => return Err(self.unexpected(other)),
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return Err(self.unexpected(other));
+            }
+            Err(other) => return Err(self.unexpected(other)),
         };
         let same = self.old.as_ref().is_some_and(|old| {
             old.get_blake3() == new.get_blake3() && old.blob_size == new.blob_size

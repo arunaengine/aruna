@@ -320,12 +320,12 @@ impl Operation for DropCopyOperation {
         let Ok(key) = HiddenBlobKey::try_from(&self.location) else {
             return Ok(Next::Done(()));
         };
-        let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
+        let delete = Effect::blob(BlobEffect::DeleteHidden { key });
         Ok(Next::Call(IoCall::Effect(Box::new(delete))))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, PurgeError> {
-        if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
+        if let Ok(BlobEvent::Error(error)) = (result.event()?).into_blob() {
             warn!(%error, "A dropped kept copy is left to the hidden sweep");
         }
         Ok(Next::Done(()))

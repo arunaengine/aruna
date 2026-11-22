@@ -57,7 +57,7 @@ async fn tombstone_blocks_apply() {
     }
 
     let create = MetadataEffect::CreateCrate {
-        request: MetadataCrateRequest {
+        request: Box::new(MetadataCrateRequest {
             graph_iri: record.graph_iri.clone(),
             name: "fenced".to_string(),
             description: "fenced".to_string(),
@@ -69,7 +69,7 @@ async fn tombstone_blocks_apply() {
             },
             durability: MetadataRequestDurability::WalAlreadyDurable,
             deterministic_actor: None,
-        },
+        }),
     };
     let guard = DeletionGuardOperation::new(record.graph_iri.clone(), create);
     let event = drive(guard, &context).await.expect("guard answers");

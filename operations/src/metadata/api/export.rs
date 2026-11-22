@@ -346,7 +346,10 @@ impl ExportOperation {
                 Ok(Next::Done(ExportMetadataResult::Summary { jsonld, record }))
             }
             MetadataEvent::RoCratePageResult { page, .. } => {
-                Ok(Next::Done(ExportMetadataResult::Page { page, record }))
+                Ok(Next::Done(ExportMetadataResult::Page {
+                    page: *page,
+                    record,
+                }))
             }
             other => Err(MetadataApiError::Internal(format!(
                 "unexpected metadata export event: {}",

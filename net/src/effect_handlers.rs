@@ -204,7 +204,7 @@ impl RealmPresenceCache {
 pub async fn handle_net_effect(ctx: &NetEffectContext, effect: NetEffect) -> NetEvent {
     let document_sync = ctx.document_sync.as_ref();
     match effect {
-        NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, dht_effect).await,
+        NetEffect::Dht(dht_effect) => handle_dht_effect(ctx, *dht_effect).await,
         NetEffect::DocumentSync(document_sync_effect) => match document_sync_effect {
             aruna_core::document::DocumentEffect::PublishDocuments {
                 documents,
@@ -899,11 +899,11 @@ mod tests {
     }
 
     fn presence_effect(realm_id: RealmId) -> NetEffect {
-        NetEffect::Dht(DhtEffect::Get {
+        NetEffect::Dht(Box::new(DhtEffect::Get {
             key: realm_presence_key(&realm_id),
             realm_filter: Some(realm_id),
             options: DhtGetOptions::presence(Duration::from_secs(4), realm_id),
-        })
+        }))
     }
 
     fn stale_entry(realm_id: RealmId, seed: u8) -> DhtEntry {
@@ -1151,12 +1151,12 @@ mod tests {
         let key = realm_presence_key(&realm_id);
         let put = handle_net_effect(
             &context,
-            NetEffect::Dht(DhtEffect::Put {
+            NetEffect::Dht(Box::new(DhtEffect::Put {
                 key,
                 realm_id,
                 value: Vec::new(),
                 ttl: Duration::from_secs(300),
-            }),
+            })),
         )
         .await;
         assert!(matches!(put, NetEvent::Dht(DhtEvent::PutComplete { .. })));
@@ -1266,12 +1266,12 @@ mod tests {
         context.refresh_probe = Some(probe.clone());
         let put = handle_net_effect(
             &context,
-            NetEffect::Dht(DhtEffect::Put {
+            NetEffect::Dht(Box::new(DhtEffect::Put {
                 key: realm_presence_key(&realm_id),
                 realm_id,
                 value: Vec::new(),
                 ttl: Duration::from_secs(300),
-            }),
+            })),
         )
         .await;
         assert!(matches!(put, NetEvent::Dht(DhtEvent::PutComplete { .. })));
@@ -1324,11 +1324,11 @@ mod tests {
 
         let event = handle_net_effect(
             &context,
-            NetEffect::Dht(DhtEffect::Get {
+            NetEffect::Dht(Box::new(DhtEffect::Get {
                 key: realm_presence_key(&realm_id),
                 realm_filter: Some(realm_id),
                 options: DhtGetOptions::presence(Duration::from_millis(300), realm_id),
-            }),
+            })),
         )
         .await;
         assert!(matches!(

@@ -122,7 +122,7 @@ fn lease() -> ReadLease {
 
 fn hashed(size: u64) -> Event {
     let hashes = HashMap::from([(HASH_BLAKE3.to_string(), BLAKE3.to_vec())]);
-    Event::Blob(BlobEvent::ArchiveHashed { hashes, size })
+    Event::blob(BlobEvent::ArchiveHashed { hashes, size })
 }
 
 /// Steps through admission and hashing into the first transaction.
@@ -134,7 +134,7 @@ fn hashed_operation() -> Stepper {
 fn hashed_in(txn_id: Ulid) -> Stepper {
     let mut operation = operation();
     operation.step(location_read());
-    operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease() }));
+    operation.step(Event::blob(BlobEvent::ReadAdmitted { lease: lease() }));
     let effects = operation.step(hashed(100));
     assert!(matches!(
         effects.as_slice(),
@@ -150,11 +150,11 @@ fn locked_key_waits() {
     let effects = operation.step(location_read());
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Blob(BlobEffect::AdmitRead { .. })]
+        [effect] if matches!(effect.as_blob(), Some(BlobEffect::AdmitRead { .. }))
     ));
     let key = sealed().format.bucket_key().unwrap();
     let locked = BlobError::BucketKey(BucketKeyError::Locked(key.bucket_id));
-    operation.step(Event::Blob(BlobEvent::Error(locked)));
+    operation.step(Event::blob(BlobEvent::Error(locked)));
     assert!(operation.is_complete());
     assert_eq!(operation.finish(), Ok(Promotion::AwaitingKey(key)));
 }
@@ -163,7 +163,7 @@ fn locked_key_waits() {
 fn wrong_size_fails() {
     let mut operation = operation();
     operation.step(location_read());
-    operation.step(Event::Blob(BlobEvent::ReadAdmitted { lease: lease() }));
+    operation.step(Event::blob(BlobEvent::ReadAdmitted { lease: lease() }));
     operation.step(hashed(99));
     assert_eq!(operation.finish(), Err(PromoteError::BadHashes));
 }
@@ -342,11 +342,10 @@ fn promotes_pending_alias() {
     ));
     let effects = operation.step(committed());
     assert!(matches!(effects.as_slice(), [Effect::Net(_)]));
-    let Effect::Net(aruna_core::effects::NetEffect::Dht(aruna_core::effects::DhtEffect::Put {
-        key,
-        ..
-    })) = &effects[0]
-    else {
+    let Effect::Net(aruna_core::effects::NetEffect::Dht(dht)) = &effects[0] else {
+        panic!("the content hash is registered in the DHT")
+    };
+    let aruna_core::effects::DhtEffect::Put { key, .. } = dht.as_ref() else {
         panic!("the content hash is registered in the DHT")
     };
     operation.step(Event::Net(aruna_core::events::NetEvent::Dht(
@@ -741,7 +740,7 @@ pub(crate) mod received {
                 max: None,
             })
             .await;
-        let Event::Blob(BlobEvent::KeyPrepared { ticket }) = prepared else {
+        let Ok(BlobEvent::KeyPrepared { ticket }) = prepared.into_blob() else {
             panic!("key missing")
         };
         blob.send_blob_effect(BlobEffect::ActivateKey { ticket })
@@ -782,8 +781,9 @@ pub(crate) mod received {
                 size: None,
             })
             .await;
-        let Event::Blob(BlobEvent::WriteFinished { mut location }) = written else {
-            panic!("write failed: {written:?}")
+        let mut location = match written.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => location,
+            other => panic!("write failed: {other:?}"),
         };
         if invalid {
             location.format = StoredFormat::pithos(
@@ -1044,7 +1044,7 @@ pub(crate) mod received {
                 range: None,
             })
             .await;
-        let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = event else {
+        let Ok(BlobEvent::ReadFinished { blob, .. }) = event.into_blob() else {
             panic!("Bao read failed")
         };
         let chunks: Vec<_> = blob.0.collect().await;
@@ -1085,8 +1085,9 @@ pub(crate) mod received {
                     size: Some(7),
                 })
                 .await;
-            let Event::Blob(BlobEvent::WriteFinished { location }) = event else {
-                panic!("sealed write failed: {event:?}")
+            let location = match event.into_blob() {
+                Ok(BlobEvent::WriteFinished { location }) => location,
+                other => panic!("sealed write failed: {other:?}"),
             };
             let bytes = std::fs::read(location.get_full_path().unwrap()).unwrap();
             (bytes, Some((location.format, location.blob_size)))

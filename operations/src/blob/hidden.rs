@@ -93,16 +93,20 @@ fn page_call(space: &str, after: Option<Vec<u8>>) -> IoCall {
 }
 
 fn delete_call(key: HiddenBlobKey) -> IoCall {
-    Effect::Blob(BlobEffect::DeleteHidden { key }).into()
+    Effect::blob(BlobEffect::DeleteHidden { key }).into()
 }
 
 /// Takes the answer of a hidden blob delete.
 fn hidden_deleted(event: Event) -> Result<(), MigrationError> {
-    match event {
-        Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
-        Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Err(no_blob_handle()),
-        Event::Blob(BlobEvent::Error(error)) => Err(failed(error)),
-        other => Err(MigrationError::Failed(format!(
+    match event.into_blob() {
+        Ok(BlobEvent::HiddenDeleted) => Ok(()),
+        Ok(BlobEvent::Error(BlobError::HandleMissing)) => Err(no_blob_handle()),
+        Ok(BlobEvent::Error(error)) => Err(failed(error)),
+        Ok(other) => Err(MigrationError::Failed(format!(
+            "unexpected hidden blob delete event: {}",
+            other.label()
+        ))),
+        Err(other) => Err(MigrationError::Failed(format!(
             "unexpected hidden blob delete event: {}",
             other.label()
         ))),
@@ -570,8 +574,8 @@ impl HiddenPageOperation {
     }
 
     fn listed(&mut self, event: Event) -> Turn<PagePass> {
-        match event {
-            Event::Blob(BlobEvent::HiddenListed {
+        match event.into_blob() {
+            Ok(BlobEvent::HiddenListed {
                 entries,
                 next_cursor,
             }) => {
@@ -579,9 +583,13 @@ impl HiddenPageOperation {
                 self.pass.next = next_cursor;
                 self.next_entry()
             }
-            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Err(no_blob_handle()),
-            Event::Blob(BlobEvent::Error(error)) => Err(failed(error)),
-            other => Err(MigrationError::Failed(format!(
+            Ok(BlobEvent::Error(BlobError::HandleMissing)) => Err(no_blob_handle()),
+            Ok(BlobEvent::Error(error)) => Err(failed(error)),
+            Ok(other) => Err(MigrationError::Failed(format!(
+                "unexpected hidden blob list event: {}",
+                other.label()
+            ))),
+            Err(other) => Err(MigrationError::Failed(format!(
                 "unexpected hidden blob list event: {}",
                 other.label()
             ))),
@@ -613,7 +621,7 @@ impl Operation for HiddenPageOperation {
             namespace: None,
             cursor: self.scope.after.take(),
         };
-        Ok(Next::Call(Effect::Blob(list).into()))
+        Ok(Next::Call(Effect::blob(list).into()))
     }
 
     fn next(&mut self, result: IoResult) -> Turn<PagePass> {
@@ -1115,7 +1123,7 @@ mod tests {
             .unwrap(),
         );
         assert!(matches!(delete.first(), Ok(Next::Call(IoCall::Effect(_)))));
-        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let missing = Event::blob(BlobEvent::Error(BlobError::HandleMissing));
         let answer = delete.next(IoResult::Event(Box::new(missing)));
         assert_eq!(answer, Err(no_blob_handle()));
     }

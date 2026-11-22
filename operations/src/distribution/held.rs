@@ -9,7 +9,7 @@ use std::time::SystemTime;
 use aruna_core::calls::{IoCall, IoError, IoResult};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::keyspaces::{ATTACHMENT_KEYSPACE, CACHE_ENTRY_KEYSPACE};
 use aruna_core::structs::checksum::HASH_BLAKE3;
 use aruna_core::structs::execution::source_connector::SourceConnectorKind;
@@ -162,14 +162,14 @@ pub(crate) fn held_call(backend_path: &str) -> IoCall {
     let held = BlobEffect::ReadHeld {
         backend_path: backend_path.to_string(),
     };
-    IoCall::from(Effect::Blob(held))
+    IoCall::from(Effect::blob(held))
 }
 
 /// The answer of a [`held_call`]; a node without a blob backend has no reads to hold a copy.
 pub(crate) fn held_answer(result: IoResult) -> Result<bool, IoError> {
-    match result.event()? {
-        Event::Blob(BlobEvent::ReadHeld { held }) => Ok(held),
-        Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Ok(false),
+    match result.blob()? {
+        BlobEvent::ReadHeld { held } => Ok(held),
+        BlobEvent::Error(BlobError::HandleMissing) => Ok(false),
         other => Err(IoError::Unexpected {
             expected: "BlobEvent::ReadHeld",
             got: other.label(),

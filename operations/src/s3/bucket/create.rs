@@ -491,12 +491,12 @@ mod mapped_tests {
         let (mut operation, effects) = until_ensure(txn_id);
         assert_eq!(
             effects.as_slice(),
-            [Effect::Blob(BlobEffect::EnsureBucket {
+            [Effect::blob(BlobEffect::EnsureBucket {
                 backend: BackendRef::Group(BACKEND),
                 bucket: "team-a-x".to_string(),
             })]
         );
-        operation.step(Event::Blob(BlobEvent::BucketReady { created: true }));
+        operation.step(Event::blob(BlobEvent::BucketReady { created: true }));
         let bucket: Value = info().to_bytes().unwrap().into();
         operation.step(batch(vec![
             Some(bucket),
@@ -561,7 +561,7 @@ mod mapped_tests {
         let (_, effects) = until_ensure_on(TxnId::default(), storage);
         assert_eq!(
             effects.as_slice(),
-            [Effect::Blob(BlobEffect::EnsureBucket {
+            [Effect::blob(BlobEffect::EnsureBucket {
                 backend: BackendRef::Group(BACKEND),
                 bucket: "aruna-spire-x".to_string(),
             })]
@@ -633,7 +633,7 @@ mod mapped_tests {
         let txn_id = TxnId::default();
         let (mut operation, _) = until_ensure(txn_id);
         let refused = BlobError::WriteError("No access to bucket `team-a-x`.".to_string());
-        let effects = operation.step(Event::Blob(BlobEvent::Error(refused)));
+        let effects = operation.step(Event::blob(BlobEvent::Error(refused)));
         assert_eq!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]

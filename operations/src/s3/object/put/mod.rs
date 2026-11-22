@@ -851,12 +851,12 @@ impl PutObjectOperation {
                 size: self.config.request.content_length,
             },
         };
-        self.effect(PutObjectState::WriteBlob, Effect::Blob(write))
+        self.effect(PutObjectState::WriteBlob, Effect::blob(write))
     }
 
     fn handle_write_finished(&mut self, event: Event) -> Turn {
-        let location = match event {
-            Event::Blob(BlobEvent::Abe(event)) => {
+        let location = match event.into_blob() {
+            Ok(BlobEvent::Abe(event)) => {
                 let aruna_core::structs::storage::abe::AbeEvent::Written { location, envelope } =
                     *event
                 else {
@@ -865,8 +865,8 @@ impl PutObjectOperation {
                 self.envelope = Some(envelope);
                 location
             }
-            Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten {
+            Ok(BlobEvent::WriteFinished { location }) => location,
+            Ok(BlobEvent::PlainWritten {
                 location,
                 version,
                 etag,
@@ -879,17 +879,17 @@ impl PutObjectOperation {
             }
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
-            Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
+            Ok(BlobEvent::Error(BlobError::StreamFailed(message))) => {
                 return Err(PutObjectError::WriteFailed(message));
             }
-            Event::Blob(BlobEvent::Error(error @ BlobError::WriteCleanup { .. })) => {
+            Ok(BlobEvent::Error(error @ BlobError::WriteCleanup { .. })) => {
                 if let BlobError::WriteCleanup { location, .. } = &error {
                     self.written_location = Some(location.clone());
                 }
                 return Err(PutObjectError::BlobWriteFailed(error));
             }
-            Event::Blob(BlobEvent::Error(BlobError::PathTaken)) => return self.drop_intent(),
-            Event::Blob(BlobEvent::Error(error)) => {
+            Ok(BlobEvent::Error(BlobError::PathTaken)) => return self.drop_intent(),
+            Ok(BlobEvent::Error(error)) => {
                 return Err(PutObjectError::BlobWriteFailed(error));
             }
             _ => return Err(PutObjectError::InvalidOperationState),
@@ -1204,7 +1204,7 @@ impl Operation for PutObjectOperation {
             calls.push(IoCall::child(RollbackWrite::new(location)));
         }
         if let Some(id) = self.cleanup.take_release() {
-            calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
+            calls.push(Effect::blob(BlobEffect::ReleaseReservation { id }).into());
         }
         calls
     }

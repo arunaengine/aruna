@@ -57,13 +57,13 @@ pub(crate) fn pin_call(backend_path: &str, blob: Blob) -> IoCall {
         backend_path: backend_path.to_string(),
         blob,
     };
-    IoCall::from(Effect::Blob(pin))
+    IoCall::from(Effect::blob(pin))
 }
 
 /// The held stream of a [`pin_call`].
 pub(crate) fn pinned(result: IoResult) -> Result<Blob, IoError> {
-    match result.event()? {
-        Event::Blob(BlobEvent::PinnedRead { blob }) => Ok(blob),
+    match result.blob()? {
+        BlobEvent::PinnedRead { blob } => Ok(blob),
         other => Err(IoError::Unexpected {
             expected: "BlobEvent::PinnedRead",
             got: other.label(),
@@ -449,23 +449,21 @@ impl PullThroughOperation {
             blob: whole,
         };
         self.step = PullStep::Spool;
-        Ok(Next::Call(IoCall::from(Effect::Blob(spool))))
+        Ok(Next::Call(IoCall::from(Effect::blob(spool))))
     }
 
     fn spooled(&mut self, event: Event) -> PullTurn {
         let expected = self.request.held.blake3;
-        match event {
-            Event::Blob(BlobEvent::LocalSpooled { hashes, blob, .. })
+        match event.into_blob() {
+            Ok(BlobEvent::LocalSpooled { hashes, blob, .. })
                 if expected.is_none_or(|blake3| {
                     hashes.get(HASH_BLAKE3).map(Vec::as_slice) == Some(blake3.as_slice())
                 }) =>
             {
                 self.finish(blob)
             }
-            Event::Blob(BlobEvent::LocalSpooled { .. }) => {
-                Err(GetObjectError::HolderIntegrityFailure)
-            }
-            Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
+            Ok(BlobEvent::LocalSpooled { .. }) => Err(GetObjectError::HolderIntegrityFailure),
+            Ok(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
                 Err(GetObjectError::SpoolBudgetExhausted)
             }
             _ => Err(GetObjectError::HoldersUnavailable),
@@ -485,7 +483,7 @@ impl PullThroughOperation {
         };
         self.location = Some(location);
         self.step = PullStep::Kept;
-        Ok(Next::Call(IoCall::from(Effect::Blob(read))))
+        Ok(Next::Call(IoCall::from(Effect::blob(read))))
     }
 
     fn finish(&mut self, blob: Blob) -> PullTurn {
@@ -538,8 +536,8 @@ impl Operation for PullThroughOperation {
                     self.read_holders(range, PullStep::Serve)
                 }
             },
-            PullStep::Kept => match result.event()? {
-                Event::Blob(BlobEvent::ReadFinished { blob, .. }) => {
+            PullStep::Kept => match result.blob()? {
+                BlobEvent::ReadFinished { blob, .. } => {
                     let location = self.location.take().ok_or(IoError::Unfinished)?;
                     self.step = PullStep::Pin;
                     Ok(Next::Call(pin_call(&location.backend_path, blob)))
@@ -628,15 +626,15 @@ impl FillOperation {
             blob: whole,
         };
         self.step = FillStep::Spool;
-        Ok(Next::Call(IoCall::from(Effect::Blob(spool))))
+        Ok(Next::Call(IoCall::from(Effect::blob(spool))))
     }
 
     /// Checks the copy against the record, then publishes it.
     fn spooled(&mut self, event: Event) -> FillTurn {
         let held = self.held();
         let (size_wanted, blake3_wanted) = (held.size, held.blake3);
-        match event {
-            Event::Blob(BlobEvent::HiddenSpooled {
+        match event.into_blob() {
+            Ok(BlobEvent::HiddenSpooled {
                 location,
                 blake3,
                 size,
@@ -658,12 +656,12 @@ impl FillOperation {
                 self.step = FillStep::Publish;
                 Ok(Next::Call(IoCall::child(KeepCopyOperation::new(copy))))
             }
-            Event::Blob(BlobEvent::HiddenSpooled { location, .. }) => {
+            Ok(BlobEvent::HiddenSpooled { location, .. }) => {
                 self.step = FillStep::Drop;
                 let drop = DropCopyOperation::new(location);
                 Ok(Next::Call(IoCall::child(drop)))
             }
-            Event::Blob(BlobEvent::Error(error)) => self.failed(&error.to_string()),
+            Ok(BlobEvent::Error(error)) => self.failed(&error.to_string()),
             _ => self.failed("unexpected answer to the copy write"),
         }
     }

@@ -288,16 +288,20 @@ pub(in crate::jobs) fn unexpected(expected: &'static str, event: &Event) -> IoEr
 /// Deletes a hidden blob.
 pub(in crate::jobs) fn hidden_delete(location: &BackendLocation) -> Result<IoCall, String> {
     let key = HiddenBlobKey::try_from(location).map_err(|error| error.to_string())?;
-    let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
+    let delete = Effect::blob(BlobEffect::DeleteHidden { key });
     Ok(IoCall::Effect(Box::new(delete)))
 }
 
 /// The answer to [`hidden_delete`].
 fn hidden_deleted(result: IoResult) -> Result<(), String> {
-    match result.event().map_err(|error| error.to_string())? {
-        Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
-        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        other => Err(format!(
+    match (result.event().map_err(|error| error.to_string())?).into_blob() {
+        Ok(BlobEvent::HiddenDeleted) => Ok(()),
+        Ok(BlobEvent::Error(error)) => Err(error.to_string()),
+        Ok(other) => Err(format!(
+            "unexpected hidden blob delete event: {}",
+            other.label()
+        )),
+        Err(other) => Err(format!(
             "unexpected hidden blob delete event: {}",
             other.label()
         )),

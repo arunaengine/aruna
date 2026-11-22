@@ -278,12 +278,12 @@ impl LocationSummaryOperation {
 
     fn send(&mut self, state: SummaryState, stream_id: Ulid, payload: Vec<u8>) -> Turn {
         let send = BlobEffect::SendMessage { stream_id, payload };
-        self.call(state, Effect::Blob(send).into())
+        self.call(state, Effect::blob(send).into())
     }
 
     fn close(&mut self, stream_id: Ulid) -> Turn {
         let close = BlobEffect::CloseConnection { stream_id };
-        self.call(SummaryState::Close, Effect::Blob(close).into())
+        self.call(SummaryState::Close, Effect::blob(close).into())
     }
 
     fn accept_snapshot(&mut self, outcome: Result<LocalSummary, LocationSummaryError>) -> Turn {
@@ -312,18 +312,21 @@ impl LocationSummaryOperation {
     }
 
     fn accept_sent(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::MessageSent { stream_id }) = event else {
-            return self.unexpected(event);
-        };
-        self.close(stream_id)
+        match event.into_blob() {
+            Ok(BlobEvent::MessageSent { stream_id }) => self.close(stream_id),
+            Ok(blob) => self.unexpected(Event::blob(blob)),
+            Err(event) => self.unexpected(event),
+        }
     }
 
     fn accept_closed(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::ConnectionClosed { stream_id }) = event else {
-            return self.unexpected(event);
+        let stream_id = match event.into_blob() {
+            Ok(BlobEvent::ConnectionClosed { stream_id }) => stream_id,
+            Ok(blob) => return self.unexpected(Event::blob(blob)),
+            Err(event) => return self.unexpected(event),
         };
         if Some(stream_id) != self.stream_id {
-            return self.unexpected(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+            return self.unexpected(Event::blob(BlobEvent::ConnectionClosed { stream_id }));
         }
         self.stream_id = None;
         match self.answer.take() {
@@ -637,7 +640,7 @@ impl Operation for LocationSummaryOperation {
 
     /// A failed run closes the stream it still holds.
     fn abort(&mut self) -> Vec<IoCall> {
-        let close = |stream_id| Effect::Blob(BlobEffect::CloseConnection { stream_id }).into();
+        let close = |stream_id| Effect::blob(BlobEffect::CloseConnection { stream_id }).into();
         self.stream_id.take().map(close).into_iter().collect()
     }
 }
@@ -757,7 +760,7 @@ mod pure_tests {
     }
 
     fn event(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     fn asked(turn: &Turn) -> &Effect {
@@ -1220,7 +1223,7 @@ mod pure_tests {
         let local = done(child.next(read_result(None)));
         let outcome = ChildOutcome::new(Ok::<_, LocationSummaryError>(local.clone()));
         let turn = operation.next(IoResult::Child(outcome));
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected the summary, got {turn:?}")
         };
         assert_eq!(
@@ -1229,8 +1232,8 @@ mod pure_tests {
         );
         let turn = operation.next(event(BlobEvent::MessageSent { stream_id }));
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::CloseConnection { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::CloseConnection { .. })
         ));
         let closed = operation.next(event(BlobEvent::ConnectionClosed { stream_id }));
         assert_eq!(done(closed), local);
@@ -1264,8 +1267,8 @@ mod pure_tests {
 
         let turn = operation.next(snapshot_denied());
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::SendMessage { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::SendMessage { .. })
         ));
         operation
             .next(event(BlobEvent::MessageSent { stream_id }))
@@ -1306,7 +1309,7 @@ mod pure_tests {
         denied(child.next(IoResult::Values(values)));
 
         let turn = operation.next(snapshot_denied());
-        let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&turn) else {
+        let Some(BlobEffect::SendMessage { payload, .. }) = asked(&turn).as_blob() else {
             panic!("expected an explicit denial, got {turn:?}")
         };
         assert_eq!(

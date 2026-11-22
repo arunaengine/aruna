@@ -13,7 +13,9 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::ConversionError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE,
     BUCKET_KEY_KEYSPACE, COPY_WAIT_KEYSPACE, PENDING_LOCATION_KEYSPACE, REPLICATION_JOB_KEYSPACE,
@@ -342,7 +344,7 @@ impl ParkJobOperation {
             return Next::Done(None);
         };
         self.state = ParkState::KeyStatus { index };
-        let read = Effect::Blob(BlobEffect::ReadKeyStatus {
+        let read = Effect::blob(BlobEffect::ReadKeyStatus {
             bucket_id: key.bucket_id,
         });
         Next::Call(IoCall::Effect(Box::new(read)))
@@ -389,16 +391,16 @@ impl Operation for ParkJobOperation {
                 }
                 CheckStep::Done(current) => Ok(self.after_recheck(current)),
             },
-            ParkState::KeyStatus { index } => match result.event()? {
-                Event::Blob(BlobEvent::KeyStatus { generations }) => {
+            ParkState::KeyStatus { index } => match result.event()?.into_blob() {
+                Ok(BlobEvent::KeyStatus { generations }) => {
                     let key = self.keys.get(index).copied();
                     let unlocked =
                         (generations.iter()).any(|status| Some(status.key) == key && status.active);
                     Ok(self.status_read(index, unlocked))
                 }
                 // Without a blob backend no key counts as unlocked here.
-                Event::Blob(_) => Ok(self.status_read(index, false)),
-                other => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
+                Ok(_) => Ok(self.status_read(index, false)),
+                Err(other) => Err(BlobQueueError::UnexpectedEvent(other.label().to_string())),
             },
             ParkState::Wake(mut wake) => match wake.answer(result)? {
                 WakeAnswer::Woke(_) => Ok(Next::Done(Some(self.now_ms))),
@@ -811,7 +813,8 @@ mod tests {
             duration: None,
             max: None,
         };
-        let Event::Blob(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await
+        let Ok(BlobEvent::KeyPrepared { ticket }) =
+            blob.send_blob_effect(prepare).await.into_blob()
         else {
             panic!("the key is prepared")
         };
@@ -819,8 +822,8 @@ mod tests {
             .send_blob_effect(BlobEffect::ActivateKey { ticket })
             .await;
         assert!(matches!(
-            activated,
-            Event::Blob(BlobEvent::KeyActivated { .. })
+            activated.as_blob(),
+            Some(BlobEvent::KeyActivated { .. })
         ));
     }
 
@@ -977,8 +980,8 @@ mod tests {
                 })
                 .await;
             assert!(matches!(
-                admission,
-                Event::Blob(BlobEvent::Error(aruna_core::errors::BlobError::BucketKey(
+                admission.as_blob(),
+                Some(BlobEvent::Error(aruna_core::errors::BlobError::BucketKey(
                     aruna_core::structs::storage::encryption::BucketKeyError::Locked(_)
                 )))
             ));
@@ -1266,8 +1269,8 @@ mod tests {
             })
             .await;
         assert!(matches!(
-            admission,
-            Event::Blob(BlobEvent::Error(aruna_core::errors::BlobError::BucketKey(
+            admission.as_blob(),
+            Some(BlobEvent::Error(aruna_core::errors::BlobError::BucketKey(
                 aruna_core::structs::storage::encryption::BucketKeyError::Locked(_)
             )))
         ));
@@ -2047,7 +2050,7 @@ mod tests {
         #[test]
         fn locked_keys_stay() {
             // After the commit each key's status is read; no unlocked key leaves the job parked.
-            let blob = |event| IoResult::Event(Box::new(Event::Blob(event)));
+            let blob = |event| IoResult::Event(Box::new(Event::blob(event)));
             let mut operation = park(vec![key()]);
             operation.state = ParkState::KeyStatus { index: 0 };
             let locked = BlobEvent::KeyStatus {

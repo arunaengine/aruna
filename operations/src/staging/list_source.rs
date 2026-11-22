@@ -4,7 +4,7 @@
 
 use crate::connectors::resolver::{ResolveConnectorInput, resolve_connector_effect};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
@@ -70,7 +70,7 @@ impl ListStagingOperation {
             access: resolved.access,
             request: self.input.request.clone(),
         };
-        Ok(IoCall::Effect(Box::new(Effect::StagingSource(list))))
+        Ok(IoCall::staging(list))
     }
 }
 
@@ -94,8 +94,8 @@ impl Operation for ListStagingOperation {
         let Some((connector, secret_fingerprint)) = self.resolved.take() else {
             return Ok(Next::Call(self.list(event)?));
         };
-        match event {
-            Event::StagingSource(StagingSourceEvent::ListResult {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::ListResult {
                 entries,
                 next_cursor,
             }) => Ok(Next::Done(ListStagingResult {
@@ -104,8 +104,9 @@ impl Operation for ListStagingOperation {
                 connector,
                 secret_fingerprint,
             })),
-            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
-            other => Err(ListStagingError::UnexpectedEvent(other.label())),
+            Ok(StagingSourceEvent::Error { error }) => Err(error.into()),
+            Ok(other) => Err(ListStagingError::UnexpectedEvent(other.label())),
+            Err(other) => Err(ListStagingError::UnexpectedEvent(other.label())),
         }
     }
 }
@@ -174,12 +175,11 @@ mod pure_tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = operation.next(resolved()) else {
             panic!("expected the list effect");
         };
-        assert!(matches!(
-            *effect,
-            Effect::StagingSource(StagingSourceEffect::List { request, .. })
+        assert!(
+            matches!((*effect).as_staging(), Some(StagingSourceEffect::List { request, .. })
                 if request.limit == 20 && request.recursive && request.files_only
-                    && request.cursor.is_none()
-        ));
+                    && request.cursor.is_none())
+        );
     }
 
     #[test]
@@ -199,12 +199,10 @@ mod pure_tests {
         operation.first().unwrap();
         operation.next(resolved()).unwrap();
         let cursor = Some(ListCursor::After("prefix/a".to_string()));
-        let listed = IoResult::Event(Box::new(Event::StagingSource(
-            StagingSourceEvent::ListResult {
-                entries: Vec::new(),
-                next_cursor: cursor.clone(),
-            },
-        )));
+        let listed = IoResult::Event(Box::new(Event::staging(StagingSourceEvent::ListResult {
+            entries: Vec::new(),
+            next_cursor: cursor.clone(),
+        })));
         let Ok(Next::Done(result)) = operation.next(listed) else {
             panic!("expected the page");
         };

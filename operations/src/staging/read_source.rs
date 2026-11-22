@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
@@ -72,7 +72,7 @@ impl ReadSourceOperation {
             range: self.input.range.clone(),
             expected: self.input.expected.clone(),
         };
-        Ok(IoCall::Effect(Box::new(Effect::StagingSource(read))))
+        Ok(IoCall::staging(read))
     }
 }
 
@@ -93,16 +93,17 @@ impl Operation for ReadSourceOperation {
         let Some(connector) = self.connector.take() else {
             return Ok(Next::Call(self.read(event)?));
         };
-        match event {
-            Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::ReadResult { metadata, stream }) => {
                 Ok(Next::Done(ReadSourceResult {
                     connector,
                     metadata,
                     stream,
                 }))
             }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
-            other => Err(ReadSourceError::UnexpectedEvent(other.label())),
+            Ok(StagingSourceEvent::Error { error }) => Err(error.into()),
+            Ok(other) => Err(ReadSourceError::UnexpectedEvent(other.label())),
+            Err(other) => Err(ReadSourceError::UnexpectedEvent(other.label())),
         }
     }
 }
@@ -180,7 +181,7 @@ mod tests {
             range: Some(5..11),
             expected: None,
         };
-        let call = IoCall::Effect(Box::new(Effect::StagingSource(read)));
+        let call = IoCall::staging(read);
         let effect = operation.next(resolved(Ok(resolved_connector)));
         assert_eq!(effect, Ok(Next::Call(call)));
     }
@@ -201,7 +202,7 @@ mod tests {
     #[tokio::test]
     async fn read_finishes_operation() {
         let mut operation = opened();
-        let read = answer(Event::StagingSource(StagingSourceEvent::ReadResult {
+        let read = answer(Event::staging(StagingSourceEvent::ReadResult {
             metadata: sample_metadata(),
             stream: sample_stream(),
         }));
@@ -219,7 +220,7 @@ mod tests {
     #[test]
     fn exposes_staging_error() {
         let mut operation = opened();
-        let failed = answer(Event::StagingSource(StagingSourceEvent::Error {
+        let failed = answer(Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::ReadError("boom".to_string()),
         }));
         assert_eq!(

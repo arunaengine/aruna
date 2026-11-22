@@ -230,7 +230,7 @@ impl UploadPartOperation {
                 .with_encryption(Some(encryption.plan));
             return self.read_saved_parts(resolved, blob);
         }
-        let write = Effect::Blob(BlobEffect::WritePart {
+        let write = Effect::blob(BlobEffect::WritePart {
             upload_id: self.input.upload_id,
             part_number: self.input.part_number,
             resolved: ResolvedBackend::new(record.backend, record.storage_class),
@@ -275,7 +275,7 @@ impl UploadPartOperation {
             got: "none",
         })?;
         let number = self.input.part_number;
-        let write = Effect::Blob(BlobEffect::WritePiece {
+        let write = Effect::blob(BlobEffect::WritePiece {
             upload_id: self.input.upload_id,
             part_number: number,
             resolved,
@@ -288,13 +288,13 @@ impl UploadPartOperation {
     }
 
     fn write_finished(&mut self, event: Event) -> PartTurn {
-        let location = match event {
-            Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PieceWritten { location, piece }) => {
+        let location = match event.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => location,
+            Ok(BlobEvent::PieceWritten { location, piece }) => {
                 self.piece = Some(piece);
                 location
             }
-            Event::Blob(BlobEvent::PartWritten {
+            Ok(BlobEvent::PartWritten {
                 location,
                 backend_etag,
             }) => {
@@ -303,17 +303,25 @@ impl UploadPartOperation {
             }
             // Only a client-sourced stream fault may become a client error; a
             // server-side write fault must stay retryable, never a bad digest.
-            Event::Blob(BlobEvent::Error(BlobError::StreamFailed(message))) => {
+            Ok(BlobEvent::Error(BlobError::StreamFailed(message))) => {
                 return Err(UploadPartError::WriteFailed(message));
             }
-            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, message })) => {
+            Ok(BlobEvent::Error(BlobError::WriteCleanup { location, message })) => {
                 self.written_location = Some(location);
                 return Err(UploadPartError::BlobWriteFailed(message));
             }
-            Event::Blob(BlobEvent::Error(error)) => {
+            Ok(BlobEvent::Error(error)) => {
                 return Err(UploadPartError::BlobWriteFailed(error.to_string()));
             }
-            other => {
+            Ok(other) => {
+                return Err(IoError::Unexpected {
+                    expected: "the written part",
+                    got: other.label(),
+                }
+                .into());
+            }
+
+            Err(other) => {
                 return Err(IoError::Unexpected {
                     expected: "the written part",
                     got: other.label(),
@@ -488,7 +496,7 @@ impl Operation for UploadPartOperation {
             calls.push(IoCall::child(RollbackWrite::new(location)));
         }
         if let Some(id) = self.release.take() {
-            calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
+            calls.push(Effect::blob(BlobEffect::ReleaseReservation { id }).into());
         }
         calls
     }
@@ -660,7 +668,7 @@ mod test {
     }
 
     fn blob(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     fn child<T, E>(result: Result<T, E>) -> IoResult
@@ -803,7 +811,7 @@ mod test {
         op.step = PartStep::ReadUpload;
         let record = upload_record(&op);
         let turn = op.next(read_record(&record, None));
-        let Effect::Blob(BlobEffect::WritePart { resolved, .. }) = effect_of(&turn) else {
+        let Some(BlobEffect::WritePart { resolved, .. }) = effect_of(&turn).as_blob() else {
             panic!("expected one part write, got {turn:?}")
         };
         assert_eq!(resolved.backend, record.backend);
@@ -858,12 +866,12 @@ mod test {
             ],
             next: None,
         });
-        let Effect::Blob(BlobEffect::WritePiece {
+        let Some(BlobEffect::WritePiece {
             resolved,
             content_offset,
             part_number: 3,
             ..
-        }) = effect_of(&turn)
+        }) = effect_of(&turn).as_blob()
         else {
             panic!("expected one piece write, got {turn:?}")
         };
@@ -895,7 +903,7 @@ mod test {
         // A replaced part must not touch the acknowledged provider part before completion.
         let (mut op, record) = in_place_op(Some(4));
         let turn = op.next(read_record(&record, Some(b"acknowledged".to_vec())));
-        let Effect::Blob(BlobEffect::WritePart { backend_upload, .. }) = effect_of(&turn) else {
+        let Some(BlobEffect::WritePart { backend_upload, .. }) = effect_of(&turn).as_blob() else {
             panic!("expected one part write, got {turn:?}")
         };
         assert!(backend_upload.is_none());
@@ -916,11 +924,11 @@ mod test {
         let (mut op, record) = in_place_op(Some(4));
         let upload = record.backend_upload.clone().unwrap();
         let turn = op.next(read_record(&record, None));
-        let Effect::Blob(BlobEffect::WritePart {
+        let Some(BlobEffect::WritePart {
             backend_upload,
             size,
             ..
-        }) = effect_of(&turn)
+        }) = effect_of(&turn).as_blob()
         else {
             panic!("expected one part write, got {turn:?}")
         };
@@ -1090,7 +1098,7 @@ mod test {
                 reconcile_work(location.clone(), op.input.upload_id, 1)
             );
             let expected = BlobEffect::ReleaseReservation { id: location.ulid };
-            assert_eq!(release.as_ref(), &Effect::Blob(expected));
+            assert_eq!(release.as_ref(), &Effect::blob(expected));
         }
     }
 

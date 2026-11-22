@@ -3,9 +3,11 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::StagingSourceError;
-use aruna_core::events::{Event, StagingSourceEvent};
+#[cfg(test)]
+use aruna_core::events::Event;
+use aruna_core::events::StagingSourceEvent;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
 use thiserror::Error;
@@ -39,15 +41,13 @@ impl Operation for CheckSourceOperation {
         let check = StagingSourceEffect::Check {
             access: self.access.clone(),
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::StagingSource(
-            check,
-        )))))
+        Ok(Next::Call(IoCall::staging(check)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, CheckSourceError> {
-        match result.event()? {
-            Event::StagingSource(StagingSourceEvent::CheckResult) => Ok(Next::Done(())),
-            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
+        match result.staging()? {
+            StagingSourceEvent::CheckResult => Ok(Next::Done(())),
+            StagingSourceEvent::Error { error } => Err(error.into()),
             other => Err(CheckSourceError::UnexpectedEvent(other.label())),
         }
     }
@@ -69,7 +69,7 @@ mod pure_tests {
     }
 
     fn answer(event: StagingSourceEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::StagingSource(event)))
+        IoResult::Event(Box::new(Event::staging(event)))
     }
 
     #[test]
@@ -78,7 +78,7 @@ mod pure_tests {
         let check = StagingSourceEffect::Check {
             access: sample_access(),
         };
-        let call = IoCall::Effect(Box::new(Effect::StagingSource(check)));
+        let call = IoCall::staging(check);
         assert_eq!(operation.first(), Ok(Next::Call(call)));
         let checked = answer(StagingSourceEvent::CheckResult);
         assert_eq!(operation.next(checked), Ok(Next::Done(())));

@@ -122,21 +122,25 @@ impl RewriteVersionOperation {
             bucket_public: target.public_key,
         };
         self.state = RewriteState::CreateEnvelope;
-        let create = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Envelope(plan))));
+        let create = Effect::blob(BlobEffect::Abe(Box::new(AbeEffect::Envelope(plan))));
         Ok(Next::Call(create.into()))
     }
 
     pub(super) fn handle_created(&mut self, event: Event) -> Step {
-        let envelope = match event {
-            Event::Blob(BlobEvent::Abe(event)) => match *event {
+        let envelope = match event.into_blob() {
+            Ok(BlobEvent::Abe(event)) => match *event {
                 AbeEvent::Envelope(envelope) => envelope,
                 other => {
-                    let other = Event::Blob(BlobEvent::Abe(Box::new(other)));
+                    let other = Event::blob(BlobEvent::Abe(Box::new(other)));
                     return Err(self.unexpected(other));
                 }
             },
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
-            other => return Err(self.unexpected(other)),
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return Err(self.unexpected(other));
+            }
+            Err(other) => return Err(self.unexpected(other)),
         };
         self.envelope = Some(envelope);
         self.proceed()

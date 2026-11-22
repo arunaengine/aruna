@@ -466,7 +466,7 @@ impl crate::GraphHandle {
         Ok(match effect {
             MetadataEffect::QueryCacheGet { key } => {
                 let stamp = queries.stamp(generation());
-                let entry = queries.get(&key, stamp, Instant::now());
+                let entry = queries.get(&key, stamp, Instant::now()).map(Box::new);
                 MetadataEvent::QueryCacheEntry { stamp, entry }
             }
             MetadataEffect::QueryCachePut {

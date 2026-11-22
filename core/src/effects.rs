@@ -44,8 +44,8 @@ use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
-    Blob(BlobEffect),
-    StagingSource(StagingSourceEffect),
+    Blob(Box<BlobEffect>),
+    StagingSource(Box<StagingSourceEffect>),
     LocalFile(LocalFileEffect),
     Storage(StorageEffect),
     Net(NetEffect),
@@ -74,6 +74,62 @@ pub enum Effect {
     Job(crate::jobs::JobEffect),
     /// One call to this node's Git store; never persisted.
     Git(Box<crate::git::GitCall>),
+}
+
+impl Effect {
+    /// Boxes a blob effect so `Effect` stays compact on non-blob paths.
+    pub fn blob(effect: BlobEffect) -> Self {
+        Self::Blob(Box::new(effect))
+    }
+
+    /// Boxes a staging-source effect so `Effect` stays compact on other paths.
+    pub fn staging(effect: StagingSourceEffect) -> Self {
+        Self::StagingSource(Box::new(effect))
+    }
+
+    /// Borrows a blob effect when this effect is one.
+    pub fn as_blob(&self) -> Option<&BlobEffect> {
+        match self {
+            Self::Blob(effect) => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// Borrows a staging-source effect when this effect is one.
+    pub fn as_staging(&self) -> Option<&StagingSourceEffect> {
+        match self {
+            Self::StagingSource(effect) => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// Unboxes a blob effect, or returns the effect unchanged.
+    pub fn into_blob(self) -> Result<BlobEffect, Self> {
+        match self {
+            Self::Blob(effect) => Ok(*effect),
+            other => Err(other),
+        }
+    }
+
+    /// Unboxes a staging-source effect, or returns the effect unchanged.
+    pub fn into_staging(self) -> Result<StagingSourceEffect, Self> {
+        match self {
+            Self::StagingSource(effect) => Ok(*effect),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<BlobEffect> for Effect {
+    fn from(effect: BlobEffect) -> Self {
+        Self::blob(effect)
+    }
+}
+
+impl From<StagingSourceEffect> for Effect {
+    fn from(effect: StagingSourceEffect) -> Self {
+        Self::staging(effect)
+    }
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -829,7 +885,7 @@ pub enum CatchUpEffect {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
-    Dht(DhtEffect),
+    Dht(Box<DhtEffect>),
     DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
@@ -962,7 +1018,7 @@ pub enum NetEffect {
         watch_id: ulid::Ulid,
         realm_id: crate::structs::identity::realm::RealmId,
         holder: NodeId,
-        entry: crate::structs::execution::notification_watch::WatchInterestEntry,
+        entry: Box<crate::structs::execution::notification_watch::WatchInterestEntry>,
     },
     /// Removes a watch a local user just deleted from this node's watch interest.
     RetractInterest(ulid::Ulid),

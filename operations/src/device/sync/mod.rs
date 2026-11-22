@@ -563,11 +563,11 @@ mod pure_tests {
             let [Effect::SubOperation(check)] = opening.as_mut_slice() else {
                 panic!("the offer checks the root before listing it");
             };
-            match check.start().as_slice() {
-                [Effect::StagingSource(StagingSourceEffect::Check { .. })] => {
+            match check.start().first().and_then(Effect::as_staging) {
+                Some(StagingSourceEffect::Check { .. }) => {
                     assert_eq!(mode, FolderMode::UploadOnly)
                 }
-                [Effect::StagingSource(StagingSourceEffect::PrepareFolder { .. })] => {
+                Some(StagingSourceEffect::PrepareFolder { .. }) => {
                     assert_ne!(mode, FolderMode::UploadOnly)
                 }
                 _ => panic!("expected a folder check"),

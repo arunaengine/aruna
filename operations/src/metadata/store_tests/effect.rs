@@ -150,7 +150,7 @@ async fn merges_converge() {
             send_metadata_effect(
                 handle,
                 MetadataEffect::CreateCrate {
-                    request: request.clone(),
+                    request: Box::new(request.clone()),
                 }
             )
             .await,

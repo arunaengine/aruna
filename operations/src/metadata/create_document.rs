@@ -248,7 +248,7 @@ impl CreateDocumentOperation {
                 date_published,
                 license,
             } => Effect::Metadata(MetadataEffect::ValidateCreateCrate {
-                request: MetadataCrateRequest {
+                request: Box::new(MetadataCrateRequest {
                     graph_iri,
                     name: name.clone(),
                     description: description.clone(),
@@ -257,7 +257,7 @@ impl CreateDocumentOperation {
                     policy,
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor: None,
-                },
+                }),
             }),
             CreateDocumentPayload::RoCrate { jsonld } => {
                 Effect::Metadata(MetadataEffect::ValidateRoCrate {

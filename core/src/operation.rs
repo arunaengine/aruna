@@ -379,8 +379,9 @@ where
             self.attempt = Some(Attempt::Running(run));
             return effects;
         }
+        let conflicted = run.lost_conflict();
         let error = match run.finalize() {
-            Err(error) if P::is_conflict(&error) => error,
+            Err(error) if conflicted || P::is_conflict(&error) => error,
             result => {
                 self.attempt = Some(Attempt::Ended(result));
                 return effects;
@@ -652,5 +653,87 @@ mod tests {
         assert_eq!(child.hold_scope(), Some(HoldScope::GraphFence(1)));
         assert!(child.abort().is_empty());
         assert_eq!(child.hold_scope(), None);
+    }
+
+    /// Collapses every runner error into one value, so `is_conflict` cannot distinguish conflicts.
+    #[derive(Debug, PartialEq)]
+    struct CollapsedError;
+
+    impl From<IoError> for CollapsedError {
+        fn from(_: IoError) -> Self {
+            Self
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct CollapsedWrite;
+
+    impl Operation for CollapsedWrite {
+        type Output = ();
+        type Error = CollapsedError;
+
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
+        }
+
+        fn is_conflict(_: &Self::Error) -> bool {
+            false
+        }
+
+        fn first(&mut self) -> Result<Next<()>, CollapsedError> {
+            Ok(Next::Call(IoCall::Write(vec![(
+                "rows".to_string(),
+                b"k".as_slice().into(),
+                b"v".as_slice().into(),
+            )])))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, CollapsedError> {
+            result.done()?;
+            Ok(Next::Done(()))
+        }
+    }
+
+    #[test]
+    fn collapsed_error_retries() {
+        use crate::errors::StorageError;
+        use crate::events::StorageEvent;
+
+        let IoCall::Child(mut child) = IoCall::retry(CollapsedWrite, &SEED) else {
+            panic!("retry produces a child call");
+        };
+        let txn_id = ulid::Ulid::from(9u128);
+        assert_eq!(child.start().len(), 1);
+        assert_eq!(
+            child
+                .step(Event::Storage(StorageEvent::TransactionStarted { txn_id }))
+                .len(),
+            1
+        );
+        assert_eq!(
+            child
+                .step(Event::Storage(StorageEvent::BatchWriteResult {
+                    entries: Vec::new(),
+                }))
+                .len(),
+            1
+        );
+        let conflict = StorageEvent::Error {
+            error: StorageError::TransactionConflict,
+        };
+        let effects = child.step(Event::Storage(conflict));
+        assert_eq!(
+            effects.as_slice(),
+            &[Effect::Delay(conflict_backoff(0, &SEED))]
+        );
+        assert!(!child.is_complete());
+
+        // Non-conflict storage errors do not retry even when the error type collapses them.
+        assert_eq!(child.step(Event::Delayed).len(), 1);
+        let full = StorageEvent::Error {
+            error: StorageError::QueueFull,
+        };
+        assert!(child.step(Event::Storage(full)).is_empty());
+        assert!(child.is_complete());
     }
 }

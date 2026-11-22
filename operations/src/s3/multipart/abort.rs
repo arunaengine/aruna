@@ -157,16 +157,16 @@ impl AbortUploadOperation {
             return self.read_upload_parts();
         };
         self.state = AbortUploadState::AbortBackendUpload;
-        let abort = Effect::Blob(BlobEffect::AbortUpload {
+        let abort = Effect::blob(BlobEffect::AbortUpload {
             backend_upload: Box::new(backend_upload),
         });
         Ok(Next::Call(abort.into()))
     }
 
     fn backend_aborted(&mut self, event: Event) -> Turn<()> {
-        match event {
-            Event::Blob(BlobEvent::UploadAborted) => self.read_upload_parts(),
-            Event::Blob(BlobEvent::Error(error)) => self.reset(error.into()),
+        match event.into_blob() {
+            Ok(BlobEvent::UploadAborted) => self.read_upload_parts(),
+            Ok(BlobEvent::Error(error)) => self.reset(error.into()),
             _ => self.reset(AbortUploadError::InvalidOperationState),
         }
     }
@@ -205,7 +205,7 @@ impl AbortUploadOperation {
         let calls = (self.upload_parts.iter())
             .map(|part| {
                 let location = part.location.clone();
-                IoCall::from(Effect::Blob(BlobEffect::Delete { location }))
+                IoCall::from(Effect::blob(BlobEffect::Delete { location }))
             })
             .collect();
         Ok(Next::Then { output: (), calls })
@@ -606,11 +606,11 @@ mod pure_tests {
                 panic!("expected the provider abort")
             };
             assert!(matches!(
-                *effect,
-                Effect::Blob(BlobEffect::AbortUpload { .. })
+                (*effect).as_blob(),
+                Some(BlobEffect::AbortUpload { .. })
             ));
 
-            let turn = operation.next(IoResult::Event(Box::new(Event::Blob(answer))));
+            let turn = operation.next(IoResult::Event(Box::new(Event::blob(answer))));
             match aborted {
                 true => assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. })))),
                 false => {
@@ -674,7 +674,7 @@ mod pure_tests {
             panic!("expected the blob deletes")
         };
         let location = part_location();
-        let delete = IoCall::from(Effect::Blob(BlobEffect::Delete { location }));
+        let delete = IoCall::from(Effect::blob(BlobEffect::Delete { location }));
         assert_eq!(calls, [delete]);
     }
 

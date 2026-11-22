@@ -598,7 +598,8 @@ impl DistributedQueryOperation {
     fn cache_read(&mut self, result: IoResult) -> Result<Next<QueryAnswer>, MetadataApiError> {
         if let Ok(Event::Metadata(MetadataEvent::QueryCacheEntry { stamp, entry })) = result.event()
         {
-            if let Some((results, nodes_queried)) = entry {
+            if let Some(cached) = entry {
+                let (results, nodes_queried) = *cached;
                 let stats = MetadataFanoutStats {
                     nodes_queried,
                     ..MetadataFanoutStats::default()

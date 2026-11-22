@@ -190,11 +190,10 @@ fn range_read_opens() {
     let Next::Call(IoCall::Effect(effect)) = range.first().unwrap() else {
         panic!("expected the blob effect");
     };
-    assert!(matches!(
-        *effect,
-        Effect::Blob(BlobEffect::ReadHiddenRange { range, .. }) if range == (1..3)
-    ));
-    let opened = Event::Blob(BlobEvent::HiddenRead {
+    assert!(
+        matches!((*effect).as_blob(), Some(BlobEffect::ReadHiddenRange { range, .. }) if *range == (1..3))
+    );
+    let opened = Event::blob(BlobEvent::HiddenRead {
         blob: body(),
         stream_size: 2,
     });

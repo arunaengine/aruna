@@ -299,7 +299,7 @@ type ScopeTurn = Result<Next<ReplicateScopeResult>, ReplicateScopeError>;
 type ObjectTurn = Result<Next<ReplicationSuboperationResult>, ReplicateObjectError>;
 
 fn blob_next<T>(effect: BlobEffect) -> Next<T> {
-    Next::Call(Effect::Blob(effect).into())
+    Next::Call(Effect::blob(effect).into())
 }
 
 #[derive(Debug, PartialEq)]
@@ -1428,15 +1428,19 @@ impl ReplicateObjectOperation {
         self.reference_access = Some(access.clone());
         self.state = ReplicateObjectState::HeadReferenceSource;
         Ok(Next::Call(
-            Effect::StagingSource(StagingSourceEffect::Head { access }).into(),
+            Effect::staging(StagingSourceEffect::Head { access }).into(),
         ))
     }
 
     fn accept_reference_access(&mut self, event: Event) -> ObjectTurn {
-        match event {
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                result: Ok(access),
-            }) => {
+        let Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) = event else {
+            return self.invalid(
+                "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
+                event.label(),
+            );
+        };
+        match *result {
+            Ok(access) => {
                 let (source_kind, source_path, source_version) = match &access {
                     aruna_core::structs::execution::source_access::ResolvedSourceAccess::OpenDal {
                         kind,
@@ -1463,7 +1467,7 @@ impl ReplicateObjectOperation {
                     self.request.bucket.as_bytes().to_vec(),
                 )
             }
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result: Err(_) }) => {
+            Err(_) => {
                 debug!(
                     bucket = %self.request.bucket,
                     key = %self.request.key,
@@ -1477,10 +1481,6 @@ impl ReplicateObjectOperation {
                     self.skip_version()
                 }
             }
-            other => self.invalid(
-                "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
-                other.label(),
-            ),
         }
     }
 
@@ -1499,8 +1499,8 @@ impl ReplicateObjectOperation {
     }
 
     fn accept_reference_head(&mut self, event: Event) -> ObjectTurn {
-        match event {
-            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::HeadResult { metadata }) => {
                 match self.reference_matches(&metadata) {
                     Some(true) => {}
                     Some(false) => return self.skip_version(),
@@ -1517,10 +1517,14 @@ impl ReplicateObjectOperation {
                     key,
                 )
             }
-            Event::StagingSource(StagingSourceEvent::Error { .. }) => {
+            Ok(StagingSourceEvent::Error { .. }) => {
                 self.fail(ReplicationError::ReplicationFailed.into())
             }
-            other => self.invalid(
+            Ok(other) => self.invalid(
+                "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                other.label(),
+            ),
+            Err(other) => self.invalid(
                 "Event::StagingSource(StagingSourceEvent::HeadResult)",
                 other.label(),
             ),
@@ -1586,7 +1590,7 @@ impl ReplicateObjectOperation {
                 event.label(),
             );
         };
-        match result {
+        match *result {
             Ok(inputs) => self.group_inputs = inputs,
             Err(error) => {
                 return self.fail(ReplicateObjectError::RoutingInputsFailed(error));
@@ -1657,12 +1661,12 @@ impl ReplicateObjectOperation {
             range: None,
             expected,
         };
-        Ok(Next::Call(Effect::StagingSource(read).into()))
+        Ok(Next::Call(Effect::staging(read).into()))
     }
 
     fn accept_reference_read(&mut self, event: Event) -> ObjectTurn {
-        match event {
-            Event::StagingSource(StagingSourceEvent::ReadResult {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::ReadResult {
                 metadata: source_metadata,
                 stream,
             }) => {
@@ -1715,7 +1719,7 @@ impl ReplicateObjectOperation {
                     size: None,
                 }))
             }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => {
+            Ok(StagingSourceEvent::Error { error }) => {
                 debug!(
                     bucket = %self.request.bucket,
                     key = %self.request.key,
@@ -1730,7 +1734,11 @@ impl ReplicateObjectOperation {
                     self.skip_version()
                 }
             }
-            other => self.invalid(
+            Ok(other) => self.invalid(
+                "Event::StagingSource(StagingSourceEvent::ReadResult)",
+                other.label(),
+            ),
+            Err(other) => self.invalid(
                 "Event::StagingSource(StagingSourceEvent::ReadResult)",
                 other.label(),
             ),
@@ -1738,8 +1746,8 @@ impl ReplicateObjectOperation {
     }
 
     fn accept_reference_write(&mut self, event: Event) -> ObjectTurn {
-        match event {
-            Event::Blob(BlobEvent::WriteFinished { location }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => {
                 let Some(version) = self.replication_version.take() else {
                     return self.fail(ReplicateObjectError::VersionNotFound);
                 };
@@ -1780,14 +1788,13 @@ impl ReplicateObjectOperation {
                 });
                 self.read_current_lookup()
             }
-            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
+            Ok(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.cleanup_reference_blob = Some(location);
                 self.fail(ReplicationError::ReplicationFailed.into())
             }
-            Event::Blob(BlobEvent::Error(_)) => {
-                self.fail(ReplicationError::ReplicationFailed.into())
-            }
-            other => self.invalid("Event::Blob(BlobEvent::WriteFinished)", other.label()),
+            Ok(BlobEvent::Error(_)) => self.fail(ReplicationError::ReplicationFailed.into()),
+            Ok(other) => self.invalid("Event::Blob(BlobEvent::WriteFinished)", other.label()),
+            Err(other) => self.invalid("Event::Blob(BlobEvent::WriteFinished)", other.label()),
         }
     }
 
@@ -2215,10 +2222,10 @@ impl Operation for ReplicateObjectOperation {
     fn abort(&mut self) -> Vec<IoCall> {
         let mut calls = Vec::new();
         if let Some(location) = self.cleanup_reference_blob.take() {
-            calls.push(Effect::Blob(BlobEffect::Delete { location }).into());
+            calls.push(Effect::blob(BlobEffect::Delete { location }).into());
         }
         if let Some(stream_id) = self.stream_id {
-            calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
+            calls.push(Effect::blob(BlobEffect::CloseConnection { stream_id }).into());
         }
         calls
     }
@@ -2498,11 +2505,9 @@ impl ReplicateObjectOperation {
 // Opening the outbound stream to the target node.
 impl ReplicateObjectOperation {
     fn accept_connection_established(&mut self, event: Event) -> ObjectTurn {
-        let Event::Blob(BlobEvent::ConnectionEstablished { stream_id }) = event else {
-            return self.invalid(
-                "Event::Blob(BlobEvent::ConnectionEstablished)",
-                event.label(),
-            );
+        let received = event.label();
+        let Ok(BlobEvent::ConnectionEstablished { stream_id }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::ConnectionEstablished)", received);
         };
         self.stream_id = Some(stream_id);
         debug!(
@@ -2522,8 +2527,9 @@ impl ReplicateObjectOperation {
 // decisions.
 impl ReplicateObjectOperation {
     fn accept_manifest_sent(&mut self, event: Event) -> ObjectTurn {
-        let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::MessageSent)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::MessageSent { .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::MessageSent)", received);
         };
         debug!(
             bucket = %self.request.bucket,
@@ -2538,8 +2544,8 @@ impl ReplicateObjectOperation {
 
     fn accept_negotiation_response(&mut self, event: Event) -> ObjectTurn {
         let received = event.label();
-        let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::MessageReceived)", event.label());
+        let Ok(BlobEvent::MessageReceived { payload, .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::MessageReceived)", received);
         };
 
         let message = match VersionReplicationMessage::from_bytes(&payload) {
@@ -2691,18 +2697,22 @@ impl ReplicateObjectOperation {
     /// plaintext. A locked key ends this item until the next unlock.
     fn accept_source_admission(&mut self, event: Event) -> ObjectTurn {
         let key = self.admit_key.take();
-        let lease = match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease }) if Some(lease.key) == key => lease,
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+        let lease = match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease }) if Some(lease.key) == key => lease,
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 return match key {
                     Some(key) => self.await_key(key),
                     None => self.fail(ReplicateObjectError::MissingBlobHash),
                 };
             }
-            Event::Blob(BlobEvent::Error(error)) => {
+            Ok(BlobEvent::Error(error)) => {
                 return self.fail(ReplicateObjectError::Blob(error));
             }
-            other => {
+            Ok(other) => {
+                return self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label());
+            }
+
+            Err(other) => {
                 return self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label());
             }
         };
@@ -2755,9 +2765,10 @@ impl ReplicateObjectOperation {
     }
 
     fn accept_approval_sent(&mut self, event: Event) -> ObjectTurn {
-        match event {
-            Event::Blob(BlobEvent::MessageSent { .. }) => self.await_apply_complete(),
-            other => self.invalid("Event::Blob(BlobEvent::MessageSent)", other.label()),
+        match event.into_blob() {
+            Ok(BlobEvent::MessageSent { .. }) => self.await_apply_complete(),
+            Ok(other) => self.invalid("Event::Blob(BlobEvent::MessageSent)", other.label()),
+            Err(other) => self.invalid("Event::Blob(BlobEvent::MessageSent)", other.label()),
         }
     }
 
@@ -2783,8 +2794,8 @@ impl ReplicateObjectOperation {
         let Some(key) = self.admit_key.take() else {
             return self.fail(ReplicateObjectError::PendingSource);
         };
-        match event {
-            Event::Blob(BlobEvent::ReadAdmitted { .. }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { .. }) => {
                 self.state = ReplicateObjectState::SchedulePromotion;
                 let wake = TaskEffect::ShortenTimer {
                     key: TaskKey::PromotePending {
@@ -2795,11 +2806,12 @@ impl ReplicateObjectOperation {
                 };
                 Ok(Next::Call(Effect::Task(wake).into()))
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 self.await_key(key)
             }
-            Event::Blob(BlobEvent::Error(error)) => self.fail(ReplicateObjectError::Blob(error)),
-            other => self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label()),
+            Ok(BlobEvent::Error(error)) => self.fail(ReplicateObjectError::Blob(error)),
+            Ok(other) => self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label()),
+            Err(other) => self.invalid("Event::Blob(BlobEvent::ReadAdmitted)", other.label()),
         }
     }
 
@@ -2813,8 +2825,9 @@ impl ReplicateObjectOperation {
     }
 
     fn accept_blob_transfer(&mut self, event: Event) -> ObjectTurn {
-        let Event::Blob(BlobEvent::ReplicationFinished { .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::ReplicationFinished)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::ReplicationFinished { .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::ReplicationFinished)", received);
         };
         debug!(
             bucket = %self.request.bucket,
@@ -2833,8 +2846,8 @@ impl ReplicateObjectOperation {
 impl ReplicateObjectOperation {
     fn accept_apply_response(&mut self, event: Event) -> ObjectTurn {
         let received = event.label();
-        let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::MessageReceived)", event.label());
+        let Ok(BlobEvent::MessageReceived { payload, .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::MessageReceived)", received);
         };
 
         match VersionReplicationMessage::from_bytes(&payload) {
@@ -2874,11 +2887,13 @@ impl ReplicateObjectOperation {
 // fingerprint and closing the stream.
 impl ReplicateObjectOperation {
     fn accept_blob_cleanup(&mut self, event: Event) -> ObjectTurn {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) | Event::Blob(BlobEvent::Error(_)) => {
-                self.close_connection()
-            }
-            other => self.invalid(
+        match event.into_blob() {
+            Ok(BlobEvent::DeleteFinished) | Ok(BlobEvent::Error(_)) => self.close_connection(),
+            Ok(other) => self.invalid(
+                "Event::Blob(BlobEvent::DeleteFinished|Error)",
+                other.label(),
+            ),
+            Err(other) => self.invalid(
                 "Event::Blob(BlobEvent::DeleteFinished|Error)",
                 other.label(),
             ),
@@ -2886,8 +2901,9 @@ impl ReplicateObjectOperation {
     }
 
     fn accept_connection_closed(&mut self, event: Event) -> ObjectTurn {
-        let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::ConnectionClosed)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::ConnectionClosed { .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::ConnectionClosed)", received);
         };
         Ok(Next::Done(self.result.clone()))
     }
@@ -2913,7 +2929,7 @@ mod tests {
     }
 
     fn blob(event: BlobEvent) -> IoResult {
-        event_result(Event::Blob(event))
+        event_result(Event::blob(event))
     }
 
     fn asked<T: std::fmt::Debug, E: std::fmt::Debug>(turn: &Result<Next<T>, E>) -> &Effect {
@@ -2985,7 +3001,7 @@ mod tests {
     fn load_routing(op: &mut ReplicateObjectOperation) -> ObjectTurn {
         op.next(event_result(Event::SubOperation(
             SubOperationEvent::GroupRoutingLoaded {
-                result: Ok(GroupRoutingInputs::default()),
+                result: Box::new(Ok(GroupRoutingInputs::default())),
             },
         )))
         .unwrap();
@@ -3395,8 +3411,8 @@ mod tests {
             let stream_id = Ulid::from_parts(13, 13);
             op.cleanup_reference_blob = Some(location.clone());
             op.stream_id = Some(stream_id);
-            let delete = Effect::Blob(BlobEffect::Delete { location });
-            let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+            let delete = Effect::blob(BlobEffect::Delete { location });
+            let close = Effect::blob(BlobEffect::CloseConnection { stream_id });
             assert_eq!(op.abort(), vec![delete.into(), close.into()]);
         }
 
@@ -3773,13 +3789,15 @@ mod tests {
         let effects = operation.step(read(newer.to_bytes().unwrap()));
         assert!(matches!(
             effects.as_slice(),
-            [Effect::Blob(BlobEffect::OpenConnection { .. })]
+            [effect] if matches!(effect.as_blob(), Some(BlobEffect::OpenConnection { .. }))
         ));
 
-        let effects = operation.step(Event::Blob(BlobEvent::ConnectionEstablished {
+        let effects = operation.step(Event::blob(BlobEvent::ConnectionEstablished {
             stream_id: Ulid::generate(),
         }));
-        let [Effect::Blob(BlobEffect::SendMessage { payload, .. })] = effects.as_slice() else {
+        let Some(BlobEffect::SendMessage { payload, .. }) =
+            effects.first().and_then(Effect::as_blob)
+        else {
             panic!("expected manifest message")
         };
         let VersionReplicationMessage::ReferenceAdvance {
@@ -4121,8 +4139,8 @@ mod tests {
         ));
         let effects = op.next(row(None));
         assert!(matches!(
-            asked(&effects),
-            Effect::Blob(BlobEffect::OpenConnection { .. })
+            (asked(&effects)).as_blob(),
+            Some(BlobEffect::OpenConnection { .. })
         ));
         assert!(matches!(
             op.replication_version,
@@ -4286,13 +4304,15 @@ mod tests {
             version: None,
         };
         op.next(event_result(Event::SubOperation(
-            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved {
+                result: Box::new(Ok(access)),
+            },
         )))
         .unwrap();
         op.next(plain_settings()).unwrap();
         let mut stale = reference_cached_metadata();
         stale.etag = Some("etag-2".to_string());
-        let effects = op.next(event_result(Event::StagingSource(
+        let effects = op.next(event_result(Event::staging(
             StagingSourceEvent::HeadResult { metadata: stale },
         )));
 
@@ -4323,12 +4343,14 @@ mod tests {
             version: None,
         };
         op.next(event_result(Event::SubOperation(
-            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved {
+                result: Box::new(Ok(access)),
+            },
         )))
         .unwrap();
         op.next(plain_settings()).unwrap();
         let metadata = reference_cached_metadata();
-        op.next(event_result(Event::StagingSource(
+        op.next(event_result(Event::staging(
             StagingSourceEvent::HeadResult {
                 metadata: metadata.clone(),
             },
@@ -4339,7 +4361,7 @@ mod tests {
 
         let mut stale = metadata;
         stale.etag = Some("etag-2".to_string());
-        let effects = op.next(event_result(Event::StagingSource(
+        let effects = op.next(event_result(Event::staging(
             StagingSourceEvent::ReadResult {
                 metadata: stale,
                 stream: BackendStream::new(stream::empty::<Result<Bytes, std::io::Error>>()),
@@ -4417,19 +4439,19 @@ mod tests {
         .unwrap();
         op.next(event_result(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved {
-                result: Ok(ResolvedSourceAccess::OpenDal {
+                result: Box::new(Ok(ResolvedSourceAccess::OpenDal {
                     kind: SourceConnectorKind::Http,
                     config: HashMap::new(),
                     path: "ref/file.txt".to_string(),
                     version: None,
-                }),
+                })),
             },
         )))
         .unwrap();
         op.next(plain_settings()).unwrap();
         op.next(event_result(Event::SubOperation(
             SubOperationEvent::GroupRoutingLoaded {
-                result: Ok(GroupRoutingInputs::default()),
+                result: Box::new(Ok(GroupRoutingInputs::default())),
             },
         )))
         .unwrap();
@@ -4463,21 +4485,20 @@ mod tests {
         };
         op.next(event_result(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved {
-                result: Ok(access.clone()),
+                result: Box::new(Ok(access.clone())),
             },
         )))
         .unwrap();
         let effects = op.next(plain_settings());
         assert!(matches!(effects, Ok(Next::Call(IoCall::Child(_)))));
         let effects = load_routing(&mut op);
-        assert!(matches!(
-            asked(&effects),
-            Effect::StagingSource(StagingSourceEffect::Read { access: emitted, range, expected })
+        assert!(
+            matches!((asked(&effects)).as_staging(), Some(StagingSourceEffect::Read { access: emitted, range, expected })
                 if emitted == &access && range.is_none()
-                    && expected.as_ref() == Some(&reference_cached_metadata())
-        ));
+                    && expected.as_ref() == Some(&reference_cached_metadata()))
+        );
 
-        let effects = op.next(event_result(Event::StagingSource(
+        let effects = op.next(event_result(Event::staging(
             StagingSourceEvent::ReadResult {
                 metadata: reference_cached_metadata(),
                 stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
@@ -4485,11 +4506,10 @@ mod tests {
                 )])),
             },
         )));
-        assert!(matches!(
-            asked(&effects),
-            Effect::Blob(BlobEffect::Write { bucket, key, .. })
-                if bucket == "bucket" && key == "dir/file.txt"
-        ));
+        assert!(
+            matches!((asked(&effects)).as_blob(), Some(BlobEffect::Write { bucket, key, .. })
+                if bucket == "bucket" && key == "dir/file.txt")
+        );
 
         let effects = op.next(blob(BlobEvent::WriteFinished {
             location: materialized_location(),
@@ -4527,7 +4547,7 @@ mod tests {
         .unwrap();
         op.next(event_result(Event::SubOperation(
             SubOperationEvent::VersionAccessResolved {
-                result: Ok(ResolvedSourceAccess::OpenDal {
+                result: Box::new(Ok(ResolvedSourceAccess::OpenDal {
                     kind: SourceConnectorKind::Http,
                     config: HashMap::from([(
                         "endpoint".to_string(),
@@ -4535,13 +4555,13 @@ mod tests {
                     )]),
                     path: "ref/file.txt".to_string(),
                     version: None,
-                }),
+                })),
             },
         )))
         .unwrap();
         op.next(plain_settings()).unwrap();
         load_routing(&mut op).unwrap();
-        op.next(event_result(Event::StagingSource(
+        op.next(event_result(Event::staging(
             StagingSourceEvent::ReadResult {
                 metadata: reference_cached_metadata(),
                 stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
@@ -4558,7 +4578,7 @@ mod tests {
         })));
 
         assert!(effects.is_err());
-        let delete = Effect::Blob(BlobEffect::Delete {
+        let delete = Effect::blob(BlobEffect::Delete {
             location: temp_location,
         });
         assert_eq!(op.abort(), vec![delete.into()]);
@@ -4583,7 +4603,9 @@ mod tests {
             version: None,
         };
         op.next(event_result(Event::SubOperation(
-            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved {
+                result: Box::new(Ok(access)),
+            },
         )))
         .unwrap();
         // The source bucket encrypts: nothing of the reference is read or written here.
@@ -4616,12 +4638,14 @@ mod tests {
             version: None,
         };
         op.next(event_result(Event::SubOperation(
-            SubOperationEvent::VersionAccessResolved { result: Ok(access) },
+            SubOperationEvent::VersionAccessResolved {
+                result: Box::new(Ok(access)),
+            },
         )))
         .unwrap();
         op.next(plain_settings()).unwrap();
         load_routing(&mut op).unwrap();
-        op.next(event_result(Event::StagingSource(
+        op.next(event_result(Event::staging(
             StagingSourceEvent::ReadResult {
                 metadata: reference_cached_metadata(),
                 stream: BackendStream::new(stream::iter(vec![Ok::<Bytes, std::io::Error>(
@@ -4659,8 +4683,8 @@ mod tests {
         // The source bucket has no encryption settings, so the transfer goes ahead.
         let effects = op.next(row(None));
         assert!(matches!(
-            asked(&effects),
-            Effect::Blob(BlobEffect::Replicate { .. })
+            (asked(&effects)).as_blob(),
+            Some(BlobEffect::Replicate { .. })
         ));
         op.next(blob(BlobEvent::ReplicationFinished {
             location: temp_location.clone(),
@@ -4676,7 +4700,7 @@ mod tests {
         }));
 
         assert_eq!(op.state, ReplicateObjectState::CleanupReferenceBlob);
-        let delete = Effect::Blob(BlobEffect::Delete {
+        let delete = Effect::blob(BlobEffect::Delete {
             location: temp_location,
         });
         assert_eq!(asked(&effects), &delete);
@@ -4779,7 +4803,7 @@ mod tests {
                 let error = op.next(encrypting()).unwrap_err();
                 assert_eq!(error, ReplicateObjectError::PlaintextRefused);
                 let stream_id = op.stream_id.unwrap();
-                let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+                let close = Effect::blob(BlobEffect::CloseConnection { stream_id });
                 assert_eq!(op.abort(), vec![close.into()]);
                 assert_eq!(
                     error.failure_category(),
@@ -4795,14 +4819,13 @@ mod tests {
             let mut op = negotiating(location.clone(), true);
             answer(&mut op, ReplicationNegotiationResult::NeedBlobVersion);
             let effects = op.next(encrypting());
-            assert!(matches!(
-                asked(&effects),
-            Effect::Blob(BlobEffect::AdmitRead { key, .. }) if *key == source_key()
-            ));
+            assert!(
+                matches!((asked(&effects)).as_blob(), Some(BlobEffect::AdmitRead { key, .. }) if *key == source_key())
+            );
             let effects = op.next(admitted(source_key(), &location));
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::ReplicateLeased { regrant: None, .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::ReplicateLeased { regrant: None, .. })
             ));
         }
 
@@ -4813,11 +4836,11 @@ mod tests {
             answer(&mut op, ReplicationNegotiationResult::NeedVersionOnly);
             let effects = op.next(encrypting());
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::AdmitRead { .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::AdmitRead { .. })
             ));
             let effects = op.next(admitted(source_key(), &location));
-            let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = asked(&effects) else {
+            let Some(BlobEffect::SendMessage { payload, .. }) = asked(&effects).as_blob() else {
                 panic!("source approval missing");
             };
             assert_eq!(
@@ -4827,8 +4850,8 @@ mod tests {
             let stream_id = op.stream_id.unwrap();
             let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::ReadMessage { .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::ReadMessage { .. })
             ));
         }
 
@@ -4843,11 +4866,10 @@ mod tests {
             );
             op.next(encrypting()).unwrap();
             let effects = op.next(admitted(source_key(), &location));
-            assert!(matches!(
-                asked(&effects),
-            Effect::Blob(BlobEffect::ReplicateLeased { regrant: Some(plan), object: None, .. })
-                    if **plan == target_plan()
-            ));
+            assert!(
+                matches!((asked(&effects)).as_blob(), Some(BlobEffect::ReplicateLeased { regrant: Some(plan), object: None, .. })
+                    if **plan == target_plan())
+            );
         }
 
         #[test]
@@ -4859,14 +4881,13 @@ mod tests {
             answer(&mut op, result);
             op.next(encrypting()).unwrap();
             let effects = op.next(admitted(source_key(), &location));
-            assert!(matches!(
-                asked(&effects),
-            Effect::Blob(BlobEffect::ReplicateLeased {
+            assert!(
+                matches!((asked(&effects)).as_blob(), Some(BlobEffect::ReplicateLeased {
                     regrant: Some(plan),
                     object: Some([8, ..]),
                     ..
-                }) if **plan == target_plan()
-            ));
+                }) if **plan == target_plan())
+            );
         }
 
         #[test]
@@ -4882,8 +4903,8 @@ mod tests {
             let locked = BlobError::BucketKey(BucketKeyError::Locked(source_key().bucket_id));
             let effects = op.next(blob(BlobEvent::Error(locked)));
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::CloseConnection { .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::CloseConnection { .. })
             ));
             let stream_id = op.stream_id.unwrap();
             assert_eq!(
@@ -4904,8 +4925,8 @@ mod tests {
             );
             let effects = op.next(plain_settings());
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::Replicate { .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::Replicate { .. })
             ));
         }
 
@@ -4924,8 +4945,8 @@ mod tests {
             ));
             let effects = op.next(row(Some(location.to_bytes().unwrap().into())));
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::AdmitRead { .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::AdmitRead { .. })
             ));
             let locked = BlobError::BucketKey(BucketKeyError::Locked(source_key().bucket_id));
             assert_eq!(

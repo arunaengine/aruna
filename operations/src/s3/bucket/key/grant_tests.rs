@@ -129,7 +129,7 @@ fn unlocked_grant_seals() {
     let Ok(Next::Call(IoCall::Effect(effect))) = &turn else {
         panic!("expected sealing with the unlocked key, got {turn:?}");
     };
-    let Effect::Blob(BlobEffect::SealUnlocked { key, holders, .. }) = effect.as_ref() else {
+    let Some(BlobEffect::SealUnlocked { key, holders, .. }) = effect.as_blob() else {
         panic!("expected sealing with the unlocked key, got {turn:?}");
     };
     assert_eq!(*key, BucketKeyRef::new(BUCKET_ID, 2));
@@ -145,7 +145,7 @@ fn unlocked_grant_seals() {
     let copies = vec![copy];
     let turn = sealed(
         &mut operation,
-        Event::Blob(BlobEvent::CopiesSealed { copies }),
+        Event::blob(BlobEvent::CopiesSealed { copies }),
     );
     let (grant, copies) = written_grant(&turn);
     assert_eq!(
@@ -159,7 +159,7 @@ fn unlocked_grant_seals() {
 fn locked_grant_waits() {
     let (mut operation, _) = started(keys(), true);
     let locked = BlobError::BucketKey(BucketKeyError::Locked(BUCKET_ID));
-    let turn = sealed(&mut operation, Event::Blob(BlobEvent::Error(locked)));
+    let turn = sealed(&mut operation, Event::blob(BlobEvent::Error(locked)));
     let (grant, copies) = written_grant(&turn);
     assert_eq!((grant.state, copies), (GrantState::Pending, 0));
     assert_eq!(grant.granted_by, user(1));

@@ -50,8 +50,13 @@ impl BlobHandle {
         let read = self.send_blob_effect(BlobEffect::ReadMessage { stream_id });
         match timeout(limit, read).await {
             Err(_) => Err(InboundError::TimedOut),
-            Ok(Event::Blob(BlobEvent::MessageReceived { payload, .. })) => Ok(payload),
-            Ok(Event::Blob(BlobEvent::Error(error))) => Err(InboundError::Blob(Box::new(error))),
+            Ok(Event::Blob(event)) => match *event {
+                BlobEvent::MessageReceived { payload, .. } => Ok(payload),
+                BlobEvent::Error(error) => Err(InboundError::Blob(Box::new(error))),
+                other => Err(InboundError::Unexpected(
+                    Event::blob(other).label().to_string(),
+                )),
+            },
             Ok(other) => Err(InboundError::Unexpected(other.label().to_string())),
         }
     }
@@ -61,7 +66,9 @@ impl BlobHandle {
         let event = self
             .send_blob_effect(BlobEffect::CloseConnection { stream_id })
             .await;
-        if let Event::Blob(BlobEvent::Error(error)) = event {
+        if let Event::Blob(event) = event
+            && let BlobEvent::Error(error) = *event
+        {
             error!(error = ?error, "Failed to close rejected inbound bao stream");
         }
     }

@@ -430,15 +430,15 @@ impl KeyOperation {
     /// Answers the issuance: a key unlocked after the locked status read cannot issue before the
     /// due raise, so that run retries.
     fn issue_read(&mut self, event: Event) -> KeyTurn {
-        match event {
-            Event::Blob(BlobEvent::Abe(_)) if self.snapshot.as_ref().is_some_and(|s| s.due) => {
+        match event.into_blob() {
+            Ok(BlobEvent::Abe(_)) if self.snapshot.as_ref().is_some_and(|s| s.due) => {
                 self.fail(KeyError::Storage)
             }
-            Event::Blob(BlobEvent::Abe(event)) => match *event {
+            Ok(BlobEvent::Abe(event)) => match *event {
                 AbeEvent::Grant(grant) => self.publish_grant(grant),
                 _ => self.fail(AbeError::Context),
             },
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 match self.request.take() {
                     Some(request) => {
                         self.result = Some(KeyResult::Request(request.clone()));
@@ -447,7 +447,7 @@ impl KeyOperation {
                     None => self.fail(KeyError::Missing),
                 }
             }
-            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => self.fail(error),
+            Ok(BlobEvent::Error(BlobError::Abe(error))) => self.fail(error),
             _ => self.fail(AbeError::Context),
         }
     }
@@ -503,7 +503,7 @@ impl Operation for KeyOperation {
                 self.prepare()
             }
             State::Unlock => {
-                let Event::Blob(BlobEvent::KeyStatus { generations }) = result.event()? else {
+                let Ok(BlobEvent::KeyStatus { generations }) = (result.event()?).into_blob() else {
                     return self.fail(AbeError::Context);
                 };
                 let key = self.snapshot.as_ref().map(|s| s.parameters.key);
@@ -848,7 +848,7 @@ mod tests {
             enc: [0; 32],
             ciphertext: Vec::new(),
         };
-        let event = Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))));
+        let event = Event::blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))));
         assert_eq!(
             operation.next(IoResult::Event(Box::new(event))),
             Err(KeyError::Storage)
@@ -963,7 +963,7 @@ mod tests {
             enc: [0; 32],
             ciphertext: vec![0; 16],
         };
-        Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))))
+        Event::blob(BlobEvent::Abe(Box::new(AbeEvent::Grant(grant))))
     }
 
     #[test]
@@ -991,7 +991,7 @@ mod tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = &turn else {
             panic!("one issuance: {turn:?}");
         };
-        let Effect::Blob(BlobEffect::Abe(effect)) = effect.as_ref() else {
+        let Some(BlobEffect::Abe(effect)) = effect.as_blob() else {
             panic!("an issuance effect");
         };
         let AbeEffect::Issue(context) = effect.as_ref() else {

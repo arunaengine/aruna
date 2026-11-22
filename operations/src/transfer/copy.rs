@@ -25,9 +25,9 @@ use crate::transfer::copy::sealed::{
 use crate::transfer::read::{ReadSourceOperation, TokenRead};
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::errors::{BlobError, ConversionError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::BUCKET_ENCRYPTION_KEYSPACE;
@@ -812,13 +812,11 @@ impl Operation for AdmitSourceOperation {
 
     fn next(&mut self, result: IoResult) -> CopyTurn<()> {
         if self.admitting {
-            return match result.event()? {
-                Event::Blob(BlobEvent::ReadAdmitted { .. }) => Ok(Next::Done(())),
-                Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
-                    Err(CopyObjectError::Get(GetObjectError::ConversionError(
-                        ConversionError::BucketKey(error),
-                    )))
-                }
+            return match result.blob()? {
+                BlobEvent::ReadAdmitted { .. } => Ok(Next::Done(())),
+                BlobEvent::Error(BlobError::BucketKey(error)) => Err(CopyObjectError::Get(
+                    GetObjectError::ConversionError(ConversionError::BucketKey(error)),
+                )),
                 _ => Err(CopyObjectError::Get(GetObjectError::GetObjectFailed)),
             };
         }
@@ -831,7 +829,7 @@ impl Operation for AdmitSourceOperation {
         let archive = reference_archive(key);
         self.admitting = true;
         let admit = BlobEffect::AdmitRead { key, archive };
-        Ok(Next::Call(Effect::Blob(admit).into()))
+        Ok(Next::Call(IoCall::blob(admit)))
     }
 }
 
@@ -1145,7 +1143,7 @@ pub(crate) mod test {
         let read = admit.next(IoResult::Values(vec![Some(row.into())]));
         assert!(matches!(read, Ok(Next::Call(IoCall::Effect(_)))));
         let error = aruna_core::structs::storage::encryption::BucketKeyError::InvalidToken;
-        let event = Event::Blob(BlobEvent::Error(BlobError::BucketKey(error)));
+        let event = Event::blob(BlobEvent::Error(BlobError::BucketKey(error)));
         let answer = admit.next(IoResult::Event(Box::new(event)));
         assert!(matches!(
             answer,

@@ -61,7 +61,7 @@ async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
     let version_id = Ulid::from_bytes([104; 16]);
     let node = export_node(realm_id, false).await;
     let node_id = node.net.node_id();
-    let Event::Blob(BlobEvent::WriteFinished { location }) = node
+    let Ok(BlobEvent::WriteFinished { location }) = (node
         .driver
         .blob_handle
         .as_ref()
@@ -74,7 +74,8 @@ async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("local blob write failed")
     };
@@ -109,7 +110,7 @@ async fn two_copies() -> (BaoNode, UserId, UserId, [ExportCandidate; 2]) {
     let node = export_node(realm_id, false).await;
     let node_id = node.net.node_id();
     let blob = node.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::WriteFinished { location }) = blob
+    let Ok(BlobEvent::WriteFinished { location }) = (blob
         .send_blob_effect(BlobEffect::Write {
             resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             bucket: "remote".to_string(),
@@ -118,7 +119,8 @@ async fn two_copies() -> (BaoNode, UserId, UserId, [ExportCandidate; 2]) {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("blob write failed")
     };
@@ -308,7 +310,7 @@ async fn sealed_local_export() {
     };
     let resolved = aruna_core::structs::storage::blob::ResolvedBackend::node_default()
         .with_encryption(Some(plan));
-    let Event::Blob(BlobEvent::WriteFinished { location }) = blob
+    let Ok(BlobEvent::WriteFinished { location }) = (blob
         .send_blob_effect(BlobEffect::Write {
             resolved,
             bucket: "remote".to_string(),
@@ -317,7 +319,8 @@ async fn sealed_local_export() {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("sealed blob write failed")
     };
@@ -364,7 +367,7 @@ async fn sealed_local_export() {
         duration: None,
         max: None,
     };
-    let Event::Blob(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await
+    let Ok(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await.into_blob()
     else {
         panic!("prepare failed")
     };

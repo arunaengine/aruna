@@ -51,7 +51,7 @@ impl PrepareAbe {
 
     pub(crate) fn first(&mut self) -> Result<IoCall, BlobError> {
         let effect = self.effect.take().ok_or(AbeError::Context)?;
-        Ok(Effect::Blob(BlobEffect::Abe(Box::new(effect))).into())
+        Ok(Effect::blob(BlobEffect::Abe(Box::new(effect))).into())
     }
 
     /// The next call, or `None` once the parameters are written.
@@ -70,12 +70,12 @@ impl PrepareAbe {
     }
 
     fn derived(&mut self, event: Event) -> Result<IoCall, BlobError> {
-        let parameters = match event {
-            Event::Blob(BlobEvent::Abe(event)) => match *event {
+        let parameters = match event.into_blob() {
+            Ok(BlobEvent::Abe(event)) => match *event {
                 AbeEvent::Parameters(parameters) => parameters,
                 _ => return Err(AbeError::Context.into()),
             },
-            Event::Blob(BlobEvent::Error(error)) => return Err(error),
+            Ok(BlobEvent::Error(error)) => return Err(error),
             _ => return Err(AbeError::Context.into()),
         };
         let reads = vec![
@@ -138,7 +138,7 @@ pub(crate) mod tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
             panic!("expected parameter derivation");
         };
-        let Effect::Blob(BlobEffect::Abe(effect)) = *effect else {
+        let Ok(BlobEffect::Abe(effect)) = (*effect).into_blob() else {
             panic!("expected parameter derivation");
         };
         let AbeEffect::Parameters {
@@ -151,7 +151,7 @@ pub(crate) mod tests {
             panic!("expected parameter derivation");
         };
         let parameters = create_parameters(private.bytes(), realm, node, key).unwrap();
-        let derived = Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Parameters(parameters))));
+        let derived = Event::blob(BlobEvent::Abe(Box::new(AbeEvent::Parameters(parameters))));
         let turn = operation.next(IoResult::Event(Box::new(derived)));
         let Ok(Next::Call(IoCall::Read(reads))) = turn else {
             panic!("expected parameter admission");
@@ -168,7 +168,7 @@ pub(crate) mod tests {
         let key = BucketKeyRef::new(Ulid::from_parts(3, 3), 1);
         let secret = SecretBytes::new(vec![4; 32]);
         let parameters = create_parameters(&secret, realm, node, key).unwrap();
-        let derived = Event::Blob(BlobEvent::Abe(Box::new(AbeEvent::Parameters(parameters))));
+        let derived = Event::blob(BlobEvent::Abe(Box::new(AbeEvent::Parameters(parameters))));
         let abe = PrepareAbe::new(realm, node, key, SharedSecret::new(secret));
         (abe, IoResult::Event(Box::new(derived)))
     }

@@ -9,7 +9,9 @@ use std::time::{Duration, SystemTime};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::StagingSourceError;
-use aruna_core::events::{Event, StagingSourceEvent};
+#[cfg(test)]
+use aruna_core::events::Event;
+use aruna_core::events::StagingSourceEvent;
 use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, OFFERED_DIRECTORY_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::rows::{read_row, values};
@@ -60,17 +62,17 @@ fn local_access(root: &str) -> ResolvedSourceAccess {
 }
 
 fn source_call(effect: StagingSourceEffect) -> IoCall {
-    IoCall::from(Effect::StagingSource(effect))
+    IoCall::from(Effect::staging(effect))
 }
 
 /// The source's answer; a node without local directory access says so.
 fn source_answer(result: IoResult) -> Result<StagingSourceEvent, OfferError> {
-    match result.event()? {
-        Event::StagingSource(StagingSourceEvent::Error { error }) => Err(match error {
+    match (result.event()?).into_staging() {
+        Ok(StagingSourceEvent::Error { error }) => Err(match error {
             StagingSourceError::HandleMissing => OfferError::HandleMissing,
             other => other.into(),
         }),
-        Event::StagingSource(event) => Ok(event),
+        Ok(event) => Ok(event),
         _ => Err(StagingSourceError::InvalidEffect.into()),
     }
 }

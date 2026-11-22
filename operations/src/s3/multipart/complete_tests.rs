@@ -181,8 +181,8 @@ fn cleanup_works(calls: &[IoCall]) -> Vec<BlobCleanupWork> {
 
 fn released(calls: &[IoCall]) -> Option<Ulid> {
     calls.iter().find_map(|call| match call {
-        IoCall::Effect(effect) => match &**effect {
-            Effect::Blob(BlobEffect::ReleaseReservation { id }) => Some(*id),
+        IoCall::Effect(effect) => match (&**effect).as_blob() {
+            Some(BlobEffect::ReleaseReservation { id }) => Some(*id),
             _ => None,
         },
         _ => None,
@@ -394,7 +394,7 @@ fn cleanup_keeps_location() {
         location: location.clone(),
         message: "reservation finalization failed".to_string(),
     };
-    let turn = operation.next(event(Event::Blob(BlobEvent::Error(failed))));
+    let turn = operation.next(event(Event::blob(BlobEvent::Error(failed))));
     assert_eq!(turn.err(), Some(CompleteUploadError::CompleteUploadFailed));
     assert_eq!(operation.delete_location, Some(location.clone()));
 
@@ -524,13 +524,13 @@ fn completes_at_provider() {
 
     let turn = operation.compose_blob();
 
-    let Effect::Blob(BlobEffect::CompleteUpload {
+    let Some(BlobEffect::CompleteUpload {
         backend_upload,
         parts,
         streamed,
         compression,
         if_not_exists,
-    }) = asked(&turn)
+    }) = asked(&turn).as_blob()
     else {
         panic!("expected the provider completion, got {turn:?}")
     };
@@ -542,7 +542,7 @@ fn completes_at_provider() {
 }
 
 fn composed_event(location: BackendLocation) -> IoResult {
-    event(Event::Blob(BlobEvent::WriteFinished { location }))
+    event(Event::blob(BlobEvent::WriteFinished { location }))
 }
 
 #[test]
@@ -558,9 +558,9 @@ fn frames_provider_object() {
 
     let turn = operation.next(composed_event(target.clone()));
 
-    let Effect::Blob(BlobEffect::Compose {
+    let Some(BlobEffect::Compose {
         resolved, parts, ..
-    }) = asked(&turn)
+    }) = asked(&turn).as_blob()
     else {
         panic!("expected a framed compose, got {turn:?}")
     };
@@ -599,10 +599,9 @@ fn framed_provider_object() {
         let turn = operation.next(composed_event(target.clone()));
 
         match composes {
-            true => assert!(matches!(
-                asked(&turn),
-                Effect::Blob(BlobEffect::Compose { parts, .. }) if parts == &vec![target.clone()]
-            )),
+            true => assert!(
+                matches!((asked(&turn)).as_blob(), Some(BlobEffect::Compose { parts, .. }) if parts == &vec![target.clone()])
+            ),
             false => {
                 assert!(starts_child(&turn));
                 assert_eq!(operation.composed_location.as_ref(), Some(&target));
@@ -1062,7 +1061,7 @@ fn compose_keeps_cause() {
     operation.state = CompleteUploadState::ComposeBlob;
 
     let failed = || BlobError::WriteError("part limit exceeded".to_string());
-    let turn = operation.next(event(Event::Blob(BlobEvent::Error(failed()))));
+    let turn = operation.next(event(Event::blob(BlobEvent::Error(failed()))));
 
     assert_eq!(turn.err(), Some(failed().into()));
     assert!(matches!(operation.abort().as_slice(), [IoCall::Child(_)]));
@@ -1154,7 +1153,7 @@ fn sealed_reserves_first() {
     ))));
     assert_eq!(
         asked(&turn),
-        &Effect::Blob(BlobEffect::ReserveCompose {
+        &Effect::blob(BlobEffect::ReserveCompose {
             content: MAX_PART_SIZE
         })
     );
@@ -1162,13 +1161,13 @@ fn sealed_reserves_first() {
     let reserved = BlobEvent::ComposeReserved {
         share: share.clone(),
     };
-    let turn = operation.next(event(Event::Blob(reserved)));
+    let turn = operation.next(event(Event::blob(reserved)));
     assert!(matches!(
         turn,
         Ok(Next::Call(IoCall::Page { ref space, .. })) if space == UPLOAD_PART_KEYSPACE
     ));
     let turn = operation.compose_blob();
-    let Effect::Blob(BlobEffect::ComposePieces { share: kept, .. }) = asked(&turn) else {
+    let Some(BlobEffect::ComposePieces { share: kept, .. }) = asked(&turn).as_blob() else {
         panic!("expected a piece composition, got {turn:?}")
     };
     assert_eq!(*kept, share);
@@ -1179,9 +1178,9 @@ fn sealed_parts_compose() {
     // Completion composes the saved pieces with the captured plan, never the bucket's.
     let (mut operation, _) = sealed_operation(&[b"first", b"second"]);
     let turn = operation.compose_blob();
-    let Effect::Blob(BlobEffect::ComposePieces {
+    let Some(BlobEffect::ComposePieces {
         resolved, parts, ..
-    }) = asked(&turn)
+    }) = asked(&turn).as_blob()
     else {
         panic!("expected a piece composition, got {turn:?}")
     };
@@ -1697,7 +1696,7 @@ fn share_outlives_compose() {
     let (mut operation, location) = sealed_operation(&[b"first"]);
     let share = operation.compose_share.clone().unwrap();
     let turn = operation.compose_blob();
-    let Effect::Blob(BlobEffect::ComposePieces { share: sent, .. }) = asked(&turn) else {
+    let Some(BlobEffect::ComposePieces { share: sent, .. }) = asked(&turn).as_blob() else {
         panic!("expected a piece composition, got {turn:?}")
     };
     assert_eq!(*sent, share);
@@ -1842,8 +1841,8 @@ mod decisions {
         let mut operation = at_gate(Some("eu-west"));
         let turn = operation.next(values(vec![bucket(Vec::new(), 0)]));
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::Compose { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::Compose { .. })
         ));
 
         // An allowed object composes after the gate.
@@ -1854,8 +1853,8 @@ mod decisions {
             .unwrap();
         let turn = operation.next(decided(PlacementDecision::Allowed));
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::Compose { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::Compose { .. })
         ));
     }
 

@@ -167,9 +167,14 @@ impl LockBucketOperation {
     }
 
     fn refused(&self, received: Event) -> LockTurn {
-        match received {
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => Err(LockError::InvalidStateEvent {
+        match received.into_blob() {
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => Err(LockError::InvalidStateEvent {
+                state: format!("{:?}", self.step),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+            Err(other) => Err(LockError::InvalidStateEvent {
                 state: format!("{:?}", self.step),
                 expected: "the event of the current step",
                 received: other.label(),
@@ -205,7 +210,7 @@ impl LockBucketOperation {
 
     fn lock(&mut self) -> LockTurn {
         let bucket_id = self.bucket_id.ok_or(LockError::NotFinished)?;
-        let lock = Effect::Blob(BlobEffect::LockKey {
+        let lock = Effect::blob(BlobEffect::LockKey {
             bucket_id,
             session: self.input.session,
         });
@@ -302,14 +307,14 @@ impl LockBucketOperation {
 
     fn event_answered(&mut self, event: Event) -> LockTurn {
         match (self.step, event) {
-            (
-                LockStep::LockKeys,
-                Event::Blob(BlobEvent::KeyLocked {
+            (LockStep::LockKeys, Event::Blob(blob)) => match *blob {
+                BlobEvent::KeyLocked {
                     locked,
                     sequence,
                     live,
-                }),
-            ) => self.audit(locked, sequence, live.map(|status| *status)),
+                } => self.audit(locked, sequence, live.map(|status| *status)),
+                other => self.refused(Event::Blob(Box::new(other))),
+            },
             (LockStep::RearmTimer, Event::Task(event)) if self.answers_waiting(&event) => {
                 self.finish(true)
             }
@@ -457,9 +462,9 @@ mod tests {
             bucket_id: BUCKET_ID,
             session: None,
         };
-        assert_eq!(asked(&turn), &Effect::Blob(lock));
+        assert_eq!(asked(&turn), &Effect::blob(lock));
         let locked = vec![ticket(1), ticket(2)];
-        let turn = operation.next(event(Event::Blob(BlobEvent::KeyLocked {
+        let turn = operation.next(event(Event::blob(BlobEvent::KeyLocked {
             locked: locked.clone(),
             sequence: Ulid::from_parts(1, 1),
             live: None,
@@ -508,9 +513,9 @@ mod tests {
             bucket_id: BUCKET_ID,
             session: Some(ticket(2)),
         };
-        assert_eq!(asked(&turn), &Effect::Blob(lock));
+        assert_eq!(asked(&turn), &Effect::blob(lock));
         // A stale timer locks nothing and records nothing.
-        let turn = operation.next(event(Event::Blob(BlobEvent::KeyLocked {
+        let turn = operation.next(event(Event::blob(BlobEvent::KeyLocked {
             locked: Vec::new(),
             sequence: Ulid::nil(),
             live: None,

@@ -267,7 +267,7 @@ async fn outbox_sync_retry() {
         vec![key.clone()],
         Vec::new(),
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
-            target: Some(record.target.clone()),
+            target: Some(Box::new(record.target.clone())),
             error: "only 1/2 peers synced".to_string(),
         })),
         DrainSyncOutcome::default(),
@@ -316,7 +316,7 @@ async fn retained_outbox_timer() {
         vec![key.clone()],
         Vec::new(),
         Event::Net(NetEvent::DocumentSync(DocumentNetEvent::Error {
-            target: Some(record.target.clone()),
+            target: Some(Box::new(record.target.clone())),
             error: "sync failed before all peers acknowledged".to_string(),
         })),
         DrainSyncOutcome::default(),

@@ -9,7 +9,9 @@ use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::document::DocumentTarget;
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::federation::Signed;
 use aruna_core::keyspaces::{
     BLOB_VERSIONS_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, FEDERATION_KEYSPACE, JOB_STATE_KEYSPACE,
@@ -291,19 +293,20 @@ impl RecheckGrantOperation {
         let status = BlobEffect::ReadKeyStatus {
             bucket_id: key.bucket_id,
         };
-        Ok(Next::Call(IoCall::from(Effect::Blob(status))))
+        Ok(Next::Call(IoCall::from(Effect::blob(status))))
     }
 
     /// A node without the blob plane holds no unlocked key.
     fn check_unlocked(&mut self, index: usize, key: BucketKeyRef, result: IoResult) -> RecheckTurn {
-        match result.event()? {
-            Event::Blob(BlobEvent::KeyStatus { generations })
+        match result.blob()? {
+            BlobEvent::KeyStatus { generations }
                 if (generations.iter()).any(|status| status.key == key && status.active) =>
             {
                 self.next_source(index + 1)
             }
-            Event::Blob(BlobEvent::KeyStatus { .. })
-            | Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Err(GrantError::Denied),
+            BlobEvent::KeyStatus { .. } | BlobEvent::Error(BlobError::HandleMissing) => {
+                Err(GrantError::Denied)
+            }
             other => Err(GrantError::Storage(format!(
                 "key status failed: {}",
                 other.label()
@@ -665,18 +668,18 @@ mod tests {
         let status = BlobEffect::ReadKeyStatus {
             bucket_id: key.bucket_id,
         };
-        let read = IoCall::from(Effect::Blob(status));
+        let read = IoCall::from(Effect::blob(status));
         let answer = check.next(child::<_, PlaintextError>(Ok(true)));
         assert_eq!(answer, Ok(Next::Call(read)));
         let locked = BlobEvent::KeyStatus {
             generations: Vec::new(),
         };
-        let answer = check.next(IoResult::Event(Box::new(Event::Blob(locked))));
+        let answer = check.next(IoResult::Event(Box::new(Event::blob(locked))));
         assert_eq!(answer, Err(GrantError::Denied));
         // A node without the blob plane denies the same way.
         check.step = RecheckStep::Unlocked(0, key);
         let missing = BlobEvent::Error(BlobError::HandleMissing);
-        let answer = check.next(IoResult::Event(Box::new(Event::Blob(missing))));
+        let answer = check.next(IoResult::Event(Box::new(Event::blob(missing))));
         assert_eq!(answer, Err(GrantError::Denied));
     }
 

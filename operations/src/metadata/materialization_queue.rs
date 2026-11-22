@@ -2721,7 +2721,7 @@ fn graph_materialization_effect(
             date_published,
             license,
         } => MetadataEffect::CreateCrate {
-            request: MetadataCrateRequest {
+            request: Box::new(MetadataCrateRequest {
                 graph_iri: event.record.graph_iri.clone(),
                 name: name.clone(),
                 description: description.clone(),
@@ -2730,7 +2730,7 @@ fn graph_materialization_effect(
                 policy,
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor,
-            },
+            }),
         },
         MetadataEventPayload::RoCrate { jsonld }
         | MetadataEventPayload::ReplaceRoCrate { jsonld } => MetadataEffect::ApplyRoCrate {

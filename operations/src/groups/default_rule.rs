@@ -6,7 +6,7 @@ use crate::groups::backends::{backend_key, record_writes};
 use crate::groups::fence::group_fence_key;
 use crate::groups::storage_routing::{GroupInputsOperation, PutGroupError, routing_key};
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, S3_BUCKET_KEYSPACE, STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
@@ -149,7 +149,7 @@ impl PutDefaultOperation {
                     bucket: bucket.clone(),
                 };
                 self.checked = Some((bucket, None));
-                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect)))))
+                Ok(Next::Call(IoCall::blob(effect)))
             }
             (bucket, _) => {
                 self.checked = bucket.map(|bucket| (bucket, None));
@@ -159,14 +159,14 @@ impl PutDefaultOperation {
     }
 
     fn ensured(&mut self, event: Event) -> DefaultTurn {
-        match event {
-            Event::Blob(BlobEvent::BucketReady { created }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::BucketReady { created }) => {
                 if let Some((_, state)) = self.checked.as_mut() {
                     *state = Some(created);
                 }
                 Ok(self.begin())
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(PutGroupError::Unusable(error)),
+            Ok(BlobEvent::Error(error)) => Err(PutGroupError::Unusable(error)),
             _ => Err(PutGroupError::Unexpected("EnsureBucket")),
         }
     }
@@ -605,12 +605,12 @@ mod tests {
         let Ok(Next::Call(IoCall::Effect(ensure))) = turn else {
             panic!("expected a bucket check");
         };
-        let Effect::Blob(BlobEffect::EnsureBucket { bucket, .. }) = *ensure else {
+        let Ok(BlobEffect::EnsureBucket { bucket, .. }) = (*ensure).into_blob() else {
             panic!("expected a bucket check");
         };
         assert_eq!(bucket, "lab-default");
 
-        let write = operation.next(event(Event::Blob(BlobEvent::BucketReady { created: true })));
+        let write = operation.next(event(Event::blob(BlobEvent::BucketReady { created: true })));
         assert!(matches!(write, Ok(Next::Call(IoCall::Child(_)))));
         let (mut write, turn) = verified(&operation, &record);
         assert!(matches!(turn, Ok(Next::Call(IoCall::Page { .. }))));
@@ -640,7 +640,7 @@ mod tests {
         let record = storage(&[("endpoint", "https://s3.lab")]);
         let (mut operation, _) = read(Some("lab-raw"), record.clone(), Vec::new());
         operation
-            .next(event(Event::Blob(BlobEvent::BucketReady {
+            .next(event(Event::blob(BlobEvent::BucketReady {
                 created: false,
             })))
             .unwrap();

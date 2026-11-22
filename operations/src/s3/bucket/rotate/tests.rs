@@ -24,7 +24,7 @@ fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
 }
 
 fn blob(event: BlobEvent) -> IoResult {
-    IoResult::Event(Box::new(Event::Blob(event)))
+    IoResult::Event(Box::new(Event::blob(event)))
 }
 
 /// The answer to the node vault write.
@@ -135,7 +135,7 @@ fn loaded_with(
     let reads_status = matches!(
         &effects,
         Ok(Next::Call(IoCall::Effect(effect)))
-            if matches!(effect.as_ref(), Effect::Blob(BlobEffect::ReadKeyStatus { .. }))
+            if matches!(effect.as_ref().as_blob(), Some(BlobEffect::ReadKeyStatus { .. }))
     );
     if !reads_status {
         return effects;
@@ -302,7 +302,7 @@ fn combined_change_reencodes() {
             .insert(admin(), KeyLookup::Keys(vec![holder.clone()]));
         loaded(&mut operation, EncryptionMode::NodeManaged, Vec::new()).unwrap();
         let effects = generated(&mut operation);
-        let Effect::Blob(BlobEffect::SealHolderCopies { key, .. }) = asked(&effects) else {
+        let Some(BlobEffect::SealHolderCopies { key, .. }) = asked(&effects).as_blob() else {
             panic!("expected holder copies")
         };
         let copy = SealedCopy {
@@ -400,8 +400,8 @@ fn concurrent_put_converted() {
             panic!("expected the admission")
         };
         assert!(matches!(
-            *effect,
-            Effect::Blob(BlobEffect::AdmitRead { .. })
+            (*effect).as_blob(),
+            Some(BlobEffect::AdmitRead { .. })
         ));
     }
 }
@@ -473,7 +473,7 @@ fn unlocking_adds_copy() {
     let key = BucketKeyRef::new(BUCKET_ID, 1);
     assert_eq!(
         asked(&effects),
-        &Effect::Blob(BlobEffect::ReadUnlockedKey { key })
+        &Effect::blob(BlobEffect::ReadUnlockedKey { key })
     );
 
     let private_key = SharedSecret::new(SecretBytes::new(vec![4; 32]));

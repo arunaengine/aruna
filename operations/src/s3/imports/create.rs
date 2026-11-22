@@ -210,7 +210,7 @@ impl CreateImportOperation {
             return self.read();
         };
         self.state = CreateState::Ensure;
-        let ensure = Effect::Blob(BlobEffect::EnsureBucket {
+        let ensure = Effect::blob(BlobEffect::EnsureBucket {
             backend: BackendRef::Group(backend_id),
             bucket,
         });
@@ -218,13 +218,13 @@ impl CreateImportOperation {
     }
 
     fn ensured(&mut self, event: Event) -> Turn {
-        match event {
-            Event::Blob(BlobEvent::BucketReady { created }) if !self.pending.is_empty() => {
+        match event.into_blob() {
+            Ok(BlobEvent::BucketReady { created }) if !self.pending.is_empty() => {
                 let (backend_id, bucket) = self.pending.remove(0);
                 self.checked.push((backend_id, bucket, created));
                 self.ensure_next()
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(ImportRuleError::Invalid(error.reason())),
+            Ok(BlobEvent::Error(error)) => Err(ImportRuleError::Invalid(error.reason())),
             _ => Err(ImportRuleError::Unexpected("Ensure")),
         }
     }
@@ -800,12 +800,14 @@ mod tests {
     fn notes_rule_bucket() {
         let record = storage(&[("endpoint", "https://s3.lab")]);
         let (mut operation, effects) = on_split(input("lab-raw/2024/", "imported/"), &record);
-        let [Effect::Blob(BlobEffect::EnsureBucket { bucket, .. })] = effects.as_slice() else {
+        let Some(BlobEffect::EnsureBucket { bucket, .. }) =
+            effects.first().and_then(Effect::as_blob)
+        else {
             panic!("expected one bucket check, got {effects:?}");
         };
         assert_eq!(bucket, "lab-raw");
 
-        let effects = operation.step(Event::Blob(BlobEvent::BucketReady { created: false }));
+        let effects = operation.step(Event::blob(BlobEvent::BucketReady { created: false }));
         assert!(matches!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::StartTransaction { .. })]
@@ -855,7 +857,7 @@ mod tests {
             ("bucket:lab-raw", "created"),
         ]);
         let (mut operation, _) = on_split(input("lab-raw/2024/", "imported/"), &record);
-        operation.step(Event::Blob(BlobEvent::BucketReady { created: false }));
+        operation.step(Event::blob(BlobEvent::BucketReady { created: false }));
         operation.step(Event::Storage(StorageEvent::TransactionStarted {
             txn_id: TxnId::default(),
         }));
@@ -922,7 +924,7 @@ mod tests {
         let denied = BlobError::WriteError("No access to bucket `lab-raw`.".to_string());
         assert!(
             operation
-                .step(Event::Blob(BlobEvent::Error(denied)))
+                .step(Event::blob(BlobEvent::Error(denied)))
                 .is_empty()
         );
         assert_eq!(

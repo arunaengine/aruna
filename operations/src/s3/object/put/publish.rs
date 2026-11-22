@@ -580,7 +580,7 @@ impl PutObjectOperation {
                 let delete = BlobEffect::Delete {
                     location: duplicate,
                 };
-                calls.push(Effect::Blob(delete).into());
+                calls.push(Effect::blob(delete).into());
                 calls.push(schedule_snapshot_publish().into());
             }
             None => {

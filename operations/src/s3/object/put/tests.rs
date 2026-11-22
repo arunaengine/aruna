@@ -251,7 +251,7 @@ fn rejects_write_error() {
     operation.state = PutObjectState::WriteBlob;
 
     let failed = BlobError::StreamFailed("checksum mismatch".to_string());
-    let turn = operation.next(event(Event::Blob(BlobEvent::Error(failed))));
+    let turn = operation.next(event(Event::blob(BlobEvent::Error(failed))));
 
     assert!(matches!(turn, Err(PutObjectError::WriteFailed(_))));
     assert!(operation.abort().is_empty());
@@ -264,7 +264,7 @@ fn rejects_server_write() {
     operation.state = PutObjectState::WriteBlob;
 
     let failed = BlobError::WriteError("No space left on device".to_string());
-    let turn = operation.next(event(Event::Blob(BlobEvent::Error(failed))));
+    let turn = operation.next(event(Event::blob(BlobEvent::Error(failed))));
 
     assert!(matches!(turn, Err(PutObjectError::BlobWriteFailed(_))));
 }
@@ -463,7 +463,7 @@ fn unknown_keeps_blob() {
                 },
             }]
         );
-        let release = IoCall::from(Effect::Blob(BlobEffect::ReleaseReservation {
+        let release = IoCall::from(Effect::blob(BlobEffect::ReleaseReservation {
             id: location.ulid,
         }));
         assert_eq!(calls.last(), Some(&release));
@@ -1939,7 +1939,7 @@ mod sealed {
             Some(1u64.to_be_bytes().to_vec().into()),
         ];
         let turn = op.next(values(answers));
-        let Effect::Blob(BlobEffect::Abe(effect)) = asked(&turn) else {
+        let Some(BlobEffect::Abe(effect)) = asked(&turn).as_blob() else {
             panic!("expected the write, got {turn:?}")
         };
         let aruna_core::structs::storage::abe::AbeEffect::Write { plan, resolved, .. } =
@@ -2096,7 +2096,7 @@ mod sealed {
         let mut op = operation();
         at_settings(&mut op);
         let turn = op.next(row(None));
-        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+        let Some(BlobEffect::Write { resolved, .. }) = asked(&turn).as_blob() else {
             panic!("expected the plain write, got {turn:?}")
         };
         assert_eq!(resolved.encryption, None);
@@ -2108,7 +2108,7 @@ mod sealed {
         at_settings(&mut op);
         op.next(row(Some(settings().to_bytes().unwrap()))).unwrap();
         let turn = op.next(row(Some(record().to_bytes().unwrap())));
-        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+        let Some(BlobEffect::Write { resolved, .. }) = asked(&turn).as_blob() else {
             panic!("expected the sealed write without envelope, got {turn:?}")
         };
         assert_eq!(
@@ -2267,8 +2267,8 @@ mod routing {
     }
 
     fn resolved(turn: &Turn) -> &aruna_core::structs::storage::blob::ResolvedBackend {
-        match asked(turn) {
-            Effect::Blob(BlobEffect::Write { resolved, .. }) => resolved,
+        match asked(turn).as_blob() {
+            Some(BlobEffect::Write { resolved, .. }) => resolved,
             other => panic!("expected one blob write, got {other:?}"),
         }
     }
@@ -2347,7 +2347,7 @@ mod routing {
         let finished = BlobEvent::WriteFinished {
             location: written.clone(),
         };
-        let turn = operation.next(event(Event::Blob(finished)));
+        let turn = operation.next(event(Event::blob(finished)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
 
         let mut child = operation.publish_child();
@@ -2570,8 +2570,8 @@ mod decisions {
         plain.next(values(vec![None])).unwrap();
         let turn = plain.next(values(vec![None]));
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::Write { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::Write { .. })
         ));
 
         let rule = policy("eu-west");
@@ -2655,7 +2655,7 @@ mod decisions {
         let finished = BlobEvent::WriteFinished {
             location: location(),
         };
-        operation.next(event(Event::Blob(finished))).unwrap();
+        operation.next(event(Event::blob(finished))).unwrap();
         let mut child = operation.publish_child();
         child.first().unwrap();
         child.next(values(vec![None])).unwrap();

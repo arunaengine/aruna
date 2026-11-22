@@ -85,7 +85,7 @@ impl CompleteUploadOperation {
         let stat_at = self.plain_stat_at.clone();
         let (backend, path) = stat_at.ok_or(CompleteUploadError::InvalidOperationState)?;
         let stat = BlobEffect::StatPlain { backend, path };
-        self.effect(CompleteUploadState::StatPlain, Effect::Blob(stat))
+        self.effect(CompleteUploadState::StatPlain, Effect::blob(stat))
     }
 
     /// The provider upload of an upload that opened at its plain path.
@@ -109,9 +109,9 @@ impl CompleteUploadOperation {
     }
 
     pub(super) fn plain_stat(&mut self, event: Event) -> Turn {
-        let (exists, version) = match event {
-            Event::Blob(BlobEvent::PlainStat { exists, version }) => (exists, version),
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
+        let (exists, version) = match event.into_blob() {
+            Ok(BlobEvent::PlainStat { exists, version }) => (exists, version),
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
             _ => return Err(CompleteUploadError::InvalidOperationState),
         };
         // Only a backend with versions keeps a file that appeared meanwhile; else it conflicts.
@@ -180,7 +180,7 @@ impl CompleteUploadOperation {
                 .collect(),
             plain: Some(plain),
         };
-        self.intent_first(&path, if_not_exists, Effect::Blob(compose).into())
+        self.intent_first(&path, if_not_exists, Effect::blob(compose).into())
     }
 
     /// A listed plain object stores its identity before `compose` moves any byte to `path`.
@@ -879,8 +879,8 @@ mod tests {
     }
 
     fn plain_compose(turn: &Turn) -> PlainPath {
-        match asked(turn) {
-            Effect::Blob(BlobEffect::Compose {
+        match asked(turn).as_blob() {
+            Some(BlobEffect::Compose {
                 plain: Some(plain), ..
             }) => plain.clone(),
             other => panic!("expected a plain compose, got {other:?}"),
@@ -932,11 +932,11 @@ mod tests {
 
     fn stat(exists: bool, version: Option<&str>) -> IoResult {
         let version = version.map(str::to_string);
-        event(Event::Blob(BlobEvent::PlainStat { exists, version }))
+        event(Event::blob(BlobEvent::PlainStat { exists, version }))
     }
 
     fn taken() -> IoResult {
-        event(Event::Blob(BlobEvent::Error(BlobError::PathTaken)))
+        event(Event::blob(BlobEvent::Error(BlobError::PathTaken)))
     }
 
     #[test]
@@ -945,10 +945,9 @@ mod tests {
         operation.compose_blob().unwrap();
         let id = operation.version_id.unwrap();
         let turn = owner_answer(&mut operation, None);
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/object"
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path, .. }) if path == "raw/object")
+        );
         let turn = operation.next(stat(false, None));
         let plain = plain_compose(&past_intent(&mut operation, turn));
         assert_eq!(plain.path, "raw/object");
@@ -993,10 +992,7 @@ mod tests {
         routing.imports[0].write_prefix = Some("out/".to_string());
         let turn = operation.compose_blob();
         assert!(
-            matches!(
-                asked(&turn),
-                Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "out/object"
-            ),
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path, .. }) if path == "out/object"),
             "expected the path stat, got {turn:?}"
         );
         let id = operation.version_id.unwrap();
@@ -1046,10 +1042,7 @@ mod tests {
         operation.compose_blob().unwrap();
         let turn = owner_answer(operation, owner);
         assert!(
-            matches!(
-                asked(&turn),
-                Effect::Blob(BlobEffect::StatPlain { path: stat, .. }) if stat == path
-            ),
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path: stat, .. }) if stat == path),
             "expected the path stat, got {turn:?}"
         );
         assert_eq!(operation.version_id, Some(id));
@@ -1061,8 +1054,8 @@ mod tests {
     }
 
     fn provider_condition(turn: &Turn) -> bool {
-        match asked(turn) {
-            Effect::Blob(BlobEffect::CompleteUpload { if_not_exists, .. }) => *if_not_exists,
+        match asked(turn).as_blob() {
+            Some(BlobEffect::CompleteUpload { if_not_exists, .. }) => *if_not_exists,
             other => panic!("expected the provider completion, got {other:?}"),
         }
     }
@@ -1191,7 +1184,7 @@ mod tests {
             version: Some("v1".to_string()),
             etag: None,
         };
-        let mut turn = operation.next(event(Event::Blob(composed)));
+        let mut turn = operation.next(event(Event::blob(composed)));
         // A listed object's intent records the hash of the bytes before the finalize.
         if operation.state == CompleteUploadState::WriteEvidence {
             turn = operation.next(fenced(Ok(Fenced::Written)));
@@ -1246,8 +1239,8 @@ mod tests {
         }
         let turn = operation.compose_blob();
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::CompleteUpload { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::CompleteUpload { .. })
         ));
     }
 

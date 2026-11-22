@@ -9,7 +9,9 @@ use crate::transfer::abe_rekey::RekeyProgress;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     ABE_DUE_KEYSPACE, ABE_EPOCH_KEYSPACE, ABE_REKEY_KEYSPACE, BUCKET_AUDIT_KEYSPACE,
     BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE, KEY_COPY_KEYSPACE, TRANSITION_KEYSPACE,
@@ -208,7 +210,7 @@ impl KeyStatusOperation {
         self.snapshot.locks = self.replay.locks();
         let bucket_id = self.bucket_id().ok_or(KeyStatusError::NotFinished)?;
         self.step = StatusStep::KeyStatus;
-        let read = Effect::Blob(BlobEffect::ReadKeyStatus { bucket_id });
+        let read = Effect::blob(BlobEffect::ReadKeyStatus { bucket_id });
         Ok(Next::Call(IoCall::Effect(Box::new(read))))
     }
 
@@ -234,12 +236,12 @@ impl Operation for KeyStatusOperation {
                 let (values, next) = result.page()?;
                 self.take_page(values, next)
             }
-            StatusStep::KeyStatus => match result.event()? {
-                Event::Blob(BlobEvent::KeyStatus { generations }) => {
+            StatusStep::KeyStatus => match result.blob()? {
+                BlobEvent::KeyStatus { generations } => {
                     self.snapshot.unlocks = generations;
                     Ok(self.finish())
                 }
-                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+                BlobEvent::Error(error) => Err(error.into()),
                 other => Err(IoError::Unexpected {
                     expected: "BlobEvent::KeyStatus",
                     got: other.label(),
@@ -379,7 +381,7 @@ mod tests {
         let status = BlobEvent::KeyStatus {
             generations: Vec::new(),
         };
-        IoResult::Event(Box::new(Event::Blob(status)))
+        IoResult::Event(Box::new(Event::blob(status)))
     }
 
     fn snapshot(turn: Step) -> KeySnapshot {
@@ -490,7 +492,7 @@ mod tests {
             .map(|record| record.to_bytes().unwrap())
             .collect();
         let turn = operation.next(iter(rows, None));
-        let read = Effect::Blob(BlobEffect::ReadKeyStatus {
+        let read = Effect::blob(BlobEffect::ReadKeyStatus {
             bucket_id: BUCKET_ID,
         });
         assert_eq!(turn, Ok(Next::Call(IoCall::Effect(Box::new(read)))));

@@ -9,7 +9,9 @@ use crate::s3::bucket::key::rows::{
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{BUCKET_HOLDER_KEYSPACE, KEY_COPY_KEYSPACE};
 use aruna_core::operation::{Operation, TransactionMode};
@@ -139,7 +141,7 @@ impl SealMissingOperation {
             return self.write(Vec::new());
         }
         self.step = SealStep::SealCopies;
-        let seal = Effect::Blob(BlobEffect::SealUnlocked {
+        let seal = Effect::blob(BlobEffect::SealUnlocked {
             key: self.input.key,
             realm_id: self.input.realm_id,
             node_id: self.input.node_id,
@@ -204,9 +206,9 @@ impl Operation for SealMissingOperation {
                 let copies = decode(&SealedCopy::user_rows(values), SealedCopy::from_bytes)?;
                 self.seal(copies)
             }
-            SealStep::SealCopies => match result.event()? {
-                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.write(copies),
-                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+            SealStep::SealCopies => match result.blob()? {
+                BlobEvent::CopiesSealed { copies } => self.write(copies),
+                BlobEvent::Error(error) => Err(error.into()),
                 other => Err(IoError::Unexpected {
                     expected: "BlobEvent::CopiesSealed",
                     got: other.label(),

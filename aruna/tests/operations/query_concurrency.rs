@@ -196,7 +196,7 @@ async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
     let event = aruna_drivers::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
-            request: MetadataCrateRequest {
+            request: Box::new(MetadataCrateRequest {
                 graph_iri: graph_iri.to_string(),
                 name: name.to_string(),
                 description: format!("Crate graph {name}"),
@@ -208,7 +208,7 @@ async fn create_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
                 },
                 durability: MetadataRequestDurability::Durable,
                 deterministic_actor: None,
-            },
+            }),
         },
     )
     .await;
@@ -560,7 +560,7 @@ async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
     let event = aruna_drivers::testing::send_metadata_effect(
         &harness.context,
         MetadataEffect::CreateCrate {
-            request: MetadataCrateRequest {
+            request: Box::new(MetadataCrateRequest {
                 graph_iri: graph_iri.to_string(),
                 name: name.to_string(),
                 description: format!("Crate graph {name}"),
@@ -572,7 +572,7 @@ async fn replay_crate(harness: &TestHarness, graph_iri: &str, name: &str) -> Res
                 },
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor: None,
-            },
+            }),
         },
     )
     .await;

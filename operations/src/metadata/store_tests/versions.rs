@@ -88,7 +88,7 @@ async fn versions_roundtrip() {
     let graph_iri = "urn:fixture:aruna:rocrate:created";
     assert!(matches!(
         send_metadata_effect(&handle, MetadataEffect::CreateCrate {
-                request: MetadataCrateRequest {
+                request: Box::new(MetadataCrateRequest {
                     graph_iri: graph_iri.to_string(),
                     name: "RO-Crate 1.3 scaffold".to_string(),
                     description: "Aruna scaffold version contract".to_string(),
@@ -100,7 +100,7 @@ async fn versions_roundtrip() {
                     },
                     durability: MetadataRequestDurability::Durable,
                     deterministic_actor: None,
-                },
+                }),
             })
             .await,
         Event::Metadata(MetadataEvent::CreateCrateResult { graph_iri: created, .. })
@@ -158,7 +158,7 @@ async fn policy_mints_nothing() {
         send_metadata_effect(
             &handle,
             MetadataEffect::CreateCrate {
-                request: MetadataCrateRequest {
+                request: Box::new(MetadataCrateRequest {
                     graph_iri: graph_iri.to_string(),
                     name: "Restored".to_string(),
                     description: "Created private, then made public".to_string(),
@@ -167,7 +167,7 @@ async fn policy_mints_nothing() {
                     policy: policy(false),
                     durability: MetadataRequestDurability::WalAlreadyDurable,
                     deterministic_actor: Some([7; 32]),
-                },
+                }),
             }
         )
         .await,

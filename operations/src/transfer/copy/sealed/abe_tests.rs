@@ -162,49 +162,52 @@ async fn run<O: Operation>(
         let effect = effects.remove(0);
         let event = match effect {
             Effect::Storage(effect) => storage.send_storage_effect(effect).await,
-            Effect::Blob(BlobEffect::Abe(effect)) => {
-                let AbeEffect::Copy {
-                    source,
-                    epoch,
-                    write_id,
-                    object_key,
-                } = *effect
-                else {
-                    panic!("unexpected ABE effect")
-                };
-                match (race, unlocked) {
-                    (Race::Epoch, Some(sealed)) => {
-                        set_epoch(storage, &sealed.location, epoch + 1).await
+            Effect::Blob(effect) => match *effect {
+                BlobEffect::Abe(effect) => {
+                    let AbeEffect::Copy {
+                        source,
+                        epoch,
+                        write_id,
+                        object_key,
+                    } = *effect
+                    else {
+                        panic!("unexpected ABE effect")
+                    };
+                    match (race, unlocked) {
+                        (Race::Epoch, Some(sealed)) => {
+                            set_epoch(storage, &sealed.location, epoch + 1).await
+                        }
+                        (Race::Generation, Some(sealed)) => {
+                            set_generation(storage, &sealed.location, 2).await
+                        }
+                        _ => {}
                     }
-                    (Race::Generation, Some(sealed)) => {
-                        set_generation(storage, &sealed.location, 2).await
-                    }
-                    _ => {}
+                    Event::blob(match unlocked {
+                        Some(sealed) => {
+                            let plan = EnvelopePlan {
+                                parameters: source.context.parameters.clone(),
+                                epoch,
+                                write_id,
+                                object_key,
+                                bucket_public: sealed.public,
+                            };
+                            let envelope = copy_envelope(
+                                &source,
+                                &sealed.secret,
+                                plan,
+                                &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
+                            )
+                            .unwrap();
+                            BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)))
+                        }
+                        None => match check_copy(&source, object_key) {
+                            Ok(()) => BlobEvent::Error(AbeError::Required.into()),
+                            Err(error) => BlobEvent::Error(error.into()),
+                        },
+                    })
                 }
-                Event::Blob(match unlocked {
-                    Some(sealed) => {
-                        let plan = EnvelopePlan {
-                            parameters: source.context.parameters.clone(),
-                            epoch,
-                            write_id,
-                            object_key,
-                            bucket_public: sealed.public,
-                        };
-                        let envelope = copy_envelope(
-                            &source,
-                            &sealed.secret,
-                            plan,
-                            &mut aruna_core::key_seal::SeedRng::new(&[7; 32]),
-                        )
-                        .unwrap();
-                        BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)))
-                    }
-                    None => match check_copy(&source, object_key) {
-                        Ok(()) => BlobEvent::Error(AbeError::Required.into()),
-                        Err(error) => BlobEvent::Error(error.into()),
-                    },
-                })
-            }
+                other => panic!("unexpected blob effect {other:?}"),
+            },
             // A read outside the transaction runs as its own child.
             Effect::SubOperation(mut child) => {
                 let mut asked: Vec<Effect> = child.start().into_iter().collect();

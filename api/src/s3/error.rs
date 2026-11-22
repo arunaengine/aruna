@@ -1301,7 +1301,7 @@ mod tests {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
             aruna_operations::s3::usage::UsageUpdateError::UnexpectedEvent(
-                aruna_core::events::Event::Blob(aruna_core::events::BlobEvent::DeleteFinished)
+                aruna_core::events::Event::blob(aruna_core::events::BlobEvent::DeleteFinished)
                     .label(),
             ),
         )

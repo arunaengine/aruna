@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::{SourceResolutionError, StagingSourceError};
 use aruna_core::events::{Event, StagingSourceEvent, SubOperationEvent};
 use aruna_core::operation::Operation;
@@ -64,7 +64,7 @@ impl HeadSourceOperation {
         let head = StagingSourceEffect::Head {
             access: resolved.access,
         };
-        Ok(IoCall::Effect(Box::new(Effect::StagingSource(head))))
+        Ok(IoCall::staging(head))
     }
 }
 
@@ -85,16 +85,15 @@ impl Operation for HeadSourceOperation {
         let Some((connector, secret_fingerprint)) = self.resolved.take() else {
             return Ok(Next::Call(self.head(event)?));
         };
-        match event {
-            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
-                Ok(Next::Done(HeadSourceResult {
-                    connector,
-                    secret_fingerprint,
-                    metadata,
-                }))
-            }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
-            other => Err(HeadSourceError::UnexpectedEvent(other.label())),
+        match event.into_staging() {
+            Ok(StagingSourceEvent::HeadResult { metadata }) => Ok(Next::Done(HeadSourceResult {
+                connector,
+                secret_fingerprint,
+                metadata,
+            })),
+            Ok(StagingSourceEvent::Error { error }) => Err(error.into()),
+            Ok(other) => Err(HeadSourceError::UnexpectedEvent(other.label())),
+            Err(other) => Err(HeadSourceError::UnexpectedEvent(other.label())),
         }
     }
 }
@@ -140,7 +139,7 @@ mod tests {
         let head = StagingSourceEffect::Head {
             access: resolved_connector.access.clone(),
         };
-        let call = IoCall::Effect(Box::new(Effect::StagingSource(head)));
+        let call = IoCall::staging(head);
         let effect = operation.next(resolved(Ok(resolved_connector)));
         assert_eq!(effect, Ok(Next::Call(call)));
     }
@@ -162,7 +161,7 @@ mod tests {
         operation
             .next(resolved(Ok(sample_resolved_connector())))
             .unwrap();
-        let headed = answer(Event::StagingSource(StagingSourceEvent::HeadResult {
+        let headed = answer(Event::staging(StagingSourceEvent::HeadResult {
             metadata: sample_metadata(),
         }));
         assert_eq!(
@@ -182,7 +181,7 @@ mod tests {
         operation
             .next(resolved(Ok(sample_resolved_connector())))
             .unwrap();
-        let failed = answer(Event::StagingSource(StagingSourceEvent::Error {
+        let failed = answer(Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::NotFound,
         }));
         assert_eq!(

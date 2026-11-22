@@ -95,7 +95,7 @@ impl PutObjectOperation {
             backend: plain.target.backend.clone(),
             path: plain.target.path.clone(),
         };
-        self.effect(PutObjectState::StatPlain, Effect::Blob(stat))
+        self.effect(PutObjectState::StatPlain, Effect::blob(stat))
     }
 
     pub(super) fn plain_owner(&mut self, value: Option<Value>) -> Turn {
@@ -110,13 +110,13 @@ impl PutObjectOperation {
         let (Some(plain), Some(id)) = (self.plain.as_ref(), self.version_id) else {
             return Err(PutObjectError::InvalidOperationState);
         };
-        match event {
-            Event::Blob(BlobEvent::PlainStat { exists, version }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::PlainStat { exists, version }) => {
                 let (path, replaces) = (&plain.target.path, version.is_some() && plain.owned);
                 let (path, if_not_exists) = same_name_path(path, id, exists, replaces);
                 self.write_plain(path, if_not_exists)
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(PutObjectError::BlobWriteFailed(error)),
+            Ok(BlobEvent::Error(error)) => Err(PutObjectError::BlobWriteFailed(error)),
             _ => Err(PutObjectError::InvalidOperationState),
         }
     }
@@ -130,7 +130,7 @@ impl PutObjectOperation {
         let intent = self.plain_intent();
         let import_id = plain.target.import_id;
         let keys = intent_keys(import_id, &path, ulid, if_not_exists);
-        let write = Effect::Blob(BlobEffect::WritePlain {
+        let write = Effect::blob(BlobEffect::WritePlain {
             resolved: plain.resolved.clone(),
             plain: PlainPath {
                 path,
@@ -652,8 +652,8 @@ mod tests {
     }
 
     fn plain_write(turn: &Turn) -> &PlainPath {
-        match asked(turn) {
-            Effect::Blob(BlobEffect::WritePlain { plain, .. }) => plain,
+        match asked(turn).as_blob() {
+            Some(BlobEffect::WritePlain { plain, .. }) => plain,
             other => panic!("expected a plain write, got {other:?}"),
         }
     }
@@ -670,7 +670,7 @@ mod tests {
         let (mut operation, _) = mapped("data/a.csv");
         // The same-name write first looks at the exact key in the provider bucket.
         let turn = operation.next(row(None));
-        let Effect::Blob(BlobEffect::StatPlain { path, .. }) = asked(&turn) else {
+        let Some(BlobEffect::StatPlain { path, .. }) = asked(&turn).as_blob() else {
             panic!("expected a plain path, got {turn:?}")
         };
         assert_eq!(path, "raw/data/a.csv");
@@ -769,7 +769,7 @@ mod tests {
             version: None,
             etag: None,
         };
-        operation.next(event(Event::Blob(written))).unwrap();
+        operation.next(event(Event::blob(written))).unwrap();
         operation.state = PutObjectState::Error;
         assert!(operation.abort().is_empty());
     }
@@ -1076,7 +1076,7 @@ mod tests {
 
     fn stat(exists: bool, version: Option<&str>) -> IoResult {
         let version = version.map(str::to_string);
-        event(Event::Blob(BlobEvent::PlainStat { exists, version }))
+        event(Event::blob(BlobEvent::PlainStat { exists, version }))
     }
 
     #[test]
@@ -1126,10 +1126,9 @@ mod tests {
         let mut operation = operation("{dir}{name}");
         let turn = owner_answered(&mut operation, None);
         let id = operation.version_id.unwrap();
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::StatPlain { path, .. }) if path == "raw/x/one.csv"
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::StatPlain { path, .. }) if path == "raw/x/one.csv")
+        );
 
         operation.next(stat(true, None)).unwrap();
         let turn = past_intent(&mut operation);
@@ -1198,7 +1197,7 @@ mod tests {
             version: None,
             etag: None,
         };
-        let turn = operation.next(event(Event::Blob(written)));
+        let turn = operation.next(event(Event::blob(written)));
         // The hash is stored with a read of the rule before the version transaction starts.
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         assert_eq!(operation.state, PutObjectState::WriteEvidence);
@@ -1225,7 +1224,7 @@ mod tests {
         past_intent(&mut operation).unwrap();
 
         // Another upload took the free path first; nothing at the path is deleted.
-        let taken = Event::Blob(BlobEvent::Error(BlobError::PathTaken));
+        let taken = Event::blob(BlobEvent::Error(BlobError::PathTaken));
         let turn = operation.next(event(taken));
         // The refused write moved no byte, so its intent goes first.
         let id = operation.version_id.unwrap();

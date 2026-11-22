@@ -220,7 +220,7 @@ pub fn load_group_inputs(group_id: GroupId) -> Effect {
         GroupInputsOperation::new(group_id),
         |result| {
             Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
-                result: result.map_err(|error| error.to_string()),
+                result: Box::new(result.map_err(|error| error.to_string())),
             })
         },
     ))

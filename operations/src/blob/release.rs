@@ -78,7 +78,7 @@ impl ReleaseFile {
             version: self.version.clone(),
             etag,
         };
-        Effect::Blob(delete).into()
+        Effect::blob(delete).into()
     }
 }
 
@@ -264,19 +264,24 @@ impl FinishDeleteOperation {
     }
 
     fn deleted(&mut self, event: Event) -> Turn<bool> {
-        match event {
-            Event::Blob(BlobEvent::DeleteFinished) => {
+        match event.into_blob() {
+            Ok(BlobEvent::DeleteFinished) => {
                 let write = claim_call(&self.claim, Some(TOMBSTONE));
                 self.call(FinishStep::Tombstone, write)
             }
             // Other bytes at an unversioned path stay, and so does the claim: an earlier send
             // may still land.
-            Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported))
-                if self.file.version.is_empty() =>
-            {
+            Ok(BlobEvent::Error(BlobError::CleanupUnsupported)) if self.file.version.is_empty() => {
                 Ok(Next::Done(true))
             }
-            event => {
+            Ok(event) => {
+                let event = Event::blob(event);
+                {
+                    warn!(event = event.label(), "A sent delete could not be finished");
+                    Ok(Next::Done(false))
+                }
+            }
+            Err(event) => {
                 warn!(event = event.label(), "A sent delete could not be finished");
                 Ok(Next::Done(false))
             }
@@ -507,17 +512,22 @@ impl ReleaseClaimedOperation {
     }
 
     fn deleted(&mut self, event: Event) -> Turn<Released> {
-        match event {
+        match event.into_blob() {
             // The tombstone is on disk before anything else may fail.
-            Event::Blob(BlobEvent::DeleteFinished) => {
+            Ok(BlobEvent::DeleteFinished) => {
                 let write = claim_call(&self.claim, Some(TOMBSTONE));
                 self.call(ClaimedStep::Tombstone, write)
             }
             // A storage that cannot delete this exact version surely kept the file and its row.
-            Event::Blob(BlobEvent::Error(BlobError::CleanupUnsupported)) => {
-                Ok(Next::Done(Released::Kept))
+            Ok(BlobEvent::Error(BlobError::CleanupUnsupported)) => Ok(Next::Done(Released::Kept)),
+            Ok(event) => {
+                let event = Event::blob(event);
+                {
+                    warn!(event = event.label(), "Renamed file could not be deleted");
+                    Ok(Next::Done(Released::Retry))
+                }
             }
-            event => {
+            Err(event) => {
                 warn!(event = event.label(), "Renamed file could not be deleted");
                 Ok(Next::Done(Released::Retry))
             }

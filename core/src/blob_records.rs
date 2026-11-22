@@ -203,12 +203,12 @@ pub fn dht_registration_effect(
     limits: &RoCrateLimits,
 ) -> Result<Effect, ConversionError> {
     let key = DhtKeyId::from_bytes(blake3.try_into()?);
-    Ok(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+    Ok(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
         key,
         realm_id: local_realm_id,
         value: Vec::new(),
         ttl: Duration::from_millis(limits.holder_ttl_ms),
-    })))
+    }))))
 }
 
 #[cfg(test)]

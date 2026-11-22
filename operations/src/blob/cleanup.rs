@@ -527,7 +527,7 @@ impl CleanupWorkOperation {
         if location.is_external() && !location.partial {
             return Ok(Next::Done(RowOutcome::Done));
         }
-        let delete = Effect::Blob(BlobEffect::Delete { location });
+        let delete = Effect::blob(BlobEffect::Delete { location });
         self.call(WorkStep::Delete, delete.into())
     }
 
@@ -575,7 +575,7 @@ impl CleanupWorkOperation {
                 self.call(step, IoCall::child(owns))
             }
             BlobCleanupWork::ReconcileReservation { location } => {
-                let reconcile = Effect::Blob(BlobEffect::ReconcileReservation { location });
+                let reconcile = Effect::blob(BlobEffect::ReconcileReservation { location });
                 self.call(WorkStep::Reconcile, reconcile.into())
             }
             BlobCleanupWork::RegisterDht {
@@ -629,7 +629,7 @@ impl CleanupWorkOperation {
                 }
                 // Exactly the decoded upload; a newer try of the attempt keeps its own.
                 let upload = Some((Box::new(location), upload_id));
-                let settle = Effect::Blob(BlobEffect::SettleCopy { attempt, upload });
+                let settle = Effect::blob(BlobEffect::SettleCopy { attempt, upload });
                 self.call(WorkStep::Settle, settle.into())
             }
             BlobCleanupWork::SettleMove { version, intents } => {
@@ -672,7 +672,7 @@ impl CleanupWorkOperation {
         match owned {
             None => Ok(Next::Done(RowOutcome::Failed)),
             Some(true) => {
-                let clear = Effect::Blob(BlobEffect::ReleaseReservation { id: location.ulid });
+                let clear = Effect::blob(BlobEffect::ReleaseReservation { id: location.ulid });
                 self.call(WorkStep::Reservation(owner), clear.into())
             }
             Some(false) => self.delete_blob(location),
@@ -717,9 +717,16 @@ impl CleanupWorkOperation {
 }
 
 fn deleted(event: Event) -> RowOutcome {
-    match event {
-        Event::Blob(BlobEvent::DeleteFinished) => RowOutcome::Done,
-        event => {
+    match event.into_blob() {
+        Ok(BlobEvent::DeleteFinished) => RowOutcome::Done,
+        Ok(event) => {
+            let event = Event::blob(event);
+            {
+                warn!(event = event.label(), "Deferred blob delete failed");
+                RowOutcome::Failed
+            }
+        }
+        Err(event) => {
             warn!(event = event.label(), "Deferred blob delete failed");
             RowOutcome::Failed
         }
@@ -787,11 +794,11 @@ impl Operation for CleanupWorkOperation {
                 let owned = result.child::<Option<bool>, IoError>()?.unwrap_or(None);
                 self.owner_known(owner, *location, owned)
             }
-            WorkStep::Reservation(owner) => match result.event()? {
-                Event::Blob(
-                    BlobEvent::ReservationReleased { .. }
-                    | BlobEvent::Error(aruna_core::errors::BlobError::HandleMissing),
-                ) => self.reservation_cleared(owner),
+            WorkStep::Reservation(owner) => match result.blob()? {
+                BlobEvent::ReservationReleased { .. }
+                | BlobEvent::Error(aruna_core::errors::BlobError::HandleMissing) => {
+                    self.reservation_cleared(owner)
+                }
                 event => {
                     warn!(
                         event = event.label(),
@@ -801,8 +808,8 @@ impl Operation for CleanupWorkOperation {
                 }
             },
             WorkStep::Delete => Ok(Next::Done(deleted(result.event()?))),
-            WorkStep::Reconcile => Ok(Next::Done(match result.event()? {
-                Event::Blob(BlobEvent::ReservationReconciled { done }) => done.into(),
+            WorkStep::Reconcile => Ok(Next::Done(match result.blob()? {
+                BlobEvent::ReservationReconciled { done } => done.into(),
                 event => {
                     let event = event.label();
                     warn!(event, "Deferred bucket reservation reconciliation failed");
@@ -817,8 +824,8 @@ impl Operation for CleanupWorkOperation {
                 self.planned(*file, row.map(|row| decode_job_record(job_id, row)))
             }
             // The settlement removes the record itself, and only while it is unchanged.
-            WorkStep::Settle => Ok(Next::Done(match result.event()? {
-                Event::Blob(BlobEvent::UploadAborted) => RowOutcome::Kept,
+            WorkStep::Settle => Ok(Next::Done(match result.blob()? {
+                BlobEvent::UploadAborted => RowOutcome::Kept,
                 event => {
                     warn!(event = event.label(), "A copy upload could not be settled");
                     RowOutcome::Failed
@@ -916,7 +923,7 @@ impl ReconcileTargetOperation {
             true => BlobEffect::DiscardTarget { location },
             false => BlobEffect::AbortTarget { location },
         };
-        self.call(TargetStep::Settled, Effect::Blob(settle).into())
+        self.call(TargetStep::Settled, Effect::blob(settle).into())
     }
 }
 
@@ -951,7 +958,7 @@ impl Operation for ReconcileTargetOperation {
                         id: self.location.ulid,
                     };
                     let step = TargetStep::Reservation(announce);
-                    self.call(step, Effect::Blob(clear).into())
+                    self.call(step, Effect::blob(clear).into())
                 }
                 Some(false) => self.past_grace(),
             },
@@ -971,10 +978,8 @@ impl Operation for ReconcileTargetOperation {
             }
             TargetStep::Dht => Ok(Next::Done(registered(result.event()?))),
             TargetStep::Row => self.row_read(result.value()?),
-            TargetStep::Settled => Ok(Next::Done(match result.event()? {
-                Event::Blob(BlobEvent::DeleteFinished | BlobEvent::UploadAborted) => {
-                    RowOutcome::Done
-                }
+            TargetStep::Settled => Ok(Next::Done(match result.blob()? {
+                BlobEvent::DeleteFinished | BlobEvent::UploadAborted => RowOutcome::Done,
                 event => {
                     let event = event.label();
                     warn!(event, "Discarding an in-place upload target failed");

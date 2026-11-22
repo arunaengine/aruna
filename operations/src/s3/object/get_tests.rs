@@ -260,11 +260,10 @@ fn materialized_range_reads() {
         }),
     );
 
-    assert!(matches!(
-        asked(&turn),
-        Effect::Blob(BlobEffect::ReadRange { location: emitted_location, range })
-            if emitted_location == &location && range == &(2..5)
-    ));
+    assert!(
+        matches!((asked(&turn)).as_blob(), Some(BlobEffect::ReadRange { location: emitted_location, range })
+            if emitted_location == &location && range == &(2..5))
+    );
 }
 
 #[test]
@@ -296,11 +295,10 @@ fn reference_range_reads() {
             value: None,
         }),
     );
-    assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Head { access: emitted_access })
-            if emitted_access == &access
-    ));
+    assert!(
+        matches!((asked(&turn)).as_staging(), Some(StagingSourceEffect::Head { access: emitted_access })
+            if emitted_access == &access)
+    );
 
     let metadata = SourceMetadata {
         content_length: 10,
@@ -314,25 +312,24 @@ fn reference_range_reads() {
     operation.reference_cached = Some(metadata.clone());
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: metadata.clone(),
         }),
     );
 
-    assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read {
+    assert!(
+        matches!((asked(&turn)).as_staging(), Some(StagingSourceEffect::Read {
             access: emitted_access,
             range,
             expected,
         })
             if emitted_access == &access && range == &Some(6..10)
-                && expected.as_ref() == Some(&metadata)
-    ));
+                && expected.as_ref() == Some(&metadata))
+    );
 
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::ReadResult {
+        Event::staging(StagingSourceEvent::ReadResult {
             metadata,
             stream: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<
                 _,
@@ -378,7 +375,7 @@ fn range_drift_restarts() {
 
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::ReadResult {
+        Event::staging(StagingSourceEvent::ReadResult {
             metadata: SourceMetadata {
                 content_length: 11,
                 content_type: None,
@@ -1340,7 +1337,7 @@ fn written_successor(turn: &Result<Next<AdvanceEnd>, GetObjectError>) -> BlobVer
 }
 
 fn source_read(metadata: SourceMetadata) -> Event {
-    Event::StagingSource(StagingSourceEvent::ReadResult {
+    Event::staging(StagingSourceEvent::ReadResult {
         metadata,
         stream: aruna_core::stream::BackendStream::new(stream::iter(vec![
             Ok::<_, std::io::Error>(Bytes::from_static(b"body")),
@@ -1597,8 +1594,8 @@ fn commit_queues_replication() {
     );
 
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { .. })
     ));
 }
 
@@ -1650,7 +1647,7 @@ fn drift_limit_fails() {
 
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(9),
         }),
     );
@@ -1711,7 +1708,7 @@ fn digested(content_length: u64, digest: u8) -> SourceMetadata {
 }
 
 fn spooled(sha256: u8) -> Event {
-    Event::Blob(BlobEvent::LocalSpooled {
+    Event::blob(BlobEvent::LocalSpooled {
         hashes: HashMap::from([(HASH_SHA256.to_string(), vec![sha256; 32])]),
         size: 9,
         blob: aruna_core::stream::BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(
@@ -1721,7 +1718,7 @@ fn spooled(sha256: u8) -> Event {
 }
 
 fn source_head(metadata: SourceMetadata) -> Event {
-    Event::StagingSource(StagingSourceEvent::HeadResult { metadata })
+    Event::staging(StagingSourceEvent::HeadResult { metadata })
 }
 
 // An unknown observation is checked against the version's recorded digests on the whole spooled
@@ -1737,13 +1734,13 @@ fn unknown_keeps_digests() {
 
     let turn = step(&mut operation, source_head(fresh.clone()));
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { expected: None, .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { expected: None, .. })
     ));
     let turn = step(&mut operation, source_read(fresh));
     assert!(matches!(
-        asked(&turn),
-        Effect::Blob(BlobEffect::SpoolLocal {
+        (asked(&turn)).as_blob(),
+        Some(BlobEffect::SpoolLocal {
             size: 9,
             range: None,
             ..
@@ -1768,8 +1765,8 @@ fn drift_digest_decides() {
 
     let turn = step(&mut operation, source_head(fresh.clone()));
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { .. })
     ));
     step(&mut operation, source_read(fresh)).unwrap();
 
@@ -1815,13 +1812,13 @@ fn same_still_verified() {
 
     let turn = step(&mut operation, source_head(stored.clone()));
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { expected: None, .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { expected: None, .. })
     ));
     let turn = step(&mut operation, source_read(stored));
     assert!(matches!(
-        asked(&turn),
-        Effect::Blob(BlobEffect::SpoolLocal { .. })
+        (asked(&turn)).as_blob(),
+        Some(BlobEffect::SpoolLocal { .. })
     ));
 }
 
@@ -1836,13 +1833,13 @@ fn spool_budget_refused() {
     step(&mut operation, source_head(stored.clone())).unwrap();
     let turn = step(&mut operation, source_read(stored));
     assert!(matches!(
-        asked(&turn),
-        Effect::Blob(BlobEffect::SpoolLocal { size: 9, .. })
+        (asked(&turn)).as_blob(),
+        Some(BlobEffect::SpoolLocal { size: 9, .. })
     ));
 
     let turn = step(
         &mut operation,
-        Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted {
+        Event::blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted {
             limit: 1,
         })),
     );
@@ -1863,7 +1860,7 @@ fn oversized_spool_refused() {
 
     let turn = step(
         &mut operation,
-        Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit: 4 })),
+        Event::blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit: 4 })),
     );
 
     assert_eq!(
@@ -1885,8 +1882,8 @@ fn unbound_pin_served() {
     let turn = step(&mut operation, source_head(stored));
 
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { .. })
     ));
     assert_eq!(operation.state, GetObjectState::ReadReferenceSource);
 }
@@ -1933,7 +1930,7 @@ fn failed_condition_refreshes() {
 
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::Error {
+        Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::ConditionFailed,
         }),
     );
@@ -2165,7 +2162,7 @@ mod sealed {
     use super::{asked, served, step, test_node_id};
     use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, Turn};
     use aruna_core::calls::{IoCall, IoResult, Next};
-    use aruna_core::effects::{BlobEffect, Effect, StagingSourceEffect};
+    use aruna_core::effects::{BlobEffect, StagingSourceEffect};
     use aruna_core::errors::{BlobError, ConversionError};
     use aruna_core::events::{BlobEvent, Event};
     use aruna_core::operation::Operation;
@@ -2231,7 +2228,7 @@ mod sealed {
     }
 
     fn locked() -> Event {
-        Event::Blob(BlobEvent::Error(BlobError::BucketKey(
+        Event::blob(BlobEvent::Error(BlobError::BucketKey(
             BucketKeyError::Locked(key().bucket_id),
         )))
     }
@@ -2243,19 +2240,18 @@ mod sealed {
         operation.location = Some(location.clone());
         let turn = operation.read_blob();
         let archive = ArchiveKey::of(&location);
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: pinned })
-                if *admitted == key() && *pinned == archive
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::AdmitRead { key: admitted, archive: pinned })
+                if *admitted == key() && *pinned == archive)
+        );
         let lease = ReadLease::new(key(), archive, Ulid::generate(), Arc::new(()));
         let turn = step(
             &mut operation,
-            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+            Event::blob(BlobEvent::ReadAdmitted { lease }),
         );
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::ReadSealed { range: None, .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::ReadSealed { range: None, .. })
         ));
     }
 
@@ -2276,7 +2272,7 @@ mod sealed {
         let lease = ReadLease::new(key(), other, Ulid::generate(), Arc::new(()));
         let turn = step(
             &mut operation,
-            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+            Event::blob(BlobEvent::ReadAdmitted { lease }),
         );
         assert!(matches!(
             turn,
@@ -2309,11 +2305,10 @@ mod sealed {
         };
         let (mut operation, turn) = reference(&settings);
         let archive = ArchiveKey::new(key().bucket_id, BackendRef::node_default());
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
-                if *admitted == key() && *named == archive
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::AdmitRead { key: admitted, archive: named })
+                if *admitted == key() && *named == archive)
+        );
         assert_eq!(step(&mut operation, locked()).err(), locked_error());
 
         // An unlocked bucket admits the read, and its lease rides with the source stream.
@@ -2322,11 +2317,11 @@ mod sealed {
         let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
         let turn = step(
             &mut operation,
-            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+            Event::blob(BlobEvent::ReadAdmitted { lease }),
         );
         assert!(matches!(
-            asked(&turn),
-            Effect::StagingSource(StagingSourceEffect::Head { .. })
+            (asked(&turn)).as_staging(),
+            Some(StagingSourceEffect::Head { .. })
         ));
         assert_eq!(Arc::strong_count(&guard), 2);
     }
@@ -2335,8 +2330,8 @@ mod sealed {
     fn plain_reference_unchanged() {
         let (_, turn) = reference(&BucketEncryption::default());
         assert!(matches!(
-            asked(&turn),
-            Effect::StagingSource(StagingSourceEffect::Head { .. })
+            (asked(&turn)).as_staging(),
+            Some(StagingSourceEffect::Head { .. })
         ));
     }
 
@@ -2369,11 +2364,10 @@ mod sealed {
         // The lease pins the physical copy, not a bucket-wide placeholder.
         let archive = ArchiveKey::of(&sealed_location());
         let (mut operation, turn) = plain_read(&encrypting());
-        assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::AdmitRead { key: admitted, archive: named })
-                if *admitted == key() && *named == archive
-        ));
+        assert!(
+            matches!((asked(&turn)).as_blob(), Some(BlobEffect::AdmitRead { key: admitted, archive: named })
+                if *admitted == key() && *named == archive)
+        );
         assert_eq!(step(&mut operation, locked()).err(), locked_error());
 
         // Unlocked, the raw bytes are read and the stream keeps the bucket lease.
@@ -2382,11 +2376,11 @@ mod sealed {
         let lease = ReadLease::new(key(), archive, Ulid::generate(), guard.clone());
         let turn = step(
             &mut operation,
-            Event::Blob(BlobEvent::ReadAdmitted { lease }),
+            Event::blob(BlobEvent::ReadAdmitted { lease }),
         );
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::Read { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::Read { .. })
         ));
         let blob = aruna_core::stream::BackendStream::new(futures_util::stream::iter([Ok::<
             _,
@@ -2396,7 +2390,7 @@ mod sealed {
         )]));
         let output = served(step(
             &mut operation,
-            Event::Blob(BlobEvent::ReadFinished {
+            Event::blob(BlobEvent::ReadFinished {
                 blob,
                 stream_size: 5,
             }),
@@ -2410,8 +2404,8 @@ mod sealed {
     fn plain_bucket_ungated() {
         let (_, turn) = plain_read(&BucketEncryption::default());
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::Read { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::Read { .. })
         ));
     }
 
@@ -2683,7 +2677,7 @@ fn ranked_with(operation: &mut GetObjectOperation, stats: Vec<SourceStats>, draw
     resolve_all(operation, accesses, &[]);
     let turn = step(
         operation,
-        Event::StagingSource(StagingSourceEvent::HealthResult { stats, draw }),
+        Event::staging(StagingSourceEvent::HealthResult { stats, draw }),
     );
     assert_eq!(read_space(&turn), BUCKET_ENCRYPTION_KEYSPACE);
     operation.next(IoResult::Values(vec![None]))
@@ -2698,7 +2692,7 @@ fn resolve_all(
 ) {
     let mut turn: Turn = Err(GetObjectError::GetObjectFailed);
     for access in accesses {
-        let result = Ok(access);
+        let result = Box::new(Ok(access));
         let resolved = SubOperationEvent::VersionAccessResolved { result };
         turn = step(operation, Event::SubOperation(resolved));
     }
@@ -2718,14 +2712,13 @@ fn resolve_all(
             Event::Storage(StorageEvent::BatchReadResult { values }),
         );
     }
-    assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Health { accesses }) if accesses.len() == 2
-    ));
+    assert!(
+        matches!((asked(&turn)).as_staging(), Some(StagingSourceEffect::Health { accesses }) if accesses.len() == 2)
+    );
 }
 
 fn headed_path(turn: &Turn) -> String {
-    let Effect::StagingSource(StagingSourceEffect::Head { access }) = asked(turn) else {
+    let Some(StagingSourceEffect::Head { access }) = asked(turn).as_staging() else {
         panic!("expected a source HEAD, got {turn:?}")
     };
     let ResolvedSourceAccess::OpenDal { path, .. } = access;
@@ -2743,7 +2736,7 @@ fn sources_fail_over() {
     let failed = StagingSourceError::StatError("timed out".to_string());
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::Error { error: failed }),
+        Event::staging(StagingSourceEvent::Error { error: failed }),
     );
     assert_eq!(headed_path(&turn), "folder/file.txt");
     let mut operation = mirrored_operation(stored.clone());
@@ -2751,7 +2744,7 @@ fn sources_fail_over() {
     assert_eq!(headed_path(&turn), "folder/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::Error {
+        Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::StatError("refused".to_string()),
         }),
     );
@@ -2760,13 +2753,13 @@ fn sources_fail_over() {
     fresh.etag = Some("mirror-etag".to_string());
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: fresh.clone(),
         }),
     );
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { expected: None, .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { expected: None, .. })
     ));
     step(&mut operation, source_read(fresh)).unwrap();
     let result = served(step(&mut operation, spooled(7)));
@@ -2800,12 +2793,12 @@ fn absence_needs_all() {
         assert_eq!(headed_path(&turn), "folder/file.txt");
         let turn = step(
             &mut operation,
-            Event::StagingSource(StagingSourceEvent::Error { error: first }),
+            Event::staging(StagingSourceEvent::Error { error: first }),
         );
         assert_eq!(headed_path(&turn), "mirror/file.txt");
         let turn = step(
             &mut operation,
-            Event::StagingSource(StagingSourceEvent::Error { error: second }),
+            Event::staging(StagingSourceEvent::Error { error: second }),
         );
         assert_eq!(
             turn.err(),
@@ -2825,18 +2818,18 @@ fn unproven_source_skipped() {
     fresh.etag = Some("mirror-etag".to_string());
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult { metadata: fresh }),
+        Event::staging(StagingSourceEvent::HeadResult { metadata: fresh }),
     );
     assert_eq!(headed_path(&turn), "folder/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(9),
         }),
     );
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { .. })
     ));
     // With every source failing, the last failure is reported.
     let mut operation = mirrored_operation(observation(9));
@@ -2844,7 +2837,7 @@ fn unproven_source_skipped() {
     let mut turn = Ok(Next::Done(()));
     for _ in 0..2 {
         let down = StagingSourceError::StatError("down".to_string());
-        let failed = Event::StagingSource(StagingSourceEvent::Error { error: down });
+        let failed = Event::staging(StagingSourceEvent::Error { error: down });
         turn = step(&mut operation, failed).map(|_| Next::Done(()));
     }
     assert!(matches!(
@@ -2864,14 +2857,14 @@ fn disagreeing_source_drifts() {
     assert_eq!(headed_path(&turn), "folder/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::Error {
+        Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::StatError("down".to_string()),
         }),
     );
     assert_eq!(headed_path(&turn), "mirror/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(12),
         }),
     );
@@ -2887,14 +2880,14 @@ fn disagreeing_source_drifts() {
     ranked_head(&mut pinned, vec![false, false]).unwrap();
     step(
         &mut pinned,
-        Event::StagingSource(StagingSourceEvent::Error {
+        Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::StatError("down".to_string()),
         }),
     )
     .unwrap();
     let turn = step(
         &mut pinned,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: digested(9, 8),
         }),
     );
@@ -2913,7 +2906,7 @@ fn failed_proof_advances() {
     assert_eq!(headed_path(&turn), "mirror/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(12),
         }),
     );
@@ -2924,7 +2917,7 @@ fn failed_proof_advances() {
     fresh.etag = Some("mirror-etag".to_string());
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: fresh.clone(),
         }),
     )
@@ -2943,7 +2936,7 @@ fn etag_alone_refused() {
     assert_eq!(headed_path(&turn), "mirror/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(9),
         }),
     );
@@ -2962,15 +2955,15 @@ fn mirror_type_kept() {
     fresh.content_type = Some("application/octet-stream".to_string());
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: fresh.clone(),
         }),
     )
     .unwrap();
     let turn = step(&mut operation, source_read(fresh));
     assert!(matches!(
-        asked(&turn),
-        Effect::Blob(BlobEffect::SpoolLocal { .. })
+        (asked(&turn)).as_blob(),
+        Some(BlobEffect::SpoolLocal { .. })
     ));
     let result = served(step(&mut operation, spooled(7)));
     let served = result.source_metadata.unwrap();
@@ -2988,18 +2981,18 @@ fn broken_spool_failover() {
     fresh.etag = None;
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: fresh.clone(),
         }),
     )
     .unwrap();
     let turn = step(&mut operation, source_read(fresh));
     assert!(matches!(
-        asked(&turn),
-        Effect::Blob(BlobEffect::SpoolLocal { .. })
+        (asked(&turn)).as_blob(),
+        Some(BlobEffect::SpoolLocal { .. })
     ));
     let broken = BlobError::StreamFailed("connection reset".to_string());
-    let turn = step(&mut operation, Event::Blob(BlobEvent::Error(broken)));
+    let turn = step(&mut operation, Event::blob(BlobEvent::Error(broken)));
     assert_eq!(headed_path(&turn), "mirror/file.txt");
 }
 
@@ -3023,7 +3016,7 @@ fn read_keeps_source() {
     resolve_all(&mut operation, accesses, &[]);
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HealthResult {
+        Event::staging(StagingSourceEvent::HealthResult {
             stats: vec![SourceStats::default(); 2],
             draw: 0,
         }),
@@ -3086,7 +3079,7 @@ fn connector_weight_counts() {
     // A draw that picks the first of two equal sources picks the heavy mirror.
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HealthResult {
+        Event::staging(StagingSourceEvent::HealthResult {
             stats: vec![SourceStats::default(); 2],
             draw: u64::MAX / 4,
         }),
@@ -3113,7 +3106,7 @@ fn kept_source_moves() {
     resolve_all(&mut operation, accesses, &[]);
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HealthResult {
+        Event::staging(StagingSourceEvent::HealthResult {
             stats: vec![SourceStats::default(); 2],
             draw: u64::MAX,
         }),
@@ -3188,13 +3181,13 @@ fn first_proof_advances() {
     assert_eq!(headed_path(&turn), "folder/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(9),
         }),
     );
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read { .. })
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read { .. })
     ));
     step(&mut operation, source_read(observation(9))).unwrap();
     let turn = step(&mut operation, spooled(8));
@@ -3204,14 +3197,14 @@ fn first_proof_advances() {
     ranked_head(&mut pinned, vec![false, false]).unwrap();
     let turn = step(
         &mut pinned,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: digested(12, 7),
         }),
     );
     assert_eq!(headed_path(&turn), "mirror/file.txt");
     let turn = step(
         &mut pinned,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: digested(12, 7),
         }),
     );
@@ -3230,7 +3223,7 @@ fn pinned_s3_mirror() -> (GetObjectOperation, Turn) {
     resolve_all(&mut operation, accesses, &[]);
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HealthResult {
+        Event::staging(StagingSourceEvent::HealthResult {
             stats: vec![SourceStats::default(); 2],
             draw: 0,
         }),
@@ -3250,20 +3243,20 @@ fn missing_validator_advances() {
     unvalidated.etag = None;
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: unvalidated.clone(),
         }),
     );
     assert_eq!(headed_path(&turn), "mirror/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(9),
         }),
     );
     assert!(matches!(
-        asked(&turn),
-        Effect::StagingSource(StagingSourceEffect::Read {
+        (asked(&turn)).as_staging(),
+        Some(StagingSourceEffect::Read {
             expected: Some(_),
             ..
         })
@@ -3272,7 +3265,7 @@ fn missing_validator_advances() {
     let (mut operation, _) = pinned_s3_mirror();
     step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: observation(9),
         }),
     )
@@ -3281,7 +3274,7 @@ fn missing_validator_advances() {
     assert_eq!(headed_path(&turn), "mirror/file.txt");
     let turn = step(
         &mut operation,
-        Event::StagingSource(StagingSourceEvent::HeadResult {
+        Event::staging(StagingSourceEvent::HeadResult {
             metadata: unvalidated,
         }),
     );

@@ -348,10 +348,13 @@ fn kept_read_pinned() {
     let IoCall::Effect(effect) = call else {
         panic!("expected the pin effect");
     };
-    assert!(matches!(*effect, Effect::Blob(BlobEffect::PinRead { .. })));
-    let held = IoResult::Event(Box::new(Event::Blob(BlobEvent::ReadHeld { held: true })));
+    assert!(matches!(
+        (*effect).as_blob(),
+        Some(BlobEffect::PinRead { .. })
+    ));
+    let held = IoResult::Event(Box::new(Event::blob(BlobEvent::ReadHeld { held: true })));
     assert_eq!(held_answer(held), Ok(true));
-    let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+    let missing = Event::blob(BlobEvent::Error(BlobError::HandleMissing));
     assert_eq!(held_answer(IoResult::Event(Box::new(missing))), Ok(false));
 }
 
@@ -372,7 +375,7 @@ fn held_copy_spared() {
         keep.next_evicted(),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
-    let held = |held| IoResult::Event(Box::new(Event::Blob(BlobEvent::ReadHeld { held })));
+    let held = |held| IoResult::Event(Box::new(Event::blob(BlobEvent::ReadHeld { held })));
     assert!(matches!(
         keep.next(held(true)),
         Ok(Next::Call(IoCall::Effect(_)))

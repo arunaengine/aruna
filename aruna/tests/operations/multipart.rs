@@ -1931,11 +1931,12 @@ async fn s3_provider_flow() {
     assert!(result.location.same_object(&backend_upload.location));
     drain_cleanup(&context).await;
     let blob_handle = context.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = blob_handle
+    let Ok(BlobEvent::ReadFinished { blob, .. }) = (blob_handle
         .send_blob_effect(BlobEffect::Read {
             location: result.location.clone(),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("the completed object is not readable")
     };
@@ -2041,7 +2042,7 @@ async fn write_target_row(context: &TestContext, key: Ulid, location: &BackendLo
 
 async fn stored_blob(context: &TestContext, key: &str) -> BackendLocation {
     let blob_handle = context.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::WriteFinished { location }) = blob_handle
+    let Ok(BlobEvent::WriteFinished { location }) = (blob_handle
         .send_blob_effect(BlobEffect::Write {
             bucket: "bucket".to_string(),
             key: key.to_string(),
@@ -2050,7 +2051,8 @@ async fn stored_blob(context: &TestContext, key: &str) -> BackendLocation {
             blob: stream_from_bytes(b"target"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("blob write failed")
     };
@@ -2150,11 +2152,12 @@ async fn set_compression(
 
 async fn read_object(context: &TestContext, location: &BackendLocation) -> Vec<u8> {
     let blob_handle = context.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = blob_handle
+    let Ok(BlobEvent::ReadFinished { blob, .. }) = (blob_handle
         .send_blob_effect(BlobEffect::Read {
             location: location.clone(),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("the completed object is not readable")
     };

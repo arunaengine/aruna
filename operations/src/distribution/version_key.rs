@@ -4,8 +4,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::effects::BlobEffect;
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::replication_protocol::VersionReplicationMessage;
@@ -51,7 +53,7 @@ pub struct VersionKeyOperation {
 }
 
 fn blob(effect: BlobEffect) -> Next<MemberAnswer> {
-    Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
+    Next::Call(IoCall::blob(effect))
 }
 
 impl VersionKeyOperation {
@@ -111,11 +113,11 @@ impl Operation for VersionKeyOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<MemberAnswer>, VersionKeyError> {
-        let event = match result.event()? {
-            Event::Blob(BlobEvent::Error(error)) => {
+        let event = match (result.event()?).into_blob() {
+            Ok(BlobEvent::Error(error)) => {
                 return Err(VersionKeyError::Transport(error.to_string()));
             }
-            Event::Blob(event) => event,
+            Ok(event) => event,
             _ => return Err(VersionKeyError::Unexpected),
         };
         let ours = |stream_id: Ulid| Some(stream_id) == self.stream_id;
@@ -147,7 +149,7 @@ impl Operation for VersionKeyOperation {
         (self.stream_id.take())
             .map(|stream_id| {
                 let close = BlobEffect::CloseConnection { stream_id };
-                IoCall::Effect(Box::new(Effect::Blob(close)))
+                IoCall::blob(close)
             })
             .into_iter()
             .collect()
@@ -175,7 +177,7 @@ mod tests {
     }
 
     fn event(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     /// Runs the lookup through a member answering `payload`.
@@ -239,7 +241,7 @@ mod tests {
         );
         // The failed run closes the open connection on abort.
         let close = BlobEffect::CloseConnection { stream_id: STREAM };
-        let close = IoCall::Effect(Box::new(Effect::Blob(close)));
+        let close = IoCall::blob(close);
         assert_eq!(lookup.abort(), vec![close]);
         assert!(lookup.abort().is_empty());
     }

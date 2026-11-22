@@ -966,7 +966,7 @@ pub enum DocumentNetEvent {
     RealmPeersReloaded,
     GitRecordNoted,
     Error {
-        target: Option<DocumentTarget>,
+        target: Option<Box<DocumentTarget>>,
         error: String,
     },
 }

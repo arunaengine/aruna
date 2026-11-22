@@ -117,7 +117,7 @@ impl CopyEnvelopeOperation {
             return Err(AbeError::Parameters);
         }
         self.state = State::Create;
-        let copy = Effect::Blob(BlobEffect::Abe(Box::new(AbeEffect::Copy {
+        let copy = Effect::blob(BlobEffect::Abe(Box::new(AbeEffect::Copy {
             source: self.pending.source.clone(),
             epoch,
             write_id: self.ids.mint(self.now_ms),
@@ -127,7 +127,7 @@ impl CopyEnvelopeOperation {
     }
 
     fn created(&mut self, event: Event) -> Step {
-        let Event::Blob(event) = event else {
+        let Ok(event) = event.into_blob() else {
             return Err(AbeError::Crypto);
         };
         match event {

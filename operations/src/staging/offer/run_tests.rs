@@ -32,7 +32,7 @@ where
 }
 
 fn source(event: StagingSourceEvent) -> IoResult {
-    IoResult::Event(Box::new(Event::StagingSource(event)))
+    IoResult::Event(Box::new(Event::staging(event)))
 }
 
 fn entry(path: &str) -> SourceEntry {

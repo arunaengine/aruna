@@ -87,7 +87,7 @@ impl Operation for ReadCrateOperation {
 
     fn next(&mut self, result: IoResult) -> CrateTurn {
         if let Some((metadata, size)) = self.collecting.take() {
-            let Event::Blob(event) = result.event()? else {
+            let Ok(event) = (result.event()?).into_blob() else {
                 return Err(CrateReadError::Failed("no crate bytes".to_string()));
             };
             return match event {
@@ -114,7 +114,7 @@ impl Operation for ReadCrateOperation {
             blob: found.blob,
             limit: None,
         };
-        Ok(Next::Call(Effect::Blob(collect).into()))
+        Ok(Next::Call(Effect::blob(collect).into()))
     }
 }
 
@@ -277,7 +277,7 @@ mod tests {
         let mut read = ReadCrateOperation::new(crate_read());
         read.collecting = Some((HashMap::new(), 9));
         let bytes = Ok(vec![1, 2]);
-        let event = Event::Blob(BlobEvent::StreamCollected { bytes });
+        let event = Event::blob(BlobEvent::StreamCollected { bytes });
         let found = CrateBytes {
             metadata: HashMap::new(),
             bytes: vec![1, 2],

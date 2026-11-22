@@ -150,13 +150,14 @@ impl PromotePendingOperation {
     }
 
     fn unexpected(state: &'static str, expected: &'static str, event: Event) -> PromoteError {
-        if let Event::Blob(BlobEvent::Error(error)) = event {
+        let received = event.label();
+        if let Ok(BlobEvent::Error(error)) = event.into_blob() {
             return error.into();
         }
         PromoteError::InvalidStateEvent {
             state,
             expected,
-            received: event.label(),
+            received,
         }
     }
 
@@ -171,9 +172,9 @@ impl PromotePendingOperation {
         let archive = &self.archive;
         let lease = self.lease.take();
         if let Some(lease) = lease.filter(|lease| lease.key == key && &lease.archive == archive) {
-            return self.handle_admit(Event::Blob(BlobEvent::ReadAdmitted { lease }));
+            return self.handle_admit(Event::blob(BlobEvent::ReadAdmitted { lease }));
         }
-        let admit = Effect::Blob(BlobEffect::AdmitRead {
+        let admit = Effect::blob(BlobEffect::AdmitRead {
             key,
             archive: self.archive.clone(),
         });
@@ -182,26 +183,32 @@ impl PromotePendingOperation {
 
     fn handle_admit(&mut self, event: Event) -> Turn<Promotion> {
         let location = self.location.clone().ok_or(PromoteError::NoKey)?;
-        match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease }) => {
                 self.state = State::Hash;
-                let hash = Effect::Blob(BlobEffect::HashArchive {
+                let hash = Effect::blob(BlobEffect::HashArchive {
                     location,
                     lease: Box::new(lease),
                 });
                 Ok(Next::Call(hash.into()))
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
+            Ok(BlobEvent::Error(BlobError::BucketKey(BucketKeyError::Locked(_)))) => {
                 let key = location.format.bucket_key().ok_or(PromoteError::NoKey)?;
                 Ok(Next::Done(Promotion::AwaitingKey(key)))
             }
-            event => Err(Self::unexpected("Admit", "ReadAdmitted", event)),
+            Ok(event) => {
+                let event = Event::blob(event);
+                Err(Self::unexpected("Admit", "ReadAdmitted", event))
+            }
+            Err(event) => Err(Self::unexpected("Admit", "ReadAdmitted", event)),
         }
     }
 
     fn handle_hash(&mut self, event: Event) -> Turn<Promotion> {
-        let Event::Blob(BlobEvent::ArchiveHashed { hashes, size }) = event else {
-            return Err(Self::unexpected("Hash", "ArchiveHashed", event));
+        let (hashes, size) = match event.into_blob() {
+            Ok(BlobEvent::ArchiveHashed { hashes, size }) => (hashes, size),
+            Ok(blob) => return Err(Self::unexpected("Hash", "ArchiveHashed", Event::blob(blob))),
+            Err(event) => return Err(Self::unexpected("Hash", "ArchiveHashed", event)),
         };
         let blake3 = hashes
             .get(HASH_BLAKE3)

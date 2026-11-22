@@ -371,7 +371,7 @@ impl RemoveImportOperation {
     /// All rows are gone: the provider bucket is next, or the mark when there is none.
     fn rows_gone(&mut self) -> RemoveTurn {
         if let Some(cleanup) = self.cleanup.as_ref() {
-            let drop = Effect::Blob(BlobEffect::DeleteEmptyBucket {
+            let drop = Effect::blob(BlobEffect::DeleteEmptyBucket {
                 backend: BackendRef::Group(cleanup.backend_id),
                 bucket: cleanup.bucket.clone(),
             });
@@ -444,10 +444,10 @@ impl RemoveImportOperation {
     }
 
     fn provider_dropped(&mut self, event: Event) -> RemoveTurn {
-        let deleted = match event {
-            Event::Blob(BlobEvent::BucketDeleted { deleted }) => deleted,
+        let deleted = match event.into_blob() {
+            Ok(BlobEvent::BucketDeleted { deleted }) => deleted,
             // The mark stays, so the schedule tries the provider bucket again.
-            Event::Blob(BlobEvent::Error(error)) => {
+            Ok(BlobEvent::Error(error)) => {
                 return Err(ImportRuleError::Read(error.reason()));
             }
             _ => return Err(ImportRuleError::Unexpected("DropProvider")),
@@ -759,12 +759,12 @@ mod tests {
     #[test]
     fn provider_drop_settles() {
         let (mut operation, _) = resumed(Some(marked(Some(cleanup()))));
-        let expected = Effect::Blob(BlobEffect::DeleteEmptyBucket {
+        let expected = Effect::blob(BlobEffect::DeleteEmptyBucket {
             backend: BackendRef::Group(cleanup().backend_id),
             bucket: "team-a-x".to_string(),
         });
         assert_eq!(drain(&mut operation), Ok(Next::Call(expected.into())));
-        let dropped = Event::Blob(BlobEvent::BucketDeleted { deleted: true });
+        let dropped = Event::blob(BlobEvent::BucketDeleted { deleted: true });
         let turn = operation.next(IoResult::Event(Box::new(dropped)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
         let settled = child(Ok::<_, ImportRuleError>(()));
@@ -777,7 +777,7 @@ mod tests {
         let (mut operation, _) = resumed(Some(marked(Some(cleanup()))));
         drain(&mut operation).unwrap();
         let failure = aruna_core::errors::BlobError::WriteError("unreachable".to_string());
-        let failed = Event::Blob(BlobEvent::Error(failure));
+        let failed = Event::blob(BlobEvent::Error(failure));
         assert!(operation.next(IoResult::Event(Box::new(failed))).is_err());
     }
 

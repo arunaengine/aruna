@@ -81,7 +81,7 @@ pub(super) fn event_result(event: Event) -> IoResult {
 }
 
 pub(super) fn blob(event: BlobEvent) -> IoResult {
-    event_result(Event::Blob(event))
+    event_result(Event::blob(event))
 }
 
 pub(super) fn asked(turn: &Turn) -> &Effect {
@@ -150,11 +150,11 @@ fn tail(calls: &[IoCall]) -> Vec<Tail> {
         IoCall::Write(rows) if rows.len() == 1 && rows[0].0 == BLOB_CLEANUP_KEYSPACE => {
             Tail::Reconcile(rows[0].1.clone())
         }
-        IoCall::Effect(effect) => match effect.as_ref() {
-            Effect::Blob(BlobEffect::ReleaseReservation { id }) => Tail::Release(*id),
-            Effect::Blob(BlobEffect::Delete { location }) => Tail::Delete(location.clone()),
-            Effect::Blob(BlobEffect::CloseConnection { .. }) => Tail::Close,
-            sent => match message_from_effect(sent) {
+        IoCall::Effect(effect) => match effect.as_blob() {
+            Some(BlobEffect::ReleaseReservation { id }) => Tail::Release(*id),
+            Some(BlobEffect::Delete { location }) => Tail::Delete(location.clone()),
+            Some(BlobEffect::CloseConnection { .. }) => Tail::Close,
+            _ => match message_from_effect(effect) {
                 VersionReplicationMessage::VersionApplyRejected(reason) => Tail::Reject(reason),
                 other => panic!("unexpected message in the cleanup: {other:?}"),
             },
@@ -299,16 +299,16 @@ async fn refused_copy_absent() {
     }
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Blob(BlobEffect::OpenConnection { .. })]
+        [effect] if matches!(effect.as_blob(), Some(BlobEffect::OpenConnection { .. }))
     ));
-    let effects = source.step(Event::Blob(BlobEvent::ConnectionEstablished { stream_id }));
+    let effects = source.step(Event::blob(BlobEvent::ConnectionEstablished { stream_id }));
     let VersionReplicationMessage::VersionManifest(mut manifest) = message_from_effect(&effects[0])
     else {
         panic!("expected source manifest");
     };
     assert!(manifest.current_version);
     manifest.writer_auth_context = Some(manifest.auth_context.clone());
-    source.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    source.step(Event::blob(BlobEvent::MessageSent { stream_id }));
     let mut target =
         IncomingVersionOperation::new(stream_id, target_node, test_realm_id(), manifest);
     target.manifest_policy = Some(target.target_authorization_path(test_group_id()));
@@ -325,7 +325,7 @@ async fn refused_copy_absent() {
             }
             [Effect::SubOperation(_)] => {
                 effects = target.step(Event::SubOperation(SubOperationEvent::GroupRoutingLoaded {
-                    result: Ok(GroupRoutingInputs::default()),
+                    result: Box::new(Ok(GroupRoutingInputs::default())),
                 }));
             }
             _ => break,
@@ -338,12 +338,12 @@ async fn refused_copy_absent() {
             ReplicationNegotiationResult::NeedVersionOnly
         )
     );
-    let waiting = target.step(Event::Blob(BlobEvent::MessageSent { stream_id }));
+    let waiting = target.step(Event::blob(BlobEvent::MessageSent { stream_id }));
     assert!(matches!(
         waiting.as_slice(),
-        [Effect::Blob(BlobEffect::ReadMessage { .. })]
+        [effect] if matches!(effect.as_blob(), Some(BlobEffect::ReadMessage { .. }))
     ));
-    let mut effects = source.step(Event::Blob(BlobEvent::MessageReceived {
+    let mut effects = source.step(Event::blob(BlobEvent::MessageReceived {
         stream_id,
         payload: negotiation.to_bytes().unwrap(),
     }));
@@ -353,13 +353,13 @@ async fn refused_copy_absent() {
     let effects = source.step(source_storage.send_storage_effect(effect).await);
     assert!(matches!(
         effects.as_slice(),
-        [Effect::Blob(BlobEffect::CloseConnection { .. })]
+        [effect] if matches!(effect.as_blob(), Some(BlobEffect::CloseConnection { .. }))
     ));
     assert_eq!(
         source.finalize(),
         Err(ReplicateObjectError::PlaintextRefused)
     );
-    target.step(Event::Blob(BlobEvent::ConnectionClosed { stream_id }));
+    target.step(Event::blob(BlobEvent::ConnectionClosed { stream_id }));
     for space in [
         BLOB_VERSIONS_KEYSPACE,
         BLOB_HEAD_KEYSPACE,
@@ -621,7 +621,7 @@ fn assert_advance_invalid(
 }
 
 fn message_from_effect(effect: &Effect) -> VersionReplicationMessage {
-    let Effect::Blob(BlobEffect::SendMessage { payload, .. }) = effect else {
+    let Some(BlobEffect::SendMessage { payload, .. }) = effect.as_blob() else {
         panic!("expected blob send message effect")
     };
     VersionReplicationMessage::from_bytes(payload).unwrap()
@@ -640,7 +640,9 @@ fn expect_rejected_negotiation(effect: &Effect, expected_reason: &str) {
 pub(super) fn load_routing(op: &mut IncomingVersionOperation, inputs: GroupRoutingInputs) -> Turn {
     assert_eq!(op.state, IncomingVersionState::LoadDestinationRouting);
     op.next(event_result(Event::SubOperation(
-        SubOperationEvent::GroupRoutingLoaded { result: Ok(inputs) },
+        SubOperationEvent::GroupRoutingLoaded {
+            result: Box::new(Ok(inputs)),
+        },
     )))
 }
 
@@ -2323,8 +2325,8 @@ fn metadata_waits_approval() {
     let stream_id = op.stream_id;
     let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::ReadMessage { .. })
+        (asked(&effects)).as_blob(),
+        Some(BlobEffect::ReadMessage { .. })
     ));
     let effects = op.next(blob(BlobEvent::MessageReceived {
         stream_id,
@@ -2534,8 +2536,8 @@ fn unbuildable_bucket_rejects() {
     let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::CloseConnection { .. })
+        (asked(&effects)).as_blob(),
+        Some(BlobEffect::CloseConnection { .. })
     ));
 }
 
@@ -2573,8 +2575,8 @@ fn rejects_denied_writer() {
     let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert_eq!(op.state, IncomingVersionState::CloseConnection);
     assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::CloseConnection { .. })
+        (asked(&effects)).as_blob(),
+        Some(BlobEffect::CloseConnection { .. })
     ));
 }
 
@@ -2827,10 +2829,9 @@ fn release_after_commit() {
     let mut op = applying(kind, 112, None, Some(received));
 
     let effects = op.next(applied(op.result(true)));
-    assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::ReleaseReservation { id: observed }) if *observed == id
-    ));
+    assert!(
+        matches!((asked(&effects)).as_blob(), Some(BlobEffect::ReleaseReservation { id: observed }) if *observed == id)
+    );
     assert_eq!(op.state, IncomingVersionState::ReleaseReservation);
     assert!(op.apply_committed);
     assert!(!op.received_blob.as_ref().unwrap().cleanup_on_abort);
@@ -2989,7 +2990,7 @@ fn materialized_trace() {
 
     op.next(event_result(Event::SubOperation(
         SubOperationEvent::GroupRoutingLoaded {
-            result: Ok(GroupRoutingInputs::default()),
+            result: Box::new(Ok(GroupRoutingInputs::default())),
         },
     )))
     .unwrap();
@@ -3012,10 +3013,9 @@ fn materialized_trace() {
 
     let effects = op.next(blob(BlobEvent::MessageSent { stream_id }));
     assert_eq!(op.state, IncomingVersionState::ReceiveBlob);
-    assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::HandleReplication { stream_id: id, .. }) if *id == stream_id
-    ));
+    assert!(
+        matches!((asked(&effects)).as_blob(), Some(BlobEffect::HandleReplication { stream_id: id, .. }) if *id == stream_id)
+    );
 
     let effects = op.next(blob(BlobEvent::ReplicationFinished {
         location: received.clone(),
@@ -3155,7 +3155,7 @@ fn replaced_row_kind() {
         .unwrap();
         op.next(event_result(Event::SubOperation(
             SubOperationEvent::GroupRoutingLoaded {
-                result: Ok(GroupRoutingInputs::default()),
+                result: Box::new(Ok(GroupRoutingInputs::default())),
             },
         )))
         .unwrap();
@@ -3336,7 +3336,7 @@ fn delete_marker_trace() {
     .unwrap();
     op.next(event_result(Event::SubOperation(
         SubOperationEvent::GroupRoutingLoaded {
-            result: Ok(GroupRoutingInputs::default()),
+            result: Box::new(Ok(GroupRoutingInputs::default())),
         },
     )))
     .unwrap();
@@ -3425,7 +3425,7 @@ fn rejected_trace() {
     .unwrap();
     let effects = op.next(event_result(Event::SubOperation(
         SubOperationEvent::GroupRoutingLoaded {
-            result: Ok(GroupRoutingInputs::default()),
+            result: Box::new(Ok(GroupRoutingInputs::default())),
         },
     )));
     assert_eq!(op.state, IncomingVersionState::SendNegotiation);
@@ -3620,11 +3620,10 @@ fn encrypting_target_negotiates() {
     let effects = op.next(blob(BlobEvent::MessageSent {
         stream_id: Ulid::from_parts(94, 94),
     }));
-    assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::HandleReplication { resolved, object: None, .. })
-            if resolved.encryption == Some(plan)
-    ));
+    assert!(
+        matches!((asked(&effects)).as_blob(), Some(BlobEffect::HandleReplication { resolved, object: None, .. })
+            if resolved.encryption == Some(plan))
+    );
     assert_eq!(op.envelope, None);
 }
 
@@ -3636,7 +3635,7 @@ fn abe_target_negotiates() {
     let parameters = target_parameters();
     let mut op = reading_abe();
     let effects = op.next(abe_rows(Some(&parameters), 2));
-    let Effect::Blob(BlobEffect::Abe(effect)) = asked(&effects) else {
+    let Some(BlobEffect::Abe(effect)) = asked(&effects).as_blob() else {
         panic!("expected the envelope effect, got {effects:?}")
     };
     let AbeEffect::Envelope(envelope_plan) = effect.as_ref() else {
@@ -3663,11 +3662,10 @@ fn abe_target_negotiates() {
     let effects = op.next(blob(BlobEvent::MessageSent {
         stream_id: Ulid::from_parts(94, 94),
     }));
-    assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::HandleReplication { object: Some(sent), .. })
-            if *sent == object
-    ));
+    assert!(
+        matches!((asked(&effects)).as_blob(), Some(BlobEffect::HandleReplication { object: Some(sent), .. })
+            if *sent == object)
+    );
 }
 
 #[test]

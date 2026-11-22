@@ -285,7 +285,7 @@ impl MigrateVersionOperation {
     }
 
     fn blob(&mut self, state: MigrateState, effect: BlobEffect) -> Turn {
-        self.call(state, Effect::Blob(effect).into())
+        self.call(state, Effect::blob(effect).into())
     }
 
     fn read(&mut self, state: MigrateState, space: &str, key: impl Into<Key>) -> Turn {
@@ -299,7 +299,7 @@ impl MigrateVersionOperation {
             return Vec::new();
         };
         let release = BlobEffect::ReleaseReservation { id: new.ulid };
-        let mut calls = vec![Effect::Blob(release).into()];
+        let mut calls = vec![Effect::blob(release).into()];
         if !self.owns_row {
             calls.push(schedule_cleanup_effect().into());
         }
@@ -462,13 +462,15 @@ impl MigrateVersionOperation {
     }
 
     fn handle_probe(&mut self, event: Event) -> Turn {
-        match event {
-            Event::Blob(BlobEvent::CopyStat { exists: true }) => self.after_found(),
-            Event::Blob(BlobEvent::CopyStat { exists: false }) => {
-                Err(MigrateVersionError::TargetMissing)
+        match event.into_blob() {
+            Ok(BlobEvent::CopyStat { exists: true }) => self.after_found(),
+            Ok(BlobEvent::CopyStat { exists: false }) => Err(MigrateVersionError::TargetMissing),
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                self.unexpected(other)
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => self.unexpected(other),
+            Err(other) => self.unexpected(other),
         }
     }
 
@@ -553,10 +555,14 @@ impl MigrateVersionOperation {
     /// The path takes the file as an upload would: free, versioned, or tagged. Each attempt
     /// names its own id, so a retry never overwrites a file an earlier attempt left there.
     fn handle_stat(&mut self, event: Event) -> Turn {
-        let (exists, version) = match event {
-            Event::Blob(BlobEvent::PlainStat { exists, version }) => (exists, version),
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
-            other => return self.unexpected(other),
+        let (exists, version) = match event.into_blob() {
+            Ok(BlobEvent::PlainStat { exists, version }) => (exists, version),
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return self.unexpected(other);
+            }
+            Err(other) => return self.unexpected(other),
         };
         let attempt = self.attempt();
         let Some(plain) = self.plain.as_ref() else {
@@ -600,8 +606,8 @@ impl MigrateVersionOperation {
     /// The file there is a copy an earlier attempt left when its size and ETag prove the old
     /// file's bytes; any other file, or one its checksums cannot decide, keeps the name taken.
     fn handle_taken(&mut self, event: Event) -> Turn {
-        let (found, version) = match event {
-            Event::Blob(BlobEvent::ExternalStat {
+        let (found, version) = match event.into_blob() {
+            Ok(BlobEvent::ExternalStat {
                 location,
                 version,
                 etag,
@@ -624,8 +630,12 @@ impl MigrateVersionOperation {
                 };
                 (location.filter(proved), version)
             }
-            Event::Blob(BlobEvent::Error(_)) => (None, None),
-            other => return self.unexpected(other),
+            Ok(BlobEvent::Error(_)) => (None, None),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return self.unexpected(other);
+            }
+            Err(other) => return self.unexpected(other),
         };
         let (Some(mut location), Some(old)) = (found, self.old.as_ref()) else {
             return self.drop_intents();
@@ -675,10 +685,14 @@ impl MigrateVersionOperation {
     }
 
     fn handle_settled(&mut self, event: Event) -> Turn {
-        match event {
-            Event::Blob(BlobEvent::UploadAborted) => self.start_publication(),
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => self.unexpected(other),
+        match event.into_blob() {
+            Ok(BlobEvent::UploadAborted) => self.start_publication(),
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                self.unexpected(other)
+            }
+            Err(other) => self.unexpected(other),
         }
     }
 
@@ -693,7 +707,7 @@ impl MigrateVersionOperation {
             self.resolved.clone(),
         ) {
             let created_by = old.created_by;
-            let copy = Effect::Blob(BlobEffect::CopyPlain {
+            let copy = Effect::blob(BlobEffect::CopyPlain {
                 resolved,
                 plain,
                 source: Box::new(old),
@@ -706,10 +720,14 @@ impl MigrateVersionOperation {
     }
 
     fn handle_read(&mut self, event: Event) -> Turn {
-        let blob = match event {
-            Event::Blob(BlobEvent::ReadFinished { blob, .. }) => blob,
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
-            other => return self.unexpected(other),
+        let blob = match event.into_blob() {
+            Ok(BlobEvent::ReadFinished { blob, .. }) => blob,
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return self.unexpected(other);
+            }
+            Err(other) => return self.unexpected(other),
         };
         let Some(old) = self.old.as_ref() else {
             return Err(MigrateVersionError::NotFinished);
@@ -720,7 +738,7 @@ impl MigrateVersionOperation {
         });
         if let Some(plain) = self.plain_path.clone() {
             let created_by = old.created_by;
-            let write = Effect::Blob(BlobEffect::WritePlain {
+            let write = Effect::blob(BlobEffect::WritePlain {
                 resolved,
                 plain,
                 created_by,
@@ -729,7 +747,7 @@ impl MigrateVersionOperation {
             let write = write.into();
             return self.intent_first(write, created_by);
         }
-        let effect = Effect::Blob(BlobEffect::Write {
+        let effect = Effect::blob(BlobEffect::Write {
             bucket: self.version_key.bucket.clone(),
             key: self.version_key.key.clone(),
             resolved,
@@ -869,9 +887,9 @@ impl MigrateVersionOperation {
     }
 
     fn handle_written(&mut self, event: Event) -> Turn {
-        let new = match event {
-            Event::Blob(BlobEvent::WriteFinished { location }) => location,
-            Event::Blob(BlobEvent::PlainWritten {
+        let new = match event.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => location,
+            Ok(BlobEvent::PlainWritten {
                 location,
                 version,
                 etag,
@@ -881,19 +899,23 @@ impl MigrateVersionOperation {
                 location
             }
             // A refused rename may meet its own earlier copy.
-            Event::Blob(BlobEvent::Error(
+            Ok(BlobEvent::Error(
                 error @ (BlobError::PathTaken | BlobError::ConditionalUnsupported),
             )) if self.renaming => return self.stat_taken(error),
             // A refused write moved no byte; its intents go before the move fails with it.
-            Event::Blob(BlobEvent::Error(
+            Ok(BlobEvent::Error(
                 error @ (BlobError::PathTaken | BlobError::ConditionalUnsupported),
             )) if !self.written_intent.is_empty() => {
                 self.refusal = Some(error);
                 return self.drop_intents();
             }
             // The adapter keeps a copy with an unclear outcome for reconciliation.
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
-            other => return self.unexpected(other),
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return self.unexpected(other);
+            }
+            Err(other) => return self.unexpected(other),
         };
         let same = self.old.as_ref().is_some_and(|old| {
             old.get_blake3() == new.get_blake3() && old.blob_size == new.blob_size
@@ -1708,7 +1730,7 @@ mod tests {
     }
 
     fn blob_event(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     fn asked(turn: &Turn) -> &Effect {
@@ -1743,8 +1765,8 @@ mod tests {
             panic!("expected the release, got {calls:?}")
         };
         assert!(matches!(
-            **release,
-            Effect::Blob(BlobEffect::ReleaseReservation { .. })
+            (**release).as_blob(),
+            Some(BlobEffect::ReleaseReservation { .. })
         ));
         assert_eq!(calls.len(), 1 + usize::from(cleanup));
         if cleanup {
@@ -1791,7 +1813,7 @@ mod tests {
             blob,
             stream_size: 40,
         }));
-        let Effect::Blob(BlobEffect::Write { resolved, .. }) = asked(&turn) else {
+        let Some(BlobEffect::Write { resolved, .. }) = asked(&turn).as_blob() else {
             panic!("expected one write, got {turn:?}")
         };
         assert_eq!(resolved.compression, ZSTD);
@@ -2901,26 +2923,26 @@ mod tests {
                 assert_eq!(reads[0].0, IMPORTED_OBJECT_KEYSPACE);
                 turn = operation.next(read_result(None));
             }
-            if let Effect::Blob(BlobEffect::StatPlain { .. }) = asked(&turn) {
+            if let Some(BlobEffect::StatPlain { .. }) = asked(&turn).as_blob() {
                 turn = operation.next(blob_event(BlobEvent::PlainStat {
                     exists: taken,
                     version: None,
                 }));
             }
             assert!(matches!(
-                asked(&turn),
-                Effect::Blob(BlobEffect::Read { .. })
+                (asked(&turn)).as_blob(),
+                Some(BlobEffect::Read { .. })
             ));
             let turn = operation.next(empty_blob());
             let turn = past_intent(operation, turn);
-            let new = match asked(&turn) {
-                Effect::Blob(BlobEffect::Write { resolved, .. }) => {
+            let new = match asked(&turn).as_blob() {
+                Some(BlobEffect::Write { resolved, .. }) => {
                     assert_eq!(resolved.backend, storage());
                     blob_event(BlobEvent::WriteFinished {
                         location: on_storage(location(false)),
                     })
                 }
-                Effect::Blob(BlobEffect::WritePlain { plain, .. }) => plain_written(plain),
+                Some(BlobEffect::WritePlain { plain, .. }) => plain_written(plain),
                 other => panic!("expected a write, got {other:?}"),
             };
             operation.next(new).unwrap();
@@ -3030,7 +3052,7 @@ mod tests {
             let target = on_storage(location(false));
 
             let effects = operation.next(read_result(Some(target.to_bytes().unwrap())));
-            let Effect::Blob(BlobEffect::StatCopy { location }) = asked(&effects) else {
+            let Some(BlobEffect::StatCopy { location }) = asked(&effects).as_blob() else {
                 panic!("expected the target probe, got {effects:?}")
             };
             assert!(location.same_object(&target));
@@ -3303,8 +3325,8 @@ mod tests {
                 .unwrap();
             let effects = operation.next(read_result(None));
             assert!(matches!(
-                asked(&effects),
-                Effect::Blob(BlobEffect::StatPlain { .. })
+                (asked(&effects)).as_blob(),
+                Some(BlobEffect::StatPlain { .. })
             ));
             operation
                 .next(blob_event(BlobEvent::PlainStat {
@@ -3314,7 +3336,7 @@ mod tests {
                 .unwrap();
             let effects = operation.next(empty_blob());
             let effects = past_intent(&mut operation, effects);
-            let Effect::Blob(BlobEffect::WritePlain { plain, .. }) = asked(&effects) else {
+            let Some(BlobEffect::WritePlain { plain, .. }) = asked(&effects).as_blob() else {
                 panic!("expected the file write, got {effects:?}")
             };
             let written = plain_written(plain);
@@ -3426,12 +3448,12 @@ mod tests {
             // Nothing records the new name for another key, and no provider is asked first.
             let effects = operation.next(read_result(None));
             let effects = past_intent(&mut operation, effects);
-            let Effect::Blob(BlobEffect::CopyPlain {
+            let Some(BlobEffect::CopyPlain {
                 plain,
                 source: copied,
                 etag,
                 ..
-            }) = asked(&effects)
+            }) = asked(&effects).as_blob()
             else {
                 panic!("expected the copy to the new name, got {effects:?}")
             };
@@ -3466,7 +3488,7 @@ mod tests {
             let refused = || BlobError::ConditionalUnsupported;
             let effects = operation.next(blob_event(BlobEvent::Error(refused())));
             // Such a storage may hold an earlier attempt at the tagged name.
-            let Effect::Blob(BlobEffect::StatExternal { path, .. }) = asked(&effects) else {
+            let Some(BlobEffect::StatExternal { path, .. }) = asked(&effects).as_blob() else {
                 panic!("expected the stat of the tagged name, got {effects:?}")
             };
             assert_eq!(path, &tagged_path(&plain.path, plain.ulid));
@@ -3564,7 +3586,7 @@ mod tests {
             }
             let (mut operation, plain) = renaming(&version, &old, (Some(b"v1"), Some("e1")));
             let effects = operation.next(blob_event(BlobEvent::Error(BlobError::PathTaken)));
-            let Effect::Blob(BlobEffect::StatExternal { path, .. }) = asked(&effects) else {
+            let Some(BlobEffect::StatExternal { path, .. }) = asked(&effects).as_blob() else {
                 panic!("expected the stat of the taken name, got {effects:?}")
             };
             assert_eq!(path, &plain.path);
@@ -3606,7 +3628,7 @@ mod tests {
                         attempt,
                         upload: None,
                     };
-                    assert_eq!(asked(&effects), &Effect::Blob(settle));
+                    assert_eq!(asked(&effects), &Effect::blob(settle));
                     let turn = operation.next(blob_event(BlobEvent::UploadAborted));
                     assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
                     // The intents the earlier attempt stored go with the publication.

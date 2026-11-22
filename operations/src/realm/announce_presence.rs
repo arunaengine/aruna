@@ -72,12 +72,12 @@ impl AnnouncePresenceOperation {
     }
 
     fn put_presence(&self) -> Next<()> {
-        let put = Effect::Net(NetEffect::Dht(DhtEffect::Put {
+        let put = Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
             key: self.presence_key(),
             realm_id: self.config.realm_id,
             value: self.config.node_id.as_bytes().to_vec(),
             ttl: REALM_PRESENCE_TTL,
-        }));
+        })));
         Next::Call(IoCall::Effect(Box::new(put)))
     }
 
@@ -163,7 +163,10 @@ mod pure_tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = op.first() else {
             panic!("expected one DHT put effect");
         };
-        let Effect::Net(NetEffect::Dht(DhtEffect::Put { ttl, .. })) = *effect else {
+        let Effect::Net(NetEffect::Dht(dht)) = *effect else {
+            panic!("expected one DHT put effect");
+        };
+        let DhtEffect::Put { ttl, .. } = *dht else {
             panic!("expected one DHT put effect");
         };
         assert!(ttl > PRESENCE_REFRESH_AFTER);

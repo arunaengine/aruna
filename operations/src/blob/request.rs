@@ -3,9 +3,9 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::operation::Operation;
 
 /// Emits one listing or hashing effect and hands back the blob adapter's answer.
@@ -42,9 +42,7 @@ impl Operation for BlobRequest {
 
     fn first(&mut self) -> Result<Next<BlobEvent>, BlobError> {
         match (self.answer, self.effect.take()) {
-            (Some(_), Some(effect)) => {
-                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect)))))
-            }
+            (Some(_), Some(effect)) => Ok(Next::Call(IoCall::blob(effect))),
             (None, _) => Err(BlobError::ReadError(
                 "not a listing or hashing request".into(),
             )),
@@ -57,10 +55,13 @@ impl Operation for BlobRequest {
         let IoResult::Event(event) = result else {
             return Err(BlobError::ReadError(format!("unexpected result {label}")));
         };
-        match (self.answer.take(), *event) {
-            (_, Event::Blob(BlobEvent::Error(error))) => Err(error),
-            (Some(Answer::Listed), Event::Blob(event @ BlobEvent::ExternalListed { .. }))
-            | (Some(Answer::Hashed), Event::Blob(event @ BlobEvent::ExternalHashed { .. })) => {
+        let Ok(event) = event.into_blob() else {
+            return Err(BlobError::ReadError(format!("unexpected event {label}")));
+        };
+        match (self.answer.take(), event) {
+            (_, BlobEvent::Error(error)) => Err(error),
+            (Some(Answer::Listed), event @ BlobEvent::ExternalListed { .. })
+            | (Some(Answer::Hashed), event @ BlobEvent::ExternalHashed { .. }) => {
                 Ok(Next::Done(event))
             }
             _ => Err(BlobError::ReadError(format!("unexpected event {label}"))),

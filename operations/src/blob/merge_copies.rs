@@ -345,7 +345,7 @@ impl UnifyStageOperation {
             return Ok(Next::Done(Unified::Changed));
         };
         let keep = &self.found.keep;
-        let list = Effect::Blob(BlobEffect::ListExternal {
+        let list = Effect::blob(BlobEffect::ListExternal {
             backend: keep.backend.clone(),
             prefix: keep.backend_path.clone(),
             start_after: None,
@@ -357,8 +357,8 @@ impl UnifyStageOperation {
     fn kept_listed(&mut self, recorded: &str, event: Event) -> Turn<Unified> {
         let keep = &self.found.keep;
         let unquoted = |etag: &str| etag.trim_matches('"').to_string();
-        let unchanged = match event {
-            Event::Blob(BlobEvent::ExternalListed { objects, .. }) => {
+        let unchanged = match event.into_blob() {
+            Ok(BlobEvent::ExternalListed { objects, .. }) => {
                 objects.first().is_some_and(|object| {
                     object.key == keep.backend_path
                         && object.size == keep.blob_size
@@ -366,8 +366,15 @@ impl UnifyStageOperation {
                 })
             }
             // A node without blob storage cannot tell.
-            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => false,
-            other => {
+            Ok(BlobEvent::Error(BlobError::HandleMissing)) => false,
+            Ok(other) => {
+                return Err(MigrationError::Failed(format!(
+                    "could not list the kept file: {}",
+                    other.label()
+                )));
+            }
+
+            Err(other) => {
                 return Err(MigrationError::Failed(format!(
                     "could not list the kept file: {}",
                     other.label()

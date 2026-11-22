@@ -5,7 +5,9 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     ABE_PENDING_KEYSPACE, BLOB_CLEANUP_KEYSPACE, UPLOAD_KEYSPACE, UPLOAD_PART_KEYSPACE,
@@ -103,7 +105,7 @@ impl Operation for RollbackWrite {
     fn first(&mut self) -> Result<Next<()>, StorageError> {
         let location = self.location.clone();
         Ok(Next::Call(
-            Effect::Blob(BlobEffect::Delete { location }).into(),
+            Effect::blob(BlobEffect::Delete { location }).into(),
         ))
     }
 
@@ -112,7 +114,7 @@ impl Operation for RollbackWrite {
             result.done()?;
             return Ok(Next::Done(()));
         }
-        let Event::Blob(BlobEvent::Error(_)) = result.event()? else {
+        let Ok(BlobEvent::Error(_)) = (result.event()?).into_blob() else {
             return Ok(Next::Done(()));
         };
         let location = self.location.clone();
@@ -163,7 +165,7 @@ impl Operation for ReleaseWrite {
 
     fn first(&mut self) -> Result<Next<()>, StorageError> {
         let release = BlobEffect::ReleaseReservation { id: self.id };
-        Ok(Next::Call(Effect::Blob(release).into()))
+        Ok(Next::Call(Effect::blob(release).into()))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<()>, StorageError> {
@@ -171,7 +173,7 @@ impl Operation for ReleaseWrite {
             result.done()?;
             return Ok(Next::Done(()));
         }
-        if let Event::Blob(BlobEvent::ReservationReleased { id }) = result.event()?
+        if let Ok(BlobEvent::ReservationReleased { id }) = (result.event()?).into_blob()
             && id == self.id
         {
             return Ok(Next::Done(()));
@@ -230,14 +232,14 @@ mod tests {
     }
 
     fn answer(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     #[test]
     fn rollback_queues_refused() {
         // A deleted blob needs nothing more.
         let mut rollback = RollbackWrite::new(location());
-        let delete = Effect::Blob(BlobEffect::Delete {
+        let delete = Effect::blob(BlobEffect::Delete {
             location: location(),
         });
         assert_eq!(rollback.first(), Ok(Next::Call(delete.into())));
@@ -272,7 +274,7 @@ mod tests {
         let id = location().ulid;
         // A released reservation needs nothing more.
         let mut release = ReleaseWrite::new(id, Some(work.clone()));
-        let effect = Effect::Blob(BlobEffect::ReleaseReservation { id });
+        let effect = Effect::blob(BlobEffect::ReleaseReservation { id });
         assert_eq!(release.first(), Ok(Next::Call(effect.into())));
         let released = BlobEvent::ReservationReleased { id };
         assert_eq!(release.next(answer(released)), Ok(Next::Done(())));

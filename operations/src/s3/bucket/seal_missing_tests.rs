@@ -82,14 +82,14 @@ fn pending_holders_sealed() {
     let Ok(Next::Call(IoCall::Effect(effect))) = &next else {
         panic!("expected the seal step, got {next:?}");
     };
-    let Effect::Blob(BlobEffect::SealUnlocked { holders, .. }) = effect.as_ref() else {
+    let Some(BlobEffect::SealUnlocked { holders, .. }) = effect.as_blob() else {
         panic!("expected the seal step, got {next:?}");
     };
     let targets: Vec<_> = holders.iter().map(|target| target.user_id).collect();
     assert_eq!(targets, [user(2), user(3)]);
 
     let copies = vec![copy(user(2)), copy(user(3))];
-    let sealed = Event::Blob(BlobEvent::CopiesSealed { copies });
+    let sealed = Event::blob(BlobEvent::CopiesSealed { copies });
     let next = operation.next(IoResult::Event(Box::new(sealed)));
     let Ok(Next::Call(IoCall::Write(writes))) = &next else {
         panic!("expected the copy writes, got {next:?}");

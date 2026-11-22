@@ -10,7 +10,9 @@ use std::time::SystemTime;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, StagingSourceEffect};
 use aruna_core::errors::SourceResolutionError;
-use aruna_core::events::{Event, StagingSourceEvent};
+#[cfg(test)]
+use aruna_core::events::Event;
+use aruna_core::events::StagingSourceEvent;
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, SOURCE_INDEX_KEYSPACE,
 };
@@ -248,7 +250,7 @@ impl SourceHealthOperation {
         }
         self.step = HealthStep::Measure;
         let health = StagingSourceEffect::Health { accesses };
-        Ok(Next::Call(Effect::StagingSource(health).into()))
+        Ok(Next::Call(Effect::staging(health).into()))
     }
 
     fn finish(&mut self, stats: Vec<SourceStats>) -> HealthTurn {
@@ -302,10 +304,8 @@ impl Operation for SourceHealthOperation {
                 self.sources.push((place(&single), access.ok()));
                 self.resolve_next()
             }
-            HealthStep::Measure => match result.event()? {
-                Event::StagingSource(StagingSourceEvent::HealthResult { stats, .. }) => {
-                    self.finish(stats)
-                }
+            HealthStep::Measure => match result.staging()? {
+                StagingSourceEvent::HealthResult { stats, .. } => self.finish(stats),
                 _ => Err(storage("no source health answer")),
             },
         }

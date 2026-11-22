@@ -111,7 +111,6 @@ async fn composition_keeps_slot() {
     // Through the dispatcher: a reservation waits for a transfer slot before it takes memory,
     // and the composition then runs on that slot even while every other slot is busy.
     use aruna_core::effects::BlobEffect;
-    use aruna_core::events::Event;
     use aruna_core::structs::storage::blob::ResolvedBackend;
     use aruna_core::structs::storage::encryption::{BucketKeyRef, SealPlan};
     use ulid::Ulid;
@@ -137,7 +136,7 @@ async fn composition_keeps_slot() {
 
     // One part write finishes; every other slot stays busy.
     drop(last);
-    let Event::Blob(BlobEvent::ComposeReserved { share }) = reserving.await else {
+    let Ok(BlobEvent::ComposeReserved { share }) = reserving.await.into_blob() else {
         panic!("the reservation must take the freed slot")
     };
     assert_eq!(handler.transfer_slots.available_permits(), 0);

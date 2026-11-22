@@ -140,9 +140,14 @@ impl InstallKeyOperation {
     }
 
     fn refused(&self, received: Event) -> InstallTurn {
-        match received {
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => Err(InstallError::InvalidStateEvent {
+        match received.into_blob() {
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => Err(InstallError::InvalidStateEvent {
+                state: format!("{:?}", self.state),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+            Err(other) => Err(InstallError::InvalidStateEvent {
                 state: format!("{:?}", self.state),
                 expected: "the event of the current step",
                 received: other.label(),
@@ -157,7 +162,7 @@ impl InstallKeyOperation {
         };
         self.failure = Some(error.into());
         self.discarded = Some(ticket);
-        let discard = Effect::Blob(BlobEffect::DiscardKey { ticket });
+        let discard = Effect::blob(BlobEffect::DiscardKey { ticket });
         self.call(InstallState::DiscardKey, discard.into())
     }
 
@@ -184,7 +189,7 @@ impl InstallKeyOperation {
 
     fn activate(&mut self) -> InstallTurn {
         let ticket = self.ticket.ok_or(InstallError::NotFinished)?;
-        let activate = Effect::Blob(BlobEffect::ActivateKey { ticket });
+        let activate = Effect::blob(BlobEffect::ActivateKey { ticket });
         self.call(InstallState::ActivateKey, activate.into())
     }
 
@@ -272,20 +277,6 @@ impl InstallKeyOperation {
 
     fn event_answered(&mut self, event: Event) -> InstallTurn {
         match (self.state, event) {
-            (InstallState::PrepareKey, Event::Blob(BlobEvent::KeyPrepared { ticket }))
-                if ticket.key == self.key =>
-            {
-                self.prepared(ticket)
-            }
-            (InstallState::ActivateKey, Event::Blob(BlobEvent::KeyActivated { status }))
-                if self.matches_ticket(&status) =>
-            {
-                self.ticket = None;
-                self.arm_timer(status)
-            }
-            (InstallState::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
-                self.discard(error)
-            }
             (InstallState::ArmTimer, Event::Task(event))
                 if self.activated.as_ref().is_some_and(|status| {
                     let ticket = KeyTicket {
@@ -298,12 +289,27 @@ impl InstallKeyOperation {
                 let status = self.activated.take().ok_or(InstallError::NotFinished)?;
                 self.complete(Ok(status))
             }
-            (InstallState::DiscardKey, Event::Blob(BlobEvent::KeyDiscarded { ticket }))
-                if self.discarded == Some(ticket) =>
-            {
-                self.key_discarded()
-            }
-            (InstallState::DiscardKey, Event::Blob(BlobEvent::Error(_))) => self.key_discarded(),
+            (state, Event::Blob(blob)) => match (state, *blob) {
+                (InstallState::PrepareKey, BlobEvent::KeyPrepared { ticket })
+                    if ticket.key == self.key =>
+                {
+                    self.prepared(ticket)
+                }
+                (InstallState::ActivateKey, BlobEvent::KeyActivated { status })
+                    if self.matches_ticket(&status) =>
+                {
+                    self.ticket = None;
+                    self.arm_timer(status)
+                }
+                (InstallState::ActivateKey, BlobEvent::Error(error)) => self.discard(error),
+                (InstallState::DiscardKey, BlobEvent::KeyDiscarded { ticket })
+                    if self.discarded == Some(ticket) =>
+                {
+                    self.key_discarded()
+                }
+                (InstallState::DiscardKey, BlobEvent::Error(_)) => self.key_discarded(),
+                (_, received) => self.refused(Event::blob(received)),
+            },
             (_, received) => self.refused(received),
         }
     }
@@ -320,7 +326,7 @@ impl Operation for InstallKeyOperation {
     /// The operation hands its only key handle to the adapter and keeps none.
     fn first(&mut self) -> InstallTurn {
         let input = self.input.take().ok_or(InstallError::NotFinished)?;
-        let prepare = Effect::Blob(BlobEffect::PrepareKey {
+        let prepare = Effect::blob(BlobEffect::PrepareKey {
             key: input.key,
             public_key: input.public_key,
             private_key: input.private_key,
@@ -347,7 +353,7 @@ impl Operation for InstallKeyOperation {
     /// A failed run discards the prepared key it still owns.
     fn abort(&mut self) -> Vec<IoCall> {
         self.input = None;
-        let discard = |ticket| Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        let discard = |ticket| Effect::blob(BlobEffect::DiscardKey { ticket }).into();
         self.ticket.take().map(discard).into_iter().collect()
     }
 }
@@ -373,7 +379,7 @@ mod tests {
     }
 
     fn blob(blob: BlobEvent) -> IoResult {
-        event(Event::Blob(blob))
+        event(Event::blob(blob))
     }
 
     fn asked(turn: &InstallTurn) -> &Effect {
@@ -442,15 +448,15 @@ mod tests {
         let mut operation = InstallKeyOperation::new(input(None, Some(Duration::from_secs(60))));
         let turn = operation.first();
         assert!(matches!(
-            asked(&turn),
-            Effect::Blob(BlobEffect::PrepareKey { .. })
+            (asked(&turn)).as_blob(),
+            Some(BlobEffect::PrepareKey { .. })
         ));
         assert!(operation.input.is_none(), "the key handle is handed on");
         let ticket = ticket_of(&operation);
         let turn = operation.next(blob(BlobEvent::KeyPrepared { ticket }));
         assert_eq!(
             asked(&turn),
-            &Effect::Blob(BlobEffect::ActivateKey { ticket })
+            &Effect::blob(BlobEffect::ActivateKey { ticket })
         );
         (operation, ticket)
     }
@@ -548,7 +554,7 @@ mod tests {
         let turn = operation.next(write_done(Ok(())));
         assert_eq!(
             asked(&turn),
-            &Effect::Blob(BlobEffect::ActivateKey { ticket })
+            &Effect::blob(BlobEffect::ActivateKey { ticket })
         );
         let mut open = status(ticket);
         (open.remaining, open.max_remaining) = (None, None);
@@ -573,7 +579,7 @@ mod tests {
         let turn = lost.next(write_done(Err(StorageError::Timeout)));
         assert_eq!(
             asked(&turn),
-            &Effect::Blob(BlobEffect::DiscardKey { ticket })
+            &Effect::blob(BlobEffect::DiscardKey { ticket })
         );
         assert_eq!(
             lost.next(blob(BlobEvent::KeyDiscarded { ticket })),
@@ -609,7 +615,7 @@ mod tests {
         let turn = operation.next(blob(BlobEvent::Error(refused())));
         assert_eq!(
             asked(&turn),
-            &Effect::Blob(BlobEffect::DiscardKey { ticket })
+            &Effect::blob(BlobEffect::DiscardKey { ticket })
         );
         assert_eq!(
             operation.next(blob(BlobEvent::KeyDiscarded { ticket })),
@@ -620,12 +626,12 @@ mod tests {
         let (mut stray, ticket) = prepared();
         let turn = stray.next(blob(BlobEvent::KeyDiscarded { ticket }));
         assert!(matches!(turn, Err(InstallError::InvalidStateEvent { .. })));
-        let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        let discard: IoCall = Effect::blob(BlobEffect::DiscardKey { ticket }).into();
         assert_eq!(stray.abort(), vec![discard]);
 
         // A run stopped before activation discards the prepared key too.
         let (mut stopped, ticket) = prepared();
-        let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        let discard: IoCall = Effect::blob(BlobEffect::DiscardKey { ticket }).into();
         assert_eq!(stopped.abort(), vec![discard]);
         assert!(stopped.abort().is_empty());
     }
@@ -917,7 +923,8 @@ mod tests {
             blob: stream,
             size: Some(23),
         };
-        let Event::Blob(BlobEvent::WriteFinished { location }) = blob.send_blob_effect(write).await
+        let Ok(BlobEvent::WriteFinished { location }) =
+            blob.send_blob_effect(write).await.into_blob()
         else {
             panic!("archive must be written")
         };

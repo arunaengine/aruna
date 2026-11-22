@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashSet};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::AuthorizationError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
@@ -58,11 +60,11 @@ type ReadPolicy = (HashSet<String>, Vec<HashIndex>, bool);
 type ContentPage = (Vec<(Ulid, String)>, bool);
 
 fn close_call(stream_id: Ulid) -> IoCall {
-    Effect::Blob(BlobEffect::CloseConnection { stream_id }).into()
+    Effect::blob(BlobEffect::CloseConnection { stream_id }).into()
 }
 
 fn closed(result: IoResult) -> StreamTurn {
-    if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
+    if let Ok(BlobEvent::Error(error)) = (result.event()?).into_blob() {
         error!(error = ?error, "Failed to close rejected inbound bao stream");
     }
     Ok(Next::Done(()))
@@ -636,7 +638,7 @@ impl AnswerLookupOperation {
         self.step = LookupStep::Send;
         let stream_id = self.stream_id;
         let send = BlobEffect::SendMessage { stream_id, payload };
-        Ok(Next::Call(Effect::Blob(send).into()))
+        Ok(Next::Call(Effect::blob(send).into()))
     }
 }
 
@@ -672,7 +674,7 @@ impl Operation for AnswerLookupOperation {
                 },
             },
             LookupStep::Send => {
-                if let Event::Blob(BlobEvent::Error(error)) = result.event()? {
+                if let Ok(BlobEvent::Error(error)) = (result.event()?).into_blob() {
                     debug!(error = ?error, "Failed to answer a set index lookup");
                 }
                 self.close()

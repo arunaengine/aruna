@@ -358,13 +358,13 @@ impl Operation for GetHoldersOperation {
     type Error = GetHoldersError;
 
     fn first(&mut self) -> Result<Next<Vec<NodeId>>, GetHoldersError> {
-        let get = Effect::Net(NetEffect::Dht(DhtEffect::Get {
+        let get = Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
             key: self.key,
             realm_filter: Some(self.realm_id),
             // Holder discovery must see every publisher, so it stays exhaustive
             // under the default read budget.
             options: DhtGetOptions::default(),
-        }));
+        })));
         Ok(Next::Call(get.into()))
     }
 
@@ -439,7 +439,7 @@ mod pure_tests {
         };
         matches!(
             effect.as_ref(),
-            Effect::Net(NetEffect::Dht(DhtEffect::Put { .. }))
+            Effect::Net(NetEffect::Dht(dht)) if matches!(dht.as_ref(), DhtEffect::Put { .. })
         )
     }
 
@@ -464,11 +464,12 @@ mod pure_tests {
 
         assert!(matches!(
             effect,
-            Effect::Net(NetEffect::Dht(DhtEffect::Put {
-                ttl,
-                value,
-                ..
-            })) if ttl == Duration::from_secs(90) && value.is_empty()
+            Effect::Net(NetEffect::Dht(dht))
+                if matches!(
+                    dht.as_ref(),
+                    DhtEffect::Put { ttl, value, .. }
+                        if *ttl == Duration::from_secs(90) && value.is_empty()
+                )
         ));
     }
 

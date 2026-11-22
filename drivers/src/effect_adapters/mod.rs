@@ -105,9 +105,9 @@ pub(crate) async fn dispatch_effect_until(
     );
 
     let event = match effect {
-        Effect::Blob(blob_effect) => blob::dispatch_blob(blob_effect, context).await,
+        Effect::Blob(blob_effect) => blob::dispatch_blob(*blob_effect, context).await,
         Effect::StagingSource(staging_source_effect) => {
-            blob::dispatch_staging_source(staging_source_effect, context).await
+            blob::dispatch_staging_source(*staging_source_effect, context).await
         }
         Effect::LocalFile(local_file_effect) => {
             blob::dispatch_local_file(local_file_effect, context).await

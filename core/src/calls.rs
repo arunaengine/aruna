@@ -11,12 +11,16 @@ use std::time::Duration;
 use smallvec::smallvec;
 use tracing::warn;
 
-use crate::effects::{Effect, EffectGroup, GroupForm, IterStart, StorageEffect, abort_effects};
+use crate::effects::{
+    BlobEffect, Effect, EffectGroup, GroupForm, IterStart, StagingSourceEffect, StorageEffect,
+    abort_effects,
+};
 use crate::errors::StorageError;
-use crate::events::{Event, GroupEvent, StorageEvent};
+use crate::events::{BlobEvent, Event, GroupEvent, StagingSourceEvent, StorageEvent};
 use crate::keyspaces::USAGE_STATS_KEYSPACE;
 use crate::operation::{
-    AfterConflict, HoldScope, Operation, SubOperation, TransactionMode, boxed_suboperation,
+    AfterConflict, HoldScope, Operation, SubOperation, TransactionMode, boxed_retry,
+    boxed_suboperation,
 };
 use crate::structs::storage::distribution::accounting::RangeCounters;
 use crate::structs::storage::usage::{BucketDelta, UsageDelta};
@@ -98,6 +102,16 @@ pub enum IoResult {
 }
 
 impl IoCall {
+    /// Runs `effect` on the blob adapter; answered by [`IoResult::blob`].
+    pub fn blob(effect: BlobEffect) -> Self {
+        Self::Effect(Box::new(Effect::blob(effect)))
+    }
+
+    /// Runs `effect` on the staging-source adapter; answered by [`IoResult::staging`].
+    pub fn staging(effect: StagingSourceEffect) -> Self {
+        Self::Effect(Box::new(Effect::staging(effect)))
+    }
+
     /// Runs `operation` as a child; its result comes back as [`IoResult::Child`].
     pub fn child<O>(operation: O) -> Self
     where
@@ -106,6 +120,29 @@ impl IoCall {
         O::Error: PartialEq + 'static,
     {
         Self::Child(boxed_suboperation(operation, |result| {
+            Event::Child(ChildOutcome::new(result))
+        }))
+    }
+
+    /// Runs a cloneable `operation` as a conflict-retrying child; see [`IoResult::child`].
+    pub fn retry<O>(operation: O, seed: &[u8]) -> Self
+    where
+        O: Operation + Clone + 'static,
+        O::Output: PartialEq + 'static,
+        O::Error: PartialEq + 'static,
+    {
+        Self::retry_with(move || operation.clone(), seed)
+    }
+
+    /// Runs `build` as a conflict-retrying child; see [`IoResult::child`].
+    pub fn retry_with<O, B>(build: B, seed: &[u8]) -> Self
+    where
+        O: Operation + 'static,
+        O::Output: PartialEq + 'static,
+        O::Error: PartialEq + 'static,
+        B: FnMut() -> O + Send + 'static,
+    {
+        Self::Child(boxed_retry(build, seed, |result| {
             Event::Child(ChildOutcome::new(result))
         }))
     }
@@ -295,6 +332,22 @@ impl IoResult {
             other => Err(other.other("IoResult::Event")),
         }
     }
+
+    /// The blob event that answered an [`IoCall::blob`] call.
+    pub fn blob(self) -> Result<BlobEvent, IoError> {
+        match self.event()? {
+            Event::Blob(event) => Ok(*event),
+            other => Err(unexpected("a blob event", other.label())),
+        }
+    }
+
+    /// The staging-source event that answered an [`IoCall::staging`] call.
+    pub fn staging(self) -> Result<StagingSourceEvent, IoError> {
+        match self.event()? {
+            Event::StagingSource(event) => Ok(*event),
+            other => Err(unexpected("a staging source event", other.label())),
+        }
+    }
 }
 
 /// What an operation does next.
@@ -390,6 +443,7 @@ pub struct CallRun<P: Operation> {
     operation: P,
     mode: TransactionMode,
     txn_id: Option<TxnId>,
+    conflicted: bool,
     state: State<P::Output, P::Error>,
 }
 
@@ -479,6 +533,7 @@ impl<P: Operation> PartialEq for CallRun<P> {
         self.operation == other.operation
             && self.mode == other.mode
             && self.txn_id == other.txn_id
+            && self.conflicted == other.conflicted
             && std::mem::discriminant(&self.state) == std::mem::discriminant(&other.state)
     }
 }
@@ -490,6 +545,7 @@ impl<P: Operation> CallRun<P> {
             mode: operation.transaction(),
             operation,
             txn_id: None,
+            conflicted: false,
             state: State::Created,
         }
     }
@@ -502,7 +558,7 @@ impl<P: Operation> CallRun<P> {
                 Ok(Next::Then { output, calls }) => return self.finish(output, calls),
                 Ok(Next::Wait) => {
                     let got = "Next::Wait outside a window";
-                    return self.fail(unexpected("a call or an outcome", got));
+                    return self.fail_io(unexpected("a call or an outcome", got));
                 }
                 Ok(Next::Call(call)) => call,
             };
@@ -538,7 +594,7 @@ impl<P: Operation> CallRun<P> {
                 self.state = State::Waiting(wait);
                 smallvec![effect]
             }
-            Err(error) => self.fail(error),
+            Err(error) => self.fail_io(error),
         }
     }
 
@@ -557,7 +613,7 @@ impl<P: Operation> CallRun<P> {
                 let txn_id = self.txn_for(&mut call);
                 match call_effect(call, txn_id) {
                     Ok((_, effect)) => smallvec![effect],
-                    Err(error) => self.fail(error),
+                    Err(error) => self.fail_io(error),
                 }
             }
             turn => self.advance(turn),
@@ -594,6 +650,14 @@ impl<P: Operation> CallRun<P> {
         }
         self.state = State::Finished(Ok(output));
         smallvec![]
+    }
+
+    /// Records a runner-level conflict before converting `error` into the operation's error type.
+    fn fail_io(&mut self, error: IoError) -> Effects {
+        if error == IoError::Conflict {
+            self.conflicted = true;
+        }
+        self.fail(error)
     }
 
     /// Ends with `error`: aborts an open transaction unless its commit was sent, then sends the
@@ -633,7 +697,7 @@ impl<P: Operation> CallRun<P> {
                     self.txn_id = Some(txn_id);
                     self.request(call)
                 }
-                other => self.fail(failure("StorageEvent::TransactionStarted", other)),
+                other => self.fail_io(failure("StorageEvent::TransactionStarted", other)),
             },
             State::Waiting(Wait::Window) => match event {
                 Event::Group(member @ GroupEvent::Member { .. }) => self.member(member),
@@ -661,7 +725,7 @@ impl<P: Operation> CallRun<P> {
                         self.operation.rolled_back();
                     }
                     self.state = State::Committing(output, calls);
-                    self.fail(failure("StorageEvent::TransactionCommitted", other))
+                    self.fail_io(failure("StorageEvent::TransactionCommitted", other))
                 }
             },
             State::After {
@@ -728,8 +792,13 @@ impl<P: Operation> CallRun<P> {
                 self.state = state;
                 smallvec![]
             }
-            _ => self.fail(IoError::Aborted),
+            _ => self.fail_io(IoError::Aborted),
         }
+    }
+
+    /// Whether the runner ended this attempt because a storage transaction conflicted.
+    pub fn lost_conflict(&self) -> bool {
+        self.conflicted
     }
 
     /// The runner's clock in Unix milliseconds, given before `start` and each `step`.
@@ -763,7 +832,7 @@ impl<P: Operation> CallRun<P> {
                 let turn = self.operation.next(result);
                 self.advance(turn)
             }
-            Err(error) => self.fail(error),
+            Err(error) => self.fail_io(error),
         }
     }
 }

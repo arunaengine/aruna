@@ -14,7 +14,7 @@ const ASK: &str = "ASK { ?s ?p ?o }";
 fn entry(entry: Option<(MetadataQueryResults, usize)>) -> IoResult {
     answer(MetadataEvent::QueryCacheEntry {
         stamp: [4, 5],
-        entry,
+        entry: entry.map(Box::new),
     })
 }
 

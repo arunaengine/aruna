@@ -196,12 +196,12 @@ async fn drive_until_txn(operation: &mut PutObjectOperation, context: &DriverCon
                 };
                 IoResult::Values(values.into_iter().map(|(_, value)| value).collect())
             }
-            IoCall::Effect(effect) => match *effect {
-                Effect::Blob(effect) => {
+            IoCall::Effect(effect) => match (*effect).into_blob() {
+                Ok(effect) => {
                     let blob = context.blob_handle.as_ref().expect("blob handle");
                     IoResult::Event(Box::new(blob.send_blob_effect(effect).await))
                 }
-                other => panic!("unexpected pre-transaction effect {other:?}"),
+                Err(other) => panic!("unexpected pre-transaction effect {other:?}"),
             },
             // The version transaction runs as a child.
             IoCall::Child(_) => return,

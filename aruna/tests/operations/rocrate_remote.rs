@@ -352,7 +352,7 @@ async fn write_payload(
     let blob = BackendStream::<Result<Bytes, StreamError>>::new(stream::once(async {
         Ok::<Bytes, std::io::Error>(Bytes::from_static(PAYLOAD))
     }));
-    match node
+    match (node
         .context
         .blob_handle
         .as_ref()
@@ -365,10 +365,15 @@ async fn write_payload(
             blob,
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     {
-        Event::Blob(BlobEvent::WriteFinished { location }) => Ok(location),
-        event => Err(format!("holder payload write failed: {event:?}").into()),
+        Ok(BlobEvent::WriteFinished { location }) => Ok(location),
+        Ok(event) => {
+            let event = Event::blob(event);
+            Err(format!("holder payload write failed: {event:?}").into())
+        }
+        Err(event) => Err(format!("holder payload write failed: {event:?}").into()),
     }
 }
 

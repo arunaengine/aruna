@@ -4,11 +4,13 @@
 
 use crate::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StagingSourceEffect};
+use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::{
     ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
-use aruna_core::events::{Event, StagingSourceEvent};
+#[cfg(test)]
+use aruna_core::events::Event;
+use aruna_core::events::StagingSourceEvent;
 use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::source_access::{ResolvedSourceAccess, SourceMetadata};
@@ -123,18 +125,15 @@ impl Operation for ObserveSourceOperation {
                 let access = result.child::<ResolvedSourceAccess, SourceResolutionError>()??;
                 self.state = ObserveState::HeadSource;
                 let head = StagingSourceEffect::Head { access };
-                return Ok(Next::Call(IoCall::Effect(Box::new(Effect::StagingSource(
-                    head,
-                )))));
+                return Ok(Next::Call(IoCall::staging(head)));
             }
             ObserveState::HeadSource => {}
         }
-        match (self.state, result.event()?) {
-            (
-                ObserveState::HeadSource,
-                Event::StagingSource(StagingSourceEvent::HeadResult { metadata }),
-            ) => Ok(Next::Done(metadata)),
-            (_, Event::StagingSource(StagingSourceEvent::Error { error })) => Err(error.into()),
+        match (self.state, result.staging()?) {
+            (ObserveState::HeadSource, StagingSourceEvent::HeadResult { metadata }) => {
+                Ok(Next::Done(metadata))
+            }
+            (_, StagingSourceEvent::Error { error }) => Err(error.into()),
             (_, event) => Err(IoError::Unexpected {
                 expected: "the version access or the source head",
                 got: event.label(),
@@ -215,7 +214,7 @@ mod tests {
         let mut operation = ObserveSourceOperation::new(VersionKey::new("b", "k", Ulid::nil()));
         operation.state = ObserveState::HeadSource;
 
-        let failed = Event::StagingSource(StagingSourceEvent::Error {
+        let failed = Event::staging(StagingSourceEvent::Error {
             error: StagingSourceError::ReadError("reset".to_string()),
         });
         let error = operation

@@ -364,10 +364,14 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
 /// commit acknowledgement is never lost.
 pub(crate) fn managed_effect(effect: &Effect) -> bool {
     match effect {
-        Effect::Blob(BlobEffect::ReleaseReservation { .. }) => true,
-        Effect::Blob(BlobEffect::SpoolHidden {
-            deadline: Some(_), ..
-        }) => true,
+        Effect::Blob(blob) => matches!(
+            blob.as_ref(),
+            BlobEffect::ReleaseReservation { .. }
+                | BlobEffect::SpoolHidden {
+                    deadline: Some(_),
+                    ..
+                }
+        ),
         Effect::Storage(StorageEffect::CommitTransaction { .. }) => true,
         Effect::Storage(StorageEffect::Write {
             key_space,
@@ -1312,66 +1316,9 @@ pub async fn drive_until<O: Operation>(
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
-    machine_until(CallRun::new(operation), context, deadline).await
-}
-
-async fn machine_until<P: Operation>(
-    mut operation: CallRun<P>,
-    context: &DriverContext,
-    deadline: tokio::time::Instant,
-) -> Result<P::Output, P::Error> {
-    let scope = operation.hold_scope();
-    let hold = take_hold(context, scope);
-    let Ok(_hold) = tokio::time::timeout_at(deadline, hold).await else {
-        warn!(
-            operation = %type_name::<CallRun<P>>(),
-            "Operation deadline expired while it waited for its backend hold"
-        );
-        let _ = operation.abort();
-        return operation.finalize();
-    };
-    let mut run = ParentRun(&mut operation, None);
-    let effects = drive_effects(
-        &mut run,
-        context,
-        0,
-        Some(deadline),
-        Some(type_name::<CallRun<P>>()),
-    );
-    let mut state = holding(scope, effects).await;
-    let record = run.1;
-    if !operation.is_complete() {
-        // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
-        // tracker resolve any transaction they name.
-        let _ = operation.abort();
-    }
-    abort_leaked_transaction(
-        &mut state.tracker,
-        context,
-        0,
-        Some(state.cleanup_deadline.unwrap_or(deadline)),
-    )
-    .await;
-    let result = operation.finalize();
-    record_end(record, &result);
-    if let Err(error) = &result {
-        if P::expected_error(error) {
-            debug!(
-                event = "operation.rejected",
-                operation = %type_name::<CallRun<P>>(),
-                error = ?error,
-                "Operation rejected"
-            );
-        } else {
-            error!(
-                event = "operation.failed",
-                operation = %type_name::<CallRun<P>>(),
-                error = ?error,
-                "Operation failed"
-            );
-        }
-    }
-    result
+    run_machine(CallRun::new(operation), context, Some(deadline))
+        .await
+        .0
 }
 
 /// Drives an operation without a deadline. Transaction ownership and the effect
@@ -1386,41 +1333,67 @@ pub async fn drive<O: Operation>(
     operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
-    drive_machine(CallRun::new(operation), context).await
+    run_machine(CallRun::new(operation), context, None).await.0
 }
 
-async fn drive_machine<P: Operation>(
+/// Drives one `CallRun`, returning its outcome and whether the runner saw a storage conflict.
+async fn run_machine<P: Operation>(
     mut operation: CallRun<P>,
     context: &DriverContext,
-) -> Result<P::Output, P::Error> {
+    deadline: Option<tokio::time::Instant>,
+) -> (Result<P::Output, P::Error>, bool) {
     let operation_name = type_name::<CallRun<P>>();
-
-    trace!(
-        event = "operation.started",
-        operation = %operation_name,
-        "Starting operation"
-    );
+    if deadline.is_none() {
+        trace!(
+            event = "operation.started",
+            operation = %operation_name,
+            "Starting operation"
+        );
+    }
 
     let scope = operation.hold_scope();
-    let _hold = take_hold(context, scope).await;
+    let _hold = match deadline {
+        Some(limit) => match tokio::time::timeout_at(limit, take_hold(context, scope)).await {
+            Ok(hold) => hold,
+            Err(_) => {
+                warn!(
+                    operation = %operation_name,
+                    "Operation deadline expired while it waited for its backend hold"
+                );
+                let _ = operation.abort();
+                let conflicted = operation.lost_conflict();
+                return (operation.finalize(), conflicted);
+            }
+        },
+        None => take_hold(context, scope).await,
+    };
     let mut run = ParentRun(&mut operation, None);
+    let label = deadline.map(|_| operation_name);
     // Heap the effect loop: an adapter may drive another operation inline, and
     // nested effect-loop futures otherwise stack up in one caller's future.
     let mut state = Box::pin(holding(
         scope,
-        drive_effects(&mut run, context, 0, None, None),
+        drive_effects(&mut run, context, 0, deadline, label),
     ))
     .await;
     let record = run.1;
-    abort_leaked_transaction(&mut state.tracker, context, 0, None).await;
+    if deadline.is_some() && !operation.is_complete() {
+        // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
+        // tracker resolve any transaction they name.
+        let _ = operation.abort();
+    }
+    let cleanup_until = deadline.map(|limit| state.cleanup_deadline.unwrap_or(limit));
+    abort_leaked_transaction(&mut state.tracker, context, 0, cleanup_until).await;
+    let conflicted = operation.lost_conflict();
     let result = operation.finalize();
     record_end(record, &result);
     match &result {
-        Ok(_) => trace!(
+        Ok(_) if deadline.is_none() => trace!(
             event = "operation.completed",
             operation = %operation_name,
             "Completed operation"
         ),
+        Ok(_) => {}
         Err(error) if P::expected_error(error) => debug!(
             event = "operation.rejected",
             operation = %operation_name,
@@ -1434,12 +1407,11 @@ async fn drive_machine<P: Operation>(
             "Operation failed"
         ),
     }
-    result
+    (result, conflicted)
 }
 
-/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it builds the next
-/// attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`, finish or fail.
-/// The same seed gives the same waits; distinct seeds spread conflicting writers out.
+/// Drives a fresh operation from `build`; after a conflict (`lost_conflict` or `is_conflict`) it
+/// builds the next attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`.
 pub async fn drive_retry<O: Operation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
@@ -1469,12 +1441,9 @@ async fn retry_machine<P: Operation>(
     let mut operation = build();
     let mut attempt: u32 = 0;
     loop {
-        let result = match deadline {
-            Some(deadline) => machine_until(operation, context, deadline).await,
-            None => drive_machine(operation, context).await,
-        };
+        let (result, conflicted) = run_machine(operation, context, deadline).await;
         let error = match result {
-            Err(error) if P::is_conflict(&error) => error,
+            Err(error) if conflicted || P::is_conflict(&error) => error,
             result => return result,
         };
         attempt = attempt.saturating_add(1);
@@ -2148,7 +2117,7 @@ mod test {
             >();
             wait.await
         });
-        Effect::Blob(BlobEffect::SpoolHidden {
+        Effect::blob(BlobEffect::SpoolHidden {
             namespace: ulid::Ulid::from_bytes([8u8; 16]),
             name: "after-commit".to_string(),
             created_by: aruna_core::user::id::UserId::default(),
@@ -2205,7 +2174,7 @@ mod test {
     }
 
     fn pending_blob() -> Effect {
-        Effect::Blob(BlobEffect::SpoolHidden {
+        Effect::blob(BlobEffect::SpoolHidden {
             namespace: ulid::Ulid::from_bytes([9u8; 16]),
             name: "nested-deadline".to_string(),
             created_by: aruna_core::user::id::UserId::default(),
@@ -2665,14 +2634,11 @@ mod test {
                     version: None,
                 },
             };
-            Ok(Next::Call(IoCall::from(Effect::StagingSource(head))))
+            Ok(Next::Call(IoCall::staging(head)))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-            let answered = matches!(
-                result.event()?,
-                Event::StagingSource(StagingSourceEvent::Error { .. })
-            );
+            let answered = matches!(result.staging()?, StagingSourceEvent::Error { .. });
             Ok(Next::Done(answered))
         }
     }
@@ -2836,9 +2802,12 @@ mod test {
                         u64::from(key[0]),
                         Event::Storage(StorageEvent::ReadResult { key, value: None }),
                     ),
-                    Effect::Blob(BlobEffect::ReleaseReservation { id }) => {
-                        (3, Event::Blob(BlobEvent::ReservationReleased { id }))
-                    }
+                    Effect::Blob(blob) => match *blob {
+                        BlobEffect::ReleaseReservation { id } => {
+                            (3, Event::blob(BlobEvent::ReservationReleased { id }))
+                        }
+                        other => panic!("unexpected member {other:?}"),
+                    },
                     other => panic!("unexpected member {other:?}"),
                 };
                 tokio::time::sleep_until(Instant::now() + Duration::from_secs(seconds)).await;
@@ -2914,7 +2883,7 @@ mod test {
         let id = ulid::Ulid::from_bytes([3u8; 16]);
         run.add([
             slow_read(5),
-            Effect::Blob(BlobEffect::ReleaseReservation { id }),
+            Effect::blob(BlobEffect::ReleaseReservation { id }),
         ]);
         let started = Instant::now();
         let results = run_all(&mut run, &mut Vec::new()).await;
@@ -2922,7 +2891,7 @@ mod test {
             results,
             [
                 GroupResult::Unfinished,
-                GroupResult::Done(Box::new(Event::Blob(BlobEvent::ReservationReleased { id }))),
+                GroupResult::Done(Box::new(Event::blob(BlobEvent::ReservationReleased { id }))),
             ]
         );
         // The managed release finishes after the deadline instead of being cut off.
@@ -3089,7 +3058,7 @@ mod test {
                 hashes: Default::default(),
             };
             Ok(Next::Call(IoCall::Group(EffectGroup {
-                members: vec![Effect::Blob(BlobEffect::Delete { location })],
+                members: vec![Effect::blob(BlobEffect::Delete { location })],
                 limit: 1,
                 form: GroupForm::All { deadline: None },
             })))
@@ -3310,16 +3279,14 @@ mod test {
                 let _ = gate.await;
                 Ok::<_, aruna_core::stream::StreamError>(bytes::Bytes::new())
             });
-            Ok(Next::Call(IoCall::from(Effect::Blob(
-                BlobEffect::SpoolHidden {
-                    namespace: ulid::Ulid::from_bytes([5u8; 16]),
-                    name: self.name.to_string(),
-                    created_by: aruna_core::user::id::UserId::default(),
-                    max_bytes: None,
-                    deadline: None,
-                    blob: aruna_core::stream::BackendStream::new(blob),
-                },
-            ))))
+            Ok(Next::Call(IoCall::blob(BlobEffect::SpoolHidden {
+                namespace: ulid::Ulid::from_bytes([5u8; 16]),
+                name: self.name.to_string(),
+                created_by: aruna_core::user::id::UserId::default(),
+                max_bytes: None,
+                deadline: None,
+                blob: aruna_core::stream::BackendStream::new(blob),
+            })))
         }
 
         fn next(&mut self, _: IoResult) -> Result<Next<()>, IoError> {

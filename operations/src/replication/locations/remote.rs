@@ -5,7 +5,7 @@
 use super::LocationSummaryError;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::replication_protocol::{
@@ -28,7 +28,7 @@ pub struct RemoteLocationOperation {
 }
 
 fn blob_call(effect: BlobEffect) -> Next<LocationSummary> {
-    Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect))))
+    Next::Call(IoCall::blob(effect))
 }
 
 impl RemoteLocationOperation {
@@ -88,24 +88,22 @@ impl Operation for RemoteLocationOperation {
     }
 
     fn next(&mut self, result: IoResult) -> Step {
-        match result.event()? {
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            Event::Blob(BlobEvent::ConnectionEstablished { stream_id })
-                if self.stream_id.is_none() =>
-            {
+        match result.blob()? {
+            BlobEvent::Error(error) => Err(error.into()),
+            BlobEvent::ConnectionEstablished { stream_id } if self.stream_id.is_none() => {
                 self.opened(stream_id)
             }
-            Event::Blob(BlobEvent::MessageSent { stream_id })
+            BlobEvent::MessageSent { stream_id }
                 if Some(stream_id) == self.stream_id && self.answer.is_none() =>
             {
                 Ok(blob_call(BlobEffect::ReadMessage { stream_id }))
             }
-            Event::Blob(BlobEvent::MessageReceived { stream_id, payload })
+            BlobEvent::MessageReceived { stream_id, payload }
                 if Some(stream_id) == self.stream_id && self.answer.is_none() =>
             {
                 self.received(stream_id, &payload)
             }
-            Event::Blob(BlobEvent::ConnectionClosed { stream_id }) if self.answer.is_some() => {
+            BlobEvent::ConnectionClosed { stream_id } if self.answer.is_some() => {
                 self.closed(stream_id)
             }
             other => Err(unexpected(
@@ -118,7 +116,7 @@ impl Operation for RemoteLocationOperation {
     /// A deadline or a failure must release the stream; only `CloseConnection` unregisters it.
     fn abort(&mut self) -> Vec<IoCall> {
         let close = |stream_id| {
-            let close = Effect::Blob(BlobEffect::CloseConnection { stream_id });
+            let close = Effect::blob(BlobEffect::CloseConnection { stream_id });
             IoCall::Effect(Box::new(close))
         };
         self.stream_id.take().map(close).into_iter().collect()
@@ -130,7 +128,7 @@ mod pure_tests {
     use super::{LocationSummaryError, RemoteLocationOperation, Step};
     use crate::tests::locations::{node_id, request};
     use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-    use aruna_core::effects::{BlobEffect, Effect};
+    use aruna_core::effects::BlobEffect;
     use aruna_core::events::{BlobEvent, Event};
     use aruna_core::operation::Operation;
     use aruna_core::replication_protocol::{LocationSummary, VersionReplicationMessage};
@@ -141,7 +139,7 @@ mod pure_tests {
     }
 
     fn blob(event: BlobEvent) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(event)))
+        IoResult::Event(Box::new(Event::blob(event)))
     }
 
     /// Runs up to the peer's answer and returns the step after it.
@@ -160,7 +158,7 @@ mod pure_tests {
         let close = BlobEffect::CloseConnection {
             stream_id: stream(),
         };
-        IoCall::Effect(Box::new(Effect::Blob(close)))
+        IoCall::blob(close)
     }
 
     fn closed() -> IoResult {

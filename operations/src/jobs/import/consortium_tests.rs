@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use aruna_blob::archive::{inspect_archive, open_archive, read_metadata};
 use aruna_blob::blob::BlobHandle;
 use aruna_core::effects::BlobEffect;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::rocrate_archive::{file_id_candidates, payload_entries, signature_entry};
 use aruna_core::stream::BackendStream;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
@@ -51,11 +51,11 @@ async fn spool_archive(
 ) -> (BackendLocation, u64) {
     let expected_hash = *blake3::hash(bytes).as_bytes();
     let expected_size = bytes.len() as u64;
-    let Event::Blob(BlobEvent::HiddenSpooled {
+    let Ok(BlobEvent::HiddenSpooled {
         location,
         blake3: actual_hash,
         size,
-    }) = handle
+    }) = (handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace: Ulid::from_bytes([seed; 16]),
             name: "consortium".to_string(),
@@ -66,7 +66,8 @@ async fn spool_archive(
                 Bytes::from_static(bytes),
             )])),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("fixture spool failed")
     };

@@ -6,7 +6,7 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::BlobError;
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     BLOB_QUARANTINE_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_CLAIM_KEYSPACE,
@@ -375,7 +375,7 @@ impl Operation for KeyUnlockedOperation {
     type Error = IoError;
 
     fn first(&mut self) -> Result<Next<bool>, IoError> {
-        let effect = Effect::Blob(BlobEffect::ReadKeyStatus {
+        let effect = Effect::blob(BlobEffect::ReadKeyStatus {
             bucket_id: self.key.bucket_id,
         });
         Ok(Next::Call(IoCall::Effect(Box::new(effect))))
@@ -383,8 +383,8 @@ impl Operation for KeyUnlockedOperation {
 
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
         let unlocked = match result {
-            IoResult::Event(event) => match *event {
-                Event::Blob(BlobEvent::KeyStatus { generations }) => generations
+            IoResult::Event(event) => match (*event).into_blob() {
+                Ok(BlobEvent::KeyStatus { generations }) => generations
                     .iter()
                     .any(|status| status.key == self.key && status.active),
                 _ => false,

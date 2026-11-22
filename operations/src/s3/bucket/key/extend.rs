@@ -122,9 +122,14 @@ impl ExtendBucketOperation {
     }
 
     fn refused(&self, received: Event) -> ExtendTurn {
-        match received {
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => Err(ExtendError::InvalidStateEvent {
+        match received.into_blob() {
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => Err(ExtendError::InvalidStateEvent {
+                state: format!("{:?}", self.step),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+            Err(other) => Err(ExtendError::InvalidStateEvent {
                 state: format!("{:?}", self.step),
                 expected: "the event of the current step",
                 received: other.label(),
@@ -159,7 +164,7 @@ impl ExtendBucketOperation {
     /// Asks the registry first, so an extension it would refuse writes no intent at all.
     fn check_session(&mut self) -> ExtendTurn {
         let key = self.key.ok_or(ExtendError::NotFinished)?;
-        let status = Effect::Blob(BlobEffect::ReadKeyStatus {
+        let status = Effect::blob(BlobEffect::ReadKeyStatus {
             bucket_id: key.bucket_id,
         });
         self.call(ExtendStep::CheckSession, status.into())
@@ -226,7 +231,7 @@ impl ExtendBucketOperation {
     /// The registry refuses a session of another generation and any bound past the maximum.
     fn extend(&mut self) -> ExtendTurn {
         let key = self.key.ok_or(ExtendError::NotFinished)?;
-        let extend = Effect::Blob(BlobEffect::ExtendKey {
+        let extend = Effect::blob(BlobEffect::ExtendKey {
             key,
             session_id: self.input.session_id,
             duration: self.input.duration,
@@ -290,15 +295,6 @@ impl ExtendBucketOperation {
 
     fn event_answered(&mut self, event: Event) -> ExtendTurn {
         match (self.step, event) {
-            (ExtendStep::CheckSession, Event::Blob(BlobEvent::KeyStatus { generations })) => {
-                self.session_checked(&generations)
-            }
-            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::KeyExtended { status })) => {
-                self.move_timer(status)
-            }
-            (ExtendStep::ExtendKey, Event::Blob(BlobEvent::Error(error))) => {
-                self.reject(error.into())
-            }
             // A timer that did not move only records the lock late; admission ends on time.
             (ExtendStep::MoveTimer, Event::Task(event))
                 if self.status.as_ref().is_some_and(|status| {
@@ -311,6 +307,16 @@ impl ExtendBucketOperation {
             {
                 self.audit()
             }
+            (step, Event::Blob(blob)) => match (step, *blob) {
+                (ExtendStep::CheckSession, BlobEvent::KeyStatus { generations }) => {
+                    self.session_checked(&generations)
+                }
+                (ExtendStep::ExtendKey, BlobEvent::KeyExtended { status }) => {
+                    self.move_timer(status)
+                }
+                (ExtendStep::ExtendKey, BlobEvent::Error(error)) => self.reject(error.into()),
+                (_, received) => self.refused(Event::blob(received)),
+            },
             (_, received) => self.refused(received),
         }
     }
@@ -371,7 +377,7 @@ mod tests {
     }
 
     fn blob(blob: BlobEvent) -> IoResult {
-        event(Event::Blob(blob))
+        event(Event::blob(blob))
     }
 
     fn intent_done(result: Result<(), StorageError>) -> IoResult {
@@ -442,7 +448,7 @@ mod tests {
         let check = BlobEffect::ReadKeyStatus {
             bucket_id: BUCKET_ID,
         };
-        assert_eq!(asked(turn), &Effect::Blob(check));
+        assert_eq!(asked(turn), &Effect::blob(check));
         let generations = vec![status(Some(Duration::from_secs(60)))];
         operation.next(blob(BlobEvent::KeyStatus { generations }))
     }
@@ -667,7 +673,7 @@ mod tests {
             session_id: SESSION,
             duration: Some(Duration::from_secs(30)),
         };
-        assert_eq!(asked(&turn), &Effect::Blob(extend));
+        assert_eq!(asked(&turn), &Effect::blob(extend));
         let remaining = Some(Duration::from_secs(30));
         let turn = operation.next(blob(BlobEvent::KeyExtended {
             status: status(remaining),

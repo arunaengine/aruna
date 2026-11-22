@@ -724,7 +724,7 @@ impl Operation for IncomingVersionOperation {
             calls.extend(self.reconcile_call());
             if let Some(received) = self.received_blob.as_ref() {
                 let id = received.location.ulid;
-                calls.push(Effect::Blob(BlobEffect::ReleaseReservation { id }).into());
+                calls.push(Effect::blob(BlobEffect::ReleaseReservation { id }).into());
             }
         }
         if self.owes_rejection() {
@@ -733,14 +733,14 @@ impl Operation for IncomingVersionOperation {
             if let Ok(payload) = VersionReplicationMessage::VersionApplyRejected(reason).to_bytes()
             {
                 let send = BlobEffect::SendMessage { stream_id, payload };
-                calls.push(Effect::Blob(send).into());
+                calls.push(Effect::blob(send).into());
             }
         }
         let cleanup = self.received_blob.as_mut();
         if let Some(location) = cleanup.and_then(ReceivedBlob::take_cleanup) {
-            calls.push(Effect::Blob(BlobEffect::Delete { location }).into());
+            calls.push(Effect::blob(BlobEffect::Delete { location }).into());
         }
-        calls.push(Effect::Blob(BlobEffect::CloseConnection { stream_id }).into());
+        calls.push(Effect::blob(BlobEffect::CloseConnection { stream_id }).into());
         calls
     }
 
@@ -868,7 +868,7 @@ impl IncomingVersionOperation {
     }
 
     fn blob(&mut self, state: IncomingVersionState, effect: BlobEffect) -> Turn {
-        self.call(state, Effect::Blob(effect).into())
+        self.call(state, Effect::blob(effect).into())
     }
 
     fn version_key_bytes(&self) -> Result<Vec<u8>, ConversionError> {
@@ -1355,16 +1355,20 @@ impl IncomingVersionOperation {
     }
 
     fn accept_envelope(&mut self, event: Event) -> Turn {
-        let envelope = match event {
-            Event::Blob(BlobEvent::Abe(event)) => match *event {
+        let envelope = match event.into_blob() {
+            Ok(BlobEvent::Abe(event)) => match *event {
                 AbeEvent::Envelope(envelope) => envelope,
                 event => {
-                    let received = Event::Blob(BlobEvent::Abe(Box::new(event))).label();
+                    let received = Event::blob(BlobEvent::Abe(Box::new(event))).label();
                     return self.invalid("AbeEvent::Envelope", received);
                 }
             },
-            Event::Blob(BlobEvent::Error(error)) => return self.reject_negotiation(error.into()),
-            event => {
+            Ok(BlobEvent::Error(error)) => return self.reject_negotiation(error.into()),
+            Ok(event) => {
+                return self.invalid("Event::Blob(BlobEvent::Abe)", event.label());
+            }
+
+            Err(event) => {
                 return self.invalid("Event::Blob(BlobEvent::Abe)", event.label());
             }
         };
@@ -2472,11 +2476,12 @@ impl IncomingVersionOperation {
     }
 
     fn accept_reservation_release(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::ReservationReleased { id }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::ReservationReleased)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::ReservationReleased { id }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::ReservationReleased)", received);
         };
         if self.release_id != Some(id) {
-            let received = Event::Blob(BlobEvent::ReservationReleased { id }).label();
+            let received = Event::blob(BlobEvent::ReservationReleased { id }).label();
             return self.invalid("matching reservation id", received);
         }
         self.release_id = None;
@@ -2682,7 +2687,7 @@ impl IncomingVersionOperation {
                 event.label(),
             );
         };
-        match result {
+        match *result {
             Ok(inputs) => self.destination_inputs = inputs,
             Err(error) => {
                 return self.fail(IncomingVersionError::RoutingInputsFailed(error));
@@ -2917,8 +2922,9 @@ impl IncomingVersionOperation {
     }
 
     fn accept_reply_sent(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::MessageSent)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::MessageSent { .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::MessageSent)", received);
         };
 
         match self.negotiation_result.clone() {
@@ -2969,14 +2975,15 @@ impl IncomingVersionOperation {
 // Accepting the transferred blob, then the apply's purge-fence and destination-drift checks.
 impl IncomingVersionOperation {
     fn accept_source_approval(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::MessageReceived { payload, .. }) = event else {
-            return self.invalid("VersionApplyApproved", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::MessageReceived { payload, .. }) = event.into_blob() else {
+            return self.invalid("VersionApplyApproved", received);
         };
         match VersionReplicationMessage::from_bytes(&payload) {
             Ok(VersionReplicationMessage::VersionApplyApproved) => self.start_apply(),
             Ok(_) => {
                 let stream_id = self.stream_id;
-                let received = Event::Blob(BlobEvent::MessageReceived { stream_id, payload });
+                let received = Event::blob(BlobEvent::MessageReceived { stream_id, payload });
                 self.invalid("VersionApplyApproved", received.label())
             }
             Err(error) => self.fail(error.into()),
@@ -2984,15 +2991,22 @@ impl IncomingVersionOperation {
     }
 
     fn accept_blob_finish(&mut self, event: Event) -> Turn {
-        let location = match event {
-            Event::Blob(BlobEvent::ReplicationFinished { location }) => location,
-            Event::Blob(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
+        let location = match event.into_blob() {
+            Ok(BlobEvent::ReplicationFinished { location }) => location,
+            Ok(BlobEvent::Error(BlobError::WriteCleanup { location, .. })) => {
                 self.received_blob = Some(ReceivedBlob::reserved(location));
                 return self.fail(IncomingVersionError::ReplicationError(
                     ReplicationError::ReplicationFailed,
                 ));
             }
-            other => {
+            Ok(other) => {
+                return self.invalid(
+                    "Event::Blob(BlobEvent::{ReplicationFinished|WriteCleanup})",
+                    other.label(),
+                );
+            }
+
+            Err(other) => {
                 return self.invalid(
                     "Event::Blob(BlobEvent::{ReplicationFinished|WriteCleanup})",
                     other.label(),
@@ -3351,8 +3365,9 @@ impl IncomingVersionOperation {
     }
 
     fn accept_completion_sent(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::MessageSent { .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::MessageSent)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::MessageSent { .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::MessageSent)", received);
         };
         debug!(
             bucket = %self.manifest.bucket,
@@ -3368,8 +3383,9 @@ impl IncomingVersionOperation {
 // Phase: close
 impl IncomingVersionOperation {
     fn accept_connection_close(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::ConnectionClosed { .. }) = event else {
-            return self.invalid("Event::Blob(BlobEvent::ConnectionClosed)", event.label());
+        let received = event.label();
+        let Ok(BlobEvent::ConnectionClosed { .. }) = event.into_blob() else {
+            return self.invalid("Event::Blob(BlobEvent::ConnectionClosed)", received);
         };
         debug!(
             bucket = %self.manifest.bucket,

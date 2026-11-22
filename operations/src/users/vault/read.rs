@@ -178,6 +178,7 @@ impl ReadVaultOperation {
         } = self.config;
         match event {
             VaultFetchEvent::Fetched { records, .. } => {
+                let records = *records;
                 let fits = match (&records, self.reads_heads()) {
                     (VaultRecords::Heads(heads), true) => heads.iter().all(|head| {
                         head.user_id == user_id
@@ -356,7 +357,7 @@ fn fetch_child(fetch: &VaultFetchEffect) -> Box<dyn SubOperation> {
         Event::Net(NetEvent::VaultFetch(match result {
             Ok(Fetched::Found { holder, value }) => VaultFetchEvent::Fetched {
                 holder,
-                records: value,
+                records: Box::new(value),
             },
             Ok(Fetched::NotFound) => VaultFetchEvent::NotFound,
             Ok(Fetched::Denied) => VaultFetchEvent::Denied,
@@ -559,7 +560,7 @@ mod tests {
         let (mut operation, _, _) = started(false, query);
         let answer = VaultFetchEvent::Fetched {
             holder: node(1),
-            records: VaultRecords::Heads(vec![foreign]),
+            records: Box::new(VaultRecords::Heads(vec![foreign])),
         };
         assert_eq!(
             fetched(&mut operation, answer),
@@ -570,7 +571,7 @@ mod tests {
         let (mut operation, _, _) = started(false, query);
         let answer = VaultFetchEvent::Fetched {
             holder: node(1),
-            records: VaultRecords::Keys(Vec::new()),
+            records: Box::new(VaultRecords::Keys(Vec::new())),
         };
         assert_eq!(
             fetched(&mut operation, answer),
@@ -659,7 +660,7 @@ mod tests {
             fetch.finalize(),
             Event::Net(NetEvent::VaultFetch(VaultFetchEvent::Fetched {
                 holder: holders[1],
-                records: keys,
+                records: Box::new(keys),
             }))
         );
     }

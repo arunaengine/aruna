@@ -46,7 +46,7 @@ fn event(event: Event) -> IoResult {
 }
 
 fn blob(blob: BlobEvent) -> IoResult {
-    event(Event::Blob(blob))
+    event(Event::blob(blob))
 }
 
 fn synced() -> IoResult {
@@ -148,7 +148,7 @@ fn activating() -> UnlockBucketOperation {
     let turn = operation.next(synced());
     assert_eq!(
         asked(&turn),
-        &Effect::Blob(BlobEffect::ActivateKey { ticket: ticket() })
+        &Effect::blob(BlobEffect::ActivateKey { ticket: ticket() })
     );
     operation
 }
@@ -172,7 +172,7 @@ fn intent_before_activation() {
     assert!(matches!(
         &turn,
         Ok(Next::Call(IoCall::Effect(effect)))
-            if matches!(effect.as_ref(), Effect::Blob(BlobEffect::PrepareKey { .. }))
+            if matches!(effect.as_ref().as_blob(), Some(BlobEffect::PrepareKey { .. }))
     ));
     let turn = intent.next(blob(BlobEvent::KeyPrepared { ticket: ticket() }));
     let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
@@ -331,7 +331,7 @@ fn failed_activation_discards() {
     let turn = operation.next(blob(BlobEvent::Error(refused)));
     assert_eq!(
         asked(&turn),
-        &Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() })
+        &Effect::blob(BlobEffect::DiscardKey { ticket: ticket() })
     );
     operation
         .next(blob(BlobEvent::KeyDiscarded { ticket: ticket() }))
@@ -363,7 +363,7 @@ fn foreign_status_refused() {
     };
     let turn = operation.next(blob(BlobEvent::KeyActivated { status: other }));
     assert!(matches!(turn, Err(UnlockError::InvalidStateEvent { .. })));
-    let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
+    let discard: IoCall = Effect::blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
     assert_eq!(operation.abort(), vec![discard]);
 }
 
@@ -374,7 +374,7 @@ fn uncommitted_intent_discards() {
     intent
         .next(blob(BlobEvent::KeyPrepared { ticket: ticket() }))
         .unwrap();
-    let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
+    let discard: IoCall = Effect::blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
     assert_eq!(intent.abort(), vec![discard]);
 }
 
@@ -392,7 +392,7 @@ fn unsynced_intent_discards() {
         .next(IoResult::Child(ChildOutcome::new(committed)))
         .unwrap();
     // A failed sync ends the run, whose cleanup discards the key.
-    let discard: IoCall = Effect::Blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
+    let discard: IoCall = Effect::blob(BlobEffect::DiscardKey { ticket: ticket() }).into();
     assert_eq!(operation.abort(), vec![discard]);
 }
 

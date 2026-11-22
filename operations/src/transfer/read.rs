@@ -750,15 +750,15 @@ impl ReadObjectOperation {
         };
         self.step = ObjectStep::Admit(archive);
         Ok(Next::Call(
-            Effect::Blob(BlobEffect::Abe(Box::new(admit))).into(),
+            Effect::blob(BlobEffect::Abe(Box::new(admit))).into(),
         ))
     }
 
     fn admitted(&mut self, archive: ArchiveKey, event: Event) -> Turn<GetObjectResult> {
-        let lease = match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease }) => lease,
-            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => return Err(error.into()),
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+        let lease = match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease }) => lease,
+            Ok(BlobEvent::Error(BlobError::Abe(error))) => return Err(error.into()),
+            Ok(BlobEvent::Error(BlobError::BucketKey(error))) => {
                 return Err(locked(error));
             }
             _ => return Err(GetObjectError::GetObjectFailed),
@@ -1590,7 +1590,7 @@ mod tests {
             archive: archive.clone(),
         };
         let blob = context.blob_handle.as_ref().unwrap();
-        let Event::Blob(BlobEvent::ReadAdmitted { lease }) = blob.send_blob_effect(admit).await
+        let Ok(BlobEvent::ReadAdmitted { lease }) = blob.send_blob_effect(admit).await.into_blob()
         else {
             panic!("read not admitted");
         };

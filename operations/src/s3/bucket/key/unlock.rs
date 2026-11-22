@@ -211,7 +211,7 @@ impl UnlockIntent {
         }
         let record = self.record.take().ok_or(UnlockError::NotFinished)?;
         let private_key = self.private_key.take().ok_or(UnlockError::NotFinished)?;
-        let prepare = Effect::Blob(BlobEffect::PrepareKey {
+        let prepare = Effect::blob(BlobEffect::PrepareKey {
             key: record.key,
             public_key: record.public_key,
             private_key,
@@ -222,11 +222,13 @@ impl UnlockIntent {
     }
 
     fn prepared(&mut self, event: Event) -> IntentTurn {
-        let ticket = match event {
-            Event::Blob(BlobEvent::KeyPrepared { ticket }) if ticket.key == self.input.key => {
-                ticket
+        let ticket = match event.into_blob() {
+            Ok(BlobEvent::KeyPrepared { ticket }) if ticket.key == self.input.key => ticket,
+            Ok(other) => {
+                let other = Event::blob(other);
+                return refused("PrepareKey", other);
             }
-            other => return refused("PrepareKey", other),
+            Err(other) => return refused("PrepareKey", other),
         };
         self.ticket = Some(ticket);
         let session = Some(ticket.session_id);
@@ -249,9 +251,14 @@ impl UnlockIntent {
 
 /// A registry error as itself; any other answer is refused.
 fn refused<T>(state: &str, received: Event) -> Result<T, UnlockError> {
-    match received {
-        Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-        other => Err(UnlockError::InvalidStateEvent {
+    match received.into_blob() {
+        Ok(BlobEvent::Error(error)) => Err(error.into()),
+        Ok(other) => Err(UnlockError::InvalidStateEvent {
+            state: state.to_string(),
+            expected: "the event of the current step",
+            received: other.label(),
+        }),
+        Err(other) => Err(UnlockError::InvalidStateEvent {
             state: state.to_string(),
             expected: "the event of the current step",
             received: other.label(),
@@ -300,7 +307,7 @@ impl Operation for UnlockIntent {
     /// A prepared key whose intent did not commit is discarded.
     fn abort(&mut self) -> Vec<IoCall> {
         self.private_key = None;
-        let discard = |ticket| Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        let discard = |ticket| Effect::blob(BlobEffect::DiscardKey { ticket }).into();
         self.ticket.take().map(discard).into_iter().collect()
     }
 }
@@ -371,7 +378,7 @@ impl UnlockBucketOperation {
 
     fn activate(&mut self) -> UnlockTurn {
         let ticket = self.ticket.ok_or(UnlockError::NotFinished)?;
-        let activate = Effect::Blob(BlobEffect::ActivateKey { ticket });
+        let activate = Effect::blob(BlobEffect::ActivateKey { ticket });
         self.call(UnlockStep::ActivateKey, activate.into())
     }
 
@@ -395,7 +402,7 @@ impl UnlockBucketOperation {
             return Err(error.into());
         };
         self.failure = Some(error.into());
-        let discard = Effect::Blob(BlobEffect::DiscardKey { ticket });
+        let discard = Effect::blob(BlobEffect::DiscardKey { ticket });
         self.call(UnlockStep::DiscardKey, discard.into())
     }
 
@@ -433,16 +440,6 @@ impl UnlockBucketOperation {
             (UnlockStep::SyncIntent, Event::Storage(StorageEvent::SyncAllFinished)) => {
                 self.activate()
             }
-            (UnlockStep::ActivateKey, Event::Blob(BlobEvent::KeyActivated { status }))
-                if self.ticket.is_some_and(|ticket| {
-                    (ticket.key, ticket.session_id) == (status.key, status.session_id)
-                }) =>
-            {
-                self.activated(status)
-            }
-            (UnlockStep::ActivateKey, Event::Blob(BlobEvent::Error(error))) => {
-                self.activation_failed(error)
-            }
             (UnlockStep::ArmTimer, Event::Task(event))
                 if self.activated.as_ref().is_some_and(|status| {
                     let ticket = KeyTicket {
@@ -455,13 +452,21 @@ impl UnlockBucketOperation {
                 let status = self.activated.take().ok_or(UnlockError::NotFinished)?;
                 self.write_outcome(Ok(status))
             }
-            (
-                UnlockStep::DiscardKey,
-                Event::Blob(BlobEvent::KeyDiscarded { .. } | BlobEvent::Error(_)),
-            ) => {
-                let error = self.failure.take().unwrap_or(UnlockError::NotFinished);
-                self.write_outcome(Err(error))
-            }
+            (step, Event::Blob(blob)) => match (step, *blob) {
+                (UnlockStep::ActivateKey, BlobEvent::KeyActivated { status })
+                    if self.ticket.is_some_and(|ticket| {
+                        (ticket.key, ticket.session_id) == (status.key, status.session_id)
+                    }) =>
+                {
+                    self.activated(status)
+                }
+                (UnlockStep::ActivateKey, BlobEvent::Error(error)) => self.activation_failed(error),
+                (UnlockStep::DiscardKey, BlobEvent::KeyDiscarded { .. } | BlobEvent::Error(_)) => {
+                    let error = self.failure.take().unwrap_or(UnlockError::NotFinished);
+                    self.write_outcome(Err(error))
+                }
+                (step, received) => refused(&format!("{step:?}"), Event::blob(received)),
+            },
             (step, received) => refused(&format!("{step:?}"), received),
         }
     }
@@ -505,7 +510,7 @@ impl Operation for UnlockBucketOperation {
     /// A prepared key that never activated is discarded.
     fn abort(&mut self) -> Vec<IoCall> {
         self.private_key = None;
-        let discard = |ticket| Effect::Blob(BlobEffect::DiscardKey { ticket }).into();
+        let discard = |ticket| Effect::blob(BlobEffect::DiscardKey { ticket }).into();
         self.ticket.take().map(discard).into_iter().collect()
     }
 }

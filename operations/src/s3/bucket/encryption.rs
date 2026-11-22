@@ -186,9 +186,14 @@ impl EnableEncryptionOperation {
     }
 
     fn refused(&self, received: Event) -> EnableTurn {
-        match received {
-            Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
-            other => Err(EnableError::InvalidStateEvent {
+        match received.into_blob() {
+            Ok(BlobEvent::Error(error)) => Err(error.into()),
+            Ok(other) => Err(EnableError::InvalidStateEvent {
+                state: format!("{:?}", self.state),
+                expected: "the event of the current step",
+                received: other.label(),
+            }),
+            Err(other) => Err(EnableError::InvalidStateEvent {
                 state: format!("{:?}", self.state),
                 expected: "the event of the current step",
                 received: other.label(),
@@ -324,7 +329,7 @@ impl EnableEncryptionOperation {
     }
 
     fn generate(&mut self) -> EnableTurn {
-        let generate = Effect::Blob(BlobEffect::GenerateBucketKey);
+        let generate = Effect::blob(BlobEffect::GenerateBucketKey);
         self.call(EnableState::GenerateKey, generate.into())
     }
 
@@ -376,7 +381,7 @@ impl EnableEncryptionOperation {
             node_id: self.input.node_id,
             holders,
         };
-        self.call(EnableState::SealCopies, Effect::Blob(seal).into())
+        self.call(EnableState::SealCopies, Effect::blob(seal).into())
     }
 
     fn report(&self, copies: &[SealedCopy]) -> HolderReport {
@@ -521,17 +526,25 @@ impl Operation for EnableEncryptionOperation {
             EnableState::ReadSizes => self.sizes_read(result.values()?),
             EnableState::ReadTransition => self.check_transition(result.value()?),
             EnableState::ReadGrants => self.grants_read(result.page()?.0),
-            EnableState::GenerateKey => match result.event()? {
-                Event::Blob(BlobEvent::BucketKeyGenerated {
+            EnableState::GenerateKey => match (result.event()?).into_blob() {
+                Ok(BlobEvent::BucketKeyGenerated {
                     public_key,
                     private_key,
                 }) => self.seal(public_key, private_key),
-                other => self.refused(other),
+                Ok(other) => {
+                    let other = Event::blob(other);
+                    self.refused(other)
+                }
+                Err(other) => self.refused(other),
             },
             EnableState::PrepareAbe => self.prepare_abe(result),
-            EnableState::SealCopies => match result.event()? {
-                Event::Blob(BlobEvent::CopiesSealed { copies }) => self.write_settings(copies),
-                other => self.refused(other),
+            EnableState::SealCopies => match (result.event()?).into_blob() {
+                Ok(BlobEvent::CopiesSealed { copies }) => self.write_settings(copies),
+                Ok(other) => {
+                    let other = Event::blob(other);
+                    self.refused(other)
+                }
+                Err(other) => self.refused(other),
             },
             EnableState::WriteSettings => {
                 result.done()?;

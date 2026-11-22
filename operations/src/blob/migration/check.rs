@@ -5,7 +5,9 @@
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{BlobEffect, Effect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{
     BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, BROKEN_VERSION_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE,
@@ -153,7 +155,7 @@ impl CheckVersionOperation {
 
     fn stat(&mut self, location: BackendLocation) -> Next<CheckOutcome> {
         self.state = CheckState::Stat;
-        let stat = Effect::Blob(BlobEffect::StatCopy { location });
+        let stat = Effect::blob(BlobEffect::StatCopy { location });
         Next::Call(IoCall::Effect(Box::new(stat)))
     }
 }
@@ -172,14 +174,12 @@ impl Operation for CheckVersionOperation {
             CheckState::ReadVersion => self.handle_version(result.value()?.as_deref()),
             CheckState::ReadLocation => self.handle_location(result.value()?.as_deref()),
             CheckState::ReadStorage => self.handle_storage(result.value()?.as_deref()),
-            CheckState::Stat => match result.event()? {
-                Event::Blob(BlobEvent::CopyStat { exists: true }) => {
-                    self.record(CheckOutcome::Healthy)
-                }
-                Event::Blob(BlobEvent::CopyStat { exists: false }) => {
+            CheckState::Stat => match result.blob()? {
+                BlobEvent::CopyStat { exists: true } => self.record(CheckOutcome::Healthy),
+                BlobEvent::CopyStat { exists: false } => {
                     self.record(CheckOutcome::Broken(BrokenReason::MissingBlob))
                 }
-                Event::Blob(BlobEvent::Error(error)) => Err(error.into()),
+                BlobEvent::Error(error) => Err(error.into()),
                 other => Err(IoError::Unexpected {
                     expected: "BlobEvent::CopyStat",
                     got: other.label(),
@@ -209,7 +209,7 @@ mod tests {
     }
 
     fn stat(exists: bool) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(BlobEvent::CopyStat { exists })))
+        IoResult::Event(Box::new(Event::blob(BlobEvent::CopyStat { exists })))
     }
 
     fn version(backend: BackendRef) -> BlobVersion {
@@ -271,7 +271,7 @@ mod tests {
         assert!(matches!(
             &turn,
             Ok(Next::Call(IoCall::Effect(effect)))
-                if matches!(effect.as_ref(), Effect::Blob(BlobEffect::StatCopy { .. }))
+                if matches!(effect.as_ref().as_blob(), Some(BlobEffect::StatCopy { .. }))
         ));
         let turn = operation.next(stat(false));
         let outcome = recorded(operation, turn);

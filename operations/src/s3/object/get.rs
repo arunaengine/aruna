@@ -608,13 +608,22 @@ impl GetObjectOperation {
     /// Orders the resolved sources: one picked by measured speed, then the others in their
     /// order, failing ones last. A restarted read keeps its source while it is not failing.
     fn sources_ranked(&mut self, event: Event) -> Turn {
-        let (stats, draw) = match event {
-            Event::StagingSource(StagingSourceEvent::HealthResult { stats, draw })
+        let (stats, draw) = match event.into_staging() {
+            Ok(StagingSourceEvent::HealthResult { stats, draw })
                 if stats.len() == self.source_queue.len() =>
             {
                 (stats, draw)
             }
-            other => {
+            Ok(other) => {
+                let other = Event::staging(other);
+                {
+                    return Err(self.unexpected(
+                        "Event::StagingSource(StagingSourceEvent::HealthResult)",
+                        other,
+                    ));
+                }
+            }
+            Err(other) => {
                 return Err(self.unexpected(
                     "Event::StagingSource(StagingSourceEvent::HealthResult)",
                     other,
@@ -701,7 +710,7 @@ impl GetObjectOperation {
         if self.reading {
             return self.read_reference();
         }
-        let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+        let head = Effect::staging(StagingSourceEffect::Head { access });
         self.effect(GetObjectState::HeadReferenceSource, head)
     }
 
@@ -822,7 +831,7 @@ impl GetObjectOperation {
 
     fn reference_access_resolved(&mut self, event: Event) -> Turn {
         let result = match event {
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) => result,
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) => *result,
             other => {
                 return Err(self.unexpected(
                     "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
@@ -891,7 +900,7 @@ impl GetObjectOperation {
         });
         self.source_weights = weights.collect();
         let accesses = self.source_queue.iter().map(|(_, access)| access.clone());
-        let health = Effect::StagingSource(StagingSourceEffect::Health {
+        let health = Effect::staging(StagingSourceEffect::Health {
             accesses: accesses.collect(),
         });
         self.effect(GetObjectState::RankSources, health)
@@ -949,7 +958,7 @@ impl GetObjectOperation {
                 BlobEffect::AdmitRead { key, archive }
             };
             self.reading = false;
-            return self.effect(GetObjectState::AdmitRead, Effect::Blob(admit));
+            return self.effect(GetObjectState::AdmitRead, Effect::blob(admit));
         }
         // A plain copy of an encrypting bucket, not converted yet, needs the bucket unlocked too.
         let read = read_row(
@@ -984,9 +993,9 @@ impl GetObjectOperation {
         match self.reference_key {
             Some(key) => {
                 let admit = BlobEffect::AdmitRead { key, archive };
-                self.effect(GetObjectState::AdmitPlain, Effect::Blob(admit))
+                self.effect(GetObjectState::AdmitPlain, Effect::blob(admit))
             }
-            None => self.effect(GetObjectState::GetBlob, Effect::Blob(read_effect)),
+            None => self.effect(GetObjectState::GetBlob, Effect::blob(read_effect)),
         }
     }
 
@@ -1000,16 +1009,20 @@ impl GetObjectOperation {
             return Err(GetObjectError::GetObjectFailed);
         };
         let archive = ArchiveKey::of(location);
-        match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease })
+        match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease })
                 if lease.key == key && lease.archive == archive =>
             {
                 self.reference_lease = Some(lease);
-                self.effect(GetObjectState::GetBlob, Effect::Blob(read_effect))
+                self.effect(GetObjectState::GetBlob, Effect::blob(read_effect))
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
-            Event::Blob(BlobEvent::Error(_)) => Err(GetObjectError::GetObjectFailed),
-            other => Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
+            Ok(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
+            Ok(BlobEvent::Error(_)) => Err(GetObjectError::GetObjectFailed),
+            Ok(other) => {
+                let other = Event::blob(other);
+                Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other))
+            }
+            Err(other) => Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
         }
     }
 
@@ -1017,22 +1030,28 @@ impl GetObjectOperation {
     fn read_admitted(&mut self, event: Event) -> Turn {
         let location = self.location.clone();
         let location = location.ok_or(GetObjectError::GetObjectFailed)?;
-        let lease = match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease })
+        let lease = match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease })
                 if Some(lease.key) == location.format.bucket_key()
                     && lease.archive == ArchiveKey::of(&location) =>
             {
                 lease
             }
             // A locked key stays typed: `BucketKeyError::Locked` names the bucket.
-            Event::Blob(BlobEvent::Error(BlobError::Abe(error))) => {
+            Ok(BlobEvent::Error(BlobError::Abe(error))) => {
                 return Err(GetObjectError::Abe(error));
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => {
+            Ok(BlobEvent::Error(BlobError::BucketKey(error))) => {
                 return Err(locked(error));
             }
-            Event::Blob(BlobEvent::Error(_)) => return Err(GetObjectError::GetObjectFailed),
-            other => return Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
+            Ok(BlobEvent::Error(_)) => return Err(GetObjectError::GetObjectFailed),
+            Ok(other) => {
+                let other = Event::blob(other);
+                return Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other));
+            }
+            Err(other) => {
+                return Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other));
+            }
         };
         let range = (self.resolved_range.as_ref()).map(|range| range.range.clone());
         let read = BlobEffect::ReadSealed {
@@ -1040,7 +1059,7 @@ impl GetObjectOperation {
             range,
             lease: Box::new(lease),
         };
-        self.effect(GetObjectState::GetBlob, Effect::Blob(read))
+        self.effect(GetObjectState::GetBlob, Effect::blob(read))
     }
 
     /// An encrypting bucket gates plaintext of every version, not only of sealed copies.
@@ -1063,12 +1082,12 @@ impl GetObjectOperation {
         self.reading = false;
         if let Some(key) = self.reference_key {
             let archive = reference_archive(key);
-            let admit = Effect::Blob(BlobEffect::AdmitRead { key, archive });
+            let admit = Effect::blob(BlobEffect::AdmitRead { key, archive });
             return self.effect(GetObjectState::CheckReferenceKey, admit);
         }
         let access = self.reference_access.clone();
         let access = access.ok_or(GetObjectError::GetObjectFailed)?;
-        let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+        let head = Effect::staging(StagingSourceEffect::Head { access });
         self.effect(GetObjectState::HeadReferenceSource, head)
     }
 
@@ -1076,22 +1095,26 @@ impl GetObjectOperation {
         let (Some(key), Some(access)) = (self.reference_key, self.reference_access.clone()) else {
             return Err(GetObjectError::GetObjectFailed);
         };
-        match event {
-            Event::Blob(BlobEvent::ReadAdmitted { lease })
+        match event.into_blob() {
+            Ok(BlobEvent::ReadAdmitted { lease })
                 if lease.key == key && lease.archive == reference_archive(key) =>
             {
                 self.reference_lease = Some(lease);
-                let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+                let head = Effect::staging(StagingSourceEffect::Head { access });
                 self.effect(GetObjectState::HeadReferenceSource, head)
             }
-            Event::Blob(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
-            Event::Blob(BlobEvent::Error(_)) => Err(GetObjectError::GetObjectFailed),
-            other => Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
+            Ok(BlobEvent::Error(BlobError::BucketKey(error))) => Err(locked(error)),
+            Ok(BlobEvent::Error(_)) => Err(GetObjectError::GetObjectFailed),
+            Ok(other) => {
+                let other = Event::blob(other);
+                Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other))
+            }
+            Err(other) => Err(self.unexpected("Event::Blob(BlobEvent::ReadAdmitted)", other)),
         }
     }
     fn reference_head_received(&mut self, event: Event) -> Turn {
-        match event {
-            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::HeadResult { metadata }) => {
                 let stored = self.reference_cached.clone();
                 // Only the first source's validators are recorded; others must match the bytes.
                 let mirror = self.source_slot > 0;
@@ -1198,10 +1221,15 @@ impl GetObjectOperation {
                 }
                 Err(GetObjectError::ReferenceSourceChanged)
             }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.source_failed(error.into())
+            Ok(StagingSourceEvent::Error { error }) => self.source_failed(error.into()),
+            Ok(other) => {
+                let other = Event::staging(other);
+                Err(self.unexpected(
+                    "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                    other,
+                ))
             }
-            other => Err(self.unexpected(
+            Err(other) => Err(self.unexpected(
                 "Event::StagingSource(StagingSourceEvent::HeadResult)",
                 other,
             )),
@@ -1225,7 +1253,7 @@ impl GetObjectOperation {
         // Verified bytes are read whole and spooled; the range is cut from the spool.
         let range = range.filter(|_| self.verify_digests.is_empty());
         self.source_metadata = Some(metadata);
-        let read = Effect::StagingSource(StagingSourceEffect::Read {
+        let read = Effect::staging(StagingSourceEffect::Read {
             access,
             range,
             expected,
@@ -1391,8 +1419,16 @@ impl GetObjectOperation {
     }
 
     fn handle_received_blob(&mut self, event: Event) -> Turn {
-        let Event::Blob(BlobEvent::ReadFinished { mut blob, .. }) = event else {
-            return Err(self.unexpected("Event::Blob(BlobEvent::ReadFinished)", event));
+        let mut blob = match event.into_blob() {
+            Ok(BlobEvent::ReadFinished { blob, .. }) => blob,
+            Ok(blob) => {
+                return Err(
+                    self.unexpected("Event::Blob(BlobEvent::ReadFinished)", Event::blob(blob))
+                );
+            }
+            Err(event) => {
+                return Err(self.unexpected("Event::Blob(BlobEvent::ReadFinished)", event));
+            }
         };
         if let Some(lease) = self.reference_lease.take() {
             blob = blob.keep(lease);
@@ -1418,8 +1454,8 @@ impl GetObjectOperation {
     }
 
     fn reference_source_received(&mut self, event: Event) -> Turn {
-        match event {
-            Event::StagingSource(StagingSourceEvent::ReadResult { metadata, stream }) => {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::ReadResult { metadata, stream }) => {
                 let head_metadata = self.source_metadata.as_ref();
                 let head_metadata = head_metadata.ok_or(GetObjectError::GetObjectFailed)?;
                 let comparison = head_metadata.compare(&metadata);
@@ -1452,13 +1488,18 @@ impl GetObjectOperation {
                 }
                 self.finish_reference_output(stream)
             }
-            Event::StagingSource(StagingSourceEvent::Error {
+            Ok(StagingSourceEvent::Error {
                 error: StagingSourceError::ConditionFailed,
             }) if self.source_queue.is_empty() => self.queue_changed_refresh(),
-            Event::StagingSource(StagingSourceEvent::Error { error }) => {
-                self.source_failed(error.into())
+            Ok(StagingSourceEvent::Error { error }) => self.source_failed(error.into()),
+            Ok(other) => {
+                let other = Event::staging(other);
+                Err(self.unexpected(
+                    "Event::StagingSource(StagingSourceEvent::ReadResult)",
+                    other,
+                ))
             }
-            other => Err(self.unexpected(
+            Err(other) => Err(self.unexpected(
                 "Event::StagingSource(StagingSourceEvent::ReadResult)",
                 other,
             )),
@@ -1503,7 +1544,7 @@ impl GetObjectOperation {
         size: u64,
     ) -> Turn {
         let range = (self.resolved_range.as_ref()).map(|resolved| resolved.range.clone());
-        let spool = Effect::Blob(BlobEffect::SpoolLocal {
+        let spool = Effect::blob(BlobEffect::SpoolLocal {
             size,
             deadline: None,
             range,
@@ -1513,20 +1554,20 @@ impl GetObjectOperation {
     }
 
     fn handle_reference_spooled(&mut self, event: Event) -> Turn {
-        let (hashes, blob) = match event {
-            Event::Blob(BlobEvent::LocalSpooled { hashes, blob, .. }) => (hashes, blob),
-            Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
+        let (hashes, blob) = match event.into_blob() {
+            Ok(BlobEvent::LocalSpooled { hashes, blob, .. }) => (hashes, blob),
+            Ok(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. })) => {
                 return Err(GetObjectError::SpoolBudgetExhausted);
             }
-            Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit })) => {
+            Ok(BlobEvent::Error(BlobError::SpoolTooLarge { limit })) => {
                 return Err(GetObjectError::ReferenceTooLarge { limit });
             }
             // A source that sent other bytes than it announced changed behind the version.
-            Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
+            Ok(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
                 return self.proof_failed(GetObjectError::ReferenceSourceChanged);
             }
             // Nothing was served yet, so a broken transfer tries the other sources.
-            Event::Blob(BlobEvent::Error(error)) => {
+            Ok(BlobEvent::Error(error)) => {
                 debug!(error = %error, "Spooling a reference source failed");
                 return self.source_failed(GetObjectError::GetObjectFailed);
             }

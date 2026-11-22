@@ -11,7 +11,7 @@ use crate::blob::request::BlobRequest;
 use crate::jobs::import_listing::{ListingNote, NoteError, NoteListingOperation};
 use crate::jobs::page_intents::PageIntentsOperation;
 use aruna_core::calls::{IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect, StorageEffect};
+use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
 use aruna_core::keyspaces::{
     BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, DELETE_TRAIL_KEYSPACE,
@@ -96,7 +96,7 @@ fn listing() -> BlobEffect {
 }
 
 fn listed() -> IoResult {
-    IoResult::Event(Box::new(Event::Blob(BlobEvent::ExternalListed {
+    IoResult::Event(Box::new(Event::blob(BlobEvent::ExternalListed {
         objects: Vec::new(),
         next: None,
     })))
@@ -105,12 +105,7 @@ fn listed() -> IoResult {
 #[test]
 fn checks_blob_answers() {
     let mut request = BlobRequest::new(listing());
-    assert_eq!(
-        request.first(),
-        Ok(Next::Call(IoCall::Effect(Box::new(
-            Effect::Blob(listing())
-        ))))
-    );
+    assert_eq!(request.first(), Ok(Next::Call(IoCall::blob(listing()))));
     assert!(matches!(
         request.next(listed()),
         Ok(Next::Done(BlobEvent::ExternalListed { .. }))
@@ -119,7 +114,7 @@ fn checks_blob_answers() {
     // Another kind of answer does not end a listing.
     let mut request = BlobRequest::new(listing());
     request.first().expect("listing call");
-    let deleted = IoResult::Event(Box::new(Event::Blob(BlobEvent::DeleteFinished)));
+    let deleted = IoResult::Event(Box::new(Event::blob(BlobEvent::DeleteFinished)));
     assert!(request.next(deleted).is_err());
 
     // A request is sent once, and an answer after its answer is refused.

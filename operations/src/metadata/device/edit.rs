@@ -624,7 +624,7 @@ mod tests {
             aruna_drivers::testing::send_metadata_effect(
                 &context,
                 MetadataEffect::CreateCrate {
-                    request: MetadataCrateRequest {
+                    request: Box::new(MetadataCrateRequest {
                         graph_iri: record.graph_iri.clone(),
                         name: "Notes".to_string(),
                         description: "Offline notes".to_string(),
@@ -636,7 +636,7 @@ mod tests {
                         },
                         durability: MetadataRequestDurability::Durable,
                         deterministic_actor: Some([1u8; 32]),
-                    },
+                    }),
                 }
             )
             .await,

@@ -101,13 +101,13 @@ impl Operation for GetNodesOperation {
     type Error = GetNodesError;
 
     fn first(&mut self) -> Result<Next<RealmPresence>, GetNodesError> {
-        let get = Effect::Net(NetEffect::Dht(DhtEffect::Get {
+        let get = Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
             key: realm_presence_key(&self.realm_id),
             realm_filter: Some(self.realm_id),
             // Multi-publisher presence must stay exhaustive; the driver enforces
             // the same budget the caller races this operation against.
             options: DhtGetOptions::presence(REALM_DISCOVERY_TIMEOUT, self.realm_id),
-        }));
+        })));
         Ok(Next::Call(IoCall::Effect(Box::new(get))))
     }
 
@@ -176,10 +176,14 @@ mod pure_tests {
         };
         assert!(matches!(
             *effect,
-            Effect::Net(NetEffect::Dht(DhtEffect::Get { options, .. }))
-                if options.presence == Some(realm_id)
-                    && options.deadline == REALM_DISCOVERY_TIMEOUT
-                    && options.completion == DhtCompletion::Exhaustive
+            Effect::Net(NetEffect::Dht(dht))
+                if matches!(
+                    dht.as_ref(),
+                    DhtEffect::Get { options, .. }
+                        if options.presence == Some(realm_id)
+                            && options.deadline == REALM_DISCOVERY_TIMEOUT
+                            && options.completion == DhtCompletion::Exhaustive
+                )
         ));
     }
 

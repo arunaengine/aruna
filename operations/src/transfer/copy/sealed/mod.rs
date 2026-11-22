@@ -401,12 +401,12 @@ impl SealedCopyOperation {
             object_key: self.input.dest_key.clone(),
         };
         Ok(Next::Call(
-            Effect::Blob(BlobEffect::Abe(Box::new(copy))).into(),
+            Effect::blob(BlobEffect::Abe(Box::new(copy))).into(),
         ))
     }
 
     fn envelope_created(&mut self, event: Event) -> Turn {
-        let Event::Blob(event) = event else {
+        let Ok(event) = event.into_blob() else {
             return Err(SealedCopyError::InvalidState);
         };
         match event {

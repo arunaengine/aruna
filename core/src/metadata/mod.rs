@@ -1333,13 +1333,13 @@ pub enum MergeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetadataEffect {
     ValidateCreateCrate {
-        request: MetadataCrateRequest,
+        request: Box<MetadataCrateRequest>,
     },
     ValidateRoCrate {
         request: ApplyRoCrateRequest,
     },
     CreateCrate {
-        request: MetadataCrateRequest,
+        request: Box<MetadataCrateRequest>,
     },
     ApplyRoCrate {
         request: ApplyRoCrateRequest,
@@ -1730,7 +1730,7 @@ pub enum MetadataEvent {
     },
     RoCratePageResult {
         graph_iri: String,
-        page: MetadataRoCratePage,
+        page: Box<MetadataRoCratePage>,
     },
     SearchResult {
         hits: Vec<MetadataSearchHit>,
@@ -1799,7 +1799,7 @@ pub enum MetadataEvent {
     /// without an entry.
     QueryCacheEntry {
         stamp: [u64; 2],
-        entry: Option<(MetadataQueryResults, usize)>,
+        entry: Option<Box<(MetadataQueryResults, usize)>>,
     },
     /// The cached registry rows of one group, or `None` without a fresh copy.
     CachedGroup {

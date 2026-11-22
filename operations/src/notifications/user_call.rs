@@ -327,7 +327,7 @@ impl UserCallOperation {
             watch_id: subscription.watch_id,
             realm_id: self.user.realm_id,
             holder,
-            entry,
+            entry: Box::new(entry),
         };
         let mut calls = Vec::new();
         if publish {

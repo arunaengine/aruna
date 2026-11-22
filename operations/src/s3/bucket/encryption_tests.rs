@@ -32,7 +32,7 @@ fn page(rows: Vec<(Key, Value)>, next: Option<Key>) -> IoResult {
 }
 
 fn blob(event: BlobEvent) -> IoResult {
-    IoResult::Event(Box::new(Event::Blob(event)))
+    IoResult::Event(Box::new(Event::blob(event)))
 }
 
 /// The answer to the node vault write.
@@ -102,7 +102,7 @@ fn generated(operation: &mut EnableEncryptionOperation) -> (Turn, [u8; 32]) {
     let effects = no_versions(operation);
     assert_eq!(
         asked(&effects),
-        &Effect::Blob(BlobEffect::GenerateBucketKey)
+        &Effect::blob(BlobEffect::GenerateBucketKey)
     );
     let private = SecretBytes::new(vec![4; 32]);
     let public = public_key_of(&private).unwrap();
@@ -120,7 +120,7 @@ fn no_versions(operation: &mut EnableEncryptionOperation) -> Turn {
 }
 
 fn sealed(effects: &Turn) -> Vec<SealedCopy> {
-    let Effect::Blob(BlobEffect::SealHolderCopies { key, holders, .. }) = asked(effects) else {
+    let Some(BlobEffect::SealHolderCopies { key, holders, .. }) = asked(effects).as_blob() else {
         panic!("expected sealing, got {effects:?}");
     };
     holders
@@ -459,8 +459,8 @@ fn oversized_copy_refused() {
     // A copy at the supported size still lets the bucket enable.
     let (_, effects) = run(MAX_SIZE);
     assert!(matches!(
-        asked(&effects),
-        Effect::Blob(BlobEffect::GenerateBucketKey)
+        (asked(&effects)).as_blob(),
+        Some(BlobEffect::GenerateBucketKey)
     ));
 }
 

@@ -171,7 +171,7 @@ fn published(
     settings: Vec<u8>,
 ) -> Step {
     let rewritten = BlobEvent::CopyRewritten { location: new };
-    let step = operation.next(event(Event::Blob(rewritten)));
+    let step = operation.next(event(Event::blob(rewritten)));
     assert!(matches!(step, Ok(Next::Call(IoCall::Read(_)))));
     let record = operation.transition.to_bytes().unwrap();
     let values = vec![Some(settings.into()), Some(record.into())];
@@ -192,12 +192,12 @@ fn rewritten(
 ) -> Vec<(String, Key, Value)> {
     let old = location(None);
     let step = located(operation, &old);
-    let Some(Effect::Blob(BlobEffect::RewriteCopy {
+    let Some(BlobEffect::RewriteCopy {
         lease,
         target: format,
         grants_only,
         ..
-    })) = asked(&step)
+    }) = asked(&step).and_then(Effect::as_blob)
     else {
         panic!("expected a rewrite, got {step:?}")
     };
@@ -255,12 +255,12 @@ fn locked_source_waits() {
     let mut operation = operation(transition(TransitionKind::Decrypt, Some(1), None));
     let step = located(&mut operation, &location(Some(1)));
     assert!(matches!(
-        asked(&step),
-        Some(Effect::Blob(BlobEffect::AdmitRead { key, .. })) if key.generation == 1
+        asked(&step).and_then(Effect::as_blob),
+        Some(BlobEffect::AdmitRead { key, .. }) if key.generation == 1
     ));
 
     let locked = BucketKeyError::Locked(BUCKET_ID);
-    let step = operation.next(event(Event::Blob(BlobEvent::Error(locked.into()))));
+    let step = operation.next(event(Event::blob(BlobEvent::Error(locked.into()))));
 
     assert_eq!(ended(step), Ok((RewriteOutcome::AwaitingKey, Vec::new())));
 }
@@ -272,7 +272,7 @@ fn stale_target_discards() {
     let old = location(Some(1));
     located(&mut operation, &old).unwrap();
     let admitted = BlobEvent::ReadAdmitted { lease: lease(&old) };
-    operation.next(event(Event::Blob(admitted))).unwrap();
+    operation.next(event(Event::blob(admitted))).unwrap();
     let newer = BucketEncryption {
         storage_generation: 4,
         ..BucketEncryption::default()
@@ -288,7 +288,7 @@ fn stale_target_discards() {
     let (outcome, calls) = ended(step).unwrap();
     assert_eq!(outcome, RewriteOutcome::Skipped);
     let id = operation.new.as_ref().unwrap().ulid;
-    let release = Effect::Blob(BlobEffect::ReleaseReservation { id });
+    let release = Effect::blob(BlobEffect::ReleaseReservation { id });
     let cleanup = IoCall::from(schedule_cleanup_effect());
     assert_eq!(calls, [IoCall::from(release), cleanup]);
 }
@@ -300,13 +300,13 @@ fn rotation_keeps_blocks() {
     located(&mut operation, &old).unwrap();
     let admitted = lease(&old);
 
-    let step = operation.next(event(Event::Blob(BlobEvent::ReadAdmitted {
+    let step = operation.next(event(Event::blob(BlobEvent::ReadAdmitted {
         lease: lease(&old),
     })));
 
-    let Some(Effect::Blob(BlobEffect::RewriteCopy {
+    let Some(BlobEffect::RewriteCopy {
         lease, grants_only, ..
-    })) = asked(&step)
+    }) = asked(&step).and_then(Effect::as_blob)
     else {
         panic!("expected a rewrite, got {step:?}")
     };
@@ -332,7 +332,7 @@ fn rejects_wrong_event() {
     located(&mut operation, &location(Some(1))).unwrap();
 
     let released = BlobEvent::ReservationReleased { id: Ulid::nil() };
-    let step = operation.next(event(Event::Blob(released)));
+    let step = operation.next(event(Event::blob(released)));
 
     assert!(matches!(step, Err(RewriteError::InvalidStateEvent { .. })));
 }
@@ -429,8 +429,8 @@ mod envelopes {
         (settings, new, epoch): (Vec<u8>, BackendLocation, u64),
     ) -> Step {
         let mut step = located_with(operation, old, &answer);
-        let plan = match asked(&step) {
-            Some(Effect::Blob(BlobEffect::Abe(effect))) => match effect.as_ref() {
+        let plan = match asked(&step).and_then(Effect::as_blob) {
+            Some(BlobEffect::Abe(effect)) => match effect.as_ref() {
                 AbeEffect::Envelope(plan) => Some(plan.clone()),
                 other => panic!("expected an envelope, got {other:?}"),
             },
@@ -443,7 +443,7 @@ mod envelopes {
             )
             .unwrap();
             let created = BlobEvent::Abe(Box::new(AbeEvent::Envelope(envelope)));
-            step = operation.next(event(Event::Blob(created)));
+            step = operation.next(event(Event::blob(created)));
         }
         // A kept envelope is read before the source is admitted.
         let effects = inner(&mut step);
@@ -454,13 +454,14 @@ mod envelopes {
             step = operation.next(IoResult::Values(values));
         }
         if matches!(
-            asked(&step),
-            Some(Effect::Blob(BlobEffect::AdmitRead { .. }))
+            asked(&step).and_then(Effect::as_blob),
+            Some(BlobEffect::AdmitRead { .. })
         ) {
             let admitted = BlobEvent::ReadAdmitted { lease: lease(old) };
-            step = operation.next(event(Event::Blob(admitted)));
+            step = operation.next(event(Event::blob(admitted)));
         }
-        let Some(Effect::Blob(BlobEffect::RewriteCopy { object, .. })) = asked(&step) else {
+        let Some(BlobEffect::RewriteCopy { object, .. }) = asked(&step).and_then(Effect::as_blob)
+        else {
             panic!("expected a rewrite, got {step:?}")
         };
         let pending = operation.pending.as_ref().map(|pending| &pending.source);
@@ -470,7 +471,7 @@ mod envelopes {
             envelope.map(|envelope| envelope.context.public_key)
         );
         let rewritten = BlobEvent::CopyRewritten { location: new };
-        let step = operation.next(event(Event::Blob(rewritten)));
+        let step = operation.next(event(Event::blob(rewritten)));
         let Ok(Next::Call(IoCall::Read(reads))) = &step else {
             panic!("expected the fence reads, got {step:?}")
         };

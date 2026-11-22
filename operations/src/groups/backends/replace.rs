@@ -121,7 +121,7 @@ impl ReplaceBackendOperation {
         };
 
         self.state = ReplaceState::Probe;
-        let effect = Effect::Blob(BlobEffect::CheckGroupBackend {
+        let effect = Effect::blob(BlobEffect::CheckGroupBackend {
             record: record.clone(),
             secret: secret.clone(),
         });
@@ -131,12 +131,22 @@ impl ReplaceBackendOperation {
     }
 
     fn handle_probe(&mut self, event: Event) -> ReplaceTurn {
-        match event {
-            Event::Blob(BlobEvent::GroupBackendChecked) => {}
-            Event::Blob(BlobEvent::Error(error)) => {
+        match event.into_blob() {
+            Ok(BlobEvent::GroupBackendChecked) => {}
+            Ok(BlobEvent::Error(error)) => {
                 return Err(CreateBackendError::Unreachable(error));
             }
-            received => {
+            Ok(received) => {
+                let received = Event::blob(received);
+                {
+                    return Err(CreateBackendError::InvalidStateEvent {
+                        state: "Probe",
+                        expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
+                        received,
+                    });
+                }
+            }
+            Err(received) => {
                 return Err(CreateBackendError::InvalidStateEvent {
                     state: "Probe",
                     expected: "Event::Blob(BlobEvent::GroupBackendChecked)",
@@ -361,7 +371,7 @@ mod pure_tests {
         operation: &mut ReplaceBackendOperation,
         stored: GroupStorage,
     ) -> (Vec<(String, Key, Value)>, GroupStorage) {
-        let checked = operation.next(event(Event::Blob(BlobEvent::GroupBackendChecked)));
+        let checked = operation.next(event(Event::blob(BlobEvent::GroupBackendChecked)));
         assert!(matches!(checked, Ok(Next::Call(IoCall::Child(_)))));
         let mut write = operation.write().unwrap();
         assert_eq!(write.transaction(), TransactionMode::Write);
@@ -432,12 +442,12 @@ mod pure_tests {
         let Ok(Next::Call(IoCall::Effect(probe))) = operation.next(opened) else {
             panic!("expected one probe");
         };
-        let Effect::Blob(BlobEffect::CheckGroupBackend { secret: probed, .. }) = *probe else {
+        let Ok(BlobEffect::CheckGroupBackend { secret: probed, .. }) = (*probe).into_blob() else {
             panic!("expected one probe");
         };
         assert_eq!(probed.secret_config, secret.secret_config);
         operation
-            .next(event(Event::Blob(BlobEvent::GroupBackendChecked)))
+            .next(event(Event::blob(BlobEvent::GroupBackendChecked)))
             .unwrap();
         // The stored keys are only read: the record commits without a vault write.
         let mut write = operation.write().unwrap();
@@ -473,7 +483,7 @@ mod pure_tests {
         else {
             panic!("expected one probe");
         };
-        let Effect::Blob(BlobEffect::CheckGroupBackend { record, .. }) = *probe else {
+        let Ok(BlobEffect::CheckGroupBackend { record, .. }) = (*probe).into_blob() else {
             panic!("expected one probe");
         };
         assert_eq!(record.backend_id, backend_id);

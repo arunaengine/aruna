@@ -470,7 +470,7 @@ mod tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = turn else {
             panic!("an issuance");
         };
-        assert!(matches!(*effect, Effect::Blob(BlobEffect::Abe(_))));
+        assert!(matches!((*effect).as_blob(), Some(BlobEffect::Abe(_))));
         assert!(operation.deletes.is_empty());
     }
 }

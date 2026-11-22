@@ -234,7 +234,7 @@ impl Operation for BackendImportOperation {
                 let (objects, next) = match result.child::<BlobEvent, BlobError>()? {
                     Ok(BlobEvent::ExternalListed { objects, next }) => (objects, next),
                     Ok(other) => {
-                        let label = Event::Blob(other).label();
+                        let label = Event::blob(other).label();
                         let error = BlobError::ListError(format!("unexpected answer {label}"));
                         return Ok(Next::Done(retryable(error)));
                     }

@@ -109,7 +109,7 @@ pub(super) fn hashed_of(result: IoResult, object: &ExternalObject) -> Result<Has
         },
         Ok(other) => Err(ItemError::System(format!(
             "unexpected answer {}",
-            Event::Blob(other).label()
+            Event::blob(other).label()
         ))),
         Err(error) => Err(hash_failure(error)),
     }

@@ -361,9 +361,7 @@ fn passes_other_calls() {
         IoCall::Effect(Box::new(Effect::Task(TaskEffect::CancelTimer {
             key: TaskKey::DrainSyncOutbox,
         }))),
-        IoCall::Effect(Box::new(Effect::Blob(BlobEffect::ReleaseReservation {
-            id,
-        }))),
+        IoCall::blob(BlobEffect::ReleaseReservation { id }),
         IoCall::Child(child),
         IoCall::Group(EffectGroup {
             members: vec![Effect::Delay(Duration::from_secs(1))],
@@ -377,7 +375,7 @@ fn passes_other_calls() {
         operation.start().as_slice(),
         [Effect::Task(TaskEffect::CancelTimer { .. })]
     ));
-    let blob = || Event::Blob(BlobEvent::ReservationReleased { id });
+    let blob = || Event::blob(BlobEvent::ReservationReleased { id });
     let child = || Event::SubOperation(SubOperationEvent::NotificationsEmitted);
     // Each answer leads to the next call's one effect.
     assert_eq!(operation.step(cancelled()).len(), 1);
@@ -466,7 +464,7 @@ fn refuses_wrong_event() {
     );
     operation.start();
     let id = ulid::Ulid::from(4u128);
-    operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
+    operation.step(Event::blob(BlobEvent::ReservationReleased { id }));
     let refused = IoError::Unexpected {
         expected: "a task event",
         got: "BlobEvent::ReservationReleased",
@@ -560,6 +558,7 @@ fn conflict_marks_retry() {
         error: StorageError::TransactionConflict,
     };
     assert!(operation.step(Event::Storage(conflict)).is_empty());
+    assert!(operation.lost_conflict(), "runner records storage conflict");
     assert!(operation.operation.rolled_back, "a refused commit is told");
     let Err(error) = operation.finalize() else {
         panic!("a lost commit fails");
@@ -702,7 +701,7 @@ fn adds_counters_inside() {
 #[test]
 fn abort_sends_cleanup() {
     let id = ulid::Ulid::from(5u128);
-    let release = || Effect::Blob(BlobEffect::ReleaseReservation { id });
+    let release = || Effect::blob(BlobEffect::ReleaseReservation { id });
     let mut procedure = script(vec![read_a()]);
     procedure.cleanup = vec![IoCall::Effect(Box::new(release()))];
     let mut operation = run(procedure, true);

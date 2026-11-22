@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 
 use aruna_core::calls::{IoCall, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
+use aruna_core::effects::BlobEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id::NodeId;
@@ -126,12 +126,12 @@ impl OpenCandidateOperation {
             (lease, _) => (BlobEffect::Read { location }, lease),
         };
         self.step = OpenStep::Read { blake3, held };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(effect)))))
+        Ok(Next::Call(IoCall::blob(effect)))
     }
 
     fn local_read(&self, event: Event, blake3: [u8; 32], held: Option<ReadLease>) -> OpenTurn {
-        match event {
-            Event::Blob(BlobEvent::ReadFinished { blob, stream_size }) => {
+        match event.into_blob() {
+            Ok(BlobEvent::ReadFinished { blob, stream_size }) => {
                 let size = stream_size;
                 let hashes = HashMap::new();
                 Ok(Next::Done(CandidateOpen::Opened(if self.metadata_only {
@@ -155,14 +155,21 @@ impl OpenCandidateOperation {
                     }
                 })))
             }
-            Event::Blob(BlobEvent::Error(BlobError::HandleMissing)) => Err(
-                ExportFailure::Retryable("blob handle unavailable".to_string()),
-            ),
-            Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
+            Ok(BlobEvent::Error(BlobError::HandleMissing)) => Err(ExportFailure::Retryable(
+                "blob handle unavailable".to_string(),
+            )),
+            Ok(BlobEvent::Error(BlobError::IntegrityCheckFailed(_))) => {
                 Ok(status(OpenStatus::Corrupt))
             }
-            Event::Blob(BlobEvent::Error(_)) => Ok(status(OpenStatus::Offline)),
-            event => Err(ExportFailure::Retryable(format!(
+            Ok(BlobEvent::Error(_)) => Ok(status(OpenStatus::Offline)),
+            Ok(event) => {
+                let event = Event::blob(event);
+                Err(ExportFailure::Retryable(format!(
+                    "unexpected local blob read event: {}",
+                    event.label()
+                )))
+            }
+            Err(event) => Err(ExportFailure::Retryable(format!(
                 "unexpected local blob read event: {}",
                 event.label()
             ))),

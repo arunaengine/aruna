@@ -5,7 +5,9 @@
 use crate::connectors::resolver::{ResolveBindingInput, resolve_binding_effect};
 use crate::s3::object::lookup::{FoundVersion, VersionLookup, VersionLookupError};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{Effect, StagingSourceEffect};
+#[cfg(test)]
+use aruna_core::effects::Effect;
+use aruna_core::effects::StagingSourceEffect;
 use aruna_core::errors::{
     ConversionError, SourceResolutionError, StagingSourceError, StorageError,
 };
@@ -168,16 +170,17 @@ impl HeadObjectOperation {
 
     fn access_resolved(&mut self, event: Event) -> HeadTurn {
         match event {
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                result: Ok(access),
-            }) => {
-                self.state = HeadObjectState::HeadReferenceSource;
-                let head = Effect::StagingSource(StagingSourceEffect::Head { access });
-                Ok(Next::Call(head.into()))
+            Event::SubOperation(SubOperationEvent::VersionAccessResolved { result }) => {
+                match *result {
+                    Ok(access) => {
+                        self.state = HeadObjectState::HeadReferenceSource;
+                        Ok(Next::Call(IoCall::staging(StagingSourceEffect::Head {
+                            access,
+                        })))
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
-            Event::SubOperation(SubOperationEvent::VersionAccessResolved {
-                result: Err(error),
-            }) => Err(error.into()),
             other => self.invalid(
                 "Event::SubOperation(SubOperationEvent::VersionSourceAccessResolved)",
                 other,
@@ -186,8 +189,8 @@ impl HeadObjectOperation {
     }
 
     fn source_answered(&mut self, event: Event) -> HeadTurn {
-        match event {
-            Event::StagingSource(StagingSourceEvent::HeadResult { metadata }) => {
+        match event.into_staging() {
+            Ok(StagingSourceEvent::HeadResult { metadata }) => {
                 let mut found = self.found.take().ok_or(IoError::Unfinished)?;
                 found.source_metadata = Some(metadata);
                 found.last_refresh =
@@ -196,8 +199,15 @@ impl HeadObjectOperation {
                 found.created_at = None;
                 Ok(Next::Done(self.result(found)))
             }
-            Event::StagingSource(StagingSourceEvent::Error { error }) => Err(error.into()),
-            other => self.invalid(
+            Ok(StagingSourceEvent::Error { error }) => Err(error.into()),
+            Ok(other) => {
+                let other = Event::staging(other);
+                self.invalid(
+                    "Event::StagingSource(StagingSourceEvent::HeadResult)",
+                    other,
+                )
+            }
+            Err(other) => self.invalid(
                 "Event::StagingSource(StagingSourceEvent::HeadResult)",
                 other,
             ),
@@ -646,13 +656,13 @@ mod tests {
             version: Some(version_id.to_string()),
         };
         let resolved = SubOperationEvent::VersionAccessResolved {
-            result: Ok(access.clone()),
+            result: Box::new(Ok(access.clone())),
         };
         let turn = operation.next(IoResult::Event(Box::new(Event::SubOperation(resolved))));
-        let head = Effect::StagingSource(StagingSourceEffect::Head { access });
+        let head = Effect::staging(StagingSourceEffect::Head { access });
         assert_eq!(turn, Ok(Next::Call(head.into())));
 
-        let answer = Event::StagingSource(StagingSourceEvent::HeadResult {
+        let answer = Event::staging(StagingSourceEvent::HeadResult {
             metadata: refreshed_metadata.clone(),
         });
         let Ok(Next::Done(result)) = operation.next(IoResult::Event(Box::new(answer))) else {

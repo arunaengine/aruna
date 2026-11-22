@@ -790,7 +790,7 @@ impl ForgetRetiredOperation {
     fn next_ticket(&mut self) -> ForgetTurn {
         match self.tickets.as_mut().and_then(VecDeque::pop_front) {
             Some(ticket) => {
-                let discard = Effect::Blob(BlobEffect::DiscardKey { ticket });
+                let discard = Effect::blob(BlobEffect::DiscardKey { ticket });
                 Ok(Next::Call(discard.into()))
             }
             None => Ok(Next::Done(())),
@@ -808,7 +808,7 @@ impl Operation for ForgetRetiredOperation {
         let Some(source) = self.record.source else {
             return Ok(Next::Done(()));
         };
-        let status = Effect::Blob(BlobEffect::ReadKeyStatus {
+        let status = Effect::blob(BlobEffect::ReadKeyStatus {
             bucket_id: source.bucket_id,
         });
         Ok(Next::Call(status.into()))
@@ -818,7 +818,7 @@ impl Operation for ForgetRetiredOperation {
         if self.tickets.is_some() {
             return self.next_ticket();
         }
-        let Event::Blob(BlobEvent::KeyStatus { generations }) = result.event()? else {
+        let Ok(BlobEvent::KeyStatus { generations }) = (result.event()?).into_blob() else {
             tracing::warn!("Could not read the unlock state of a retired key generation");
             return Ok(Next::Done(()));
         };

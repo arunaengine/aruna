@@ -1603,9 +1603,9 @@ impl AbandonOperation {
     /// Nothing there releases nothing but this write's own reservation, which a stat does not
     /// show as a file; without a backend version nothing names the bytes.
     fn stat_read(&mut self, event: Event) -> Turn<bool> {
-        let (location, version, etag) = match event {
-            Event::Blob(BlobEvent::ExternalStat { location: None, .. }) => {
-                let drop = Effect::Blob(BlobEffect::DropReservation {
+        let (location, version, etag) = match event.into_blob() {
+            Ok(BlobEvent::ExternalStat { location: None, .. }) => {
+                let drop = Effect::blob(BlobEffect::DropReservation {
                     backend: self.intent.backend.clone(),
                     path: self.path.clone(),
                     version_id: self.intent.version_id,
@@ -1613,12 +1613,12 @@ impl AbandonOperation {
                 self.step = AbandonStep::Dropped;
                 return Ok(Next::Call(drop.into()));
             }
-            Event::Blob(BlobEvent::ExternalStat {
+            Ok(BlobEvent::ExternalStat {
                 location: Some(location),
                 version: Some(version),
                 etag,
             }) => (location, version, etag),
-            Event::Blob(BlobEvent::ExternalStat { .. }) => return Ok(Next::Done(true)),
+            Ok(BlobEvent::ExternalStat { .. }) => return Ok(Next::Done(true)),
             _ => return Ok(Next::Done(false)),
         };
         // A stored copy of the bytes that records their MD5 proves what the file holds.
@@ -1665,7 +1665,7 @@ impl Operation for AbandonOperation {
     type Error = MigrationError;
 
     fn first(&mut self) -> Turn<bool> {
-        let stat = Effect::Blob(BlobEffect::StatExternal {
+        let stat = Effect::blob(BlobEffect::StatExternal {
             resolved: ResolvedBackend::new(self.intent.backend.clone(), None),
             path: self.path.clone(),
             created_by: self.intent.created_by,
@@ -1677,8 +1677,8 @@ impl Operation for AbandonOperation {
         match std::mem::replace(&mut self.step, AbandonStep::Queued) {
             AbandonStep::Stat => self.stat_read(result.event()?),
             AbandonStep::Dropped => Ok(Next::Done(matches!(
-                result.event()?,
-                Event::Blob(BlobEvent::DeleteFinished)
+                (result.event()?).as_blob(),
+                Some(BlobEvent::DeleteFinished)
             ))),
             AbandonStep::Copies(location, version, etag, mut pages) => {
                 for (_, value) in pages.take(result)? {
@@ -1810,7 +1810,7 @@ mod step_tests {
         let import = Ulid::from_bytes([2; 16]);
         let mut abandon = AbandonOperation::new(vec![1], intent, import, "p".to_string());
         assert!(matches!(abandon.first(), Ok(Next::Call(IoCall::Effect(_)))));
-        let missing = Event::Blob(BlobEvent::Error(BlobError::HandleMissing));
+        let missing = Event::blob(BlobEvent::Error(BlobError::HandleMissing));
         let answer = IoResult::Event(Box::new(missing));
         assert_eq!(abandon.next(answer), Ok(Next::Done(false)));
     }

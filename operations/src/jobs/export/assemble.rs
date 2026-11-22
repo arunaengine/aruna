@@ -349,7 +349,7 @@ impl AssembleOperation {
         let writer = boxed_suboperation(writer, |result| Event::Child(ChildOutcome::new(result)));
         self.step = AssembleStep::Group;
         Ok(Next::Call(IoCall::Group(EffectGroup {
-            members: vec![Effect::Blob(spool), Effect::SubOperation(writer)],
+            members: vec![Effect::blob(spool), Effect::SubOperation(writer)],
             limit: 2,
             form: GroupForm::All { deadline: None },
         })))
@@ -365,9 +365,9 @@ impl AssembleOperation {
                 "the artifact spool did not finish".to_string(),
             ));
         };
-        match (*event, written) {
+        match (event.into_blob(), written) {
             (
-                Event::Blob(BlobEvent::HiddenSpooled {
+                Ok(BlobEvent::HiddenSpooled {
                     location,
                     blake3,
                     size,
@@ -382,7 +382,7 @@ impl AssembleOperation {
                     expires_at_ms: self.now_ms.saturating_add(retention),
                 }))
             }
-            (Event::Blob(BlobEvent::HiddenSpooled { location, .. }), Err(error)) => {
+            (Ok(BlobEvent::HiddenSpooled { location, .. }), Err(error)) => {
                 match hidden_delete(&location) {
                     Ok(delete) => {
                         self.step = AssembleStep::Discard(error);
@@ -391,21 +391,23 @@ impl AssembleOperation {
                     Err(_) => Err(error),
                 }
             }
-            (Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })), _) => {
+            (Ok(BlobEvent::Error(BlobError::SizeLimitExceeded { limit })), _) => {
                 Err(ExportFailure::Permanent(format!(
                     "assembled ZIP exceeds the {limit} byte artifact limit"
                 )))
             }
-            (Event::Blob(BlobEvent::Error(_)), Err(ExportFailure::Cancelled)) => {
+            (Ok(BlobEvent::Error(_)), Err(ExportFailure::Cancelled)) => {
                 Err(ExportFailure::Cancelled)
             }
-            (Event::Blob(BlobEvent::Error(_)), Err(ExportFailure::Interrupted)) => {
+            (Ok(BlobEvent::Error(_)), Err(ExportFailure::Interrupted)) => {
                 Err(ExportFailure::Interrupted)
             }
-            (Event::Blob(BlobEvent::Error(error)), _) => {
-                Err(ExportFailure::Retryable(error.to_string()))
-            }
-            (event, _) => Err(ExportFailure::Retryable(format!(
+            (Ok(BlobEvent::Error(error)), _) => Err(ExportFailure::Retryable(error.to_string())),
+            (Ok(event), _) => Err(ExportFailure::Retryable(format!(
+                "unexpected hidden artifact event: {}",
+                event.label()
+            ))),
+            (Err(event), _) => Err(ExportFailure::Retryable(format!(
                 "unexpected hidden artifact event: {}",
                 event.label()
             ))),
