@@ -41,20 +41,13 @@ irokle = { workspace = true }
 
 # The rest
 async-trait = { workspace = true }
-base64 = { workspace = true }
-blake3 = { workspace = true }
 crypto_box = { workspace = true }
 dirs = { workspace = true }
-ipnet = { workspace = true }
 dotenvy = { workspace = true }
-ed25519-dalek = { workspace = true }
 fjall = { workspace = true }
-flate2 = { workspace = true }
 futures-util = { workspace = true }
-chrono = { workspace = true }
 hex = { workspace = true }
 iroh = { workspace = true }
-jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry_sdk = { workspace = true }
@@ -64,8 +57,6 @@ rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
-tar = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -77,6 +68,13 @@ byteview = { workspace = true }
 rand = { workspace = true }
 
 [dev-dependencies]
+base64 = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+sha2 = { workspace = true }
 aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-api = { workspace = true, features = ["test-hooks"] }
 aruna-test-support = { workspace = true }

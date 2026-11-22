@@ -9,7 +9,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::stream;
+use futures_util::stream;
 use ulid::Ulid;
 
 use crate::jobs::ByteStream;

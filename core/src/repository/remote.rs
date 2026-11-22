@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::ops::Range;
 use std::sync::Arc;
 
-use futures::future::BoxFuture;
+use futures_util::future::BoxFuture;
 use serde_json::Value;
 use thiserror::Error;
 use ulid::Ulid;

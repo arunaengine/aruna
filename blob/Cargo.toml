@@ -47,7 +47,6 @@ postcard = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 tempfile = { workspace = true }
@@ -66,3 +65,4 @@ windows-sys = { workspace = true }
 [dev-dependencies]
 aruna-core = { workspace = true, features = ["test-hooks"] }
 axum = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

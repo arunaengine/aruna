@@ -11,7 +11,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures_core::Stream;
+use futures_util::StreamExt;
 use globset::{Glob, GlobBuilder, GlobMatcher, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
@@ -546,7 +547,11 @@ impl TaskInput {
     pub fn from_bytes(path: impl Into<String>, bytes: impl Into<Bytes>) -> Self {
         let bytes = bytes.into();
         let size = bytes.len() as u64;
-        Self::from_stream(path, size, Box::pin(futures::stream::iter([Ok(bytes)])))
+        Self::from_stream(
+            path,
+            size,
+            Box::pin(futures_util::stream::iter([Ok(bytes)])),
+        )
     }
 
     pub fn size(&self) -> u64 {
