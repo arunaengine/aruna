@@ -436,7 +436,7 @@ async fn write_temp(
 
 /// The second half of the replace rule: the spool and target swap places
 /// atomically, then only displaced bytes matching the guard are discarded;
-/// anything else is swapped back, and what that displaces goes beside the target.
+/// anything else is swapped back (beside the target on Windows).
 async fn exchange_guarded(
     spooled: &Spooled,
     kept: &Path,
@@ -456,7 +456,12 @@ async fn exchange_guarded(
         let _ = tokio::fs::remove_file(kept).await;
         return Ok(());
     }
-    Err(swap_back(kept, target).await)
+    #[cfg(not(windows))]
+    let rolled = swap_back(kept, target).await;
+    // Windows has no atomic exchange, so there the live file keeps the target name.
+    #[cfg(windows)]
+    let rolled = keep_displaced(kept, target).await;
+    Err(rolled)
 }
 
 /// Swaps the spool in for the target through the kept path, so the bytes it
@@ -496,6 +501,7 @@ async fn undo_replace(kept: &Path, target: &Path, error: String) -> PlaceError {
 /// Rolls back a replace whose displaced owner file at `kept` drifted. The owner's
 /// file first takes a visible copy name, then one swap puts it back at the target
 /// and leaves the live file under a visible copy name, so nothing is hidden or lost.
+#[cfg(not(windows))]
 async fn swap_back(kept: &Path, target: &Path) -> PlaceError {
     let copy = match rescue_displaced(kept, target).await {
         Ok(copy) => copy,
@@ -505,30 +511,11 @@ async fn swap_back(kept: &Path, target: &Path) -> PlaceError {
     let is_file = tokio::fs::symlink_metadata(target)
         .await
         .is_ok_and(|entry| entry.is_file());
-    if !is_file || swap_copy(&copy, target).is_err() {
+    if !is_file || exchange(&copy, target).is_err() {
         // A vacant target takes the owner's file back; a taken one keeps its save.
         let _ = place_new(&copy, target);
     }
     PlaceError::Refused(LocalFileRefusal::Drifted)
-}
-
-/// Swaps the owner's file at `copy` with the live file at `target` in one step.
-#[cfg(not(windows))]
-fn swap_copy(copy: &Path, target: &Path) -> Result<(), PlaceError> {
-    exchange(copy, target)
-}
-
-/// Replaces the target with the owner's file at `copy`; the live file leaves under a
-/// free copy name beside it, so a partial replace (error 1177) also hides nothing.
-#[cfg(windows)]
-fn swap_copy(copy: &Path, target: &Path) -> Result<(), PlaceError> {
-    let Some(backup) = copy_paths(target)?.find(|path| {
-        std::fs::symlink_metadata(path)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    }) else {
-        return Err(PlaceError::Failed("no free copy name".to_string()));
-    };
-    replace_file(target, copy, &backup).map_err(|error| PlaceError::Failed(error.to_string()))
 }
 
 /// Puts the owner's file back at the vacant target. A save that took the name
@@ -571,23 +558,7 @@ fn exchange(left: &Path, right: &Path) -> Result<(), PlaceError> {
 
 #[cfg(windows)]
 fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    let target = target
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let replacement = replacement
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let backup = backup
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
+    let (target, replacement, backup) = (wide(target), wide(replacement), wide(backup));
     let result = unsafe {
         windows_sys::Win32::Storage::FileSystem::ReplaceFileW(
             target.as_ptr(),
@@ -605,12 +576,21 @@ fn replace_file(target: &Path, replacement: &Path, backup: &Path) -> std::io::Re
     }
 }
 
+/// The path as the nul-terminated UTF-16 string the Windows file functions take.
+#[cfg(windows)]
+fn wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
 /// Puts displaced bytes beside the target under a free conflict copy name and
 /// answers that path, so they stay on the owner's disk under a findable name.
 async fn rescue_displaced(spool: &Path, target: &Path) -> Result<PathBuf, PlaceError> {
     for candidate in copy_paths(target)? {
-        if place_new(spool, &candidate).is_ok() {
-            return Ok(candidate);
+        match place_new(spool, &candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(PlaceError::Refused(LocalFileRefusal::Exists)) => {}
+            Err(error) => return Err(error),
         }
     }
     Err(PlaceError::Failed(
@@ -686,11 +666,25 @@ fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
     }
 }
 
+/// Without `MOVEFILE_REPLACE_EXISTING` the move refuses any entry at the target.
 #[cfg(windows)]
 fn place_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
-    link_new(source, target)
+    let (source, target) = (wide(source), wide(target));
+    let moved = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(source.as_ptr(), target.as_ptr(), 0)
+    };
+    if moved != 0 {
+        return Ok(());
+    }
+    match std::io::Error::last_os_error() {
+        error if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(PlaceError::Refused(LocalFileRefusal::Exists))
+        }
+        error => Err(PlaceError::Failed(error.to_string())),
+    }
 }
 
+#[cfg(not(windows))]
 fn link_new(source: &Path, target: &Path) -> Result<(), PlaceError> {
     match std::fs::hard_link(source, target) {
         Ok(()) => {
@@ -712,15 +706,26 @@ fn conflict_stamp(at_ms: u64) -> String {
 }
 
 /// `note (conflicted copy 2026-08-25 1032, realm).txt`, with a numeric suffix
-/// from the second attempt on.
+/// from the second attempt on. A name too long for one path component drops its
+/// stem, then its extension.
 fn copy_name(relative: &str, stamp: &str, attempt: usize) -> String {
     let (stem, extension) = split_name(relative);
     let suffix = match attempt {
         1 => String::new(),
         other => format!(" ({other})"),
     };
-    format!("{stem} (conflicted copy {stamp}, realm){suffix}{extension}")
+    let marker = format!("(conflicted copy {stamp}, realm){suffix}");
+    [
+        format!("{stem} {marker}{extension}"),
+        format!("{marker}{extension}"),
+    ]
+    .into_iter()
+    .find(|name| name.len() <= MAX_NAME_BYTES)
+    .unwrap_or(marker)
 }
+
+/// The longest file name in bytes that every supported file system accepts.
+const MAX_NAME_BYTES: usize = 255;
 
 /// The same file name, with a numeric suffix from the second attempt on.
 fn suffixed_name(relative: &str, attempt: usize) -> String {
@@ -922,6 +927,7 @@ mod tests {
 
     // The one rule the whole design rests on: bytes that no longer equal the
     // recorded base are kept, even though the operation asked for a replace.
+    // Windows keeps the download at the target and the owner's edit beside it.
     #[tokio::test]
     async fn refuses_drifted_target() {
         let root = tempfile::tempdir().unwrap();
@@ -949,20 +955,59 @@ mod tests {
                 reason: LocalFileRefusal::Drifted
             }
         );
-        assert_eq!(
-            tokio::fs::read(&file).await.unwrap(),
-            b"the owner's own edit"
-        );
+        let live: &[u8] = match cfg!(windows) {
+            true => b"newer",
+            false => b"the owner's own edit",
+        };
+        assert_eq!(tokio::fs::read(&file).await.unwrap(), live);
         for directory in [SPOOL_DIR, KEPT_DIR] {
             let left = std::fs::read_dir(root.path().join(directory))
                 .map(|entries| entries.filter_map(Result::ok).count())
                 .unwrap_or_default();
             assert_eq!(left, 0, "{directory} must be empty");
         }
-        // The displaced download stays beside the owner's file as a visible copy.
+        // The displaced version stays beside the live file as a visible copy.
         assert_eq!(
             listed_bytes(root.path()).await,
             vec![b"newer".to_vec(), b"the owner's own edit".to_vec()]
+        );
+    }
+
+    // A valid name at the length limit still gets a visible copy on a drift, and a
+    // restart pass finds both versions in the listing.
+    #[tokio::test]
+    async fn keeps_long_name() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().to_string_lossy().to_string();
+        let name = format!("{}.txt", "n".repeat(MAX_NAME_BYTES - 4));
+        let file = root.path().join(&name);
+        tokio::fs::write(&file, b"base").await.unwrap();
+        let (fingerprint, blake3) = identity(&file).await;
+        tokio::fs::write(&file, b"owner edit").await.unwrap();
+
+        let guard = WriteGuard::MatchesBase {
+            fingerprint,
+            blake3,
+        };
+        let event = write_guarded(&path, &name, &guard, body(b"newer")).await;
+        assert_eq!(
+            event,
+            LocalFileEvent::Refused {
+                reason: LocalFileRefusal::Drifted
+            }
+        );
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            listed_bytes(root.path()).await,
+            vec![b"newer".to_vec(), b"owner edit".to_vec()]
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join(KEPT_DIR))
+                .unwrap()
+                .count(),
+            0
         );
     }
 
@@ -1006,6 +1051,7 @@ mod tests {
 
     /// The end of a rollback: the first save at the target, `beside` as its one
     /// visible copy, and nothing left hidden in the kept directory.
+    #[cfg(not(windows))]
     async fn assert_rolled_back(root: &Path, beside: &[u8]) {
         let target = root.join("note.txt");
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"first save");
@@ -1019,6 +1065,7 @@ mod tests {
 
     // A save the owner makes before the rollback is what the swap back displaces.
     // The target is never vacant, and a restart pass finds both versions visible.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn keeps_second_save() {
         let root = tempfile::tempdir().unwrap();
@@ -1040,6 +1087,7 @@ mod tests {
 
     // An editor that rewrites the live download in place and closes it while the
     // rollback runs keeps its bytes: the rollback never deletes a file.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn keeps_rewritten_file() {
         let root = tempfile::tempdir().unwrap();
@@ -1076,6 +1124,7 @@ mod tests {
 
     // A new file holding exactly the incoming bytes is still the owner's save:
     // no hash decides about deleting it, so it stays beside the first save.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn keeps_identical_save() {
         let root = tempfile::tempdir().unwrap();
@@ -1093,6 +1142,7 @@ mod tests {
 
     // A populated directory a local tool put at the target keeps its place and its
     // children; the owner's file waits beside it as a visible copy.
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn keeps_replaced_directory() {
         let root = tempfile::tempdir().unwrap();
@@ -1131,39 +1181,43 @@ mod tests {
         );
     }
 
-    // Each state a Windows rollback passes through, where a process exit can stop it:
-    // the rescued owner file, a partial replace (error 1177), and a full replace.
+    // The Windows rollback: the live file keeps the target name, and the owner's
+    // file takes the first free copy name, so a copy already there stays.
     #[tokio::test]
-    async fn shows_replace_states() {
+    async fn keeps_live_file() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().to_string_lossy().to_string();
         let (target, kept) = swapped_folder(&path).await;
-        let both = vec![b"first save".to_vec(), b"incoming".to_vec()];
-        let Ok(copy) = rescue_displaced(&kept, &target).await else {
-            panic!("the owner's file was not rescued");
+        editor_save(&target, b"second save").await;
+        let Some(taken) = copy_paths(&target).ok().and_then(|mut paths| paths.next()) else {
+            panic!("no copy name");
         };
-        let Some(backup) = copy_paths(&target)
-            .ok()
-            .and_then(|mut paths| paths.find(|path| !path.exists()))
-        else {
-            panic!("no free copy name");
-        };
-        for step in [None, Some((&target, &backup)), Some((&copy, &target))] {
-            if let Some((from, to)) = step {
-                tokio::fs::rename(from, to).await.unwrap();
-            }
-            crate::fs_source::check_local(&access(root.path(), ""))
-                .await
-                .unwrap();
-            assert_eq!(listed_bytes(root.path()).await, both);
-            assert_eq!(
-                std::fs::read_dir(root.path().join(KEPT_DIR))
-                    .unwrap()
-                    .count(),
-                0
-            );
-        }
-        assert_rolled_back(root.path(), b"incoming").await;
+        tokio::fs::write(&taken, b"other copy").await.unwrap();
+
+        let refusal = keep_displaced(&kept, &target).await;
+        assert!(matches!(
+            refusal,
+            PlaceError::Refused(LocalFileRefusal::Drifted)
+        ));
+        crate::fs_source::check_local(&access(root.path(), ""))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second save");
+        assert_eq!(tokio::fs::read(&taken).await.unwrap(), b"other copy");
+        assert_eq!(
+            listed_bytes(root.path()).await,
+            vec![
+                b"first save".to_vec(),
+                b"other copy".to_vec(),
+                b"second save".to_vec()
+            ]
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join(KEPT_DIR))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     // A partial replace (Windows error 1177) left the owner's file at the backup
@@ -1550,6 +1604,13 @@ mod tests {
         assert_eq!(
             copy_name("note", "s", 2),
             "note (conflicted copy s, realm) (2)"
+        );
+        let long = format!("a/{}.txt", "n".repeat(MAX_NAME_BYTES - 4));
+        assert_eq!(copy_name(&long, "s", 1), "(conflicted copy s, realm).txt");
+        let extension = format!("a.{}", "x".repeat(MAX_NAME_BYTES - 2));
+        assert_eq!(
+            copy_name(&extension, "s", 2),
+            "(conflicted copy s, realm) (2)"
         );
         assert_eq!(suffixed_name("a/note.txt", 3), "note (3).txt");
         assert_eq!(sibling_path("a/note.txt", "other.txt"), "a/other.txt");

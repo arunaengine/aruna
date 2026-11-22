@@ -320,7 +320,7 @@ fn restore_previous(path: &Path, previous: &Path) -> Result<(), PortalArtifactEr
         && owned_backup(previous)
         && fs::symlink_metadata(&backup).is_ok_and(|metadata| metadata.is_dir())
     {
-        fs::rename(&backup, path)?;
+        rename_new(&backup, path)?;
         let _ = fs::remove_dir_all(previous);
     }
     Ok(())
@@ -341,8 +341,15 @@ fn lock_install(previous: &Path) -> io::Result<fs::File> {
         .truncate(false)
         .write(true)
         .open(previous.with_extension("lock"))?;
-    file.lock()?;
-    Ok(file)
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(fs::TryLockError::WouldBlock) => {
+            #[cfg(test)]
+            tests::CONTENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+            file.lock().map(|()| file)
+        }
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
 /// Publishes the marked recovery directory `previous` whole with one rename of a staged copy, so
@@ -390,25 +397,29 @@ fn exchange_dirs(_staged: &Path, _target: &Path) -> io::Result<()> {
     Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
-/// Renames `from` to `to` only while nothing is at `to`, where the file system can refuse a
-/// replacement; elsewhere this is a plain rename.
+/// Renames `from` to `to` only while nothing is at `to`. A file system that cannot refuse a
+/// replacement fails the rename instead of replacing.
 #[cfg(not(windows))]
 fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
-    use rustix::io::Errno;
     let flags = rustix::fs::RenameFlags::NOREPLACE;
-    match rustix::fs::renameat_with(rustix::fs::CWD, from, rustix::fs::CWD, to, flags) {
-        Err(error)
-            if [Errno::INVAL, Errno::NOSYS, Errno::NOTSUP, Errno::OPNOTSUPP].contains(&error) =>
-        {
-            fs::rename(from, to)
-        }
-        result => result.map_err(io::Error::from),
-    }
+    rustix::fs::renameat_with(rustix::fs::CWD, from, rustix::fs::CWD, to, flags)
+        .map_err(io::Error::from)
 }
 
+/// Without `MOVEFILE_REPLACE_EXISTING` the move refuses any entry at `to`.
 #[cfg(windows)]
 fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
-    fs::rename(from, to)
+    use std::os::windows::ffi::OsStrExt;
+    let wide =
+        |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
+    let (from, to) = (wide(from), wide(to));
+    let moved = unsafe {
+        windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0)
+    };
+    match moved {
+        0 => Err(io::Error::last_os_error()),
+        _ => Ok(()),
+    }
 }
 
 /// Replaces `target` with two renames for file systems without an exchange.
@@ -424,21 +435,28 @@ fn replace_portable(
         return Err(error.into());
     }
     if let Err(install) = staged.persist(target) {
-        return match fs::rename(&backup, target) {
-            Ok(()) => {
-                let _ = fs::remove_dir_all(previous);
-                Err(install.into())
-            }
-            Err(restore) => Err(PortalArtifactError::RollbackFailed {
-                backup,
-                install,
-                restore,
-            }),
-        };
+        return Err(restore_backup(previous, target, install));
     }
     // A backup that stays behind is removed by the next replacement.
     let _ = fs::remove_dir_all(previous);
     Ok(())
+}
+
+/// Moves the old portal from the recovery directory `previous` back to the vacant `target`
+/// after a failed install. An entry that took `target` meanwhile stays, and so does the backup.
+fn restore_backup(previous: &Path, target: &Path, install: io::Error) -> PortalArtifactError {
+    let backup = previous.join(BACKUP_DIR);
+    match rename_new(&backup, target) {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(previous);
+            install.into()
+        }
+        Err(restore) => PortalArtifactError::RollbackFailed {
+            backup,
+            install,
+            restore,
+        },
+    }
 }
 
 fn can_replace_dir(path: &Path) -> io::Result<bool> {
@@ -698,7 +716,7 @@ mod tests {
         BACKUP_DIR, CHECKSUM_FILE, DownloadedChecksumFile, PortalArtifactError, TempInstallDir,
         claim_backup, existing_install, install_parent, install_verified_artifact,
         installed_status, lock_install, portal_dir, prepare_artifact_status, previous_install,
-        replace_portable, safe_archive_path, unpack_archive, verify_sha256,
+        replace_portable, restore_backup, safe_archive_path, unpack_archive, verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -707,8 +725,12 @@ mod tests {
     use std::fs;
     use std::io::Cursor;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tar::{Builder, EntryType, Header};
     use tempfile::tempdir;
+
+    /// Set when an installer finds the install lock held and starts waiting for it.
+    pub(super) static CONTENDED: AtomicBool = AtomicBool::new(false);
 
     fn config(portal_dir: &Path) -> PortalArtifactConfig {
         PortalArtifactConfig {
@@ -972,16 +994,11 @@ mod tests {
             install_verified_artifact(&second_config, &archive, checksum, "now".to_string())
         });
 
-        // The second install has staged its portal and is waiting for the lock.
-        while !staged_checksum(tempdir.path()) {
+        // The second install has tried the lock and is waiting for it.
+        while !CONTENDED.load(Ordering::SeqCst) {
             assert!(!second.is_finished());
             std::thread::yield_now();
         }
-        let probe = fs::File::open(previous.with_extension("lock")).unwrap();
-        assert!(matches!(
-            probe.try_lock(),
-            Err(fs::TryLockError::WouldBlock)
-        ));
         assert!(!second.is_finished());
 
         // The first install fails and restores its backup, as `replace_portable` does.
@@ -997,17 +1014,7 @@ mod tests {
         assert!(!previous.exists());
     }
 
-    /// Whether an installer staged a portal with its checksum file under `parent`.
-    fn staged_checksum(parent: &Path) -> bool {
-        fs::read_dir(parent).unwrap().any(|entry| {
-            let entry = entry.unwrap();
-            entry.file_name().to_string_lossy().starts_with(".portal-")
-                && entry.path().join(CHECKSUM_FILE).is_file()
-        })
-    }
-
     // A directory another tool creates at the recovery name after the absence check stays.
-    #[cfg(not(windows))]
     #[test]
     fn claim_keeps_directory() {
         let tempdir = tempdir().unwrap();
@@ -1045,6 +1052,27 @@ mod tests {
             "new"
         );
         assert!(!previous.exists());
+    }
+
+    // A directory another tool creates at the live name before the rollback stays, and the old
+    // portal waits in its backup.
+    #[test]
+    fn rollback_keeps_occupant() {
+        let tempdir = tempdir().unwrap();
+        let target = tempdir.path().join("portal");
+        let previous = previous_install(&target).unwrap();
+        write_portal(&target, "old");
+        claim_backup(&previous).unwrap();
+        fs::rename(&target, previous.join(BACKUP_DIR)).unwrap();
+        fs::create_dir(&target).unwrap();
+
+        let error = restore_backup(&previous, &target, std::io::Error::other("install"));
+        assert!(matches!(error, PortalArtifactError::RollbackFailed { .. }));
+        assert_eq!(fs::read_dir(&target).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_to_string(previous.join(BACKUP_DIR).join("index.html")).unwrap(),
+            "old"
+        );
     }
 
     #[test]
