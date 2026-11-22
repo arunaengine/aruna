@@ -1144,9 +1144,7 @@ mod tests {
                 reason: LocalFileRefusal::Drifted
             }
         );
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_eq!(
             listed_bytes(root.path()).await,
             vec![b"newer".to_vec(), b"owner edit".to_vec()]
@@ -1227,9 +1225,7 @@ mod tests {
             PlaceError::Refused(LocalFileRefusal::Drifted)
         ));
         assert_rolled_back(root.path(), b"second save").await;
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_rolled_back(root.path(), b"second save").await;
     }
 
@@ -1349,9 +1345,7 @@ mod tests {
             refusal,
             PlaceError::Refused(LocalFileRefusal::Drifted)
         ));
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_eq!(tokio::fs::read(&target).await.unwrap(), b"second save");
         assert_eq!(tokio::fs::read(&taken).await.unwrap(), b"other copy");
         assert_eq!(
@@ -1429,9 +1423,7 @@ mod tests {
         let running = kept_file(&path, "other.txt").await.unwrap();
         tokio::fs::write(&running.path, b"in flight").await.unwrap();
 
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         let paths = listed_paths(root.path()).await;
         assert_eq!(paths.len(), 2, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));
@@ -1467,14 +1459,15 @@ mod tests {
         assert!(matches!(refusal, PlaceError::Kept(_)));
         tokio::fs::remove_file(&docs).await.unwrap();
 
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         assert_eq!(tokio::fs::read(&hidden).await.unwrap(), b"owner edit");
         drop(kept);
         crate::fs_source::check_local(&access(root.path(), ""))
             .await
             .unwrap();
+        assert_eq!(tokio::fs::read(&hidden).await.unwrap(), b"owner edit");
+        assert_eq!(listed_paths(root.path()).await, vec!["moved/note.txt"]);
+        crate::fs_source::check_root(&path, true).await.unwrap();
         let paths = listed_paths(root.path()).await;
         assert_eq!(paths.len(), 2, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));
@@ -1497,7 +1490,7 @@ mod tests {
         let docs = root.path().join("docs");
         tokio::fs::write(&docs, b"obstacle").await.unwrap();
 
-        let checked = crate::fs_source::check_local(&access(root.path(), "")).await;
+        let checked = crate::fs_source::check_root(&path, true).await;
         let Err(StagingSourceError::CheckError(message)) = checked else {
             panic!("the blocked recovery must fail the check: {checked:?}");
         };
@@ -1505,9 +1498,7 @@ mod tests {
         assert!(message.contains(&kept.display().to_string()), "{message}");
         assert_eq!(tokio::fs::read(&kept).await.unwrap(), b"owner edit");
         tokio::fs::remove_file(&docs).await.unwrap();
-        crate::fs_source::check_local(&access(root.path(), ""))
-            .await
-            .unwrap();
+        crate::fs_source::check_root(&path, true).await.unwrap();
         let paths = listed_paths(root.path()).await;
         assert_eq!(paths.len(), 1, "{paths:?}");
         assert!(paths[0].starts_with("docs/note (conflicted copy "));

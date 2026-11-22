@@ -178,7 +178,7 @@ impl FolderPassOperation {
             return self.fail(ReconcileFolderError::Unavailable);
         };
         let folder = &self.folder;
-        let offer = offer_directory(OfferDirectoryInput {
+        let mut offer = offer_directory(OfferDirectoryInput {
             bucket: folder.local_bucket.clone(),
             root: folder.root.clone(),
             group_id: folder.group_id,
@@ -186,6 +186,7 @@ impl FolderPassOperation {
             node_id,
             user_id: folder.created_by,
         });
+        offer.recover_kept = folder.mode != FolderMode::UploadOnly;
         self.step = PassStep::Sweep;
         Ok(Next::Call(IoCall::child(offer)))
     }
@@ -537,6 +538,42 @@ impl Operation for SyncTimersOperation {
 #[cfg(test)]
 mod pure_tests {
     use super::*;
+
+    #[test]
+    fn recovery_obeys_mode() {
+        use aruna_core::calls::ChildOutcome;
+        use aruna_core::effects::{Effect, StagingSourceEffect};
+
+        for mode in [
+            FolderMode::TwoWay,
+            FolderMode::DownloadOnly,
+            FolderMode::UploadOnly,
+        ] {
+            let mut folder = reconcile::pure_tests::folder();
+            folder.mode = mode;
+            let ids = Some((folder.remote.node_id, folder.created_by.realm_id));
+            let mut pass = folder_pass(ids, folder.clone());
+            pass.first().unwrap();
+            let current = ChildOutcome::new(Ok::<_, FolderError>(folder));
+            let Next::Call(IoCall::Child(mut offer)) = pass.next(IoResult::Child(current)).unwrap()
+            else {
+                panic!("an active folder offers its directory");
+            };
+            let mut opening = offer.start();
+            let [Effect::SubOperation(check)] = opening.as_mut_slice() else {
+                panic!("the offer checks the root before listing it");
+            };
+            match check.start().as_slice() {
+                [Effect::StagingSource(StagingSourceEffect::Check { .. })] => {
+                    assert_eq!(mode, FolderMode::UploadOnly)
+                }
+                [Effect::StagingSource(StagingSourceEffect::PrepareFolder { .. })] => {
+                    assert_ne!(mode, FolderMode::UploadOnly)
+                }
+                _ => panic!("expected a folder check"),
+            }
+        }
+    }
 
     fn view(boundary: &str) -> RemoteView {
         RemoteView {

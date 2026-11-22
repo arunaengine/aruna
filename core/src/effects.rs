@@ -514,6 +514,10 @@ pub enum BlobEffect {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagingSourceEffect {
+    /// Checks a download-capable local folder and publishes displaced files before listing it.
+    PrepareFolder {
+        root: String,
+    },
     Check {
         access: ResolvedSourceAccess,
     },

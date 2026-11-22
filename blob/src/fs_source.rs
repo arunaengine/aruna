@@ -49,16 +49,22 @@ pub(crate) fn is_local_access(access: &ResolvedSourceAccess) -> bool {
 
 pub(crate) async fn check_local(access: &ResolvedSourceAccess) -> Result<(), StagingSourceError> {
     let (root, _) = access_parts(access)?;
+    check_root(&root, false).await
+}
+
+pub(crate) async fn check_root(root: &str, recover: bool) -> Result<(), StagingSourceError> {
     // A root that does not resolve is as unusable as one that is not a directory.
-    let resolved = tokio::fs::canonicalize(&root)
+    let resolved = tokio::fs::canonicalize(root)
         .await
         .map_err(|error| StagingSourceError::CheckError(error.to_string()))?;
     // Every sweep starts by dropping the spool a crashed write left behind.
     // Those bytes are this node's own, never the owner's.
-    crate::fs_write::sweep_spool(&root).await;
-    crate::fs_write::recover_kept(&root)
-        .await
-        .map_err(StagingSourceError::CheckError)?;
+    crate::fs_write::sweep_spool(root).await;
+    if recover {
+        crate::fs_write::recover_kept(root)
+            .await
+            .map_err(StagingSourceError::CheckError)?;
+    }
     match tokio::fs::metadata(&resolved).await {
         Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(StagingSourceError::CheckError(
