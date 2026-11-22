@@ -399,13 +399,28 @@ fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
         .map_err(io::Error::from)
 }
 
-/// Without `MOVEFILE_REPLACE_EXISTING` the move refuses any entry at `to`.
+/// Without `MOVEFILE_REPLACE_EXISTING` the move refuses any entry at `to`. Both operands are
+/// spelled under the canonical parent of `to`, an extended-length path past the legacy limit.
 #[cfg(windows)]
 fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    let wide =
-        |path: &Path| -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() };
-    let (from, to) = (wide(from), wide(to));
+    let parent = to.parent().unwrap_or(Path::new(""));
+    let base = match parent.as_os_str().is_empty() {
+        true => fs::canonicalize(".")?,
+        false => fs::canonicalize(parent)?,
+    };
+    let wide = |path: &Path| -> io::Result<Vec<u16>> {
+        let rest = path
+            .strip_prefix(parent)
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        Ok(base
+            .join(rest)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect())
+    };
+    let (from, to) = (wide(from)?, wide(to)?);
     let moved = unsafe {
         windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0)
     };
@@ -721,7 +736,8 @@ mod tests {
         BACKUP_DIR, CHECKSUM_FILE, DownloadedChecksumFile, PortalArtifactError, TempInstallDir,
         claim_backup, existing_install, install_parent, install_verified_artifact,
         installed_status, lock_install, portal_dir, prepare_artifact_status, previous_install,
-        replace_portable, restore_backup, safe_archive_path, unpack_archive, verify_sha256,
+        rename_new, replace_portable, restore_backup, safe_archive_path, unpack_archive,
+        verify_sha256,
     };
     use crate::PortalArtifactConfig;
     use flate2::Compression;
@@ -843,6 +859,22 @@ mod tests {
         write_portal(&installed, "old");
         assert!(existing_install(&installed).unwrap());
         assert!(!existing_install(&tempdir.path().join("missing")).unwrap());
+    }
+
+    #[test]
+    fn rename_allows_deep() {
+        let tempdir = tempdir().unwrap();
+        let parent = (0..4).fold(tempdir.path().to_path_buf(), |dir, _| {
+            dir.join("d".repeat(80))
+        });
+        let (from, to) = (parent.join("staged"), parent.join("portal"));
+        write_portal(&from, "new");
+        assert!(to.as_os_str().len() > 260);
+
+        rename_new(&from, &to).unwrap();
+
+        assert_eq!(fs::read_to_string(to.join("index.html")).unwrap(), "new");
+        assert!(!from.exists());
     }
 
     #[cfg(windows)]
