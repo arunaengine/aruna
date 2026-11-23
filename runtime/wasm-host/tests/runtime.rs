@@ -35,9 +35,9 @@ struct Recorder {
     intents: Mutex<Vec<Intent>>,
     /// Ordinals of writes whose outcome the runtime gave up on.
     abandoned: Mutex<Vec<u32>>,
-    /// Signals that a call to the `block` resource is waiting.
+    /// Signals that a call to the `block` or `slow` resource is waiting.
     blocked: tokio::sync::Notify,
-    /// Lets a write to the `slow` resource finish.
+    /// Lets a call to the `slow` resource finish.
     released: tokio::sync::Notify,
 }
 
@@ -72,11 +72,10 @@ impl Broker for Recorder {
                     json: format!(r#"{{"name":"{}"}}"#, "x".repeat(8192)),
                 });
             }
-            // A host call that stays pending across several polls while the guest waits on it.
+            // A host call that stays pending until the test releases it.
             "slow" => {
-                for _ in 0..8 {
-                    tokio::task::yield_now().await;
-                }
+                self.blocked.notify_one();
+                self.released.notified().await;
             }
             "block" => {
                 self.blocked.notify_one();
@@ -996,6 +995,21 @@ async fn wasi_calls_bounded() {
     );
 }
 
+/// Runs `call`; with `slow` the engine epoch ticks while its `slow` host call is pending.
+async fn run_fill(call: Invocation, slow: bool) -> Result<Option<String>, InvokeError> {
+    let (runtime, broker) = (runtime(), Arc::new(Recorder::default()));
+    let release = async {
+        if slow {
+            broker.blocked.notified().await;
+            runtime.tick_epoch();
+            broker.released.notify_one();
+        }
+    };
+    let run = invoke_on(&runtime, call, broker.clone());
+    let joined = tokio::time::timeout(HANG_CAP, async { tokio::join!(run, release) });
+    joined.await.expect("the run ended within the hang cap").0
+}
+
 #[tokio::test]
 async fn fill_keeps_calls() {
     // A large fill costs much fuel at once; neither it nor the yields may change the count.
@@ -1009,13 +1023,13 @@ async fn fill_keeps_calls() {
         let mut exact = probe(input.clone());
         exact.limits.calls = allowed;
         assert_eq!(
-            output(invoke(exact, Arc::default()).await),
+            output(run_fill(exact, slow).await),
             serde_json::json!(1),
             "slow {slow}"
         );
         let mut short = probe(input);
         short.limits.calls = allowed - 1;
-        let ended = invoke(short, Arc::default()).await;
+        let ended = run_fill(short, slow).await;
         assert!(
             matches!(ended, Err(InvokeError::Limit(Limit::Calls))),
             "slow {slow}: {ended:?}"

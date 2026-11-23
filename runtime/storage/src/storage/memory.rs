@@ -40,7 +40,8 @@ use super::worker::{
 };
 
 /// Opens storage that keeps every row in memory, without files or threads. It answers storage
-/// effects as `FjallStorage` does, apart from durability.
+/// effects as `FjallStorage` does, apart from durability. One mutex runs each effect whole, so
+/// tests of a read racing a commit in the same write transaction use `FjallStorage`.
 pub struct MemoryStorage;
 
 impl MemoryStorage {
@@ -438,11 +439,15 @@ impl State {
         if limit == 0 {
             return Ok((Vec::new(), None));
         }
-        let bounds = byte_bounds(page_bounds(prefix.as_ref(), start.as_ref()));
+        let Some(bounds) = page_bounds(prefix.as_ref(), start.as_ref()) else {
+            return Ok((Vec::new(), None));
+        };
+        let bounds = byte_bounds(bounds);
         let snapshot = self.mark(txn_id, key_space, &bounds)?;
         collect_page(
             self.scan(txn_id, key_space, snapshot, &bounds, false),
             limit,
+            |row| row,
         )
     }
 
@@ -465,6 +470,7 @@ impl State {
         budget_page(
             self.scan(txn_id, key_space, snapshot, &bounds, false),
             budget,
+            |row| row,
         )
     }
 
@@ -477,11 +483,15 @@ impl State {
         if self.view(txn_id).is_some() {
             return Err(StorageError::InvalidEffect);
         }
-        let bounds = byte_bounds(page_bounds(prefix.as_ref(), None));
-        let snapshot = self.mark(txn_id, key_space, &bounds)?;
-        let last = self.scan(txn_id, key_space, snapshot, &bounds, true).next();
+        let mut values = Vec::new();
+        if let Some(bounds) = page_bounds(prefix.as_ref(), None) {
+            let bounds = byte_bounds(bounds);
+            let snapshot = self.mark(txn_id, key_space, &bounds)?;
+            let last = self.scan(txn_id, key_space, snapshot, &bounds, true).next();
+            values.extend(last.transpose()?);
+        }
         Ok(StorageEvent::IterResult {
-            values: last.transpose()?.into_iter().collect(),
+            values,
             next_start_after: None,
         })
     }
@@ -649,21 +659,34 @@ impl State {
         start: Option<&IterStart>,
         limit: usize,
     ) -> Result<PageResult, StorageError> {
-        let bounds = byte_bounds(page_bounds(prefix, start));
-        let rows = self.rows.scan(key_space, snapshot, None, &bounds, false);
-        let page = collect_page(rows, limit)?;
+        let page = match page_bounds(prefix, start) {
+            Some(bounds) => {
+                let bounds = byte_bounds(bounds);
+                let rows = self.rows.scan(key_space, snapshot, None, &bounds, false);
+                collect_page(rows, limit, |row| row)?
+            }
+            None => (Vec::new(), None),
+        };
         if !is_source(key_space) {
             return Ok(page);
         }
         let (kept_prefix, kept_start) = kept_cursor(key_space, prefix, start);
-        let bounds = byte_bounds(page_bounds(Some(&kept_prefix), kept_start.as_ref()));
-        let kept = (self.rows).scan(USAGE_PREIMAGE_KEYSPACE, snapshot, None, &bounds, false);
-        merge_kept(key_space, page, collect_page(kept, limit)?, limit)
+        let kept = match page_bounds(Some(&kept_prefix), kept_start.as_ref()) {
+            Some(bounds) => {
+                let bounds = byte_bounds(bounds);
+                let rows =
+                    (self.rows).scan(USAGE_PREIMAGE_KEYSPACE, snapshot, None, &bounds, false);
+                collect_page(rows, limit, |row| row)?
+            }
+            None => (Vec::new(), None),
+        };
+        merge_kept(key_space, page, kept, limit)
     }
 
     fn begin_rebuild(&mut self, key_space: String) -> StorageEvent {
         if !self.usage_shadow.contains(&key_space) {
-            self.rows.clear(USAGE_PREIMAGE_KEYSPACE);
+            let floor = self.floor();
+            self.rows.clear(USAGE_PREIMAGE_KEYSPACE, floor);
             if let Err(error) = self.clear_rebuild(&key_space) {
                 return StorageEvent::Error { error };
             }
@@ -679,12 +702,14 @@ impl State {
     /// Deletes old rebuild rows and writes the seed rows of a new generation in one commit.
     fn clear_rebuild(&mut self, key_space: &str) -> Result<(), StorageError> {
         let prefix = ByteView::from(USAGE_SHADOW_PREFIX);
-        let bounds = byte_bounds(page_bounds(Some(&prefix), None));
         let latest = self.rows.sequence;
-        let old = self.rows.scan(key_space, latest, None, &bounds, false);
-        let mut rows: Rows = old
-            .map(|row| row.map(|(key, _)| (key, None)))
-            .collect::<Result<_, _>>()?;
+        let mut rows = Rows::new();
+        if let Some(bounds) = page_bounds(Some(&prefix), None) {
+            let old = (self.rows).scan(key_space, latest, None, &byte_bounds(bounds), false);
+            for row in old {
+                rows.insert(row?.0, None);
+            }
+        }
         for (row, value) in rebuild_seed()? {
             rows.insert(row, Some(value));
         }
@@ -700,7 +725,8 @@ impl State {
         let entries = self.replace_counters(key_space)?;
         self.usage_shadow.remove(key_space);
         // A fresh rebuild clears what is left.
-        self.rows.clear(USAGE_PREIMAGE_KEYSPACE);
+        let floor = self.floor();
+        self.rows.clear(USAGE_PREIMAGE_KEYSPACE, floor);
         Ok(entries)
     }
 
@@ -894,9 +920,19 @@ impl Committed {
         }
     }
 
-    /// Drops a keyspace with all its versions, as a Fjall keyspace clear does.
-    fn clear(&mut self, key_space: &str) {
-        self.spaces.remove(key_space);
+    /// Deletes every live row of a keyspace as the next commit; like Fjall, a snapshot from
+    /// `floor` on still reads the old rows.
+    fn clear(&mut self, key_space: &str, floor: u64) {
+        let Some(space) = self.spaces.get(key_space) else {
+            return;
+        };
+        let live = space
+            .iter()
+            .filter(|(_, versions)| versions.last().is_some_and(|(_, value)| value.is_some()));
+        let rows: Rows = live.map(|(key, _)| (key.clone(), None)).collect();
+        if !rows.is_empty() {
+            self.apply(Changes::from([(key_space.to_string(), rows)]), floor);
+        }
     }
 }
 

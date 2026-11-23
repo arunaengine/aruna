@@ -594,6 +594,8 @@ impl StorageHandle {
         }
         #[cfg(any(test, feature = "test-hooks"))]
         if let Some(memory) = &self.memory {
+            // One yield per effect lets joined futures interleave as they do on the worker queue.
+            tokio::task::yield_now().await;
             return self.dispatch_memory(memory, effect);
         }
         let mut deferred = None;

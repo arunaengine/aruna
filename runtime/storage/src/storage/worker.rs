@@ -1299,18 +1299,24 @@ pub(super) fn iterate_page<R: Readable>(
     start: Option<&IterStart>,
     limit: usize,
 ) -> Result<PageResult, StorageError> {
-    let rows = reader.range(keyspace, page_bounds(prefix, start));
-    collect_page(rows.map(guard_row), limit)
+    match page_bounds(prefix, start) {
+        Some(bounds) => collect_page(reader.range(keyspace, bounds), limit, guard_row),
+        None => Ok((Vec::new(), None)),
+    }
 }
 
-/// The key bounds of a page under `prefix` from `start`; a start below the prefix begins at it.
-pub(super) fn page_bounds(prefix: Option<&ByteView>, start: Option<&IterStart>) -> KeyBounds {
+/// The key bounds of a page under `prefix` from `start`, or `None` when they hold no key; a start
+/// below the prefix begins at it.
+pub(super) fn page_bounds(
+    prefix: Option<&ByteView>,
+    start: Option<&IterStart>,
+) -> Option<KeyBounds> {
     let start = start.map(|start| match start {
         IterStart::After(key) => Excluded(key.as_ref().to_vec()),
         IterStart::At(key) => Included(key.as_ref().to_vec()),
     });
     let Some(prefix) = prefix.map(|prefix| prefix.as_ref().to_vec()) else {
-        return (start.unwrap_or(Unbounded), Unbounded);
+        return Some((start.unwrap_or(Unbounded), Unbounded));
     };
     let end = prefix_upper_bound(&prefix).map_or(Unbounded, Excluded);
     let start = match start {
@@ -1318,7 +1324,9 @@ pub(super) fn page_bounds(prefix: Option<&ByteView>, start: Option<&IterStart>) 
         Some(bound) => bound,
         None => Included(prefix),
     };
-    (start, end)
+    let empty =
+        matches!((&start, &end), (Included(from) | Excluded(from), Excluded(to)) if from >= to);
+    (!empty).then_some((start, end))
 }
 
 /// The key bounds of `[start, end]`, or `None` when the interval holds no key.
@@ -1351,21 +1359,23 @@ pub(super) fn range_page<R: Readable>(
     budget: (usize, usize),
 ) -> Result<PageResult, StorageError> {
     match range_bounds(start, end).filter(|_| budget.0 > 0) {
-        Some(bounds) => budget_page(reader.range(keyspace, bounds).map(guard_row), budget),
+        Some(bounds) => budget_page(reader.range(keyspace, bounds), budget, guard_row),
         None => Ok((Vec::new(), None)),
     }
 }
 
 /// Takes at most `limit` rows and, after the first, at most `max_bytes` of keys and values.
-pub(super) fn budget_page(
-    rows: impl Iterator<Item = Result<(ByteView, ByteView), StorageError>>,
+/// Only taken rows pass through `decode`; the lookahead row stays undecoded.
+pub(super) fn budget_page<T>(
+    rows: impl Iterator<Item = T>,
     (limit, max_bytes): (usize, usize),
+    mut decode: impl FnMut(T) -> Result<(ByteView, ByteView), StorageError>,
 ) -> Result<PageResult, StorageError> {
     let mut rows = rows.peekable();
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
     let mut bytes = 0usize;
     while let Some(row) = rows.next() {
-        let (key, value) = row?;
+        let (key, value) = decode(row)?;
         bytes = bytes.saturating_add(key.len() + value.len());
         if !values.is_empty() && bytes > max_bytes {
             let last = values.last().map(|(key, _)| key.clone());
@@ -1380,15 +1390,17 @@ pub(super) fn budget_page(
     Ok((values, None))
 }
 
-pub(super) fn collect_page(
-    rows: impl Iterator<Item = Result<(ByteView, ByteView), StorageError>>,
+/// Takes at most `limit` rows; only taken rows pass through `decode`.
+pub(super) fn collect_page<T>(
+    rows: impl Iterator<Item = T>,
     limit: usize,
+    mut decode: impl FnMut(T) -> Result<(ByteView, ByteView), StorageError>,
 ) -> Result<PageResult, StorageError> {
     let mut rows = rows.peekable();
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
 
     while let Some(row) = rows.next() {
-        values.push(row?);
+        values.push(decode(row)?);
 
         if values.len() == limit {
             let next_start_after = if rows.peek().is_some() {

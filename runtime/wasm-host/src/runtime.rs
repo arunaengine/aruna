@@ -318,6 +318,12 @@ impl Runtime {
         self.inner.tracker.wait().await;
     }
 
+    /// Advances the engine epoch once, as the ticker does, so tests can place a tick exactly.
+    #[doc(hidden)]
+    pub fn tick_epoch(&self) {
+        self.inner.engine.increment_epoch();
+    }
+
     async fn run<P, R>(
         &self,
         compiled: &Compiled,

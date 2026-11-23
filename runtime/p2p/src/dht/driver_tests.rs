@@ -834,6 +834,10 @@ async fn capacity_concurrent_reclaims() {
     );
     first_result.expect("first admission succeeds");
     second_result.expect("second admission retries");
+    assert!(
+        storage.snapshot_metrics().conflicts_total > 0,
+        "admissions overlap"
+    );
 
     assert!(!row_exists(&storage, first_victim).await);
     assert!(!row_exists(&storage, second_victim).await);
@@ -1204,6 +1208,10 @@ async fn concurrent_merges_preserve() {
     );
     first_result.expect("first merge succeeds");
     second_result.expect("second merge retries and succeeds");
+    assert!(
+        storage.snapshot_metrics().conflicts_total > 0,
+        "merges overlap"
+    );
 
     let entries = read_entries(&storage, key).await;
     assert_eq!(entries.len(), 2);

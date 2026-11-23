@@ -199,6 +199,7 @@ async fn create_is_atomic() {
         }
 
         let (first_seed, second_seed) = (first.id.to_bytes(), second.id.to_bytes());
+        let conflicts = context.storage_handle.snapshot_metrics().conflicts_total;
         let (first_result, second_result) = tokio::join!(
             drive_retry(
                 || CreateRelationshipOperation::new(first.clone()),
@@ -216,6 +217,8 @@ async fn create_is_atomic() {
             (Ok(_), Err(SyncRelationshipError::Duplicate))
                 | (Err(SyncRelationshipError::Duplicate), Ok(_))
         ));
+        let metrics = context.storage_handle.snapshot_metrics();
+        assert!(metrics.conflicts_total > conflicts, "both creates overlap");
 
         let stored = drive(
             ListRelationshipsOperation::new(SyncRelationshipDirection::Outgoing, Some(source)),

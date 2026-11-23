@@ -470,6 +470,8 @@ mod tests {
         assert_eq!(outcomes.iter().filter(|ok| **ok).count(), 1);
         let refused = [first, second].into_iter().find_map(Result::err);
         assert_eq!(refused, Some(SourceConnectorError::IdTaken));
+        let metrics = context.storage_handle.snapshot_metrics();
+        assert!(metrics.conflicts_total > 0, "both registrations overlap");
     }
 
     // Without a chosen id the runner's stamp and entropy give the connector its id and times.

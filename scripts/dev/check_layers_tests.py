@@ -401,6 +401,23 @@ class CratesTest(unittest.TestCase):
                 (["aruna-p2p -> aruna-storage", "aruna-storage -> aruna-p2p"], []),
             )
 
+    def test_build_deps(self):
+        build = "\n[build-dependencies]\naruna-runner = { workspace = true }\n"
+        target = "\n[target.'cfg(unix)'.build-dependencies]\naruna-runner = { workspace = true }\n"
+        for extra in (build, target):
+            files = {
+                "Cargo.toml": '[workspace]\nmembers = ["domain/ops-data", "runtime/runner"]\n',
+                "domain/ops-data/Cargo.toml": '[package]\nname = "aruna-ops-data"\n' + extra,
+                "runtime/runner/Cargo.toml": '[package]\nname = "aruna-runner"\n',
+            }
+            with tempfile.TemporaryDirectory() as root:
+                write_tree(root, files)
+                self.assertEqual(check_layers.crate_findings(root, {}), (["aruna-ops-data -> aruna-runner"], []))
+                self.assertEqual(
+                    check_layers.layer_findings(root),
+                    ["aruna-ops-data -> aruna-runner: domain crates depend only on domain crates"],
+                )
+
 
 def crate_toml(name, normal=(), dev=()):
     """A member manifest with internal normal and dev-dependencies; a trailing ? marks optional."""
@@ -523,6 +540,21 @@ class EffectsTest(unittest.TestCase):
         errors, output = run_report(pure_tree({"frontends/api/src/routes.rs": text}), zero_baseline())
         self.assertEqual(errors, 1, output)
         self.assertIn("error: api_raw_effects rose above its baseline", output)
+
+    def test_aliased_effects(self):
+        text = (
+            "use aruna_core::effects::StorageEffect as Store;\n"
+            "use aruna_core::effects::{BlobEffect as _, NetEffect as Net};\n"
+            "fn handler() {\n    let sync = Store::SyncAll;\n    let send = Net::Send;\n}\n"
+            "#[cfg(test)]\nmod tests {\n    fn fixture() {\n        let sync = Store::SyncAll;\n    }\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, {"frontends/api/src/routes.rs": text})
+            sources = [check_layers.load_source(root, "frontends/api/src/routes.rs")]
+        self.assertEqual(
+            check_layers.raw_effects(sources),
+            ["frontends/api/src/routes.rs:4", "frontends/api/src/routes.rs:5"],
+        )
 
 
 class GuardTest(unittest.TestCase):

@@ -496,6 +496,35 @@ async fn conflicts_match_fjall() {
     parity(read_conflicts).await;
 }
 
+/// A cursor at or past the end of its prefix reads an empty page and adds no read.
+async fn spent_cursors(handle: &StorageHandle) -> Vec<String> {
+    let mut session = Session::new(handle);
+    session.send(put("p/1", "a", None)).await;
+    let txn = session.begin(false).await;
+    let starts = [
+        IterStart::At(bytes("p0")),
+        IterStart::After(bytes("p0")),
+        IterStart::At(bytes("q/1")),
+    ];
+    for start in starts {
+        let page = session.send(iter("p/", Some(start), 10, Some(txn))).await;
+        assert!(page_keys(&page).is_empty());
+    }
+    session.send(put("q/1", "other", None)).await;
+    session.send(put("x", "mine", Some(txn))).await;
+    let committed = session.send(commit(txn)).await;
+    assert!(matches!(
+        committed,
+        StorageEvent::TransactionCommitted { .. }
+    ));
+    session.trace
+}
+
+#[tokio::test]
+async fn spent_cursors_match() {
+    parity(spent_cursors).await;
+}
+
 async fn aborted_writes(handle: &StorageHandle) -> Vec<String> {
     let mut session = Session::new(handle);
     let txn = session.begin(false).await;
@@ -697,6 +726,38 @@ async fn usage_rebuild(handle: &StorageHandle) -> Vec<String> {
 #[tokio::test]
 async fn rebuild_matches_fjall() {
     parity(usage_rebuild).await;
+}
+
+/// A view resumed during a rebuild still reads the kept values after the rebuild finishes.
+async fn resumed_view(handle: &StorageHandle) -> Vec<String> {
+    let mut session = Session::new(handle);
+    session.send(source_put("s/1", "a", None)).await;
+    let rebuild = || StorageEffect::BeginUsageRebuild {
+        key_space: USAGE.to_string(),
+    };
+    let mut views = Vec::new();
+    for value in ["b", "c"] {
+        match session.send(rebuild()).await {
+            StorageEvent::TransactionStarted { txn_id } => views.push(txn_id),
+            other => panic!("rebuild did not begin: {other:?}"),
+        }
+        session.send(source_put("s/1", value, None)).await;
+    }
+    session.send(commit(views[0])).await;
+    let source = || read_in(S3_BUCKET_KEYSPACE, b"s/1", Some(views[1]));
+    assert_eq!(read_value(&session.send(source()).await), Some(&b"a"[..]));
+    let finish = StorageEffect::FinishUsageRebuild {
+        key_space: USAGE.to_string(),
+    };
+    session.send(finish).await;
+    assert_eq!(read_value(&session.send(source()).await), Some(&b"a"[..]));
+    session.send(commit(views[1])).await;
+    session.trace
+}
+
+#[tokio::test]
+async fn resumed_view_matches() {
+    parity(resumed_view).await;
 }
 
 fn config_put(txn_id: Option<Ulid>) -> StorageEffect {

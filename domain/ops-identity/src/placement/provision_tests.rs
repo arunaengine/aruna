@@ -13,6 +13,8 @@ use aruna_core::structs::placement::record::{FIRST_GRANTABLE_HANDLE, HandleRange
 use aruna_core::structured_id::PlacementHandle;
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::{DriverContext, drive};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 
 fn node(seed: u8) -> NodeId {
     iroh::SecretKey::from_bytes(&[seed; 32]).public()
@@ -27,8 +29,12 @@ fn actor(realm_id: RealmId) -> Actor {
 }
 
 fn context() -> DriverContext {
+    with_storage(aruna_storage::storage::memory::MemoryStorage::open())
+}
+
+fn with_storage(storage_handle: StorageHandle) -> DriverContext {
     DriverContext {
-        storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
+        storage_handle,
         net_handle: None,
         blob_handle: None,
         graph_handle: None,
@@ -77,7 +83,9 @@ fn range(owner: NodeId, start: u32, end: u32) -> HandleRange {
 
 #[tokio::test]
 async fn allocation_survives_restart() {
-    let context = context();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().to_str().unwrap();
+    let context = with_storage(FjallStorage::open(path).unwrap());
     let realm_id = RealmId::from_bytes([60; 32]);
     let actor = actor(realm_id);
     seed_range_config(
@@ -102,8 +110,10 @@ async fn allocation_survives_restart() {
     assert_eq!(second.handle.get(), FIRST_GRANTABLE_HANDLE + 2);
     assert_eq!(first.allocator_range_id, Ulid::from_bytes([9; 16]));
 
-    // "Restart": a fresh allocation reads the persisted cursor and does not
+    // After a restart the next allocation reads the persisted cursor and does not
     // re-issue a spent handle.
+    context.storage_handle.close().await;
+    let context = with_storage(FjallStorage::open(path).unwrap());
     let third = drive(DrawHandleOperation::new(realm_id, actor.node_id), &context)
         .await
         .unwrap();
@@ -139,6 +149,18 @@ async fn concurrent_allocation_unique() {
         handles,
         [FIRST_GRANTABLE_HANDLE + 1, FIRST_GRANTABLE_HANDLE + 2]
     );
+
+    // The same race without the placement hold draws one handle twice, so the draws overlap
+    // and the hold is what keeps them apart.
+    let granted = range(
+        actor.node_id,
+        FIRST_GRANTABLE_HANDLE,
+        FIRST_GRANTABLE_HANDLE + 1024,
+    );
+    let ranges = vec![granted];
+    let unheld = || AllocateHandleOperation::new(realm_id, actor.node_id, ranges.clone(), 0);
+    let (left, right) = tokio::join!(drive(unheld(), &context), drive(unheld(), &context));
+    assert_eq!(left.unwrap().handle, right.unwrap().handle);
 }
 
 #[tokio::test]

@@ -529,11 +529,10 @@ mod tests {
         assert!(due.due_unix_millis <= limit);
     }
 
-    #[tokio::test]
-    async fn disabled_survives_restart() {
-        // The attempt count is stored, so a restarted node does not withdraw again.
+    /// Opens the store at `path` and counts the withdrawals of `runs` publications.
+    async fn count_withdrawals(path: &str, realm_id: RealmId, runs: u8) -> u8 {
         let context = DriverContext {
-            storage_handle: aruna_storage::storage::memory::MemoryStorage::open(),
+            storage_handle: aruna_storage::storage::worker::FjallStorage::open(path).unwrap(),
             net_handle: None,
             blob_handle: None,
             graph_handle: None,
@@ -541,6 +540,25 @@ mod tests {
             compute_handle: None,
             outbound_handle: None,
         };
+        let mut sent = 0;
+        for _ in 0..runs {
+            let publication = drive(PublishOperation::new(realm_id, reporter()), &context)
+                .await
+                .unwrap();
+            if matches!(publication, Publication::Withdraw { .. }) {
+                sent += 1;
+            }
+        }
+        context.storage_handle.close().await;
+        sent
+    }
+
+    #[tokio::test]
+    async fn disabled_survives_restart() {
+        // The attempt count is stored, so a restarted node does not withdraw again.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_str().unwrap();
+        let storage = aruna_storage::storage::worker::FjallStorage::open(path).unwrap();
         let config = config(RegistrationMode::Disabled, true);
         let target = DocumentTarget::RealmConfig {
             realm_id: config.realm_id,
@@ -550,8 +568,7 @@ mod tests {
             user_id: UserId::local(Ulid::from_bytes([1; 16]), config.realm_id),
             realm_id: config.realm_id,
         };
-        context
-            .storage_handle
+        storage
             .send_storage_effect(StorageEffect::Write {
                 key_space: target.storage_keyspace().to_string(),
                 key: target.storage_key(),
@@ -559,16 +576,11 @@ mod tests {
                 txn_id: None,
             })
             .await;
-        let mut sent = 0;
-        for _ in 0..MAX_WITHDRAWALS + 2 {
-            let publication = drive(PublishOperation::new(config.realm_id, reporter()), &context)
-                .await
-                .unwrap();
-            if matches!(publication, Publication::Withdraw { .. }) {
-                sent += 1;
-            }
-        }
-        assert_eq!(sent, MAX_WITHDRAWALS);
+        storage.close().await;
+        let realm_id = config.realm_id;
+        let before = count_withdrawals(path, realm_id, MAX_WITHDRAWALS).await;
+        assert_eq!(before, MAX_WITHDRAWALS);
+        assert_eq!(count_withdrawals(path, realm_id, 2).await, 0);
     }
 
     fn soon_read(realm_id: RealmId) -> Result<Next<bool>, PublishError> {

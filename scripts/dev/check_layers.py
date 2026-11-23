@@ -129,8 +129,8 @@ CRATE_TARGETS = {
     "aruna-registry": ("aruna-core", "aruna-clock", "aruna-blob"),
     "aruna-compute-helper": (),
 }
-# Backends keep their table for test and build dependencies as well, except for the explicit
-# dev-only storage test fixture allowance below (production edges stay strictly forbidden).
+# Every crate keeps its table for build dependencies; backends also for test dependencies, except
+# for the explicit dev-only storage test fixture allowance below (production edges stay forbidden).
 BACKENDS = frozenset(
     "aruna-storage aruna-p2p aruna-blob aruna-scheduler aruna-compute aruna-wasm-host aruna-rdf-graph aruna-egress".split()
 )
@@ -147,6 +147,7 @@ RUNTIME_EXTRAS = {"aruna-config": ("aruna-wire",)}
 FRONTEND_RUNTIME = frozenset({"aruna-clock", "aruna-runner"})
 API_SRC = "frontends/api/src/"
 RAW_EFFECT = re.compile(r"\b(?:Storage|Net|Blob)Effect::")
+EFFECT_ALIAS = re.compile(r"\b(?:Storage|Net|Blob)Effect\s+as\s+([A-Za-z_]\w*)")
 TRIGGER_MATCHES = (
     ("apps/node/src/tasks/incoming/mod.rs", "TaskKey::"),
     ("apps/node/src/inbound.rs", "Alpn::"),
@@ -769,7 +770,8 @@ def workspace_members(root):
 
 
 def crate_manifests(root):
-    """Map each workspace crate name to its internal normal dependencies, for backends all of them."""
+    """Map each workspace crate name to its internal normal and build dependencies; backends add
+    their dev-dependencies."""
     manifests, renames = workspace_members(root)
     names = {data["package"]["name"] for data in manifests.values()}
     result = {}
@@ -777,20 +779,19 @@ def crate_manifests(root):
         crate = data["package"]["name"]
         sections = [data, *data.get("target", {}).values()]
         normal_deps = set()
-        for table in (section.get("dependencies", {}) for section in sections):
-            for key, value in table.items():
+        for kind in ("dependencies", "build-dependencies"):
+            for key, value in (item for section in sections for item in section.get(kind, {}).items()):
                 name = value.get("package", renames.get(key, key)) if isinstance(value, dict) else key
                 if name in names:
                     normal_deps.add(name)
         deps = set(normal_deps)
         if crate in BACKENDS:
             dev_allow = set(BACKEND_DEV_TARGETS.get(crate, ()))
-            for kind in ("dev-dependencies", "build-dependencies"):
-                for table in (section.get(kind, {}) for section in sections):
-                    for key, value in table.items():
-                        name = value.get("package", renames.get(key, key)) if isinstance(value, dict) else key
-                        if name in names and not (kind == "dev-dependencies" and name in dev_allow):
-                            deps.add(name)
+            for table in (section.get("dev-dependencies", {}) for section in sections):
+                for key, value in table.items():
+                    name = value.get("package", renames.get(key, key)) if isinstance(value, dict) else key
+                    if name in names and name not in dev_allow:
+                        deps.add(name)
         result[crate] = deps
     return result
 
@@ -812,10 +813,10 @@ def crate_findings(root, allow):
 
 
 def member_deps(data, renames, names):
-    """Internal normal dependencies with their optional flag, and internal dev-dependencies."""
+    """Internal normal and build dependencies with their optional flag, and internal dev-dependencies."""
     normal, dev = {}, set()
     for section in [data, *data.get("target", {}).values()]:
-        for kind in ("dependencies", "dev-dependencies"):
+        for kind in ("dependencies", "build-dependencies", "dev-dependencies"):
             for key, value in section.get(kind, {}).items():
                 spec = value if isinstance(value, dict) else {}
                 name = spec.get("package", renames.get(key, key))
@@ -873,13 +874,17 @@ def layer_findings(root):
 
 
 def raw_effects(sources):
-    """Raw storage, net and blob effect paths in API production code; handlers use operations."""
-    return [
-        f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}"
-        for source in sources
-        if source.rel.startswith(API_SRC)
-        for hit in RAW_EFFECT.finditer(source.masked)
-    ]
+    """Raw storage, net and blob effect paths in API production code, also through a `use` alias;
+    handlers use operations."""
+    found = []
+    for source in sources:
+        if not source.rel.startswith(API_SRC):
+            continue
+        aliases = sorted({hit.group(1) for hit in EFFECT_ALIAS.finditer(source.masked)} - {"_"})
+        patterns = [RAW_EFFECT, *(re.compile(rf"\b{re.escape(alias)}::") for alias in aliases)]
+        starts = sorted(hit.start() for pattern in patterns for hit in pattern.finditer(source.masked))
+        found.extend(f"{source.rel}:{source.masked.count(chr(10), 0, start) + 1}" for start in starts)
+    return found
 
 
 def measure(root):
