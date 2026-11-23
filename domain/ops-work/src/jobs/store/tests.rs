@@ -1,0 +1,3153 @@
+//! Tests job store claims, leases, pruning, dedup rows, and index moves against storage.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::control_mutation::ControlChange;
+use super::job_calls::{
+    AdoptOutcome, CancelRequestOutcome, ClaimOutcome, ExecutionCompleteOutcome, ParkOutcome,
+    ReleaseOutcome, RequeueOutcome,
+};
+use super::list_jobs::ListJobsOperation;
+use super::store_call::RowBatch;
+use super::*;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::STAGING_STATE_KEYSPACE;
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::structs::execution::job::identity::LEASE_INDEX_PREFIX;
+use aruna_core::structs::execution::job::input::{
+    ComputeResources, ExecutionSpec, ImportMetadataTarget, ImportReportRow, ImportRoCrateResult,
+    ImportRoCrateSource, ImportRoCrateSpec, ImportRoCrateTarget, JobPayload, RoCrateLimits,
+};
+use aruna_core::structs::execution::job::local::{
+    encode_dedup_value, parse_schedule_key, pid_dedup_key,
+};
+use aruna_core::structs::execution::job::rows::job_schedule_key;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::persistent_id::MintPersistentSpec;
+use aruna_core::types::TxnId;
+use aruna_core::user::id::UserId;
+use aruna_runner::driver::{DriverContext, drive};
+use aruna_storage::scan::iter_prefix_page;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use aruna_test_harness::jobs::{
+    find_dedup_job, insert_job, list_job_entries, read_crate_status, read_job_record,
+    read_launch_record, read_state,
+};
+use tempfile::tempdir;
+
+/// The stored value of one row.
+async fn read_raw(
+    context: &DriverContext,
+    key_space: &str,
+    key: Key,
+    txn_id: Option<TxnId>,
+) -> Result<Option<Value>, String> {
+    let read = StorageEffect::Read {
+        key_space: key_space.to_string(),
+        key,
+        txn_id,
+    };
+    match context.storage_handle.send_storage_effect(read).await {
+        Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+        other => Err(other.label().to_string()),
+    }
+}
+
+/// Writes rows as they are, without any of the store's own checks.
+async fn batch_write(
+    context: &DriverContext,
+    writes: JobWrites,
+    _txn_id: Option<TxnId>,
+) -> Result<(), String> {
+    drive(RowBatch::write(Ok(writes)), context)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn temp_storage() -> (tempfile::TempDir, StorageHandle) {
+    let dir = tempdir().expect("temp dir");
+    let storage =
+        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    (dir, storage)
+}
+
+fn node_id(seed: u8) -> NodeId {
+    let mut seed_bytes = [0u8; 32];
+    seed_bytes[0] = seed;
+    iroh::SecretKey::from_bytes(&seed_bytes).public()
+}
+
+fn job_id(timestamp_ms: u64) -> JobId {
+    aruna_core::testing::job_at(timestamp_ms, 0)
+}
+
+fn queued_record(job_id: JobId) -> JobRecord {
+    JobRecord::new(
+        job_id,
+        JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        },
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    )
+}
+
+fn rocrate_record(job_id: JobId) -> JobRecord {
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    JobRecord::new(
+        job_id,
+        JobPayload::ImportRoCrate(ImportRoCrateSpec {
+            auth_context: AuthContext {
+                user_id: owner,
+                realm_id: RealmId([1u8; 32]),
+                path_restrictions: None,
+                session: None,
+            },
+            source: ImportRoCrateSource::Upload {
+                upload_id: Ulid::from_bytes([3u8; 16]),
+            },
+            target: ImportRoCrateTarget {
+                bucket: "target".to_string(),
+                prefix: "crate".to_string(),
+            },
+            metadata: ImportMetadataTarget {
+                group_id: Ulid::from_bytes([4u8; 16]),
+                path: "crate".to_string(),
+                public: false,
+            },
+            limits: RoCrateLimits::default(),
+            document_id: Ulid::from_bytes([5u8; 16]),
+        }),
+        owner,
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    )
+}
+
+fn report_row(entry_key: &str) -> ImportReportRow {
+    aruna_core::testing::report_row(entry_key)
+}
+
+fn digest_values(values: &[Vec<u8>]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for value in values {
+        hash_report_value(&mut hasher, value);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+proptest::proptest! {
+    #[test]
+    fn digest_is_stable(
+        first in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        second in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+    ) {
+        let framed = digest_values(&[first.clone(), second.clone()]);
+        let mut concatenated = first;
+        concatenated.extend_from_slice(&second);
+        proptest::prop_assert_ne!(framed, digest_values(&[concatenated]));
+    }
+}
+
+async fn schedule_keys(context: &DriverContext) -> Vec<Key> {
+    let (values, _) = iter_prefix_page(
+        &context.storage_handle,
+        SCHEDULE_INDEX_KEYSPACE,
+        None,
+        None,
+        64,
+        None,
+    )
+    .await
+    .expect("scan schedule index");
+    values.into_iter().map(|(key, _)| key).collect()
+}
+
+// Stealing a claim whose lease is still live would put two supervisors on one
+// container. Only a genuinely expired lease may be adopted.
+#[tokio::test]
+async fn adopt_spares_live() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0x77; 16]);
+    let mut record = queued_record(job_id);
+    record.execution_class = JobExecutionClass::ExternalAttempt;
+    record.state = JobState::Running;
+    let live_token = Ulid::generate();
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: live_token,
+        lease_expires_ms: 10_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            live_token,
+            AttemptIntent {
+                attempt_no: 0,
+                external_name: aruna_core::structs::execution::job::local::attempt_external_name(
+                    job_id, 0,
+                ),
+                executor_kind: "docker".to_string(),
+                pinned_image:
+                    "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                        .to_string(),
+                attempt_epoch: 0,
+                backend: "docker".to_string(),
+                config_generation: 0,
+                home_digest: aruna_core::compute::identity::home_digest("docker", None),
+            },
+            None,
+            None,
+            1_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    // The holder renewed: its lease outlives `now`, so adoption must skip.
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::adopt_external_attempt(job_id, node_id(4), 9_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, AdoptOutcome::Skipped));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.claim.unwrap().claim_token, live_token);
+
+    // Once the lease really has expired, the attempt is adopted with a fresh token.
+    let AdoptOutcome::Adopted(adopted, _) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::adopt_external_attempt(job_id, node_id(4), 11_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expired lease must be adopted");
+    };
+    let claim = adopted.claim.unwrap();
+    assert_ne!(claim.claim_token, live_token);
+    assert_eq!(claim.holder_node_id, node_id(4));
+}
+
+#[test]
+fn prune_covers_controls() {
+    // Every attempt epoch handed out must have its control row pruned.
+    let mut record = queued_record(JobId::from_bytes([0x55; 16]));
+    record.next_attempt_epoch = 3;
+
+    let deletes = prune_delete_entries(&record);
+
+    let controls: Vec<_> = deletes
+        .iter()
+        .filter(|(space, _)| space == ATTEMPT_CONTROL_KEYSPACE)
+        .map(|(_, key)| key.as_ref().to_vec())
+        .collect();
+    assert_eq!(
+        controls,
+        vec![
+            attempt_control_key(record.job_id, 1),
+            attempt_control_key(record.job_id, 2),
+        ]
+    );
+}
+
+#[test]
+fn prune_covers_dedup() {
+    let mut record = rocrate_record(JobId::from_bytes([0x57; 16]));
+    record.dedup_key = Some(b"import".to_vec());
+
+    let deletes = prune_delete_entries(&record);
+
+    assert!(deletes.contains(&(
+        DEDUP_INDEX_KEYSPACE.to_string(),
+        dedup_index_key(record.created_by, b"import"),
+    )));
+}
+
+fn pid_record(job_id: JobId, minted_by: UserId) -> JobRecord {
+    let document_id = Ulid::from_bytes([0x99u8; 16]);
+    JobRecord::new(
+        job_id,
+        JobPayload::MintPersistentId(MintPersistentSpec {
+            document_id,
+            minted_by,
+        }),
+        minted_by,
+        node_id(7),
+        1_000,
+        1_000,
+        Some(pid_dedup_key(document_id)),
+    )
+}
+
+#[test]
+fn dedup_index_global() {
+    let realm = RealmId([1u8; 32]);
+    let first = UserId::new(Ulid::from_bytes([2u8; 16]), realm);
+    let second = UserId::new(Ulid::from_bytes([3u8; 16]), realm);
+    let document_id = Ulid::from_bytes([0x99u8; 16]);
+
+    assert_eq!(
+        dedup_index_key(first, &pid_dedup_key(document_id)),
+        dedup_index_key(second, &pid_dedup_key(document_id)),
+    );
+    assert_ne!(
+        dedup_index_key(first, b"user/local"),
+        dedup_index_key(second, b"user/local"),
+    );
+}
+
+#[test]
+fn prune_reclaims_pid() {
+    let minted_by = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    let record = pid_record(JobId::from_bytes([0x58; 16]), minted_by);
+    let dedup_key = record
+        .dedup_key
+        .clone()
+        .expect("pid jobs carry a dedup key");
+
+    let deletes = prune_delete_entries(&record);
+
+    assert!(deletes.contains(&(
+        DEDUP_INDEX_KEYSPACE.to_string(),
+        dedup_index_key(record.created_by, &dedup_key),
+    )));
+    assert!(record.payload.dedup_until_prune());
+}
+
+#[test]
+fn schedule_uses_retention() {
+    let mut record = queued_record(JobId::from_bytes([0x56; 16]));
+    record.state = JobState::Succeeded;
+    record.finished_at_ms = Some(2_000);
+    record.retention_ms = 42;
+
+    let (expiry, job_id) = parse_schedule_key(job_schedule_key(&record).unwrap().as_ref()).unwrap();
+
+    assert_eq!(expiry, 2_042);
+    assert_eq!(job_id, record.job_id);
+}
+
+#[tokio::test]
+async fn handoff_releases_preintent() {
+    // Shutdown while staging: no attempt intent exists yet, so the lease
+    // must be released instead of failing with MissingControl.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0x21; 16]);
+    let mut record = queued_record(job_id);
+    record.execution_class = JobExecutionClass::ExternalAttempt;
+    record.state = JobState::Preparing;
+    let token = Ulid::generate();
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: token,
+        lease_expires_ms: 10_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::handoff_external_attempt(job_id, token, 2_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let ReleaseOutcome::Released(released) = outcome else {
+        panic!("pre-intent handoff must release the job");
+    };
+    assert_eq!(released.state, JobState::Queued);
+    assert!(released.claim.is_none());
+}
+
+#[tokio::test]
+async fn claim_moves_index() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([9u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+
+    let ClaimOutcome::Claimed(record) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .expect("claim succeeds") else {
+        panic!("expected claimed outcome");
+    };
+
+    let claim = record.claim.expect("claim present");
+    assert_eq!(record.state, JobState::Claimed);
+    assert_eq!(claim.lease_expires_ms, 5_000 + JOB_LEASE_MS);
+
+    let keys = schedule_keys(&context).await;
+    assert_eq!(keys.len(), 1, "exactly one schedule index entry");
+    assert!(keys[0].starts_with(LEASE_INDEX_PREFIX));
+    let (ts, parsed) = parse_schedule_key(keys[0].as_ref()).unwrap();
+    assert_eq!(ts, 5_000 + JOB_LEASE_MS);
+    assert_eq!(parsed, job_id);
+}
+
+// A job its node gave up on is cancelled for good, after which it can be deleted.
+#[tokio::test]
+async fn exhausted_job_cancels() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let mut record = queued_record(JobId::from_bytes([0x44; 16]));
+    record.state = JobState::Indeterminate;
+    record.locally_exhausted = true;
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(record.job_id, 9_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let CancelRequestOutcome::Cancelled(cancelled) = outcome else {
+        panic!("an exhausted job must settle as cancelled");
+    };
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(!cancelled.locally_exhausted && cancelled.cancel_requested);
+    let deleted = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::delete_finished_run(record.created_by, record.job_id, true),
+        &context,
+    )
+    .await;
+    assert_eq!(deleted.unwrap(), RunDelete::Deleted);
+}
+
+fn claim_rows(old: &JobRecord, new: &JobRecord) -> (usize, usize) {
+    let (writes, deletes) = index_deltas(old, new).unwrap();
+    let written = writes
+        .iter()
+        .filter(|(space, ..)| space == JOB_CLAIM_KEYSPACE);
+    let deleted = deletes
+        .iter()
+        .filter(|(space, _)| space == JOB_CLAIM_KEYSPACE);
+    (written.count(), deleted.count())
+}
+
+// Lease renewals and progress flushes leave the claim row alone; a new claim or settling moves it.
+#[test]
+fn claim_row_moves() {
+    let mut claimed = queued_record(JobId::from_bytes([3u8; 16]));
+    claimed.state = JobState::Running;
+    claimed.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::from_bytes([4u8; 16]),
+        lease_expires_ms: 5_000,
+    });
+    let mut renewed = claimed.clone();
+    renewed.progress.current = 7;
+    renewed.claim.as_mut().unwrap().lease_expires_ms = 9_000;
+    let mut taken = renewed.clone();
+    taken.claim.as_mut().unwrap().claim_token = Ulid::from_bytes([5u8; 16]);
+    let mut settled = renewed.clone();
+    settled.state = JobState::Succeeded;
+
+    assert_eq!(claim_rows(&queued_record(claimed.job_id), &claimed), (1, 0));
+    assert_eq!(claim_rows(&claimed, &renewed), (0, 0));
+    assert_eq!(claim_rows(&renewed, &taken), (1, 0));
+    assert_eq!(claim_rows(&renewed, &settled), (0, 1));
+}
+
+// Perf budget: a claim is start + read + batch-write + batch-delete + commit.
+#[tokio::test]
+async fn claim_transition_bounded() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([2u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+
+    let before = storage.snapshot_metrics().requests_total;
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(storage.snapshot_metrics().requests_total - before, 5);
+}
+
+#[tokio::test]
+async fn report_freezes() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0x42; 16]);
+    insert_job(&context, &rocrate_record(job_id)).await.unwrap();
+    let ClaimOutcome::Claimed(claimed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 2_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("job must be claimed");
+    };
+    let token = claimed.claim.unwrap().claim_token;
+    let row_b = report_row("b");
+    let row_a = report_row("a");
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::put_job_entry(job_id, token, b"b", &row_b),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::put_job_entry(job_id, token, b"a", &row_a),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::transition_to_running(job_id, token, 3_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let terminal = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            token,
+            JobResultPayload::ImportRoCrate(ImportRoCrateResult {
+                document_id: None,
+                entries_total: 2,
+                imported: 2,
+                unlisted: 0,
+                failed: 0,
+                report_digest: [0; 32],
+            }),
+            JobProgress {
+                current: 2,
+                total: Some(2),
+                unit: "items".to_string(),
+                paused_until: None,
+            },
+            4_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let mut hasher = blake3::Hasher::new();
+    hash_report_value(&mut hasher, &postcard::to_allocvec(&row_a).unwrap());
+    hash_report_value(&mut hasher, &postcard::to_allocvec(&row_b).unwrap());
+    let digest = *hasher.finalize().as_bytes();
+    assert_eq!(terminal.report_digest, Some(digest));
+    let JobResultPayload::ImportRoCrate(result) = terminal.result.unwrap() else {
+        panic!("import result expected");
+    };
+    assert_eq!(result.report_digest, digest);
+
+    let (first, cursor) = list_job_entries(&context, job_id, None, 1).await.unwrap();
+    assert_eq!(first[0].0, b"a");
+    let (second, cursor) = list_job_entries(&context, job_id, cursor, 1).await.unwrap();
+    assert_eq!(second[0].0, b"b");
+    assert!(cursor.is_none());
+    assert!(matches!(
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::put_job_entry(job_id, token, b"c", &report_row("c")),
+            &context
+        )
+        .await,
+        Err(JobMutationError::ReportFrozen)
+    ));
+}
+
+// The framework is opt-in: a write to any other keyspace never touches a job one.
+#[tokio::test]
+async fn other_write_untouched() {
+    let (_dir, storage) = temp_storage();
+    match storage
+        .send_storage_effect(StorageEffect::Write {
+            key_space: "unrelated".to_string(),
+            key: ByteView::from(vec![1]),
+            value: ByteView::from(vec![2]),
+            txn_id: None,
+        })
+        .await
+    {
+        Event::Storage(StorageEvent::WriteResult { .. }) => {}
+        other => panic!("unexpected write event: {other:?}"),
+    }
+    for key_space in [
+        JOB_KEYSPACE,
+        SCHEDULE_INDEX_KEYSPACE,
+        JOB_INDEX_KEYSPACE,
+        DEDUP_INDEX_KEYSPACE,
+    ] {
+        let (values, _) = iter_prefix_page(&storage, key_space, None, None, 8, None)
+            .await
+            .unwrap();
+        assert!(values.is_empty(), "{key_space} must stay empty");
+    }
+}
+
+#[tokio::test]
+async fn zombie_rejected() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([1u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let err = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            Ulid::generate(),
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        ),
+        &context,
+    )
+    .await
+    .expect_err("stale token must be rejected");
+    assert!(matches!(err, JobMutationError::TokenMismatch));
+
+    let record = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.state,
+        JobState::Claimed,
+        "record unchanged after rejection"
+    );
+}
+
+#[tokio::test]
+async fn stale_checkpoint_rejected() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([2u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    let ClaimOutcome::Claimed(record) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+    let key = ByteView::from(job_id.to_bytes().to_vec());
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::put_state(
+            job_id,
+            token,
+            STAGING_STATE_KEYSPACE,
+            key.clone(),
+            &b"newer".to_vec(),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::put_state(
+                job_id,
+                Ulid::generate(),
+                STAGING_STATE_KEYSPACE,
+                key.clone(),
+                &b"stale".to_vec()
+            ),
+            &context
+        )
+        .await,
+        Err(JobMutationError::TokenMismatch)
+    ));
+    assert_eq!(
+        read_state::<Vec<u8>>(&context, STAGING_STATE_KEYSPACE, key, "staging checkpoint",)
+            .await
+            .unwrap()
+            .unwrap(),
+        b"newer".to_vec()
+    );
+}
+
+#[tokio::test]
+async fn requeue_backs_off() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([4u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let RequeueOutcome::Requeued(record) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            6_000,
+            None,
+            Some(JobError::retryable("lease expired")),
+        ),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected requeue");
+    };
+    assert_eq!(record.state, JobState::Queued);
+    assert_eq!(record.attempts, 1);
+    // retry_delay_ms(1) = 500ms.
+    assert_eq!(record.due_at_ms, 6_500);
+    assert!(record.claim.is_none());
+}
+
+#[tokio::test]
+async fn deferral_keeps_attempt() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0x44u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    let ClaimOutcome::Claimed(record) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+
+    let ReleaseOutcome::Released(deferred) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::defer_job(
+            job_id,
+            token,
+            6_000,
+            1_000,
+            JobError::retryable("metadata projection pending"),
+        ),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("job must be deferred")
+    };
+    assert_eq!(deferred.state, JobState::Queued);
+    assert_eq!(deferred.attempts, 0);
+    assert_eq!(deferred.due_at_ms, 7_000);
+    assert!(deferred.claim.is_none());
+    assert_eq!(
+        deferred
+            .last_error
+            .as_ref()
+            .map(|error| error.message.as_str()),
+        Some("metadata projection pending")
+    );
+}
+
+// A run deferred by a storage conflict spends no attempt, and the success after it clears the
+// conflict from the job's error.
+#[tokio::test]
+async fn success_clears_error() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0x45u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    let claim = |now| {
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node_id(3), now),
+            &context,
+        )
+    };
+    let ClaimOutcome::Claimed(record) = claim(5_000).await.unwrap() else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+    let conflict = JobError::retryable("Transaction conflict");
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::defer_job(job_id, token, 6_000, 1_000, conflict),
+        &context,
+    )
+    .await
+    .unwrap();
+    let ClaimOutcome::Claimed(record) = claim(7_000).await.unwrap() else {
+        panic!("job must be claimed again")
+    };
+    assert_eq!(record.attempts, 0);
+    let token = record.claim.unwrap().claim_token;
+
+    let progress = JobProgress {
+        current: 1,
+        total: Some(1),
+        unit: "items".to_string(),
+        paused_until: None,
+    };
+    let payload = JobResultPayload::Staging {
+        completed_items: 1,
+        failed_items: 0,
+    };
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::transition_to_running(job_id, token, 7_500),
+        &context,
+    )
+    .await
+    .unwrap();
+    let done = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_job(job_id, token, payload, progress, 8_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(done.state, JobState::Succeeded);
+    assert!(done.last_error.is_none());
+}
+
+// A pause shown while the attempt runs is gone once the attempt fails or is cancelled.
+#[tokio::test]
+async fn finish_clears_pause() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let paused = Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(60));
+    for (seed, cancel) in [(0x46u8, false), (0x47u8, true)] {
+        let job_id = JobId::from_bytes([seed; 16]);
+        insert_job(&context, &queued_record(job_id)).await.unwrap();
+        let ClaimOutcome::Claimed(record) = aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+            &context,
+        )
+        .await
+        .unwrap() else {
+            panic!("job must be claimed")
+        };
+        let token = record.claim.unwrap().claim_token;
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::transition_to_running(job_id, token, 5_500),
+            &context,
+        )
+        .await
+        .unwrap();
+        let mut progress = JobProgress::new("items");
+        progress.paused_until = paused;
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::renew_lease(job_id, token, 6_000, Some(progress)),
+            &context,
+        )
+        .await
+        .unwrap();
+        let stored = read_job_record(&context, job_id, None).await.unwrap();
+        assert_eq!(stored.unwrap().progress.paused_until, paused);
+        let finished = match cancel {
+            true => {
+                aruna_runner::driver::drive(
+                    crate::jobs::store::job_calls::cancel_running_job(job_id, token, 7_000),
+                    &context,
+                )
+                .await
+            }
+            false => {
+                aruna_runner::driver::drive(
+                    crate::jobs::store::job_calls::fail_job(
+                        job_id,
+                        token,
+                        JobError::retryable("x"),
+                        7_000,
+                    ),
+                    &context,
+                )
+                .await
+            }
+        };
+        assert_eq!(finished.unwrap().progress.paused_until, None);
+    }
+}
+
+// An effect that may have happened is never tried again, and a lost answer proves no failure.
+#[tokio::test]
+async fn undecided_never_retries() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0x48u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    let ClaimOutcome::Claimed(record) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("job must be claimed")
+    };
+    let token = record.claim.unwrap().claim_token;
+    let error = JobError::permanent("the request may have been sent");
+    let ended = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::exhaust_job(job_id, token, error, 6_000),
+        &context,
+    )
+    .await;
+    let ended = ended.unwrap();
+    assert_eq!(ended.state, JobState::Indeterminate);
+    assert!(ended.locally_exhausted && ended.claim.is_none() && ended.is_settled());
+    assert_eq!(
+        ended.last_error.map(|error| error.kind),
+        Some(JobErrorKind::Retryable)
+    );
+    let again = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 7_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !matches!(again, ClaimOutcome::Claimed(_)),
+        "it must not run again"
+    );
+}
+
+// Retried payload work starts over, so persisted progress must start over too.
+#[tokio::test]
+async fn retry_resets_progress() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([12u8; 16]);
+    let mut record = queued_record(job_id);
+    record.progress.current = 1;
+    record.progress.total = Some(1);
+    insert_job(&context, &record).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let RequeueOutcome::Requeued(record) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected requeue");
+    };
+    assert_eq!(
+        record.progress,
+        JobProgress::new(record.payload.progress_unit())
+    );
+}
+
+#[tokio::test]
+async fn requeue_exhausts() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([6u8; 16]);
+    let mut record = queued_record(job_id);
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::generate(),
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let RequeueOutcome::Exhausted(failed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected local exhaustion");
+    };
+    assert_eq!(failed.state, JobState::Indeterminate);
+    assert!(failed.locally_exhausted);
+    assert!(failed.claim.is_none());
+    assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+}
+
+// A job-specific permanent verdict is the only exhaustion that terminalizes.
+#[tokio::test]
+async fn permanent_cap_fails() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xD4; 16]);
+    let mut record = queued_record(job_id);
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::generate(),
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let RequeueOutcome::Exhausted(failed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            6_000,
+            None,
+            Some(JobError::permanent("input is not readable")),
+        ),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected exhaustion");
+    };
+    assert_eq!(failed.state, JobState::Failed);
+    assert!(!failed.locally_exhausted);
+    assert_eq!(failed.finished_at_ms, Some(6_000));
+}
+
+// Exhaustion means no further automatic attempt: the sweep must not pick it up.
+#[tokio::test]
+async fn exhausted_stops_sweep() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xD5; 16]);
+    let mut record = queued_record(job_id);
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::generate(),
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, Some(6_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let swept = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(swept, RequeueOutcome::Skipped));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.attempts, JOB_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn cleanup_retries_forever() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xC5; 16]);
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::TerminalCleanup {
+            for_job: JobId::from_bytes([0xC6; 16]),
+            attempt: None,
+            access_key: "access".to_string(),
+        },
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    );
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::generate(),
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let RequeueOutcome::Requeued(requeued) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("cleanup must remain retryable");
+    };
+    assert_eq!(requeued.state, JobState::Queued);
+    assert_eq!(requeued.attempts, JOB_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn import_exhausts() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xC7; 16]);
+    let mut record = rocrate_record(job_id);
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: Ulid::generate(),
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let RequeueOutcome::Exhausted(failed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 6_000, None, None),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("import must stop after exhausting attempts");
+    };
+    assert_eq!(failed.state, JobState::Indeterminate);
+    assert!(failed.locally_exhausted);
+    assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn release_keeps_attempts() {
+    // Lease hand-back preserves attempts but resets execution progress.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA1; 16]);
+    let token = Ulid::generate();
+    let mut record = running_record(job_id, token, 60_000);
+    record.attempts = 2;
+    record.progress.current = 4;
+    record.progress.total = Some(10);
+    insert_job(&context, &record).await.unwrap();
+
+    let ReleaseOutcome::Released(released) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::release_job(job_id, token, 6_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected release");
+    };
+    assert_eq!(released.state, JobState::Queued);
+    assert_eq!(released.attempts, 2);
+    assert_eq!(released.due_at_ms, 6_000);
+    assert_eq!(
+        released.progress,
+        JobProgress::new(released.payload.progress_unit())
+    );
+    assert!(released.claim.is_none());
+}
+
+#[tokio::test]
+async fn release_guards_token() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xB2; 16]);
+    insert_job(&context, &running_record(job_id, Ulid::generate(), 60_000))
+        .await
+        .unwrap();
+
+    let error = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::release_job(job_id, Ulid::generate(), 6_000),
+        &context,
+    )
+    .await
+    .expect_err("a foreign token must not release the lease");
+    assert!(matches!(error, JobMutationError::TokenMismatch));
+    let record = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, JobState::Running);
+    assert!(record.claim.is_some());
+}
+
+#[tokio::test]
+async fn cancel_before_claim() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([7u8; 16]);
+    let mut record = queued_record(job_id);
+    record.cancel_requested = true;
+    insert_job(&context, &record).await.unwrap();
+
+    let ClaimOutcome::CancelledFresh(cancelled) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("expected fresh cancellation");
+    };
+    assert_eq!(cancelled.state, JobState::Cancelled);
+}
+
+#[tokio::test]
+async fn cancel_terminal_noop() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([8u8; 16]);
+    let mut record = queued_record(job_id);
+    record.state = JobState::Succeeded;
+    record.finished_at_ms = Some(2_000);
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 9_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, CancelRequestOutcome::AlreadyTerminal(_)));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!stored.cancel_requested);
+}
+
+#[tokio::test]
+async fn terminal_clears_dedup() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([5u8; 16]);
+    let mut record = queued_record(job_id);
+    record.dedup_key = Some(b"dedup".to_vec());
+    record.state = JobState::Running;
+    let token = Ulid::generate();
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: token,
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+    assert_eq!(
+        find_dedup_job(&context, record.created_by, b"dedup", None)
+            .await
+            .unwrap(),
+        Some(job_id)
+    );
+
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            token,
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        find_dedup_job(&context, record.created_by, b"dedup", None)
+            .await
+            .unwrap(),
+        None
+    );
+    let keys = schedule_keys(&context).await;
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].starts_with(aruna_core::structs::execution::job::identity::PRUNE_INDEX_PREFIX));
+}
+
+#[tokio::test]
+async fn malformed_retained() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([3u8; 16]);
+    batch_write(
+        &context,
+        vec![(
+            JOB_KEYSPACE.to_string(),
+            job_record_key(job_id),
+            ByteView::from(vec![1, 2, 3]),
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        read_job_record(&context, job_id, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        read_raw(&context, JOB_KEYSPACE, job_record_key(job_id), None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+fn running_record(job_id: JobId, token: Ulid, lease_expires: u64) -> JobRecord {
+    let mut record = queued_record(job_id);
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: token,
+        lease_expires_ms: lease_expires,
+    });
+    record
+}
+
+fn execution_record(job_id: JobId, token: Ulid, state: JobState) -> JobRecord {
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            backend: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        }),
+        UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32])),
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    );
+    record.state = state;
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(3),
+        claim_token: token,
+        lease_expires_ms: 10_000,
+    });
+    record
+}
+
+fn execution_result() -> JobResultPayload {
+    JobResultPayload::Execution {
+        exit_code: Some(0),
+        workspace_bucket: Some("ws-test".to_string()),
+        outputs: Vec::new(),
+        stdout: String::new(),
+        stderr: String::new(),
+        output_digest: None,
+    }
+}
+
+fn named_result(digest: [u8; 32]) -> JobResultPayload {
+    let mut result = execution_result();
+    if let JobResultPayload::Execution { output_digest, .. } = &mut result {
+        *output_digest = Some(digest);
+    }
+    result
+}
+
+/// Fence an attempt so the success path has a control row to read.
+async fn fence_attempt(context: &DriverContext, job_id: JobId, token: Ulid) -> AttemptControl {
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            token,
+            AttemptIntent {
+                attempt_no: 1,
+                external_name: "aruna-test-a1".to_string(),
+                executor_kind: "docker".to_string(),
+                pinned_image: "alpine@sha256:0".to_string(),
+                attempt_epoch: 0,
+                backend: "docker".to_string(),
+                config_generation: 0,
+                home_digest: aruna_core::compute::identity::home_digest("docker", None),
+            },
+            None,
+            None,
+            2_000,
+        ),
+        context,
+    )
+    .await
+    .unwrap()
+    .control
+}
+
+#[tokio::test]
+async fn revived_lease_kept() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([2u8; 16]);
+    insert_job(&context, &running_record(job_id, Ulid::generate(), 10_000))
+        .await
+        .unwrap();
+
+    // Sweep at now=5_000 with the lease valid until 10_000 must not revoke it.
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            5_000,
+            Some(5_000),
+            Some(JobError::retryable("lease expired")),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, RequeueOutcome::Skipped));
+    let record = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.state, JobState::Running);
+}
+
+// A sweep racing a completed requeue (record already Queued, claim gone) must not
+// charge a second attempt or overwrite last_error.
+#[tokio::test]
+async fn sweep_skips_requeued() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([11u8; 16]);
+    let mut record = queued_record(job_id);
+    record.attempts = 1;
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(
+            job_id,
+            None,
+            6_000,
+            Some(6_000),
+            Some(JobError::retryable("lease expired")),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, RequeueOutcome::Skipped));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Queued);
+    assert_eq!(stored.attempts, 1);
+    assert!(stored.last_error.is_none());
+}
+
+#[tokio::test]
+async fn reclaim_not_eligible() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([2u8; 16]);
+    insert_job(&context, &queued_record(job_id)).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(3), 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    // A second claim of an already-Claimed job must not hand back a token.
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::claim_job(job_id, node_id(4), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ClaimOutcome::NotEligible));
+}
+
+// A state filter must scan past non-matching pages, not return an empty page + cursor.
+#[tokio::test]
+async fn filter_scans_pages() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    let make = |seq: u64, state: JobState| {
+        let mut record = JobRecord::new(
+            job_id(seq),
+            JobPayload::Probe {
+                steps: 1,
+                step_sleep_ms: 0,
+                fail_at: None,
+                panic_at: None,
+                cleanup_marker: None,
+            },
+            owner,
+            node_id(7),
+            seq * 1000,
+            seq * 1000,
+            None,
+        );
+        record.state = state;
+        record
+    };
+    for record in [
+        make(5, JobState::Queued),
+        make(4, JobState::Failed),
+        make(3, JobState::Queued),
+    ] {
+        insert_job(&context, &record).await.unwrap();
+    }
+    batch_write(
+        &context,
+        vec![(
+            JOB_INDEX_KEYSPACE.to_string(),
+            owner_index_key(owner, 2_000, job_id(2)),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let (page, cursor) = drive(
+        ListJobsOperation::new(owner, None, 1, |record: &JobRecord| {
+            record.state == JobState::Failed
+        }),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.len(), 1, "the older Failed job is found across pages");
+    assert_eq!(page[0].state, JobState::Failed);
+    assert!(
+        cursor.is_none(),
+        "no dangling cursor on an exhausted filter"
+    );
+}
+
+#[tokio::test]
+async fn internal_jobs_hidden() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    let job_id = JobId::from_bytes([0xC1; 16]);
+    let record = JobRecord::new(
+        job_id,
+        JobPayload::WriteRunCrate {
+            for_job: JobId::from_bytes([0xC2; 16]),
+        },
+        owner,
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    );
+    insert_job(&context, &record).await.unwrap();
+
+    let (indexed, _) = iter_prefix_page(
+        &storage,
+        JOB_INDEX_KEYSPACE,
+        Some(owner_index_prefix(owner)),
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(indexed.is_empty(), "internal jobs are not owner-indexed");
+
+    batch_write(
+        &context,
+        vec![(
+            JOB_INDEX_KEYSPACE.to_string(),
+            owner_index_key(owner, record.created_at_ms, job_id),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+    let (listed, cursor) = drive(
+        ListJobsOperation::new(owner, None, 1, |_: &JobRecord| true),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(listed.is_empty(), "stale owner entries stay hidden");
+    assert!(cursor.is_none());
+}
+
+#[tokio::test]
+async fn cleanup_jobs_hidden() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    let job_id = JobId::from_bytes([0xC7; 16]);
+    let record = JobRecord::new(
+        job_id,
+        JobPayload::TerminalCleanup {
+            for_job: JobId::from_bytes([0xC8; 16]),
+            attempt: None,
+            access_key: "access".to_string(),
+        },
+        owner,
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    );
+    insert_job(&context, &record).await.unwrap();
+
+    let (indexed, _) = iter_prefix_page(
+        &storage,
+        JOB_INDEX_KEYSPACE,
+        Some(owner_index_prefix(owner)),
+        None,
+        1,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(indexed.is_empty());
+
+    batch_write(
+        &context,
+        vec![(
+            JOB_INDEX_KEYSPACE.to_string(),
+            owner_index_key(owner, record.created_at_ms, job_id),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+    let (listed, cursor) = drive(
+        ListJobsOperation::new(owner, None, 1, |_: &JobRecord| true),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(listed.is_empty());
+    assert!(cursor.is_none());
+}
+
+#[tokio::test]
+async fn terminal_enqueues_cleanup() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    let job_id = JobId::from_bytes([0xC9; 16]);
+    let token = Ulid::from_bytes([0xCA; 16]);
+    let intent = AttemptIntent {
+        attempt_no: 2,
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 2),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    };
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(ExecutionSpec {
+            group_id: Ulid::from_bytes([3u8; 16]),
+            name: None,
+            description: None,
+            tags: Default::default(),
+            image: "alpine:3".to_string(),
+            entrypoint: None,
+            command: Vec::new(),
+            workdir: None,
+            env: Default::default(),
+            resources: ComputeResources::default(),
+            executor_constraint: None,
+            backend: None,
+            inputs: Vec::new(),
+            file_outputs: Vec::new(),
+            workspace_outputs: Vec::new(),
+            output_prefixes: Vec::new(),
+            collision_policy: Default::default(),
+        }),
+        owner,
+        node_id(7),
+        1_000,
+        1_000,
+        None,
+    );
+    record.state = JobState::Running;
+    record.attempt_intent = Some(intent.clone());
+    record.claim = Some(JobClaim {
+        holder_node_id: node_id(7),
+        claim_token: token,
+        lease_expires_ms: 5_000,
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let terminal = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_id,
+            token,
+            JobResultPayload::Execution {
+                exit_code: Some(0),
+                workspace_bucket: Some("ws-test".to_string()),
+                outputs: Vec::new(),
+                stdout: String::new(),
+                stderr: String::new(),
+                output_digest: None,
+            },
+            JobProgress::new("phases"),
+            6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert!(terminal.claim.is_none());
+    let child = read_job_record(&context, cleanup_job_id(job_id), None)
+        .await
+        .unwrap()
+        .unwrap();
+    let expected_access = UserAccess::build_access_key(&workspace_credential_id(job_id)).unwrap();
+    assert_eq!(
+        child.payload,
+        JobPayload::TerminalCleanup {
+            for_job: job_id,
+            attempt: Some(intent),
+            access_key: expected_access,
+        }
+    );
+    assert_eq!(child.state, JobState::Queued);
+    assert!(child.payload.is_internal());
+}
+
+#[tokio::test]
+async fn run_delete_rules() {
+    // Only the caller's finished run is removed, with its list entry; a
+    // running run, a foreign one and a system job stay untouched.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    let other = UserId::new(Ulid::from_bytes([4u8; 16]), RealmId([1u8; 32]));
+    let run = |seed: u8, state: JobState| {
+        let mut record = JobRecord::new(
+            JobId::from_bytes([seed; 16]),
+            JobPayload::Execution(ExecutionSpec {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                name: None,
+                description: None,
+                tags: Default::default(),
+                image: "alpine:3".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                backend: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
+            }),
+            owner,
+            node_id(7),
+            1_000 + u64::from(seed),
+            1_000 + u64::from(seed),
+            None,
+        );
+        record.state = state;
+        record.finished_at_ms = state.is_terminal().then_some(2_000);
+        record
+    };
+    let finished = run(0xE1, JobState::Failed);
+    let running = run(0xE2, JobState::Running);
+    let mut probe = finished.clone();
+    probe.job_id = JobId::from_bytes([0xE3; 16]);
+    probe.payload = JobPayload::Probe {
+        steps: 1,
+        step_sleep_ms: 0,
+        fail_at: None,
+        panic_at: None,
+        cleanup_marker: None,
+    };
+    for record in [&finished, &running, &probe] {
+        insert_job(&context, record).await.unwrap();
+    }
+    batch_write(
+        &context,
+        vec![(
+            JOB_ENTRY_KEYSPACE.to_string(),
+            job_entry_key(finished.job_id, b"row"),
+            aruna_core::types::Value::from(Vec::<u8>::new()),
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let delete = |user, job| {
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::delete_finished_run(user, job, true),
+            &context,
+        )
+    };
+    assert_eq!(
+        delete(other, finished.job_id).await.unwrap(),
+        RunDelete::NotFound
+    );
+    assert_eq!(
+        delete(owner, running.job_id).await.unwrap(),
+        RunDelete::Unfinished(JobState::Running)
+    );
+    // Another kind of job leaves the list at once and is pruned later.
+    assert_eq!(
+        delete(owner, probe.job_id).await.unwrap(),
+        RunDelete::Deleted
+    );
+    assert_eq!(
+        delete(owner, probe.job_id).await.unwrap(),
+        RunDelete::NotFound
+    );
+    // A run whose deletion was not recorded first stays, whatever state it settled in since.
+    let unrecorded = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::delete_finished_run(owner, finished.job_id, false),
+        &context,
+    )
+    .await;
+    assert!(matches!(unrecorded, Ok(RunDelete::Unrecorded(_))));
+    assert_eq!(
+        delete(owner, finished.job_id).await.unwrap(),
+        RunDelete::Deleted
+    );
+    assert_eq!(
+        delete(owner, finished.job_id).await.unwrap(),
+        RunDelete::NotFound
+    );
+
+    assert!(
+        read_job_record(&context, finished.job_id, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let (listed, _) = drive(
+        ListJobsOperation::new(owner, None, 10, |_: &JobRecord| true),
+        &context,
+    )
+    .await
+    .unwrap();
+    let ids: Vec<JobId> = listed.iter().map(|record| record.job_id).collect();
+    assert!(!ids.contains(&finished.job_id));
+    assert!(!ids.contains(&probe.job_id));
+    assert!(ids.contains(&running.job_id));
+    let hidden = read_job_record(&context, probe.job_id, None).await.unwrap();
+    let keys = schedule_keys(&context).await;
+    let due = job_prune_key(hidden.unwrap().finished_at_ms.unwrap(), probe.job_id);
+    assert!(keys.contains(&due), "the deleted job is due for pruning");
+    let (entries, _) = iter_prefix_page(
+        &storage,
+        JOB_ENTRY_KEYSPACE,
+        Some(job_entry_prefix(finished.job_id)),
+        None,
+        10,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(entries.is_empty(), "report rows go with the run");
+}
+
+#[tokio::test]
+async fn session_skips_crate() {
+    // A stopped notebook session writes no run dataset, while an ordinary
+    // run of the same shape still queues the crate job.
+    use aruna_core::compute::runtimes::{SESSION_TAG, SESSION_TAG_NOTEBOOK};
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let owner = UserId::new(Ulid::from_bytes([2u8; 16]), RealmId([1u8; 32]));
+    for (seed, session) in [(0xD1u8, true), (0xD3u8, false)] {
+        let job_id = JobId::from_bytes([seed; 16]);
+        let token = Ulid::from_bytes([seed + 1; 16]);
+        let mut tags = std::collections::BTreeMap::new();
+        if session {
+            tags.insert(SESSION_TAG.to_string(), SESSION_TAG_NOTEBOOK.to_string());
+        }
+        let mut record = JobRecord::new(
+            job_id,
+            JobPayload::Execution(ExecutionSpec {
+                group_id: Ulid::from_bytes([3u8; 16]),
+                name: None,
+                description: None,
+                tags,
+                image: "session:latest".to_string(),
+                entrypoint: None,
+                command: Vec::new(),
+                workdir: None,
+                env: Default::default(),
+                resources: ComputeResources::default(),
+                executor_constraint: None,
+                backend: None,
+                inputs: Vec::new(),
+                file_outputs: Vec::new(),
+                workspace_outputs: Vec::new(),
+                output_prefixes: Vec::new(),
+                collision_policy: Default::default(),
+            }),
+            owner,
+            node_id(7),
+            1_000,
+            1_000,
+            None,
+        );
+        record.state = JobState::Running;
+        record.claim = Some(JobClaim {
+            holder_node_id: node_id(7),
+            claim_token: token,
+            lease_expires_ms: 5_000,
+        });
+        insert_job(&context, &record).await.unwrap();
+        aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::complete_job(
+                job_id,
+                token,
+                JobResultPayload::Execution {
+                    exit_code: Some(0),
+                    workspace_bucket: Some("ws-test".to_string()),
+                    outputs: Vec::new(),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    output_digest: None,
+                },
+                JobProgress::new("phases"),
+                6_000,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let crate_job = read_job_record(&context, crate_job_id(job_id), None)
+            .await
+            .unwrap();
+        let status = read_crate_status(&context, job_id).await.unwrap();
+        assert_eq!(
+            crate_job.is_none(),
+            session,
+            "crate job for session={session}"
+        );
+        assert_eq!(
+            status.is_none(),
+            session,
+            "crate status for session={session}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dedup_delete_guarded() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_a = JobId::from_bytes([1u8; 16]);
+    let job_b = JobId::from_bytes([2u8; 16]);
+    let token = Ulid::generate();
+    let mut record = running_record(job_a, token, 10_000);
+    record.dedup_key = Some(b"k".to_vec());
+    insert_job(&context, &record).await.unwrap();
+
+    // A raced submit repoints the dedup row at job B.
+    batch_write(
+        &context,
+        vec![(
+            DEDUP_INDEX_KEYSPACE.to_string(),
+            dedup_index_key(record.created_by, b"k"),
+            ByteView::from(encode_dedup_value(job_b, [3u8; 32])),
+        )],
+        None,
+    )
+    .await
+    .unwrap();
+
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_job(
+            job_a,
+            token,
+            JobResultPayload::Probe { completed_steps: 1 },
+            JobProgress::new("steps"),
+            6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    // A going terminal must not delete B's dedup row.
+    assert_eq!(
+        find_dedup_job(&context, record.created_by, b"k", None)
+            .await
+            .unwrap(),
+        Some(job_b)
+    );
+}
+
+// An external attempt with an expired lease is never requeued; it is reconciled,
+// and the sweep leaves it untouched so a restart whose adoption succeeds is free.
+#[tokio::test]
+async fn external_never_requeued() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xE0; 16]);
+    let mut record = execution_record(job_id, Ulid::generate(), JobState::Running);
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
+    record.attempt_intent = Some(AttemptIntent {
+        attempt_no: 1,
+        external_name: "attempt".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:digest".to_string(),
+        attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, RequeueOutcome::NeedsReconcile(_)));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Running, "not requeued");
+    assert_eq!(stored.attempts, 0, "attempt untouched");
+    assert!(stored.claim.is_some(), "claim untouched");
+}
+
+// The effective retry budget of a park that repeats: one attempt per supervision
+// cycle, because the sweep that re-routes the parked job never charges a second.
+#[tokio::test]
+async fn park_sweep_budget() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xE4; 16]);
+    let token = Ulid::generate();
+    let mut record = execution_record(job_id, token, JobState::Running);
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
+    record.workspace_bucket = Some("ws-test".to_string());
+    record.attempt_intent = Some(AttemptIntent {
+        attempt_no: 1,
+        external_name: "attempt".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:digest".to_string(),
+        attempt_epoch: 1,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    });
+    insert_job(&context, &record).await.unwrap();
+
+    for cycle in 1..JOB_MAX_ATTEMPTS {
+        let parked = aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::mark_indeterminate(
+                job_id,
+                token,
+                JobError::retryable("attempt unobservable"),
+                6_000,
+            ),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(parked, ParkOutcome::Parked(_)), "cycle {cycle}");
+        let swept = aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(swept, RequeueOutcome::NeedsReconcile(_)),
+            "cycle {cycle}"
+        );
+        let stored = read_job_record(&context, job_id, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempts, cycle, "one charge per cycle");
+        assert_eq!(stored.state, JobState::Indeterminate);
+    }
+
+    let capped = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::mark_indeterminate(
+            job_id,
+            token,
+            JobError::retryable("attempt unobservable"),
+            7_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    let ParkOutcome::Exhausted(failed) = capped else {
+        panic!("the last cycle must exhaust");
+    };
+    assert_eq!(failed.state, JobState::Indeterminate);
+    assert!(failed.locally_exhausted);
+    assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+}
+
+// Parking spends the attempt and stops at the cap; without that a failure
+// repeating on every reconcile pass re-drives the job forever.
+#[tokio::test]
+async fn park_spends_attempt() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xE5; 16]);
+    let token = Ulid::generate();
+    let mut record = execution_record(job_id, token, JobState::Running);
+    record.workspace_bucket = Some("ws-test".to_string());
+    insert_job(&context, &record).await.unwrap();
+
+    for attempt in 1..JOB_MAX_ATTEMPTS {
+        let ParkOutcome::Parked(parked) = aruna_runner::driver::drive(
+            crate::jobs::store::job_calls::mark_indeterminate(
+                job_id,
+                token,
+                JobError::retryable("output capture failed"),
+                6_000,
+            ),
+            &context,
+        )
+        .await
+        .unwrap() else {
+            panic!("a park below the cap must stay Indeterminate");
+        };
+        assert_eq!(parked.state, JobState::Indeterminate);
+        assert_eq!(parked.attempts, attempt);
+    }
+
+    let ParkOutcome::Exhausted(failed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::mark_indeterminate(
+            job_id,
+            token,
+            JobError::retryable("output capture failed"),
+            7_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("the capped park must exhaust");
+    };
+    assert_eq!(failed.state, JobState::Indeterminate);
+    assert!(failed.locally_exhausted);
+    assert_eq!(failed.attempts, JOB_MAX_ATTEMPTS);
+    assert!(failed.finished_at_ms.is_none());
+    assert!(failed.claim.is_none());
+    assert!(
+        matches!(failed.result, Some(JobResultPayload::Execution { .. })),
+        "cleanup and the run crate need a result"
+    );
+}
+
+// Every cap site must leave the result payload terminal cleanup and the run crate
+// read, not just the park that exhaustion was introduced for.
+#[tokio::test]
+async fn cap_sites_result() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let swept = JobId::from_bytes([0xE6; 16]);
+    let token = Ulid::generate();
+    let mut record = execution_record(swept, token, JobState::Ready);
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.workspace_bucket = Some("ws-test".to_string());
+    insert_job(&context, &record).await.unwrap();
+    let presubmit = JobId::from_bytes([0xE9; 16]);
+    let mut record = execution_record(presubmit, token, JobState::Ready);
+    record.attempts = JOB_MAX_ATTEMPTS - 1;
+    record.workspace_bucket = Some("ws-test".to_string());
+    insert_job(&context, &record).await.unwrap();
+
+    let RequeueOutcome::Exhausted(failed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(swept, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("the sweep must exhaust at the cap");
+    };
+    assert!(matches!(
+        failed.result,
+        Some(JobResultPayload::Execution { .. })
+    ));
+
+    let failed = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_before_attempt(
+            presubmit,
+            token,
+            9_000,
+            JobError::retryable("image pull failed"),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(failed.state, JobState::Indeterminate);
+    assert!(failed.locally_exhausted);
+    assert!(matches!(
+        failed.result,
+        Some(JobResultPayload::Execution { .. })
+    ));
+}
+
+#[tokio::test]
+async fn preintent_requeues() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xE3; 16]);
+    let mut record = execution_record(job_id, Ulid::generate(), JobState::Ready);
+    record.claim.as_mut().unwrap().lease_expires_ms = 1;
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 9_000, Some(9_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, RequeueOutcome::Requeued(_)));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Queued);
+    assert_eq!(stored.attempts, 1);
+    assert!(stored.claim.is_none());
+}
+
+#[tokio::test]
+async fn attempt_intent_persists() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA0; 16]);
+    let token = Ulid::generate();
+    insert_job(&context, &running_record(job_id, token, 10_000))
+        .await
+        .unwrap();
+
+    let intent = AttemptIntent {
+        attempt_no: 1,
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 1),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    };
+    let committed = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id, token, intent, None, None, 6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.attempt_intent, committed.record.attempt_intent);
+    assert_eq!(committed.control.attempt_epoch, 1);
+}
+
+#[tokio::test]
+async fn cancel_blocks_intent() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA1; 16]);
+    let token = Ulid::generate();
+    let mut record = running_record(job_id, token, 10_000);
+    record.execution_class = JobExecutionClass::ExternalAttempt;
+    record.state = JobState::Ready;
+    insert_job(&context, &record).await.unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let intent = AttemptIntent {
+        attempt_no: 0,
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    };
+    let error = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id, token, intent, None, None, 6_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, JobMutationError::IntentConflict));
+}
+
+#[tokio::test]
+async fn cancel_blocks_running() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA2; 16]);
+    let token = Ulid::generate();
+    insert_job(&context, &execution_record(job_id, token, JobState::Ready))
+        .await
+        .unwrap();
+    let intent = AttemptIntent {
+        attempt_no: 0,
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    };
+    let committed = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id, token, intent, None, None, 4_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let stored = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(5_500), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stored.state, JobState::Ready);
+    assert!(stored.cancel_requested);
+    assert_eq!(stored.attempt_intent, committed.record.attempt_intent);
+    assert!(stored.started_at_ms.is_none());
+    assert!(stored.claim.is_some());
+}
+
+fn sample_launch() -> LaunchRecord {
+    LaunchRecord {
+        node_id: node_id(5),
+        executor_kind: "docker".to_string(),
+        backend: "default".to_string(),
+        location: "giessen".to_string(),
+        resources: Default::default(),
+        workdir: None,
+        env: Default::default(),
+        started_at_ms: None,
+    }
+}
+
+fn plain_intent(job_id: JobId) -> AttemptIntent {
+    AttemptIntent {
+        attempt_no: 0,
+        external_name: aruna_core::structs::execution::job::local::attempt_external_name(job_id, 0),
+        executor_kind: "docker".to_string(),
+        pinned_image:
+            "alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string(),
+        attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    }
+}
+
+#[tokio::test]
+async fn launch_marks_executed() {
+    // The launch row joins the epoch's guarded commit and counts only once the job runs.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xB1; 16]);
+    let token = Ulid::generate();
+    insert_job(&context, &execution_record(job_id, token, JobState::Ready))
+        .await
+        .unwrap();
+    let launch = sample_launch();
+    let committed = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            token,
+            plain_intent(job_id),
+            None,
+            (Some(&launch)).cloned(),
+            4_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        read_launch_record(&context, &committed.record).await,
+        Ok(None)
+    );
+
+    let running = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(5_500), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    let executed = read_launch_record(&context, &running)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executed.started_at_ms, Some(5_500));
+    assert_eq!(executed.location, "giessen");
+}
+
+#[tokio::test]
+async fn stale_launch_refused() {
+    // A claimant whose token lost writes no launch facts; an accepted attempt counts as executed
+    // even when a cancellation keeps it from running.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xB2; 16]);
+    let token = Ulid::generate();
+    insert_job(&context, &execution_record(job_id, token, JobState::Ready))
+        .await
+        .unwrap();
+    let launch = sample_launch();
+    let stale = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            Ulid::generate(),
+            plain_intent(job_id),
+            None,
+            (Some(&launch)).cloned(),
+            4_000,
+        ),
+        &context,
+    )
+    .await;
+    assert!(stale.is_err());
+    let key = ByteView::from(attempt_control_key(job_id, 1));
+    let row = read_raw(&context, LAUNCH_RECORD_KEYSPACE, key, None).await;
+    assert_eq!(row, Ok(None));
+
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            job_id,
+            token,
+            plain_intent(job_id),
+            None,
+            (Some(&launch)).cloned(),
+            4_000,
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    let stored = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(5_500), 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.state, JobState::Ready);
+    let executed = read_launch_record(&context, &stored)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(executed.started_at_ms, Some(5_500));
+}
+
+#[tokio::test]
+async fn running_backfills_start() {
+    // Kubernetes and Apptainer accept an attempt before reporting a start
+    // time; without a start the walltime cap would have no anchor.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA9; 16]);
+    let token = Ulid::generate();
+    insert_job(&context, &execution_record(job_id, token, JobState::Ready))
+        .await
+        .unwrap();
+
+    let stored = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, None, 6_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(stored.state, JobState::Running);
+    assert_eq!(stored.started_at_ms, Some(6_000));
+
+    // Later evidence must not move an already anchored start.
+    let stored = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::begin_external_running(job_id, token, Some(9_000), 9_100),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(stored.started_at_ms, Some(6_000));
+}
+
+#[tokio::test]
+async fn cancel_blocks_completion() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA3; 16]);
+    let token = Ulid::generate();
+    insert_job(
+        &context,
+        &execution_record(job_id, token, JobState::Running),
+    )
+    .await
+    .unwrap();
+    fence_attempt(&context, job_id, token).await;
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 5_000),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let ExecutionCompleteOutcome::CancelRequested(stored) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: execution_result(),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_000,
+            },
+        ),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("cancellation must win completion");
+    };
+
+    assert_eq!(stored.state, JobState::Running);
+    assert!(stored.result.is_none());
+    assert!(stored.finished_at_ms.is_none());
+    assert!(stored.claim.is_some());
+    assert!(
+        read_job_record(&context, cleanup_job_id(job_id), None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn success_wins_cancel() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA4; 16]);
+    let token = Ulid::generate();
+    insert_job(
+        &context,
+        &execution_record(job_id, token, JobState::Running),
+    )
+    .await
+    .unwrap();
+
+    let control = fence_attempt(&context, job_id, token).await;
+    let digest = [8u8; 32];
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(
+            job_id,
+            &control,
+            digest,
+            vec![1, 2, 3],
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+
+    let ExecutionCompleteOutcome::Completed(completed) = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: named_result(digest),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_000,
+            },
+        ),
+        &context,
+    )
+    .await
+    .unwrap() else {
+        panic!("success must complete without cancellation");
+    };
+    assert_eq!(completed.state, JobState::Succeeded);
+    assert!(completed.claim.is_none());
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::set_cancel_requested(job_id, 7_000),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, CancelRequestOutcome::AlreadyTerminal(_)));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Succeeded);
+    assert!(!stored.cancel_requested);
+    assert!(stored.result.is_some());
+    assert!(
+        read_job_record(&context, cleanup_job_id(job_id), None)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn output_record_cas() {
+    // A replay may confirm the same digest, but a later write cannot replace it.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA8; 16]);
+    let token = Ulid::generate();
+    insert_job(
+        &context,
+        &execution_record(job_id, token, JobState::Running),
+    )
+    .await
+    .unwrap();
+    let control = fence_attempt(&context, job_id, token).await;
+    let first = vec![1, 2, 3];
+
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(
+            job_id,
+            &control,
+            [8u8; 32],
+            first.clone(),
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(
+            job_id,
+            &control,
+            [8u8; 32],
+            vec![4, 5],
+        ),
+        &context,
+    )
+    .await
+    .unwrap();
+    let conflict = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(job_id, &control, [9u8; 32], vec![6]),
+        &context,
+    )
+    .await;
+    assert!(matches!(
+        conflict,
+        Err(JobMutationError::OutputRecordConflict)
+    ));
+
+    let raw = read_raw(
+        &context,
+        OUTPUT_RECORD_KEYSPACE,
+        ByteView::from(attempt_control_key(job_id, control.attempt_epoch)),
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(raw.as_ref(), first.as_slice());
+    let stored = aruna_runner::driver::drive(
+        crate::jobs::store::row_calls::read_attempt_control(job_id, control.attempt_epoch),
+        &context,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(stored.output_record, Some([8u8; 32]));
+}
+
+#[tokio::test]
+async fn success_needs_record() {
+    // Without a durable output record naming the same digest, the storage
+    // mutation itself refuses to publish Succeeded.
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xA7; 16]);
+    let token = Ulid::generate();
+    insert_job(
+        &context,
+        &execution_record(job_id, token, JobState::Running),
+    )
+    .await
+    .unwrap();
+    let control = fence_attempt(&context, job_id, token).await;
+
+    let unproven = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: execution_result(),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_000,
+            },
+        ),
+        &context,
+    )
+    .await;
+    assert!(matches!(
+        unproven,
+        Err(JobMutationError::OutputsUnproven(_))
+    ));
+
+    aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::persist_output_record(job_id, &control, [8u8; 32], vec![9]),
+        &context,
+    )
+    .await
+    .unwrap();
+    let mismatched = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::complete_execution(
+            job_id,
+            token,
+            crate::jobs::store::job_calls::RunSuccess {
+                result: named_result([1u8; 32]),
+                progress: JobProgress::new("phases"),
+                now_ms: 6_100,
+            },
+        ),
+        &context,
+    )
+    .await;
+    assert!(matches!(
+        mismatched,
+        Err(JobMutationError::OutputsUnproven(_))
+    ));
+
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Running);
+    assert!(stored.result.is_none());
+}
+
+// A live renewed external lease is a plain sweep Skip, never routed to reconcile.
+#[tokio::test]
+async fn external_live_skipped() {
+    let (_dir, storage) = temp_storage();
+    let context = aruna_runner::testing::test_context(storage.clone());
+    let job_id = JobId::from_bytes([0xE2; 16]);
+    let mut record = running_record(job_id, Ulid::generate(), 10_000);
+    record.execution_class = JobExecutionClass::ExternalAttempt;
+    insert_job(&context, &record).await.unwrap();
+
+    let outcome = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::requeue_job(job_id, None, 5_000, Some(5_000), None),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, RequeueOutcome::Skipped));
+    let stored = read_job_record(&context, job_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, JobState::Running);
+}
+
+#[test]
+fn capacity_not_conflict() {
+    // Cleanup-capacity exhaustion must fail fast, never feed the conflict retry.
+    use aruna_core::calls::IoError;
+    use aruna_core::errors::StorageError;
+    let error = JobMutationError::from(IoError::Storage(StorageError::CleanupCapacity));
+    assert!(matches!(error, JobMutationError::Storage(_)));
+}
+
+// A listing reads the record of an index row that carries none, and a short page ends it.
+#[test]
+fn list_reads_bare() {
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    let record = queued_record(job_id(1_000));
+    let owner = record.created_by;
+    let mut listing = ListJobsOperation::new(owner, None, 2, |_: &JobRecord| true);
+    assert!(matches!(
+        listing.first(),
+        Ok(Next::Call(IoCall::Page { limit: 2, .. }))
+    ));
+    let row = (
+        owner_index_key(owner, 1_000, record.job_id),
+        Value::from(&[][..]),
+    );
+    let page = IoResult::Page {
+        rows: vec![row],
+        next: None,
+    };
+    assert!(matches!(
+        listing.next(page),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    let bytes = Value::from(record.to_bytes().unwrap().as_slice());
+    let Ok(Next::Done((records, cursor))) = listing.next(IoResult::Values(vec![Some(bytes)]))
+    else {
+        panic!("a short page ends the listing");
+    };
+    assert_eq!(records, vec![record]);
+    assert_eq!(cursor, None);
+    let mut empty = ListJobsOperation::new(owner, None, 0, |_: &JobRecord| true);
+    assert_eq!(empty.first(), Ok(Next::Done((Vec::new(), None))));
+}
+
+// A launch start marks the current attempt's launch record once, in the job mutation's run.
+#[test]
+fn marks_launch_once() {
+    use super::mark_start::MarkStartOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let mut record = queued_record(job_id(2_000));
+    record.attempt_intent = Some(AttemptIntent {
+        attempt_no: 1,
+        external_name: "attempt".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:digest".to_string(),
+        attempt_epoch: 3,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    });
+    let mut rows = seeded_rows(&record);
+    let key = attempt_control_key(record.job_id, 3);
+    let launch = LaunchRecord {
+        node_id: node_id(7),
+        executor_kind: "docker".to_string(),
+        backend: "default".to_string(),
+        location: String::new(),
+        resources: Default::default(),
+        workdir: None,
+        env: Default::default(),
+        started_at_ms: None,
+    };
+    let row = (LAUNCH_RECORD_KEYSPACE.to_string(), key.to_vec());
+    rows.insert(row.clone(), launch.to_bytes().unwrap());
+    let mut touch = |record: &mut JobRecord| {
+        record.updated_at_ms = 2_500;
+        Ok(JobMutation::Persist)
+    };
+    let mark = MarkStartOperation::new(record.job_id, &mut touch, 2_600);
+    let marked = run_in_memory(mark, &mut rows).unwrap();
+    assert_eq!(marked.updated_at_ms, 2_500);
+    let stored = LaunchRecord::from_bytes(&rows[&row]).unwrap();
+    assert_eq!(stored.started_at_ms, Some(2_600));
+
+    let mut again = |_: &mut JobRecord| Ok(JobMutation::Skip);
+    let mark = MarkStartOperation::new(record.job_id, &mut again, 2_900);
+    run_in_memory(mark, &mut rows).unwrap();
+    let kept = LaunchRecord::from_bytes(&rows[&row]).unwrap();
+    assert_eq!(kept.started_at_ms, Some(2_600));
+}
+
+fn draft() -> AttemptIntent {
+    AttemptIntent {
+        attempt_no: 1,
+        external_name: "aruna-test-a1".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:0".to_string(),
+        attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    }
+}
+
+fn has_row(rows: &mutation::Rows, space: &str, key: &[u8]) -> bool {
+    rows.contains_key(&(space.to_string(), key.to_vec()))
+}
+
+// A settled job other than a run leaves the list; an unfinished or foreign one stays.
+#[test]
+fn delete_hides_settled() {
+    use super::mutation::{run_in_memory, seeded_rows};
+    use super::run_delete::DeleteRunOperation;
+    let mut record = queued_record(job_id(1_000));
+    let (owner, id) = (record.created_by, record.job_id);
+    let mut rows = seeded_rows(&record);
+    let delete = DeleteRunOperation::new(owner, id, true);
+    assert_eq!(delete.transaction(), TransactionMode::Write);
+    let unfinished = run_in_memory(delete, &mut rows);
+    assert_eq!(unfinished, Ok(RunDelete::Unfinished(JobState::Queued)));
+    let stranger = UserId::new(Ulid::from_bytes([9u8; 16]), RealmId([1u8; 32]));
+    let foreign = DeleteRunOperation::new(stranger, id, true);
+    assert_eq!(run_in_memory(foreign, &mut rows), Ok(RunDelete::NotFound));
+
+    record.state = JobState::Succeeded;
+    let mut rows = seeded_rows(&record);
+    let listed = owner_index_key(owner, record.created_at_ms, id);
+    let hidden = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut rows);
+    assert_eq!(hidden, Ok(RunDelete::Deleted));
+    assert!(!has_row(&rows, JOB_INDEX_KEYSPACE, &listed));
+    assert!(has_row(&rows, JOB_KEYSPACE, &job_record_key(id)));
+    let again = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut rows);
+    assert_eq!(again, Ok(RunDelete::NotFound));
+}
+
+// A finished run goes with its entries once recorded; a queued cleanup or a missing record keeps it.
+#[test]
+fn delete_removes_run() {
+    use super::mutation::{run_in_memory, seeded_rows};
+    use super::run_delete::DeleteRunOperation;
+    let record = execution_record(
+        job_id(1_000),
+        Ulid::from_bytes([5u8; 16]),
+        JobState::Succeeded,
+    );
+    let (owner, id) = (record.created_by, record.job_id);
+    let mut rows = seeded_rows(&record);
+    let entry = job_entry_key(id, b"a");
+    rows.insert((JOB_ENTRY_KEYSPACE.to_string(), entry.to_vec()), vec![1]);
+
+    let unrecorded = run_in_memory(DeleteRunOperation::new(owner, id, false), &mut rows);
+    assert!(matches!(unrecorded, Ok(RunDelete::Unrecorded(_))));
+    let mut pending = rows.clone();
+    pending.extend(seeded_rows(&queued_record(cleanup_job_id(id))));
+    let cleanup = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut pending);
+    assert_eq!(cleanup, Ok(RunDelete::CleanupPending));
+
+    let deleted = run_in_memory(DeleteRunOperation::new(owner, id, true), &mut rows);
+    assert_eq!(deleted, Ok(RunDelete::Deleted));
+    assert!(!has_row(&rows, JOB_KEYSPACE, &job_record_key(id)));
+    assert!(!has_row(&rows, JOB_ENTRY_KEYSPACE, &entry));
+}
+
+// Only the claim token holder writes and deletes a running job's rows.
+#[test]
+fn claim_fences_rows() {
+    use super::job_rows::PutRowsOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let record = running_record(job_id(1_000), token, 10_000);
+    let mut rows = seeded_rows(&record);
+    let key = ByteView::from(b"state".to_vec());
+    let write = vec![(
+        STAGING_STATE_KEYSPACE.to_string(),
+        key.clone(),
+        ByteView::from(vec![1]),
+    )];
+    let before = rows.clone();
+    let stranger = PutRowsOperation::new(
+        record.job_id,
+        Ulid::from_bytes([6u8; 16]),
+        write.clone(),
+        Vec::new(),
+    );
+    assert_eq!(
+        run_in_memory(stranger, &mut rows),
+        Err(JobMutationError::TokenMismatch)
+    );
+    assert_eq!(rows, before);
+
+    let put = PutRowsOperation::new(record.job_id, token, write, Vec::new());
+    assert_eq!(put.transaction(), TransactionMode::Write);
+    assert_eq!(run_in_memory(put, &mut rows), Ok(()));
+    assert!(has_row(&rows, STAGING_STATE_KEYSPACE, &key));
+    let gone = vec![(STAGING_STATE_KEYSPACE.to_string(), key.clone())];
+    let delete = PutRowsOperation::new(record.job_id, token, Vec::new(), gone);
+    assert_eq!(run_in_memory(delete, &mut rows), Ok(()));
+    assert!(!has_row(&rows, STAGING_STATE_KEYSPACE, &key));
+}
+
+// A running job adds report entries under its claim; a settled report is frozen.
+#[test]
+fn entries_need_claim() {
+    use super::job_rows::PutEntryOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let mut record = running_record(job_id(1_000), token, 10_000);
+    let value = ByteView::from(vec![7]);
+    let missing = PutEntryOperation::new(record.job_id, token, b"e", value.clone());
+    assert_eq!(
+        run_in_memory(missing, &mut Default::default()),
+        Err(JobMutationError::NotFound)
+    );
+
+    let mut rows = seeded_rows(&record);
+    let put = PutEntryOperation::new(record.job_id, token, b"e", value.clone());
+    assert_eq!(put.transaction(), TransactionMode::Write);
+    assert_eq!(run_in_memory(put, &mut rows), Ok(()));
+    assert!(has_row(
+        &rows,
+        JOB_ENTRY_KEYSPACE,
+        &job_entry_key(record.job_id, b"e")
+    ));
+    let stranger = PutEntryOperation::new(
+        record.job_id,
+        Ulid::from_bytes([6u8; 16]),
+        b"f",
+        value.clone(),
+    );
+    assert_eq!(
+        run_in_memory(stranger, &mut rows),
+        Err(JobMutationError::TokenMismatch)
+    );
+
+    record.state = JobState::Succeeded;
+    let mut rows = seeded_rows(&record);
+    let frozen = PutEntryOperation::new(record.job_id, token, b"e", value);
+    assert_eq!(
+        run_in_memory(frozen, &mut rows),
+        Err(JobMutationError::ReportFrozen)
+    );
+}
+
+// A new intent takes the next epoch with its control and launch rows; the same intent replays.
+#[test]
+fn intent_takes_epoch() {
+    use super::attempt_intent::RecordIntentOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let record = running_record(job_id(1_000), token, 10_000);
+    let id = record.job_id;
+    let mut rows = seeded_rows(&record);
+    let execution = Ulid::from_bytes([8u8; 16]);
+    let launch = Some(sample_launch());
+    let intent = RecordIntentOperation::new((id, token), draft(), execution, launch.clone(), 2_000);
+    assert_eq!(intent.transaction(), TransactionMode::Write);
+    let commit = run_in_memory(intent, &mut rows).expect("intent recorded");
+    assert_eq!(commit.control.execution_id, execution);
+    assert_eq!(
+        commit.record.next_attempt_epoch,
+        record.next_attempt_epoch + 1
+    );
+    let key = attempt_control_key(id, commit.control.attempt_epoch);
+    assert!(has_row(&rows, ATTEMPT_CONTROL_KEYSPACE, &key));
+    assert!(has_row(&rows, LAUNCH_RECORD_KEYSPACE, &key));
+
+    let other = Ulid::from_bytes([9u8; 16]);
+    let replay = RecordIntentOperation::new((id, token), draft(), other, None, 3_000);
+    assert_eq!(run_in_memory(replay, &mut rows), Ok(commit));
+    let mut changed = draft();
+    changed.attempt_no = 2;
+    let conflict = RecordIntentOperation::new((id, token), changed, other, None, 3_000);
+    assert_eq!(
+        run_in_memory(conflict, &mut rows),
+        Err(JobMutationError::IntentConflict)
+    );
+}
+
+// A control change writes both rows; a job without an intent has no control to change.
+#[test]
+fn control_follows_job() {
+    use super::attempt_intent::RecordIntentOperation;
+    use super::control_mutation::MutateControlOperation;
+    use super::mutation::{run_in_memory, seeded_rows};
+    let token = Ulid::from_bytes([5u8; 16]);
+    let record = running_record(job_id(1_000), token, 10_000);
+    let id = record.job_id;
+    let mut rows = seeded_rows(&record);
+    let mut bump = |record: &mut JobRecord, control: &mut AttemptControl| {
+        record.updated_at_ms = 4_000;
+        control.controller_generation += 1;
+        Ok(JobMutation::Persist)
+    };
+    let early = MutateControlOperation::new(id, Vec::new(), &mut bump);
+    assert_eq!(early.transaction(), TransactionMode::Write);
+    assert_eq!(
+        run_in_memory(early, &mut rows),
+        Err(JobMutationError::MissingControl)
+    );
+
+    let intent = RecordIntentOperation::new(
+        (id, token),
+        draft(),
+        Ulid::from_bytes([8u8; 16]),
+        None,
+        2_000,
+    );
+    let commit = run_in_memory(intent, &mut rows).expect("intent recorded");
+    let extra = (
+        STAGING_STATE_KEYSPACE.to_string(),
+        ByteView::from(b"x".to_vec()),
+        ByteView::from(vec![1]),
+    );
+    let change = MutateControlOperation::new(id, vec![extra], &mut bump);
+    let ControlChange {
+        record: changed,
+        control,
+        ..
+    } = run_in_memory(change, &mut rows).expect("control changed");
+    assert_eq!(changed.updated_at_ms, 4_000);
+    assert_eq!(
+        control.controller_generation,
+        commit.control.controller_generation + 1
+    );
+    let key = attempt_control_key(id, control.attempt_epoch);
+    let stored = &rows[&(ATTEMPT_CONTROL_KEYSPACE.to_string(), key)];
+    assert_eq!(AttemptControl::from_bytes(stored).unwrap(), control);
+    assert!(has_row(&rows, STAGING_STATE_KEYSPACE, b"x"));
+}

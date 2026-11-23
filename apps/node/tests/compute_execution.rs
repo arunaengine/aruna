@@ -1,0 +1,841 @@
+//! End-to-end compute tests that run jobs on a real Docker daemon and a real S3 endpoint.
+//! They are ignored by default; a run on purpose without a daemon fails.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+#![cfg(feature = "docker")]
+
+use crate::shared;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aruna::tasks::runner::{reconcile_lost_attempt, run_execution_job};
+use aruna_clock::testing::poll_until;
+use aruna_clock::unix_timestamp_millis;
+use aruna_compute::executor::docker::DockerBackend;
+use aruna_compute::registry::ExecutorRegistry;
+use aruna_core::id::NodeId;
+use aruna_core::structs::checksum::HASH_BLAKE3;
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::{
+    CapturedInput, ComputeResources, ExecutionSpec, InputMode, InputSelection, InputSource,
+    JobPayload, OutputDestination, OutputSelection,
+};
+use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
+use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
+use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_ops_work::jobs::store::job_calls::{self, ClaimOutcome};
+use aruna_ops_work::jobs::store::{JobMutation, row_calls};
+use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_ops_work::testing::fresh_job_id;
+use aruna_runner::driver::{DriverContext, drive};
+use aruna_runner::jobs::runtime::JobsRuntime;
+use aws_sdk_s3::primitives::ByteStream;
+use serde_json::{Value, json};
+use shared::{
+    S3Credentials, TestResult, create_bearer_token, create_group_http, create_s3_credentials,
+    s3_client, spawn_complete_seed, spawn_compute_seed, wait_group_http,
+};
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+
+fn job_id() -> JobId {
+    fresh_job_id(
+        PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
+        BucketId::new(0).unwrap(),
+    )
+    .unwrap()
+}
+
+struct Fixture {
+    seed: shared::SeedNode,
+    bearer: String,
+    compute_ctx: Arc<DriverContext>,
+    group_id: Ulid,
+    s3: S3Credentials,
+    endpoint: shared::S3Endpoint,
+    source_bucket: String,
+}
+
+/// Full node + Docker-backed compute context + a group with a source object staged.
+async fn setup(backend: DockerBackend) -> TestResult<Fixture> {
+    let seed = spawn_complete_seed().await?;
+    let endpoint = seed.s3.clone().expect("full node exposes S3");
+
+    let bearer = create_bearer_token(
+        &seed.context,
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group = create_group_http(&seed.base_url, &bearer, "compute-e2e").await?;
+    wait_group_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let group_id = Ulid::from_string(&group.group_id)?;
+    let creds = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+
+    // A multi-chunk source object (~1 MiB) the workflow snapshots into the
+    // workspace, so staging, container upload, and output capture all stream.
+    let source_bucket = format!("src-{}", Ulid::generate().to_string().to_lowercase());
+    let client = s3_client(&endpoint, &creds);
+    client.create_bucket().bucket(&source_bucket).send().await?;
+    client
+        .put_object()
+        .bucket(&source_bucket)
+        .key("data.txt")
+        .body(ByteStream::from(source_payload()))
+        .send()
+        .await?;
+
+    // Compute-enabled context sharing the node's storage/net/blob/metadata.
+    let container_endpoint = endpoint.endpoint_url.replace("localhost", "127.0.0.1");
+    let workspace = aruna_compute::registry::WorkspaceEndpoint {
+        endpoint: Some(container_endpoint),
+        region: "eu-central-1".to_string(),
+        session_endpoint: None,
+    };
+    let registry = ExecutorRegistry::new().with_workspace("docker", Arc::new(backend), workspace);
+    let mut ctx = (*seed.context).clone();
+    ctx.compute_handle = Some(Arc::new(registry));
+    let compute_ctx = Arc::new(ctx);
+
+    Ok(Fixture {
+        seed,
+        bearer,
+        compute_ctx,
+        group_id,
+        s3: creds,
+        endpoint,
+        source_bucket,
+    })
+}
+
+fn source_payload() -> Vec<u8> {
+    b"payload-from-source\n".repeat(52_429)
+}
+
+fn execution_spec(
+    fixture: &Fixture,
+    image: &str,
+    entrypoint: Option<Vec<String>>,
+    command: Vec<String>,
+) -> ExecutionSpec {
+    ExecutionSpec {
+        group_id: fixture.group_id,
+        name: None,
+        description: None,
+        tags: Default::default(),
+        image: image.to_string(),
+        entrypoint,
+        command,
+        workdir: None,
+        env: Default::default(),
+        resources: ComputeResources {
+            cpu_cores: Some(1),
+            ram_bytes: Some(512 * 1024 * 1024),
+            disk_bytes: None,
+            max_walltime_ms: Some(120_000),
+            preemptible: false,
+        },
+        executor_constraint: Some("docker".to_string()),
+        backend: None,
+        inputs: vec![InputSelection {
+            source: InputSource::S3 {
+                bucket: fixture.source_bucket.clone(),
+                key: "data.txt".to_string(),
+                version_id: None,
+            },
+            source_node_id: None,
+            dest_key: "inputs/data.txt".to_string(),
+            mode: InputMode::Snapshot,
+            container_path: Some("/inputs/data.txt".to_string()),
+            name: None,
+            description: None,
+        }],
+        file_outputs: Vec::new(),
+        workspace_outputs: Vec::new(),
+        output_prefixes: Vec::new(),
+        collision_policy: Default::default(),
+    }
+}
+
+/// Insert a queued execution job and claim it, returning the claimed record. The
+/// job is inserted already-claimed so the seed node's background drain (which has
+/// no compute backend) never races us for it.
+async fn claim_execution(fixture: &Fixture, spec: ExecutionSpec) -> (JobId, JobRecord) {
+    let ctx = fixture.compute_ctx.as_ref();
+    let node_id = ctx.net_handle.as_ref().unwrap().node_id();
+    let job_id = job_id();
+    let captured_inputs = capture_inputs(ctx, node_id, &spec).await;
+    let mut record = JobRecord::new(
+        job_id,
+        JobPayload::Execution(spec),
+        fixture.seed.user_id,
+        node_id,
+        unix_timestamp_millis(),
+        unix_timestamp_millis(),
+        None,
+    );
+    record.captured_inputs = captured_inputs;
+    drive(row_calls::insert_job(&record), ctx).await.unwrap();
+    let claim = job_calls::claim_job(job_id, node_id, unix_timestamp_millis());
+    let ClaimOutcome::Claimed(claimed) = drive(claim, ctx).await.unwrap() else {
+        panic!("claim failed");
+    };
+    (job_id, claimed)
+}
+
+/// The inputs admission captures before a run is claimed. Outputs inherit
+/// their refs from these, so a hand-built record must carry them too.
+async fn capture_inputs(
+    ctx: &DriverContext,
+    node_id: NodeId,
+    spec: &ExecutionSpec,
+) -> Vec<CapturedInput> {
+    let mut captured = Vec::with_capacity(spec.inputs.len());
+    for input in &spec.inputs {
+        let InputSource::S3 { bucket, key, .. } = &input.source else {
+            panic!("the input names an object");
+        };
+        let head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+            }),
+            ctx,
+        )
+        .await
+        .expect("head succeeds");
+        let location = head.location.as_ref().expect("input is materialized");
+        captured.push(CapturedInput {
+            destination_key: input.dest_key.clone(),
+            source_node_id: node_id,
+            version_id: head
+                .resolved_version_id
+                .or(head.version_id)
+                .expect("input has a version"),
+            content: aruna_core::structs::execution::job::input::InputContent::Blake3(
+                <[u8; 32]>::try_from(
+                    location
+                        .hashes
+                        .get(HASH_BLAKE3)
+                        .expect("blake3 is stored")
+                        .as_slice(),
+                )
+                .expect("blake3 is 32 bytes"),
+            ),
+            bytes: location.blob_size,
+            policies: head.source_policies.clone(),
+            source_group_id: Default::default(),
+            public: false,
+            link: None,
+            source_pin: None,
+            database: None,
+            releases: Vec::new(),
+            releases_complete: false,
+            grant: None,
+            served_by: None,
+        });
+    }
+    captured
+}
+
+/// Waits for `want` on a lost-progress window, not a wall-clock budget: the
+/// supervisor's lease heartbeat ticks `updated_at_ms` while an attempt is alive,
+/// so only a record that stopped advancing fails the wait.
+async fn wait_state(
+    ctx: &DriverContext,
+    job_id: JobId,
+    want: JobState,
+    idle: Duration,
+) -> JobState {
+    // Each window of `idle` ends early on a changed record, so only a stalled job fails.
+    let progress = &std::sync::Mutex::new(None);
+    loop {
+        let seen = poll_until(idle, move || async move {
+            let record = drive(row_calls::read_job_record(job_id), ctx)
+                .await
+                .ok()
+                .flatten();
+            if let Some(record) = &record
+                && (record.state == want || (record.state.is_terminal() && want.is_terminal()))
+            {
+                return Some(Some(record.state));
+            }
+            let observed = record.map(|record| (record.state, record.updated_at_ms));
+            let mut progress = progress.lock().unwrap();
+            if observed == *progress {
+                return None;
+            }
+            *progress = observed;
+            Some(None)
+        })
+        .await;
+        match seen {
+            Some(Some(state)) => return state,
+            Some(None) => {}
+            None => {
+                let state = progress.lock().unwrap().map(|(state, _)| state);
+                panic!("timed out waiting for {want:?}, last state {state:?}");
+            }
+        }
+    }
+}
+
+async fn count_containers(job_id: JobId) -> usize {
+    let output = tokio::process::Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("name=aruna-{}", job_id.to_string().to_lowercase()),
+            "-q",
+        ])
+        .output()
+        .await
+        .expect("docker ps");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count()
+}
+
+async fn wait_run_crate(
+    ctx: &DriverContext,
+    job_id: JobId,
+    timeout: Duration,
+) -> Option<RunCrateStatus> {
+    poll_until(timeout, move || async move {
+        match drive(row_calls::read_crate_status(job_id), ctx).await {
+            Ok(Some(RunCrateStatus::Pending | RunCrateStatus::Minted { .. })) => None,
+            Ok(status) => status,
+            Err(_) => None,
+        }
+    })
+    .await
+}
+
+/// Runs a container that upper-cases the source into `outputs/result.txt`; it must succeed.
+async fn run_upper(fixture: &Fixture) -> JobId {
+    let script = "tr a-z A-Z < /input/input.txt > /output/result.txt";
+    let mut spec = execution_spec(
+        fixture,
+        "busybox:latest",
+        Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+        vec![script.to_string()],
+    );
+    spec.inputs[0].container_path = Some("/input/input.txt".to_string());
+    spec.file_outputs = vec![OutputSelection {
+        container_path: "/output/result.txt".to_string(),
+        path_prefix: None,
+        destination_node_id: Some(fixture.compute_ctx.net_handle.as_ref().unwrap().node_id()),
+        destination: OutputDestination::S3 {
+            bucket: fixture.source_bucket.clone(),
+            key: "outputs/result.txt".to_string(),
+        },
+        name: None,
+        description: None,
+    }];
+    spec.output_prefixes.clear();
+    let (job_id, record) = claim_execution(fixture, spec).await;
+
+    run_execution_job(
+        fixture.compute_ctx.clone(),
+        record,
+        CancellationToken::new(),
+    )
+    .await;
+
+    let state = wait_state(
+        &fixture.compute_ctx,
+        job_id,
+        JobState::Succeeded,
+        Duration::from_secs(180),
+    )
+    .await;
+    if state != JobState::Succeeded {
+        let logs = tokio::process::Command::new("docker")
+            .args([
+                "logs",
+                &format!("aruna-{}-a0", job_id.to_string().to_lowercase()),
+            ])
+            .output()
+            .await
+            .map(|o| {
+                format!(
+                    "STDOUT:\n{}\nSTDERR:\n{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                )
+            })
+            .unwrap_or_default();
+        eprintln!("=== container logs ===\n{logs}");
+    }
+    assert_eq!(state, JobState::Succeeded, "container job must succeed");
+    job_id
+}
+
+// Covers staged input, container output, terminal success, durable output, and run crate.
+// The run must not create a bucket of its own.
+#[tokio::test]
+#[ignore = "requires a running Docker daemon"]
+async fn executes_job() -> TestResult<()> {
+    let backend = shared::docker_backend().await;
+    let fixture = setup(backend).await?;
+    let job_id = run_upper(&fixture).await;
+
+    // The output copied from the container is durable at its declared URL.
+    let client = s3_client(&fixture.endpoint, &fixture.s3);
+    let output = client
+        .get_object()
+        .bucket(&fixture.source_bucket)
+        .key("outputs/result.txt")
+        .send()
+        .await
+        .expect("output object durable at its declared URL");
+    let body = output.body.collect().await.unwrap().into_bytes();
+    let expected = source_payload().to_ascii_uppercase();
+    assert_eq!(body.len(), expected.len(), "output size must match");
+    assert_eq!(&body[..], expected, "output bytes must match");
+
+    // The run crate obligation ran and wrote a crate at runs/{JobId}.
+    let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;
+    eprintln!("run crate status: {crate_status:?}");
+    assert!(
+        matches!(crate_status, Some(RunCrateStatus::Written { .. })),
+        "run crate must be written, got {crate_status:?}"
+    );
+
+    fixture.seed.shutdown().await;
+    Ok(())
+}
+
+/// A GET of an api route with the fixture's token; `None` while it answers 503.
+async fn api_get(fixture: &Fixture, path: &str, query: &[(&str, &str)]) -> Option<Value> {
+    let url = format!("{}/api/v1{path}", fixture.seed.base_url);
+    let url = reqwest::Url::parse_with_params(&url, query).expect("api url");
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(&fixture.bearer)
+        .send()
+        .await
+        .expect("api answers");
+    if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+        return None;
+    }
+    assert!(
+        response.status().is_success(),
+        "{path}: {}",
+        response.status()
+    );
+    Some(response.json().await.expect("json answer"))
+}
+
+/// The exact version id a run crate names for the file at `location`; the values of
+/// `contentUrl` have no order once the crate is stored.
+fn exact_version(run_crate: &Value, location: &str) -> String {
+    let graph = run_crate["@graph"].as_array().expect("crate graph");
+    let urls = |node: &Value| -> Vec<String> {
+        let values = node["contentUrl"].as_array().cloned().unwrap_or_default();
+        values
+            .iter()
+            .filter_map(|value| value.as_str().map(str::to_string))
+            .collect()
+    };
+    let file = graph
+        .iter()
+        .map(urls)
+        .find(|urls| urls.iter().any(|url| url == location))
+        .expect("the crate names the file");
+    file.into_iter()
+        .find(|url| url.contains("arn:aruna:"))
+        .expect("exact id")
+}
+
+// Follows a run's output back to its input through the provenance routes, and exports it.
+#[tokio::test]
+#[ignore = "requires a running Docker daemon"]
+async fn follows_provenance() -> TestResult<()> {
+    let backend = shared::docker_backend().await;
+    let fixture = setup(backend).await?;
+    let job_id = run_upper(&fixture).await;
+    let crate_status = wait_run_crate(&fixture.compute_ctx, job_id, Duration::from_secs(30)).await;
+    assert!(matches!(crate_status, Some(RunCrateStatus::Written { .. })));
+    let bucket = fixture.source_bucket.clone();
+
+    let origin_path = format!("/data/buckets/{bucket}/objects/origin");
+    let key = [("key", "outputs/result.txt")];
+    let output = api_get(&fixture, &origin_path, &key).await.expect("origin");
+    assert_eq!(output["origin"]["kind"], "job");
+    assert_eq!(output["origin"]["run_id"], job_id.to_string());
+    assert!(
+        output["content_id"].is_string(),
+        "stored bytes carry a content id"
+    );
+
+    let run = api_get(&fixture, &format!("/compute/runs/{job_id}"), &[])
+        .await
+        .expect("run");
+    let document = run["run_crate"].as_str().expect("the run names its crate");
+    // The crate graph is read once it is materialized.
+    let (fixture_ref, path) = (&fixture, &format!("/metadata/{document}/rocrate"));
+    let answer = poll_until(Duration::from_secs(60), move || async move {
+        api_get(fixture_ref, path, &[]).await
+    })
+    .await;
+    let run_crate = answer.expect("the run crate never materialized")["rocrate"].clone();
+
+    let input_id = exact_version(&run_crate, &format!("s3://{bucket}/data.txt"));
+    let input = api_get(&fixture, "/data/origin", &[("version", &input_id)])
+        .await
+        .expect("input origin");
+    assert_eq!(input["origin"]["kind"], "upload");
+    let head = drive(
+        HeadObjectOperation::new(HeadObjectInput {
+            bucket: bucket.clone(),
+            key: "data.txt".to_string(),
+            version_id: None,
+        }),
+        fixture.compute_ctx.as_ref(),
+    )
+    .await?;
+    let version = head
+        .resolved_version_id
+        .or(head.version_id)
+        .expect("version");
+    assert_eq!(input["version_id"], version.to_string());
+
+    let output_id = exact_version(&run_crate, &format!("s3://{bucket}/outputs/result.txt"));
+    let url = format!("{}/api/v1/data/provenance/crate", fixture.seed.base_url);
+    let url = reqwest::Url::parse_with_params(&url, [("version", output_id.as_str())])?;
+    let exported = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(&fixture.bearer)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    // Stored ZIP entries carry their names in plain text.
+    let names = String::from_utf8_lossy(&exported);
+    assert!(names.contains(&format!("runs/{job_id}/ro-crate-metadata.json")));
+    assert!(names.contains(&input_id), "the export reaches the input");
+    assert!(names.contains("\"Complete\""), "every hop answered");
+
+    fixture.seed.shutdown().await;
+    Ok(())
+}
+
+// A cancel mid-run terminalizes as Cancelled (evidence-correlated).
+#[tokio::test]
+#[ignore = "requires a running Docker daemon"]
+async fn execution_cancel_terminalizes() -> TestResult<()> {
+    let backend = shared::docker_backend().await;
+    let fixture = setup(backend).await?;
+    let spec = execution_spec(
+        &fixture,
+        "busybox:latest",
+        None,
+        vec!["sh".to_string(), "-c".to_string(), "sleep 120".to_string()],
+    );
+    let (job_id, record) = claim_execution(&fixture, spec).await;
+
+    let cancel = CancellationToken::new();
+    let ctx = fixture.compute_ctx.clone();
+    let handle = tokio::spawn(async move {
+        run_execution_job(ctx, record, cancel).await;
+    });
+
+    // Wait until the container is running, then cancel.
+    wait_state(
+        &fixture.compute_ctx,
+        job_id,
+        JobState::Running,
+        Duration::from_secs(90),
+    )
+    .await;
+    drive(
+        job_calls::set_cancel_requested(job_id, unix_timestamp_millis()),
+        &fixture.compute_ctx,
+    )
+    .await
+    .unwrap();
+
+    let state = wait_state(
+        &fixture.compute_ctx,
+        job_id,
+        JobState::Cancelled,
+        Duration::from_secs(180),
+    )
+    .await;
+    assert_eq!(
+        state,
+        JobState::Cancelled,
+        "cancel must terminalize as Cancelled"
+    );
+    let _ = handle.await;
+
+    fixture.seed.shutdown().await;
+    Ok(())
+}
+
+// A node restart mid-run: the reconciler adopts the running container and does
+// NOT start a second one.
+#[tokio::test]
+#[ignore = "requires a running Docker daemon"]
+async fn execution_restart_adopts() -> TestResult<()> {
+    let backend = shared::docker_backend().await;
+    let fixture = setup(backend).await?;
+    let spec = execution_spec(
+        &fixture,
+        "busybox:latest",
+        None,
+        vec!["sh".to_string(), "-c".to_string(), "sleep 20".to_string()],
+    );
+    let (job_id, record) = claim_execution(&fixture, spec).await;
+
+    // Supervise, then simulate a crash by dropping the supervisor task.
+    let ctx = fixture.compute_ctx.clone();
+    let crashed = tokio::spawn(async move {
+        run_execution_job(ctx, record, CancellationToken::new()).await;
+    });
+    wait_state(
+        &fixture.compute_ctx,
+        job_id,
+        JobState::Running,
+        Duration::from_secs(90),
+    )
+    .await;
+    crashed.abort();
+    let _ = crashed.await;
+    assert_eq!(
+        count_containers(job_id).await,
+        1,
+        "exactly one container before adopt"
+    );
+
+    // Reconciliation receives only jobs with leases expired by the sweep.
+    // Expire the crashed holder's lease to reproduce that admission condition.
+    let expire = job_calls::change_job(job_id, |record| {
+        if let Some(claim) = record.claim.as_mut() {
+            claim.lease_expires_ms = 1;
+        }
+        Ok(JobMutation::Persist)
+    });
+    drive(expire, &fixture.compute_ctx)
+        .await
+        .expect("expire crashed lease");
+
+    // The reconciler adopts the still-running container.
+    let lost = drive(row_calls::read_job_record(job_id), &fixture.compute_ctx)
+        .await
+        .unwrap()
+        .unwrap();
+    let runtime = JobsRuntime::new();
+    reconcile_lost_attempt(&runtime, &fixture.compute_ctx, lost).await;
+
+    // Still exactly one container: no double-run.
+    assert_eq!(
+        count_containers(job_id).await,
+        1,
+        "adoption must not double-run"
+    );
+
+    // The adopted supervision drives it to a terminal success.
+    let state = wait_state(
+        &fixture.compute_ctx,
+        job_id,
+        JobState::Succeeded,
+        Duration::from_secs(90),
+    )
+    .await;
+    assert_eq!(state, JobState::Succeeded);
+
+    fixture.seed.shutdown().await;
+    Ok(())
+}
+
+const NEXTFLOW_WORK: &str = "work/ab/task";
+// Mirrors Nextflow's `.command.run`: run the script in /work and record its exit status.
+const NEXTFLOW_WRAPPER: &str =
+    "cd /work\nsh .command.sh > .command.out 2> .command.err\necho $? > .exitcode\n";
+// Like SEQTK_TRIM and MULTIQC: one glob also matches the staged input, one matches a directory.
+// `results` is a `type: 'dir'` output sent as DIRECTORY; `*.{bam,bai}` is a Java glob.
+const NEXTFLOW_SCRIPT: &str = "cp sample.fastq.gz trimmed.fastq.gz\nmkdir -p report_data/plots\n\
+    echo log > report_data/report.log\necho plot > report_data/plots/a.txt\n\
+    mkdir -p results/deep\necho table > results/deep/t.tsv\n\
+    echo bam > aln.bam\necho bai > aln.bai\n\
+    printf 'SEQTK=1.4\\n/SEQTK/=exit:0\\n' > .command.env\n";
+// What an `eval` output leaves in `.command.env`; no `.command.trace` is written.
+const EVAL_ENV: &str = "SEQTK=1.4\n/SEQTK/=exit:0\n";
+const READS: &str = "@read\nACGT\n+\nIIII\n";
+
+/// The body nf-ga4gh 1.5.0 builds: control files in and out, and every glob under the
+/// task directory with `path_prefix` `/work`. Only `bash` is replaced by `sh`.
+fn nextflow_task(bucket: &str) -> Value {
+    let url = |key: &str| format!("s3://{bucket}/{key}");
+    let work = |name: &str| url(&format!("{NEXTFLOW_WORK}/{name}"));
+    let input = |url: String, path: &str| json!({ "url": url, "path": path, "type": "FILE" });
+    let output =
+        |name: &str| json!({ "url": work(name), "path": format!("/work/{name}"), "type": "FILE" });
+    let pattern = |glob: &str| {
+        json!({
+            "url": url(NEXTFLOW_WORK),
+            "path": format!("/work/{glob}"),
+            "path_prefix": "/work",
+            "type": "FILE"
+        })
+    };
+    json!({
+        "name": "SEQTK_TRIM (sample)",
+        "executors": [{
+            "image": "busybox:latest",
+            "command": [
+                "sh", "-o", "pipefail", "-c",
+                "sh /work/.command.run 2>&1 | tee /work/.command.log"
+            ],
+            "workdir": "/work"
+        }],
+        "inputs": [
+            input(work(".command.sh"), "/work/.command.sh"),
+            input(work(".command.run"), "/work/.command.run"),
+            input(url("work/cd/prev/sample.fastq.gz"), "/work/sample.fastq.gz")
+        ],
+        "outputs": [
+            output(".command.out"),
+            output(".command.err"),
+            output(".command.log"),
+            output(".exitcode"),
+            pattern("*.fastq.gz"),
+            pattern("*_data"),
+            pattern("*.{bam,bai}"),
+            json!({ "url": work("results"), "path": "/work/results", "type": "DIRECTORY" })
+        ],
+        "resources": { "cpu_cores": 1, "ram_gb": 0.25 }
+    })
+}
+
+/// Polls one TES task until its state is terminal, up to a generous hang cap.
+async fn wait_task(client: &reqwest::Client, url: &str, creds: &S3Credentials) -> Value {
+    let ended = poll_until(Duration::from_secs(600), move || async move {
+        let task: Value = client
+            .get(format!("{url}?view=FULL"))
+            .basic_auth(&creds.access_key_id, Some(&creds.access_secret))
+            .send()
+            .await
+            .expect("task read")
+            .json()
+            .await
+            .unwrap_or_default();
+        let state = task["state"].as_str().map(str::to_string);
+        let terminal = matches!(
+            state.as_deref(),
+            Some("COMPLETE" | "EXECUTOR_ERROR" | "SYSTEM_ERROR" | "CANCELED")
+        );
+        terminal.then_some(task)
+    })
+    .await;
+    ended.expect("the task never ended")
+}
+
+async fn read_object(s3: &aws_sdk_s3::Client, bucket: &str, key: String) -> Option<Vec<u8>> {
+    let object = s3.get_object().bucket(bucket).key(key).send().await.ok()?;
+    Some(object.body.collect().await.ok()?.into_bytes().to_vec())
+}
+
+// A Nextflow task through the TES route: a glob keeps the staged input it matches out of the
+// results, and a glob that matches a directory captures every file below it.
+#[tokio::test]
+#[ignore = "requires a running Docker daemon"]
+async fn runs_nextflow_task() -> TestResult<()> {
+    let backend = shared::docker_backend().await;
+    // One absolute cap over setup, every request and the polling keeps a hang under five minutes.
+    tokio::time::timeout(Duration::from_secs(240), check_nextflow_task(backend))
+        .await
+        .map_err(|_| "Nextflow task did not finish within 240 s")?
+}
+
+async fn check_nextflow_task(backend: DockerBackend) -> TestResult<()> {
+    let registry = Arc::new(ExecutorRegistry::new().with_backend("docker", Arc::new(backend)));
+    let seed = spawn_compute_seed(registry).await?;
+    let endpoint = seed.s3.clone().expect("full node exposes S3");
+    let bearer = create_bearer_token(
+        &seed.context,
+        seed.user_id,
+        seed.realm_id,
+        seed.capabilities.clone(),
+    )
+    .await?;
+    let group = create_group_http(&seed.base_url, &bearer, "nextflow-tes").await?;
+    wait_group_http(&seed.base_url, &bearer, &group.group_id).await?;
+    let creds = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
+    let bucket = format!("nf-{}", Ulid::generate().to_string().to_lowercase());
+    let s3 = s3_client(&endpoint, &creds);
+    s3.create_bucket().bucket(&bucket).send().await?;
+    for (key, body) in [
+        (format!("{NEXTFLOW_WORK}/.command.sh"), NEXTFLOW_SCRIPT),
+        (format!("{NEXTFLOW_WORK}/.command.run"), NEXTFLOW_WRAPPER),
+        ("work/cd/prev/sample.fastq.gz".to_string(), READS),
+    ] {
+        s3.put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from(body.as_bytes().to_vec()))
+            .send()
+            .await?;
+    }
+
+    let client = reqwest::Client::new();
+    let tasks = format!("{}/api/v1/ga4gh/tes/v1/tasks", seed.base_url);
+    let created = client
+        .post(&tasks)
+        .basic_auth(&creds.access_key_id, Some(&creds.access_secret))
+        .json(&nextflow_task(&bucket))
+        .send()
+        .await?;
+    let status = created.status();
+    let created: Value = created.json().await?;
+    assert_eq!(status, reqwest::StatusCode::OK, "{created}");
+    let id = created["id"].as_str().expect("task id");
+    let task = wait_task(&client, &format!("{tasks}/{id}"), &creds).await;
+    assert_eq!(task["state"], "COMPLETE", "{task}");
+
+    let read = |name: &str| read_object(&s3, &bucket, format!("{NEXTFLOW_WORK}/{name}"));
+    assert_eq!(read(".exitcode").await.as_deref(), Some(&b"0\n"[..]));
+    assert_eq!(
+        read("trimmed.fastq.gz").await.as_deref(),
+        Some(READS.as_bytes())
+    );
+    assert_eq!(
+        read("sample.fastq.gz").await,
+        None,
+        "staged input written back"
+    );
+    assert_eq!(
+        read("report_data/report.log").await.as_deref(),
+        Some(&b"log\n"[..])
+    );
+    assert_eq!(
+        read("report_data/plots/a.txt").await.as_deref(),
+        Some(&b"plot\n"[..])
+    );
+    assert_eq!(
+        read("results/deep/t.tsv").await.as_deref(),
+        Some(&b"table\n"[..])
+    );
+    assert_eq!(read("aln.bam").await.as_deref(), Some(&b"bam\n"[..]));
+    assert_eq!(read("aln.bai").await.as_deref(), Some(&b"bai\n"[..]));
+    assert_eq!(
+        read(".command.env").await.as_deref(),
+        Some(EVAL_ENV.as_bytes())
+    );
+    assert_eq!(
+        read(".command.trace").await,
+        None,
+        "an absent optional file"
+    );
+
+    seed.shutdown().await;
+    Ok(())
+}

@@ -1,0 +1,30 @@
+# Manifest of aruna-egress, the HTTP and SMTP client backend crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-egress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-core = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+lettre = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+http = { workspace = true }
+iroh = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

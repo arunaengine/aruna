@@ -4,36 +4,36 @@
 
 [workspace]
 members = [
-    "api",
-    "aruna",
-    "config",
-    "blob",
-    "compute",
-    "core",
-    "clock",
-    "graph",
-    "wire",
-    "kpabe",
-    "kpabe/wasm",
-    "storage",
-    "net",
-    "tasks",
-    "ops-identity",
-    "ops-data",
-    "operations",
-    "drivers",
-    "outbound",
-    "test-support",
-    "aruna-doctor",
-    "cli",
-    "plugins",
-    "plugin-types",
+    "apps/node",
+    "apps/doctor",
+    "apps/cli",
+    "apps/registry",
+    "apps/compute-helper",
+    "frontends/api",
+    "frontends/wire",
+    "domain/core",
+    "domain/kpabe",
+    "domain/kpabe/wasm",
+    "domain/plugin-contract",
+    "domain/ops-identity",
+    "domain/ops-data",
+    "domain/ops-work",
+    "runtime/runner",
+    "runtime/clock",
+    "runtime/config",
+    "runtime/storage",
+    "runtime/p2p",
+    "runtime/blob",
+    "runtime/rdf-graph",
+    "runtime/compute",
+    "runtime/scheduler",
+    "runtime/egress",
+    "runtime/wasm-host",
     "plugins/examples/elabftw",
     "plugins/examples/announcer/rust",
     "plugins/fixture",
     "plugins/sdk",
-    "registry",
-    "scripts/compute-helper",
+    "testing/harness",
 ]
 # default-members = ["aruna"]
 resolver = "3"
@@ -48,30 +48,30 @@ rust-version = "1.97.1"
 
 [workspace.dependencies]
 argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "zeroize"] }
-aruna-kpabe = { path = "kpabe" }
+aruna-kpabe = { path = "domain/kpabe" }
 # Workspace crates
-aruna = { path = "aruna" }
-aruna-api = { path = "api" }
-aruna-blob = { path = "blob" }
-aruna-cli = { path = "cli" }
-aruna-compute = { path = "compute", default-features = false }
-aruna-clock = { path = "clock" }
-aruna-config = { path = "config" }
-aruna-core = { path = "core" }
-aruna-graph = { path = "graph" }
-aruna-net = { path = "net" }
-aruna-operations = { path = "operations" }
-aruna-ops-data = { path = "ops-data" }
-aruna-ops-identity = { path = "ops-identity" }
-aruna-drivers = { path = "drivers" }
-aruna-outbound = { path = "outbound" }
+aruna = { path = "apps/node" }
+aruna-api = { path = "frontends/api" }
+aruna-blob = { path = "runtime/blob" }
+aruna-cli = { path = "apps/cli" }
+aruna-compute = { path = "runtime/compute", default-features = false }
+aruna-clock = { path = "runtime/clock" }
+aruna-config = { path = "runtime/config" }
+aruna-core = { path = "domain/core" }
+aruna-rdf-graph = { path = "runtime/rdf-graph" }
+aruna-p2p = { path = "runtime/p2p" }
+aruna-ops-work = { path = "domain/ops-work" }
+aruna-ops-data = { path = "domain/ops-data" }
+aruna-ops-identity = { path = "domain/ops-identity" }
+aruna-runner = { path = "runtime/runner" }
+aruna-egress = { path = "runtime/egress" }
 aruna-plugin = { path = "plugins/sdk" }
-aruna-plugin-types = { path = "plugin-types" }
-aruna-plugins = { path = "plugins", default-features = false }
-aruna-storage = { path = "storage" }
-aruna-tasks = { path = "tasks" }
-aruna-test-support = { path = "test-support" }
-aruna-wire = { path = "wire" }
+aruna-plugin-contract = { path = "domain/plugin-contract" }
+aruna-wasm-host = { path = "runtime/wasm-host", default-features = false }
+aruna-storage = { path = "runtime/storage" }
+aruna-scheduler = { path = "runtime/scheduler" }
+aruna-test-harness = { path = "testing/harness" }
+aruna-wire = { path = "frontends/wire" }
 
 # Third-party crates
 aes-gcm = "0.11.1"

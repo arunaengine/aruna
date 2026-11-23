@@ -1,0 +1,193 @@
+//! Tests that a hand-off to an unreachable node stalls until force-finalize clears it (#400).
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::topology;
+
+use std::collections::BTreeMap;
+
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::id::NodeId;
+use aruna_core::placement::transition::{preview_transition, transition_health};
+use aruna_core::placement::{holds_placement, resolve_shard_holders};
+use aruna_core::structs::identity::realm::RealmNodeKind;
+use aruna_core::structs::placement::record::{NodePlacementEntry, PlacementRef};
+use aruna_core::structs::placement::transition::TransitionLimits;
+use aruna_core::structured_id::StructuredId;
+use aruna_ops_work::metadata::create_document::mint_local_document;
+use aruna_ops_work::realm::mutate_placement::RealmPlacementMutation;
+
+use crate::topology::document_present;
+use topology::{LOCATIONS, NODE_WEIGHT, TestResult, Topology, wait_until};
+
+const MANAGEMENT_NODES: usize = 5;
+const USER_NODES: usize = 1;
+const REPLICATION_FACTOR: u32 = 3;
+const SHARD_COUNT: u32 = 4;
+
+#[tokio::test]
+async fn unreachable_target_stalls() -> TestResult<()> {
+    let mut realm = Topology::spawn_sharded(
+        MANAGEMENT_NODES,
+        USER_NODES,
+        REPLICATION_FACTOR,
+        SHARD_COUNT,
+    )
+    .await?;
+    let group_id = realm.seed_group().await?;
+
+    let path = "datasets/stalled";
+    let origin = realm.leading_node(group_id, path);
+    let document_id = mint_local_document(
+        &realm.config,
+        &realm.actor(origin),
+        group_id,
+        path,
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
+    let placement = realm
+        .create_document(origin, group_id, document_id, path, "stall fixture")
+        .await?;
+    let before = realm.assert_holder(origin.node_id(), &placement);
+    for holder in &before {
+        let node = realm.find(*holder);
+        wait_until("document reaches holder", node.node_id(), || {
+            document_present(node, group_id, document_id)
+        })
+        .await?;
+    }
+
+    // A node the map knows and the realm cannot reach, plus every current holder marked full:
+    // the bucket's target set is the two remaining nodes and the phantom.
+    let phantom = register_phantom(&mut realm).await?;
+    for holder in &before {
+        let mut entry = realm
+            .config
+            .placement_entry(*holder)
+            .cloned()
+            .expect("every management node is mapped");
+        entry.full = true;
+        realm
+            .mutate(0, RealmPlacementMutation::UpsertNode(entry))
+            .await?;
+    }
+    let epoch = realm.publish_map(0).await?;
+    let preview = preview_transition(
+        &realm.config,
+        placement.strategy_id,
+        &[placement.shard],
+        epoch,
+    )?
+    .pop()
+    .expect("the preview covers the requested bucket");
+    assert!(
+        preview.new_holders.contains(&phantom),
+        "the fixture must route the bucket through the unreachable node"
+    );
+    let reachable: Vec<NodeId> = preview
+        .new_holders
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != phantom)
+        .collect();
+    assert!(!reachable.is_empty());
+
+    let transition = realm
+        .start_transition(
+            0,
+            placement.strategy_id,
+            vec![placement.shard],
+            epoch,
+            TransitionLimits {
+                max_incomplete_buckets: 1,
+                grace_ms: 0,
+            },
+        )
+        .await?;
+    let bucket = placement.shard;
+    let expected = reachable.len();
+    realm
+        .await_config("every reachable target proves", move |config| {
+            config
+                .transition(&transition)
+                .is_some_and(|record| record.proofs_for(bucket).count() == expected)
+        })
+        .await?;
+
+    // Every old holder fenced and every reachable target proved, and the bucket
+    // still has not moved: one missing proof is enough to hold it.
+    let record = realm
+        .config
+        .transition(&transition)
+        .expect("the stalled record stays readable");
+    assert!(record.barrier_established(bucket, &preview.old_holders));
+    assert!(record.completion(bucket).is_none());
+    assert_eq!(realm.holders(&placement), before);
+    for view in realm.holder_views(&placement).await? {
+        assert_eq!(view, before, "a node moved the bucket on its own");
+    }
+    for target in &reachable {
+        assert!(!holds_placement(&realm.config, &placement, *target));
+    }
+    assert_eq!(
+        transition_health(&realm.config, unix_timestamp_millis()).incomplete_buckets,
+        1
+    );
+
+    // Force-finalize is the way out, and only because a verified copy exists.
+    realm
+        .mutate(
+            0,
+            RealmPlacementMutation::ForceFinalizeBucket {
+                transition_id: transition,
+                bucket,
+                at_risk_report: "one target never proved".to_string(),
+            },
+        )
+        .await?;
+    realm
+        .await_config("the forced bucket cuts over", move |config| {
+            resolve_shard_holders(
+                config,
+                &PlacementRef {
+                    strategy_id: placement.strategy_id,
+                    shard: bucket,
+                },
+            ) != before
+        })
+        .await?;
+    assert_eq!(realm.holders(&placement), preview.new_holders);
+
+    // No rival genesis: what the reachable targets serve afterwards is the history they pulled
+    // from the old holders, not one they minted to get unstuck - the same document.
+    for target in &reachable {
+        let node = realm.find(*target);
+        wait_until("target serves the pulled history", *target, || {
+            document_present(node, group_id, document_id)
+        })
+        .await?;
+    }
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+/// Adds a node to the realm config that no process backs, so a hand-off routed
+/// through it can never complete.
+async fn register_phantom(realm: &mut Topology) -> TestResult<NodeId> {
+    let phantom = iroh::SecretKey::from_bytes(&[199; 32]).public();
+    let mut config = realm.config.clone();
+    config.ensure_node(phantom, RealmNodeKind::Management);
+    config.placement_map.push(NodePlacementEntry {
+        node_id: phantom,
+        location: LOCATIONS[0].to_string(),
+        weight: NODE_WEIGHT,
+        full: false,
+        draining: false,
+        labels: BTreeMap::new(),
+    });
+    realm.apply_config(config).await?;
+    Ok(phantom)
+}

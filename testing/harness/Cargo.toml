@@ -1,0 +1,38 @@
+# Manifest of aruna-test-harness, the test helpers that drive operations through the runner.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-test-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+aruna-blob = { workspace = true }
+aruna-core = { workspace = true }
+aruna-runner = { workspace = true, features = ["test-hooks"] }
+aruna-rdf-graph = { workspace = true }
+aruna-p2p = { workspace = true }
+aruna-ops-work = { workspace = true, features = ["test-hooks"] }
+aruna-egress = { workspace = true }
+aruna-plugin-contract = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-scheduler = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+ed25519-dalek = { workspace = true }
+iroh = { workspace = true }
+irokle = { workspace = true }
+jsonwebtoken = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+ulid = { workspace = true }

@@ -11,21 +11,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use aruna_plugin_types::calls::{
+use aruna_plugin_contract::calls::{
     Created, Document, Entry, ErrorKind, Field, FilePage, HostError, Intent, Listing,
     Method as Verb, ObjectInfo, ObjectPage, Response,
 };
-use aruna_plugin_types::manifest::SettingKind;
-use aruna_plugin_types::permission::Permission;
-use aruna_plugin_types::trigger::TriggerKind;
-use aruna_plugins::CancellationToken;
-use aruna_plugins::broker::{
+use aruna_plugin_contract::manifest::SettingKind;
+use aruna_plugin_contract::permission::Permission;
+use aruna_plugin_contract::trigger::TriggerKind;
+use aruna_wasm_host::CancellationToken;
+use aruna_wasm_host::broker::{
     Broker, CallContext, FileChange, MetadataCreate, MetadataPatch, SendRequest, StatePut,
 };
-use aruna_plugins::host::wit::aruna::plugin::types::{Trigger, WatchEvent};
-use aruna_plugins::limits::{Limits, RuntimeConfig};
-use aruna_plugins::package::{load_manifest, package};
-use aruna_plugins::runtime::{Compiled, Invocation, Runtime};
+use aruna_wasm_host::host::wit::aruna::plugin::types::{Trigger, WatchEvent};
+use aruna_wasm_host::limits::{Limits, RuntimeConfig};
+use aruna_wasm_host::package::{load_manifest, package};
+use aruna_wasm_host::runtime::{Compiled, Invocation, Runtime};
 use elabftw_sync::host::{Fault, Host, Kind, Method, Request};
 use serde_json::{Value, json};
 use support::{BUCKET, START, World};

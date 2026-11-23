@@ -27,60 +27,71 @@ Inputs (api, node triggers, doctor, cli)
 A timer that fires, a message from a peer node and node startup are inputs too.
 They start an operation in the same way as an HTTP request does.
 
+## Top-level folders
+
+| Folder | Holds |
+| --- | --- |
+| `apps/` | runnable binaries: node, doctor, cli, registry, compute helper |
+| `frontends/` | external client protocols and wire DTOs |
+| `domain/` | pure sans-IO models, crypto, contracts and state machines |
+| `runtime/` | async I/O execution, OS interfaces and effect backends |
+| `plugins/` | plugin SDKs, the shared WIT contract, examples, fixture and templates |
+| `testing/` | test helpers that only dev-dependencies use |
+
 ## Crates by layer
 
 | Layer | Crate | Owns |
 | --- | --- | --- |
-| Inputs | `api`, `wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
-| Inputs | `aruna`, `config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
-| Inputs | `aruna-doctor`, `cli`, `registry` | operator tool on a stopped node; user client; standalone identifier registry |
-| Operations | `ops-identity`, `ops-data`, `operations` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-operations` facade + triggers) |
-| Drivers | `drivers` (`aruna-drivers`) | the drive loop, effect routing to the backends and the job runtime |
-| Backends | `storage`, `net`, `blob`, `graph`, `tasks`, `compute`, `outbound`, `plugins` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host |
-| Foundations | `core`, `kpabe`, `plugin-types` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers, plugin manifests/recipes |
-| Foundations | `clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
-| Tests | `test-support` (`aruna-test-support`) | test helpers that drive operations through the drivers; only dev-dependencies use it |
+| Inputs | `frontends/api`, `frontends/wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
+| Inputs | `apps/node`, `runtime/config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
+| Inputs | `apps/doctor`, `apps/cli`, `apps/registry` | operator tool on a stopped node; user client; standalone identifier registry |
+| Operations | `domain/ops-identity`, `domain/ops-data`, `domain/ops-work` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-ops-work` facade + triggers) |
+| Drivers | `runtime/runner` (`aruna-runner`) | the drive loop, effect routing to the backends and the job runtime |
+| Backends | `runtime/storage`, `runtime/p2p`, `runtime/blob`, `runtime/rdf-graph`, `runtime/scheduler`, `runtime/compute`, `runtime/egress`, `runtime/wasm-host` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host |
+| Foundations | `domain/core`, `domain/kpabe`, `domain/plugin-contract` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers, plugin manifests/recipes |
+| Foundations | `runtime/clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
+| Tests | `testing/harness` (`aruna-test-harness`) | test helpers that drive operations through the drivers; only dev-dependencies use it |
 
-`operations` holds only synchronous sans-IO state machines and the trigger tables
-(`operations/src/triggers.rs`). The small number of remaining unconverted timer
-and peer arms live in the `aruna` trigger shells (`aruna/src/tasks/incoming/mod.rs`
-and `aruna/src/inbound.rs`) and are tracked by `scripts/dev/layers_baseline.json`.
-Do not add new async services to `operations`.
+`domain/ops-work` holds only synchronous sans-IO state machines and the trigger tables
+(`domain/ops-work/src/triggers.rs`). The small number of remaining unconverted timer
+and peer arms live in the `apps/node` trigger shells (`apps/node/src/tasks/incoming/mod.rs`
+and `apps/node/src/inbound.rs`) and are tracked by `scripts/dev/layers_baseline.json`.
+Do not add new async services to `domain/ops-work`.
 
 ## Call flows
 
-- **External request.** The `api` handler checks the input and builds the
-  operation. `aruna_drivers::driver::drive` wraps it in `CallRun`, calls `first`,
+- **External request.** The `frontends/api` handler checks the input and builds the
+  operation. `aruna_runner::driver::drive` wraps it in `CallRun`, calls `first`,
   sends each effect to its backend, calls `next` with the answering result, and
   returns the output or error. The handler maps the result to a response.
-- **Timer.** `tasks` fires a timer key. The shell in
-  `aruna/src/tasks/incoming/mod.rs` looks up `timer_operation` in
-  `operations/src/triggers.rs` and drives it; a queue drain handles one page per
+- **Timer.** `runtime/scheduler` fires a timer key. The shell in
+  `apps/node/src/tasks/incoming/mod.rs` looks up `timer_operation` in
+  `domain/ops-work/src/triggers.rs` and drives it; a queue drain handles one page per
   run and returns its next schedule plan.
-- **Peer message.** `net` receives a request or a document update. The shell in
-  `aruna/src/inbound.rs` looks up `peer_operation` in
-  `operations/src/triggers.rs`, drives it, and writes the answer back on the stream.
+- **Peer message.** `runtime/p2p` receives a request or a document update. The shell in
+  `apps/node/src/inbound.rs` looks up `peer_operation` in
+  `domain/ops-work/src/triggers.rs`, drives it, and writes the answer back on the stream.
 - **Sub-operation.** An operation emits a sub-operation effect, the drivers run
   the child operation and return its result as an event.
-- **Startup.** `aruna` builds the backends and the drivers, then runs the
+- **Startup.** `apps/node` builds the backends and the drivers, then runs the
   startup phases (see Node lifecycle).
 
 ## What goes where
 
 | Kind of code | Home |
 | --- | --- |
-| Domain type, stored record format, key layout | `core`, in the module of its domain |
-| Effect and event types | `core/src/effects.rs`, `core/src/events.rs` |
-| A decision, a rule, a check of an event against the state | an operation in `operations` |
+| Domain type, stored record format, key layout | `domain/core`, in the module of its domain |
+| Effect and event types | `domain/core/src/effects.rs`, `domain/core/src/events.rs` |
+| A decision, a rule, a check of an event against the state | an operation in `domain/ops-work` |
 | A use case with several steps | an operation built from sub-operations |
 | Retry after a transaction conflict | one rule in the drivers |
 | Background work, queue drains, repair sweeps | a timer trigger and an operation per page |
 | Cache, connection pool, concurrency limit | the backend that owns the resource |
-| Transport checks, auth, error mapping, OpenAPI | `api` |
-| Settings parsing and wiring | `aruna` |
-| Shutdown coordination | `tasks` |
+| Transport checks, auth, error mapping, OpenAPI | `frontends/api` |
+| Settings parsing and wiring | `apps/node` |
+| Shutdown coordination | `runtime/scheduler` |
 
-Inside `operations`, domains form three groups. A domain may use its own group
+Inside `domain/ops-work`, domains form three groups. A domain may use its own group
 and lower groups, and never forms a cycle inside its group:
 
 1. Identity and realm: realm, auth, users, groups, session, device, onboarding,
@@ -106,25 +117,25 @@ the same change.
 ## Where new files live
 
 - bucket, object, multipart and access operations:
-  `operations/src/s3/{bucket,object,multipart,access}/`;
-- routes: `api/src/routes/{execution,access,storage}/`; other route domains
-  stay flat under `api/src/routes/`;
-- persisted records: `core/src/structs/{placement,identity,storage,execution}/`;
-- effect adapters: `drivers/src/effect_adapters/`;
+  `domain/ops-work/src/s3/{bucket,object,multipart,access}/`;
+- routes: `frontends/api/src/routes/{execution,access,storage}/`; other route domains
+  stay flat under `frontends/api/src/routes/`;
+- persisted records: `domain/core/src/structs/{placement,identity,storage,execution}/`;
+- effect adapters: `runtime/runner/src/effect_adapters/`;
 - test helpers: in a `src/tests/` folder beside the domain when the helper
   family qualifies under the folder threshold, otherwise a hoisted sibling file
-  declared with an explicit `#[path]` (`aruna/src/bootstrap_tests.rs`);
-- shared integration test fixtures of `operations`: `operations/tests/topology/`
-  (realm nodes, realm config, loopback net) and `operations/tests/convergence/`
+  declared with an explicit `#[path]` (`apps/node/src/bootstrap_tests.rs`);
+- shared integration test fixtures of `domain/ops-work`: `domain/ops-work/tests/topology/`
+  (realm nodes, realm config, loopback net) and `domain/ops-work/tests/convergence/`
   (progress waits and hang caps);
 - raw fixture assets: the owning crate's `tests/fixtures/`.
 
 ## Add an operation
 
 1. Define the input, output, error and a private state enum in
-   `operations/src/<area>/<verb>.rs`. Keep `Output` one domain value; failure
+   `domain/ops-work/src/<area>/<verb>.rs`. Keep `Output` one domain value; failure
    belongs in the error type.
-2. Implement `Operation` (`core/src/operation.rs`): `first`, `next`, and as
+2. Implement `Operation` (`domain/core/src/operation.rs`): `first`, `next`, and as
    needed `transaction`, `hold_scope`, `abort`, `stamp`, `seed`, `on_conflict`,
    and `expected_error` for ordinary client outcomes such as not found. `next`
    rejects any result that does not fit the current state.
@@ -136,49 +147,49 @@ the same change.
 
 ## Add a REST route or MCP tool
 
-1. Put a REST handler in `api/src/routes/<domain>/<feature>.rs` for the
+1. Put a REST handler in `frontends/api/src/routes/<domain>/<feature>.rs` for the
    execution, access and storage domains (other domains stay flat) and register
    it in that module's `router()` with a `#[utoipa::path]` attribute.
-   `api/src/routes/mod.rs::rest_api` merges the routers, so the runtime router
+   `frontends/api/src/routes/mod.rs::rest_api` merges the routers, so the runtime router
    and the OpenAPI document cannot diverge.
-2. Put an MCP tool in `api/src/mcp/<area>.rs` and register the area router in
-   `api/src/mcp/mod.rs::router`. Reuse the operation call of the REST route.
+2. Put an MCP tool in `frontends/api/src/mcp/<area>.rs` and register the area router in
+   `frontends/api/src/mcp/mod.rs::router`. Reuse the operation call of the REST route.
 3. Map operation errors to responses explicitly. Test allowed, denied and
    public cases and the error shape.
 
 ## Add a background queue or timer
 
-1. Add the `TaskKey` variant in `core/src/task.rs`; stored keys keep their
+1. Add the `TaskKey` variant in `domain/core/src/task.rs`; stored keys keep their
    bytes, so new variants are appended.
-2. Wire the timer operation in `operations/src/triggers.rs` (`timer_operation`)
-   so `aruna/src/tasks/incoming/mod.rs` drives it without adding a new trigger
+2. Wire the timer operation in `domain/ops-work/src/triggers.rs` (`timer_operation`)
+   so `apps/node/src/tasks/incoming/mod.rs` drives it without adding a new trigger
    arm. Write the work itself as an operation that handles one page and returns
    its `TimerPlan`.
-3. Production startup starts queues in `aruna/src/startup/background.rs`
+3. Production startup starts queues in `apps/node/src/startup/background.rs`
    (`STARTUP_PHASES`).
 4. Test the due and not-due decision with explicit times.
 
 ## Add a compute backend
 
-1. Implement `ExecutorBackend` in `compute/src/executor/<backend>.rs`.
-2. Add the typed settings to `aruna/src/compute_setup/mod.rs`, read them in
-   `aruna/src/compute_setup/settings.rs::collect` and build the registry in
-   `aruna/src/compute_setup/<backend>.rs`.
-3. Add the feature to `compute/Cargo.toml` and `aruna/Cargo.toml` and check
+1. Implement `ExecutorBackend` in `runtime/compute/src/executor/<backend>.rs`.
+2. Add the typed settings to `apps/node/src/compute_setup/mod.rs`, read them in
+   `apps/node/src/compute_setup/settings.rs::collect` and build the registry in
+   `apps/node/src/compute_setup/<backend>.rs`.
+3. Add the feature to `runtime/compute/Cargo.toml` and `apps/node/Cargo.toml` and check
    every selection as `just check` does.
 
 ## Add a persisted record
 
-1. Add the keyspace constant in `core/src/keyspaces.rs` and the record type
+1. Add the keyspace constant in `domain/core/src/keyspaces.rs` and the record type
    with `to_bytes` and `from_bytes` in the matching family under
-   `core/src/structs/`.
+   `domain/core/src/structs/`.
 2. Never change an existing encoding silently.
 3. Test round trips and malformed bytes at the record boundary, and one real
    temporary-storage persistence test.
 
 ## Node lifecycle
 
-`aruna/src/main.rs` starts the Tokio runtime and calls
+`apps/node/src/main.rs` starts the Tokio runtime and calls
 `aruna::application::run_node`, which runs in order:
 
 1. `startup::resources::acquire` opens storage, resolves identity, enrollment
@@ -195,16 +206,16 @@ the same change.
 ## Tests, measurements and commands
 
 - `just test-fast` runs the no-I/O `state_machine_tests`, `pure_tests` and
-  `decision_tests` modules of `aruna-core` and `aruna-operations`. Cargo still
+  `decision_tests` modules of `aruna-core` and `aruna-ops-work`. Cargo still
   compiles both packages and their dependencies.
 - Runtime, storage and multi-node behavior lives in ordinary test modules,
-  `operations/tests` and `aruna/tests`. Tests wait on progress with a hang cap
+  `domain/ops-work/tests` and `apps/node/tests`. Tests wait on progress with a hang cap
   and assert no speed.
 - Speed is measured on request with
   `cargo run --release -p aruna --example measure`, which prints
   rates for fixed workloads on real backends in temporary folders. Peak memory
   is read with `/usr/bin/time -v` around the built binary.
-- `core/tests/type_sizes.rs` fixes upper limits for the sizes of `Effect`,
+- `domain/core/tests/type_sizes.rs` fixes upper limits for the sizes of `Effect`,
   `Event` and `Effects`; a change may lower them.
 - Full local gate: `just lint`, `just check`, `just test` (see
   `CONTRIBUTING.md`). CI runs the full matrix after a pull request is opened.

@@ -327,17 +327,17 @@ dependencies = [
  "aruna-compute",
  "aruna-config",
  "aruna-core",
- "aruna-drivers",
- "aruna-graph",
+ "aruna-egress",
  "aruna-kpabe",
- "aruna-net",
- "aruna-operations",
- "aruna-outbound",
- "aruna-plugin-types",
- "aruna-plugins",
+ "aruna-ops-work",
+ "aruna-p2p",
+ "aruna-plugin-contract",
+ "aruna-rdf-graph",
+ "aruna-runner",
+ "aruna-scheduler",
  "aruna-storage",
- "aruna-tasks",
- "aruna-test-support",
+ "aruna-test-harness",
+ "aruna-wasm-host",
  "aruna-wire",
  "astral_async_zip",
  "async-trait",
@@ -401,13 +401,13 @@ dependencies = [
  "aruna-clock",
  "aruna-compute",
  "aruna-core",
- "aruna-drivers",
- "aruna-graph",
- "aruna-net",
- "aruna-operations",
+ "aruna-ops-work",
+ "aruna-p2p",
+ "aruna-rdf-graph",
+ "aruna-runner",
+ "aruna-scheduler",
  "aruna-storage",
- "aruna-tasks",
- "aruna-test-support",
+ "aruna-test-harness",
  "aruna-wire",
  "astral_async_zip",
  "async-trait",
@@ -473,7 +473,7 @@ dependencies = [
  "aruna-clock",
  "aruna-core",
  "aruna-kpabe",
- "aruna-net",
+ "aruna-p2p",
  "aruna-storage",
  "astral_async_zip",
  "async-compression",
@@ -524,8 +524,8 @@ name = "aruna-cli"
 version = "3.0.0-alpha.208"
 dependencies = [
  "apple-native-keyring-store",
- "aruna-plugin-types",
- "aruna-plugins",
+ "aruna-plugin-contract",
+ "aruna-wasm-host",
  "aruna-wire",
  "aws-sdk-s3",
  "base64 0.23.1",
@@ -607,7 +607,7 @@ version = "3.0.0-alpha.208"
 dependencies = [
  "aruna-clock",
  "aruna-core",
- "aruna-net",
+ "aruna-p2p",
  "aruna-storage",
  "aruna-wire",
  "base64 0.23.1",
@@ -706,12 +706,12 @@ dependencies = [
  "aruna-clock",
  "aruna-config",
  "aruna-core",
- "aruna-drivers",
- "aruna-net",
- "aruna-operations",
+ "aruna-ops-work",
+ "aruna-p2p",
+ "aruna-runner",
+ "aruna-scheduler",
  "aruna-storage",
- "aruna-tasks",
- "aruna-test-support",
+ "aruna-test-harness",
  "aruna-wire",
  "async-trait",
  "axum",
@@ -745,58 +745,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "aruna-drivers"
+name = "aruna-egress"
 version = "3.0.0-alpha.208"
 dependencies = [
- "aruna-blob",
- "aruna-clock",
- "aruna-compute",
  "aruna-core",
- "aruna-graph",
- "aruna-net",
- "aruna-outbound",
- "aruna-plugins",
- "aruna-storage",
- "aruna-tasks",
  "async-trait",
  "bytes",
- "byteview",
- "chacha20poly1305",
- "craqle",
  "futures-util",
- "hex",
+ "http",
  "iroh",
- "irokle",
- "postcard",
- "rand 0.10.4",
+ "lettre",
+ "reqwest 0.13.5",
  "serde",
- "smallvec",
- "sysinfo",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
- "ulid 3.0.0",
-]
-
-[[package]]
-name = "aruna-graph"
-version = "3.0.0-alpha.208"
-dependencies = [
- "aruna-core",
- "chrono",
- "craqle",
- "fjall",
- "futures-util",
- "iroh",
- "irokle",
- "lru 0.19.1",
- "oxrdf",
- "oxttl",
  "serde_json",
- "spareval",
- "spargebra",
- "tempfile",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "ulid 3.0.0",
@@ -833,106 +795,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "aruna-net"
-version = "3.0.0-alpha.208"
-dependencies = [
- "aruna-clock",
- "aruna-core",
- "aruna-storage",
- "async-trait",
- "blake3",
- "byteview",
- "crossfire",
- "fjall",
- "futures",
- "governor",
- "iroh",
- "irokle",
- "lru 0.19.1",
- "parking_lot 0.13.0",
- "postcard",
- "serde",
- "smallvec",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-opentelemetry",
- "ulid 3.0.0",
-]
-
-[[package]]
-name = "aruna-operations"
-version = "3.0.0-alpha.208"
-dependencies = [
- "aruna-blob",
- "aruna-compute",
- "aruna-core",
- "aruna-drivers",
- "aruna-graph",
- "aruna-net",
- "aruna-operations",
- "aruna-ops-data",
- "aruna-ops-identity",
- "aruna-outbound",
- "aruna-plugin-types",
- "aruna-storage",
- "aruna-tasks",
- "aruna-test-support",
- "astral_async_zip",
- "async-trait",
- "axum",
- "base64 0.23.1",
- "blake3",
- "bytes",
- "byteview",
- "chrono",
- "craqle",
- "ed25519-dalek",
- "futures-util",
- "globset",
- "hex",
- "http",
- "iroh",
- "irokle",
- "md5",
- "oxrdf",
- "oxttl",
- "percent-encoding",
- "postcard",
- "proptest",
- "quick-xml 0.42.0",
- "rand 0.10.4",
- "reqwest 0.13.5",
- "schemars",
- "serde",
- "serde_json",
- "spareval",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
- "ulid 3.0.0",
- "url",
- "zip",
-]
-
-[[package]]
 name = "aruna-ops-data"
 version = "3.0.0-alpha.208"
 dependencies = [
  "aruna-blob",
  "aruna-core",
- "aruna-drivers",
- "aruna-graph",
- "aruna-net",
- "aruna-operations",
  "aruna-ops-identity",
+ "aruna-ops-work",
+ "aruna-p2p",
+ "aruna-rdf-graph",
+ "aruna-runner",
+ "aruna-scheduler",
  "aruna-storage",
- "aruna-tasks",
- "aruna-test-support",
+ "aruna-test-harness",
  "async-trait",
  "axum",
  "base64 0.23.1",
@@ -973,13 +848,13 @@ name = "aruna-ops-identity"
 version = "3.0.0-alpha.208"
 dependencies = [
  "aruna-core",
- "aruna-drivers",
- "aruna-net",
  "aruna-ops-data",
- "aruna-plugin-types",
+ "aruna-p2p",
+ "aruna-plugin-contract",
+ "aruna-runner",
+ "aruna-scheduler",
  "aruna-storage",
- "aruna-tasks",
- "aruna-test-support",
+ "aruna-test-harness",
  "async-trait",
  "base64 0.23.1",
  "blake3",
@@ -1005,22 +880,89 @@ dependencies = [
 ]
 
 [[package]]
-name = "aruna-outbound"
+name = "aruna-ops-work"
 version = "3.0.0-alpha.208"
 dependencies = [
+ "aruna-blob",
+ "aruna-compute",
  "aruna-core",
+ "aruna-egress",
+ "aruna-ops-data",
+ "aruna-ops-identity",
+ "aruna-ops-work",
+ "aruna-p2p",
+ "aruna-plugin-contract",
+ "aruna-rdf-graph",
+ "aruna-runner",
+ "aruna-scheduler",
+ "aruna-storage",
+ "aruna-test-harness",
+ "astral_async_zip",
  "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "blake3",
  "bytes",
+ "byteview",
+ "chrono",
+ "craqle",
+ "ed25519-dalek",
  "futures-util",
+ "globset",
+ "hex",
  "http",
  "iroh",
- "lettre",
+ "irokle",
+ "md5",
+ "oxrdf",
+ "oxttl",
+ "percent-encoding",
+ "postcard",
+ "proptest",
+ "quick-xml 0.42.0",
+ "rand 0.10.4",
  "reqwest 0.13.5",
+ "schemars",
  "serde",
  "serde_json",
+ "spareval",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "tracing",
+ "ulid 3.0.0",
+ "url",
+ "zip",
+]
+
+[[package]]
+name = "aruna-p2p"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "aruna-clock",
+ "aruna-core",
+ "aruna-storage",
+ "async-trait",
+ "blake3",
+ "byteview",
+ "crossfire",
+ "fjall",
+ "futures",
+ "governor",
+ "iroh",
+ "irokle",
+ "lru 0.19.1",
+ "parking_lot 0.13.0",
+ "postcard",
+ "serde",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-opentelemetry",
  "ulid 3.0.0",
 ]
 
@@ -1028,23 +970,14 @@ dependencies = [
 name = "aruna-plugin"
 version = "3.0.0-alpha.208"
 dependencies = [
- "aruna-plugin-types",
+ "aruna-plugin-contract",
  "serde",
  "serde_json",
  "wit-bindgen 0.63.0",
 ]
 
 [[package]]
-name = "aruna-plugin-fixture"
-version = "3.0.0-alpha.208"
-dependencies = [
- "aruna-plugin",
- "serde_json",
- "wit-bindgen 0.63.0",
-]
-
-[[package]]
-name = "aruna-plugin-types"
+name = "aruna-plugin-contract"
 version = "3.0.0-alpha.208"
 dependencies = [
  "hex",
@@ -1060,33 +993,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "aruna-plugins"
+name = "aruna-plugin-fixture"
 version = "3.0.0-alpha.208"
 dependencies = [
- "aruna-plugin-types",
- "async-trait",
- "bytes",
- "getrandom 0.4.3",
- "lru 0.19.1",
- "rustix",
- "serde",
+ "aruna-plugin",
  "serde_json",
+ "wit-bindgen 0.63.0",
+]
+
+[[package]]
+name = "aruna-rdf-graph"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "aruna-core",
+ "chrono",
+ "craqle",
+ "fjall",
+ "futures-util",
+ "iroh",
+ "irokle",
+ "lru 0.19.1",
+ "oxrdf",
+ "oxttl",
+ "serde_json",
+ "spareval",
+ "spargebra",
  "tempfile",
- "thiserror 2.0.21",
  "tokio",
- "tokio-util",
- "toml 1.2.2+spec-1.1.0",
  "tracing",
  "ulid 3.0.0",
- "url",
- "wasm-encoder 0.263.0",
- "wasmparser 0.263.0",
- "wasmtime",
- "wasmtime-wasi",
- "wasmtime-wasi-io",
- "wit-component 0.263.0",
- "wit-parser 0.263.0",
- "zeroize",
 ]
 
 [[package]]
@@ -1121,6 +1056,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "aruna-runner"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "aruna-blob",
+ "aruna-clock",
+ "aruna-compute",
+ "aruna-core",
+ "aruna-egress",
+ "aruna-p2p",
+ "aruna-rdf-graph",
+ "aruna-scheduler",
+ "aruna-storage",
+ "aruna-wasm-host",
+ "async-trait",
+ "bytes",
+ "byteview",
+ "chacha20poly1305",
+ "craqle",
+ "futures-util",
+ "hex",
+ "iroh",
+ "irokle",
+ "postcard",
+ "rand 0.10.4",
+ "serde",
+ "smallvec",
+ "sysinfo",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ulid 3.0.0",
+]
+
+[[package]]
+name = "aruna-scheduler"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "aruna-core",
+ "async-trait",
+ "futures-util",
+ "iroh",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "aruna-storage"
 version = "3.0.0-alpha.208"
 dependencies = [
@@ -1145,33 +1129,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "aruna-tasks"
-version = "3.0.0-alpha.208"
-dependencies = [
- "aruna-core",
- "async-trait",
- "futures-util",
- "iroh",
- "tempfile",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "aruna-test-support"
+name = "aruna-test-harness"
 version = "3.0.0-alpha.208"
 dependencies = [
  "aruna-blob",
  "aruna-core",
- "aruna-drivers",
- "aruna-graph",
- "aruna-net",
- "aruna-operations",
- "aruna-outbound",
- "aruna-plugin-types",
+ "aruna-egress",
+ "aruna-ops-work",
+ "aruna-p2p",
+ "aruna-plugin-contract",
+ "aruna-rdf-graph",
+ "aruna-runner",
+ "aruna-scheduler",
  "aruna-storage",
- "aruna-tasks",
  "axum",
  "bytes",
  "chrono",
@@ -1186,6 +1156,36 @@ dependencies = [
  "tokio",
  "tokio-util",
  "ulid 3.0.0",
+]
+
+[[package]]
+name = "aruna-wasm-host"
+version = "3.0.0-alpha.208"
+dependencies = [
+ "aruna-plugin-contract",
+ "async-trait",
+ "bytes",
+ "getrandom 0.4.3",
+ "lru 0.19.1",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "toml 1.2.2+spec-1.1.0",
+ "tracing",
+ "ulid 3.0.0",
+ "url",
+ "wasm-encoder 0.263.0",
+ "wasmparser 0.263.0",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-io",
+ "wit-component 0.263.0",
+ "wit-parser 0.263.0",
+ "zeroize",
 ]
 
 [[package]]
@@ -3602,8 +3602,8 @@ name = "elabftw-sync"
 version = "0.1.0"
 dependencies = [
  "aruna-plugin",
- "aruna-plugin-types",
- "aruna-plugins",
+ "aruna-plugin-contract",
+ "aruna-wasm-host",
  "async-trait",
  "hex",
  "html5ever",

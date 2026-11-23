@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use aruna_plugin_types::calls::merge_into;
+use aruna_plugin_contract::calls::merge_into;
 use serde_json::{Map, Value};
 
 use crate::Level;

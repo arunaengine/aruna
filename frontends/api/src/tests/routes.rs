@@ -1,0 +1,203 @@
+//! Builds route test fixtures: temporary storage, state, seeded documents and requests sent
+//! through a route's router.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::ValidatedBearer;
+use crate::server::state::ServerState;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::identity::realm::{
+    RealmAuthorizationDocument, RealmConfigDocument, RealmId,
+};
+use aruna_core::user::id::UserId;
+use aruna_runner::driver::DriverContext;
+use aruna_runner::jobs::runtime::JobsRuntime;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::{Extension, Router};
+use byteview::ByteView;
+use std::sync::Arc;
+use tempfile::TempDir;
+use tower::ServiceExt;
+use ulid::Ulid;
+use utoipa_axum::router::OpenApiRouter;
+
+pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
+    (directory, storage)
+}
+
+pub(crate) async fn test_state(
+    context: Arc<DriverContext>,
+    realm_id: RealmId,
+    node_id: NodeId,
+    capabilities: NodeCapabilities,
+) -> ServerState {
+    ServerState::new(
+        context,
+        realm_id,
+        node_id,
+        capabilities,
+        false,
+        None,
+        JobsRuntime::new(),
+    )
+    .await
+}
+
+pub(crate) async fn write_doc(
+    context: &Arc<DriverContext>,
+    key_space: &str,
+    key: ByteView,
+    value: ByteView,
+) {
+    let event = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Write {
+            key_space: key_space.to_string(),
+            key,
+            value,
+            txn_id: None,
+        })
+        .await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+}
+
+/// Writes one row through the storage of `state`; panics on any other answer.
+pub(crate) async fn write_fixture(
+    state: &ServerState,
+    key_space: &str,
+    key: ByteView,
+    value: ByteView,
+) {
+    write_doc(&state.get_ctx(), key_space, key, value).await;
+}
+
+pub(crate) async fn seed_realm_auth(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    actor: &Actor,
+) {
+    write_doc(
+        context,
+        AUTH_KEYSPACE,
+        (*realm_id.as_bytes()).into(),
+        RealmAuthorizationDocument::default_realm_doc(realm_id)
+            .to_bytes(actor)
+            .unwrap()
+            .into(),
+    )
+    .await;
+}
+
+pub(crate) async fn seed_realm_config(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    actor: &Actor,
+) {
+    write_doc(
+        context,
+        REALM_CONFIG_KEYSPACE,
+        (*realm_id.as_bytes()).into(),
+        RealmConfigDocument::default_for_realm(realm_id, Vec::new())
+            .to_bytes(actor)
+            .unwrap()
+            .into(),
+    )
+    .await;
+}
+
+pub(crate) async fn seed_group_docs(
+    context: &Arc<DriverContext>,
+    realm_id: RealmId,
+    actor: &Actor,
+    group_id: Ulid,
+    display_name: &str,
+    owner: UserId,
+) {
+    let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    let group = Group {
+        display_name: display_name.to_string(),
+        group_id,
+        realm_id,
+        roles: group_auth.roles.keys().copied().collect(),
+        owner,
+    };
+    write_doc(
+        context,
+        AUTH_KEYSPACE,
+        group_id.to_bytes().into(),
+        group_auth.to_bytes(actor).unwrap().into(),
+    )
+    .await;
+    write_doc(
+        context,
+        GROUP_KEYSPACE,
+        group_id.to_bytes().into(),
+        group.to_bytes(actor).unwrap().into(),
+    )
+    .await;
+}
+
+/// Rewrites the group's authorization with one more role that lets Everyone READ `paths`.
+pub(crate) async fn open_paths(
+    context: &Arc<DriverContext>,
+    actor: &Actor,
+    group_id: Ulid,
+    paths: &[String],
+) {
+    use aruna_core::structs::identity::auth::{Permission, Role};
+    let (realm_id, owner) = (actor.realm_id, actor.user_id);
+    let mut document = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+    let role_id = Ulid::from_parts(7, 7);
+    let permissions = paths.iter().map(|path| (path.clone(), Permission::READ));
+    let role = Role {
+        role_id,
+        name: "public".to_string(),
+        permissions: permissions.collect(),
+        assigned_users: std::collections::HashSet::from([UserId::nil(realm_id)]),
+    };
+    document.roles.insert(role_id, role);
+    let value = document.to_bytes(actor).unwrap();
+    write_doc(
+        context,
+        AUTH_KEYSPACE,
+        group_id.to_bytes().into(),
+        value.into(),
+    )
+    .await;
+}
+
+/// Sends a JSON request through `router` with `auth` and no bearer, as the auth middleware does.
+pub(crate) async fn send_json(
+    router: OpenApiRouter<Arc<ServerState>>,
+    state: Arc<ServerState>,
+    auth: Option<AuthContext>,
+    (method, uri, body): (&str, &str, &'static str),
+) -> StatusCode {
+    let (router, _): (Router<Arc<ServerState>>, _) = router.split_for_parts();
+    let request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("a valid request");
+    // The middleware always stores both values, also when the request carries no token.
+    let router = router
+        .layer(Extension(auth))
+        .layer(Extension(Option::<ValidatedBearer>::None))
+        .with_state(state);
+    router.oneshot(request).await.expect("an answer").status()
+}

@@ -1,0 +1,51 @@
+# Manifest of aruna-config: the node configuration, settings and identity the inputs share.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-clock = { workspace = true }
+aruna-core = { workspace = true }
+aruna-p2p = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-wire = { workspace = true }
+irokle = { workspace = true }
+base64 = { workspace = true }
+byteview = { workspace = true }
+chrono = { workspace = true }
+crypto_box = { workspace = true }
+dotenvy = { workspace = true }
+ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }
+hex = { workspace = true }
+ipnet = { workspace = true }
+iroh = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(not(windows))'.dependencies]
+rustix = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+[dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

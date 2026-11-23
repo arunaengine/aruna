@@ -1,0 +1,649 @@
+//! Tests changes of an active install: grants, updates, pause and resume, removal, recovery of
+//! a failed change, and the rights an updating caller must hold.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::plugins::account::{AccountChange, EnsureRole, Teardown};
+use crate::plugins::calls::*;
+use crate::plugins::grants::role_paths;
+use crate::plugins::test_support::{group_role, install_as, install_request};
+use aruna_core::structs::identity::admin_audit::AuditIndex;
+use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access};
+use aruna_core::time::unix_timestamp_secs;
+use aruna_core::user::id::UserId;
+use aruna_ops_identity::users::account_status::{AccountStatusConfig, AccountStatusOperation};
+use aruna_ops_identity::users::admin_audit::{AuditPageInput, AuditPageOperation};
+use aruna_runner::driver::drive;
+use aruna_test_harness::plugins::Fixture;
+use serde_json::json;
+
+fn needs_write() -> Value {
+    json!({ "permissions": { "required": ["metadata.read", "metadata.write"] } })
+}
+
+/// Choices that remove the optional `write` of the fixture's first version.
+fn no_write() -> BTreeMap<String, Vec<String>> {
+    BTreeMap::from([("write".to_string(), Vec::new())])
+}
+
+#[tokio::test]
+async fn later_changes() {
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
+    let id = installed.install_id;
+    let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
+    let choices = BTreeMap::from([("write".to_string(), vec![format!("{meta}/runs/**")])]);
+    let narrowed = set_grants(ctx, actor, &auth, id, &choices).await.unwrap();
+    assert_eq!(narrowed.state, InstallState::Active);
+    assert_eq!(narrowed.grants["write"], vec![format!("{meta}/runs/**")]);
+    let role = group_role(&fixture, &narrowed).await.unwrap();
+    assert_eq!(role.permissions[&format!("{meta}/runs/**")], Access::WRITE);
+    let group = format!("/{}/g/{}/**", actor.realm_id, fixture.group_id);
+    assert_eq!(role.permissions[&group], Access::READ);
+
+    assert_eq!(narrowed.receiver, installed.receiver);
+    let paused = pause_install(ctx, actor, &auth, id).await.unwrap();
+    assert_eq!((paused.state, paused.paused), (InstallState::Paused, true));
+    assert_eq!(paused.receiver, installed.receiver);
+    assert!(matches!(
+        pause_install(ctx, actor, &auth, id).await,
+        Err(InstallError::State(_))
+    ));
+    assert_eq!(
+        resume_install(ctx, actor, &auth, id).await.unwrap().state,
+        InstallState::Active
+    );
+
+    // A version that requires writing keeps the narrowed write.
+    let digest = fixture.publish("0.2.0", "ef", needs_write()).await;
+    let (updated, missing) = update_install(ctx, actor, &auth, id, &digest, None)
+        .await
+        .unwrap();
+    assert_eq!((updated.state, missing), (InstallState::Active, Vec::new()));
+    assert_eq!(updated.receiver, installed.receiver);
+    assert_eq!(updated.grants["write"], vec![format!("{meta}/runs/**")]);
+    let approved = set_grants(ctx, actor, &auth, id, &BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(approved.state, InstallState::Active);
+
+    remove_install(ctx, actor, &auth, id).await.unwrap();
+    assert!(fixture.installs().await.is_empty());
+    assert!(fixture.account(&approved).await.unwrap().is_deactivated());
+    assert!(group_role(&fixture, &approved).await.is_none());
+    let page = AuditPageOperation::new(AuditPageInput {
+        index: AuditIndex::Group(fixture.group_id),
+        start_after: None,
+        limit: 50,
+    });
+    let actions: Vec<_> = (drive(page, ctx).await.unwrap().records.into_iter())
+        .filter(|record| record.plugin.is_some())
+        .map(|record| record.action)
+        .collect();
+    let expected = [
+        AdminAuditAction::PluginInstalled,
+        AdminAuditAction::PluginGrantsChanged,
+        AdminAuditAction::PluginPaused,
+        AdminAuditAction::PluginResumed,
+        AdminAuditAction::PluginUpdated,
+        AdminAuditAction::PluginGrantsChanged,
+        AdminAuditAction::PluginRemoved,
+    ];
+    assert_eq!(actions.len(), expected.len(), "{actions:?}");
+    assert!(expected.iter().all(|action| actions.contains(action)));
+}
+
+#[tokio::test]
+async fn keeps_pause() {
+    // A paused install stays paused through an update and the approval of what it needs.
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let id = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap()
+        .install_id;
+    set_grants(ctx, actor, &auth, id, &no_write())
+        .await
+        .unwrap();
+    pause_install(ctx, actor, &auth, id).await.unwrap();
+    let digest = fixture.publish("0.2.0", "ef", needs_write()).await;
+    let (updated, _) = update_install(ctx, actor, &auth, id, &digest, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (updated.state, updated.paused),
+        (InstallState::Blocked, true)
+    );
+    let approved = set_grants(ctx, actor, &auth, id, &BTreeMap::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        (approved.state, approved.paused),
+        (InstallState::Paused, true)
+    );
+    let resumed = resume_install(ctx, actor, &auth, id).await.unwrap();
+    assert_eq!(
+        (resumed.state, resumed.paused),
+        (InstallState::Active, false)
+    );
+}
+
+#[tokio::test]
+async fn resume_needs_grants() {
+    // Resuming a paused install that misses a required grant leaves it blocked.
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let id = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap()
+        .install_id;
+    set_grants(ctx, actor, &auth, id, &no_write())
+        .await
+        .unwrap();
+    pause_install(ctx, actor, &auth, id).await.unwrap();
+    let digest = fixture.publish("0.2.0", "ef", needs_write()).await;
+    update_install(ctx, actor, &auth, id, &digest, None)
+        .await
+        .unwrap();
+    let resumed = resume_install(ctx, actor, &auth, id).await.unwrap();
+    assert_eq!(
+        (resumed.state, resumed.paused),
+        (InstallState::Blocked, false)
+    );
+}
+
+#[tokio::test]
+async fn checks_updater() {
+    // A session restricted to the group's admin path may not carry whole-group grants over.
+    let fixture = Fixture::new().await;
+    let (ctx, actor) = (&fixture.ctx, &fixture.actor);
+    let id = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap()
+        .install_id;
+    let digest = fixture.publish("0.1.1", "cd", json!({})).await;
+    let mut restricted = fixture.auth();
+    restricted.path_restrictions = Some(vec![PathRestriction {
+        pattern: format!("/{}/g/{}/admin", actor.realm_id, fixture.group_id),
+        permission: Access::WRITE,
+    }]);
+    let refused = update_install(ctx, actor, &restricted, id, &digest, None).await;
+    assert!(
+        matches!(refused, Err(InstallError::NotHeld(_))),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fixture.installs().await[0].digest,
+        format!("sha256:{}", "ab".repeat(32))
+    );
+}
+
+#[tokio::test]
+async fn recovers_changes() {
+    // A crash after the audited record write leaves the install inactive, never active with a
+    // role wider than its grants; the next change finishes it.
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
+    let id = installed.install_id;
+    let group = format!("/{}/g/{}", actor.realm_id, fixture.group_id);
+    let choices = no_write();
+    let scope = scope_of(actor.realm_id, &installed);
+    let manifest_grants = narrow_grants(
+        &read_manifest(&fixture_plugin(&fixture, &installed).await).unwrap(),
+        &scope,
+        &choices,
+    )
+    .unwrap();
+    let crashed = preparing(&installed, &manifest_grants);
+    let crashed = write_record(ctx, actor, &auth, Some(installed.revision), crashed, None).await;
+    assert_eq!(crashed.unwrap().state, InstallState::Preparing);
+    let finished = set_grants(ctx, actor, &auth, id, &choices).await.unwrap();
+    assert_eq!(finished.state, InstallState::Active);
+    let role = group_role(&fixture, &finished).await.unwrap();
+    assert_eq!(
+        role.permissions[&format!("{group}/**")],
+        Access::READ,
+        "write is gone"
+    );
+}
+
+async fn fixture_plugin(
+    fixture: &Fixture,
+    install: &PluginInstall,
+) -> aruna_core::plugins::PublishedPlugin {
+    let config = read_config(&fixture.ctx, fixture.actor.realm_id)
+        .await
+        .unwrap();
+    pick_version(&config, &install.plugin, Some(&install.digest)).unwrap()
+}
+
+#[tokio::test]
+async fn stale_node_changes() {
+    // Node A stalls in a grant change while node B finishes another one; A's late role write and
+    // cleanup must not break B's newer active install, on either node.
+    let fixture = Fixture::new().await;
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
+    let id = installed.install_id;
+    let (a, b) = fixture.split().await;
+    let a_auth = a.auth();
+    let scope = scope_of(a.actor.realm_id, &installed);
+    let manifest = read_manifest(&fixture_plugin(&a, &installed).await).unwrap();
+    let dropped = no_write();
+    let grants_a = narrow_grants(&manifest, &scope, &dropped).unwrap();
+    let stale = preparing(&installed, &grants_a);
+    let stale = write_record(
+        &a.ctx,
+        &a.actor,
+        &a_auth,
+        Some(installed.revision),
+        stale,
+        None,
+    );
+    let stale = stale.await.unwrap();
+    a.deliver_config(&b).await;
+
+    let meta = format!("/{}/g/{}/meta", b.actor.realm_id, b.group_id);
+    let runs = BTreeMap::from([("write".to_string(), vec![format!("{meta}/runs/**")])]);
+    let active = set_grants(&b.ctx, &b.actor, &b.auth(), id, &runs)
+        .await
+        .unwrap();
+    assert_eq!(active.state, InstallState::Active);
+    let wanted = role_paths(&parse_grants(&active.grants));
+
+    // A writes its role before it learns of B's record; that role reaches B late, and B repairs.
+    let change = AccountChange::of((&a.actor, &a_auth), &stale, 1);
+    let paths_a = role_paths(&grants_a);
+    let write = EnsureRole::new(change.clone(), paths_a.clone());
+    drive(write, &a.ctx).await.unwrap();
+    a.deliver_group(&b).await;
+    assert_ne!(group_role(&b, &active).await.unwrap().permissions, wanted);
+    let node = b.actor.node_id;
+    assert!(
+        repair_install(&b.ctx, node, b.actor.realm_id, &active)
+            .await
+            .unwrap()
+    );
+    assert_eq!(group_role(&b, &active).await.unwrap().permissions, wanted);
+
+    // Once A holds B's record, its stale role write and cleanup are refused, and A repairs too.
+    b.deliver_config(&a).await;
+    let again = EnsureRole::new(change.clone(), paths_a);
+    let again = drive(again, &a.ctx).await;
+    assert!(again.is_err(), "a stale role write is refused");
+    let undo = drive(Teardown::new(change), &a.ctx).await;
+    assert!(undo.is_err(), "a stale cleanup is refused");
+    assert!(!a.account(&active).await.unwrap().is_deactivated());
+    assert!(
+        repair_install(&a.ctx, node, a.actor.realm_id, &active)
+            .await
+            .unwrap()
+    );
+    assert_eq!(group_role(&a, &active).await.unwrap().permissions, wanted);
+}
+
+#[tokio::test]
+async fn keeps_admin_deactivation() {
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
+    let (node, realm) = (actor.node_id, actor.realm_id);
+    let change = AccountChange::of((actor, &auth), &installed, 1);
+
+    // The install's own stop is repaired.
+    drive(Teardown::new(change), ctx).await.unwrap();
+    assert!(repair_install(ctx, node, realm, &installed).await.unwrap());
+    assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
+
+    // An administrator's deactivation stays through repair.
+    let stop = AccountStatusOperation::new(AccountStatusConfig {
+        actor: actor.clone(),
+        auth_context: auth.clone(),
+        target: installed.account,
+        active: false,
+        now: unix_timestamp_secs(),
+    });
+    drive(stop, ctx).await.unwrap();
+    assert!(!repair_install(ctx, node, realm, &installed).await.unwrap());
+    assert!(fixture.account(&installed).await.unwrap().is_deactivated());
+}
+
+#[tokio::test]
+async fn repairs_after_failure() {
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let installed = install_as(&fixture, &install_request(&fixture, None))
+        .await
+        .unwrap();
+    let (node, realm) = (actor.node_id, actor.realm_id);
+    let change = AccountChange::of((actor, &auth), &installed, 1);
+    drive(Teardown::new(change), ctx).await.unwrap();
+
+    // The first entry's approving admin holds no rights, so its repair fails; the next still runs.
+    let mut orphaned = installed.clone();
+    orphaned.granted_by = UserId::new(Ulid::from_parts(9, 9), realm);
+    let repaired = repair_settled(ctx, node, realm, &[orphaned, installed.clone()]).await;
+    assert_eq!(repaired, 1);
+    assert!(!fixture.account(&installed).await.unwrap().is_deactivated());
+    assert!(group_role(&fixture, &installed).await.is_some());
+}
+
+#[tokio::test]
+async fn coverage_times() {
+    // Activation and resume name their node; a grant change that grows the events an install
+    // matches records a widening, and one that narrows them keeps the earlier one.
+    let fixture = Fixture::new().await;
+    let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, fixture.auth());
+    let triggers = json!({
+        "triggers": { "dataset_created": {} }
+    });
+    let mut request = install_request(&fixture, None);
+    request.version = Some(fixture.publish("0.3.0", "aa", triggers).await);
+    let meta = format!("/{}/g/{}/meta", actor.realm_id, fixture.group_id);
+    let only = |pattern: &str| {
+        let read = ("read".to_string(), vec![format!("{meta}/{pattern}")]);
+        BTreeMap::from([read, ("write".to_string(), Vec::new())])
+    };
+    request.grants = only("a/**");
+    let installed = install_as(&fixture, &request).await.unwrap();
+    let id = installed.install_id;
+    assert_eq!(installed.activated_by, Some(actor.node_id));
+    assert_eq!(installed.widened, None);
+
+    let grown = set_grants(ctx, actor, &auth, id, &only("**"))
+        .await
+        .unwrap();
+    let widened = grown.widened.expect("a wider grant records a widening");
+    assert_eq!(
+        (widened.by, widened.extends),
+        (actor.node_id, installed.revision)
+    );
+    let narrowed = set_grants(ctx, actor, &auth, id, &only("a/**"))
+        .await
+        .unwrap();
+    assert_eq!(narrowed.widened, Some(widened));
+
+    pause_install(ctx, actor, &auth, id).await.unwrap();
+    let resumed = resume_install(ctx, actor, &auth, id).await.unwrap();
+    assert_eq!(resumed.activated_by, Some(actor.node_id));
+    assert!(resumed.active_since_ms >= installed.active_since_ms);
+}
+
+#[tokio::test]
+async fn updates_bind_slots() {
+    use crate::plugins::rules::tests::plain_secret;
+    use aruna_test_harness::plugins::{bound, secret};
+    let fixture = Fixture::keyed().await;
+    let install = bound(&fixture).await;
+    secret(&fixture, &install).await;
+    let bearer = |title: &str| json!({ "title": title, "kind": "bearer" });
+    let connection = json!({ "catalog": { "url": "{catalog_url}/api/", "auth": "api_key" } });
+    let added = json!({
+        "secrets": { "api_key": bearer("API key"), "extra_key": bearer("Extra key") },
+        "connections": connection.clone()
+    });
+    let wider = fixture.publish("0.3.0", "ee", added).await;
+    let auth = fixture.auth();
+    let update = |digest: String| {
+        let (ctx, actor, auth) = (&fixture.ctx, &fixture.actor, &auth);
+        async move { update_install(ctx, actor, auth, install.install_id, &digest, None).await }
+    };
+    // An added slot whose secret does not exist is refused before anything changes.
+    let refused = update(wider.clone()).await;
+    assert!(
+        matches!(refused, Err(InstallError::Binding(_))),
+        "{refused:?}"
+    );
+    assert_eq!(fixture.installs().await[0].digest, install.digest);
+    plain_secret(&fixture, ("extra_key", "bearer"), &[]).await;
+    let (updated, _) = update(wider).await.unwrap();
+    let names: Vec<String> = updated.secrets.values().map(ToString::to_string).collect();
+    assert_eq!(names, ["group:api-key", "group:extra_key"]);
+    // A version without the slot drops its binding and keeps the others.
+    let narrow = json!({ "secrets": { "api_key": bearer("API key") }, "connections": connection });
+    let narrow = fixture.publish("0.4.0", "ef", narrow).await;
+    let (updated, _) = update(narrow).await.unwrap();
+    let names: Vec<String> = updated.secrets.values().map(ToString::to_string).collect();
+    assert_eq!(names, ["group:api-key"]);
+}
+
+mod operations {
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::fixtures::{self, config_result, is_child};
+    use crate::plugins::rows::tests::child_result;
+    use aruna_core::structs::identity::user::User;
+    use aruna_ops_identity::document_repository::GetConfigError;
+    use aruna_ops_identity::users::service_account::check::ServiceCheckError;
+
+    fn open_manifest() -> serde_json::Value {
+        json!({ "permissions": { "required": [] } })
+    }
+
+    fn loaded(current: &PluginInstall) -> IoResult {
+        let config = Arc::new(fixtures::config(current, open_manifest()));
+        let current = current.clone();
+        child_result(Ok::<_, InstallError>(LoadedInstall { config, current }))
+    }
+
+    fn holder_ok() -> IoResult {
+        child_result(Ok::<(), InstallError>(()))
+    }
+
+    fn settled(install: &PluginInstall) -> IoResult {
+        child_result(Ok::<_, InstallError>(install.clone()))
+    }
+
+    fn write_done() -> IoResult {
+        child_result(Ok::<Option<PluginInstall>, RecordError>(None))
+    }
+
+    #[test]
+    fn load_checks_admin() {
+        let install = fixtures::install();
+        let caller = fixtures::caller();
+        let mut load = LoadInstall::new(&caller, install.install_id);
+        assert!(is_child(&load.first()));
+        let config = fixtures::config(&install, json!({}));
+        assert!(is_child(&load.next(config_result(config.clone()))));
+        let admin = child_result(Ok::<Option<User>, ServiceCheckError>(None));
+        let Ok(Next::Done(done)) = load.next(admin) else {
+            panic!("an admin gets the install");
+        };
+        assert_eq!(done.current, install);
+
+        let mut load = LoadInstall::new(&caller, install.install_id);
+        load.first().unwrap();
+        load.next(config_result(config)).unwrap();
+        let refused = child_result(Err::<Option<User>, _>(ServiceCheckError::Refused));
+        assert_eq!(load.next(refused), Err(InstallError::Unauthorized));
+
+        let mut load = LoadInstall::new(&caller, Ulid::from_parts(9, 9));
+        load.first().unwrap();
+        let other = fixtures::config(&install, json!({}));
+        assert_eq!(load.next(config_result(other)), Err(InstallError::NotFound));
+        let failed = child_result(Err::<RealmConfigDocument, _>(
+            GetConfigError::DocumentNotFound,
+        ));
+        let mut load = LoadInstall::new(&caller, install.install_id);
+        load.first().unwrap();
+        assert!(matches!(
+            load.next(failed),
+            Err(InstallError::Unavailable(_))
+        ));
+    }
+
+    #[test]
+    fn commit_then_settles() {
+        let install = fixtures::install();
+        let mut commit = CommitChange {
+            caller: fixtures::caller(),
+            expected: install.revision,
+            next: Some(install.clone()),
+            action: AdminAuditAction::PluginUpdated,
+            ids: aruna_core::id_mint::IdMint::default(),
+            now_ms: 0,
+        };
+        assert!(is_child(&commit.first()));
+        assert!(is_child(&commit.next(write_done())));
+        assert_eq!(commit.next(settled(&install)), Ok(Next::Done(install)));
+    }
+
+    #[test]
+    fn grants_run_steps() {
+        let install = fixtures::install();
+        let id = install.install_id;
+        let mut change = SetGrants::new(fixtures::caller(), id, &BTreeMap::new());
+        assert_eq!(change.hold_scope(), Some(HoldScope::PluginInstall(id)));
+        assert!(is_child(&change.first()));
+        assert!(is_child(&change.next(loaded(&install))));
+        assert!(is_child(&change.next(holder_ok())));
+        assert_eq!(
+            change.next(settled(&install)),
+            Ok(Next::Done(install.clone()))
+        );
+
+        let mut removing = install;
+        removing.state = InstallState::Removing;
+        let mut change = SetGrants::new(fixtures::caller(), id, &BTreeMap::new());
+        change.first().unwrap();
+        let refused = InstallError::State(InstallState::Removing.as_str());
+        assert_eq!(change.next(loaded(&removing)), Err(refused));
+    }
+
+    #[test]
+    fn update_runs_steps() {
+        let install = fixtures::install();
+        let who = (fixtures::caller(), Some(fixtures::node(3)));
+        let id = install.install_id;
+        let mut update = UpdateInstall::new(who, id, &install.digest, None);
+        assert_eq!(update.hold_scope(), Some(HoldScope::PluginInstall(id)));
+        assert!(is_child(&update.first()));
+        assert!(is_child(&update.next(loaded(&install))));
+        assert!(is_child(&update.next(holder_ok())));
+        let bound = child_result(Ok::<BoundSlots, BindError>((BTreeMap::new(), Vec::new())));
+        assert!(is_child(&update.next(bound)));
+        let done = update.next(settled(&install));
+        assert_eq!(done, Ok(Next::Done((install, Vec::new()))));
+    }
+
+    #[test]
+    fn pause_and_resume() {
+        let install = fixtures::install();
+        let id = install.install_id;
+        let mut pause = SetPaused::new(fixtures::caller(), id, true);
+        assert!(is_child(&pause.first()));
+        assert!(is_child(&pause.next(loaded(&install))));
+        let Ok(Next::Done(paused)) = pause.next(write_done()) else {
+            panic!("the write ends the pause");
+        };
+        assert_eq!((paused.state, paused.paused), (InstallState::Paused, true));
+
+        let mut resume = SetPaused::new(fixtures::caller(), id, false);
+        resume.first().unwrap();
+        assert!(is_child(&resume.next(loaded(&paused))));
+        let Ok(Next::Done(active)) = resume.next(write_done()) else {
+            panic!("the write ends the resume");
+        };
+        assert_eq!((active.state, active.paused), (InstallState::Active, false));
+        assert_eq!(active.active_since_ms, Some(5_000));
+
+        let mut again = SetPaused::new(fixtures::caller(), id, true);
+        again.first().unwrap();
+        let refused = InstallError::State(InstallState::Paused.as_str());
+        assert_eq!(again.next(loaded(&paused)), Err(refused));
+        let mut idle = SetPaused::new(fixtures::caller(), id, false);
+        idle.first().unwrap();
+        assert!(matches!(
+            idle.next(loaded(&install)),
+            Err(InstallError::State(_))
+        ));
+    }
+
+    #[test]
+    fn remove_runs_steps() {
+        let install = fixtures::install();
+        let id = install.install_id;
+        let mut remove = RemoveInstall::new(fixtures::caller(), id);
+        assert_eq!(remove.hold_scope(), Some(HoldScope::PluginInstall(id)));
+        assert!(is_child(&remove.first()));
+        assert!(is_child(&remove.next(loaded(&install))));
+        assert!(is_child(&remove.next(write_done())));
+        assert!(is_child(
+            &remove.next(child_result(Ok::<(), AccountError>(())))
+        ));
+        let kept = child_result(Err::<(), _>(RulesFailure("no".into())));
+        assert!(is_child(&remove.next(kept)));
+        let Ok(Next::Done(gone)) = remove.next(write_done()) else {
+            panic!("the delete ends the removal");
+        };
+        assert_eq!(gone.state, InstallState::Removing);
+    }
+
+    #[test]
+    fn remove_resumes_teardown() {
+        let mut removing = fixtures::install();
+        removing.state = InstallState::Removing;
+        let mut remove = RemoveInstall::new(fixtures::caller(), removing.install_id);
+        remove.first().unwrap();
+        assert!(is_child(&remove.next(loaded(&removing))));
+        let failed = child_result(Err::<(), _>(AccountError("no".into())));
+        let step = InstallError::Step {
+            step: "remove",
+            error: "no".into(),
+        };
+        assert_eq!(remove.next(failed), Err(step));
+    }
+}
+
+fn conflicted() -> RemoveConflicted {
+    use aruna_core::structs::identity::auth::Actor;
+    let install = crate::plugins::fixtures::install();
+    let actor = Actor {
+        node_id: install.receiver,
+        user_id: install.granted_by,
+        realm_id: install.account.realm_id,
+    };
+    let caller = InstallCaller::new(&actor, &AuthContext::from(&actor), 5);
+    let proven = BTreeSet::from([install.group_id]);
+    RemoveConflicted::new(caller, (install.install_id, proven))
+}
+
+// Only a conflict with a deletion is removed this way; every candidate is torn down first.
+#[test]
+fn conflict_torn_down() {
+    use crate::plugins::fixtures::is_child;
+    use crate::plugins::rows::tests::child_result;
+    let mut absent = conflicted();
+    assert!(is_child(&absent.first()));
+    let none = child_result(Ok::<_, RecordError>(InstallEntry::Absent));
+    assert_eq!(absent.next(none), Err(InstallError::NotFound));
+    let mut remove = conflicted();
+    remove.first().unwrap();
+    let conflict = InstallEntry::Conflict {
+        deletion: true,
+        installs: vec![crate::plugins::fixtures::install()],
+    };
+    let entry = child_result(Ok::<_, RecordError>(conflict));
+    assert!(is_child(&remove.next(entry)));
+    assert!(is_child(
+        &remove.next(child_result(Ok::<_, AccountError>(())))
+    ));
+    assert!(is_child(
+        &remove.next(child_result(Ok::<_, RulesFailure>(())))
+    ));
+    assert_eq!(remove.phase, ConflictPhase::Deleted);
+    let deleted = child_result(Ok::<Option<PluginInstall>, RecordError>(None));
+    assert_eq!(remove.next(deleted), Ok(Next::Done(())));
+}

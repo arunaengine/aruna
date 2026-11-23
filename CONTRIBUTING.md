@@ -48,10 +48,10 @@ keeping a local copy. The root policy is the single owner of the folder
 threshold, the shared-prefix exception, term limits, and hoisting.
 
 - **Behavior homes.** Bucket, object, multipart, and access operations belong
-  under `operations/src/s3/<family>/`; routes under
-  `api/src/routes/{execution,access,storage}/`; records under
-  `core/src/structs/{placement,identity,storage,execution}/`; effect adapters
-  under `drivers/src/effect_adapters/`. See
+  under `domain/ops-work/src/s3/<family>/`; routes under
+  `frontends/api/src/routes/{execution,access,storage}/`; records under
+  `domain/core/src/structs/{placement,identity,storage,execution}/`; effect adapters
+  under `runtime/runner/src/effect_adapters/`. See
   [REPO_STRUCTURE.md](REPO_STRUCTURE.md) for the full map.
 
 ### Workflow

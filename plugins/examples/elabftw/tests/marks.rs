@@ -7,7 +7,7 @@ mod support;
 
 use std::collections::BTreeSet;
 
-use aruna_plugins::limits::Limits;
+use aruna_wasm_host::limits::Limits;
 use elabftw_sync::compare::Snapshot;
 use elabftw_sync::host::{Host, Kind, Meter};
 use elabftw_sync::progress::{DAY_MS, MAX_VALUE, Mark, PART_BYTES, REPORT_BYTES, Record, store};

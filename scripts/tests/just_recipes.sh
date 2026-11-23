@@ -449,7 +449,7 @@ test_static_gates() {
     fi
   done
 
-  for script in "$ROOT_DIR"/scripts/compute-helper/build.sh \
+  for script in "$ROOT_DIR"/apps/compute-helper/build.sh \
     "$ROOT_DIR"/scripts/dev/rustc_coverage.sh \
     "$ROOT_DIR"/scripts/session-deno/build.sh \
     "$ROOT_DIR"/scripts/session-python/build.sh \
@@ -464,7 +464,7 @@ test_static_gates() {
   if command -v shellcheck >/dev/null 2>&1; then
     if output="$(cd "$ROOT_DIR" \
       && shellcheck scripts/*.sh scripts/tests/*.sh \
-      && shellcheck --shell=sh scripts/compute-helper/build.sh \
+      && shellcheck --shell=sh apps/compute-helper/build.sh \
         scripts/dev/rustc_coverage.sh \
         scripts/session-deno/build.sh \
         scripts/session-python/build.sh scripts/session-helper/session-start 2>&1)"; then

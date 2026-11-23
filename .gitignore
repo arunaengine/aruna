@@ -11,7 +11,7 @@ target/
 !.env.example
 /docker/*
 /portal*
-aruna/compute-state/
+apps/node/compute-state/
 plugins/fixture/.aruna/
 __pycache__/
 /.prebuilt/

@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from check_style import CHAR_RE, iter_rust_files, read_source, scan_block
 
-OPERATIONS_SRCS = ("ops-identity/src", "ops-data/src", "operations/src")
+OPERATIONS_SRCS = ("domain/ops-identity/src", "domain/ops-data/src", "domain/ops-work/src")
 OPERATIONS_CRATES = ("aruna_ops_identity", "aruna_ops_data")
 BASELINE_PATH = "scripts/dev/layers_baseline.json"
 # Domain groups of target-architecture.md section 5, lowest first. A module may
@@ -46,10 +46,10 @@ CRATE_TARGETS = {
     "aruna-api": (
         "aruna-core",
         "aruna-clock",
-        "aruna-operations",
-        "aruna-drivers",
+        "aruna-ops-work",
+        "aruna-runner",
         "aruna-wire",
-        "aruna-test-support",
+        "aruna-test-harness",
     ),
     "aruna-doctor": (
         "aruna-core",
@@ -57,59 +57,59 @@ CRATE_TARGETS = {
         "aruna-config",
         "aruna-storage",
         "aruna-blob",
-        "aruna-operations",
-        "aruna-drivers",
+        "aruna-ops-work",
+        "aruna-runner",
     ),
     # The node configuration, settings and identity that the node and the doctor share.
     "aruna-config": (
         "aruna-core",
         "aruna-clock",
-        "aruna-net",
+        "aruna-p2p",
         "aruna-storage",
         "aruna-wire",
     ),
-    "aruna-cli": ("aruna-wire", "aruna-plugins", "aruna-plugin-types"),
-    "aruna-ops-identity": ("aruna-core", "aruna-plugin-types"),
+    "aruna-cli": ("aruna-wire", "aruna-wasm-host", "aruna-plugin-contract"),
+    "aruna-ops-identity": ("aruna-core", "aruna-plugin-contract"),
     "aruna-ops-data": ("aruna-core", "aruna-ops-identity"),
-    "aruna-operations": (
+    "aruna-ops-work": (
         "aruna-core",
-        "aruna-plugin-types",
+        "aruna-plugin-contract",
         "aruna-ops-identity",
         "aruna-ops-data",
     ),
-    "aruna-drivers": (
+    "aruna-runner": (
         "aruna-core",
         "aruna-clock",
         "aruna-storage",
-        "aruna-net",
+        "aruna-p2p",
         "aruna-blob",
-        "aruna-tasks",
+        "aruna-scheduler",
         "aruna-compute",
-        "aruna-plugins",
-        "aruna-graph",
-        "aruna-outbound",
+        "aruna-wasm-host",
+        "aruna-rdf-graph",
+        "aruna-egress",
     ),
     "aruna-storage": ("aruna-core", "aruna-clock"),
-    "aruna-net": ("aruna-core", "aruna-clock", "aruna-storage"),
-    "aruna-blob": ("aruna-core", "aruna-clock", "aruna-kpabe", "aruna-storage", "aruna-net"),
-    "aruna-tasks": ("aruna-core",),
+    "aruna-p2p": ("aruna-core", "aruna-clock", "aruna-storage"),
+    "aruna-blob": ("aruna-core", "aruna-clock", "aruna-kpabe", "aruna-storage", "aruna-p2p"),
+    "aruna-scheduler": ("aruna-core",),
     "aruna-compute": ("aruna-core", "aruna-clock"),
-    "aruna-plugins": ("aruna-plugin-types",),
-    "aruna-plugin-types": (),
-    "aruna-graph": ("aruna-core",),
-    "aruna-outbound": ("aruna-core",),
+    "aruna-wasm-host": ("aruna-plugin-contract",),
+    "aruna-plugin-contract": (),
+    "aruna-rdf-graph": ("aruna-core",),
+    "aruna-egress": ("aruna-core",),
     # Test helpers that drive operations; only dev-dependencies name it.
-    "aruna-test-support": (
+    "aruna-test-harness": (
         "aruna-core",
         "aruna-blob",
-        "aruna-graph",
-        "aruna-net",
-        "aruna-operations",
-        "aruna-drivers",
-        "aruna-outbound",
-        "aruna-plugin-types",
+        "aruna-rdf-graph",
+        "aruna-p2p",
+        "aruna-ops-work",
+        "aruna-runner",
+        "aruna-egress",
+        "aruna-plugin-contract",
         "aruna-storage",
-        "aruna-tasks",
+        "aruna-scheduler",
     ),
     "aruna-core": ("aruna-kpabe",),
     # Host clocks and the OS random source; core and operations never reach them.
@@ -126,18 +126,18 @@ CRATE_TARGETS = {
 }
 # Backends keep their table for test and build dependencies as well.
 BACKENDS = frozenset(
-    "aruna-storage aruna-net aruna-blob aruna-tasks aruna-compute aruna-plugins aruna-graph aruna-outbound".split()
+    "aruna-storage aruna-p2p aruna-blob aruna-scheduler aruna-compute aruna-wasm-host aruna-rdf-graph aruna-egress".split()
 )
 TRIGGER_MATCHES = (
-    ("aruna/src/tasks/incoming/mod.rs", "TaskKey::"),
-    ("aruna/src/inbound.rs", "Alpn::"),
+    ("apps/node/src/tasks/incoming/mod.rs", "TaskKey::"),
+    ("apps/node/src/inbound.rs", "Alpn::"),
 )
-TRIGGER_IMPLS = (("aruna/src/plugin_host/broker.rs", "Broker"),)
+TRIGGER_IMPLS = (("apps/node/src/plugin_host/broker.rs", "Broker"),)
 # The one helper an arm without an inline async block may hand its work to, and the table that
 # helper must look the operation up in before it drives it.
 TRIGGER_HELPERS = {
-    "aruna/src/tasks/incoming/mod.rs": ("run_trigger", "timer_operation"),
-    "aruna/src/inbound.rs": ("serve_peer", "peer_operation"),
+    "apps/node/src/tasks/incoming/mod.rs": ("run_trigger", "timer_operation"),
+    "apps/node/src/inbound.rs": ("serve_peer", "peer_operation"),
 }
 CALL_RE = re.compile(r"(?<![\w!])([a-z_]\w*)\s*\(")
 DRIVE_ANY = re.compile(r"\bdrive(?:_retry(?:_until)?)?\s*\(")
@@ -199,7 +199,7 @@ CLOCK_RE = re.compile(
 )
 PAUSE_RE = re.compile(r"\bstart_paused\b|\bpause\s*\(\s*\)")
 # The shared bounded poll helper; the one real sleep in tests the guard does not count.
-POLL_HELPER = ("clock/src/testing.rs", "poll_until")
+POLL_HELPER = ("runtime/clock/src/testing.rs", "poll_until")
 SKIP_RE = re.compile(r"\be?println!\s*\([^;]*\)\s*;\s*(?:return\b|None\s*[},])")
 SPACE_RE = re.compile(r"\s+")
 COMMA_RE = re.compile(r"\s*,")
@@ -832,7 +832,7 @@ def hook_modules(sources):
     return prefixes
 
 
-def core_clocks(sources, root="core/src/"):
+def core_clocks(sources, root="domain/core/src/"):
     """Clock, random and id-mint calls in a crate's production code; test hooks are helpers."""
     prefixes = tuple(item.rstrip("/") + "/" for item in root) if isinstance(root, tuple) else (root,)
     core = [source for source in sources if source.rel.startswith(prefixes)]

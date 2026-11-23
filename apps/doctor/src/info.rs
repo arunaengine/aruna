@@ -1,0 +1,589 @@
+//! Prints the node's local configuration together with its info endpoint response.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::error::CliError;
+use aruna_core::structs::storage::backends::BackendsFile;
+use aruna_wire::address::client_bind_url;
+use aruna_wire::info::InfoResponse;
+use reqwest::Client;
+use serde::Serialize;
+use std::net::SocketAddr;
+use std::time::Duration;
+
+#[derive(Debug, Serialize)]
+struct DoctorInfoOutput {
+    config: ConfigView,
+    endpoint_info: InfoResponse,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigView {
+    storage_path: String,
+    metadata_storage_path: String,
+    blob_root: String,
+    /// Backends declared in `BLOB_BACKENDS_PATH`; empty means the implicit
+    /// single filesystem backend rooted at `blob_root`.
+    blob_backends: Vec<BackendView>,
+    blob_bucket_prefix: Option<String>,
+    #[serde(rename = "blob_max_bucket_size")]
+    blob_bucket_size: Option<u64>,
+    blob_multipart_bucket: Option<String>,
+    #[serde(rename = "blob_control_plane_connect_timeout_secs")]
+    connect_timeout_secs: u64,
+    #[serde(rename = "blob_control_plane_io_timeout_secs")]
+    io_timeout_secs: u64,
+    #[serde(rename = "blob_transfer_idle_timeout_secs")]
+    transfer_idle_secs: u64,
+    http_socket_addr: String,
+    http_base_url: String,
+    #[serde(rename = "p2p_socket_addr")]
+    p2p_addr: String,
+    #[serde(rename = "max_concurrent_uni_streams")]
+    max_uni_streams: Option<u64>,
+    #[serde(rename = "max_concurrent_bidi_streams")]
+    max_bidi_streams: Option<u64>,
+    #[serde(rename = "p2p_additional_relay_urls")]
+    additional_urls: Vec<String>,
+    #[serde(rename = "default_metadata_replication_factor")]
+    metadata_replication_factor: u32,
+    s3_host: String,
+    api_public_url: Option<String>,
+    s3_public_url: Option<String>,
+    s3_address: String,
+    onboarding_secret_present: bool,
+    oidc_providers: Vec<OidcProviderView>,
+}
+
+#[derive(Debug, Serialize)]
+struct BackendView {
+    name: String,
+    backend: String,
+    class: Option<String>,
+    allow_tenants: bool,
+    /// Advisory only; never enforced against writes.
+    quota_bytes: Option<u64>,
+    default: bool,
+}
+
+/// Reads the operator's backends file through the shared core parser, so the
+/// doctor never re-implements the node's schema.
+fn backend_views() -> Result<Vec<BackendView>, CliError> {
+    let Ok(path) = dotenvy::var("BLOB_BACKENDS_PATH") else {
+        return Ok(Vec::new());
+    };
+    let text = std::fs::read_to_string(&path)?;
+    let file =
+        BackendsFile::parse(&text).map_err(|error| CliError::BackendsFile(error.to_string()))?;
+    Ok(file
+        .backend
+        .into_iter()
+        .map(|(name, entry)| BackendView {
+            name,
+            backend: entry.kind,
+            class: entry.class,
+            allow_tenants: entry.allow_tenants,
+            quota_bytes: entry.quota_bytes,
+            default: entry.default,
+        })
+        .collect())
+}
+
+#[derive(Debug, Serialize)]
+struct OidcProviderView {
+    id: String,
+    issuer: String,
+    audience: String,
+    discovery_url: String,
+}
+
+pub async fn print_info(token: Option<String>) -> Result<(), CliError> {
+    let _ = dotenvy::dotenv();
+    let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
+    let endpoint_info = fetch_info(http_socket_addr, resolve_token(token).as_deref()).await?;
+    let output = DoctorInfoOutput {
+        config: ConfigView::from_env(http_socket_addr)?,
+        endpoint_info,
+    };
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+/// `/info` only reports topology to a realm token and backend detail to a realm
+/// admin, so the operator passes one via `--token` or `ARUNA_TOKEN`.
+pub(crate) fn resolve_token(token: Option<String>) -> Option<String> {
+    token
+        .or_else(|| dotenvy::var("ARUNA_TOKEN").ok())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+pub(crate) fn default_info_url() -> Result<String, CliError> {
+    let http_socket_addr: SocketAddr = dotenvy::var("SOCKET_ADDRESS")?.parse()?;
+    Ok(info_url(http_socket_addr))
+}
+
+pub(crate) async fn fetch_info(
+    http_socket_addr: SocketAddr,
+    token: Option<&str>,
+) -> Result<InfoResponse, CliError> {
+    fetch_info_url(&info_url(http_socket_addr), Duration::from_secs(10), token).await
+}
+
+pub(crate) async fn fetch_info_url(
+    url: &str,
+    timeout: Duration,
+    token: Option<&str>,
+) -> Result<InfoResponse, CliError> {
+    let timeout = nonzero_timeout(timeout);
+    let connect_timeout = nonzero_timeout(timeout.min(Duration::from_secs(2)));
+    let mut request = Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
+        .build()?
+        .get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|source| CliError::InfoRequest {
+            url: url.to_string(),
+            source,
+        })?
+        .error_for_status()
+        .map_err(|source| CliError::InfoRequest {
+            url: url.to_string(),
+            source,
+        })?;
+
+    response
+        .json::<InfoResponse>()
+        .await
+        .map_err(|source| CliError::InfoRequest {
+            url: url.to_string(),
+            source,
+        })
+}
+
+fn http_base_url(addr: SocketAddr) -> String {
+    client_bind_url(addr)
+}
+
+fn info_url(addr: SocketAddr) -> String {
+    format!("{}/api/v1/system/info", http_base_url(addr))
+}
+
+fn nonzero_timeout(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        timeout
+    }
+}
+
+impl ConfigView {
+    fn from_env(http_socket_addr: SocketAddr) -> Result<Self, CliError> {
+        let storage_path = dotenvy::var("DATABASE_DIR").ok();
+        let metadata_storage_path = dotenvy::var("CRAQLE_STORAGE_PATH")
+            .ok()
+            .or_else(|| storage_path.as_ref().map(|path| format!("{path}/craqle")));
+        let blob_root = dotenvy::var("CONTENT_DIR").ok().or_else(|| {
+            storage_path
+                .as_ref()
+                .map(|path| format!("{path}/blobstore"))
+        });
+        let oidc_provider_ids = dotenvy::var("OIDC_PROVIDER_IDS").unwrap_or_default();
+
+        Ok(Self {
+            storage_path: storage_path.unwrap_or_default(),
+            metadata_storage_path: metadata_storage_path.unwrap_or_default(),
+            blob_root: blob_root.unwrap_or_default(),
+            blob_backends: backend_views()?,
+            blob_bucket_prefix: dotenvy::var("BLOB_BUCKET_PREFIX").ok(),
+            blob_bucket_size: parse_optional_env("BLOB_MAX_BUCKET_SIZE")?.or(Some(100_000)),
+            blob_multipart_bucket: dotenvy::var("BLOB_MULTIPART_BUCKET")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or(Some("uploaded-parts".to_string())),
+            connect_timeout_secs: parse_optional_env("BLOB_CONTROL_PLANE_CONNECT_TIMEOUT_SECS")?
+                .unwrap_or(30),
+            io_timeout_secs: parse_optional_env("BLOB_CONTROL_PLANE_IO_TIMEOUT_SECS")?
+                .unwrap_or(30),
+            transfer_idle_secs: parse_optional_env("BLOB_TRANSFER_IDLE_TIMEOUT_SECS")?
+                .unwrap_or(30 * 60),
+            http_socket_addr: http_socket_addr.to_string(),
+            http_base_url: http_base_url(http_socket_addr),
+            p2p_addr: dotenvy::var("P2P_SOCKET_ADDRESS")
+                .unwrap_or_else(|_| http_socket_addr.to_string()),
+            max_uni_streams: parse_optional_env("MAX_CONCURRENT_UNI_STREAMS")?,
+            max_bidi_streams: parse_optional_env("MAX_CONCURRENT_BIDI_STREAMS")?,
+            additional_urls: parse_list_env("P2P_ADDITIONAL_RELAY_URLS"),
+            metadata_replication_factor: parse_optional_env("METADATA_REPLICATION_FACTOR")?
+                .unwrap_or(3)
+                .max(1),
+            s3_host: dotenvy::var("S3_HOST").unwrap_or_default(),
+            api_public_url: optional_nonempty_env("API_PUBLIC_URL"),
+            s3_public_url: optional_nonempty_env("S3_PUBLIC_URL"),
+            s3_address: dotenvy::var("S3_ADDRESS").unwrap_or_default(),
+            onboarding_secret_present: dotenvy::var("ONBOARDING_SECRET")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty()),
+            oidc_providers: oidc_provider_ids
+                .split(',')
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(|id| OidcProviderView {
+                    id: id.to_string(),
+                    issuer: dotenvy::var(format!("OIDC_{}_ISSUER", env_key(id)))
+                        .unwrap_or_default(),
+                    audience: dotenvy::var(format!("OIDC_{}_AUDIENCE", env_key(id)))
+                        .unwrap_or_default(),
+                    discovery_url: dotenvy::var(format!("OIDC_{}_DISCOVERY_URL", env_key(id)))
+                        .unwrap_or_default(),
+                })
+                .collect(),
+        })
+    }
+}
+
+fn parse_optional_env<T>(key: &str) -> Result<Option<T>, CliError>
+where
+    T: std::str::FromStr,
+    CliError: From<T::Err>,
+{
+    Ok(dotenvy::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.parse::<T>())
+        .transpose()?)
+}
+
+fn optional_nonempty_env(key: &str) -> Option<String> {
+    dotenvy::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn parse_list_env(key: &str) -> Vec<String> {
+    dotenvy::var(key)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn env_key(id: &str) -> String {
+    id.to_ascii_uppercase().replace('-', "_")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConfigView, fetch_info, http_base_url};
+    use crate::tests::fixtures::env_lock;
+    use aruna::inbound::initialize_net_holder;
+    use aruna::tasks::incoming::restore::start_task_queues;
+    use aruna_api::server::state::ServerState;
+    use aruna_api::server::{Server, ServerConfig};
+    use aruna_config::load;
+    use aruna_core::keys::generate_signing_key;
+    use aruna_core::structs::identity::auth::NodeCapabilities;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::testing::EnvGuard;
+    use aruna_ops_work::realm::announce_presence::{
+        AnnouncePresenceConfig, AnnouncePresenceOperation,
+    };
+    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_p2p::NetHandle;
+    use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_runner::driver::{DriverContext, drive};
+    use aruna_scheduler::TaskHandle;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+    use tokio::net::TcpListener;
+    use ulid::Ulid;
+
+    struct TestNode {
+        _temp_dir: tempfile::TempDir,
+        _env_guard: EnvGuard,
+        http_addr: std::net::SocketAddr,
+        server_task: tokio::task::JoinHandle<()>,
+        net: NetHandle,
+    }
+
+    impl TestNode {
+        async fn shutdown(self) {
+            self.server_task.abort();
+            let _ = self.server_task.await;
+            self.net.shutdown().await;
+        }
+    }
+
+    async fn spawn_test_node() -> TestNode {
+        let temp_dir = tempdir().unwrap();
+        let storage_path = temp_dir.path().join("storage");
+        let blob_root = temp_dir.path().join("blobstore");
+        std::fs::create_dir_all(&blob_root).unwrap();
+
+        let env_guard = EnvGuard::set(&[
+            ("DATABASE_DIR", storage_path.to_str().unwrap().to_string()),
+            ("CONTENT_DIR", blob_root.to_str().unwrap().to_string()),
+            ("SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
+            ("P2P_SOCKET_ADDRESS", "127.0.0.1:0".to_string()),
+            ("S3_HOST", "127.0.0.1:0".to_string()),
+            ("S3_ADDRESS", "127.0.0.1:0".to_string()),
+            ("OIDC_PROVIDER_IDS", "".to_string()),
+            ("ONBOARDING_SECRET", "".to_string()),
+        ]);
+
+        let (config, storage_handle) = load().await.unwrap();
+        let net = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                secret_key: Some(config.net_secret_key.clone()),
+                realm_id: config.realm_id,
+                peer_nodes: Vec::new(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..Default::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
+        let context = Arc::new(DriverContext {
+            storage_handle,
+            net_handle: Some(net.clone()),
+            blob_handle: None,
+            graph_handle: None,
+            task_handle: Some(task_handle.clone()),
+            compute_handle: None,
+            outbound_handle: None,
+        });
+        let jobs_runtime = aruna_runner::jobs::runtime::JobsRuntime::new();
+        let shutdown = aruna_scheduler::shutdown::Shutdown::new();
+        initialize_net_holder(
+            context.clone(),
+            aruna_core::structs::execution::job::input::RoCrateLimits::default(),
+            jobs_runtime.clone(),
+            &shutdown,
+        );
+        start_task_queues(context.clone(), task_handle, jobs_runtime, &shutdown).await;
+
+        let realm_signing_key = generate_signing_key();
+        let realm_id = RealmId::from_bytes(realm_signing_key.verifying_key().to_bytes());
+        let capabilities = NodeCapabilities::management_node(realm_signing_key).unwrap();
+        let bootstrap_user = aruna_core::user::id::UserId::local(Ulid::generate(), realm_id);
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: aruna_core::structs::identity::auth::Actor {
+                    node_id: net.node_id(),
+                    user_id: bootstrap_user,
+                    realm_id,
+                },
+                realm_description: "Doctor Test Realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            context.as_ref(),
+        )
+        .await
+        .unwrap();
+        drive(
+            AnnouncePresenceOperation::new(AnnouncePresenceConfig {
+                realm_id,
+                node_id: net.node_id(),
+                schedule_refresh: false,
+            }),
+            context.as_ref(),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(
+            ServerState::new(
+                context,
+                realm_id,
+                net.node_id(),
+                capabilities,
+                false,
+                None,
+                aruna_runner::jobs::runtime::JobsRuntime::new(),
+            )
+            .await,
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Server::new(
+            state,
+            ServerConfig {
+                http_addr: addr,
+                max_body_size: aruna_core::listener::MAX_BODY_SIZE,
+                cors: aruna_api::cors::CorsConfig::default(),
+            },
+        );
+        let server_task = tokio::spawn(async move {
+            server
+                .run_with_listener(listener, tokio_util::sync::CancellationToken::new())
+                .await
+                .unwrap();
+        });
+
+        TestNode {
+            _temp_dir: temp_dir,
+            _env_guard: env_guard,
+            http_addr: addr,
+            server_task,
+            net,
+        }
+    }
+
+    #[test]
+    fn ipv4_base_url() {
+        let addr: std::net::SocketAddr = "0.0.0.0:3000".parse().unwrap();
+        assert_eq!(http_base_url(addr), "http://127.0.0.1:3000");
+    }
+
+    #[test]
+    fn ipv6_base_url() {
+        let addr: std::net::SocketAddr = "[::]:3000".parse().unwrap();
+        assert_eq!(http_base_url(addr), "http://[::1]:3000");
+    }
+
+    #[tokio::test]
+    async fn onboarding_secret() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = EnvGuard::set(&[
+            ("DATABASE_DIR", "/tmp/storage".to_string()),
+            ("ONBOARDING_SECRET", "secret".to_string()),
+        ]);
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+
+        assert_eq!(view.http_base_url, "http://127.0.0.1:3000");
+        assert!(view.onboarding_secret_present);
+    }
+
+    #[tokio::test]
+    async fn doctor_matches_defaults() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = EnvGuard::set(&[
+            ("DATABASE_DIR", "/tmp/aruna-doctor-defaults".to_string()),
+            (
+                "CONTENT_DIR",
+                "/tmp/aruna-doctor-defaults/blobs".to_string(),
+            ),
+            ("METADATA_REPLICATION_FACTOR", "0".to_string()),
+        ]);
+        let _unset = EnvGuard::remove(&["BLOB_MAX_BUCKET_SIZE", "BLOB_MULTIPART_BUCKET"]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
+
+        assert_eq!(view.blob_bucket_size, Some(100_000));
+        assert_eq!(
+            view.blob_multipart_bucket.as_deref(),
+            Some("uploaded-parts")
+        );
+        assert_eq!(view.metadata_replication_factor, 1);
+        assert_eq!(view.storage_path, "/tmp/aruna-doctor-defaults");
+        assert_eq!(view.blob_root, "/tmp/aruna-doctor-defaults/blobs");
+        assert_eq!(view.storage_path, settings.storage_path);
+        assert_eq!(view.blob_root, settings.blob_root);
+        assert_eq!(view.blob_bucket_size, settings.blob_bucket_size);
+        assert_eq!(view.blob_multipart_bucket, settings.blob_multipart_bucket);
+        assert_eq!(
+            view.metadata_replication_factor,
+            settings.metadata_replication_factor
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_content_default() {
+        let _env_lock = env_lock().lock().await;
+        // Load the `.env` file first, so it cannot restore CONTENT_DIR after the removal.
+        let _ = dotenvy::var("CONTENT_DIR");
+        let _guard = EnvGuard::set(&[
+            ("DATABASE_DIR", "/tmp/aruna-doctor-content".to_string()),
+            ("METADATA_REPLICATION_FACTOR", "0".to_string()),
+        ]);
+        let _unset = EnvGuard::remove(&["CONTENT_DIR"]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+        let settings = aruna_config::settings::read_settings().unwrap();
+
+        assert_eq!(view.blob_root, "/tmp/aruna-doctor-content/blobstore");
+        assert_eq!(view.blob_root, settings.blob_root);
+    }
+
+    #[tokio::test]
+    async fn doctor_relays() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = EnvGuard::set(&[(
+            "P2P_ADDITIONAL_RELAY_URLS",
+            "https://relay-a.example,https://relay-b.example".to_string(),
+        )]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+
+        assert_eq!(
+            view.additional_urls,
+            vec![
+                "https://relay-a.example".to_string(),
+                "https://relay-b.example".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_public_urls() {
+        let _env_lock = env_lock().lock().await;
+        let _guard = EnvGuard::set(&[
+            ("API_PUBLIC_URL", "https://api.example.test".to_string()),
+            ("S3_PUBLIC_URL", "https://s3.example.test".to_string()),
+        ]);
+
+        let view = ConfigView::from_env("0.0.0.0:3000".parse().unwrap()).unwrap();
+
+        assert_eq!(
+            view.api_public_url.as_deref(),
+            Some("https://api.example.test")
+        );
+        assert_eq!(
+            view.s3_public_url.as_deref(),
+            Some("https://s3.example.test")
+        );
+    }
+
+    /// Without a token the node reports health, version and public interface
+    /// urls, but no node identity or backend topology.
+    #[tokio::test]
+    async fn live_info() {
+        let _guard = env_lock().lock().await;
+        let node = spawn_test_node().await;
+
+        let info = fetch_info(node.http_addr, None).await.unwrap();
+
+        assert_eq!(info.node.status, aruna_wire::info::ServiceStatus::Available);
+        assert!(!info.api_version.is_empty());
+        assert_eq!(
+            info.services.interfaces.rest.status,
+            aruna_wire::info::ServiceStatus::Available
+        );
+        let api_url = format!("http://{}/api/v1", node.http_addr);
+        assert_eq!(
+            info.services.interfaces.rest.url.as_deref(),
+            Some(api_url.as_str())
+        );
+        assert!(info.node.peer_id.is_some());
+        assert!(info.services.network.is_none());
+        node.shutdown().await;
+    }
+}

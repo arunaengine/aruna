@@ -2,8 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Rebuild: RUSTFLAGS="--remap-path-prefix=$HOME=~" aruna-cli plugin build plugins/fixture, then
-// copy target/wasm32-unknown-unknown/release/fixture-0.2.0.wasm to plugins/tests/fixture.wasm.
+// Rebuild: RUSTFLAGS="--remap-path-prefix=$HOME=~" aruna-cli plugin build plugins/fixture, copy
+// target/wasm32-unknown-unknown/release/fixture-0.2.0.wasm to runtime/wasm-host/tests/fixture.wasm.
 
 use std::hint::black_box;
 

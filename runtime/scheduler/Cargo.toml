@@ -1,0 +1,24 @@
+# Manifest of aruna-scheduler, the timer and task runtime crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+aruna-core = { workspace = true }
+async-trait = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+iroh = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

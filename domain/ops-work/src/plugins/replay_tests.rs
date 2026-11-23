@@ -1,0 +1,550 @@
+//! Tests replays: a late install and a widened grant replay once, skipped revisions and resumes
+//! replay from the activation, a cut replay continues, and clocks and pruning are bounded.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::plugins::calls::*;
+use crate::plugins::clock::ClockReading;
+use crate::plugins::journal::JOURNAL_PAGE;
+use crate::plugins::matcher::tests::gap;
+use crate::plugins::rows::decode;
+use crate::plugins::rows::tests::child_result;
+use crate::plugins::rows::tests::values_result;
+use aruna_core::keyspaces::PLUGIN_GAPS_KEYSPACE;
+use aruna_core::plugin_installs::Widening;
+use aruna_core::plugin_runs::{GapRow, gap_key};
+use aruna_core::time::unix_timestamp_millis;
+use aruna_test_harness::plugins::artifacts::{echoed_sync, install_artifact, installed};
+use aruna_test_harness::plugins::flows::matcher::{config, forwarded, journal};
+use aruna_test_harness::plugins::rows::Txn;
+use aruna_test_harness::plugins::{created, scoped, synced};
+
+const MINUTE: u64 = 60 * 1000;
+
+async fn no_clock(_: NodeId) -> Option<ClockReading> {
+    None
+}
+
+/// A created dataset journaled here at `at_ms`.
+fn dataset(install: &PluginInstall, resource: &str, at_ms: u64) -> SourceEvent {
+    let mut event = created(install, resource).0;
+    (event.journaled_ms, event.anchor_ms) = (at_ms, at_ms);
+    event
+}
+
+/// Matches the pending rows as a node that did not know any install yet.
+async fn unmatched(fixture: &aruna_test_harness::plugins::Fixture, now: u64) {
+    let mut bare = config(fixture).await;
+    bare.installs.clear();
+    let local = fixture.actor.node_id;
+    match_journal(&fixture.ctx, &bare, local, (now, EVENTS_QUEUED))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn late_install() {
+    // Active elsewhere, committed here before this node had the install: one row, once.
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
+    journal(&fixture, &dataset(&install, "D1", now)).await;
+    unmatched(&fixture, now).await;
+    let config = config(&fixture).await;
+    assert_eq!(
+        plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
+        Ok(1)
+    );
+    assert_eq!(
+        run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await,
+        Ok(1)
+    );
+    assert_eq!(
+        plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
+        Ok(0)
+    );
+    assert_eq!(
+        run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await,
+        Ok(0)
+    );
+    assert_eq!(forwarded(&fixture, &install).await, ["D1"]);
+}
+
+#[tokio::test]
+async fn widened_grant() {
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, now, auth) = (
+        fixture.actor.node_id,
+        unix_timestamp_millis(),
+        fixture.auth(),
+    );
+    let (whole, base) = (install.grants["read"].clone(), created(&install, "").1);
+    let (inside, outside) = (
+        dataset(&install, "A/one", now - 1),
+        dataset(&install, "B/two", now),
+    );
+    let id = install.install_id;
+    let narrow = scoped(vec![format!("{base}/A/**")]);
+    set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrow)
+        .await
+        .unwrap();
+    let narrowed = config(&fixture).await;
+    plan_replays(&fixture.ctx, &narrowed, local, now, no_clock)
+        .await
+        .unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX))
+        .await
+        .unwrap();
+    journal(&fixture, &inside).await;
+    journal(&fixture, &outside).await;
+    match_journal(&fixture.ctx, &narrowed, local, (now, EVENTS_QUEUED))
+        .await
+        .unwrap();
+    assert_eq!(forwarded(&fixture, &install).await, ["A/one"]);
+
+    let wide = scoped(whole);
+    let widened = set_grants(&fixture.ctx, &fixture.actor, &auth, id, &wide);
+    assert!(widened.await.unwrap().widened.is_some());
+    let config = config(&fixture).await;
+    assert_eq!(
+        plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
+        Ok(1)
+    );
+    // Only the newly covered event is read into a forward row.
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(forwarded(&fixture, &install).await, ["A/one", "B/two"]);
+    assert_eq!(
+        plan_replays(&fixture.ctx, &config, local, now, no_clock).await,
+        Ok(0)
+    );
+}
+
+#[tokio::test]
+async fn widened_sync() {
+    // A sync row journaled while the grant left its path out is read once the grant widens.
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, now, auth) = (
+        fixture.actor.node_id,
+        unix_timestamp_millis(),
+        fixture.auth(),
+    );
+    let whole = install.grants["read"].clone();
+    let base = whole[0].strip_suffix("/**").unwrap().to_string();
+    let (inside, outside) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 2));
+    let id = install.install_id;
+    let narrow = scoped(vec![format!("{base}/data/raw/**")]);
+    (set_grants(&fixture.ctx, &fixture.actor, &auth, id, &narrow).await).unwrap();
+    let narrowed = config(&fixture).await;
+    plan_replays(&fixture.ctx, &narrowed, local, now, no_clock)
+        .await
+        .unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX))
+        .await
+        .unwrap();
+    for (prefix, relationship, at) in [("raw/", inside, now - 1), ("other/", outside, now)] {
+        let mut event = synced(&install, prefix, relationship);
+        (event.journaled_ms, event.anchor_ms) = (at, at);
+        journal(&fixture, &event).await;
+    }
+    match_journal(&fixture.ctx, &narrowed, local, (now, EVENTS_QUEUED))
+        .await
+        .unwrap();
+    assert_eq!(forwarded(&fixture, &install).await, [inside.to_string()]);
+
+    let wide = scoped(whole);
+    let widened = set_grants(&fixture.ctx, &fixture.actor, &auth, id, &wide);
+    assert!(widened.await.unwrap().widened.is_some());
+    let config = config(&fixture).await;
+    let planned = plan_replays(&fixture.ctx, &config, local, now, no_clock).await;
+    assert_eq!(planned, Ok(1));
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX))
+        .await
+        .unwrap();
+    let both = [inside.to_string(), outside.to_string()];
+    assert_eq!(forwarded(&fixture, &install).await, both);
+}
+
+#[tokio::test]
+async fn growth_rules() {
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let mut install = installed(&fixture).await;
+    let since = install.active_since_ms.unwrap();
+    let wide = Coverage::from([(
+        TriggerKind::DatasetCreated,
+        BTreeSet::from(["/a/**".into()]),
+    )]);
+    let narrow = Coverage::from([(TriggerKind::DatasetCreated, BTreeSet::from(["/a/b".into()]))]);
+    let other = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+    let row = |revision, coverage: &Coverage| CoverageRow {
+        revision,
+        active_since_ms: Some(since),
+        coverage: coverage.clone(),
+        note: None,
+    };
+    install.revision = 3;
+    install.widened = Some(Widening {
+        at_ms: since + 60 * MINUTE,
+        by: other,
+        extends: 2,
+    });
+    let first = growth(&install, None, &wide).unwrap();
+    assert_eq!((first.0, first.1), (Coverage::new(), since));
+    assert_eq!(growth(&install, Some(&row(3, &narrow)), &wide), None);
+    assert_eq!(growth(&install, Some(&row(2, &wide)), &wide), None);
+    let extended = growth(&install, Some(&row(2, &narrow)), &wide).unwrap();
+    assert_eq!((extended.1, extended.2), (since + 60 * MINUTE, Some(other)));
+    // Revision 2 was skipped here, so the grown part replays from the activation.
+    let skipped = growth(&install, Some(&row(1, &narrow)), &wide).unwrap();
+    assert_eq!((skipped.0, skipped.1), (narrow.clone(), since));
+    let mut resumed = row(3, &wide);
+    resumed.active_since_ms = Some(since - 1);
+    assert_eq!(
+        growth(&install, Some(&resumed), &wide).unwrap().0,
+        Coverage::new()
+    );
+}
+
+#[tokio::test]
+async fn cut_replay_continues() {
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
+    for (n, resource) in ["D1", "D2", "D3"].into_iter().enumerate() {
+        journal(&fixture, &dataset(&install, resource, now - 3 + n as u64)).await;
+    }
+    unmatched(&fixture, now).await;
+    let config = config(&fixture).await;
+    plan_replays(&fixture.ctx, &config, local, now, no_clock)
+        .await
+        .unwrap();
+    // One key page and one journal page of one row.
+    assert_eq!(run_replays(&fixture.ctx, now, (1, 2)).await, Ok(1));
+    // After a restart the replay reads on from its last row.
+    assert_eq!(
+        run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX)).await,
+        Ok(2)
+    );
+    assert_eq!(forwarded(&fixture, &install).await, ["D1", "D2", "D3"]);
+}
+
+#[tokio::test]
+async fn unreadable_clock() {
+    // Six minutes off with two minutes of round trip: the replay starts at the earliest row.
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let install = installed(&fixture).await;
+    let (local, now) = (fixture.actor.node_id, unix_timestamp_millis());
+    journal(&fixture, &dataset(&install, "D0", now - 24 * 60 * MINUTE)).await;
+    unmatched(&fixture, now).await;
+    let other = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+    let mut config = config(&fixture).await;
+    config.installs[0].activated_by = Some(other);
+    let slow = async |_| {
+        Some(ClockReading {
+            sent_ms: now,
+            remote_ms: now - 6 * MINUTE,
+            received_ms: now + 2 * MINUTE,
+        })
+    };
+    plan_replays(&fixture.ctx, &config, local, now, slow)
+        .await
+        .unwrap();
+    run_replays(&fixture.ctx, now, (JOURNAL_PAGE, usize::MAX))
+        .await
+        .unwrap();
+    assert_eq!(forwarded(&fixture, &install).await, ["D0"]);
+    let key = row_key(COVERAGE_ROW, install.install_id);
+    let row = Txn::direct(&fixture.ctx)
+        .read(PLUGIN_REPLAYS_KEYSPACE, &key)
+        .await;
+    let row: CoverageRow = decode(&row.unwrap().unwrap()).unwrap();
+    assert!(row.note.unwrap().contains(&other.to_string()));
+}
+
+#[tokio::test]
+async fn pruned_journal() {
+    let fixture = aruna_test_harness::plugins::Fixture::new().await;
+    let install = install_artifact(&fixture, echoed_sync()).await;
+    let local = fixture.actor.node_id;
+    let now = install.active_since_ms.unwrap() + JOURNAL_RETENTION_MS + 60 * MINUTE;
+    let config = config(&fixture).await;
+    plan_replays(&fixture.ctx, &config, local, now, no_clock)
+        .await
+        .unwrap();
+    // The pruned part held an unknown number of events.
+    let pruned = gap(&fixture, &install, GapReason::Pruned).await.unwrap();
+    assert_eq!((pruned.count, pruned.unknown), (0, true));
+    let since = install.active_since_ms.unwrap();
+    assert!(pruned.earliest_ms < since && pruned.latest_ms == now - JOURNAL_RETENTION_MS);
+    // Each grown sync kind counts its own pruned gap.
+    for kind in [SourceKind::SyncCompleted, SourceKind::SyncFailed] {
+        let key = gap_key(install.install_id, kind, GapReason::Pruned);
+        let row = Txn::direct(&fixture.ctx)
+            .read(PLUGIN_GAPS_KEYSPACE, &key)
+            .await;
+        let row: GapRow = decode(&row.unwrap().expect("a pruned gap")).unwrap();
+        assert_eq!((row.count, row.unknown), (0, true), "{kind:?}");
+    }
+}
+
+#[test]
+fn replay_rows_read() {
+    let mut plan = ReplayRows(Ulid::from_parts(2, 2));
+    let Next::Call(IoCall::Read(keys)) = plan.first().unwrap() else {
+        panic!("the replay rows are read together");
+    };
+    assert_eq!(keys.len(), 2);
+    let answer = plan.next(values_result(vec![None, None])).unwrap();
+    assert_eq!(answer, Next::Done((None, None)));
+    assert!(plan.next(values_result(vec![None])).is_err());
+}
+
+fn replay_target(install: &PluginInstall) -> Target {
+    Target {
+        install_id: install.install_id,
+        group_id: install.group_id,
+        revision: install.revision,
+        coverage: BTreeMap::new(),
+        account: install.account,
+    }
+}
+
+type ReplayAnswer = (Option<CoverageRow>, Option<ReplayRow>);
+
+#[test]
+fn first_coverage_starts() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let mut plan = PlanReplay::new(install.clone(), replay_target(&install));
+    assert!(matches!(plan.first(), Ok(Next::Call(IoCall::Child(_)))));
+    let rows: ReplayAnswer = (None, None);
+    let answer = plan.next(child_result(Ok::<_, StoreError>(rows))).unwrap();
+    let Next::Done(ReplayPlan::Start { boundary, by, .. }) = answer else {
+        panic!("a first activation replays");
+    };
+    assert_eq!((boundary, by), (5, install.activated_by));
+}
+
+#[test]
+fn moved_record_updates() {
+    let install = crate::plugins::work::tests::sample_install(Ulid::from_parts(1, 1));
+    let mut newer = install.clone();
+    newer.revision = 2;
+    let row = CoverageRow {
+        revision: 1,
+        active_since_ms: newer.active_since_ms,
+        coverage: BTreeMap::new(),
+        note: None,
+    };
+    let mut plan = PlanReplay::new(newer.clone(), replay_target(&newer));
+    let rows: ReplayAnswer = (Some(row), None);
+    let answer = plan.next(child_result(Ok::<_, StoreError>(rows)));
+    assert!(matches!(answer, Ok(Next::Call(IoCall::Write(_)))));
+    assert_eq!(
+        plan.next(IoResult::Done),
+        Ok(Next::Done(ReplayPlan::Nothing))
+    );
+}
+
+fn key_page(keys: &[&[u8]]) -> IoResult {
+    let rows = keys.iter().map(|key| (key.to_vec(), Vec::new())).collect();
+    crate::plugins::rows::tests::page_result(rows, None)
+}
+
+#[test]
+fn replays_pages_bounded() {
+    // The key page and every journal page cost one page; a spent budget names where to go on.
+    let mut replays = RunReplays::new(9, (10, 3), None);
+    assert!(matches!(
+        replays.first(),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let turn = replays.next(key_page(&[b"r1"]));
+    assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+    let more = child_result(Ok::<_, StoreError>((4usize, false)));
+    assert!(matches!(
+        replays.next(more),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    let spent = Replayed {
+        read: 4,
+        more: true,
+        after: Some(b"r1".to_vec()),
+        failed: 0,
+    };
+    assert_eq!(replays.next(key_page(&[b"r1"])), Ok(Next::Done(spent)));
+}
+
+#[test]
+fn replays_take_turns() {
+    // Each replay reads a page in turn, so a long replay cannot hold back the others.
+    let mut replays = RunReplays::new(9, (10, 3), None);
+    replays.first().unwrap();
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r1"[..]));
+    let more = || child_result(Ok::<_, StoreError>((10usize, false)));
+    replays.next(more()).unwrap();
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "then the other one"
+    );
+    let ended = child_result(Ok::<_, StoreError>((2usize, true)));
+    let spent = Replayed {
+        read: 12,
+        more: true,
+        after: Some(b"r2".to_vec()),
+        failed: 0,
+    };
+    assert_eq!(replays.next(ended), Ok(Next::Done(spent)));
+}
+
+#[test]
+fn failed_replay_waits() {
+    // A failing replay neither stops the pass nor asks for the next tick at once; the position
+    // goes past it, so the other installs come first.
+    let mut replays = RunReplays::new(9, (10, 5), None);
+    replays.first().unwrap();
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(
+        Err::<(usize, bool), _>(StoreError::Message("unreadable".into())),
+    ));
+    replays.next(failed).unwrap();
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r2"[..]),
+        "the next install goes on"
+    );
+    let more = child_result(Ok::<_, StoreError>((3usize, false)));
+    let done = Replayed {
+        read: 3,
+        more: false,
+        after: Some(b"r2".to_vec()),
+        failed: 1,
+    };
+    assert_eq!(replays.next(more), Ok(Next::Done(done)));
+}
+
+#[test]
+fn cursor_wraps_once() {
+    // A pass goes on after the last replay of the previous one, then wraps to the first once.
+    let mut replays = RunReplays::new(9, (10, 10), Some(b"r1".to_vec()));
+    let Ok(Next::Call(IoCall::Page { after, .. })) = replays.first() else {
+        panic!("expected the key page after the cursor");
+    };
+    assert_eq!(after.map(|key| key.to_vec()), Some(b"r1".to_vec()));
+    replays.next(key_page(&[b"r2"])).unwrap();
+    assert_eq!(replays.current.as_deref(), Some(&b"r2"[..]));
+    let ended = || child_result(Ok::<_, StoreError>((1usize, true)));
+    assert!(matches!(
+        replays.next(ended()),
+        Ok(Next::Call(IoCall::Page { .. }))
+    ));
+    replays.next(key_page(&[b"r1", b"r2"])).unwrap();
+    assert_eq!(
+        replays.current.as_deref(),
+        Some(&b"r1"[..]),
+        "then the first one"
+    );
+    let done = Replayed {
+        read: 2,
+        more: false,
+        after: None,
+        failed: 0,
+    };
+    assert_eq!(replays.next(ended()), Ok(Next::Done(done)));
+}
+
+mod replay_pass {
+    use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::realm::RealmNodeKind;
+    use aruna_core::user::id::UserId;
+    use serde_json::json;
+
+    use super::*;
+    use crate::plugins::clock::SKEW_MARGIN_MS;
+    use crate::plugins::fixtures::{self, is_child, node};
+    use crate::plugins::rows::tests::child_result;
+
+    fn plans() -> PlanReplays {
+        let config = Arc::new(fixtures::config(&fixtures::install(), json!({})));
+        PlanReplays::new(config, node(3), 50)
+    }
+
+    fn start_plan(by: Option<NodeId>) -> ReplayPlan {
+        let install = fixtures::install();
+        let next = CoverageRow {
+            revision: 1,
+            active_since_ms: None,
+            coverage: Default::default(),
+            note: None,
+        };
+        ReplayPlan::Start {
+            target: Box::new(Target {
+                install_id: install.install_id,
+                group_id: install.group_id,
+                revision: 1,
+                coverage: Default::default(),
+                account: install.account,
+            }),
+            next: Box::new(next),
+            old: Default::default(),
+            boundary: SKEW_MARGIN_MS + 100,
+            by,
+        }
+    }
+
+    fn started() -> IoResult {
+        child_result(Ok::<(), StoreError>(()))
+    }
+
+    #[test]
+    fn user_node_skips() {
+        let mut config = fixtures::config(&fixtures::install(), json!({}));
+        let owner = UserId::nil(fixtures::realm());
+        config.ensure_node(node(4), RealmNodeKind::User { owner });
+        let mut plans = PlanReplays::new(Arc::new(config), node(4), 50);
+        assert_eq!(plans.first(), Ok(Next::Done(0)));
+    }
+
+    #[test]
+    fn local_boundary_starts() {
+        let mut plans = plans();
+        assert!(is_child(&Ok::<_, StoreError>(
+            plans.planned(start_plan(Some(node(3))))
+        )));
+        assert_eq!(plans.next(started()), Ok(Next::Done(1)));
+    }
+
+    #[test]
+    fn remote_clock_asked() {
+        let mut plans = plans();
+        plans.stamp(1_000);
+        let asked = plans.planned(start_plan(Some(node(1))));
+        assert!(matches!(asked, Next::Call(IoCall::Child(_))));
+        plans.stamp(1_010);
+        let clock = child_result(Ok::<_, IoError>(Some(1_005u64)));
+        assert!(is_child(&plans.next(clock)));
+        assert_eq!(plans.next(started()), Ok(Next::Done(1)));
+    }
+
+    #[test]
+    fn silent_clock_starts() {
+        let mut plans = plans();
+        plans.planned(start_plan(Some(node(1))));
+        let clock = child_result(Ok::<Option<u64>, IoError>(None));
+        assert!(is_child(&plans.next(clock)));
+    }
+
+    #[test]
+    fn nothing_planned() {
+        let mut plans = plans();
+        plans.targets.clear();
+        let answer = child_result(Ok::<_, StoreError>(ReplayPlan::Nothing));
+        assert_eq!(plans.next(answer), Ok(Next::Done(0)));
+    }
+}

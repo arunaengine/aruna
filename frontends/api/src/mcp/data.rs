@@ -1,0 +1,1422 @@
+//! MCP tools that list buckets and objects, read and write them, and aggregate or search.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::compute::request_bearer;
+use super::{
+    JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
+    server_error, tool_extras,
+};
+use crate::lookup::ObjectOutput;
+use crate::routes::storage::objects::object_page;
+use crate::routes::storage::relay::{relay_json, rest_target};
+use crate::server::state::ServerState;
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::HASH_MD5;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::{
+    BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
+};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_work::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_ops_work::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_ops_work::metadata::api::search_types::BucketSearchRequest;
+use aruna_ops_work::placement::policy::gate::GateOperation;
+use aruna_ops_work::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use aruna_ops_work::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_ops_work::s3::object::get::{GetObjectError, GetObjectInput};
+use aruna_ops_work::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_ops_work::s3::object::pages::ListRequest;
+use aruna_ops_work::s3::object::put::{
+    PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use aruna_ops_work::staging::offered_directory::OfferedDirectoryError;
+use aruna_ops_work::transfer::read::GetRoutedOperation;
+use aruna_runner::driver::{drive, node_routing};
+use bytes::Bytes;
+use futures_util::{StreamExt, stream};
+use rmcp::Json;
+use rmcp::handler::server::tool::Extension;
+use rmcp::model::CallToolResult;
+use rmcp::{schemars, tool, tool_router};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
+/// Upper bound on one aggregation's scan, so a huge bucket answers partially
+/// rather than holding the tool open.
+const MAX_SCAN_OBJECTS: usize = 50_000;
+const SCAN_PAGE_KEYS: usize = 1_000;
+/// Listing pages one aggregation reads at most, readable entries or not; each page examines a
+/// bounded number of entries, so a mostly unreadable bucket ends the scan too.
+const MAX_SCAN_PAGES: usize = MAX_SCAN_OBJECTS / SCAN_PAGE_KEYS;
+const DEFAULT_BUCKETS: usize = 200;
+const MAX_BUCKETS: usize = 1_000;
+const BUCKET_PAGE: usize = 50;
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct BucketOutput {
+    pub bucket: String,
+    pub group_id: String,
+    pub node_id: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct BucketsOutput {
+    pub buckets: Vec<BucketOutput>,
+    pub next_cursor: Option<String>,
+    pub nodes_failed: usize,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ListBucketsInput {
+    /// Opaque continuation token copied verbatim from the `next_cursor` of a
+    /// previous `list_buckets` answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ListObjectsInput {
+    /// S3 bucket name, containing three to 63 lowercase letters, digits, dots, or hyphens.
+    /// Call `list_buckets` for names. Do not pass an `s3://` URL or key.
+    pub bucket: String,
+    /// Optional key prefix filter, for example `reads/2026/`. Matched literally
+    /// from the start of the key, with no wildcards and no leading slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Opaque continuation token copied verbatim from the `next_cursor` of a
+    /// previous `list_objects` answer for the same bucket and prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    /// Maximum number of objects to return. Defaults to 100 and is clamped to
+    /// the range 1 to 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ObjectsOutput {
+    pub bucket: String,
+    pub objects: Vec<ObjectOutput>,
+    pub next_cursor: Option<String>,
+    /// The node that answered the call.
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReadObjectInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Call
+    /// `list_buckets` for the readable names; this is not an `s3://` URL.
+    pub bucket: String,
+    /// Object key inside the bucket, for example `reads/sample.fastq.gz`.
+    /// Relative, with no leading slash, no `..` segment, and no control
+    /// character. Call `list_objects` for the keys in a bucket.
+    pub key: String,
+    /// Byte offset to start reading from. Defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+    /// Maximum number of bytes to return. Defaults to 1048576, which is also
+    /// the maximum; a value outside 1 to 1048576 is refused. The answer sets
+    /// `truncated` when the object continues past this window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct ReadObjectOutput {
+    pub bucket: String,
+    pub key: String,
+    pub offset: u64,
+    pub bytes: usize,
+    pub content_type: String,
+    pub truncated: bool,
+    pub text: String,
+    /// The node that answered the call.
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StatObjectInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Call
+    /// `list_buckets` for the readable names; this is not an `s3://` URL.
+    pub bucket: String,
+    /// Object key inside the bucket, for example `results/run-1/chart.png`.
+    /// Relative, with no leading slash, no `..` segment, and no control
+    /// character. Call `list_objects` for the keys in a bucket.
+    pub key: String,
+    /// Exact version to describe, as the 26-character ULID `list_job_outputs`
+    /// or a previous write returned. Omit it for the key's latest version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<String>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct StatObjectOutput {
+    pub bucket: String,
+    pub key: String,
+    /// Version described, which for an omitted `version_id` is the latest one.
+    pub version_id: Option<String>,
+    pub filename: String,
+    pub size: u64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    /// The stored type, or the type the key's extension implies. Never null, so
+    /// a caller can decide how to render the object before fetching it.
+    pub content_type: String,
+    /// Node that owns this version; S3 reads of it go to that node's endpoint.
+    pub node_id: String,
+}
+
+/// Calendar unit one aggregation bucket spans, in UTC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BucketUnit {
+    Day,
+    Week,
+    Month,
+}
+
+impl BucketUnit {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Week => "week",
+            Self::Month => "month",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct AggregateObjectsInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. Call
+    /// `list_buckets` for the readable names.
+    pub bucket: String,
+    /// Optional key prefix filter, for example `reads/2026/`. Matched literally
+    /// from the start of the key, with no wildcards and no leading slash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Calendar unit each bucket spans, in UTC: `day`, `week` (starting
+    /// Monday), or `month`. Objects are counted by their last modification.
+    pub bucket_by: BucketUnit,
+    /// Optional inclusive lower bound as RFC 3339, for example
+    /// `2026-01-01T00:00:00Z`. Objects modified earlier are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// Optional exclusive upper bound as RFC 3339, for example
+    /// `2026-02-01T00:00:00Z`. Objects modified at or after it are ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    /// Maximum number of buckets to return, oldest first. Defaults to 200 and is
+    /// clamped to the range 1 to 1000; a longer series sets `truncated`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_buckets: Option<usize>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct TimeBucketOutput {
+    /// Start of the bucket in RFC 3339 UTC; it spans one `bucket_by` unit.
+    pub start: String,
+    pub count: u64,
+    pub bytes: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct AggregateObjectsOutput {
+    pub bucket: String,
+    pub prefix: Option<String>,
+    pub bucket_by: String,
+    pub buckets: Vec<TimeBucketOutput>,
+    /// Totals over every object in the window, including buckets the answer
+    /// dropped.
+    pub total_count: u64,
+    pub total_bytes: u64,
+    /// Readable objects the scan examined before the time window applied.
+    pub scanned: usize,
+    /// The scan hit its object cap or the series exceeded `max_buckets`, so the
+    /// answer covers only part of the prefix.
+    pub truncated: bool,
+    /// Key ranges a copy listed because their coordinator could not answer; their
+    /// counts may miss recent changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_ranges: Vec<String>,
+    /// The node that answered the call.
+    pub node_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct WriteObjectInput {
+    /// Bucket name as the S3 surface uses it, for example `project-data`. It
+    /// must already exist and the caller needs write permission on it.
+    pub bucket: String,
+    /// Object key inside the bucket, for example `notes/summary.md`. Relative,
+    /// with no leading slash, no `..` segment, and no control character. An
+    /// existing key is replaced with a new version.
+    pub key: String,
+    /// The full UTF-8 body to store, at most 1048576 bytes. This tool writes
+    /// text only; binary content must go through the S3 surface.
+    pub text: String,
+    /// MIME type recorded for the object, for example `application/json`.
+    /// Defaults to `text/plain; charset=utf-8`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Optional `node_id` from `list_buckets` that holds the bucket. Omit it to run the call
+    /// on the node that holds the bucket, found by its name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, schemars::JsonSchema, utoipa::ToSchema)]
+pub struct WriteObjectOutput {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    pub size: u64,
+    pub content_type: String,
+    /// The node that answered the call.
+    pub node_id: String,
+}
+
+/// Which section of the unified search to query.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchKind {
+    Documents,
+    Buckets,
+    Groups,
+    Users,
+}
+
+impl SearchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Documents => "documents",
+            Self::Buckets => "buckets",
+            Self::Groups => "groups",
+            Self::Users => "users",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct SearchInput {
+    /// Search text of at least two characters. Buckets, groups, and users use substring matching.
+    /// Documents search names, descriptions, keywords, and identifiers after removing operators.
+    pub q: String,
+    /// Restrict the answer to one section: `documents`, `buckets`, `groups`, or
+    /// `users`. Omit to search all four. Each section returns at most ten hits,
+    /// and the users section is present only for a caller with admin read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SearchKind>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SearchOutput {
+    pub results: JsonPayload,
+}
+
+pub(crate) fn toolset() -> rmcp::handler::server::router::tool::ToolRouter<McpServer> {
+    McpServer::data_router()
+}
+
+#[tool_router(router = data_router)]
+impl McpServer {
+    #[tool(
+        description = "List the buckets across the realm that the caller may read, as the bucket search does: the caller's own groups' buckets, buckets shared with the caller and public buckets, each with its name, owning group_id, node_id, and creation time. Call it first to obtain the bucket name that list_objects, read_object, write_object, and run_script require. Those tools run on the node that holds the bucket, found by its name, and report it as node_id; a distributed bucket shows once, under one of its member nodes. Follow next_cursor for the next page; nodes_failed above zero means buckets of an unreachable node may be missing.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn list_buckets(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ListBucketsInput>,
+    ) -> Result<Json<BucketsOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let extras = tool_extras("list_buckets", &input)?;
+        authorize_search(self, &auth, extras.clone()).await?;
+        // Every node checks the caller on its own buckets and leaves out what it may not read.
+        let bearer = request_bearer(&parts).map(|carrier| carrier.as_str().to_string());
+        let result = drive(
+            search_buckets_distributed(
+                self.state.get_realm_id(),
+                self.state.get_node_id(),
+                BucketSearchRequest {
+                    auth: auth.clone(),
+                    bearer_token: bearer,
+                    query: String::new(),
+                    key: None,
+                    // The tool's policies apply on each node, before members of a bucket merge.
+                    extras: Some(extras.clone()),
+                    limit: BUCKET_PAGE,
+                    group_id: None,
+                    cursor: input.cursor,
+                    target_nodes: None,
+                    database: false,
+                },
+            ),
+            self.state.get_ctx().as_ref(),
+        )
+        .await
+        .map_err(crate::metadata::map_api_error)
+        .map_err(server_error)?;
+        let buckets = result
+            .hits
+            .into_iter()
+            .map(|hit| BucketOutput {
+                bucket: hit.bucket,
+                group_id: hit.group_id.to_string(),
+                node_id: hit.node_id.to_string(),
+                created_at: chrono::DateTime::<chrono::Utc>::from(hit.created_at).to_rfc3339(),
+            })
+            .collect();
+        Ok(Json(BucketsOutput {
+            buckets,
+            next_cursor: result.next_cursor,
+            nodes_failed: result.fanout_stats.nodes_failed,
+        }))
+    }
+
+    #[tool(
+        description = "List objects in one bucket, each with key, size, etag, last_modified, content_type, content_id, and whether it is a reference. Use content_id as the File entity @id and s3://bucket/key as its contentUrl. Call list_buckets first for a valid bucket name. Narrow the answer with a key prefix, and follow next_cursor for the next page. Use read_object to fetch the text of one key.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn list_objects(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ListObjectsInput>,
+    ) -> Result<Json<ObjectsOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let prefix = input.prefix.as_deref().unwrap_or_default();
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), prefix);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "list_objects", &input)
+                    .await?,
+            ));
+        }
+        let extras = tool_extras("list_objects", &input)?;
+        let bucket_info = self.bucket_info(&input.bucket).await?;
+        let path = listing_path(&self.state, &bucket_info, &input.bucket, &input.prefix);
+        authorize_tool(&self.state, &auth, path, Permission::READ, extras)
+            .await
+            .map_err(|error| object_error(error, "read"))?;
+        let limit = input.limit.unwrap_or(100).clamp(1, 200);
+        // Only what the caller may read shows, as in the bucket's own listing; a distributed
+        // bucket is listed across its key ranges.
+        let bearer = request_bearer(&parts);
+        let request = ListRequest {
+            bucket: input.bucket.clone(),
+            prefix: input.prefix,
+            delimiter: None,
+            cursor: input.cursor,
+            limit,
+            partial: false,
+        };
+        let expiry = bearer
+            .as_ref()
+            .map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+        let caller = (bearer.as_ref(), Some((&auth, expiry)));
+        let page = object_page(&self.state, &bucket_info, caller, request)
+            .await
+            .map_err(server_error)?;
+        Ok(Json(ObjectsOutput {
+            bucket: input.bucket,
+            objects: page.objects,
+            next_cursor: page.next_cursor,
+            node_id: self.state.get_node_id().to_string(),
+        }))
+    }
+
+    #[tool(
+        description = "Read a bounded UTF-8 text window from one object and return the text with its offset, byte count, content type, and a truncated flag. Call list_objects for a valid key. Use offset and max_bytes to walk a large object; the window is at most 1 MiB. An object that is not valid UTF-8 is refused, so this tool cannot fetch binary content.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn read_object(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<ReadObjectInput>,
+    ) -> Result<Json<ReadObjectOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), &input.key);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "read_object", &input).await?,
+            ));
+        }
+        let extras = tool_extras("read_object", &input)?;
+        Ok(Json(read_text(self, &auth, input, extras).await?))
+    }
+
+    #[tool(
+        description = "Describe one object without reading its bytes: size, etag, last_modified, content type, filename, and the owning node. Pass version_id to describe the exact version a job wrote, as list_job_outputs reports it; omit it for the latest version. The content type is never null, so use this to decide whether an object is an image, JSON, or text before fetching it. Binary objects are fetched through the S3 surface with the bucket, key, and version_id, not through this tool.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn stat_object(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<StatObjectInput>,
+    ) -> Result<Json<StatObjectOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), &input.key);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "stat_object", &input).await?,
+            ));
+        }
+        let extras = tool_extras("stat_object", &input)?;
+        validate_key(&input.key)?;
+        let version_id = input
+            .version_id
+            .as_deref()
+            .map(|version_id| {
+                super::parse_ulid(
+                    "version_id",
+                    version_id,
+                    "copy it from a list_job_outputs entry or a write_object answer, or omit it \
+                     for the latest version",
+                )
+            })
+            .transpose()?;
+        let bucket_info = self.bucket_info(&input.bucket).await?;
+        authorize_tool(
+            &self.state,
+            &auth,
+            object_permission_path(
+                self.state.get_realm_id(),
+                bucket_info.group_id,
+                self.state.get_node_id(),
+                &input.bucket,
+                &input.key,
+            ),
+            Permission::READ,
+            extras,
+        )
+        .await
+        .map_err(|error| object_error(error, "read"))?;
+        let result = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                version_id,
+            }),
+            &self.state.get_ctx(),
+        )
+        .await
+        .map_err(map_head_error)?;
+        let size = result
+            .location
+            .as_ref()
+            .map(|location| location.blob_size)
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .map(|metadata| metadata.content_length)
+            })
+            .unwrap_or(0);
+        let etag = result
+            .location
+            .as_ref()
+            .and_then(|location| location.hashes.get(HASH_MD5))
+            .map(hex::encode)
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.etag.clone())
+            });
+        let last_modified = result
+            .version_created_at
+            .or(result.last_refresh)
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.last_modified)
+            })
+            .map(|time| chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339());
+        let content_type = result
+            .metadata
+            .get(CONTENT_TYPE_KEY)
+            .cloned()
+            .or_else(|| {
+                result
+                    .source_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.content_type.clone())
+            })
+            .unwrap_or_else(|| key_content_type(&input.key).to_string());
+        Ok(Json(StatObjectOutput {
+            filename: filename_of(&input.key),
+            version_id: result
+                .version_id
+                .or(result.resolved_version_id)
+                .map(|version_id| version_id.to_string()),
+            bucket: input.bucket,
+            key: input.key,
+            size,
+            etag,
+            last_modified,
+            content_type,
+            node_id: self.state.get_node_id().to_string(),
+        }))
+    }
+
+    #[tool(
+        description = "Count objects and bytes per calendar bucket over one bucket and optional key prefix, so a question such as documents per week is answered in one call instead of paging list_objects. Objects are bucketed by their last modification in UTC, with weeks starting Monday, and an optional since and until window bounds the range. Only objects the caller may read count, across every key range of a distributed bucket; stale_ranges names ranges a possibly lagging copy answered. The scan stops after 50000 objects or 50 listing pages, and the series after max_buckets, both reported as truncated.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn aggregate_objects(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<AggregateObjectsInput>,
+    ) -> Result<Json<AggregateObjectsOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let prefix = input.prefix.as_deref().unwrap_or_default();
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), prefix);
+        if let Some(node_id) = node.await? {
+            let tool = "aggregate_objects";
+            return Ok(Json(self.forward(&parts, node_id, tool, &input).await?));
+        }
+        let extras = tool_extras("aggregate_objects", &input)?;
+        let since = parse_bound("since", input.since.as_deref())?;
+        let until = parse_bound("until", input.until.as_deref())?;
+        if let (Some(since), Some(until)) = (since, until)
+            && since > until
+        {
+            return Err(bad_request("since must not be later than until"));
+        }
+        let max_buckets = input
+            .max_buckets
+            .unwrap_or(DEFAULT_BUCKETS)
+            .clamp(1, MAX_BUCKETS);
+        let bucket_info = self.bucket_info(&input.bucket).await?;
+        let path = listing_path(&self.state, &bucket_info, &input.bucket, &input.prefix);
+        authorize_tool(&self.state, &auth, path, Permission::READ, extras)
+            .await
+            .map_err(|error| object_error(error, "read"))?;
+        // Only what the caller may read counts, as in the REST listing, across every key range.
+        let bearer = request_bearer(&parts);
+        let expiry = (bearer.as_ref()).map_or(0, crate::auth::ValidatedBearer::expires_at_secs);
+        let (mut samples, mut stale_ranges) = (Vec::new(), Vec::new());
+        let mut cursor = None;
+        let (mut scanned, mut pages) = (0usize, 0usize);
+        let mut scan_truncated = false;
+        loop {
+            let request = ListRequest {
+                bucket: input.bucket.clone(),
+                prefix: input.prefix.clone(),
+                delimiter: None,
+                cursor,
+                limit: SCAN_PAGE_KEYS,
+                partial: false,
+            };
+            let caller = (bearer.as_ref(), Some((&auth, expiry)));
+            let page = object_page(&self.state, &bucket_info, caller, request)
+                .await
+                .map_err(server_error)?;
+            scanned = scanned.saturating_add(page.objects.len());
+            for object in &page.objects {
+                let at = object.last_modified.as_deref();
+                let Some(at) = at.and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                else {
+                    continue;
+                };
+                let at = at.with_timezone(&chrono::Utc);
+                if since.is_some_and(|since| at < since) || until.is_some_and(|until| at >= until) {
+                    continue;
+                }
+                samples.push(ObjectSample {
+                    at,
+                    bytes: object.size.unwrap_or(0),
+                });
+            }
+            for range in page.stale_ranges {
+                if !stale_ranges.contains(&range) {
+                    stale_ranges.push(range);
+                }
+            }
+            cursor = page.next_cursor;
+            pages += 1;
+            if cursor.is_none() {
+                break;
+            }
+            if scanned >= MAX_SCAN_OBJECTS || pages >= MAX_SCAN_PAGES {
+                scan_truncated = true;
+                break;
+            }
+        }
+        let folded = fold_buckets(&samples, input.bucket_by, max_buckets);
+        Ok(Json(AggregateObjectsOutput {
+            bucket: input.bucket,
+            prefix: input.prefix,
+            bucket_by: input.bucket_by.as_str().to_string(),
+            buckets: folded.buckets,
+            total_count: folded.total_count,
+            total_bytes: folded.total_bytes,
+            scanned,
+            truncated: scan_truncated || folded.truncated,
+            stale_ranges,
+            node_id: self.state.get_node_id().to_string(),
+        }))
+    }
+
+    #[tool(
+        description = "Write at most 1 MiB of UTF-8 text to one object and return the bucket, key, new version_id, size, and content type. The bucket must already exist and the caller needs write permission on it; call list_buckets for names. The whole body is replaced, creating a new version of an existing key, so read_object first when appending. Use create_dataset for RO-Crate metadata rather than storing it as an object.",
+        annotations(read_only_hint = false, destructive_hint = false)
+    )]
+    pub async fn write_object(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<WriteObjectInput>,
+    ) -> Result<Json<WriteObjectOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let call = (&parts, &auth);
+        let node = self.bucket_node(call, &input.bucket, input.node_id.as_deref(), &input.key);
+        if let Some(node_id) = node.await? {
+            return Ok(Json(
+                self.forward(&parts, node_id, "write_object", &input)
+                    .await?,
+            ));
+        }
+        let extras = tool_extras("write_object", &input)?;
+        let bearer = request_bearer(&parts);
+        let relay = (&parts.headers, bearer.as_ref());
+        Ok(Json(write_text(self, &auth, input, extras, relay).await?))
+    }
+
+    #[tool(
+        description = "Search across documents, buckets, groups, and users in one call and return the matching sections, each with its hits and paging state. Use it to find something by name when no id is known; use search_datasets for a metadata search that also filters by Profile conformance and group. Document hits carry document_id for get_dataset, bucket hits carry the bucket name for list_objects, and group hits carry group_id. A section the caller may not read is omitted rather than refused.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true
+        )
+    )]
+    pub async fn search(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        rmcp::handler::server::wrapper::Parameters(input): rmcp::handler::server::wrapper::Parameters<SearchInput>,
+    ) -> Result<Json<SearchOutput>, CallToolResult> {
+        let auth = request_auth(&parts)?;
+        let extras = tool_extras("search", &input)?;
+        authorize_search(self, &auth, extras).await?;
+        let bearer = parts
+            .extensions
+            .get::<Option<crate::auth::ValidatedBearer>>()
+            .cloned()
+            .flatten()
+            .map(|carrier| carrier.as_str().to_string());
+        let response = crate::routes::search::run_unified(
+            &self.state,
+            &auth,
+            bearer,
+            crate::routes::search::SearchParams {
+                q: input.q,
+                types: input.kind.map(|kind| kind.as_str().to_string()),
+                limit: None,
+                cursor: None,
+                group_id: None,
+                conforms_to: None,
+                mode: None,
+            },
+        )
+        .await
+        .map_err(server_error)?;
+        let results = serde_json::to_value(response).map_err(internal_error)?;
+        Ok(Json(SearchOutput {
+            results: JsonPayload(results),
+        }))
+    }
+
+    async fn bucket_info(&self, bucket: &str) -> Result<BucketInfo, CallToolResult> {
+        drive(
+            GetBucketOperation::new(bucket.to_string()),
+            &self.state.get_ctx(),
+        )
+        .await
+        .map_err(map_bucket_error)
+    }
+}
+
+pub(crate) fn filename_of(key: &str) -> String {
+    key.rsplit('/')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(key)
+        .to_string()
+}
+
+fn parse_bound(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, CallToolResult> {
+    value
+        .map(|value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|time| time.with_timezone(&chrono::Utc))
+                .map_err(|_| {
+                    bad_request(format!(
+                        "{field} must be an RFC 3339 timestamp such as 2026-01-01T00:00:00Z"
+                    ))
+                })
+        })
+        .transpose()
+}
+
+struct ObjectSample {
+    at: chrono::DateTime<chrono::Utc>,
+    bytes: u64,
+}
+
+struct FoldedBuckets {
+    buckets: Vec<TimeBucketOutput>,
+    total_count: u64,
+    total_bytes: u64,
+    truncated: bool,
+}
+
+/// Start of the UTC calendar bucket holding `at`. Weeks start on Monday, as ISO
+/// 8601 defines them.
+fn bucket_start(
+    at: chrono::DateTime<chrono::Utc>,
+    unit: BucketUnit,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::Datelike;
+    let date = at.date_naive();
+    let start = match unit {
+        BucketUnit::Day => date,
+        BucketUnit::Week => {
+            date - chrono::Duration::days(i64::from(date.weekday().num_days_from_monday()))
+        }
+        BucketUnit::Month => date.with_day(1).unwrap_or(date),
+    };
+    start.and_time(chrono::NaiveTime::MIN).and_utc()
+}
+
+/// Folds samples into calendar buckets. Totals cover every sample, so a series
+/// cut to `max_buckets` still reports the whole window.
+fn fold_buckets(samples: &[ObjectSample], unit: BucketUnit, max_buckets: usize) -> FoldedBuckets {
+    let mut totals: BTreeMap<i64, (u64, u64)> = BTreeMap::new();
+    let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
+    for sample in samples {
+        let entry = totals
+            .entry(bucket_start(sample.at, unit).timestamp())
+            .or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        entry.1 = entry.1.saturating_add(sample.bytes);
+        total_count = total_count.saturating_add(1);
+        total_bytes = total_bytes.saturating_add(sample.bytes);
+    }
+    let truncated = totals.len() > max_buckets;
+    let buckets = totals
+        .into_iter()
+        .take(max_buckets)
+        .map(|(start, (count, bytes))| TimeBucketOutput {
+            start: chrono::DateTime::from_timestamp(start, 0)
+                .map(|time| time.to_rfc3339())
+                .unwrap_or_default(),
+            count,
+            bytes,
+        })
+        .collect();
+    FoldedBuckets {
+        buckets,
+        total_count,
+        total_bytes,
+        truncated,
+    }
+}
+
+/// The path a listing needs READ on: the listed prefix, as for the REST listing, or the bucket.
+fn listing_path(
+    state: &ServerState,
+    info: &BucketInfo,
+    bucket: &str,
+    prefix: &Option<String>,
+) -> String {
+    let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
+    match prefix.as_deref().filter(|prefix| !prefix.is_empty()) {
+        Some(prefix) => object_permission_path(realm_id, info.group_id, node_id, bucket, prefix),
+        None => bucket_permission_path(realm_id, info.group_id, node_id, bucket),
+    }
+}
+
+/// Bucket names are node-local, so a caller needs to be told which node holds a listed bucket.
+fn missing_bucket() -> CallToolResult {
+    explained(
+        crate::error::ServerError::NotFound,
+        "no bucket with that name exists on the node named by node_id; omit node_id to use the \
+         node that holds the bucket, or call list_buckets for readable names. Pass the bare \
+         bucket name without an s3:// prefix or a key",
+    )
+}
+
+pub(crate) async fn read_text(
+    server: &McpServer,
+    auth: &AuthContext,
+    input: ReadObjectInput,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
+) -> Result<ReadObjectOutput, CallToolResult> {
+    validate_key(&input.key)?;
+    let max_bytes = bounded_bytes(input.max_bytes)?;
+    let offset = input.offset.unwrap_or(0);
+    let bucket_info = server.bucket_info(&input.bucket).await?;
+    authorize_tool(
+        &server.state,
+        auth,
+        object_permission_path(
+            server.state.get_realm_id(),
+            bucket_info.group_id,
+            server.state.get_node_id(),
+            &input.bucket,
+            &input.key,
+        ),
+        Permission::READ,
+        extras,
+    )
+    .await
+    .map_err(|error| object_error(error, "read"))?;
+    let range = if offset == 0 {
+        None
+    } else {
+        Some(ObjectRangeRequest::StartEnd {
+            start: offset,
+            end: offset
+                .checked_add(max_bytes as u64)
+                .ok_or_else(|| bad_request("offset and max_bytes overflow"))?,
+        })
+    };
+    let mut result = drive(
+        GetRoutedOperation::new(
+            GetObjectInput {
+                bucket: input.bucket.clone(),
+                key: input.key.clone(),
+                version_id: None,
+                range,
+                group_id: bucket_info.group_id,
+                user_identity: auth.user_id,
+                realm_id: auth.realm_id,
+                node_id: server.state.get_node_id(),
+            },
+            auth.path_restrictions.clone(),
+            None,
+        ),
+        &server.state.get_ctx(),
+    )
+    .await
+    .map_err(map_get_error)?;
+    let content_type = result
+        .metadata
+        .remove(CONTENT_TYPE_KEY)
+        .or_else(|| {
+            result
+                .source_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.content_type.clone())
+        })
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let mut bytes = Vec::with_capacity(max_bytes.min(64 * 1024));
+    while let Some(chunk) = result.blob.next().await {
+        let chunk = chunk.map_err(internal_error)?;
+        let remaining = max_bytes.saturating_add(1).saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if bytes.len() > max_bytes {
+            break;
+        }
+    }
+    let truncated = bytes.len() > max_bytes;
+    bytes.truncate(max_bytes);
+    let text = match String::from_utf8(bytes) {
+        Ok(text) => text,
+        Err(error) if truncated && error.utf8_error().error_len().is_none() => {
+            let valid = error.utf8_error().valid_up_to();
+            let mut valid_bytes = error.into_bytes();
+            valid_bytes.truncate(valid);
+            String::from_utf8(valid_bytes).map_err(|_| {
+                bad_request(format!(
+                    "the object is not UTF-8 text and its content type is {content_type}; this tool \
+                     returns text only, so fetch binary content through the S3 surface"
+                ))
+            })?
+        }
+        Err(_) => {
+            return Err(bad_request(format!(
+                "the object is not UTF-8 text and its content type is {content_type}; this tool \
+                 returns text only, so fetch binary content through the S3 surface"
+            )));
+        }
+    };
+    let byte_count = text.len();
+    Ok(ReadObjectOutput {
+        node_id: server.state.get_node_id().to_string(),
+        bucket: input.bucket,
+        key: input.key,
+        offset,
+        bytes: byte_count,
+        content_type,
+        truncated,
+        text,
+    })
+}
+
+pub(crate) async fn write_text(
+    server: &McpServer,
+    auth: &AuthContext,
+    input: WriteObjectInput,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
+    (headers, bearer): (&http::HeaderMap, Option<&crate::auth::ValidatedBearer>),
+) -> Result<WriteObjectOutput, CallToolResult> {
+    validate_key(&input.key)?;
+    let size = input.text.len();
+    if size > MAX_TEXT_BYTES {
+        return Err(server_error(crate::error::ServerError::PayloadTooLarge(
+            format!(
+                "text is {size} bytes and this tool stores at most {MAX_TEXT_BYTES}; split the \
+                 content across keys or upload it through the S3 surface"
+            ),
+        )));
+    }
+    drive(
+        BucketGuardOperation::new(input.bucket.as_str()),
+        server.state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(OfferedDirectoryError::from)
+    .map_err(map_offered_error)?;
+    let bucket_info = server.bucket_info(&input.bucket).await?;
+    authorize_tool(
+        &server.state,
+        auth,
+        object_permission_path(
+            server.state.get_realm_id(),
+            bucket_info.group_id,
+            server.state.get_node_id(),
+            &input.bucket,
+            &input.key,
+        ),
+        Permission::WRITE,
+        extras,
+    )
+    .await
+    .map_err(|error| object_error(error, "write"))?;
+    // In a distributed bucket the coordinator of the key's range writes it.
+    let forward = rest_target(&server.state, &bucket_info, &input.key, headers)
+        .await
+        .map_err(server_error)?;
+    if let Some(forward) = forward {
+        let path = format!("/data/buckets/{}/objects/text", input.bucket);
+        let body = TextObjectRequest {
+            key: input.key,
+            text: input.text,
+            content_type: input.content_type,
+        };
+        let (_, answer) = relay_json(&server.state, &forward, &path, bearer, &body)
+            .await
+            .map_err(server_error)?;
+        return Ok(answer);
+    }
+    store_text(&server.state, auth, &bucket_info, input, HashMap::new())
+        .await
+        .map_err(server_error)
+}
+
+/// The body of a relayed text write.
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
+pub struct TextObjectRequest {
+    pub key: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+}
+
+/// Stores a checked text write on this node as one new version of its key, with `tags` as
+/// server-set version metadata.
+pub(crate) async fn store_text(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bucket_info: &BucketInfo,
+    input: WriteObjectInput,
+    tags: HashMap<String, String>,
+) -> Result<WriteObjectOutput, crate::error::ServerError> {
+    let size = input.text.len();
+    let content_type = input
+        .content_type
+        .clone()
+        .unwrap_or_else(|| "text/plain; charset=utf-8".to_string());
+    let body = BackendStream::new(stream::iter([Ok::<Bytes, std::io::Error>(Bytes::from(
+        input.text.into_bytes(),
+    ))]));
+    let metadata = tags
+        .into_iter()
+        .chain([(CONTENT_TYPE_KEY.to_string(), content_type.clone())])
+        .collect();
+    let result = store_stream(
+        state,
+        auth,
+        bucket_info,
+        (&input.bucket, &input.key),
+        (body, Some(size as u64)),
+        (metadata, false),
+    )
+    .await?;
+    Ok(WriteObjectOutput {
+        node_id: state.get_node_id().to_string(),
+        bucket: input.bucket,
+        key: input.key,
+        version_id: result.version_id.to_string(),
+        size: result.location.blob_size,
+        content_type,
+    })
+}
+
+/// Stores `body` as a new version of `key` with the caller's quota, routing and restrictions,
+/// then queues replication like every other write.
+pub(crate) async fn store_stream(
+    state: &Arc<ServerState>,
+    auth: &AuthContext,
+    bucket_info: &BucketInfo,
+    (bucket, key): (&str, &str),
+    (body, content_length): (
+        BackendStream<Result<Bytes, aruna_core::stream::StreamError>>,
+        Option<u64>,
+    ),
+    (metadata, create_only): (HashMap<String, String>, bool),
+) -> Result<PutObjectResult, crate::error::ServerError> {
+    use crate::error::ServerError;
+    let internal =
+        |error: &dyn std::fmt::Display| ServerError::InternalError(error.to_string().into());
+    let realm = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
+    let quota_ceiling = realm.quota.effective_group_ceiling(&bucket_info.group_id);
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&state.get_ctx()),
+            (bucket_info).group_id,
+            BucketRules::of(bucket_info),
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
+    let gate = drive(
+        GateOperation::new(state.get_realm_id(), unix_timestamp_millis()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| internal(&error))?;
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: auth.user_id,
+        group_id: bucket_info.group_id,
+        realm_id: state.get_realm_id(),
+        node_id: state.get_node_id(),
+        request: PutObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            content_length,
+            body: Some(body),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling,
+        routing,
+    })
+    .with_rocrate_limits(state.rocrate_limits().clone())
+    .with_metadata(metadata)
+    .with_restrictions(auth.path_restrictions.clone());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    if create_only {
+        operation = operation.create_only();
+    }
+    let result = drive(operation, &state.get_ctx())
+        .await
+        .map_err(put_server_error)?;
+    drive(
+        CompletePutOperation::new(CompletePutInput {
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            auth: auth.clone(),
+            group_id: bucket_info.group_id,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: result.version_id,
+            size_bytes: result.location.blob_size,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .ok();
+    Ok(result)
+}
+
+fn object_error(error: crate::error::ServerError, action: &str) -> CallToolResult {
+    match error {
+        crate::error::ServerError::Forbidden => explained(
+            error,
+            format!(
+                "the caller holds no {action} permission there; call list_buckets for the \
+                 buckets it may use"
+            ),
+        ),
+        error => server_error(error),
+    }
+}
+
+fn map_offered_error(error: OfferedDirectoryError) -> CallToolResult {
+    match error {
+        OfferedDirectoryError::ReadOnly(bucket) => explained(
+            crate::error::ServerError::Forbidden,
+            format!("bucket {bucket} is an offered directory and is read-only"),
+        ),
+        error => internal_error(error),
+    }
+}
+
+/// The S3 key rule reads as an opaque `InvalidArgument`; a tool caller needs the
+/// shape a key must have.
+fn validate_key(key: &str) -> Result<(), CallToolResult> {
+    crate::s3::util::validate_object_key(key).map_err(|error| {
+        bad_request(format!(
+            "key is not a valid object key ({}); pass a relative key such as \
+             reads/sample.fastq.gz, with no leading slash, no `..` segment, and no control \
+             character, and call list_objects for existing keys",
+            error.message().unwrap_or_default()
+        ))
+    })
+}
+
+fn bounded_bytes(max_bytes: Option<usize>) -> Result<usize, CallToolResult> {
+    let max_bytes = max_bytes.unwrap_or(MAX_TEXT_BYTES);
+    if !(1..=MAX_TEXT_BYTES).contains(&max_bytes) {
+        return Err(bad_request(format!(
+            "max_bytes must be between 1 and {MAX_TEXT_BYTES}; omit it to read the full {MAX_TEXT_BYTES} byte window"
+        )));
+    }
+    Ok(max_bytes)
+}
+
+/// Search visibility is decided per hit by the shared REST path; the gate here
+/// is the realm policy layer only, as for the REST route.
+async fn authorize_search(
+    server: &McpServer,
+    auth: &AuthContext,
+    extras: aruna_core::request_policy::PolicyRequestExtras,
+) -> Result<(), CallToolResult> {
+    super::authorize_self(server.state.as_ref(), auth, Permission::READ, extras)
+        .await
+        .map_err(server_error)
+}
+
+pub(crate) fn map_bucket_error(error: GetBucketError) -> CallToolResult {
+    match error {
+        GetBucketError::NotFound => missing_bucket(),
+        GetBucketError::StorageError(error) => internal_error(error),
+        GetBucketError::ConversionError(error) => internal_error(error),
+        GetBucketError::InvalidStateEvent {
+            state,
+            expected,
+            received,
+        } => internal_error(format!(
+            "unexpected bucket lookup event in {state:?}: expected {expected}, got {received}"
+        )),
+        GetBucketError::Incomplete => internal_error("bucket lookup failed"),
+    }
+}
+
+fn map_get_error(error: GetObjectError) -> CallToolResult {
+    match error {
+        GetObjectError::NoSuchKey
+        | GetObjectError::NoSuchVersion
+        | GetObjectError::DeleteMarker
+        | GetObjectError::HistoricalReferenceUnavailable => explained(
+            crate::error::ServerError::NotFound,
+            "the bucket holds no readable object under that key; call list_objects for the keys \
+             it does hold",
+        ),
+        error @ GetObjectError::ReferenceTooLarge { .. } => bad_request(error),
+        error @ GetObjectError::InvalidRange => bad_request(format!(
+            "{error} offset must be below the object size; call list_objects for the size and \
+             read from offset 0 for a fresh read"
+        )),
+        error @ (GetObjectError::ReferenceSourceChanged
+        | GetObjectError::ReferenceChecksumMismatch
+        | GetObjectError::ReferenceAdvanceExhausted
+        | GetObjectError::SpoolBudgetExhausted) => {
+            server_error(crate::error::ServerError::Conflict(error.to_string()))
+        }
+        GetObjectError::GovernedUnavailable => server_error(crate::error::ServerError::Forbidden),
+        // This tool reads bytes of this bucket only; a link is followed through S3.
+        error @ GetObjectError::Link(_) => bad_request(error),
+        GetObjectError::StorageError(error) => internal_error(error),
+        GetObjectError::ConversionError(error) => internal_error(error),
+        GetObjectError::InvalidState { current, expected } => internal_error(format!(
+            "invalid object read state {current:?}; expected {expected:?}"
+        )),
+        GetObjectError::InvalidStateEvent {
+            state,
+            expected,
+            received,
+        } => internal_error(format!(
+            "unexpected object read event in {state:?}: expected {expected}, got {received}"
+        )),
+        GetObjectError::NoTransactionFound => internal_error("object read transaction is missing"),
+        GetObjectError::UsageError(error) => internal_error(error),
+        GetObjectError::ResolveReferenceError(error) => internal_error(error),
+        GetObjectError::StagingSourceError(error) => internal_error(error),
+        GetObjectError::ManagedCopyError(error) => internal_error(error),
+        GetObjectError::PolicyError(error) => internal_error(error),
+        error @ (GetObjectError::BlobNotLocal { .. } | GetObjectError::HeldElsewhere(_)) => {
+            internal_error(error)
+        }
+        GetObjectError::HolderAccessDenied => server_error(crate::error::ServerError::Forbidden),
+        error @ (GetObjectError::HoldersUnavailable | GetObjectError::HolderIntegrityFailure) => {
+            internal_error(error)
+        }
+        GetObjectError::NotFinished => internal_error("object read did not finish"),
+        GetObjectError::GetObjectFailed => internal_error("object read failed"),
+        error @ (GetObjectError::PendingContent(_) | GetObjectError::Abe(_)) => {
+            internal_error(error)
+        }
+    }
+}
+
+fn map_head_error(error: HeadObjectError) -> CallToolResult {
+    match error {
+        HeadObjectError::NoSuchKey | HeadObjectError::DeleteMarker => explained(
+            crate::error::ServerError::NotFound,
+            "the bucket holds no readable object under that key; call list_objects for the keys \
+             it does hold",
+        ),
+        HeadObjectError::NoSuchVersion => explained(
+            crate::error::ServerError::NotFound,
+            "that version does not exist for the key; copy version_id from a list_job_outputs \
+             entry or omit it for the latest version",
+        ),
+        HeadObjectError::StorageError(error) => internal_error(error),
+        HeadObjectError::ConversionError(error) => internal_error(error),
+        HeadObjectError::InvalidStateEvent {
+            state,
+            expected,
+            received,
+        } => internal_error(format!(
+            "unexpected object head event in {state:?}: expected {expected}, got {received}"
+        )),
+        HeadObjectError::ResolveReferenceError(error) => internal_error(error),
+        HeadObjectError::StagingSourceError(error) => internal_error(error),
+        HeadObjectError::ManagedCopyError(error) => internal_error(error),
+        HeadObjectError::HeadObjectFailed => internal_error("object head failed"),
+    }
+}
+
+fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
+    use crate::error::ServerError;
+    match error {
+        error @ (PutObjectError::MissingBody
+        | PutObjectError::IncompleteBody
+        | PutObjectError::MissingExpectedChecksum(_)
+        | PutObjectError::ChecksumMismatch(_)
+        | PutObjectError::Unmapped) => ServerError::BadRequestReason(error.to_string()),
+        error @ PutObjectError::QuotaExceeded { .. } => ServerError::Conflict(error.to_string()),
+        error @ PutObjectError::UsageRebuilding => {
+            ServerError::ServiceUnavailableReason(error.to_string())
+        }
+        PutObjectError::Distribution(error) => crate::lookup::map_guard_error(error),
+        PutObjectError::InvalidOperationState => {
+            ServerError::InternalError("invalid object write state".to_string().into())
+        }
+        PutObjectError::NoTransactionFound => {
+            ServerError::InternalError("object write transaction is missing".to_string().into())
+        }
+        PutObjectError::MissingOutput => {
+            ServerError::InternalError("object write output is missing".to_string().into())
+        }
+        PutObjectError::MissingHash(hash) => {
+            ServerError::InternalError(format!("object hash is missing: {hash}").into())
+        }
+        PutObjectError::InvalidPreassignedVersion => {
+            ServerError::InternalError("invalid object version".to_string().into())
+        }
+        PutObjectError::ObjectExists => ServerError::Refused(
+            http::StatusCode::CONFLICT,
+            "name_taken",
+            "another file took this name during the upload; upload again".to_string(),
+        ),
+        PutObjectError::PutObjectFailed => {
+            ServerError::InternalError("object write failed".to_string().into())
+        }
+        error @ (PutObjectError::StorageError(_)
+        | PutObjectError::WriteFailed(_)
+        | PutObjectError::BlobWriteFailed(_)
+        | PutObjectError::ConversionError(_)
+        | PutObjectError::UsageUpdateError(_)
+        | PutObjectError::QuotaGateError(_)
+        | PutObjectError::RoutingFailed(_)
+        | PutObjectError::BackendFenceError(_)
+        | PutObjectError::ManagedCopyError(_)
+        | PutObjectError::PolicyError(_)
+        | PutObjectError::PolicyGate(_)
+        | PutObjectError::PurgeFence(_)
+        | PutObjectError::HeadChanged
+        | PutObjectError::ImportRemoved
+        | PutObjectError::VersionExists
+        | PutObjectError::HistoryDeleted
+        | PutObjectError::FenceTaken) => ServerError::InternalError(error.into()),
+    }
+}
+
+#[cfg(test)]
+#[path = "data_tests.rs"]
+mod pure_tests;

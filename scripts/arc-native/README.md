@@ -162,7 +162,7 @@ working ARC can still lack the contacts, assays, workflows or evidence required 
 
 ## Runtime requirements
 
-Native hosting requires Unix, Git and Python 3.13 with `blob/arc-requirements.txt`. The image
+Native hosting requires Unix, Git and Python 3.13 with `runtime/blob/arc-requirements.txt`. The image
 includes Git, Python, ARCtrl and the CWL validator. Generated commits are not signed yet; they
 have the service author `Aruna <git@aruna.local>` and matching author/committer timestamps.
 Missing runtime or storage infrastructure leaves work pending for retry.

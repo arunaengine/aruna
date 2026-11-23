@@ -1,0 +1,85 @@
+//! Opens a temporary metadata handle and registry record for the metadata API tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle, StructuredId};
+use aruna_core::types::GroupId;
+use aruna_storage::storage;
+use tempfile::{TempDir, tempdir};
+use ulid::Ulid;
+
+use aruna_runner::driver::DriverContext;
+
+pub(crate) const TEST_REALM_ID: RealmId = RealmId([7u8; 32]);
+
+pub(crate) struct MetadataTest {
+    pub(crate) context: DriverContext,
+    _storage_dir: TempDir,
+    _metadata_dir: TempDir,
+}
+
+pub(crate) fn metadata_test() -> MetadataTest {
+    let storage_dir = tempdir().expect("storage dir");
+    let metadata_dir = tempdir().expect("metadata dir");
+    let storage_handle =
+        storage::worker::FjallStorage::open(storage_dir.path().to_str().expect("storage path"))
+            .expect("storage opens");
+    let graph_handle = aruna_rdf_graph::GraphHandle::open(
+        metadata_dir.path(),
+        iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+        None,
+        None,
+        aruna_rdf_graph::GraphOptions::default(),
+    )
+    .expect("metadata handle");
+    storage_handle.install_metadata_indexes(metadata_dir.path());
+    MetadataTest {
+        context: DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: Some(graph_handle),
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        },
+        _storage_dir: storage_dir,
+        _metadata_dir: metadata_dir,
+    }
+}
+
+pub(crate) fn public_record(group_id: GroupId, document_id: Ulid) -> MetadataRegistryRecord {
+    let event_id = Ulid::generate();
+    let document_id = MetaResourceId::from_parts(
+        document_id.timestamp_ms(),
+        PlacementHandle::new(1).unwrap(),
+        BucketId::new(0).unwrap(),
+        document_id.0 as u64 & ((1_u64 << 48) - 1),
+    )
+    .unwrap()
+    .as_ulid();
+    let document_path = format!("datasets/cached/{document_id}");
+    MetadataRegistryRecord {
+        realm_id: TEST_REALM_ID,
+        group_id,
+        document_id,
+        document_path: document_path.clone(),
+        graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+        public: true,
+        permission_path: MetadataRegistryRecord::permission_path_for(
+            &TEST_REALM_ID,
+            group_id,
+            &document_path,
+            document_id,
+        ),
+        placement: PlacementRef::NIL,
+        holder_node_ids: Vec::new(),
+        created_at_ms: 1,
+        updated_at_ms: 1,
+        establishing_event_id: event_id,
+        last_event_id: event_id,
+    }
+}

@@ -1,0 +1,1940 @@
+//! Applies a bucket default to current heads in bounded pages, one target per transaction; each
+//! mint unions refs, never removes them, and in a distributed bucket only in this node's ranges.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::distribution::guard::{GuardError, authority_reads, write_authority};
+use crate::s3::policy::successor::{
+    CapturedDefault, MintSuccessorOperation, SuccessorError, SuccessorOutcome, SuccessorPlan,
+};
+use aruna_core::blob_records::HeadAliasContext;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{AuthorizationError, ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::{BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::rows::{read_row, values};
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::placement::policy::attachment::{
+    BULK_INTENT_KEYSPACE, BULK_RUN_KEYSPACE, PolicyBlockedReason, PolicyBulkRun, PolicyIntent,
+    PolicyIntentKey, PolicyIntentOutcome, PolicyRefMode, PolicyStatus,
+};
+use aruna_core::structs::placement::policy::document::{group_admin_path, policy_admin_path};
+use aruna_core::structs::placement::policy::{
+    PlacementPolicyRef, PlacementSubject, PolicyResolution,
+};
+use aruna_core::structs::storage::blob::{
+    BlobHeadKey, BlobVersion, BlobVersionState, BucketInfo, CurrentVersionPointer, VersionKey,
+};
+use aruna_core::structs::storage::distribution::DistributionBinding;
+use aruna_core::structs::storage::distribution::hint::{SetHint, mint_version};
+use aruna_core::structs::storage::distribution::route::RouteError;
+use aruna_core::types::{GroupId, Key, Value};
+use aruna_ops_identity::placement::policy::foreign_owner;
+use aruna_ops_identity::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
+};
+use std::collections::BTreeMap;
+use std::time::SystemTime;
+use thiserror::Error;
+use tracing::warn;
+use ulid::Ulid;
+
+/// Upper bound on the heads one pass touches.
+const BULK_PAGE_LIMIT: usize = 128;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BulkConfig {
+    pub operation_id: Ulid,
+    pub bucket: String,
+    /// Group the bucket belongs to, so a group administrator may run it.
+    pub group_id: GroupId,
+    pub auth_context: AuthContext,
+    pub subject: PlacementSubject,
+    pub start_after: Option<Key>,
+    pub limit: usize,
+    pub now_ms: u64,
+    pub created_at: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockedGap {
+    pub key: String,
+    pub reason: PolicyBlockedReason,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BulkReport {
+    pub operation_id: Ulid,
+    pub status: PolicyStatus,
+    pub generation: u64,
+    pub target_refs: Vec<PlacementPolicyRef>,
+    pub observed: usize,
+    /// Heads this pass needed no successor for: already stored, a delete
+    /// marker, or an intent an earlier pass completed.
+    pub covered: usize,
+    pub minted: usize,
+    /// Intents replanned from a newer head; the next pass mints them.
+    pub replanned: usize,
+    pub blocked: Vec<BlockedGap>,
+    pub cursor: Option<Key>,
+    /// True when this pass exhausted the bounded local iterator.
+    pub complete: bool,
+    /// Heads of ranges another node coordinates; that node's pass applies the default there.
+    pub elsewhere: usize,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum BulkError {
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Successor(#[from] SuccessorError),
+    #[error("The specified bucket does not exist.")]
+    NoSuchBucket,
+    #[error("caller may not administer the realm configuration")]
+    Unauthorized,
+    /// A group-owned rule governs only its owner's buckets.
+    #[error("placement policy {policy_id} belongs to another group")]
+    ForeignPolicy { policy_id: Ulid },
+    #[error("the run was captured against a different bucket record")]
+    BucketChanged,
+    #[error(transparent)]
+    Distribution(#[from] GuardError),
+}
+
+impl From<IoError> for BulkError {
+    fn from(error: IoError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+type BulkTurn = Result<Next<BulkReport>, BulkError>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkState {
+    Authorize,
+    AuthorizeGroup,
+    Capture,
+    Resolve,
+    /// Reads the set record and this node's fence before the heads, so only owned keys mint.
+    ReadRecord,
+    ScanHeads,
+    ReadVersions,
+    ResolveUnion,
+    ReadIntents,
+    Mint,
+    Close,
+}
+
+/// Only the resolutions one object's mint may evaluate. A pass accumulates every
+/// page's resolutions, while one evaluation is bounded to the refs of that
+/// object and the captured target.
+fn mint_resolutions(
+    resolved: &BTreeMap<Ulid, PolicyResolution>,
+    refs: &[PlacementPolicyRef],
+    target: &[PlacementPolicyRef],
+) -> BTreeMap<Ulid, PolicyResolution> {
+    refs.iter()
+        .chain(target)
+        .filter_map(|policy_ref| {
+            resolved
+                .get(&policy_ref.policy_id)
+                .map(|resolution| (policy_ref.policy_id, resolution.clone()))
+        })
+        .collect()
+}
+
+/// One head this pass observed, with the durable intent it is minted under.
+#[derive(Clone, Debug, PartialEq)]
+struct Candidate {
+    key: String,
+    pointer: CurrentVersionPointer,
+    /// Refs the observed head already carries; the union mint needs them
+    /// resolved before it can decide.
+    refs: Vec<PlacementPolicyRef>,
+    intent: Option<PolicyIntent>,
+}
+
+/// What the capture transaction leaves the pass with.
+#[derive(Clone, Debug, PartialEq)]
+struct CapturedRun {
+    run: PolicyBulkRun,
+    group_id: GroupId,
+    binding: Option<DistributionBinding>,
+}
+
+type CaptureTurn = Result<Next<CapturedRun>, BulkError>;
+
+/// The run's own transaction: capturing and superseding are compare-and-set writes against the
+/// row it just read.
+#[derive(Debug, PartialEq)]
+struct CaptureRun {
+    operation_id: Ulid,
+    bucket: String,
+    group_id: GroupId,
+    written: Option<CapturedRun>,
+}
+
+impl CaptureRun {
+    fn rows_read(&mut self, [bucket, run]: [Option<Value>; 2]) -> CaptureTurn {
+        let bucket = bucket.ok_or(BulkError::NoSuchBucket)?;
+        let bucket = BucketInfo::from_bytes(bucket.as_ref())?;
+        // The authorized group was read before this transaction: a bucket
+        // recreated for another group must not inherit that admin's authority.
+        if bucket.group_id != self.group_id {
+            return Err(BulkError::BucketChanged);
+        }
+        let stored = (run.as_deref())
+            .map(PolicyBulkRun::from_bytes)
+            .transpose()?;
+        let captured = |run| CapturedRun {
+            run,
+            group_id: bucket.group_id,
+            binding: bucket.distribution.clone(),
+        };
+        let Some(run) = stored else {
+            return self.write_run(captured(PolicyBulkRun {
+                operation_id: self.operation_id,
+                bucket: self.bucket.clone(),
+                bucket_identity: bucket.identity(),
+                generation: bucket.placement_policy_generation,
+                target_refs: bucket.placement_policies.clone(),
+                status: PolicyStatus::Active,
+            }));
+        };
+        if run.bucket != self.bucket || run.bucket_identity != bucket.identity() {
+            return Err(BulkError::BucketChanged);
+        }
+        // A default change ends the run: one pass never mixes two policies.
+        if run.generation != bucket.placement_policy_generation
+            || run.target_refs != bucket.placement_policies
+        {
+            let mut superseded = run;
+            superseded.status = PolicyStatus::Superseded;
+            return self.write_run(captured(superseded));
+        }
+        Ok(Next::Done(captured(run)))
+    }
+
+    fn write_run(&mut self, captured: CapturedRun) -> CaptureTurn {
+        let row = run_row(&captured.run)?;
+        self.written = Some(captured);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+}
+
+fn run_row(run: &PolicyBulkRun) -> Result<(String, Key, Value), ConversionError> {
+    Ok((
+        BULK_RUN_KEYSPACE.to_string(),
+        PolicyBulkRun::key(run.operation_id)?.into(),
+        run.to_bytes()?.into(),
+    ))
+}
+
+impl Operation for CaptureRun {
+    type Output = CapturedRun;
+    type Error = BulkError;
+
+    fn first(&mut self) -> CaptureTurn {
+        let reads = vec![
+            (
+                S3_BUCKET_KEYSPACE.to_string(),
+                Key::from(self.bucket.as_bytes().to_vec()),
+            ),
+            (
+                BULK_RUN_KEYSPACE.to_string(),
+                Key::from(PolicyBulkRun::key(self.operation_id)?),
+            ),
+        ];
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CaptureTurn {
+        match self.written.take() {
+            Some(captured) => {
+                result.done()?;
+                Ok(Next::Done(captured))
+            }
+            None => self.rows_read(values::<2>(result)?),
+        }
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+type CloseTurn = Result<Next<Option<PolicyBulkRun>>, BulkError>;
+
+/// Status transitions are compare-and-set: only an active run moves on, so a replayed or
+/// concurrent pass cannot revive or downgrade a finished one. Outputs the stored run.
+#[derive(Debug, PartialEq)]
+struct CloseRun {
+    operation_id: Ulid,
+    status: PolicyStatus,
+    written: Option<PolicyBulkRun>,
+}
+
+impl Operation for CloseRun {
+    type Output = Option<PolicyBulkRun>;
+    type Error = BulkError;
+
+    fn first(&mut self) -> CloseTurn {
+        let key = PolicyBulkRun::key(self.operation_id)?;
+        Ok(Next::Call(read_row(BULK_RUN_KEYSPACE, key)))
+    }
+
+    fn next(&mut self, result: IoResult) -> CloseTurn {
+        if let Some(run) = self.written.take() {
+            result.done()?;
+            return Ok(Next::Done(Some(run)));
+        }
+        let stored = result.value()?;
+        let stored = stored
+            .as_deref()
+            .map(PolicyBulkRun::from_bytes)
+            .transpose()?;
+        let Some(mut run) = stored else {
+            return Ok(Next::Done(None));
+        };
+        if run.status != PolicyStatus::Active {
+            return Ok(Next::Done(Some(run)));
+        }
+        run.status = self.status;
+        let row = run_row(&run)?;
+        self.written = Some(run);
+        Ok(Next::Call(IoCall::Write(vec![row])))
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+}
+
+/// Runs one bounded pass over this responder's own heads. Nothing here claims
+/// whole-bucket or realm-wide convergence: the report states what this node
+/// observed and what stays a resumable gap.
+#[derive(Debug, PartialEq)]
+pub struct PolicyBulkOperation {
+    config: BulkConfig,
+    ids: IdMint,
+    state: BulkState,
+    group_id: Option<Ulid>,
+    /// The set hint of a distributed bucket, so planned successor ids carry it.
+    set_hint: Option<SetHint>,
+    /// The bucket's membership in a distributed set, and the set record and fence rows.
+    binding: Option<DistributionBinding>,
+    authority: (Option<Value>, Option<Value>),
+    run: Option<PolicyBulkRun>,
+    resolved: BTreeMap<Ulid, PolicyResolution>,
+    candidates: Vec<Candidate>,
+    index: usize,
+    report: BulkReport,
+}
+
+impl PolicyBulkOperation {
+    pub fn new(config: BulkConfig) -> Self {
+        let report = BulkReport {
+            operation_id: config.operation_id,
+            status: PolicyStatus::Active,
+            generation: 0,
+            target_refs: Vec::new(),
+            observed: 0,
+            covered: 0,
+            minted: 0,
+            replanned: 0,
+            blocked: Vec::new(),
+            cursor: None,
+            complete: false,
+            elsewhere: 0,
+        };
+        Self {
+            config,
+            ids: IdMint::default(),
+            state: BulkState::Authorize,
+            group_id: None,
+            set_hint: None,
+            binding: None,
+            authority: (None, None),
+            run: None,
+            resolved: BTreeMap::new(),
+            candidates: Vec::new(),
+            index: 0,
+            report,
+        }
+    }
+
+    fn call(&mut self, state: BulkState, call: IoCall) -> BulkTurn {
+        self.state = state;
+        Ok(Next::Call(call))
+    }
+
+    fn authorize(&mut self, state: BulkState, path: String) -> BulkTurn {
+        let check = super::write_check(self.config.auth_context.clone(), path);
+        self.call(state, check)
+    }
+
+    /// A failed check counts as a denial.
+    fn allowed(result: Result<bool, AuthorizationError>) -> Result<bool, BulkError> {
+        result.map_err(|error| {
+            warn!(error = %error, "Bulk policy authorization check failed");
+            BulkError::Unauthorized
+        })
+    }
+
+    fn capture(&mut self) -> BulkTurn {
+        let capture = CaptureRun {
+            operation_id: self.config.operation_id,
+            bucket: self.config.bucket.clone(),
+            group_id: self.config.group_id,
+            written: None,
+        };
+        self.call(BulkState::Capture, IoCall::child(capture))
+    }
+
+    fn finish(&mut self) -> BulkTurn {
+        if let Some(run) = self.run.as_ref() {
+            self.report.status = run.status;
+        }
+        Ok(Next::Done(self.report.clone()))
+    }
+
+    /// After the capture commits, the pass either stops or resolves its target.
+    fn captured(&mut self, captured: CapturedRun) -> BulkTurn {
+        let CapturedRun {
+            run,
+            group_id,
+            binding,
+        } = captured;
+        self.group_id = Some(group_id);
+        self.set_hint = binding.as_ref().map(DistributionBinding::hint);
+        self.binding = binding;
+        self.report.generation = run.generation;
+        self.report.target_refs = run.target_refs.clone();
+        let active = run.status == PolicyStatus::Active;
+        self.run = Some(run);
+        match active {
+            true => self.resolve_refs(),
+            false => self.finish(),
+        }
+    }
+
+    fn resolver(&self, refs: &[PlacementPolicyRef]) -> IoCall {
+        IoCall::child(PolicySetResolver::new(
+            self.config.auth_context.realm_id,
+            self.config.subject.node_id,
+            self.config.now_ms,
+            // A rule this node cannot obtain blocks its objects; the run stays
+            // resumable instead of failing.
+            ResolveMode::Lenient,
+            refs,
+        ))
+    }
+
+    fn resolve_refs(&mut self) -> BulkTurn {
+        let refs = (self.run.as_ref())
+            .map(|run| run.target_refs.clone())
+            .unwrap_or_default();
+        let resolver = self.resolver(&refs);
+        self.call(BulkState::Resolve, resolver)
+    }
+
+    /// The lenient resolver's resolutions; an unreadable outcome resolves nothing.
+    fn resolutions(result: IoResult) -> Resolutions {
+        result
+            .child::<Resolutions, PolicySetError>()
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default()
+    }
+
+    fn target_resolved(&mut self, resolved: Resolutions) -> BulkTurn {
+        self.resolved.extend(resolved);
+        if let Some(policy_id) = foreign_owner(&self.resolved, self.config.group_id) {
+            return Err(BulkError::ForeignPolicy { policy_id });
+        }
+        self.read_record()
+    }
+
+    /// Each mint checks the authority again inside its own transaction; this read only
+    /// selects the keys to plan.
+    fn read_record(&mut self) -> BulkTurn {
+        let Some(binding) = self.binding.as_ref() else {
+            return self.scan_heads();
+        };
+        let reads = authority_reads(binding.set_id);
+        self.call(BulkState::ReadRecord, IoCall::Read(reads))
+    }
+
+    /// Whether this node plans `key`: always in an ordinary bucket, and in a distributed one only
+    /// while it coordinates the key's range. A range that moves or is fenced waits for a later pass.
+    fn owns(&mut self, key: &str) -> Result<bool, BulkError> {
+        let Some(binding) = self.binding.as_ref() else {
+            return Ok(true);
+        };
+        let (record, fence) = (self.authority.0.as_deref(), self.authority.1.as_deref());
+        match write_authority(binding, key, record, fence) {
+            Ok(_) => Ok(true),
+            Err(GuardError::NotCoordinator { .. }) => {
+                self.report.elsewhere += 1;
+                Ok(false)
+            }
+            Err(error) if error.moved_away() => {
+                self.report.replanned += 1;
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn scan_heads(&mut self) -> BulkTurn {
+        let page = IoCall::Page {
+            space: BLOB_HEAD_KEYSPACE.to_string(),
+            prefix: BlobHeadKey::bucket_prefix(&self.config.bucket)?.into(),
+            after: self.config.start_after.clone(),
+            limit: self.config.limit.clamp(1, BULK_PAGE_LIMIT),
+        };
+        self.call(BulkState::ScanHeads, page)
+    }
+
+    fn heads_read(&mut self, (rows, next): (Vec<(Key, Value)>, Option<Key>)) -> BulkTurn {
+        self.report.cursor = next;
+        self.report.complete = self.report.cursor.is_none();
+        if rows.is_empty() {
+            return self.after_page();
+        }
+        let mut reads = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            let head = BlobHeadKey::from_bytes(key.as_ref())?;
+            if !self.owns(&head.key)? {
+                continue;
+            }
+            let pointer = CurrentVersionPointer::from_bytes(value.as_ref())?;
+            let version_key = VersionKey::new(&self.config.bucket, &head.key, pointer.version_id);
+            reads.push((
+                BLOB_VERSIONS_KEYSPACE.to_string(),
+                Key::from(version_key.to_bytes()?),
+            ));
+            self.candidates.push(Candidate {
+                key: head.key,
+                pointer,
+                refs: Vec::new(),
+                intent: None,
+            });
+        }
+        if reads.is_empty() {
+            return self.after_page();
+        }
+        self.call(BulkState::ReadVersions, IoCall::Read(reads))
+    }
+
+    fn check_answers(&self, read: &[Option<Value>]) -> Result<(), BulkError> {
+        if read.len() == self.candidates.len() {
+            return Ok(());
+        }
+        let got = "a different row count";
+        let expected = "one row per candidate";
+        Err(IoError::Unexpected { expected, got }.into())
+    }
+
+    fn versions_read(&mut self, read: Vec<Option<Value>>) -> BulkTurn {
+        self.check_answers(&read)?;
+        let target = (self.run.as_ref())
+            .map(|run| run.target_refs.clone())
+            .unwrap_or_default();
+        let candidates = std::mem::take(&mut self.candidates);
+        let mut pending = Vec::with_capacity(candidates.len());
+        for (mut candidate, value) in candidates.into_iter().zip(read) {
+            self.report.observed += 1;
+            let Some(value) = value else {
+                // A head pointing at a version this node no longer stores is a
+                // gap, never a covered object.
+                self.report.blocked.push(BlockedGap {
+                    key: candidate.key,
+                    reason: PolicyBlockedReason::SourceUnavailable,
+                });
+                continue;
+            };
+            let version = BlobVersion::from_bytes(value.as_ref())?;
+            if version.state == BlobVersionState::Deleted || covered(&version, &target) {
+                self.report.covered += 1;
+                continue;
+            }
+            candidate.refs = version.placement_policies;
+            pending.push(candidate);
+        }
+        self.candidates = pending;
+        if self.candidates.is_empty() {
+            return self.after_page();
+        }
+        self.resolve_union()
+    }
+
+    /// The union a mint stores also contains the refs the head already carries,
+    /// so they have to be authenticated too before any of them may be evaluated.
+    fn resolve_union(&mut self) -> BulkTurn {
+        let mut refs = Vec::new();
+        for candidate in &self.candidates {
+            for policy_ref in &candidate.refs {
+                if !self.resolved.contains_key(&policy_ref.policy_id) {
+                    refs.push(*policy_ref);
+                }
+            }
+        }
+        if refs.is_empty() {
+            return self.read_intents();
+        }
+        let resolver = self.resolver(&refs);
+        self.call(BulkState::ResolveUnion, resolver)
+    }
+
+    fn read_intents(&mut self) -> BulkTurn {
+        let mut reads = Vec::with_capacity(self.candidates.len());
+        for candidate in &self.candidates {
+            let key = PolicyIntentKey::new(self.config.operation_id, candidate.key.clone());
+            reads.push((BULK_INTENT_KEYSPACE.to_string(), Key::from(key.to_bytes()?)));
+        }
+        self.call(BulkState::ReadIntents, IoCall::Read(reads))
+    }
+
+    /// Reuses the intent planned for this head, replans one whose head moved,
+    /// and never re-mints one an earlier pass completed.
+    fn intents_read(&mut self, read: Vec<Option<Value>>) -> BulkTurn {
+        self.check_answers(&read)?;
+        let candidates = std::mem::take(&mut self.candidates);
+        let mut pending = Vec::with_capacity(candidates.len());
+        for (mut candidate, value) in candidates.into_iter().zip(read) {
+            let stored = value.as_deref().map(PolicyIntent::from_bytes).transpose()?;
+            let intent = match stored {
+                Some(intent) if matches!(intent.outcome, PolicyIntentOutcome::Completed { .. }) => {
+                    self.report.covered += 1;
+                    continue;
+                }
+                Some(intent) if intent.observed_head == candidate.pointer => intent,
+                stale => {
+                    if stale.is_some() {
+                        self.report.replanned += 1;
+                    }
+                    PolicyIntent {
+                        operation_id: self.config.operation_id,
+                        key: candidate.key.clone(),
+                        observed_head: candidate.pointer.clone(),
+                        successor_version_id: mint_version(
+                            self.ids.mint(self.config.now_ms),
+                            self.set_hint,
+                        ),
+                        outcome: PolicyIntentOutcome::Planned,
+                    }
+                }
+            };
+            candidate.intent = Some(intent);
+            pending.push(candidate);
+        }
+        self.candidates = pending;
+        self.index = 0;
+        self.mint_next()
+    }
+
+    fn mint_next(&mut self) -> BulkTurn {
+        let Some(candidate) = self.candidates.get(self.index) else {
+            return self.after_page();
+        };
+        let (Some(intent), Some(run), Some(group_id)) =
+            (candidate.intent.clone(), self.run.as_ref(), self.group_id)
+        else {
+            let expected = "a planned candidate";
+            return Err(IoError::Unexpected {
+                expected,
+                got: "none",
+            }
+            .into());
+        };
+        let plan = SuccessorPlan {
+            context: HeadAliasContext::new(
+                self.config.auth_context.realm_id,
+                group_id,
+                self.config.subject.node_id,
+                self.config.bucket.clone(),
+                candidate.key.clone(),
+            ),
+            // The successor id is the stable mutation identity across retries.
+            mutation_id: intent.successor_version_id,
+            expected_head: intent.observed_head.clone(),
+            bucket_identity: run.bucket_identity,
+            target_refs: run.target_refs.clone(),
+            mode: PolicyRefMode::Union,
+            successor_version_id: intent.successor_version_id,
+            created_at: self.config.created_at,
+            auth_context: self.config.auth_context.clone(),
+            subject: self.config.subject.clone(),
+            resolved: mint_resolutions(&self.resolved, &candidate.refs, &run.target_refs),
+            captured_default: Some(CapturedDefault {
+                generation: run.generation,
+                refs: run.target_refs.clone(),
+            }),
+            intent: Some(intent),
+        };
+        let mint = MintSuccessorOperation::new(plan);
+        self.call(BulkState::Mint, IoCall::child(mint))
+    }
+
+    fn record_outcome(&mut self, result: Result<SuccessorOutcome, SuccessorError>) -> BulkTurn {
+        let key = self
+            .candidates
+            .get(self.index)
+            .map(|candidate| candidate.key.clone())
+            .unwrap_or_default();
+        self.index += 1;
+        match result {
+            Ok(SuccessorOutcome::Minted { .. }) => self.report.minted += 1,
+            Ok(SuccessorOutcome::Replayed { .. }) => self.report.covered += 1,
+            Ok(SuccessorOutcome::Blocked(reason)) => {
+                self.report.blocked.push(BlockedGap { key, reason })
+            }
+            // The default moved on: the run stops instead of committing an old
+            // target against a new default.
+            Err(SuccessorError::DefaultChanged { .. }) => {
+                return self.close_run(PolicyStatus::Superseded);
+            }
+            // This node is mid-transition, so every evaluation this pass made is
+            // stale. The run stays active and a later pass resumes it.
+            Err(SuccessorError::SubjectDrift) => return self.finish(),
+            // Concurrent head, id, intent and commit races are replanned next pass.
+            Err(
+                SuccessorError::HeadConflict { .. }
+                | SuccessorError::VersionCollision(_)
+                | SuccessorError::IntentConflict
+                | SuccessorError::Storage(StorageError::TransactionConflict),
+            ) => self.report.replanned += 1,
+            // The range moved or was fenced after the scan: the mint refused it, nothing was
+            // written, and a later pass plans the key only if this node coordinates it again.
+            Err(SuccessorError::Distribution(error))
+                if error.moved_away()
+                    || matches!(error, GuardError::Route(RouteError::StaleRange(_))) =>
+            {
+                self.report.replanned += 1
+            }
+            // A head that lost its version or became a delete marker is retained
+            // as a blocked gap: the pass must not claim it as completed.
+            Err(SuccessorError::HeadDeleted | SuccessorError::VersionMissing) => {
+                self.report.blocked.push(BlockedGap {
+                    key,
+                    reason: PolicyBlockedReason::SourceUnavailable,
+                })
+            }
+            Err(error) => return Err(error.into()),
+        }
+        self.mint_next()
+    }
+
+    /// Converged only when a full rescan from the start found nothing to do.
+    fn after_page(&mut self) -> BulkTurn {
+        let converged = self.config.start_after.is_none()
+            && self.report.complete
+            && self.report.minted == 0
+            && self.report.replanned == 0
+            && self.report.blocked.is_empty();
+        if !converged {
+            return self.finish();
+        }
+        self.close_run(PolicyStatus::Completed)
+    }
+
+    fn close_run(&mut self, status: PolicyStatus) -> BulkTurn {
+        let close = CloseRun {
+            operation_id: self.config.operation_id,
+            status,
+            written: None,
+        };
+        self.call(BulkState::Close, IoCall::child(close))
+    }
+}
+
+fn covered(version: &BlobVersion, target: &[PlacementPolicyRef]) -> bool {
+    target
+        .iter()
+        .all(|policy| version.placement_policies.contains(policy))
+}
+
+impl Operation for PolicyBulkOperation {
+    type Output = BulkReport;
+    type Error = BulkError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> BulkTurn {
+        let path = policy_admin_path(self.config.auth_context.realm_id);
+        self.authorize(BulkState::Authorize, path)
+    }
+
+    fn next(&mut self, result: IoResult) -> BulkTurn {
+        match self.state {
+            BulkState::Authorize => {
+                if Self::allowed(result.child::<bool, AuthorizationError>()?)? {
+                    return self.capture();
+                }
+                // A group administrator governs that group's own buckets.
+                let realm_id = self.config.auth_context.realm_id;
+                let path = group_admin_path(realm_id, self.config.group_id);
+                self.authorize(BulkState::AuthorizeGroup, path)
+            }
+            BulkState::AuthorizeGroup => {
+                match Self::allowed(result.child::<bool, AuthorizationError>()?)? {
+                    true => self.capture(),
+                    false => Err(BulkError::Unauthorized),
+                }
+            }
+            BulkState::Capture => self.captured(result.child::<CapturedRun, BulkError>()??),
+            BulkState::Resolve => self.target_resolved(Self::resolutions(result)),
+            BulkState::ReadRecord => {
+                let [record, fence] = values::<2>(result)?;
+                self.authority = (record, fence);
+                self.scan_heads()
+            }
+            BulkState::ScanHeads => self.heads_read(result.page()?),
+            BulkState::ReadVersions => self.versions_read(result.values()?),
+            BulkState::ResolveUnion => {
+                self.resolved.extend(Self::resolutions(result));
+                self.read_intents()
+            }
+            BulkState::ReadIntents => self.intents_read(result.values()?),
+            BulkState::Mint => {
+                self.record_outcome(result.child::<SuccessorOutcome, SuccessorError>()?)
+            }
+            BulkState::Close => {
+                if let Some(run) = result.child::<Option<PolicyBulkRun>, BulkError>()?? {
+                    self.run = Some(run);
+                }
+                self.finish()
+            }
+        }
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        matches!(
+            error,
+            BulkError::Unauthorized
+                | BulkError::ForeignPolicy { .. }
+                | BulkError::NoSuchBucket
+                | BulkError::BucketChanged
+        )
+    }
+}
+
+/// Exit gate for step 6: a default applies to current heads by minting
+/// successors, never by rewriting a stored version, and a run that cannot act
+/// keeps the object as a resumable gap.
+#[cfg(test)]
+mod tests {
+    use super::{
+        BULK_PAGE_LIMIT, BulkConfig, BulkError, BulkState, CaptureRun, CloseRun,
+        PolicyBulkOperation,
+    };
+    use crate::s3::bucket::placement::{PutPlacementInput, PutPlacementOperation};
+    use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::tests::policy::{seed_gate, subject};
+    use aruna_blob::blob::BlobHandler;
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::id::NodeId;
+    use aruna_core::keyspaces::{
+        BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, MANAGED_COPY_KEYSPACE, POLICY_CACHE_KEYSPACE,
+        S3_BUCKET_KEYSPACE,
+    };
+    use aruna_core::operation::{Operation, TransactionMode};
+    use aruna_core::stream::BackendStream;
+    use aruna_core::structs::identity::auth::{Actor, AuthContext};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::placement::policy::attachment::{
+        BULK_INTENT_KEYSPACE, PolicyBlockedReason, PolicyIntent, PolicyIntentKey,
+        PolicyIntentOutcome, PolicyStatus,
+    };
+    use aruna_core::structs::placement::policy::{
+        PlacementPolicy, PlacementPolicyRef, PlacementSelector, VerifiedPolicy,
+    };
+    use aruna_core::structs::storage::blob::{
+        Backend, BackendConfig, BackendRef, BlobHeadKey, BlobVersion, BucketInfo,
+        CurrentVersionPointer, ManagedCopyKey, ManagedCopyRecord, VersionKey,
+    };
+    use aruna_core::structs::storage::format::Compression;
+    use aruna_core::structs::storage::routing::RoutingSnapshot;
+    use aruna_core::types::{GroupId, Key, Value};
+    use aruna_core::user::id::UserId;
+    use aruna_ops_identity::placement::policy::cache::cache_key;
+    use aruna_ops_identity::placement::policy::gate::GateOperation;
+    use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_p2p::NetHandle;
+    use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_runner::driver::{DriverContext, drive};
+    use aruna_scheduler::TaskHandle;
+    use aruna_storage::storage;
+    use std::collections::HashMap;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::{TempDir, tempdir};
+    use ulid::Ulid;
+
+    const BUCKET: &str = "governed";
+    const OBJECT: &str = "object.txt";
+    const BODY: &[u8] = b"payload";
+
+    struct Fixture {
+        realm_id: RealmId,
+        group_id: GroupId,
+        node_id: NodeId,
+        user_id: UserId,
+    }
+
+    /// A realm with a claimed administrator, an advertised subject and the rule
+    /// these tests attach already resolved, which is what production wiring
+    /// establishes before a governed write is possible.
+    async fn full_context() -> (TempDir, DriverContext, Fixture) {
+        let temp_handle = tempdir().expect("temp dir");
+        let temp_root = temp_handle.path().to_str().expect("utf8 path");
+        let blob_root = format!("{temp_root}/blobstore");
+        std::fs::create_dir_all(&blob_root).expect("blob root");
+        let storage_handle = storage::worker::FjallStorage::open(temp_root).expect("storage opens");
+        let secret = iroh::SecretKey::from_bytes(&[3u8; 32]);
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("bind addr"),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                secret_key: Some(secret.clone()),
+                realm_id,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .expect("net handle");
+        let blob_handle = BlobHandler::new(
+            BackendConfig {
+                backend_type: Backend::FileSystem,
+                bucket_prefix: Some("aruna_".to_string()),
+                max_bucket_size: Some(100_000),
+                multipart_bucket: Some("multipart".to_string()),
+                root: blob_root,
+                service_config: HashMap::new(),
+                timeouts: Default::default(),
+            },
+            storage_handle.clone(),
+            net_handle.clone(),
+        )
+        .await
+        .expect("blob handle");
+        let fixture = Fixture {
+            realm_id,
+            group_id: Ulid::generate(),
+            node_id: net_handle.node_id(),
+            user_id: UserId::local(Ulid::from_bytes([4u8; 16]), realm_id),
+        };
+        let context = DriverContext {
+            storage_handle,
+            net_handle: Some(net_handle),
+            blob_handle: Some(blob_handle),
+            graph_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+            outbound_handle: None,
+        };
+        let actor = Actor {
+            node_id: fixture.node_id,
+            user_id: fixture.user_id,
+            realm_id,
+        };
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "policy realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &context,
+        )
+        .await
+        .expect("realm is created");
+        drive(
+            ClaimInitialOperation::new(ClaimInitialInput { actor }),
+            &context,
+        )
+        .await
+        .expect("admin is claimed");
+        seed_gate(
+            &context,
+            realm_id,
+            fixture.user_id,
+            subject(fixture.node_id, "eu-west"),
+            &[policy(fixture.node_id)],
+        )
+        .await;
+        (temp_handle, context, fixture)
+    }
+
+    async fn write_bucket(context: &DriverContext, fixture: &Fixture) {
+        let bucket = BucketInfo {
+            group_id: fixture.group_id,
+            created_at: UNIX_EPOCH,
+            created_by: fixture.user_id,
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: BUCKET.as_bytes().to_vec().into(),
+                value: bucket.to_bytes().expect("bucket encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    async fn put_object(context: &DriverContext, fixture: &Fixture, key: &str) -> Ulid {
+        let gate = drive(GateOperation::new(fixture.realm_id, 1_000), context)
+            .await
+            .expect("subject reads");
+        let mut operation = PutObjectOperation::new(PutObjectConfig {
+            user_id: fixture.user_id,
+            group_id: fixture.group_id,
+            realm_id: fixture.realm_id,
+            node_id: fixture.node_id,
+            request: PutObjectInput {
+                bucket: BUCKET.to_string(),
+                key: key.to_string(),
+                content_length: Some(BODY.len() as u64),
+                body: Some(BackendStream::new(tokio_util::io::ReaderStream::new(BODY))),
+            },
+            expected_checksums: vec![],
+            checksum_type: None,
+            exists: false,
+            version_source: None,
+            preassigned_version_id: None,
+            quota_ceiling: None,
+            routing: RoutingSnapshot::single(fixture.group_id),
+        });
+        if let Some(gate) = gate {
+            operation = operation.with_gate(gate);
+        }
+        drive(operation, context)
+            .await
+            .expect("put drives")
+            .version_id
+    }
+
+    fn policy(node_id: NodeId) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([5u8; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: Some(node_id),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn second_policy(node_id: NodeId) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([6u8; 16]),
+            "second".to_string(),
+            vec![PlacementSelector {
+                node_id: Some(node_id),
+                location: None,
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    async fn set_default(
+        context: &DriverContext,
+        fixture: &Fixture,
+        refs: Vec<PlacementPolicyRef>,
+    ) {
+        drive(
+            PutPlacementOperation::new(PutPlacementInput {
+                bucket: BUCKET.to_string(),
+                group_id: fixture.group_id,
+                policies: refs,
+                expected_generation: None,
+                auth_context: auth(fixture),
+                local_node_id: fixture.node_id,
+                now_ms: 1_000,
+            }),
+            context,
+        )
+        .await
+        .expect("default is set");
+    }
+
+    fn auth(fixture: &Fixture) -> AuthContext {
+        AuthContext {
+            user_id: fixture.user_id,
+            realm_id: fixture.realm_id,
+            path_restrictions: None,
+            session: None,
+        }
+    }
+
+    fn config(fixture: &Fixture, operation_id: Ulid) -> BulkConfig {
+        BulkConfig {
+            operation_id,
+            bucket: BUCKET.to_string(),
+            group_id: fixture.group_id,
+            auth_context: auth(fixture),
+            subject: subject(fixture.node_id, "eu-west"),
+            start_after: None,
+            limit: BULK_PAGE_LIMIT,
+            now_ms: 1_000,
+            created_at: SystemTime::now(),
+        }
+    }
+
+    async fn read_head(context: &DriverContext, key: &str) -> CurrentVersionPointer {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_HEAD_KEYSPACE.to_string(),
+                key: BlobHeadKey::new(BUCKET, key)
+                    .to_bytes()
+                    .expect("key encodes")
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+        CurrentVersionPointer::from_bytes(value.expect("head exists").as_ref())
+            .expect("pointer decodes")
+    }
+
+    async fn read_version(context: &DriverContext, key: &str, version_id: Ulid) -> BlobVersion {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(BUCKET, key, version_id)
+                    .to_bytes()
+                    .expect("key encodes")
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+        BlobVersion::from_bytes(value.expect("version exists").as_ref()).expect("version decodes")
+    }
+
+    /// Every stored version of one object, so a pass can be shown to mint at
+    /// most one successor however often it runs.
+    async fn count_versions(context: &DriverContext, key: &str) -> usize {
+        let prefix: Key = VersionKey::object_prefix(BUCKET, key)
+            .expect("prefix encodes")
+            .into();
+        let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                prefix: Some(prefix),
+                start: None,
+                limit: 64,
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage iter result");
+        };
+        values.len()
+    }
+
+    async fn copy_key(key: &str, version_id: Ulid) -> ManagedCopyKey {
+        ManagedCopyKey::new(
+            VersionKey::new(BUCKET, key, version_id),
+            BackendRef::node_default(),
+        )
+    }
+
+    async fn read_copy(
+        context: &DriverContext,
+        key: &str,
+        version_id: Ulid,
+    ) -> Option<ManagedCopyRecord> {
+        let managed_key = copy_key(key, version_id).await;
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: MANAGED_COPY_KEYSPACE.to_string(),
+                key: managed_key.to_bytes().expect("key encodes").into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+        value.map(|value| ManagedCopyRecord::from_bytes(value.as_ref()).expect("record decodes"))
+    }
+
+    async fn take_copy(context: &DriverContext, key: &str, version_id: Ulid) -> ManagedCopyRecord {
+        let record = read_copy(context, key, version_id)
+            .await
+            .expect("copy row exists");
+        let managed_key = copy_key(key, version_id).await;
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: MANAGED_COPY_KEYSPACE.to_string(),
+                key: managed_key.to_bytes().expect("key encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        record
+    }
+
+    async fn restore_copy(context: &DriverContext, record: &ManagedCopyRecord) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: MANAGED_COPY_KEYSPACE.to_string(),
+                key: record.key().to_bytes().expect("key encodes").into(),
+                value: record.to_bytes().expect("record encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    async fn read_intent(
+        context: &DriverContext,
+        operation_id: Ulid,
+        key: &str,
+    ) -> Option<PolicyIntent> {
+        let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: BULK_INTENT_KEYSPACE.to_string(),
+                key: PolicyIntentKey::new(operation_id, key)
+                    .to_bytes()
+                    .expect("key encodes")
+                    .into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("unexpected storage read result");
+        };
+        value.map(|value| PolicyIntent::from_bytes(value.as_ref()).expect("intent decodes"))
+    }
+
+    fn bulk_config(group_id: GroupId) -> BulkConfig {
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        BulkConfig {
+            operation_id: Ulid::generate(),
+            bucket: BUCKET.to_string(),
+            group_id,
+            auth_context: AuthContext {
+                user_id: UserId::local(Ulid::generate(), realm_id),
+                realm_id,
+                path_restrictions: None,
+                session: None,
+            },
+            subject: subject(iroh::SecretKey::from_bytes(&[7u8; 32]).public(), "eu-west"),
+            start_after: None,
+            limit: BULK_PAGE_LIMIT,
+            now_ms: 1_000,
+            created_at: SystemTime::now(),
+        }
+    }
+
+    fn stored_bucket(group_id: GroupId) -> Value {
+        let bucket = BucketInfo {
+            group_id,
+            created_at: UNIX_EPOCH,
+            created_by: UserId::local(Ulid::generate(), RealmId::from_bytes([1u8; 32])),
+            cors_configuration: None,
+            storage_routing: Vec::new(),
+            placement_policies: Vec::new(),
+            placement_policy_generation: 0,
+            compression: Compression::Off,
+            distribution: None,
+        };
+        Value::from(bucket.to_bytes().expect("bucket encodes"))
+    }
+
+    fn capture(group_id: GroupId) -> CaptureRun {
+        CaptureRun {
+            operation_id: Ulid::from_bytes([3u8; 16]),
+            bucket: BUCKET.to_string(),
+            group_id,
+            written: None,
+        }
+    }
+
+    #[test]
+    fn rejects_regrouped_bucket() {
+        // A bucket deleted and recreated for another group must not stay under
+        // the authority of the group this run authorized.
+        let mut capture = capture(Ulid::generate());
+        assert_eq!(capture.transaction(), TransactionMode::Write);
+        assert!(matches!(capture.first(), Ok(Next::Call(IoCall::Read(_)))));
+        let rows = IoResult::Values(vec![Some(stored_bucket(Ulid::generate())), None]);
+        assert_eq!(capture.next(rows), Err(BulkError::BucketChanged));
+    }
+
+    #[test]
+    fn first_pass_stores() {
+        let group_id = Ulid::generate();
+        let mut capture = capture(group_id);
+        capture.first().unwrap();
+        let rows = IoResult::Values(vec![Some(stored_bucket(group_id)), None]);
+        assert!(matches!(
+            capture.next(rows),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Done(captured)) = capture.next(IoResult::Done) else {
+            panic!("the captured run is returned");
+        };
+        assert_eq!(captured.run.status, PolicyStatus::Active);
+    }
+
+    #[test]
+    fn finished_run_stays() {
+        // A pass never revives or downgrades a run another pass finished.
+        use aruna_core::structs::placement::policy::attachment::PolicyBulkRun;
+        let operation_id = Ulid::from_bytes([3u8; 16]);
+        let run = PolicyBulkRun {
+            operation_id,
+            bucket: BUCKET.to_string(),
+            bucket_identity: (Ulid::generate(), UNIX_EPOCH, UserId::default()),
+            generation: 1,
+            target_refs: Vec::new(),
+            status: PolicyStatus::Superseded,
+        };
+        let mut close = CloseRun {
+            operation_id,
+            status: PolicyStatus::Completed,
+            written: None,
+        };
+        close.first().unwrap();
+        let stored = IoResult::Values(vec![Some(run.to_bytes().unwrap().into())]);
+        assert_eq!(close.next(stored), Ok(Next::Done(Some(run))));
+    }
+
+    #[tokio::test]
+    async fn bulk_mints_successor() {
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let predecessor = put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(report.minted, 1);
+        assert!(report.blocked.is_empty());
+        let head = read_head(&context, OBJECT).await;
+        assert_ne!(head.version_id, predecessor);
+        let successor = read_version(&context, OBJECT, head.version_id).await;
+        assert_eq!(successor.placement_policies, vec![policy.policy_ref()]);
+        assert_eq!(
+            successor.state,
+            read_version(&context, OBJECT, predecessor).await.state
+        );
+        // The predecessor keeps its own refs until retention retires it.
+        assert!(
+            read_version(&context, OBJECT, predecessor)
+                .await
+                .placement_policies
+                .is_empty()
+        );
+        assert!(read_copy(&context, OBJECT, head.version_id).await.is_some());
+        assert!(matches!(
+            read_intent(&context, operation_id, OBJECT).await,
+            Some(PolicyIntent {
+                outcome: PolicyIntentOutcome::Completed { .. },
+                ..
+            })
+        ));
+
+        // A second pass observes no gap and converges.
+        let second = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
+        assert_eq!(second.minted, 0);
+        assert_eq!(second.covered, 1);
+        assert_eq!(second.status, PolicyStatus::Completed);
+    }
+
+    /// Binds the bucket to member 1 of the two-shard test set: it coordinates the keys below "m".
+    async fn distribute(context: &DriverContext) -> Ulid {
+        use crate::distribution::test_record::{binding, record};
+        let (snapshot, bytes) = record(true);
+        aruna_runner::testing::write_value(
+            &context.storage_handle,
+            aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+            snapshot.set_id().to_bytes().to_vec(),
+            bytes,
+        )
+        .await;
+        // The inventory a mint keeps current needs the set's ranges opened on this member.
+        crate::distribution::test_store::install(
+            &context.storage_handle,
+            snapshot.set_id(),
+            &snapshot.config.ranges,
+        )
+        .await;
+        let Event::Storage(StorageEvent::ReadResult {
+            value: Some(stored),
+            ..
+        }) = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: BUCKET.as_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await
+        else {
+            panic!("the bucket is stored");
+        };
+        let mut bucket = BucketInfo::from_bytes(&stored).expect("bucket decodes");
+        bucket.distribution = Some(binding(&snapshot, 1, 5));
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: S3_BUCKET_KEYSPACE.to_string(),
+                key: BUCKET.as_bytes().to_vec().into(),
+                value: bucket.to_bytes().expect("bucket encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        snapshot.set_id()
+    }
+
+    #[tokio::test]
+    async fn mints_own_ranges() {
+        // Member 1 coordinates "a" but not "x": only the coordinator of a range mints there.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let own = put_object(&context, &fixture, "a").await;
+        let other = put_object(&context, &fixture, "x").await;
+        distribute(&context).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(
+            (report.minted, report.elsewhere, report.observed),
+            (1, 1, 1)
+        );
+        assert_ne!(read_head(&context, "a").await.version_id, own);
+        assert_eq!(read_head(&context, "x").await.version_id, other);
+        assert_eq!(count_versions(&context, "x").await, 1);
+        assert_eq!(report.status, PolicyStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn fenced_range_waits() {
+        // A range fenced for a transfer is not minted; the run stays open for a later pass.
+        use aruna_core::keyspaces::DISTRIBUTION_FENCE_KEYSPACE;
+        use aruna_core::structs::storage::distribution::fence::{LocalFence, RangeFence};
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let own = put_object(&context, &fixture, "a").await;
+        let set_id = distribute(&context).await;
+        let (snapshot, _) = crate::distribution::test_record::record(true);
+        let mut fence = LocalFence::default();
+        fence.fence_range(RangeFence {
+            range_id: snapshot.config.ranges[0].range_id,
+            transfer_id: Ulid::from_bytes([3; 16]),
+            epoch: 1,
+            since_ms: 0,
+            uploads_open: false,
+        });
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: DISTRIBUTION_FENCE_KEYSPACE.to_string(),
+                key: set_id.to_bytes().to_vec().into(),
+                value: fence.to_bytes().expect("fence encodes").into(),
+                txn_id: None,
+            })
+            .await;
+        set_default(
+            &context,
+            &fixture,
+            vec![policy(fixture.node_id).policy_ref()],
+        )
+        .await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!((report.minted, report.replanned), (0, 1));
+        assert_eq!(read_head(&context, "a").await.version_id, own);
+        assert_eq!(report.status, PolicyStatus::Active);
+    }
+
+    #[test]
+    fn moved_range_replans() {
+        // A mint the range authority refused inside its transaction wrote nothing; the next
+        // key goes on and a later pass decides the refused key again.
+        use crate::distribution::guard::GuardError;
+        use crate::s3::policy::successor::SuccessorError;
+        use aruna_core::structs::storage::distribution::route::RouteError;
+        let range_id = Ulid::from_bytes([7; 16]);
+        for refusal in [
+            GuardError::Route(RouteError::StaleRange(range_id)),
+            GuardError::Route(RouteError::Moving(range_id)),
+        ] {
+            let mut operation = PolicyBulkOperation::new(bulk_config(Ulid::generate()));
+            operation.state = BulkState::Mint;
+            let turn = operation.record_outcome(Err(SuccessorError::Distribution(refusal)));
+            assert_eq!(operation.report.replanned, 1);
+            assert!(turn.is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn denies_non_admin() {
+        // Applying a bucket default is a realm-configuration change.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        put_object(&context, &fixture, OBJECT).await;
+        let mut config = config(&fixture, Ulid::generate());
+        config.auth_context.user_id = UserId::local(Ulid::from_bytes([9u8; 16]), fixture.realm_id);
+
+        let denied = drive(PolicyBulkOperation::new(config), &context).await;
+
+        assert_eq!(denied, Err(BulkError::Unauthorized));
+    }
+
+    /// Drops the durable cache entry, leaving a ref this node can no longer
+    /// authenticate because no holder answers in a single-node realm.
+    async fn evict_policy(context: &DriverContext, policy: &VerifiedPolicy) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: POLICY_CACHE_KEYSPACE.to_string(),
+                key: cache_key(&policy.policy_ref()),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn bulk_blocks_unresolved() {
+        // A ref the node can no longer obtain leaves the object a resumable gap
+        // instead of granting anything.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let predecessor = put_object(&context, &fixture, OBJECT).await;
+        let unknown = second_policy(fixture.node_id);
+        seed_gate(
+            &context,
+            fixture.realm_id,
+            fixture.user_id,
+            subject(fixture.node_id, "eu-west"),
+            std::slice::from_ref(&unknown),
+        )
+        .await;
+        set_default(&context, &fixture, vec![unknown.policy_ref()]).await;
+        evict_policy(&context, &unknown).await;
+        let operation_id = Ulid::generate();
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(report.minted, 0);
+        assert_eq!(
+            report.blocked.first().map(|gap| gap.reason),
+            Some(PolicyBlockedReason::PolicyUnresolved)
+        );
+        assert_eq!(read_head(&context, OBJECT).await.version_id, predecessor);
+        assert_eq!(report.status, PolicyStatus::Active);
+        assert!(matches!(
+            read_intent(&context, operation_id, OBJECT).await,
+            Some(PolicyIntent {
+                outcome: PolicyIntentOutcome::Blocked(PolicyBlockedReason::PolicyUnresolved),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocked_copy_resumes() {
+        // No compliant local copy blocks the mint; once the ordinary movement
+        // path has registered verified bytes again the same run completes it.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let predecessor = put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+        let copy = take_copy(&context, OBJECT, predecessor).await;
+
+        let blocked = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("first pass runs");
+
+        assert_eq!(
+            blocked.blocked.first().map(|gap| gap.reason),
+            Some(PolicyBlockedReason::SourceUnavailable)
+        );
+        assert_eq!(read_head(&context, OBJECT).await.version_id, predecessor);
+        let intent = read_intent(&context, operation_id, OBJECT)
+            .await
+            .expect("blocked intent is durable");
+        assert_eq!(
+            intent.outcome,
+            PolicyIntentOutcome::Blocked(PolicyBlockedReason::SourceUnavailable)
+        );
+
+        restore_copy(&context, &copy).await;
+        let resumed = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
+
+        assert_eq!(resumed.minted, 1);
+        // The blocked intent kept its successor id, so resuming mints exactly
+        // the version the first pass had planned.
+        assert_eq!(
+            read_head(&context, OBJECT).await.version_id,
+            intent.successor_version_id
+        );
+        assert_eq!(count_versions(&context, OBJECT).await, 2);
+    }
+
+    async fn write_intent(context: &DriverContext, intent: &PolicyIntent) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BULK_INTENT_KEYSPACE.to_string(),
+                key: intent.key().to_bytes().expect("key encodes").into(),
+                value: intent.to_bytes().expect("intent encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    async fn write_version(
+        context: &DriverContext,
+        key: &str,
+        version_id: Ulid,
+        version: &BlobVersion,
+    ) {
+        let _ = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+                key: VersionKey::new(BUCKET, key, version_id)
+                    .to_bytes()
+                    .expect("key encodes")
+                    .into(),
+                value: version.to_bytes().expect("version encodes").into(),
+                txn_id: None,
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn conflict_keeps_page() {
+        // A collision on the first object must neither overwrite it nor abandon
+        // the rest of the page.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let first = put_object(&context, &fixture, "a.txt").await;
+        put_object(&context, &fixture, "b.txt").await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+        let taken = Ulid::generate();
+        write_intent(
+            &context,
+            &PolicyIntent {
+                operation_id,
+                key: "a.txt".to_string(),
+                observed_head: read_head(&context, "a.txt").await,
+                successor_version_id: taken,
+                outcome: PolicyIntentOutcome::Planned,
+            },
+        )
+        .await;
+        let stored = read_version(&context, "a.txt", first).await;
+        write_version(&context, "a.txt", taken, &stored).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(report.replanned, 1);
+        assert_eq!(report.minted, 1);
+        assert_eq!(read_head(&context, "a.txt").await.version_id, first);
+        let head = read_head(&context, "b.txt").await;
+        assert_eq!(
+            read_version(&context, "b.txt", head.version_id)
+                .await
+                .placement_policies,
+            vec![policy.policy_ref()]
+        );
+    }
+
+    #[tokio::test]
+    async fn bulk_stops_superseded() {
+        // A changed default supersedes the run instead of mixing two policies.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+        drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("first pass runs");
+
+        set_default(&context, &fixture, Vec::new()).await;
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
+
+        assert_eq!(report.status, PolicyStatus::Superseded);
+        assert_eq!(report.observed, 0);
+    }
+
+    #[tokio::test]
+    async fn bulk_reuses_successor() {
+        // A lost response must reuse the assigned VersionId, not mint another.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let operation_id = Ulid::generate();
+        drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("first pass runs");
+        let successor = read_head(&context, OBJECT).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, operation_id)),
+            &context,
+        )
+        .await
+        .expect("second pass runs");
+
+        assert_eq!(report.minted, 0);
+        assert_eq!(read_head(&context, OBJECT).await, successor);
+        assert_eq!(count_versions(&context, OBJECT).await, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_passes_agree() {
+        // Two runs applying the same default may race, but only one successor
+        // can exist: the loser sees a changed head and replans.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+
+        let (first, second) = tokio::join!(
+            drive(
+                PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+                &context
+            ),
+            drive(
+                PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+                &context
+            ),
+        );
+
+        let minted =
+            first.expect("first pass runs").minted + second.expect("second pass runs").minted;
+        assert!(minted <= 1, "at most one successor may be minted");
+        assert_eq!(count_versions(&context, OBJECT).await, 1 + minted);
+        let head = read_head(&context, OBJECT).await;
+        if minted == 1 {
+            assert_eq!(
+                read_version(&context, OBJECT, head.version_id)
+                    .await
+                    .placement_policies,
+                vec![policy.policy_ref()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_unions_existing() {
+        // Applying a default may only add refs to the head it re-reads.
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let first = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![first.policy_ref()]).await;
+        put_object(&context, &fixture, OBJECT).await;
+
+        let second = second_policy(fixture.node_id);
+        seed_gate(
+            &context,
+            fixture.realm_id,
+            fixture.user_id,
+            subject(fixture.node_id, "eu-west"),
+            std::slice::from_ref(&second),
+        )
+        .await;
+        set_default(&context, &fixture, vec![second.policy_ref()]).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(report.minted, 1);
+        let head = read_head(&context, OBJECT).await;
+        let successor = read_version(&context, OBJECT, head.version_id).await;
+        assert!(successor.placement_policies.contains(&first.policy_ref()));
+        assert!(successor.placement_policies.contains(&second.policy_ref()));
+    }
+
+    #[tokio::test]
+    async fn bulk_skips_covered() {
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+        let version_id = put_object(&context, &fixture, OBJECT).await;
+
+        let report = drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        assert_eq!(report.covered, 1);
+        assert_eq!(report.minted, 0);
+        assert_eq!(read_head(&context, OBJECT).await.version_id, version_id);
+        assert_eq!(report.status, PolicyStatus::Completed);
+    }
+
+    #[test]
+    fn mint_slices_resolutions() {
+        // A bucket whose heads reference more policies than one evaluation may
+        // resolve must still mint: each object only carries its own refs.
+        use aruna_core::structs::placement::policy::{
+            MAX_REF_INPUT, PlacementDecision, PolicyResolution, evaluate_placement,
+        };
+        use std::collections::BTreeMap;
+
+        let node_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let refs = (1..=MAX_REF_INPUT as u8 + 5)
+            .map(|seed| PlacementPolicyRef {
+                policy_id: Ulid::from_bytes([seed; 16]),
+                digest: [seed; 32],
+            })
+            .collect::<Vec<_>>();
+        let resolved = refs
+            .iter()
+            .map(|policy_ref| (policy_ref.policy_id, PolicyResolution::Unresolved))
+            .collect::<BTreeMap<_, _>>();
+        let object = vec![refs[0], refs[1]];
+        let target = vec![refs[9]];
+
+        let sliced = super::mint_resolutions(&resolved, &object, &target);
+
+        assert_eq!(sliced.len(), 3);
+        let mut union = object.clone();
+        union.extend(target);
+        assert!(!matches!(
+            evaluate_placement(&union, &sliced, &subject(node_id, "eu-west")),
+            PlacementDecision::InvalidInput { .. }
+        ));
+        assert!(matches!(
+            evaluate_placement(&union, &resolved, &subject(node_id, "eu-west")),
+            PlacementDecision::InvalidInput { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn successor_is_fresh() {
+        let (_temp, context, fixture) = full_context().await;
+        write_bucket(&context, &fixture).await;
+        let predecessor = put_object(&context, &fixture, OBJECT).await;
+        let policy = policy(fixture.node_id);
+        set_default(&context, &fixture, vec![policy.policy_ref()]).await;
+
+        drive(
+            PolicyBulkOperation::new(config(&fixture, Ulid::generate())),
+            &context,
+        )
+        .await
+        .expect("pass runs");
+
+        let head = read_head(&context, OBJECT).await;
+        let successor = read_version(&context, OBJECT, head.version_id).await;
+        let before = read_version(&context, OBJECT, predecessor).await;
+        assert!(successor.created_at >= before.created_at);
+        assert!(successor.created_at <= SystemTime::now());
+    }
+}

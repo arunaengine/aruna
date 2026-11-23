@@ -364,7 +364,7 @@ jobs:
         run: >-
           cargo-nextest nextest run --archive-file nextest-crates.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --run-ignored all --no-tests fail
-          -E "package(aruna-plugins) & binary(integration) & test(/^(examples|elabftw_python)::/)"
+          -E "package(aruna-wasm-host) & binary(integration) & test(/^(examples|elabftw_python)::/)"
 
   restart-stress:
     name: Restart scale stress
@@ -627,7 +627,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/*.sh scripts/tests/*.sh
-          shellcheck --shell=sh scripts/compute-helper/build.sh scripts/dev/rustc_coverage.sh \
+          shellcheck --shell=sh apps/compute-helper/build.sh scripts/dev/rustc_coverage.sh \
             scripts/session-deno/build.sh scripts/session-python/build.sh \
             scripts/session-helper/session-start
 

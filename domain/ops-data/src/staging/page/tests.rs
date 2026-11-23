@@ -1,0 +1,1337 @@
+//! Tests the page import transitions: guards, replay, newer writes, usage and the checkpoint.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::connectors::descriptor::build_source_binding;
+use crate::s3::purge_fence::PurgeFenceError;
+use crate::staging::page::rows::{GUARD_READS, MAX_PAGE_ENTRIES, PageEntry};
+use aruna_core::calls::CallRun;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::id::NodeId;
+use aruna_core::id_mint::run_entropy;
+use aruna_core::keyspaces::{
+    BLOB_HEAD_KEYSPACE, BLOB_VERSIONS_KEYSPACE, CONNECTOR_REFERENCE_KEYSPACE,
+    REPLICATION_OBLIGATION_KEYSPACE, STAGING_STATE_KEYSPACE,
+};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobPhase,
+};
+use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::{
+    SourceConnector, SourceConnectorKind, SourceConnectorSecret,
+};
+use aruna_core::structs::execution::staging::StagingStrategy;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::{BucketInfo, CurrentVersionPointer};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
+use byteview::ByteView;
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime};
+use ulid::Ulid;
+
+const JOB_CREATED_MS: u64 = 1_000_000;
+
+fn token() -> Ulid {
+    Ulid::from_bytes([7; 16])
+}
+
+fn node() -> NodeId {
+    iroh::SecretKey::from_bytes(&[4; 32]).public()
+}
+
+fn connector() -> SourceConnector {
+    SourceConnector::new(
+        Ulid::from_bytes([2; 16]),
+        Ulid::from_bytes([1; 16]),
+        "public-data".to_string(),
+        SourceConnectorKind::S3,
+        HashMap::from([("bucket".to_string(), "public".to_string())]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+    )
+}
+
+fn bucket() -> BucketInfo {
+    BucketInfo {
+        group_id: Ulid::from_bytes([1; 16]),
+        created_at: SystemTime::UNIX_EPOCH,
+        created_by: UserId::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    }
+}
+
+fn observation(etag: &str) -> SourceMetadata {
+    SourceMetadata {
+        content_length: 3,
+        content_type: None,
+        etag: Some(format!("\"{etag}\"")),
+        last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(60)),
+        source_version: None,
+        digests: Default::default(),
+    }
+}
+
+fn entry(path: &str) -> PageEntry {
+    PageEntry {
+        source_path: format!("data/{path}"),
+        target_key: path.to_string(),
+        observation: observation(path),
+        metadata: Default::default(),
+        mirrors: Vec::new(),
+    }
+}
+
+fn checkpoint() -> StagingJobCheckpoint {
+    StagingJobCheckpoint {
+        phase: StagingJobPhase::Registering,
+        flat: Some(true),
+        items_done: 0,
+        prefixes_done: 1,
+        walk: None,
+        manifest: None,
+        table: None,
+        queue_head: 0,
+        queue_tail: 0,
+        items_current: 0,
+        items_succeeded: 0,
+        items_failed: 0,
+        items_total: None,
+        bytes_current: 0,
+        bytes_total: None,
+        bytes_discovered: 0,
+        current_path: None,
+        errors: Vec::new(),
+    }
+}
+
+fn input(entries: Vec<PageEntry>) -> PageImportInput {
+    PageImportInput {
+        job_id: JobId::from_bytes([5; 16]),
+        claim_token: token(),
+        realm_id: RealmId::from_bytes([3; 32]),
+        group_id: bucket().group_id,
+        user_id: UserId::default(),
+        auth_context: AuthContext {
+            user_id: UserId::default(),
+            realm_id: RealmId::from_bytes([3; 32]),
+            path_restrictions: None,
+            session: None,
+        },
+        node_id: node(),
+        bucket: "imports".to_string(),
+        expected_bucket: bucket(),
+        connector: connector(),
+        secret_fingerprint: None,
+        entries,
+        checkpoint: checkpoint(),
+        checkpoint_key: ByteView::from(JobId::from_bytes([5; 16]).to_bytes().to_vec()),
+        writes: Vec::new(),
+        deletes: Vec::new(),
+        now: SystemTime::UNIX_EPOCH + Duration::from_secs(2_000),
+        ranges: None,
+        mirror_connectors: Vec::new(),
+    }
+}
+
+fn record(claim_token: Ulid) -> JobRecord {
+    let mut record = JobRecord::new(
+        JobId::from_bytes([5; 16]),
+        JobPayload::Probe {
+            steps: 1,
+            step_sleep_ms: 0,
+            fail_at: None,
+            panic_at: None,
+            cleanup_marker: None,
+        },
+        UserId::default(),
+        node(),
+        JOB_CREATED_MS,
+        JOB_CREATED_MS,
+        None,
+    );
+    record.claim = Some(JobClaim {
+        holder_node_id: node(),
+        claim_token,
+        lease_expires_ms: u64::MAX,
+    });
+    record
+}
+
+fn claim(record: &JobRecord) -> Option<Value> {
+    let guard = aruna_core::structs::execution::job::rows::ClaimGuard::of(record)?;
+    value(guard.to_bytes().unwrap())
+}
+
+fn value(bytes: Vec<u8>) -> Option<Value> {
+    Some(ByteView::from(bytes))
+}
+
+fn guard_values(fence: Option<Value>, record: &JobRecord) -> Vec<Option<Value>> {
+    vec![
+        fence,
+        value(bucket().to_bytes().unwrap()),
+        value(connector().to_bytes().unwrap()),
+        claim(record),
+    ]
+}
+
+fn guards(fence: Option<Value>, record: &JobRecord) -> IoResult {
+    IoResult::Values(guard_values(fence, record))
+}
+
+fn range_page(next: Option<Key>) -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(StorageEvent::IterResult {
+        values: Vec::new(),
+        next_start_after: next,
+    })))
+}
+
+/// Answers the head interval read as holding too many other keys, then the head reads with
+/// `heads` in entry order.
+fn answer_heads(operation: &mut PageImportOperation, heads: Vec<Option<Value>>) -> IoCall {
+    let other = Some(Key::from(b"other".to_vec()));
+    let reads = operation.next(range_page(other));
+    assert!(matches!(
+        reads,
+        Ok(Next::Call(IoCall::Read(ref reads))) if reads.len() == heads.len()
+    ));
+    called(operation.next(IoResult::Values(heads)))
+}
+
+fn called(next: Result<Next<PageImportResult>, PageImportError>) -> IoCall {
+    match next {
+        Ok(Next::Call(call)) => call,
+        other => panic!("expected a call, got {other:?}"),
+    }
+}
+
+/// The answer to the relationship read: `count` relationships replicate the bucket.
+fn relationships(count: usize) -> IoResult {
+    let row = || (Key::from(b"rel".to_vec()), ByteView::from(Vec::new()));
+    IoResult::Page {
+        rows: (0..count).map(|_| row()).collect(),
+        next: None,
+    }
+}
+
+fn no_secret() -> IoResult {
+    IoResult::Event(Box::new(Event::Storage(StorageEvent::VaultResult {
+        entry: SourceConnectorSecret::vault_entry(connector().connector_id),
+        secret: None,
+    })))
+}
+
+fn head(version_id: Ulid) -> Option<Value> {
+    value(CurrentVersionPointer::new(version_id).to_bytes().unwrap())
+}
+
+/// A head version bound to `path` of the test connector, or of another source.
+fn reference(path: &str, observation: SourceMetadata, same_source: bool) -> Option<Value> {
+    let mut binding = build_source_binding(
+        StagingStrategy::Reference,
+        &connector(),
+        &observation,
+        path.to_string(),
+        Some(node()),
+        Some(connector().connector_id),
+    );
+    if !same_source {
+        binding.connector_id = Some(Ulid::from_bytes([8; 16]));
+    }
+    let now = SystemTime::UNIX_EPOCH;
+    let version = BlobVersion::reference(binding, observation, now, UserId::default(), now);
+    value(version.to_bytes().unwrap())
+}
+
+/// Drives the operation up to its row writes and returns them.
+fn run_to_writes(
+    operation: &mut PageImportOperation,
+    heads: Vec<Option<Value>>,
+    versions: Option<Vec<Option<Value>>>,
+) -> Vec<(KeySpace, Key, Value)> {
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let Ok(Next::Call(IoCall::Read(reads))) = operation.first() else {
+        panic!("expected the guard reads");
+    };
+    assert_eq!(reads.len(), GUARD_READS);
+    operation.next(guards(None, &record(token()))).unwrap();
+    answer_heads(operation, heads);
+    operation.next(relationships(1)).unwrap();
+    let mut call = called(operation.next(no_secret()));
+    if let Some(versions) = versions {
+        call = called(operation.next(IoResult::Values(versions)));
+    }
+    let IoCall::Write(writes) = call else {
+        panic!("expected the page rows, got {call:?}");
+    };
+    writes
+}
+
+/// Answers the row write and the empty delete; the next call is the usage update or nothing.
+fn after_rows(
+    operation: &mut PageImportOperation,
+) -> Result<Next<PageImportResult>, PageImportError> {
+    assert_eq!(
+        operation.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Delete(Vec::new())))
+    );
+    operation.next(IoResult::Done)
+}
+
+/// Answers the usage write and the dirty markers, and takes the outcome with its wake-ups.
+fn after_usage(operation: &mut PageImportOperation) -> (PageImportResult, Vec<IoCall>) {
+    assert!(matches!(
+        operation.next(IoResult::Done),
+        Ok(Next::Call(IoCall::Write(_)))
+    ));
+    match operation.next(IoResult::Done) {
+        Ok(Next::Then { output, calls }) => (output, calls),
+        other => panic!("expected the outcome, got {other:?}"),
+    }
+}
+
+fn rows_in(writes: &[(KeySpace, Key, Value)], key_space: &str) -> usize {
+    writes
+        .iter()
+        .filter(|(space, ..)| space == key_space)
+        .count()
+}
+
+#[test]
+fn page_registers_atomically() {
+    let mut operation = PageImportOperation::new(input(vec![entry("a"), entry("b")]));
+
+    let writes = run_to_writes(&mut operation, vec![None, None], None);
+
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, BLOB_HEAD_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, CONNECTOR_REFERENCE_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
+    assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 2);
+    let Ok(Next::Call(IoCall::AddUsage {
+        deltas, buckets, ..
+    })) = after_rows(&mut operation)
+    else {
+        panic!("expected one usage update");
+    };
+    assert!(
+        deltas
+            .iter()
+            .all(|(_, delta)| delta.objects == 2 && delta.referenced_bytes == 6)
+    );
+    // The bucket row counts the page like the group does, with one version row per entry.
+    let [(_, bucket)] = buckets.as_slice() else {
+        panic!("expected the bucket row, got {buckets:?}");
+    };
+    assert_eq!(
+        (bucket.objects, bucket.versions, bucket.referenced_bytes),
+        (2, 2, 6)
+    );
+    let (result, wakes) = after_usage(&mut operation);
+    let [publish, drain] = wakes.as_slice() else {
+        panic!("expected two wake-ups, got {wakes:?}");
+    };
+    assert!(matches!(
+        publish,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Task(TaskEffect::ShortenTimer {
+            key: TaskKey::PublishUsageSnapshots,
+            ..
+        }))
+    ));
+    assert!(matches!(
+        drain,
+        IoCall::Effect(effect) if matches!(**effect, Effect::Task(TaskEffect::ResetTimer {
+            key: TaskKey::DrainReplicationQueue,
+            ..
+        }))
+    ));
+    assert_eq!(
+        (result.registered, result.unchanged, result.kept),
+        (2, 0, 0)
+    );
+    assert_eq!(result.checkpoint.items_current, 2);
+    assert_eq!(result.checkpoint.items_succeeded, 2);
+}
+
+// An imported version records its external source and its import job as its origin.
+#[test]
+fn origin_marks_source() {
+    use aruna_core::structs::storage::blob::BlobVersion;
+    use aruna_core::structs::storage::origin::VersionOrigin;
+    let input = input(vec![entry("a")]);
+    let job_id = Some(input.job_id.as_ulid());
+    let mut operation = PageImportOperation::new(input);
+
+    let writes = run_to_writes(&mut operation, vec![None], None);
+
+    let (_, _, value) = (writes.iter())
+        .find(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE)
+        .unwrap();
+    let version = BlobVersion::from_bytes(value).unwrap();
+    assert_eq!(version.origin, Some(VersionOrigin::Source { job_id }));
+}
+
+#[test]
+fn replay_counts_once() {
+    let first = entry("a");
+    let mut operation = PageImportOperation::new(input(vec![first.clone()]));
+    let held = reference(&first.source_path, first.observation.clone(), true);
+
+    let writes = run_to_writes(
+        &mut operation,
+        vec![head(Ulid::from_parts(JOB_CREATED_MS + 5, 1))],
+        Some(vec![held]),
+    );
+
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
+    assert_eq!(rows_in(&writes, STAGING_STATE_KEYSPACE), 1);
+    // Nothing new is registered, so no usage moves and no publication is scheduled.
+    let Ok(Next::Done(result)) = after_rows(&mut operation) else {
+        panic!("expected the page outcome");
+    };
+    assert_eq!((result.registered, result.unchanged), (0, 1));
+}
+
+/// Prepares the rows of `entries` in a read snapshot where no key has a head yet.
+fn prepare(entries: Vec<PageEntry>) -> PreparedRows {
+    let heads = entries.iter().map(|_| None).collect();
+    let mut operation = PreparePageOperation::new(input(entries));
+    assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
+    answer_heads(&mut operation.0, heads);
+    operation.next(relationships(1)).unwrap();
+    // The snapshot ends without a write.
+    match operation.next(no_secret()) {
+        Ok(Next::Done(prepared)) => prepared,
+        other => panic!("expected the prepared rows, got {other:?}"),
+    }
+}
+
+// Rows prepared before the turn are written when the transaction reads what they were built
+// from; a head written meanwhile has the page build its rows anew.
+#[test]
+fn prepared_rows_checked() {
+    let entries = vec![entry("a"), entry("b")];
+    let prepared = prepare(entries.clone());
+    let expected = prepared.rows.writes.clone();
+    let mut operation =
+        PageImportOperation::new(input(entries.clone())).with_prepared(Some(prepared));
+    assert_eq!(
+        run_to_writes(&mut operation, vec![None, None], None),
+        expected
+    );
+
+    let prepared = prepare(entries.clone());
+    let expected = prepared.rows.writes.clone();
+    let mut operation = PageImportOperation::new(input(entries)).with_prepared(Some(prepared));
+    // The runner seeds every run with its own entropy; the preparation kept the default.
+    operation.seed(run_entropy(1, 1));
+    let other = reference("data/x", observation("x"), false);
+    let heads = vec![head(Ulid::from_parts(JOB_CREATED_MS - 5, 1)), None];
+    let writes = run_to_writes(&mut operation, heads, Some(vec![other]));
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+    let versions = |writes: &[(KeySpace, Key, Value)]| -> Vec<Key> {
+        let rows = writes
+            .iter()
+            .filter(|(space, ..)| space == BLOB_VERSIONS_KEYSPACE);
+        rows.map(|(_, key, _)| key.clone()).collect()
+    };
+    // Every version is minted anew, none taken from the stale preparation.
+    let stale = versions(&expected);
+    assert!(versions(&writes).iter().all(|key| !stale.contains(key)));
+}
+
+#[test]
+fn newer_write_kept() {
+    let (newer, older) = (entry("a"), entry("b"));
+    let mut operation = PageImportOperation::new(input(vec![newer.clone(), older.clone()]));
+    let other = |entry: &PageEntry| reference(&entry.source_path, observation("x"), false);
+
+    let writes = run_to_writes(
+        &mut operation,
+        vec![
+            head(Ulid::from_parts(JOB_CREATED_MS + 1, 1)),
+            head(Ulid::from_parts(JOB_CREATED_MS - 1, 1)),
+        ],
+        Some(vec![other(&newer), other(&older)]),
+    );
+
+    // Only the head written before the job started is replaced.
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 1);
+    let Ok(Next::Call(IoCall::AddUsage { deltas, .. })) = after_rows(&mut operation) else {
+        panic!("expected one usage update");
+    };
+    assert!(
+        deltas
+            .iter()
+            .all(|(_, delta)| delta.objects == 0 && delta.referenced_bytes == 3)
+    );
+    let (result, _) = after_usage(&mut operation);
+    assert_eq!((result.registered, result.kept), (1, 1));
+    assert_eq!(result.checkpoint.items_failed, 1);
+    assert_eq!(result.checkpoint.errors[0].target_key, newer.target_key);
+}
+
+// A drift successor of the same file written after the job started is newer than the listing.
+#[test]
+fn newer_same_kept() {
+    let first = entry("a");
+    let mut operation = PageImportOperation::new(input(vec![first.clone()]));
+    let held = reference(&first.source_path, observation("drifted"), true);
+
+    let writes = run_to_writes(
+        &mut operation,
+        vec![head(Ulid::from_parts(JOB_CREATED_MS + 1, 1))],
+        Some(vec![held]),
+    );
+
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 0);
+    let Ok(Next::Done(result)) = after_rows(&mut operation) else {
+        panic!("expected the page outcome");
+    };
+    assert_eq!((result.registered, result.kept), (0, 1));
+}
+
+#[test]
+fn guards_abort_page() {
+    let fence = StoragePurgeFence {
+        job_id: JobId::from_bytes([6; 16]),
+        scope: StoragePurgeScope::Bucket {
+            bucket: "imports".to_string(),
+        },
+    };
+    let cases = [
+        (
+            guards(value(fence.to_bytes().unwrap()), &record(token())),
+            PageImportError::Purge(PurgeFenceError::Suspended),
+        ),
+        (
+            guards(None, &record(Ulid::from_bytes([1; 16]))),
+            PageImportError::ClaimLost,
+        ),
+    ];
+    for (read, expected) in cases {
+        let mut operation = PageImportOperation::new(input(vec![entry("a")]));
+        operation.first().unwrap();
+        assert_eq!(operation.next(read), Err(expected));
+    }
+}
+
+#[test]
+fn changed_secret_aborts() {
+    let mut operation = PageImportOperation::new(PageImportInput {
+        secret_fingerprint: Some([1; 16]),
+        ..input(vec![entry("a")])
+    });
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
+    answer_heads(&mut operation, vec![None]);
+    operation.next(relationships(1)).unwrap();
+    assert_eq!(
+        operation.next(no_secret()),
+        Err(PageImportError::ConnectorChanged)
+    );
+}
+
+// The heads of a page are read as one interval of its keys; an empty interval proves every
+// key new without a read per key.
+#[test]
+fn interval_proves_absence() {
+    use aruna_core::effects::{IterEnd, IterStart};
+    use aruna_core::structs::storage::blob::BlobHeadKey;
+    let mut operation = PageImportOperation::new(input(vec![entry("b"), entry("a")]));
+    operation.first().unwrap();
+
+    let call = called(operation.next(guards(None, &record(token()))));
+
+    let key = |name| Key::from(BlobHeadKey::new("imports", name).to_bytes().unwrap());
+    let IoCall::Effect(read) = call else {
+        panic!("expected one head interval read, got {call:?}");
+    };
+    let Effect::Storage(StorageEffect::IterRange {
+        start, end, txn_id, ..
+    }) = *read
+    else {
+        panic!("expected one head interval read, got {read:?}");
+    };
+    assert_eq!(
+        (start, end, txn_id),
+        (IterStart::At(key("a")), IterEnd::Through(key("b")), None)
+    );
+    operation.next(range_page(None)).unwrap();
+    operation.next(relationships(1)).unwrap();
+    let IoCall::Write(writes) = called(operation.next(no_secret())) else {
+        panic!("expected the page rows");
+    };
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+}
+
+// A bucket nothing replicates gets no replication obligation per imported file.
+#[test]
+fn obligations_need_downstream() {
+    let mut operation = PageImportOperation::new(input(vec![entry("a"), entry("b")]));
+    operation.first().unwrap();
+    operation.next(guards(None, &record(token()))).unwrap();
+    let call = answer_heads(&mut operation, vec![None, None]);
+    assert!(matches!(call, IoCall::Page { limit: 1, .. }));
+    operation.next(relationships(0)).unwrap();
+
+    let IoCall::Write(writes) = called(operation.next(no_secret())) else {
+        panic!("expected the page rows");
+    };
+    assert_eq!(rows_in(&writes, BLOB_VERSIONS_KEYSPACE), 2);
+    assert_eq!(rows_in(&writes, REPLICATION_OBLIGATION_KEYSPACE), 0);
+}
+
+// An answer of another kind than the pending read fails the page.
+#[test]
+fn page_rejects_event() {
+    let mut operation = PageImportOperation::new(input(vec![entry("a")]));
+    operation.first().unwrap();
+    assert!(matches!(
+        operation.next(no_secret()),
+        Err(PageImportError::Storage(_))
+    ));
+}
+
+#[test]
+fn page_bounds_entries() {
+    let entries = (0..=MAX_PAGE_ENTRIES)
+        .map(|index| entry(&index.to_string()))
+        .collect();
+    let mut operation = PageImportOperation::new(input(entries));
+    assert_eq!(
+        operation.first(),
+        Err(PageImportError::TooManyEntries(MAX_PAGE_ENTRIES + 1))
+    );
+}
+
+// A progress flush and a lease renewal that commit while the page is open must not conflict.
+#[tokio::test]
+async fn flush_keeps_page() {
+    use aruna_test_harness::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let storage = &context.storage_handle;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    let job = record(token());
+    aruna_test_harness::jobs::insert_job(context, &job)
+        .await
+        .unwrap();
+    let mut operation = CallRun::new(PageImportOperation::new(PageImportInput {
+        connector,
+        expected_bucket,
+        ..input(vec![entry("a")])
+    }));
+
+    let mut pending = std::collections::VecDeque::from(operation.start().into_vec());
+    while let Some(effect) = pending.pop_front() {
+        let Effect::Storage(effect) = effect else {
+            break;
+        };
+        let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
+        if commit {
+            let progress = job.progress.clone();
+            aruna_runner::driver::drive(
+                aruna_ops_work::jobs::store::job_calls::flush_progress(
+                    job.job_id,
+                    token(),
+                    progress,
+                    2,
+                ),
+                context,
+            )
+            .await
+            .unwrap();
+            aruna_runner::driver::drive(
+                aruna_ops_work::jobs::store::job_calls::renew_lease(job.job_id, token(), 3, None),
+                context,
+            )
+            .await
+            .unwrap();
+        }
+        let event = storage.send_storage_effect(effect).await;
+        if commit {
+            assert!(
+                matches!(
+                    event,
+                    Event::Storage(StorageEvent::TransactionCommitted { .. })
+                ),
+                "the page must commit, got {event:?}"
+            );
+            return;
+        }
+        pending.extend(operation.step(event));
+    }
+    panic!("the page never reached its commit");
+}
+
+// An observation with nothing to compare but its size, as a table row gives it, imported
+// again unchanged writes nothing; a different size or a moved source is no longer unchanged.
+#[tokio::test]
+async fn bare_size_unchanged() {
+    use crate::connectors::repository::source_connector_key;
+    use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
+    use aruna_runner::driver::drive;
+    use aruna_test_harness::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    let bare = |content_length| PageEntry {
+        observation: SourceMetadata {
+            content_length,
+            content_type: None,
+            etag: None,
+            last_modified: None,
+            source_version: None,
+            digests: Default::default(),
+        },
+        ..entry("a")
+    };
+    let page = |content_length, checkpoint| PageImportInput {
+        connector: connector.clone(),
+        expected_bucket: expected_bucket.clone(),
+        checkpoint,
+        ..input(vec![bare(content_length)])
+    };
+    let run = |page| drive(PageImportOperation::new(page), context);
+
+    let first = run(page(4, checkpoint())).await.unwrap();
+    let again = run(page(4, first.checkpoint.clone())).await.unwrap();
+    assert_eq!(
+        (first.registered, again.registered, again.unchanged),
+        (1, 0, 1)
+    );
+    let resized = run(page(5, again.checkpoint.clone())).await.unwrap();
+    assert_eq!(resized.unchanged, 0);
+
+    // A later job sees the same bare row as unchanged until the connector's endpoint moves;
+    // then it binds the file to the new source.
+    let started = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap();
+    let started = started.as_millis() as u64 + 1;
+    let job_id = JobId::from_bytes([6; 16]);
+    let mut later = record(token());
+    later.job_id = job_id;
+    (later.created_at_ms, later.updated_at_ms) = (started, started);
+    aruna_test_harness::jobs::insert_job(context, &later)
+        .await
+        .unwrap();
+    let mut moved = connector.clone();
+    let endpoint = "http://127.0.0.1:10".to_string();
+    moved.public_config.insert("endpoint".to_string(), endpoint);
+    let later_page = |connector: &SourceConnector| PageImportInput {
+        job_id,
+        checkpoint_key: ByteView::from(job_id.to_bytes().to_vec()),
+        connector: connector.clone(),
+        ..page(4, checkpoint())
+    };
+    let kept = run(later_page(&connector)).await.unwrap();
+    assert_eq!((kept.registered, kept.unchanged), (0, 1));
+    let write = StorageEffect::Write {
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+        key: source_connector_key(group_id, moved.connector_id),
+        value: moved.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context.storage_handle.send_storage_effect(write).await;
+    let rebound = run(later_page(&moved)).await.unwrap();
+    assert_eq!((rebound.registered, rebound.unchanged), (1, 0));
+}
+
+// Runs the page twice against real storage: the commit is atomic and the replay finds the
+// registered head, so usage and connector rows are counted once.
+#[tokio::test]
+async fn replay_charges_once() {
+    use aruna_core::effects::IterStart;
+    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
+    use aruna_core::structs::storage::usage::{UsageCounters, usage_group_key};
+    use aruna_runner::driver::drive;
+    use aruna_test_harness::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    let page = PageImportInput {
+        connector: connector.clone(),
+        expected_bucket,
+        ..input(vec![entry("a")])
+    };
+
+    let first = drive(PageImportOperation::new(page.clone()), context)
+        .await
+        .unwrap();
+    let second = drive(
+        PageImportOperation::new(PageImportInput {
+            checkpoint: first.checkpoint.clone(),
+            ..page
+        }),
+        context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!((first.registered, second.unchanged), (1, 1));
+    assert_eq!(second.checkpoint.items_succeeded, 2);
+    let Event::Storage(StorageEvent::ReadResult {
+        value: Some(usage), ..
+    }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: USAGE_STATS_KEYSPACE.to_string(),
+            key: usage_group_key(group_id).into(),
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("group usage must exist");
+    };
+    let usage = UsageCounters::from_bytes(&usage).unwrap();
+    assert_eq!((usage.objects, usage.referenced_bytes), (1, 3));
+    let Event::Storage(StorageEvent::IterResult { values, .. }) = context
+        .storage_handle
+        .send_storage_effect(StorageEffect::Iter {
+            key_space: CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+            prefix: Some(ByteView::from(connector.connector_id.to_bytes().to_vec())),
+            start: None::<IterStart>,
+            limit: 10,
+            txn_id: None,
+        })
+        .await
+    else {
+        panic!("reference rows must be readable");
+    };
+    assert_eq!(values.len(), 1);
+}
+
+#[test]
+fn guards_carry_hint() {
+    use aruna_core::structs::storage::distribution::DistributionBinding;
+    use aruna_core::structs::storage::distribution::hint::SetHint;
+
+    let mut bound = bucket();
+    bound.distribution = Some(DistributionBinding {
+        set_id: Ulid::from_bytes([5u8; 16]),
+        member_id: Ulid::from_bytes([6u8; 16]),
+        incarnation: 1,
+        revision: Default::default(),
+    });
+    let values = vec![
+        None,
+        value(bound.to_bytes().unwrap()),
+        value(connector().to_bytes().unwrap()),
+        claim(&record(token())),
+    ];
+    let input = input(vec![entry("a")]);
+    let guards = crate::staging::page::rows::check_guards(&input, values).unwrap();
+    assert_eq!(
+        guards.set_hint,
+        Some(SetHint::of_set(Ulid::from_bytes([5u8; 16])))
+    );
+}
+
+// A page into a distributed bucket writes inventory rows and range counters in its own
+// transaction; its replay changes neither.
+#[tokio::test]
+async fn page_maintains_inventory() {
+    use crate::distribution::test_store::{counters, has_row, install, range};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::structs::storage::distribution::accounting::generation_key;
+    use aruna_core::structs::storage::distribution::inventory::head_position;
+    use aruna_runner::driver::drive;
+    use aruna_test_harness::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    // Member 1 of the test set coordinates the keys "a" and "b".
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    aruna_runner::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    assert!(matches!(
+        handle.send_storage_effect(write).await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    install(handle, set_id, &[range(1, "", None)]).await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    let page = PageImportInput {
+        connector,
+        bucket: "shared".to_string(),
+        expected_bucket: bound,
+        ..input(vec![entry("a"), entry("b")])
+    };
+
+    let first = drive(PageImportOperation::new(page.clone()), context)
+        .await
+        .unwrap();
+    let replay = PageImportInput {
+        checkpoint: first.checkpoint.clone(),
+        ..page
+    };
+    let second = drive(PageImportOperation::new(replay), context)
+        .await
+        .unwrap();
+
+    assert_eq!((first.registered, second.unchanged), (2, 2));
+    let total = counters(handle, generation_key(set_id, Ulid::from_bytes([1; 16]), 1)).await;
+    assert_eq!(
+        (total.objects, total.versions, total.referenced_bytes),
+        (2, 2, 6)
+    );
+    assert!(has_row(handle, head_position(set_id, "a")).await);
+    assert!(has_row(handle, head_position(set_id, "b")).await);
+    // The set keeps no search index, so the page feeds none.
+    let feed = crate::distribution::test_store::get(
+        handle,
+        aruna_core::keyspaces::SEARCH_FEED_KEYSPACE,
+        head_position(set_id, "a"),
+    );
+    assert!(feed.await.is_none());
+}
+
+// A page whose keys reach a range another member coordinates writes nothing.
+#[tokio::test]
+async fn page_needs_coordinator() {
+    use crate::distribution::guard::GuardError;
+    use crate::distribution::test_record::{binding, record as set_record};
+    use crate::distribution::test_store::{has_row, install, range};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_core::structs::storage::distribution::inventory::head_position;
+    use aruna_runner::driver::drive;
+    use aruna_test_harness::staging::{
+        create_http_connector, create_test_bucket, setup_driver_context,
+    };
+
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let group_id = bucket().group_id;
+    let connector = create_http_connector(context, group_id, "http://127.0.0.1:9").await;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    // Member 1 coordinates "a"; member 2 coordinates "x".
+    let (snapshot, record_bytes) = set_record(true);
+    let set_id = snapshot.set_id();
+    aruna_runner::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
+    bound.distribution = Some(binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    assert!(matches!(
+        handle.send_storage_effect(write).await,
+        Event::Storage(StorageEvent::WriteResult { .. })
+    ));
+    install(handle, set_id, &[range(1, "", None)]).await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    let page = PageImportInput {
+        connector,
+        bucket: "shared".to_string(),
+        expected_bucket: bound,
+        ..input(vec![entry("a"), entry("x")])
+    };
+    let refused = drive(PageImportOperation::new(page), context).await;
+    assert!(matches!(
+        refused,
+        Err(PageImportError::Distribution(
+            GuardError::NotCoordinator { .. }
+        ))
+    ));
+    assert!(!has_row(handle, head_position(set_id, "a")).await);
+}
+
+/// Bytes of keys and values per keyspace in `handle`.
+async fn keyspace_bytes(
+    handle: &aruna_storage::storage::handle::StorageHandle,
+) -> HashMap<&'static str, usize> {
+    let mut sizes = HashMap::new();
+    for key_space in aruna_core::keyspaces::KEYSPACE_CATALOG {
+        let iter = StorageEffect::Iter {
+            key_space: key_space.to_string(),
+            prefix: None,
+            start: None,
+            limit: 1_000_000,
+            txn_id: None,
+        };
+        if let Event::Storage(StorageEvent::IterResult { values, .. }) =
+            handle.send_storage_effect(iter).await
+        {
+            let bytes = values.iter().map(|(key, value)| key.len() + value.len());
+            sizes.insert(*key_space, bytes.sum());
+        }
+    }
+    sizes
+}
+
+/// A public bakrep-like S3 connector stored for the test group.
+async fn bakrep_connector(context: &aruna_runner::driver::DriverContext) -> SourceConnector {
+    use crate::connectors::create_connector::{SourceConnectorInput, SourceConnectorOperation};
+    let input = SourceConnectorInput {
+        group_id: bucket().group_id,
+        created_by: UserId::default(),
+        name: "bakrep".to_string(),
+        kind: SourceConnectorKind::S3,
+        public_config: HashMap::from([
+            ("bucket".to_string(), "bakrep-v2-data-000".to_string()),
+            (
+                "endpoint".to_string(),
+                "https://s3.bwsfs.uni-freiburg.de".to_string(),
+            ),
+            ("region".to_string(), "us-east-1".to_string()),
+            ("skip_signature".to_string(), "true".to_string()),
+        ]),
+        secret_config: HashMap::new(),
+    };
+    let operation = SourceConnectorOperation::new(input);
+    aruna_runner::driver::drive(operation, context)
+        .await
+        .unwrap()
+        .connector
+}
+
+fn bakrep_entry(index: usize) -> PageEntry {
+    let sample = format!("SAMD{:08}", 344 + index);
+    let source_path = format!("{sample}/{sample}.bakta.gff3.gz");
+    PageEntry {
+        target_key: format!("bakrep-v2-data-000/{source_path}"),
+        source_path,
+        observation: SourceMetadata {
+            content_length: 1_234_567,
+            content_type: None,
+            etag: Some("\"9b2cf535f27731c974343645a3985328\"".to_string()),
+            last_modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+            source_version: None,
+            digests: Default::default(),
+        },
+        metadata: Default::default(),
+        mirrors: Vec::new(),
+    }
+}
+
+/// Prints the bytes each row kind gained per entry between `before` and `after`.
+fn print_sizes(
+    label: &str,
+    before: &HashMap<&'static str, usize>,
+    after: &HashMap<&'static str, usize>,
+    entries: usize,
+) {
+    let mut rows: Vec<_> = (after.iter())
+        .map(|(space, bytes)| (*space, bytes - before.get(space).copied().unwrap_or(0)))
+        .filter(|(_, bytes)| *bytes > 0)
+        .collect();
+    rows.sort();
+    let total: usize = rows.iter().map(|(_, bytes)| bytes / entries).sum();
+    for (space, bytes) in rows {
+        println!("{label} {space}: {} bytes per entry", bytes / entries);
+    }
+    println!("{label} total: {total} bytes per entry");
+}
+
+// The same measurement for a distributed bucket, inventory rows included.
+#[tokio::test]
+async fn distributed_sizes_measured() {
+    use crate::distribution::test_store::{install, range};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_runner::driver::drive;
+    use aruna_test_harness::staging::{create_test_bucket, setup_driver_context};
+
+    const ENTRIES: usize = 100;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    aruna_runner::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    handle.send_storage_effect(write).await;
+    install(handle, set_id, &[range(1, "", None)]).await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    let before = keyspace_bytes(handle).await;
+    let page = PageImportInput {
+        connector,
+        bucket: "shared".to_string(),
+        expected_bucket: bound,
+        ..input((0..ENTRIES).map(bakrep_entry).collect())
+    };
+    drive(PageImportOperation::new(page), context)
+        .await
+        .unwrap();
+
+    let after = keyspace_bytes(handle).await;
+    print_sizes("distributed", &before, &after, ENTRIES);
+}
+
+// Prints the stored bytes per entry and row kind of a realistic bakrep page; a measurement
+// for the entry size work, not a size contract. Run with `--nocapture` to read it.
+#[tokio::test]
+async fn entry_sizes_measured() {
+    use aruna_runner::driver::drive;
+    use aruna_test_harness::staging::{create_test_bucket, setup_driver_context};
+
+    const ENTRIES: usize = 100;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let expected_bucket = create_test_bucket(context, group_id, UserId::default(), "imports").await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    let before = keyspace_bytes(handle).await;
+    let page = PageImportInput {
+        connector,
+        expected_bucket,
+        ..input((0..ENTRIES).map(bakrep_entry).collect())
+    };
+    drive(PageImportOperation::new(page), context)
+        .await
+        .unwrap();
+
+    let after = keyspace_bytes(handle).await;
+    print_sizes("plain", &before, &after, ENTRIES);
+}
+
+/// Answers one storage or timer effect and counts the storage exchange.
+async fn exchange(
+    effect: Effect,
+    handle: &aruna_storage::storage::handle::StorageHandle,
+    exchanges: &mut usize,
+) -> Event {
+    match effect {
+        Effect::Storage(effect) => {
+            *exchanges += 1;
+            handle.send_storage_effect(effect).await
+        }
+        Effect::Task(
+            TaskEffect::ShortenTimer { key, after } | TaskEffect::ResetTimer { key, after },
+        ) => Event::Task(TaskEvent::TimerScheduled { key, after }),
+        other => panic!("unexpected effect: {other:?}"),
+    }
+}
+
+/// Drives `operation` against `handle` and counts its storage request/response exchanges,
+/// those of the reads it runs as children included.
+async fn count_exchanges(
+    operation: PageImportOperation,
+    handle: &aruna_storage::storage::handle::StorageHandle,
+    process: u32,
+) -> (usize, Result<PageImportResult, PageImportError>) {
+    let mut operation = CallRun::new(operation);
+    // Each run gets its own entropy, as the runner gives it.
+    let (now_ms, mut slot) = (2_000_000, 0);
+    operation.stamp(now_ms);
+    operation.seed(run_entropy(process, slot));
+    let mut exchanges = 0;
+    let mut effects: std::collections::VecDeque<Effect> = operation.start().into_iter().collect();
+    while let Some(effect) = effects.pop_front() {
+        let event = match effect {
+            Effect::SubOperation(mut child) => {
+                slot += 1;
+                child.stamp(now_ms);
+                child.seed(run_entropy(process, slot));
+                let mut inner: std::collections::VecDeque<Effect> =
+                    child.start().into_iter().collect();
+                while let Some(effect) = inner.pop_front() {
+                    let event = exchange(effect, handle, &mut exchanges).await;
+                    inner.extend(child.step(event));
+                }
+                child.finalize()
+            }
+            effect => exchange(effect, handle, &mut exchanges).await,
+        };
+        effects.extend(operation.step(event));
+    }
+    (exchanges, operation.finalize())
+}
+
+// Prints the storage exchanges of four 500-key pages into one distributed range, the last ones
+// with a full key sample, then of two gathered 5,000-key pages; a measurement, not a contract.
+// Run with `--nocapture` to read it.
+#[tokio::test]
+async fn page_exchanges_measured() {
+    use crate::distribution::test_store::{install, range};
+    use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
+    use aruna_test_harness::staging::{create_test_bucket, setup_driver_context};
+
+    const ENTRIES: usize = 500;
+    let test = setup_driver_context().await;
+    let context = &test.driver_context;
+    let handle = &context.storage_handle;
+    let connector = bakrep_connector(context).await;
+    let group_id = bucket().group_id;
+    let mut bound = create_test_bucket(context, group_id, UserId::default(), "shared").await;
+    let (snapshot, record_bytes) = crate::distribution::test_record::record(true);
+    let set_id = snapshot.set_id();
+    aruna_runner::testing::write_value(
+        handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        set_id.to_bytes().to_vec(),
+        record_bytes,
+    )
+    .await;
+    bound.distribution = Some(crate::distribution::test_record::binding(&snapshot, 1, 5));
+    let write = StorageEffect::Write {
+        key_space: S3_BUCKET_KEYSPACE.to_string(),
+        key: b"shared".to_vec().into(),
+        value: bound.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    handle.send_storage_effect(write).await;
+    install(handle, set_id, &[range(1, "", None)]).await;
+    aruna_test_harness::jobs::insert_job(context, &record(token()))
+        .await
+        .unwrap();
+    for page in 0..4 {
+        let entries = (page * ENTRIES..(page + 1) * ENTRIES).map(bakrep_entry);
+        let input = PageImportInput {
+            connector: connector.clone(),
+            bucket: "shared".to_string(),
+            expected_bucket: bound.clone(),
+            ..input(entries.collect())
+        };
+        let operation = PageImportOperation::new(input);
+        let (exchanges, result) = count_exchanges(operation, handle, page as u32).await;
+        assert_eq!(result.unwrap().registered, ENTRIES as u64);
+        println!("distributed page {page}: {exchanges} storage exchanges for {ENTRIES} keys");
+    }
+    const GATHERED: usize = 5_000;
+    for page in 0..2 {
+        let first = 4 * ENTRIES + page * GATHERED;
+        let entries = (first..first + GATHERED).map(bakrep_entry);
+        let input = PageImportInput {
+            connector: connector.clone(),
+            bucket: "shared".to_string(),
+            expected_bucket: bound.clone(),
+            ..input(entries.collect())
+        };
+        let started = std::time::Instant::now();
+        let operation = PageImportOperation::new(input);
+        let (exchanges, result) = count_exchanges(operation, handle, 4 + page as u32).await;
+        assert_eq!(result.unwrap().registered, GATHERED as u64);
+        let elapsed = started.elapsed().as_millis();
+        println!(
+            "gathered page {page}: {exchanges} storage exchanges, {elapsed} ms for {GATHERED} keys"
+        );
+    }
+}
+
+// A further source's connector is read again with the page's guards: replaced or removed since
+// the page resolved it, the page stops.
+#[test]
+fn mirror_connector_rechecked() {
+    let mirror = SourceConnector::new(
+        Ulid::from_bytes([3; 16]),
+        Ulid::from_bytes([1; 16]),
+        "mirror".to_string(),
+        SourceConnectorKind::S3,
+        HashMap::from([("bucket".to_string(), "mirror".to_string())]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+    );
+    let input = PageImportInput {
+        mirror_connectors: vec![mirror.clone()],
+        ..input(vec![entry("a")])
+    };
+    let reads = crate::staging::page::rows::guard_reads(&input).unwrap();
+    assert_eq!(reads.len(), GUARD_READS + 1);
+    let values = |found: Option<&SourceConnector>| {
+        let mut values = guard_values(None, &record(token()));
+        values.push(found.map(|connector| connector.to_bytes().unwrap().into()));
+        values
+    };
+    let check = crate::staging::page::rows::check_guards;
+    assert!(check(&input, values(Some(&mirror))).is_ok());
+    let mut replaced = mirror.clone();
+    replaced
+        .public_config
+        .insert("bucket".to_string(), "other".to_string());
+    for found in [None, Some(&replaced)] {
+        let result = check(&input, values(found)).map(|_| ());
+        assert_eq!(result, Err(PageImportError::ConnectorChanged));
+    }
+}

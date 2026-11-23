@@ -1,0 +1,1264 @@
+//! Tests staging permission checks, batch caps, prefix expansion and job listing.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::auth::RealmAuth;
+use crate::openapi::ApiDoc;
+use crate::tests::routes::{
+    seed_realm_auth, seed_realm_config, test_state, test_storage, write_doc,
+};
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::keyspaces::{
+    AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
+    GROUP_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::structs::execution::source_access::SourceMetadata;
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::execution::staging::{
+    PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
+};
+use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
+use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::blob::{
+    BackendLocation, BackendRef, BlobHeadKey, BlobLocationKey, BlobVersion, CurrentVersionPointer,
+    VersionKey,
+};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::format::EncodingClass;
+use aruna_core::structs::storage::format::StoredFormat;
+use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
+use aruna_core::user::id::UserId;
+use aruna_runner::driver::DriverContext;
+use aruna_runner::testing::test_context;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
+use tempfile::TempDir;
+use ulid::Ulid;
+
+struct TestState {
+    _storage_dir: TempDir,
+    state: Arc<ServerState>,
+    bucket_group_id: Ulid,
+    connector_id: Ulid,
+    source_path: String,
+    bucket: String,
+    key: String,
+    auth_bucket_read: AuthContext,
+    auth_source_read: AuthContext,
+    without_source_read: AuthContext,
+}
+
+#[test]
+fn job_cursor_roundtrip() {
+    let cursor = vec![7u8; 24];
+    let encoded = encode_job_cursor(Some(cursor.clone())).unwrap();
+
+    assert_eq!(decode_job_cursor(Some(&encoded)).unwrap(), Some(cursor));
+    assert!(decode_job_cursor(Some("invalid")).is_err());
+}
+
+#[tokio::test]
+async fn snapshot_requires_read() {
+    let test = setup_state().await;
+
+    let result = snapshot_blob(
+        test.state.clone(),
+        test.without_source_read,
+        StageTargetRequest {
+            group_id: test.bucket_group_id.to_string(),
+            connector_id: test.connector_id.to_string(),
+            source_path: test.source_path,
+            bucket: test.bucket,
+            key: test.key,
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn reference_auth_succeeds() {
+    let test = setup_state().await;
+
+    let result = reference_blob(
+        test.state.clone(),
+        test.auth_source_read,
+        StageTargetRequest {
+            group_id: test.bucket_group_id.to_string(),
+            connector_id: test.connector_id.to_string(),
+            source_path: test.source_path,
+            bucket: test.bucket,
+            key: test.key,
+        },
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::NotFound)));
+}
+
+#[tokio::test]
+async fn references_hide_denied() {
+    // A key under a deny restriction is left out, the rest of the page stays.
+    let test = setup_state().await;
+    seed_reference_objects(&test).await;
+    let mut auth = test.auth_bucket_read.clone();
+    let restrictions = auth.path_restrictions.as_mut().unwrap();
+    let denied = format!("{}/data/b-external", restrictions[0].pattern);
+    restrictions.push(PathRestriction {
+        pattern: denied,
+        permission: Permission::DENY,
+    });
+
+    let (_, Json(page)) = list_references(
+        State(test.state.clone()),
+        RealmAuth(auth),
+        Query(ReferenceListQuery {
+            bucket: test.bucket.clone(),
+            prefix: Some("data/".to_string()),
+            limit: Some(10),
+            cursor: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let keys: Vec<&str> = page
+        .entries
+        .iter()
+        .map(|entry| entry.key.as_str())
+        .collect();
+    assert_eq!(keys, ["data/a-materialized", "data/c-native"]);
+}
+
+#[tokio::test]
+async fn references_list_bindings() {
+    let test = setup_state().await;
+    let origin = seed_reference_objects(&test).await;
+
+    let (status, Json(mut first)) = list_references(
+        State(test.state.clone()),
+        RealmAuth(test.auth_bucket_read.clone()),
+        Query(ReferenceListQuery {
+            bucket: test.bucket.clone(),
+            prefix: Some("data/".to_string()),
+            limit: Some(2),
+            cursor: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first.entries.len(), 2);
+
+    let (_, Json(second)) = list_references(
+        State(test.state.clone()),
+        RealmAuth(test.auth_bucket_read.clone()),
+        Query(ReferenceListQuery {
+            bucket: test.bucket.clone(),
+            prefix: Some("data/".to_string()),
+            limit: Some(2),
+            cursor: first.next_cursor.take(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(second.next_cursor.is_none());
+    first.entries.extend(second.entries);
+    assert_eq!(first.entries.len(), 3);
+    assert!(
+        first
+            .entries
+            .iter()
+            .all(|entry| entry.key.starts_with("data/"))
+    );
+
+    let materialized = first
+        .entries
+        .iter()
+        .find(|entry| entry.key == "data/a-materialized")
+        .unwrap();
+    assert_eq!(materialized.size, 42);
+    assert!(!materialized.referenced);
+    assert_eq!(materialized.kind, None);
+    assert_eq!(materialized.source_path, None);
+    assert_eq!(materialized.connector_id, None);
+    assert_eq!(materialized.origin_node_id, None);
+
+    let external = first
+        .entries
+        .iter()
+        .find(|entry| entry.key == "data/b-external")
+        .unwrap();
+    assert_eq!(external.size, 64);
+    assert!(external.referenced);
+    assert_eq!(external.kind, Some(ApiConnectorKind::Http));
+    assert_eq!(external.source_path.as_deref(), Some("remote/file.txt"));
+    let connector_id = test.connector_id.to_string();
+    assert_eq!(
+        external.connector_id.as_deref(),
+        Some(connector_id.as_str())
+    );
+    assert_eq!(external.origin_node_id, None);
+
+    let native = first
+        .entries
+        .iter()
+        .find(|entry| entry.key == "data/c-native")
+        .unwrap();
+    assert_eq!(native.size, 128);
+    assert!(native.referenced);
+    assert_eq!(native.kind, Some(ApiConnectorKind::ArunaNative));
+    assert_eq!(native.source_path.as_deref(), Some("source-bucket/native"));
+    assert_eq!(native.connector_id, None);
+    let origin_node_id = origin.to_string();
+    assert_eq!(
+        native.origin_node_id.as_deref(),
+        Some(origin_node_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn references_deny_read() {
+    let test = setup_state().await;
+
+    let result = list_references(
+        State(test.state),
+        RealmAuth(test.without_source_read),
+        Query(ReferenceListQuery {
+            bucket: test.bucket,
+            prefix: None,
+            limit: None,
+            cursor: None,
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::Forbidden)));
+}
+
+#[tokio::test]
+async fn queue_failure_repairable() {
+    let test = setup_state().await;
+    let version_id = Ulid::generate();
+    write_doc(
+        &test.state.get_ctx(),
+        S3_BUCKET_KEYSPACE,
+        test.bucket.as_bytes().to_vec().into(),
+        b"not a bucket replication config".to_vec().into(),
+    )
+    .await;
+
+    let obligation = LiveObligationRecord::new(
+        test.state.get_node_id(),
+        test.auth_source_read.clone(),
+        test.bucket.clone(),
+        test.key.clone(),
+        version_id,
+        false,
+    );
+    let obligation_key = live_obligation_key(&obligation).unwrap();
+    write_doc(
+        &test.state.get_ctx(),
+        REPLICATION_OBLIGATION_KEYSPACE,
+        obligation_key.as_ref().to_vec().into(),
+        postcard::to_allocvec(&obligation).unwrap().into(),
+    )
+    .await;
+
+    queue_live_replication(
+        &test.state,
+        test.auth_source_read,
+        test.bucket,
+        test.key,
+        version_id,
+        false,
+    )
+    .await;
+
+    assert!(
+        read_doc(
+            &test.state.get_ctx(),
+            REPLICATION_OBLIGATION_KEYSPACE,
+            obligation_key.as_ref().to_vec().into(),
+        )
+        .await
+        .is_some(),
+        "durable obligation should remain repairable when staging queue kick fails"
+    );
+}
+
+#[test]
+fn staging_submit_classifies() {
+    // Job admission refusals must keep their status instead of collapsing into 500.
+    use aruna_core::job_request::SubmitJobError;
+
+    assert_eq!(
+        map_submit_error(SubmitJobError::PlacementUnavailable(
+            "no binding".to_string()
+        ))
+        .status_code(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        map_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())).status_code(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[test]
+fn quota_maps_forbidden() {
+    let error = map_snapshot_error(MaterializeSnapshotError::Write(
+        PutObjectError::QuotaExceeded {
+            limit: 100,
+            usage: 200,
+        },
+    ));
+    assert!(matches!(error, ServerError::Forbidden));
+}
+
+#[test]
+fn batch_keeps_failures() {
+    let success = stage_result(
+        StageBatchItem {
+            source_path: "a.txt".to_string(),
+            target_key: "a.txt".to_string(),
+        },
+        Ok(()),
+    );
+    let failure = stage_result(
+        StageBatchItem {
+            source_path: "missing.txt".to_string(),
+            target_key: "missing.txt".to_string(),
+        },
+        Err(ServerError::NotFound),
+    );
+
+    assert_eq!(success.status, StageBatchStatus::Ok);
+    assert_eq!(failure.status, StageBatchStatus::Error);
+    assert_eq!(failure.error.as_deref(), Some("Not found"));
+}
+
+#[test]
+fn prefix_expands_paths() {
+    let items = map_prefix_entries(
+        vec![SourceEntry {
+            name: "file.txt".to_string(),
+            path: "folder/nested/file.txt".to_string(),
+            kind: SourceEntryKind::File,
+            size: Some(4),
+            modified: None,
+            etag: None,
+            stat: None,
+        }],
+        "folder/",
+        "imported",
+    );
+
+    assert_eq!(
+        items,
+        vec![StageBatchItem {
+            source_path: "folder/nested/file.txt".to_string(),
+            target_key: "imported/nested/file.txt".to_string(),
+        }]
+    );
+}
+
+#[test]
+fn prefix_normalizes_root() {
+    assert_eq!(normalize_prefix(".").unwrap(), "");
+    assert_eq!(normalize_prefix("./").unwrap(), "");
+    assert_eq!(normalize_prefix("./refseq/").unwrap(), "refseq/");
+    assert!(normalize_prefix("refseq/./nested").is_err());
+    assert!(normalize_prefix("../refseq").is_err());
+}
+
+#[test]
+fn batch_enforces_cap() {
+    assert!(ensure_batch_capacity(999, 1, 1000).is_ok());
+    assert!(matches!(
+        ensure_batch_capacity(1000, 1, 1000),
+        Err(ServerError::BadRequestReason(message)) if message.contains("1000")
+    ));
+}
+
+#[tokio::test]
+async fn batch_rejects_cap() {
+    let test = setup_state().await;
+    let items = (0..1001)
+        .map(|index| StageBatchItem {
+            source_path: format!("source-{index}"),
+            target_key: format!("target-{index}"),
+        })
+        .collect();
+
+    let result = stage_batch(
+        State(test.state),
+        RealmAuth(test.auth_source_read),
+        Json(StageBatchRequest {
+            group_id: test.bucket_group_id.to_string(),
+            node_id: None,
+            connector_id: test.connector_id.to_string(),
+            bucket: test.bucket,
+            strategy: ApiStagingStrategy::Snapshot,
+            items: Some(items),
+            prefixes: None,
+            checksum_manifest: None,
+            table: None,
+            mirrors: Vec::new(),
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+}
+
+#[tokio::test]
+async fn batch_rejects_node() {
+    let test = setup_state().await;
+    let other_node = iroh::SecretKey::from_bytes(&[17u8; 32]).public();
+
+    let result = stage_batch(
+        State(test.state),
+        RealmAuth(test.auth_source_read),
+        Json(StageBatchRequest {
+            group_id: test.bucket_group_id.to_string(),
+            node_id: Some(other_node.to_string()),
+            connector_id: test.connector_id.to_string(),
+            bucket: test.bucket,
+            strategy: ApiStagingStrategy::Snapshot,
+            items: None,
+            prefixes: None,
+            checksum_manifest: None,
+            table: None,
+            mirrors: Vec::new(),
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::BadRequestReason(_))));
+}
+
+// Every job store state reads as itself or its collapsed class; nothing settled reads as running.
+#[test]
+fn job_states_mapped() {
+    use aruna_core::structs::execution::job::identity::JobId;
+    use aruna_core::structs::execution::job::input::StagingJobSpec;
+    use aruna_core::structs::execution::job::local::JobRecord;
+    let realm_id = aruna_core::structs::identity::realm::RealmId([1; 32]);
+    let user_id = UserId::new(Ulid::from_bytes([2; 16]), realm_id);
+    let spec = StagingJobSpec {
+        auth_context: AuthContext {
+            user_id,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        group_id: Ulid::from_bytes([3; 16]),
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        connector_id: Ulid::from_bytes([5; 16]),
+        bucket: "imports".to_string(),
+        bucket_identity: (Ulid::nil(), UNIX_EPOCH, UserId::default()),
+        strategy: StagingStrategy::Reference,
+        items: Vec::new(),
+        prefixes: Vec::new(),
+        checksum_manifest: None,
+        table: None,
+        mirrors: Vec::new(),
+    };
+    let node = iroh::SecretKey::from_bytes(&[6; 32]).public();
+    let job_id = JobId::from_bytes([7; 16]);
+    let payload = JobPayload::Staging(spec);
+    let mut record = JobRecord::new(job_id, payload, user_id, node, 1, 1, None);
+    let expected = [
+        (JobState::Queued, "queued"),
+        (JobState::Claimed, "queued"),
+        (JobState::AwaitingKey, "awaiting_key"),
+        (JobState::Preparing, "running"),
+        (JobState::Ready, "running"),
+        (JobState::Running, "running"),
+        (JobState::Cancelling, "cancelling"),
+        (JobState::Indeterminate, "indeterminate"),
+        (JobState::Succeeded, "done"),
+        (JobState::Failed, "failed"),
+        (JobState::Cancelled, "cancelled"),
+    ];
+    for (state, name) in expected {
+        record.state = state;
+        assert_eq!(staging_job_response(&record, None).unwrap().state, name);
+    }
+    // A job waiting out a source's `Retry-After` shows when it goes on.
+    assert_eq!(
+        staging_job_response(&record, None).unwrap().paused_until,
+        None
+    );
+    record.progress.paused_until = Some(UNIX_EPOCH + std::time::Duration::from_secs(60));
+    let paused = staging_job_response(&record, None).unwrap().paused_until;
+    assert_eq!(paused.as_deref(), Some("1970-01-01T00:01:00+00:00"));
+    // A stored end beyond the calendar shows no date instead of failing the response.
+    let far = std::time::Duration::from_secs(100_000_000_000_000);
+    record.progress.paused_until = UNIX_EPOCH.checked_add(far);
+    assert_eq!(
+        staging_job_response(&record, None).unwrap().paused_until,
+        None
+    );
+}
+
+#[tokio::test]
+async fn batch_sync_unimplemented() {
+    let test = setup_state().await;
+
+    let result = stage_batch(
+        State(test.state),
+        RealmAuth(test.auth_source_read),
+        Json(StageBatchRequest {
+            group_id: test.bucket_group_id.to_string(),
+            node_id: None,
+            connector_id: test.connector_id.to_string(),
+            bucket: test.bucket,
+            strategy: ApiStagingStrategy::Sync,
+            items: None,
+            prefixes: None,
+            checksum_manifest: None,
+            table: None,
+            mirrors: Vec::new(),
+        }),
+    )
+    .await;
+
+    assert!(matches!(result, Err(ServerError::Unimplemented)));
+}
+
+#[test]
+fn openapi_has_staging() {
+    let openapi = ApiDoc::openapi();
+
+    assert!(openapi.paths.paths.contains_key("/data/staging"));
+    assert!(openapi.paths.paths.contains_key("/data/staging/batch"));
+    assert!(openapi.paths.paths.contains_key("/data/staging/references"));
+    assert!(!openapi.paths.paths.contains_key("/blobs/staging"));
+}
+
+async fn seed_reference_objects(test: &TestState) -> NodeId {
+    let created_by = test.auth_bucket_read.user_id;
+    let materialized_hash = [21u8; 32];
+    let location = BackendLocation {
+        backend: BackendRef::node_default(),
+        storage_class: None,
+        root: "/tmp".to_string(),
+        storage_bucket: "objects".to_string(),
+        backend_path: "materialized".to_string(),
+        ulid: Ulid::generate(),
+        format: StoredFormat::default(),
+        created_by,
+        created_at: UNIX_EPOCH,
+        staging: false,
+        partial: false,
+        blob_size: 42,
+        hashes: HashMap::new(),
+    };
+    write_doc(
+        &test.state.get_ctx(),
+        BLOB_LOCATIONS_KEYSPACE,
+        BlobLocationKey::new(
+            materialized_hash,
+            EncodingClass::Raw,
+            location.backend.clone(),
+        )
+        .to_bytes()
+        .into(),
+        location.to_bytes().unwrap().into(),
+    )
+    .await;
+    for key in ["data/a-materialized", "other/d-materialized"] {
+        write_blob_version(
+            &test.state.get_ctx(),
+            &test.bucket,
+            key,
+            BlobVersion::materialized(
+                materialized_hash,
+                BackendRef::node_default(),
+                EncodingClass::Raw,
+                UNIX_EPOCH,
+                created_by,
+                None,
+            ),
+        )
+        .await;
+    }
+
+    write_blob_version(
+        &test.state.get_ctx(),
+        &test.bucket,
+        "data/b-external",
+        BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::Http,
+                    public_config: HashMap::new(),
+                    source_path: "remote/file.txt".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: None,
+                    namespace: None,
+                    root: None,
+                },
+                connector_id: Some(test.connector_id),
+                mirrors: Vec::new(),
+            },
+            SourceMetadata {
+                content_length: 64,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            },
+            UNIX_EPOCH,
+            created_by,
+            UNIX_EPOCH,
+        ),
+    )
+    .await;
+
+    let origin = iroh::SecretKey::from_bytes(&[19u8; 32]).public();
+    write_blob_version(
+        &test.state.get_ctx(),
+        &test.bucket,
+        "data/c-native",
+        BlobVersion::reference(
+            VersionSourceBinding {
+                strategy: StagingStrategy::Reference,
+                descriptor: PortableSourceDescriptor {
+                    kind: SourceConnectorKind::ArunaNative,
+                    public_config: HashMap::new(),
+                    source_path: "source-bucket/native".to_string(),
+                    version_selector: None,
+                    capabilities: Vec::new(),
+                    origin_node_id: Some(origin),
+                    namespace: None,
+                    root: None,
+                },
+                connector_id: None,
+                mirrors: Vec::new(),
+            },
+            SourceMetadata {
+                content_length: 128,
+                content_type: None,
+                etag: None,
+                last_modified: None,
+                source_version: None,
+                digests: Default::default(),
+            },
+            UNIX_EPOCH,
+            created_by,
+            UNIX_EPOCH,
+        ),
+    )
+    .await;
+    origin
+}
+
+async fn write_blob_version(
+    driver_ctx: &Arc<DriverContext>,
+    bucket: &str,
+    key: &str,
+    version: BlobVersion,
+) {
+    let version_id = Ulid::generate();
+    write_doc(
+        driver_ctx,
+        BLOB_HEAD_KEYSPACE,
+        BlobHeadKey::new(bucket, key).to_bytes().unwrap().into(),
+        CurrentVersionPointer::new(version_id)
+            .to_bytes()
+            .unwrap()
+            .into(),
+    )
+    .await;
+    write_doc(
+        driver_ctx,
+        BLOB_VERSIONS_KEYSPACE,
+        VersionKey::new(bucket, key, version_id)
+            .to_bytes()
+            .unwrap()
+            .into(),
+        version.to_bytes().unwrap().into(),
+    )
+    .await;
+}
+
+async fn setup_state() -> TestState {
+    let (storage_dir, storage_handle) = test_storage();
+    let realm_signing_key = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes(
+        realm_signing_key.verifying_key().to_bytes(),
+    );
+    let node_id = iroh::SecretKey::from_bytes(&[13u8; 32]).public();
+    let with_source_read = UserId::local(Ulid::generate(), realm_id);
+    let without_source_read = UserId::local(Ulid::generate(), realm_id);
+    let actor = Actor {
+        node_id,
+        user_id: with_source_read,
+        realm_id,
+    };
+    let driver_ctx = Arc::new(test_context(storage_handle));
+
+    let bucket_group_id = Ulid::generate();
+    let source_group_id = Ulid::generate();
+    let mut bucket_auth =
+        GroupAuthorizationDocument::default_group_doc(with_source_read, realm_id, bucket_group_id);
+    for role in bucket_auth.roles.values_mut() {
+        role.assigned_users.insert(without_source_read);
+    }
+    let mut source_auth =
+        GroupAuthorizationDocument::default_group_doc(with_source_read, realm_id, source_group_id);
+    for role in source_auth.roles.values_mut() {
+        role.assigned_users.remove(&without_source_read);
+    }
+
+    let bucket_group = Group {
+        display_name: "bucket-group".to_string(),
+        group_id: bucket_group_id,
+        realm_id,
+        owner: with_source_read,
+        roles: bucket_auth.roles.keys().copied().collect(),
+    };
+    let source_group = Group {
+        display_name: "source-group".to_string(),
+        group_id: source_group_id,
+        realm_id,
+        owner: with_source_read,
+        roles: source_auth.roles.keys().copied().collect(),
+    };
+    seed_realm_auth(&driver_ctx, realm_id, &actor).await;
+    seed_realm_config(&driver_ctx, realm_id, &actor).await;
+    write_doc(
+        &driver_ctx,
+        AUTH_KEYSPACE,
+        bucket_group_id.to_bytes().into(),
+        bucket_auth.to_bytes(&actor).unwrap().into(),
+    )
+    .await;
+    write_doc(
+        &driver_ctx,
+        AUTH_KEYSPACE,
+        source_group_id.to_bytes().into(),
+        source_auth.to_bytes(&actor).unwrap().into(),
+    )
+    .await;
+    write_doc(
+        &driver_ctx,
+        GROUP_KEYSPACE,
+        bucket_group_id.to_bytes().into(),
+        bucket_group.to_bytes(&actor).unwrap().into(),
+    )
+    .await;
+    write_doc(
+        &driver_ctx,
+        GROUP_KEYSPACE,
+        source_group_id.to_bytes().into(),
+        source_group.to_bytes(&actor).unwrap().into(),
+    )
+    .await;
+
+    let bucket = "stage-bucket".to_string();
+    let key = "test.txt".to_string();
+    let connector_id = Ulid::generate();
+    let source_path = "folder/file.txt".to_string();
+    let bucket_info = BucketInfo {
+        group_id: bucket_group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: with_source_read,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    write_doc(
+        &driver_ctx,
+        S3_BUCKET_KEYSPACE,
+        bucket.as_bytes().to_vec().into(),
+        bucket_info.to_bytes().unwrap().into(),
+    )
+    .await;
+
+    let state = Arc::new(
+        test_state(
+            driver_ctx,
+            realm_id,
+            node_id,
+            NodeCapabilities::user_node(realm_id).unwrap(),
+        )
+        .await,
+    );
+
+    let target_path =
+        crate::auth::blob_permission_path(state.as_ref(), bucket_group_id, &bucket, &key);
+    let bucket_path = bucket_permission_path(realm_id, bucket_group_id, node_id, &bucket);
+    let source_path_restriction =
+        connector_permission_path(state.as_ref(), bucket_group_id, connector_id, &source_path);
+
+    TestState {
+        _storage_dir: storage_dir,
+        state,
+        bucket_group_id,
+        connector_id,
+        source_path,
+        bucket,
+        key,
+        auth_bucket_read: AuthContext {
+            user_id: with_source_read,
+            realm_id,
+            path_restrictions: Some(vec![
+                PathRestriction {
+                    pattern: bucket_path.clone(),
+                    permission: Permission::READ,
+                },
+                PathRestriction {
+                    pattern: format!("{bucket_path}/**"),
+                    permission: Permission::READ,
+                },
+            ]),
+            session: None,
+        },
+        auth_source_read: AuthContext {
+            user_id: with_source_read,
+            realm_id,
+            path_restrictions: Some(vec![
+                PathRestriction {
+                    pattern: target_path.clone(),
+                    permission: Permission::WRITE,
+                },
+                PathRestriction {
+                    pattern: source_path_restriction,
+                    permission: Permission::READ,
+                },
+            ]),
+            session: None,
+        },
+        without_source_read: AuthContext {
+            user_id: without_source_read,
+            realm_id,
+            path_restrictions: Some(vec![PathRestriction {
+                pattern: target_path,
+                permission: Permission::WRITE,
+            }]),
+            session: None,
+        },
+    }
+}
+
+async fn read_doc(
+    driver_ctx: &Arc<DriverContext>,
+    key_space: &str,
+    key: byteview::ByteView,
+) -> Option<byteview::ByteView> {
+    let event = driver_ctx
+        .storage_handle
+        .send_storage_effect(StorageEffect::Read {
+            key_space: key_space.to_string(),
+            key,
+            txn_id: None,
+        })
+        .await;
+    let Event::Storage(StorageEvent::ReadResult { value, .. }) = event else {
+        panic!("unexpected storage event")
+    };
+
+    value
+}
+
+mod distributed {
+    use super::super::*;
+    use crate::tests::distributed::{
+        BUCKET, CLOSED_API, Node, PEER, distribute, mock_peer, node_id, node_state, publish_api,
+        replicate,
+    };
+
+    fn bearer() -> Extension<Option<ValidatedBearer>> {
+        Extension(Some(ValidatedBearer::new_for_test("caller-token")))
+    }
+
+    fn connector() -> String {
+        ulid::Ulid::from_bytes([30; 16]).to_string()
+    }
+
+    fn target(node: &Node, key: &str) -> StageTargetRequest {
+        StageTargetRequest {
+            group_id: node.group_id.to_string(),
+            connector_id: connector(),
+            source_path: "data/a.bin".to_string(),
+            bucket: BUCKET.to_string(),
+            key: key.to_string(),
+        }
+    }
+
+    fn batch(node: &Node, items: &[&str], prefixes: &[&str]) -> StageBatchRequest {
+        StageBatchRequest {
+            group_id: node.group_id.to_string(),
+            node_id: None,
+            connector_id: connector(),
+            bucket: BUCKET.to_string(),
+            strategy: ApiStagingStrategy::Snapshot,
+            items: Some(
+                (items.iter())
+                    .map(|path| StageBatchItem {
+                        source_path: path.to_string(),
+                        target_key: path.to_string(),
+                    })
+                    .collect(),
+            ),
+            prefixes: Some(
+                (prefixes.iter())
+                    .map(|prefix| StageBatchPrefix {
+                        source_prefix: prefix.to_string(),
+                        target_prefix: "imported".to_string(),
+                    })
+                    .collect(),
+            ),
+            checksum_manifest: None,
+            table: None,
+            mirrors: Vec::new(),
+        }
+    }
+
+    /// Stores the job's connector on the node, with or without credentials.
+    async fn store_connector(node: &Node, secret: bool) {
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_ops_work::connectors::create_connector::{
+            SourceConnectorInput, SourceConnectorOperation,
+        };
+        use std::collections::HashMap;
+        let mut public_config = HashMap::from([
+            ("bucket".to_string(), "bakrep".to_string()),
+            ("endpoint".to_string(), "https://s3.example.org".to_string()),
+        ]);
+        let mut secret_config = HashMap::new();
+        match secret {
+            true => secret_config.extend([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret-canary".to_string()),
+            ]),
+            false => {
+                public_config.insert("skip_signature".to_string(), "true".to_string());
+            }
+        }
+        let input = SourceConnectorInput {
+            group_id: node.group_id,
+            created_by: node.owner.user_id,
+            name: "bakrep".to_string(),
+            kind: SourceConnectorKind::S3,
+            public_config,
+            secret_config,
+        };
+        let id = ulid::Ulid::from_string(&connector()).unwrap();
+        let operation = SourceConnectorOperation::with_id(input, id);
+        drive(operation, &node.state.get_ctx()).await.unwrap();
+    }
+
+    /// A coordinator that registers a shared connector and accepts the job, recording each
+    /// request path and body.
+    async fn coordinator(
+        node: &Node,
+    ) -> (
+        Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let group = node.group_id;
+        let answer = move |uri: axum::http::Uri, body: String| {
+            record.lock().unwrap().push((uri.path().to_string(), body));
+            async move {
+                let json = [("content-type", "application/json")];
+                if !uri.path().ends_with("/connectors") {
+                    return (StatusCode::ACCEPTED, json, r#"{"job_id":"j1"}"#.to_string());
+                }
+                let created = serde_json::json!({
+                    "connector_id": connector(), "group_id": group.to_string(),
+                    "name": "bakrep", "kind": "s3", "public_config": {},
+                    "created_at": "", "updated_at": "", "created_by": "",
+                    "has_secret_config": false
+                });
+                (StatusCode::CREATED, json, created.to_string())
+            }
+        };
+        let router = axum::Router::new().fallback(answer);
+        let (url, task) = crate::tests::assistant::spawn_mock(router).await;
+        publish_api(&node.state, node_id(PEER), &url).await;
+        (seen, task)
+    }
+
+    // A connector without credentials is registered on the other coordinator under its id
+    // before the job; credentials never leave the node, and an unknown connector is refused.
+    #[tokio::test]
+    async fn submit_shares_connector() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        let Err(ServerError::Refused(status, code, _)) =
+            submit(&node, batch(&node, &["data/a.bin"], &[])).await
+        else {
+            panic!("a connector this node does not hold is refused");
+        };
+        assert_eq!(
+            (status, code),
+            (StatusCode::NOT_FOUND, "connector_not_found")
+        );
+
+        store_connector(&node, false).await;
+        let (seen, task) = coordinator(&node).await;
+        let (_, Json(submitted)) = submit(&node, batch(&node, &["data/a.bin"], &[]))
+            .await
+            .unwrap();
+        task.abort();
+        assert_eq!(submitted.job_id, "j1");
+        let seen = seen.lock().unwrap().clone();
+        let paths: Vec<_> = seen.iter().map(|(path, _)| path.as_str()).collect();
+        let shared = format!("/api/v1/data/groups/{}/connectors", node.group_id);
+        assert_eq!(paths, [shared.as_str(), "/api/v1/data/staging/jobs"]);
+        let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+        assert_eq!(body["connector_id"], connector());
+        assert_eq!(body["public_config"]["skip_signature"], "true");
+    }
+
+    #[tokio::test]
+    async fn secret_stays_local() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        store_connector(&node, true).await;
+        let (seen, task) = coordinator(&node).await;
+        let _ = submit(&node, batch(&node, &["data/a.bin"], &[]))
+            .await
+            .unwrap();
+        task.abort();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "only the job is relayed");
+        assert_eq!(seen[0].0, "/api/v1/data/staging/jobs");
+        assert!(!seen[0].1.contains("secret-canary"));
+    }
+
+    async fn submit(
+        node: &Node,
+        request: StageBatchRequest,
+    ) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
+        submit_staging(
+            State(node.state.clone()),
+            RealmAuth(node.owner.clone()),
+            bearer(),
+            axum::http::HeaderMap::new(),
+            Json(request),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stage_relays_write() {
+        let node = node_state().await;
+        distribute(&node.state, node.group_id, BUCKET).await;
+        let answer =
+            r#"{"strategy":"snapshot","bucket":"routed","key":"z.bin","version_id":"v","size":3}"#;
+        let peer = mock_peer(StatusCode::CREATED, answer).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+        let stage = |key: &str| {
+            stage_blob(
+                State(node.state.clone()),
+                RealmAuth(node.owner.clone()),
+                bearer(),
+                axum::http::HeaderMap::new(),
+                Json(StageRequest::Snapshot(target(&node, key))),
+            )
+        };
+
+        let (status, Json(staged)) = stage("z.bin").await.unwrap();
+
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            (staged.key.as_str(), staged.version_id.as_str()),
+            ("z.bin", "v")
+        );
+        assert_eq!(
+            peer.paths.lock().unwrap().clone(),
+            vec!["/api/v1/data/staging"]
+        );
+        // A key of this node's range is staged here, where the connector is unknown.
+        assert!(stage("a.bin").await.is_err());
+        assert_eq!(peer.paths.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_fans_out() {
+        let node = node_state().await;
+        replicate(&node.state, node.group_id, BUCKET).await;
+        store_connector(&node, true).await;
+        let peer = mock_peer(StatusCode::ACCEPTED, r#"{"job_id":"j1"}"#).await;
+        publish_api(&node.state, node_id(PEER), &peer.url).await;
+
+        let (status, Json(submitted)) = submit(&node, batch(&node, &["data/a.bin"], &[]))
+            .await
+            .unwrap();
+
+        // This node coordinates no range, so the peer's job is the answer.
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(submitted.job_id, "j1");
+        let job = &submitted.coordinator_jobs[0];
+        assert_eq!(job.node_id, node_id(PEER).to_string());
+        assert_eq!(
+            (job.job_id.as_deref(), job.error.as_deref()),
+            (Some("j1"), None)
+        );
+        assert_eq!(
+            peer.paths.lock().unwrap().clone(),
+            vec!["/api/v1/data/staging/jobs"]
+        );
+
+        publish_api(&node.state, node_id(PEER), CLOSED_API).await;
+        let Err(ServerError::ServiceUnavailableReason(reason)) =
+            submit(&node, batch(&node, &["data/a.bin"], &[])).await
+        else {
+            panic!("a job no coordinator accepted answers 503");
+        };
+        assert!(reason.contains("no coordinator"));
+    }
+
+    #[tokio::test]
+    async fn submit_validates_input() {
+        let node = node_state().await;
+        let mut sync = batch(&node, &["data/a.bin"], &[]);
+        sync.strategy = ApiStagingStrategy::Sync;
+        assert!(matches!(
+            submit(&node, sync).await,
+            Err(ServerError::Unimplemented)
+        ));
+        let mut elsewhere = batch(&node, &["data/a.bin"], &[]);
+        elsewhere.node_id = Some(node_id(PEER).to_string());
+        assert!(matches!(
+            submit(&node, elsewhere).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+        assert!(matches!(
+            submit(&node, batch(&node, &[], &[])).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+        let mut manifest = batch(&node, &["data/a.bin"], &[]);
+        manifest.checksum_manifest = Some("../sums.txt".to_string());
+        assert!(submit(&node, manifest).await.is_err());
+        let mut foreign = batch(&node, &["data/a.bin"], &[]);
+        foreign.group_id = ulid::Ulid::nil().to_string();
+        assert!(submit(&node, foreign).await.is_err());
+    }
+
+    // A table import takes no items, uses references and needs a valid descriptor.
+    #[tokio::test]
+    async fn submit_checks_tables() {
+        use aruna_core::structs::execution::table::TableImport;
+        let node = node_state().await;
+        let table = |target: &str| {
+            let rows = serde_json::json!({ "kind": "file", "source": "{url}", "target": target });
+            let table =
+                serde_json::json!({ "source": { "connector": "lists/a.csv" }, "rows": rows });
+            Some(serde_json::from_value::<TableImport>(table).unwrap())
+        };
+        let mut with_items = batch(&node, &["data/a.bin"], &[]);
+        with_items.strategy = ApiStagingStrategy::Reference;
+        with_items.table = table("{url|basename}");
+        let mut snapshot = batch(&node, &[], &[]);
+        snapshot.table = table("{url|basename}");
+        let mut invalid = batch(&node, &[], &[]);
+        invalid.strategy = ApiStagingStrategy::Reference;
+        invalid.table = table("{url|upper}");
+        for request in [with_items, snapshot, invalid] {
+            let refused = submit(&node, request).await;
+            assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
+        }
+        // Rows are read through a connector even when the list itself is an uploaded object.
+        let mut unconnected = batch(&node, &[], &[]);
+        unconnected.strategy = ApiStagingStrategy::Reference;
+        unconnected.connector_id = String::new();
+        unconnected.table = table("{url|basename}");
+        let Err(ServerError::BadRequestReason(reason)) = submit(&node, unconnected).await else {
+            panic!("a table without a connector is refused");
+        };
+        assert!(reason.contains("read through a connector"));
+        let mut blocking = batch(&node, &[], &[]);
+        blocking.table = table("{url|basename}");
+        let refused = stage_batch(
+            State(node.state.clone()),
+            RealmAuth(node.owner.clone()),
+            Json(blocking),
+        )
+        .await;
+        assert!(matches!(refused, Err(ServerError::BadRequestReason(_))));
+    }
+
+    #[tokio::test]
+    async fn batch_reports_errors() {
+        let node = node_state().await;
+        let run = |request: StageBatchRequest| {
+            stage_batch(
+                State(node.state.clone()),
+                RealmAuth(node.owner.clone()),
+                Json(request),
+            )
+        };
+        // A prefix that is no confined path and a prefix the unknown connector cannot list
+        // both come back as error results; nothing is staged.
+        let (status, Json(answer)) = run(batch(&node, &[], &["../escape", "data"]))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer.results.len(), 2);
+        assert!(
+            (answer.results.iter())
+                .all(|result| result.status == StageBatchStatus::Error && result.error.is_some())
+        );
+        let mut sync = batch(&node, &["data/a.bin"], &[]);
+        sync.strategy = ApiStagingStrategy::Sync;
+        assert!(matches!(run(sync).await, Err(ServerError::Unimplemented)));
+        let mut manifest = batch(&node, &["data/a.bin"], &[]);
+        manifest.checksum_manifest = Some("sums.txt".to_string());
+        assert!(matches!(
+            run(manifest).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+        let mut elsewhere = batch(&node, &["data/a.bin"], &[]);
+        elsewhere.node_id = Some(node_id(PEER).to_string());
+        assert!(matches!(
+            run(elsewhere).await,
+            Err(ServerError::BadRequestReason(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn references_state_completeness() {
+    // A member that keeps only the lower shard lists the whole bucket incompletely.
+    use crate::tests::distributed::{BUCKET, distribute, node_state};
+    let node = node_state().await;
+    distribute(&node.state, node.group_id, BUCKET).await;
+    let page = |prefix: &str| {
+        list_references(
+            State(node.state.clone()),
+            RealmAuth(node.owner.clone()),
+            Query(ReferenceListQuery {
+                bucket: BUCKET.to_string(),
+                prefix: Some(prefix.to_string()),
+                limit: None,
+                cursor: None,
+            }),
+        )
+    };
+    let (_, Json(whole)) = page("").await.unwrap();
+    assert!(!whole.complete);
+    let (_, Json(lower)) = page("apple").await.unwrap();
+    assert!(
+        lower.complete,
+        "a prefix inside the held shard is listed in full"
+    );
+}

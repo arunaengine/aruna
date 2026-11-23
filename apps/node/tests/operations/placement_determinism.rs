@@ -1,0 +1,578 @@
+//! Tests that placement policy and node info documents converge to one inventory on all nodes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::BTreeMap;
+
+use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::document::{DocumentEffect, DocumentNetEvent, DocumentSyncPublish, DocumentTarget};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::metadata::api::CreateDocumentPayload;
+use aruna_core::node::state::ReadInfoOperation;
+use aruna_core::placement::resolve_shard_holders;
+use aruna_core::placement::resolver::{build_view, resolve_holders};
+use aruna_core::reducer::AdminDocumentState;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::{
+    AffinityEffect, AffinityRule, LabelMatch, NodePlacementEntry,
+};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structured_id::StructuredId;
+use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_work::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
+};
+use aruna_ops_work::node::info::flows::SeedInfoOperation;
+use aruna_ops_work::realm::mutate_placement::{
+    MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
+};
+use aruna_ops_work::sync::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
+use aruna_runner::driver::drive;
+use aruna_runner::driver::node_facts;
+use aruna_test_harness::documents::sync_topics;
+use ulid::Ulid;
+
+use crate::convergence;
+use crate::topology::store_realm_config;
+use crate::topology::{TestNode, spawn_replicas};
+use convergence::wait_for_convergence;
+
+// #261 Definition of Done: placement policy converges over the real admin topic, every node
+// derives the same weighted multi-location holder sets.
+#[tokio::test]
+async fn policy_converges_inventory() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([61u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 4).await?;
+    let actor = test_actor(&nodes[0], realm_id);
+    let group_id = Ulid::from_bytes([71; 16]);
+
+    let initial_config =
+        drive(GetConfigOperation::new(realm_id), nodes[0].context.as_ref()).await?;
+    assert_distinct_resolution(&nodes, &initial_config);
+    let document_id = mint_local_document(
+        &initial_config,
+        &actor,
+        group_id,
+        "datasets/issue-261",
+        &mut crate::fresh_ids(),
+        aruna_core::time::unix_timestamp_millis(),
+    )?
+    .as_ulid();
+
+    // The create-receiving node chooses the document's bucket out of the ones
+    // it holds; every record of the document rides that bucket.
+    let created = create_metadata_document(&nodes[0], realm_id, group_id, document_id).await?;
+    let placement = created.placement;
+    let target = DocumentTarget::MetadataCreateEvent {
+        document_id,
+        event_id: created.last_event_id,
+    };
+
+    let mut expected_initial = resolve_shard_holders(&initial_config, &placement);
+    sort_node_ids(&mut expected_initial);
+    assert_eq!(expected_initial.len(), 2);
+    assert!(expected_initial.contains(&nodes[0].net.node_id()));
+    wait_holder_document(&nodes, &expected_initial, &target).await?;
+
+    let obsolete = expected_initial[0];
+    let old_entry = initial_config
+        .placement_entry(obsolete)
+        .expect("selected holder should have a placement entry");
+    drive(
+        MutatePlacementOperation::new(MutatePlacementConfig {
+            actor: actor.clone(),
+            mutation: RealmPlacementMutation::UpsertNode(NodePlacementEntry {
+                draining: true,
+                ..old_entry.clone()
+            }),
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+
+    let mut expanded_strategy = initial_config
+        .strategy(
+            &initial_config
+                .default_strategy_id
+                .expect("default strategy should be configured"),
+        )
+        .expect("default strategy should resolve")
+        .clone();
+    expanded_strategy.replica_count = Some(3);
+    drive(
+        MutatePlacementOperation::new(MutatePlacementConfig {
+            actor,
+            mutation: RealmPlacementMutation::UpsertStrategy(expanded_strategy.clone()),
+        }),
+        nodes[0].context.as_ref(),
+    )
+    .await?;
+
+    let configs = wait_policy_convergence(&nodes, realm_id, obsolete, 3).await?;
+    assert_placement_equal(&configs);
+    assert_holders_equal(&configs);
+    assert_eq!(placement.strategy_id, expanded_strategy.strategy_id);
+    let mut expected_final = resolve_shard_holders(&configs[0], &placement);
+    sort_node_ids(&mut expected_final);
+    assert_eq!(expected_final.len(), 3);
+    assert!(!expected_final.contains(&obsolete));
+    assert!(
+        expected_final
+            .iter()
+            .any(|holder| !expected_initial.contains(holder)),
+        "policy change should add replacement/top-up holders"
+    );
+    wait_holder_document(&nodes, &expected_final, &target).await?;
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn node_info_propagates() -> Result<(), Box<dyn std::error::Error>> {
+    let realm_id = RealmId([67u8; 32]);
+    let nodes = build_realm_nodes(&realm_id, 2).await?;
+    let publisher = &nodes[0];
+    let peer = &nodes[1];
+    let publisher_id = publisher.net.node_id();
+    let urls = NodeUrls {
+        api: Some("https://api.node-a.example.test".to_string()),
+        s3: Some("https://s3.node-a.example.test".to_string()),
+    };
+
+    let facts = node_facts(publisher.context.as_ref());
+    let seed = SeedInfoOperation::new(realm_id, publisher_id, urls.clone(), facts, false);
+    drive(seed, publisher.context.as_ref())
+        .await
+        .map_err(std::io::Error::other)?;
+    drive(
+        ReplicateDocumentsOperation::new(ReplicateDocumentsConfig {
+            realm_id,
+            local_node_id: publisher_id,
+            excluded_peers: Vec::new(),
+            documents: vec![DocumentTarget::NodeInfo {
+                realm_id,
+                node_id: publisher_id,
+            }],
+            allow_genesis: true,
+        }),
+        publisher.context.as_ref(),
+    )
+    .await?;
+
+    let expected_labels = build_view(
+        &drive(
+            GetConfigOperation::new(realm_id),
+            publisher.context.as_ref(),
+        )
+        .await?,
+    )
+    .nodes
+    .into_iter()
+    .find(|node| node.node_id == publisher_id)
+    .expect("publisher should be present in placement view")
+    .labels;
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "node info document did not propagate over the shared topic",
+        || async {
+            Ok(usize::from(
+                drive(
+                    ReadInfoOperation::new(vec![publisher_id]),
+                    peer.context.as_ref(),
+                )
+                .await
+                .map_err(std::io::Error::other)?
+                .is_empty(),
+            ))
+        },
+    )
+    .await?;
+    let received = drive(
+        ReadInfoOperation::new(vec![publisher_id]),
+        peer.context.as_ref(),
+    )
+    .await
+    .map_err(std::io::Error::other)?
+    .remove(&publisher_id)
+    .expect("node info document present after convergence");
+
+    assert_eq!(received.node_id, publisher_id);
+    assert!(received.executors.is_empty());
+    assert_eq!(received.labels, expected_labels);
+    assert_eq!(received.labels.get("tier").map(String::as_str), Some("hot"));
+    assert_eq!(received.urls, urls);
+    assert_eq!(received.utilization.storage_bytes_used, 0);
+    assert_eq!(received.utilization.documents_held, Some(0));
+    assert!(received.utilization.load_permille.is_some());
+    assert!(received.utilization.heartbeat_at_ms > 0);
+    assert!(received.updated_at_ms > 0);
+
+    shutdown_nodes(nodes).await;
+    Ok(())
+}
+
+fn test_actor(node: &TestNode, realm_id: RealmId) -> Actor {
+    Actor {
+        node_id: node.net.node_id(),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
+        realm_id,
+    }
+}
+
+async fn create_metadata_document(
+    node: &TestNode,
+    realm_id: RealmId,
+    group_id: Ulid,
+    document_id: Ulid,
+) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
+    Ok(drive(
+        CreateDocumentOperation::new(CreateDocumentConfig {
+            actor: Actor {
+                node_id: node.net.node_id(),
+                user_id: aruna_core::user::id::UserId::local(Ulid::from_bytes([74; 16]), realm_id),
+                realm_id,
+            },
+            group_id,
+            document_id,
+            document_path: "datasets/issue-261".to_string(),
+            public: false,
+            payload: CreateDocumentPayload::Scaffold {
+                name: "Issue 261 placement".to_string(),
+                description: "Integration placement fixture".to_string(),
+                date_published: "2026-07-10".to_string(),
+                license: Some("https://creativecommons.org/licenses/by/4.0/".to_string()),
+            },
+        }),
+        node.context.as_ref(),
+    )
+    .await?
+    .record)
+}
+
+async fn wait_holder_document(
+    nodes: &[TestNode],
+    holders: &[aruna_core::id::NodeId],
+    target: &DocumentTarget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for holder in holders {
+        let node = nodes
+            .iter()
+            .find(|node| node.net.node_id() == *holder)
+            .expect("holder should be a fixture node");
+        wait_for_document(node, target).await?;
+    }
+    Ok(())
+}
+
+async fn wait_for_document(
+    node: &TestNode,
+    target: &DocumentTarget,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = format!("document did not reach final holder {}", node.net.node_id());
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(&context, || async {
+        match node
+            .context
+            .storage_handle
+            .send_effect(Effect::Storage(StorageEffect::Read {
+                key_space: target.storage_keyspace().to_string(),
+                key: target.storage_key(),
+                txn_id: None,
+            }))
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value: Some(_), .. }) => Ok(0),
+            Event::Storage(StorageEvent::ReadResult { value: None, .. }) => Ok(1),
+            other => Err(format!("unexpected document read event: {other:?}").into()),
+        }
+    })
+    .await
+}
+
+async fn wait_policy_convergence(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    draining_node: aruna_core::id::NodeId,
+    replica_count: u32,
+) -> Result<Vec<RealmConfigDocument>, Box<dyn std::error::Error>> {
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "placement policy did not converge on all nodes",
+        || async {
+            let mut pending = 0;
+            for node in nodes {
+                let config =
+                    drive(GetConfigOperation::new(realm_id), node.context.as_ref()).await?;
+                let strategy_matches = config
+                    .default_strategy_id
+                    .and_then(|strategy_id| config.strategy(&strategy_id))
+                    .is_some_and(|strategy| strategy.replica_count == Some(replica_count));
+                let node_matches = config
+                    .placement_entry(draining_node)
+                    .is_some_and(|entry| entry.draining);
+                if !(strategy_matches && node_matches) {
+                    pending += 1;
+                }
+            }
+            Ok(pending)
+        },
+    )
+    .await?;
+
+    let mut configs = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        configs.push(drive(GetConfigOperation::new(realm_id), node.context.as_ref()).await?);
+    }
+    Ok(configs)
+}
+
+fn assert_distinct_resolution(nodes: &[TestNode], config: &RealmConfigDocument) {
+    let strategy = config
+        .default_strategy_id
+        .and_then(|strategy_id| config.strategy(&strategy_id))
+        .expect("default placement strategy should resolve");
+    assert_eq!(strategy.replica_count, Some(2));
+    assert!(strategy.distinct_locations);
+    assert!(matches!(
+        strategy.affinity.as_slice(),
+        [AffinityRule {
+            effect: AffinityEffect::Multiply { permille: 4_000 },
+            ..
+        }]
+    ));
+
+    let view = build_view(config);
+    let hot_node = nodes[0].net.node_id();
+    let mut baseline = strategy.clone();
+    baseline.affinity.clear();
+    let mut hot_wins = 0usize;
+    let mut baseline_hot_wins = 0usize;
+    for counter in 0u64..2_000 {
+        let subject = blake3::hash(&counter.to_le_bytes());
+        let holders = resolve_holders(&view, strategy, subject.as_bytes(), None);
+        let locations: std::collections::HashSet<_> = holders
+            .iter()
+            .map(|holder| {
+                view.nodes
+                    .iter()
+                    .find(|node| node.node_id == *holder)
+                    .expect("holder should be in placement view")
+                    .location
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(holders.len(), 2);
+        assert_eq!(locations.len(), 2);
+        hot_wins += usize::from(holders[0] == hot_node);
+        baseline_hot_wins +=
+            usize::from(resolve_holders(&view, &baseline, subject.as_bytes(), None)[0] == hot_node);
+    }
+    assert!(
+        hot_wins > baseline_hot_wins + 400,
+        "weighted location affinity should materially increase first-choice share: weighted={hot_wins} baseline={baseline_hot_wins}"
+    );
+}
+
+fn sort_node_ids(nodes: &mut [aruna_core::id::NodeId]) {
+    nodes.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+}
+
+fn assert_placement_equal(configs: &[RealmConfigDocument]) {
+    let first = &configs[0];
+    let mut first_map = first.placement_map.clone();
+    first_map.sort_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
+    for config in &configs[1..] {
+        let mut map = config.placement_map.clone();
+        map.sort_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
+        assert_eq!(map, first_map, "placement_map diverged across nodes");
+        assert_eq!(
+            config.strategies, first.strategies,
+            "strategies diverged across nodes"
+        );
+        assert_eq!(
+            config.default_strategy_id, first.default_strategy_id,
+            "default strategy diverged across nodes"
+        );
+        assert_eq!(
+            config.strategy_bindings, first.strategy_bindings,
+            "strategy bindings diverged across nodes"
+        );
+    }
+}
+
+fn assert_holders_equal(configs: &[RealmConfigDocument]) {
+    let strategy = configs[0]
+        .default_strategy_id
+        .and_then(|id| configs[0].strategy(&id))
+        .expect("realm config has a default strategy")
+        .clone();
+
+    let views: Vec<_> = configs.iter().map(build_view).collect();
+
+    for counter in 0u64..100 {
+        let subject = *blake3::hash(&counter.to_le_bytes()).as_bytes();
+        let reference = resolve_holders(&views[0], &strategy, &subject, None);
+        assert!(
+            !reference.is_empty(),
+            "empty holder set for subject {counter}"
+        );
+        for view in &views[1..] {
+            let holders = resolve_holders(view, &strategy, &subject, None);
+            assert_eq!(
+                holders, reference,
+                "holder set diverged for subject {counter}"
+            );
+        }
+    }
+}
+
+async fn build_realm_nodes(
+    realm_id: &RealmId,
+    count: usize,
+) -> Result<Vec<TestNode>, Box<dyn std::error::Error>> {
+    let nodes = spawn_replicas(*realm_id, count, true, true).await?;
+    install_realm_config(&nodes, *realm_id).await?;
+    Ok(nodes)
+}
+
+// Four independently weighted locations; the hot label multiplies both the
+// location and node rendezvous weight for node zero.
+fn base_config(nodes: &[TestNode], realm_id: RealmId) -> RealmConfigDocument {
+    let mut config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    config.seed_default_placement();
+    let default_id = config.default_strategy_id.expect("seeded default strategy");
+    if let Some(strategy) = config
+        .strategies
+        .iter_mut()
+        .find(|strategy| strategy.strategy_id == default_id)
+    {
+        strategy.replica_count = Some(2);
+        strategy.distinct_locations = true;
+        strategy.affinity = vec![AffinityRule {
+            matcher: LabelMatch {
+                key: "tier".to_string(),
+                value: "hot".to_string(),
+            },
+            effect: AffinityEffect::Multiply { permille: 4_000 },
+        }];
+    }
+
+    let locations = ["eu", "us", "ap", "sa"];
+    let weights = [100u32, 200, 150, 75];
+    for (index, node) in nodes.iter().enumerate() {
+        let node_id = node.net.node_id();
+        config.ensure_node(node_id, RealmNodeKind::Management);
+        config.seed_job_control(node_id, index as u32);
+        config.placement_map.push(NodePlacementEntry {
+            node_id,
+            location: locations[index % locations.len()].to_string(),
+            weight: weights[index % weights.len()],
+            full: false,
+            draining: false,
+            labels: BTreeMap::from([(
+                "tier".to_string(),
+                if index == 0 { "hot" } else { "cold" }.to_string(),
+            )]),
+        });
+    }
+    config
+}
+
+async fn install_realm_config(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = base_config(nodes, realm_id);
+    for node in nodes {
+        store_realm_config(&node.net, &node.context, realm_id, &config).await?;
+    }
+    seed_config_topic(nodes, realm_id, &config).await?;
+    // Config apply hook: restore shared topics and converge shard membership
+    // before the fixture starts publishing or changing placement.
+    for _ in 0..5 {
+        for node in nodes {
+            aruna_runner::driver::drive(
+                aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+                    node.net.node_id(),
+                    realm_id,
+                ),
+                &node.context,
+            )
+            .await
+            .expect("shard topics restore");
+        }
+        let mut retry = false;
+        for node in nodes {
+            retry |= aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure())
+            .retry_scheduled;
+        }
+        if !retry {
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn seed_config_topic(
+    nodes: &[TestNode],
+    realm_id: RealmId,
+    config: &RealmConfigDocument,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let target = DocumentTarget::RealmConfig { realm_id };
+    let placement =
+        aruna_core::placement::target_placement_ref(config, &target, Default::default());
+    let topic = target.sync_topic_id(realm_id, &placement);
+    let actor = Actor {
+        node_id: nodes[1].net.node_id(),
+        user_id: aruna_core::user::id::UserId::nil(realm_id),
+        realm_id,
+    };
+    let mut reducer_state = AdminDocumentState::new(AdminDocumentTarget::RealmConfig { realm_id });
+    let event = reducer_state.apply_operation(
+        &actor,
+        AdminDocumentOperation::NodePlacementSet {
+            entry: config
+                .placement_map
+                .first()
+                .ok_or("realm config has no placement entry")?
+                .clone(),
+        },
+        ulid::Ulid::generate(),
+    )?;
+
+    match nodes[1]
+        .net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::AdminOperation {
+                    target: target.clone(),
+                    event: Box::new(event),
+                    placement,
+                    allow_genesis: true,
+                    origin_signature: None,
+                }],
+                peers: Vec::new(),
+                expected: Vec::new(),
+            },
+        )))
+        .await
+    {
+        Event::Net(NetEvent::DocumentSync(DocumentNetEvent::DocumentsPublished { .. })) => {}
+        other => {
+            return Err(format!("unexpected realm config seed publish event: {other:?}").into());
+        }
+    }
+
+    sync_topics(nodes[0].context.as_ref(), vec![topic], Vec::new()).await?;
+    Ok(())
+}
+
+async fn shutdown_nodes(nodes: Vec<TestNode>) {
+    for node in nodes {
+        node.net.shutdown().await;
+    }
+}

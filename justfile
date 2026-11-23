@@ -27,7 +27,7 @@ test:
 # targets, still compiles their transitive dependencies, and executes only the
 # audited no-I/O state-machine, pure, decision and reducer tests.
 test-fast:
-	cargo nextest run -p aruna-core -p aruna-ops-identity -p aruna-ops-data -p aruna-operations --lib --locked --profile fast
+	cargo nextest run -p aruna-core -p aruna-ops-identity -p aruna-ops-data -p aruna-ops-work --lib --locked --profile fast
 
 # The same selection across every workspace target; compiles more than it runs.
 test-fast-workspace:

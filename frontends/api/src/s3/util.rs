@@ -1,0 +1,814 @@
+//! Maps S3 operation names to needed access and parses common S3 request fields.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::s3::auth::Action;
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
+use aruna_core::structs::storage::blob::{BackendLocation, ensure_confined_path};
+use aruna_core::structs::storage::format::{StoredEncryption, StoredFormat};
+use aruna_core::structs::storage::multipart::{MultipartChecksumHint, MultipartChecksumType};
+use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+use aruna_ops_work::s3::multipart::complete::CompleteMultipartPart;
+use aruna_ops_work::s3::object::put::PutObjectInput as BlobPutObjectInput;
+use base64::prelude::*;
+use http::HeaderMap;
+use s3s::dto::ChecksumAlgorithm as S3ChecksumAlgorithm;
+use s3s::dto::ServerSideEncryption;
+use s3s::dto::{
+    ChecksumType, CompletedPart, CopySource, CreateMultipartUploadInput, PartNumber, PutObjectInput,
+};
+use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use std::path::Path;
+use ulid::Ulid;
+
+pub fn operation_permission(operation_name: &str) -> Option<Action> {
+    match operation_name {
+        // Write operations (operations that modify state/data)
+        "AbortMultipartUpload" => Some(Action::Write),
+        "CompleteMultipartUpload" => Some(Action::Write),
+        "CopyObject" => Some(Action::Write),
+        "CreateBucket" => Some(Action::Write),
+        "CreateBucketMetadataTableConfiguration" => Some(Action::Write),
+        "CreateMultipartUpload" => Some(Action::Write),
+        "DeleteBucket" => Some(Action::Write),
+        "DeleteBucketAnalyticsConfiguration" => Some(Action::Write),
+        "DeleteBucketCors" => Some(Action::Write),
+        "DeleteBucketEncryption" => Some(Action::Write),
+        "DeleteBucketIntelligentTieringConfiguration" => Some(Action::Write),
+        "DeleteBucketInventoryConfiguration" => Some(Action::Write),
+        "DeleteBucketLifecycle" => Some(Action::Write),
+        "DeleteBucketMetadataTableConfiguration" => Some(Action::Write),
+        "DeleteBucketMetricsConfiguration" => Some(Action::Write),
+        "DeleteBucketOwnershipControls" => Some(Action::Write),
+        "DeleteBucketPolicy" => Some(Action::Write),
+        "DeleteBucketReplication" => Some(Action::Write),
+        "DeleteBucketTagging" => Some(Action::Write),
+        "DeleteBucketWebsite" => Some(Action::Write),
+        "DeleteObject" => Some(Action::Write),
+        "DeleteObjectTagging" => Some(Action::Write),
+        "DeleteObjects" => Some(Action::Write),
+        "DeletePublicAccessBlock" => Some(Action::Write),
+        "PutBucketAccelerateConfiguration" => Some(Action::Write),
+        "PutBucketAcl" => Some(Action::Write),
+        "PutBucketAnalyticsConfiguration" => Some(Action::Write),
+        "PutBucketCors" => Some(Action::Write),
+        "PutBucketEncryption" => Some(Action::Write),
+        "PutBucketIntelligentTieringConfiguration" => Some(Action::Write),
+        "PutBucketInventoryConfiguration" => Some(Action::Write),
+        "PutBucketLifecycleConfiguration" => Some(Action::Write),
+        "PutBucketLogging" => Some(Action::Write),
+        "PutBucketMetricsConfiguration" => Some(Action::Write),
+        "PutBucketNotificationConfiguration" => Some(Action::Write),
+        "PutBucketOwnershipControls" => Some(Action::Write),
+        "PutBucketPolicy" => Some(Action::Write),
+        "PutBucketReplication" => Some(Action::Write),
+        "PutBucketRequestPayment" => Some(Action::Write),
+        "PutBucketTagging" => Some(Action::Write),
+        "PutBucketVersioning" => Some(Action::Write),
+        "PutBucketWebsite" => Some(Action::Write),
+        "PutObject" => Some(Action::Write),
+        "PutObjectAcl" => Some(Action::Write),
+        "PutObjectLegalHold" => Some(Action::Write),
+        "PutObjectLockConfiguration" => Some(Action::Write),
+        "PutObjectRetention" => Some(Action::Write),
+        "PutObjectTagging" => Some(Action::Write),
+        "PutPublicAccessBlock" => Some(Action::Write),
+        "RestoreObject" => Some(Action::Write),
+        "UploadPart" => Some(Action::Write),
+        "UploadPartCopy" => Some(Action::Write),
+        "WriteGetObjectResponse" => Some(Action::Write),
+
+        // Read operations (operations that only retrieve/read data)
+        "GetBucketAccelerateConfiguration" => Some(Action::Read),
+        "GetBucketAcl" => Some(Action::Read),
+        "GetBucketAnalyticsConfiguration" => Some(Action::Read),
+        "GetBucketCors" => Some(Action::Read),
+        "GetBucketEncryption" => Some(Action::Read),
+        "GetBucketIntelligentTieringConfiguration" => Some(Action::Read),
+        "GetBucketInventoryConfiguration" => Some(Action::Read),
+        "GetBucketLifecycleConfiguration" => Some(Action::Read),
+        "GetBucketLocation" => Some(Action::Read),
+        "GetBucketLogging" => Some(Action::Read),
+        "GetBucketMetadataTableConfiguration" => Some(Action::Read),
+        "GetBucketMetricsConfiguration" => Some(Action::Read),
+        "GetBucketNotificationConfiguration" => Some(Action::Read),
+        "GetBucketOwnershipControls" => Some(Action::Read),
+        "GetBucketPolicy" => Some(Action::Read),
+        "GetBucketPolicyStatus" => Some(Action::Read),
+        "GetBucketReplication" => Some(Action::Read),
+        "GetBucketRequestPayment" => Some(Action::Read),
+        "GetBucketTagging" => Some(Action::Read),
+        "GetBucketVersioning" => Some(Action::Read),
+        "GetBucketWebsite" => Some(Action::Read),
+        "GetObject" => Some(Action::Read),
+        "GetObjectAcl" => Some(Action::Read),
+        "GetObjectAttributes" => Some(Action::Read),
+        "GetObjectLegalHold" => Some(Action::Read),
+        "GetObjectLockConfiguration" => Some(Action::Read),
+        "GetObjectRetention" => Some(Action::Read),
+        "GetObjectTagging" => Some(Action::Read),
+        "GetObjectTorrent" => Some(Action::Read),
+        "GetPublicAccessBlock" => Some(Action::Read),
+        "HeadBucket" => Some(Action::Read),
+        "HeadObject" => Some(Action::Read),
+        "ListBucketAnalyticsConfigurations" => Some(Action::Read),
+        "ListBucketIntelligentTieringConfigurations" => Some(Action::Read),
+        "ListBucketInventoryConfigurations" => Some(Action::Read),
+        "ListBucketMetricsConfigurations" => Some(Action::Read),
+        "ListBuckets" => Some(Action::Read),
+        "ListMultipartUploads" => Some(Action::Read),
+        "ListObjectVersions" => Some(Action::Read),
+        "ListObjects" => Some(Action::Read),
+        "ListObjectsV2" => Some(Action::Read),
+        "ListParts" => Some(Action::Read),
+        "SelectObjectContent" => Some(Action::Read),
+
+        // Unknown operation
+        _ => None,
+    }
+}
+
+pub(crate) fn anonymous_read_allowed(operation_name: &str) -> bool {
+    matches!(operation_name, "GetObject")
+}
+
+/// Reads a signed caller may make on another group's bucket, as Everyone.
+pub(crate) fn public_read_allowed(operation_name: &str, has_key: bool) -> bool {
+    match has_key {
+        true => matches!(operation_name, "GetObject" | "HeadObject"),
+        false => matches!(
+            operation_name,
+            "HeadBucket" | "GetBucketLocation" | "ListObjects" | "ListObjectsV2"
+        ),
+    }
+}
+
+pub(crate) fn validate_object_key(key: &str) -> S3Result<()> {
+    if key.is_empty() {
+        return Err(s3_error!(InvalidArgument, "Object key must not be empty"));
+    }
+
+    ensure_confined_path(Path::new(key))
+        .map_err(|err| s3_error!(InvalidArgument, "{}", err.to_string()))
+}
+
+pub(crate) fn convert_input(mut input: PutObjectInput) -> S3Result<BlobPutObjectInput, S3Error> {
+    match input.body.take() {
+        None => Err(s3_error!(InvalidRequest, "Missing body")),
+        Some(stream) => {
+            let content_length = input.content_length.map(checked_size).transpose()?;
+            Ok(BlobPutObjectInput {
+                bucket: input.bucket,
+                key: input.key,
+                content_length,
+                body: Some(BackendStream::new_from_boxed(stream)),
+            })
+        }
+    }
+}
+
+/// Rejects negative S3 size headers before an `i64 -> u64` cast can wrap them.
+pub(crate) fn checked_size(value: i64) -> S3Result<u64> {
+    u64::try_from(value).map_err(|_| s3_error!(InvalidArgument, "Size must not be negative"))
+}
+
+/// Server-side encryption is not implemented; SSE/SSE-C request headers must be
+/// rejected rather than silently ignored so a client is never told its data is
+/// encrypted while it is stored as plaintext (real SSE-C support is tracked in #387).
+pub(crate) fn reject_sse(requested: bool) -> S3Result<()> {
+    if requested {
+        return Err(s3_error!(
+            NotImplemented,
+            "Server-side encryption is not supported"
+        ));
+    }
+    Ok(())
+}
+
+/// Encrypted buckets accept absent or `AES256` SSE on new objects; plain buckets reject
+/// `AES256`. KMS, SSE-C and other algorithms stay rejected.
+pub(crate) fn check_sse(
+    requested: Option<&ServerSideEncryption>,
+    other: bool,
+    encrypted: bool,
+) -> S3Result<()> {
+    reject_sse(other)?;
+    match requested.map(ServerSideEncryption::as_str) {
+        None => Ok(()),
+        Some(ServerSideEncryption::AES256) if encrypted => Ok(()),
+        Some(ServerSideEncryption::AES256) => Err(s3_error!(
+            InvalidArgument,
+            "Server-side encryption is not enabled for this bucket"
+        )),
+        Some(_) => reject_sse(true),
+    }
+}
+
+/// `AES256` for a copy stored encrypted, so responses describe the actual stored copy.
+pub(crate) fn sse_header(encrypted: bool) -> Option<ServerSideEncryption> {
+    encrypted.then(|| ServerSideEncryption::from_static(ServerSideEncryption::AES256))
+}
+
+pub(crate) fn stored_encrypted(format: &StoredFormat) -> bool {
+    matches!(format.encryption, StoredEncryption::Pithos(_))
+}
+
+pub(crate) fn location_sse(location: Option<&BackendLocation>) -> Option<ServerSideEncryption> {
+    sse_header(location.is_some_and(|location| stored_encrypted(&location.format)))
+}
+
+pub(crate) fn parse_checksum_hint(
+    input: &CreateMultipartUploadInput,
+) -> S3Result<Option<MultipartChecksumHint>> {
+    let algorithm = input
+        .checksum_algorithm
+        .as_ref()
+        .map(parse_checksum_algorithm)
+        .transpose()?;
+    let checksum_type = input
+        .checksum_type
+        .as_ref()
+        .map(parse_checksum_type)
+        .unwrap_or(MultipartChecksumType::FullObject);
+
+    Ok(
+        (algorithm.is_some() || input.checksum_type.is_some()).then_some(MultipartChecksumHint {
+            algorithm,
+            checksum_type,
+        }),
+    )
+}
+
+pub(crate) fn parse_completed_part(part: &CompletedPart) -> S3Result<CompleteMultipartPart> {
+    let Some(part_number) = part.part_number else {
+        return Err(s3_error!(InvalidPart, "Missing part number"));
+    };
+    let part_number = parse_part_number(part_number, S3ErrorCode::InvalidPart)?;
+
+    let mut expected_checksums = Vec::new();
+    for (value, algorithm) in [
+        (part.checksum_crc32.as_deref(), ChecksumAlgorithm::Crc32),
+        (part.checksum_crc32c.as_deref(), ChecksumAlgorithm::Crc32c),
+        (
+            part.checksum_crc64nvme.as_deref(),
+            ChecksumAlgorithm::Crc64Nvme,
+        ),
+        (part.checksum_sha1.as_deref(), ChecksumAlgorithm::Sha1),
+        (part.checksum_sha256.as_deref(), ChecksumAlgorithm::Sha256),
+    ] {
+        if let Some(value) = value {
+            expected_checksums.push(ExpectedChecksum {
+                algorithm,
+                digest: decode_checksum_header(algorithm, value)?,
+            });
+        }
+    }
+
+    Ok(CompleteMultipartPart {
+        part_number,
+        etag: part.e_tag.as_ref().map(|etag| etag.value().to_string()),
+        expected_checksums,
+    })
+}
+
+pub(crate) fn parse_part_number(part_number: PartNumber, error_code: S3ErrorCode) -> S3Result<u16> {
+    if !(1..=10_000).contains(&part_number) {
+        return Err(S3Error::with_message(error_code, "Invalid part number"));
+    }
+
+    u16::try_from(part_number).map_err(|_| S3Error::with_message(error_code, "Invalid part number"))
+}
+
+pub(crate) fn decode_checksum_header(
+    algorithm: ChecksumAlgorithm,
+    value: &str,
+) -> S3Result<Vec<u8>> {
+    let digest = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| s3_error!(InvalidDigest, "Invalid checksum encoding"))?;
+    if digest.len() != algorithm.digest_len() {
+        return Err(s3_error!(InvalidDigest, "Invalid checksum length"));
+    }
+    Ok(digest)
+}
+
+pub(crate) fn parse_upload_id(upload_id: &str) -> S3Result<Ulid> {
+    Ulid::from_string(upload_id)
+        .map_err(|_| s3_error!(NoSuchUpload, "The specified upload does not exist."))
+}
+
+pub(crate) fn parse_copy_source(
+    copy_source: &CopySource,
+) -> S3Result<(String, String, Option<Ulid>)> {
+    match copy_source {
+        CopySource::Bucket {
+            bucket,
+            key,
+            version_id,
+        } => {
+            let version_id = version_id
+                .as_ref()
+                .map(|version_id| {
+                    Ulid::from_string(version_id)
+                        .map_err(|_| s3_error!(InvalidArgument, "Invalid version id"))
+                })
+                .transpose()?;
+            Ok((bucket.to_string(), key.to_string(), version_id))
+        }
+        _ => Err(s3_error!(
+            InvalidArgument,
+            "Unsupported copy source; only bucket/key sources are supported"
+        )),
+    }
+}
+
+pub(crate) fn parse_source_range(range: Option<&str>) -> S3Result<Option<ObjectRangeRequest>> {
+    let Some(range) = range else {
+        return Ok(None);
+    };
+    let invalid = || s3_error!(InvalidArgument, "Invalid copy source range");
+    let spec = range.strip_prefix("bytes=").ok_or_else(invalid)?;
+    let (start, end) = spec.split_once('-').ok_or_else(invalid)?;
+    let start: u64 = start.parse().map_err(|_| invalid())?;
+    let end: u64 = end.parse().map_err(|_| invalid())?;
+    if start > end {
+        return Err(invalid());
+    }
+    Ok(Some(ObjectRangeRequest::StartEnd { start, end }))
+}
+
+pub(crate) fn parse_version_id(version_id: Option<String>) -> S3Result<Option<Ulid>> {
+    version_id
+        .map(|version_id| {
+            Ulid::from_string(&version_id)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid version id"))
+        })
+        .transpose()
+}
+
+pub(crate) fn parse_checksum_type(checksum_type: &ChecksumType) -> MultipartChecksumType {
+    match checksum_type.as_str() {
+        ChecksumType::COMPOSITE => MultipartChecksumType::Composite,
+        _ => MultipartChecksumType::FullObject,
+    }
+}
+
+pub(crate) fn map_checksum_type(checksum_type: MultipartChecksumType) -> ChecksumType {
+    match checksum_type {
+        MultipartChecksumType::FullObject => ChecksumType::from_static(ChecksumType::FULL_OBJECT),
+        MultipartChecksumType::Composite => ChecksumType::from_static(ChecksumType::COMPOSITE),
+    }
+}
+
+pub(crate) fn checksum_response_hashes<'a>(
+    checksum_type: MultipartChecksumType,
+    location_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+    composite_hashes: &'a std::collections::HashMap<String, Vec<u8>>,
+) -> &'a std::collections::HashMap<String, Vec<u8>> {
+    match checksum_type {
+        MultipartChecksumType::Composite if !composite_hashes.is_empty() => composite_hashes,
+        _ => location_hashes,
+    }
+}
+
+pub(crate) fn parse_checksum_algorithm(
+    algorithm: &S3ChecksumAlgorithm,
+) -> S3Result<ChecksumAlgorithm> {
+    match algorithm.as_str() {
+        S3ChecksumAlgorithm::CRC32 => Ok(ChecksumAlgorithm::Crc32),
+        S3ChecksumAlgorithm::CRC32C => Ok(ChecksumAlgorithm::Crc32c),
+        S3ChecksumAlgorithm::CRC64NVME => Ok(ChecksumAlgorithm::Crc64Nvme),
+        S3ChecksumAlgorithm::SHA1 => Ok(ChecksumAlgorithm::Sha1),
+        S3ChecksumAlgorithm::SHA256 => Ok(ChecksumAlgorithm::Sha256),
+        _ => Err(s3_error!(InvalidRequest, "Unsupported checksum algorithm")),
+    }
+}
+
+/// s3s attaches a trailing-headers handle to every streaming payload, so only
+/// an `x-amz-trailer` declaration announces an actual checksum trailer.
+pub(crate) fn declared_trailer_algorithm(
+    headers: &HeaderMap,
+    has_handle: bool,
+    algorithm: Option<&S3ChecksumAlgorithm>,
+) -> S3Result<Option<ChecksumAlgorithm>> {
+    algorithm
+        .filter(|_| has_handle && headers.contains_key("x-amz-trailer"))
+        .map(parse_checksum_algorithm)
+        .transpose()
+}
+
+pub(crate) fn map_checksum_algorithm(algorithm: ChecksumAlgorithm) -> Option<S3ChecksumAlgorithm> {
+    match algorithm {
+        ChecksumAlgorithm::Crc32 => {
+            Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::CRC32))
+        }
+        ChecksumAlgorithm::Crc32c => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::CRC32C,
+        )),
+        ChecksumAlgorithm::Crc64Nvme => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::CRC64NVME,
+        )),
+        ChecksumAlgorithm::Sha1 => {
+            Some(S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::SHA1))
+        }
+        ChecksumAlgorithm::Sha256 => Some(S3ChecksumAlgorithm::from_static(
+            S3ChecksumAlgorithm::SHA256,
+        )),
+        ChecksumAlgorithm::Md5 => None,
+    }
+}
+
+/// Names the first bucket-naming rule `name` violates, mirroring the rules the
+/// S3 framework enforces at path parse time so the node can answer with a
+/// reason instead of a bare `InvalidBucketName` code.
+pub(crate) fn bucket_name_reason(name: &str) -> Option<&'static str> {
+    if name.len() < 3 {
+        return Some("Bucket names must contain at least 3 characters.");
+    }
+    if name.len() > 63 {
+        return Some("Bucket names must contain at most 63 characters.");
+    }
+    if !name.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+    }) {
+        return Some("Bucket names may only contain lowercase letters, digits, dots and dashes.");
+    }
+    let ends_alphanumeric =
+        |byte: Option<u8>| byte.is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !ends_alphanumeric(name.bytes().next()) || !ends_alphanumeric(name.bytes().next_back()) {
+        return Some("Bucket names must start and end with a letter or a digit.");
+    }
+    if name.contains("..") {
+        return Some("Bucket names must not contain two dots in a row.");
+    }
+    if name.parse::<std::net::Ipv4Addr>().is_ok() {
+        return Some("Bucket names must not look like an IP address.");
+    }
+    if name.starts_with("xn--") {
+        return Some("Bucket names must not start with xn--.");
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        S3ChecksumAlgorithm, anonymous_read_allowed, bucket_name_reason, checksum_response_hashes,
+        declared_trailer_algorithm, operation_permission, parse_copy_source, parse_part_number,
+        parse_source_range, public_read_allowed, validate_object_key,
+    };
+    use crate::s3::auth::Action;
+    use crate::s3::checksum::parse_upload_checksum;
+    use aruna_core::structs::checksum::ChecksumAlgorithm;
+    use aruna_core::structs::storage::multipart::MultipartChecksumType;
+    use aruna_core::structs::storage::object_read::ObjectRangeRequest;
+    use http::HeaderMap;
+    use s3s::S3ErrorCode;
+    use s3s::dto::CopySource;
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    #[test]
+    fn accepts_untrailered_streaming() {
+        // Streaming PUT without x-amz-trailer but with a precomputed checksum
+        // header must skip trailer verification and stay accepted.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-sdk-checksum-algorithm", "CRC32".parse().unwrap());
+        headers.insert("x-amz-checksum-crc32", "y/Q5Jg==".parse().unwrap());
+        let algorithm = S3ChecksumAlgorithm::from_static(S3ChecksumAlgorithm::CRC32);
+
+        let derived = declared_trailer_algorithm(&headers, true, Some(&algorithm)).unwrap();
+        assert_eq!(derived, None);
+        let request = parse_upload_checksum(&headers, derived).unwrap();
+        assert_eq!(request.expected.len(), 1);
+
+        headers.insert("x-amz-trailer", "x-amz-checksum-crc32".parse().unwrap());
+        let derived = declared_trailer_algorithm(&headers, true, Some(&algorithm)).unwrap();
+        assert_eq!(derived, Some(ChecksumAlgorithm::Crc32));
+        assert_eq!(
+            declared_trailer_algorithm(&headers, false, Some(&algorithm)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn composite_upload_hashes() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::Composite, &location, &composite),
+            &composite
+        );
+    }
+
+    #[test]
+    fn full_upload_hashes() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::from([("md5".to_string(), vec![2u8; 16])]);
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::FullObject, &location, &composite),
+            &location
+        );
+    }
+
+    #[test]
+    fn composite_fallback_location() {
+        let location = HashMap::from([("md5".to_string(), vec![1u8; 16])]);
+        let composite = HashMap::new();
+
+        assert_eq!(
+            checksum_response_hashes(MultipartChecksumType::Composite, &location, &composite),
+            &location
+        );
+    }
+
+    #[test]
+    fn parses_bounded_range() {
+        assert_eq!(
+            parse_source_range(Some("bytes=0-99")).unwrap(),
+            Some(ObjectRangeRequest::StartEnd { start: 0, end: 99 })
+        );
+    }
+
+    #[test]
+    fn parses_absent_range() {
+        assert_eq!(parse_source_range(None).unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_ranges_rejected() {
+        for value in ["0-99", "bytes=2-", "bytes=-5", "bytes=abc-def", "bytes=5-2"] {
+            assert_eq!(
+                *parse_source_range(Some(value)).unwrap_err().code(),
+                S3ErrorCode::InvalidArgument,
+                "expected InvalidArgument for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_unversioned_source() {
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "folder/object.txt".into(),
+            version_id: None,
+        };
+
+        let (bucket, key, version_id) = parse_copy_source(&source).unwrap();
+
+        assert_eq!(bucket, "src-bucket");
+        assert_eq!(key, "folder/object.txt");
+        assert_eq!(version_id, None);
+    }
+
+    #[test]
+    fn parses_versioned_source() {
+        let version = Ulid::generate();
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "object.txt".into(),
+            version_id: Some(version.to_string().into()),
+        };
+
+        let (_, _, version_id) = parse_copy_source(&source).unwrap();
+
+        assert_eq!(version_id, Some(version));
+    }
+
+    #[test]
+    fn invalid_version_rejected() {
+        let source = CopySource::Bucket {
+            bucket: "src-bucket".into(),
+            key: "object.txt".into(),
+            version_id: Some("not-a-ulid".into()),
+        };
+
+        assert_eq!(
+            *parse_copy_source(&source).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn nonbucket_source_rejected() {
+        let source = CopySource::AccessPoint {
+            partition: "aws".into(),
+            region: "eu-central-1".into(),
+            account_id: "123456789012".into(),
+            access_point_name: "my-access-point".into(),
+            key: "object.txt".into(),
+            version_id: None,
+        };
+
+        assert_eq!(
+            *parse_copy_source(&source).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn ordinary_keys_accepted() {
+        for key in ["object.bin", "nested/path/object.bin", "a.b..c/keep..dots"] {
+            assert!(
+                validate_object_key(key).is_ok(),
+                "key {key:?} must be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_keys_rejected() {
+        let cases = [
+            "",
+            "/absolute/key",
+            "../escape",
+            "../../etc/passwd",
+            "nested/../../escape",
+            "trailing/..",
+            "with\u{0000}null",
+            "with\u{007f}delete",
+            "with\nnewline",
+        ];
+        for key in cases {
+            assert_eq!(
+                *validate_object_key(key).unwrap_err().code(),
+                S3ErrorCode::InvalidArgument,
+                "key {key:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_only_gets() {
+        assert!(anonymous_read_allowed("GetObject"));
+
+        for operation in [
+            "HeadObject",
+            "GetObjectAttributes",
+            "GetObjectTagging",
+            "GetBucketCors",
+            "GetBucketVersioning",
+            "ListBuckets",
+            "ListObjectsV2",
+            "ListObjectVersions",
+            "ListMultipartUploads",
+            "ListParts",
+        ] {
+            assert!(
+                !anonymous_read_allowed(operation),
+                "{operation} must not be allowed anonymously"
+            );
+        }
+    }
+
+    #[test]
+    fn public_reads_listed() {
+        for operation in ["GetObject", "HeadObject"] {
+            assert!(public_read_allowed(operation, true));
+            assert!(!public_read_allowed(operation, false));
+        }
+        for operation in [
+            "HeadBucket",
+            "GetBucketLocation",
+            "ListObjects",
+            "ListObjectsV2",
+        ] {
+            assert!(public_read_allowed(operation, false));
+            assert!(!public_read_allowed(operation, true));
+        }
+        for operation in [
+            "ListObjectVersions",
+            "ListMultipartUploads",
+            "GetObjectTagging",
+        ] {
+            assert!(!public_read_allowed(operation, false));
+            assert!(!public_read_allowed(operation, true));
+        }
+    }
+
+    #[test]
+    fn metadata_reads_classified() {
+        assert_eq!(operation_permission("GetObject"), Some(Action::Read));
+        assert_eq!(operation_permission("HeadObject"), Some(Action::Read));
+        assert_eq!(operation_permission("ListObjectsV2"), Some(Action::Read));
+    }
+
+    #[test]
+    fn rejects_negative_size() {
+        assert_eq!(
+            *super::checked_size(-1).unwrap_err().code(),
+            S3ErrorCode::InvalidArgument
+        );
+        assert_eq!(super::checked_size(0).unwrap(), 0);
+        assert_eq!(super::checked_size(i64::MAX).unwrap(), i64::MAX as u64);
+    }
+
+    #[test]
+    fn zero_part_rejected() {
+        assert_eq!(
+            *parse_part_number(0, S3ErrorCode::InvalidArgument)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn large_part_rejected() {
+        assert_eq!(
+            *parse_part_number(10_001, S3ErrorCode::InvalidArgument)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn negative_part_rejected() {
+        assert_eq!(
+            *parse_part_number(-1, S3ErrorCode::InvalidPart)
+                .unwrap_err()
+                .code(),
+            S3ErrorCode::InvalidPart
+        );
+    }
+
+    #[test]
+    fn part_bounds_accepted() {
+        assert_eq!(
+            parse_part_number(1, S3ErrorCode::InvalidArgument).unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_part_number(10_000, S3ErrorCode::InvalidPart).unwrap(),
+            10_000
+        );
+    }
+
+    #[test]
+    fn names_broken_rule() {
+        // One sentence per rule; the portal mirrors the same table.
+        assert_eq!(
+            bucket_name_reason("b1"),
+            Some("Bucket names must contain at least 3 characters.")
+        );
+        assert_eq!(
+            bucket_name_reason(&"a".repeat(64)),
+            Some("Bucket names must contain at most 63 characters.")
+        );
+        assert_eq!(
+            bucket_name_reason("Bucket"),
+            Some("Bucket names may only contain lowercase letters, digits, dots and dashes.")
+        );
+        assert_eq!(
+            bucket_name_reason("bucket_name"),
+            Some("Bucket names may only contain lowercase letters, digits, dots and dashes.")
+        );
+        assert_eq!(
+            bucket_name_reason("-bucket"),
+            Some("Bucket names must start and end with a letter or a digit.")
+        );
+        assert_eq!(
+            bucket_name_reason("bucket."),
+            Some("Bucket names must start and end with a letter or a digit.")
+        );
+        assert_eq!(
+            bucket_name_reason("a..b"),
+            Some("Bucket names must not contain two dots in a row.")
+        );
+        assert_eq!(
+            bucket_name_reason("192.168.0.1"),
+            Some("Bucket names must not look like an IP address.")
+        );
+        assert_eq!(
+            bucket_name_reason("xn--abc"),
+            Some("Bucket names must not start with xn--.")
+        );
+    }
+
+    #[test]
+    fn accepts_valid_names() {
+        for name in ["abc", "my-bucket", "my.bucket-1", &"a".repeat(63)] {
+            assert_eq!(bucket_name_reason(name), None, "rejected {name}");
+        }
+    }
+
+    #[test]
+    fn bucket_sse_modes() {
+        use super::{ServerSideEncryption, check_sse};
+        let aes = ServerSideEncryption::from_static(ServerSideEncryption::AES256);
+        let kms = ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS);
+        assert!(check_sse(None, false, false).is_ok());
+        assert!(check_sse(None, false, true).is_ok());
+        assert!(check_sse(Some(&aes), false, true).is_ok());
+        let plain = check_sse(Some(&aes), false, false).unwrap_err();
+        assert_eq!(plain.code().as_str(), "InvalidArgument");
+        for (requested, other) in [(Some(&kms), false), (None, true), (Some(&aes), true)] {
+            let refused = check_sse(requested, other, true).unwrap_err();
+            assert_eq!(refused.code().as_str(), "NotImplemented");
+        }
+    }
+}

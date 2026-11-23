@@ -1,0 +1,795 @@
+//! Request and response types of the metadata adapter, with their OpenAPI schemas.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::format_timestamp_ms;
+use crate::error::{ProfileFindingResponse, ValidationViolationResponse};
+use crate::routes::git::location::StorageLocationRequest;
+use aruna_core::metadata::protocol::MetadataPathWinner;
+use aruna_core::metadata::{
+    ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
+};
+use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+use aruna_ops_work::metadata::profile::validation::MetadataProfilePreview;
+use aruna_ops_work::metadata::public_preview::RestrictedFilesPreview;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+use utoipa::ToSchema;
+
+/// Public registry summary for a write accepted by the durable projection pipeline.
+/// Graph visibility and remote replicas may still be catching up.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataDocumentSummary {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub public: bool,
+    pub replicas: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    /// The newest accepted event, usable as `expected_revision` for a later replace.
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = ProfileValidationCapabilitiesResponse)]
+pub struct ProfileCapabilitiesResponse {
+    pub evaluator: String,
+    pub supported_constraints: Vec<String>,
+    pub unsupported_constraint_policy: String,
+    #[serde(rename = "public_profile_iri_template")]
+    pub profile_iri_template: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = ProfileValidationPreviewRequest)]
+pub struct ProfilePreviewRequest {
+    /// RO-Crate JSON-LD draft. Nothing is stored.
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    /// Group the draft would be saved in. A Profile of that group resolves
+    /// even while it is not public; without it only public Profiles do.
+    #[serde(default)]
+    pub group_id: Option<String>,
+    /// Whether the draft would be saved as a public dataset. Only then are
+    /// restricted files reported.
+    #[serde(default)]
+    pub public: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = ProfileValidationPreviewResponse)]
+pub struct ProfilePreviewResponse {
+    /// Whether a create or replace of this draft would be accepted.
+    pub accepted: bool,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_iri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub evaluator: String,
+    pub findings: Vec<ProfileFindingResponse>,
+    pub completeness: String,
+    pub structural_violations: Vec<ValidationViolationResponse>,
+    /// Data entities the anonymous principal may not read. Empty unless the
+    /// request set `public`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restricted_files: Vec<RestrictedFileResponse>,
+    /// Whether every relevant file could be checked. Present for public drafts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restricted_files_complete: Option<bool>,
+}
+
+/// A draft data entity that a public dataset would not expose. The location
+/// fields are omitted when the caller may not read the object either.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RestrictedFileResponse {
+    pub entity_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// The object's permission path, ready to grant READ on exactly this object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl From<MetadataProfilePreview> for ProfilePreviewResponse {
+    fn from(preview: MetadataProfilePreview) -> Self {
+        let accepted = preview.accepted();
+        let status = ProfileValidationResponse::from(preview.status);
+        Self {
+            accepted,
+            state: status.state,
+            profile_id: status.profile_id,
+            profile_iri: status.profile_iri,
+            profile_revision: status.profile_revision,
+            evaluator: status.evaluator,
+            findings: status.findings,
+            completeness: status.completeness,
+            structural_violations: preview
+                .structural_violations
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+            restricted_files: Vec::new(),
+            restricted_files_complete: None,
+        }
+    }
+}
+
+impl ProfilePreviewResponse {
+    pub(crate) fn set_restricted(&mut self, preview: RestrictedFilesPreview) {
+        self.restricted_files_complete = Some(preview.complete);
+        self.restricted_files = preview
+            .files
+            .into_iter()
+            .map(|file| RestrictedFileResponse {
+                entity_id: file.entity_id,
+                group_id: file.group_id.map(|id| id.to_string()),
+                permission_path: file.permission_path,
+                bucket: file.bucket,
+                key: file.key,
+            })
+            .collect();
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = ProfileValidationStatusResponse)]
+pub struct ProfileValidationResponse {
+    pub document_id: String,
+    pub dataset_revision: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_iri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_revision: Option<String>,
+    pub evaluator: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validated_at_ms: Option<u64>,
+    pub findings: Vec<ProfileFindingResponse>,
+    pub completeness: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
+}
+
+impl From<ProfileValidationStatus> for ProfileValidationResponse {
+    fn from(status: ProfileValidationStatus) -> Self {
+        Self {
+            document_id: status.document_id.to_string(),
+            dataset_revision: status.dataset_revision.to_string(),
+            state: match status.state {
+                ProfileValidationState::NotProfiled => "not_profiled",
+                ProfileValidationState::Valid => "valid",
+                ProfileValidationState::Invalid => "invalid",
+                ProfileValidationState::Stale => "stale",
+            }
+            .to_string(),
+            profile_id: status.profile_id.map(|id| id.to_string()),
+            profile_iri: status.profile_iri,
+            profile_revision: status.profile_revision,
+            evaluator: status.evaluator,
+            validated_at_ms: status.validated_at_ms,
+            findings: status.findings.into_iter().map(Into::into).collect(),
+            completeness: match status.completeness {
+                ProfileValidationCompleteness::Complete => "complete",
+                ProfileValidationCompleteness::Incomplete => "incomplete",
+            }
+            .to_string(),
+            stale_reason: status.stale_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = CreateMetadataScaffoldRequest)]
+pub struct CreateScaffoldRequest {
+    pub group_id: String,
+    pub path: String,
+    pub name: String,
+    pub description: String,
+    pub date_published: String,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub public: bool,
+    /// Commit message for the ARC snapshot of this revision. Plain text, at most 4096 bytes after
+    /// trimming; empty or omitted describes the change instead.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Where files pushed through Git are stored; omitted keeps the default location.
+    #[serde(default)]
+    pub storage_location: Option<StorageLocationRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = CreateMetadataRoCrateRequest)]
+pub struct CreateRoCrateRequest {
+    pub group_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub public: bool,
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    /// Commit message for the ARC snapshot of this revision. Plain text, at most 4096 bytes after
+    /// trimming; empty or omitted describes the change instead.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Where files pushed through Git are stored; omitted keeps the default location.
+    #[serde(default)]
+    pub storage_location: Option<StorageLocationRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum CreateMetadataRequest {
+    Scaffold(CreateScaffoldRequest),
+    RoCrate(CreateRoCrateRequest),
+}
+
+impl<'de> Deserialize<'de> for CreateMetadataRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // A body with `rocrate` is a crate and any other a scaffold, so an error names its field.
+        let value = Value::deserialize(deserializer)?;
+        let request = match value.get("rocrate").is_some() {
+            true => serde_json::from_value(value).map(Self::RoCrate),
+            false => serde_json::from_value(value).map(Self::Scaffold),
+        };
+        request.map_err(serde::de::Error::custom)
+    }
+}
+
+/// Response for a metadata create request accepted into the durable
+/// event/projection pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct CreateMetadataResponse {
+    /// Accepted registry summary. It does not guarantee the graph is fully
+    /// materialized, queryable, searchable, or replicated yet.
+    #[serde(flatten)]
+    pub summary: MetadataDocumentSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListMetadataResponse {
+    pub documents: Vec<DocumentListItem>,
+    pub limit: usize,
+    pub offset: usize,
+    pub total_returned: usize,
+    /// Exact total of documents visible to the caller across all pages,
+    /// evaluated per document against the caller's permission rules. Absent
+    /// on targeted lookups, whose limit is too small to be worth the scan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_estimate: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataDocumentListItem)]
+pub struct DocumentListItem {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub public: bool,
+    pub replicas: usize,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub rocrate_summary: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPathResponse {
+    pub winner: MetadataDocumentSummary,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct MetadataPathQuery {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ListMetadataQuery {
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub include: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub order: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = ReplaceMetadataRoCrateRequest)]
+pub struct ReplaceRoCrateRequest {
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    #[serde(default)]
+    pub public: Option<bool>,
+    /// The newest event id the caller based its crate on; a newer edit answers 412.
+    #[serde(default)]
+    pub expected_revision: Option<String>,
+    /// Commit message for the ARC snapshot of this revision. Plain text, at most 4096 bytes after
+    /// trimming; empty or omitted describes the change instead.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum MetadataRoCrateResponse {
+    Projected(ProjectedRoCrateResponse),
+    Raw(RawRoCrateResponse),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProjectedRoCrateResponse {
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    pub total_data_entities: Option<usize>,
+    pub returned_data_entities: Option<usize>,
+    pub next_offset: Option<usize>,
+    pub next_cursor: Option<String>,
+    /// The event the full view reflects, usable as `expected_revision`; absent for other views.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataRawRoCrateResponse)]
+pub struct RawRoCrateResponse {
+    #[schema(value_type = Object)]
+    pub raw: Value,
+    pub winning_event_id: String,
+    pub projection_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projected_event_id: Option<String>,
+    pub context_digest: String,
+    pub dataset_digest: Option<String>,
+    /// Present only while the merged graph fails profile validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merged: Option<MergedRoCrateResponse>,
+}
+
+/// The merged graph while it is invalid: what the editor opens to fix it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataMergedRoCrateResponse)]
+pub struct MergedRoCrateResponse {
+    #[schema(value_type = Object)]
+    pub rocrate: Value,
+    pub findings: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(value_type = Object)]
+pub struct JsonLdObject(pub Value);
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MetadataRoCrateView {
+    Full,
+    Summary,
+    Page,
+    Raw,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataRoCrateExportParams)]
+pub struct RoCrateExportParams {
+    #[serde(default)]
+    pub view: Option<MetadataRoCrateView>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub after: Option<String>,
+    /// Serve this node's own copy without asking other holders; w3id redirects set it.
+    #[serde(default)]
+    pub here: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = SubmitRoCrateExportRequest)]
+pub struct SubmitExportRequest {
+    /// Set only by the repository export route; this route refuses it as an unknown field.
+    #[serde(skip)]
+    pub destination: Option<RepositoryExportRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RepositoryExportRequest {
+    pub group_id: String,
+    pub connector_id: String,
+    #[serde(default)]
+    pub draft_id: Option<String>,
+    #[serde(default)]
+    pub published_id: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub publish: bool,
+    #[serde(default)]
+    pub public_files: bool,
+    #[serde(default, skip_serializing_if = "omit_token")]
+    #[schema(write_only = true, required = true)]
+    pub access_token: Option<String>,
+}
+
+fn omit_token(_: &Option<String>) -> bool {
+    true
+}
+
+impl std::fmt::Debug for RepositoryExportRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RepositoryExportRequest")
+            .field("group_id", &self.group_id)
+            .field("connector_id", &self.connector_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = SubmitRoCrateExportResponse)]
+pub struct SubmitExportResponse {
+    pub job_id: String,
+    pub created: bool,
+    pub owner_node_url: String,
+    pub status_url: String,
+    pub report_url: String,
+    pub artifact_url: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct MetadataSearchParams {
+    #[serde(default)]
+    pub q: String,
+    #[serde(default)]
+    pub conforms_to: Option<String>,
+    #[serde(default)]
+    pub group_id: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Opaque continuation token from a previous response's `next_cursor`. Bound
+    /// to the original query; a changed query is rejected with `400`.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub mode: Option<MetadataQueryMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataSearchHitResponse)]
+pub struct SearchHitResponse {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    pub subject_iri: String,
+    pub score: f32,
+    /// Human-readable title for the hit, populated by the answering node from
+    /// the resource's `schema:name` with a path-based fallback.
+    pub title: String,
+    /// Query-relevant text excerpt, populated by the answering node. Absent when
+    /// the resource has no indexed literals to window.
+    pub snippet: Option<String>,
+    /// `rdf:type` IRIs of the matched subject, at most eight, so a file entity
+    /// can be told apart from the dataset it belongs to. Empty when the
+    /// answering node knows no named type for it.
+    pub subject_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataSearchResponse)]
+pub struct SearchResultsResponse {
+    pub hits: Vec<SearchHitResponse>,
+    /// Continuation token for the next page, or `null` when the results are
+    /// exhausted. Pass it back as `cursor` to fetch the next page.
+    pub next_cursor: Option<String>,
+    /// Number of node partitions this search was executed against.
+    pub nodes_queried: usize,
+    /// Number of node partitions that failed or timed out; a non-zero value
+    /// means the result is partial.
+    pub nodes_failed: usize,
+    /// True when pagination stopped at the server-side depth cap before the
+    /// result set was exhausted.
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencesParams {
+    /// Referenced object IRI to find backlinks for, such as a document graph IRI
+    /// or any IRI that appears as a triple object.
+    pub iri: String,
+    /// Optional exact predicate IRI filter, such as http://schema.org/conformsTo.
+    #[serde(default)]
+    pub predicate: Option<String>,
+    /// Documents per page (default 25, silently clamped to a maximum of 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Resolve `iri` as a document graph IRI and return that document's summary
+    /// as a single predicate-less entry, skipping the backlink lookup.
+    #[serde(default)]
+    pub resolve: bool,
+    /// The `next_after` of the previous page.
+    #[serde(default)]
+    #[schema(value_type = Option<String>)]
+    pub after: Option<ulid::Ulid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferenceItem {
+    pub document_id: String,
+    pub group_id: String,
+    pub document_path: String,
+    pub graph_iri: String,
+    /// Predicate that names the queried IRI, or absent for a resolved graph-IRI
+    /// entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<String>,
+    /// Subjects in the referencing document that name the queried IRI; empty for
+    /// a resolved graph-IRI entry.
+    pub subject_iris: Vec<String>,
+    /// Human-readable title for the referencing document, from its root
+    /// schema:name with a document-path fallback.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataReferencesResponse {
+    pub references: Vec<MetadataReferenceItem>,
+    /// Pass as `after` for the next page; absent on the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_after: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[schema(as = MetadataReferencePreflightTargetBody)]
+pub enum PreflightTargetBody {
+    ContentW3ids {
+        content_w3ids: Vec<String>,
+        #[serde(default)]
+        #[serde(rename = "remove_all_resolvable_locations")]
+        remove_resolvable_locations: bool,
+    },
+    BucketPrefix {
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        #[serde(default)]
+        operation: PreflightStorageBody,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+#[schema(as = MetadataPreflightStorageOperationBody)]
+pub enum PreflightStorageBody {
+    #[default]
+    LatestVersionTombstone,
+    AllVersionsPurge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataReferencePreflightBody)]
+pub struct PreflightBody {
+    pub target: PreflightTargetBody,
+    #[serde(default)]
+    pub mode: Option<MetadataQueryMode>,
+    #[serde(default = "default_allow_partial")]
+    pub allow_partial: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataPreflightLocationResponse)]
+pub struct PreflightLocationResponse {
+    pub node_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataPreflightVisibleReferenceResponse)]
+pub struct PreflightVisibleResponse {
+    pub document_id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataPreflightTargetResponse)]
+pub struct PreflightTargetResponse {
+    /// The content identity of stored bytes; null for a target named by `location_iri`.
+    pub content_w3id: Option<String>,
+    /// The `s3://bucket/key` location of reference or pending versions, whose bytes were never
+    /// read and so have no content identity; null for a target named by `content_w3id`.
+    pub location_iri: Option<String>,
+    pub targeted_versions: Vec<PreflightLocationResponse>,
+    pub visible_references: Vec<PreflightVisibleResponse>,
+    /// A document the caller may not read references the target, among the documents each
+    /// node read for this page.
+    pub hidden_references_exist: bool,
+    #[serde(rename = "would_remove_last_resolvable_aruna_location")]
+    pub would_remove_location: bool,
+    pub location_impact_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataPreflightExcludedFormResponse)]
+pub struct ExcludedFormResponse {
+    pub form: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataPreflightNodeFreshnessResponse)]
+pub struct PreflightFreshnessResponse {
+    pub node_id: String,
+    /// Materialization state of the referencing documents the node read for this page;
+    /// `pending` also while accepted documents of the realm wait for projection.
+    pub index_state: String,
+    /// Oldest materialization status update among the documents the node read for this page.
+    #[serde(rename = "oldest_status_updated_at_ms")]
+    pub oldest_status_updated: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataPreflightCoverageResponse)]
+pub struct PreflightCoverageResponse {
+    pub queried_scope: String,
+    pub queried_forms: Vec<String>,
+    pub excluded_forms: Vec<ExcludedFormResponse>,
+    pub node_freshness: Vec<PreflightFreshnessResponse>,
+    pub target_resolution_complete: bool,
+    #[serde(rename = "path_style_endpoint_coverage_complete")]
+    pub path_style_complete: bool,
+    pub realm_coverage_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(as = MetadataReferencePreflightResponse)]
+pub struct PreflightResponse {
+    pub targets: Vec<PreflightTargetResponse>,
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+    pub nodes_queried: usize,
+    pub nodes_failed: usize,
+    pub complete: bool,
+    pub failed_partitions: Vec<String>,
+    pub coverage: PreflightCoverageResponse,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct MetadataIncludeFlags {
+    pub(super) summary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SparqlQueryRequest {
+    /// SPARQL query string. Only `SELECT` and `ASK` queries are supported.
+    pub query: String,
+    /// Query scope; omitted means distributed. `local` uses only this node.
+    /// `distributed` fans out all-metadata queries, but document queries try
+    /// replicas sequentially until one complete result succeeds.
+    #[serde(default)]
+    pub mode: Option<MetadataQueryMode>,
+    /// Keeps successful all-metadata partitions, and permits document-local fallback
+    /// only when holder discovery fails. Replica failover never returns partial data.
+    #[serde(default = "default_allow_partial")]
+    pub allow_partial: bool,
+}
+
+fn default_allow_partial() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MetadataQueryMode {
+    /// Run the query only on the current node.
+    Local,
+    /// Fan out all-metadata queries or try document replicas sequentially.
+    /// Only fanout and document discovery fallback may return partial data.
+    Distributed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct MetadataQueryResponse {
+    #[serde(flatten)]
+    pub result: MetadataQueryResult,
+    /// Number of node attempts made while producing this result.
+    pub nodes_queried: usize,
+    /// Number of selected partitions absent from the result; non-zero means partial.
+    /// Failed document replica attempts followed by success are not partitions.
+    pub nodes_failed: usize,
+    /// Whether every selected partition completed successfully.
+    pub complete: bool,
+    /// Node partitions that failed, timed out, or exceeded the fan-out bound.
+    pub failed_partitions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", content = "value")]
+pub enum MetadataQueryResult {
+    Solutions(Vec<HashMap<String, String>>),
+    Boolean(bool),
+}
+
+impl From<&MetadataRegistryRecord> for MetadataDocumentSummary {
+    fn from(record: &MetadataRegistryRecord) -> Self {
+        Self {
+            document_id: record.document_id.to_string(),
+            group_id: record.group_id.to_string(),
+            document_path: record.document_path.clone(),
+            graph_iri: record.graph_iri.clone(),
+            public: record.public,
+            replicas: record.holder_node_ids.len(),
+            created_at: format_timestamp_ms(record.created_at_ms),
+            updated_at: format_timestamp_ms(record.updated_at_ms),
+            revision: Some(record.last_event_id.to_string()),
+        }
+    }
+}
+
+impl From<&MetadataPathWinner> for MetadataDocumentSummary {
+    fn from(winner: &MetadataPathWinner) -> Self {
+        Self {
+            document_id: winner.document_id.to_string(),
+            group_id: winner.group_id.to_string(),
+            document_path: winner.document_path.clone(),
+            graph_iri: winner.graph_iri.clone(),
+            public: winner.public,
+            replicas: winner.replicas,
+            created_at: format_timestamp_ms(winner.created_at_ms),
+            updated_at: format_timestamp_ms(winner.updated_at_ms),
+            revision: None,
+        }
+    }
+}
+
+impl DocumentListItem {
+    pub(super) fn from_record(
+        record: &MetadataRegistryRecord,
+        rocrate_summary: Option<Value>,
+    ) -> Self {
+        Self {
+            document_id: record.document_id.to_string(),
+            group_id: record.group_id.to_string(),
+            document_path: record.document_path.clone(),
+            graph_iri: record.graph_iri.clone(),
+            public: record.public,
+            replicas: record.holder_node_ids.len(),
+            created_at: format_timestamp_ms(record.created_at_ms),
+            updated_at: format_timestamp_ms(record.updated_at_ms),
+            rocrate_summary,
+        }
+    }
+}

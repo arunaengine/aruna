@@ -17,9 +17,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 # Install Python ARC dependencies and copy host runtime tools before `COPY . .`
 # so Rust source edits keep these layers cached.
-COPY blob/arc-requirements.txt blob/arc-requirements.txt
+COPY runtime/blob/arc-requirements.txt runtime/blob/arc-requirements.txt
 RUN python3 -m venv /opt/arctrl \
-    && /opt/arctrl/bin/pip install --no-cache-dir -r blob/arc-requirements.txt
+    && /opt/arctrl/bin/pip install --no-cache-dir -r runtime/blob/arc-requirements.txt
 RUN mkdir -p /git-runtime/usr/bin /git-runtime/usr/lib/git-core \
     && cp /usr/bin/git /usr/bin/gpg /usr/bin/gpg-agent /usr/bin/gpgconf /git-runtime/usr/bin/ \
     && cp -L /usr/bin/python3 /git-runtime/usr/bin/python3 \

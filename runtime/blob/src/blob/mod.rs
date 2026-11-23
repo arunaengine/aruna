@@ -1,0 +1,118 @@
+//! Owns the blob handler: backend registry, staging writers, replication and read streams.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::egress::EgressGuard;
+use aruna_core::id::NodeId;
+use aruna_p2p::NetHandle;
+use aruna_p2p::streams::BiStream;
+use aruna_storage::storage::handle::StorageHandle;
+use bao_tree::BlockSize;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
+use tokio::sync::{Mutex, Notify, Semaphore};
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+
+mod abe;
+mod backend;
+mod control_plane;
+mod external;
+mod framed_parts;
+mod frames;
+pub mod group;
+mod in_place;
+pub mod inbound;
+mod io;
+mod local_spool;
+pub mod pithos;
+mod plain;
+mod read_pins;
+pub mod registry;
+mod replication;
+mod runtime;
+mod source;
+mod unlock;
+
+use registry::BackendRegistry;
+
+#[cfg(test)]
+mod tests;
+
+pub const BAO_BLOCK_SIZE: BlockSize = BlockSize::from_chunk_log(16); // 2^16 bytes
+
+type SharedBiStream = Arc<Mutex<BiStream>>;
+
+pub(super) const CONNECTION_SLOTS: usize = 256;
+pub(super) const PEER_CONNECTIONS: usize = 32;
+
+#[derive(Debug)]
+struct Connection {
+    peer: NodeId,
+    stream: SharedBiStream,
+    _slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlPlaneKind {
+    Connection,
+    Read,
+    Write,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlobHandler {
+    registry: BackendRegistry,
+    egress: EgressGuard,
+    storage: StorageHandle,
+    net: NetHandle,
+    connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
+    connection_slots: Arc<Semaphore>,
+    transfer_slots: Arc<Semaphore>,
+    read_slots: Arc<Semaphore>,
+    spool_slots: Arc<Semaphore>,
+    inflight: Arc<AtomicUsize>,
+    /// Holds and removal claims on tenant backends. Erasing credentials an
+    /// operation still holds would leave that work unable to roll back.
+    group_effects: Arc<StdMutex<HashMap<Ulid, group::GroupBackendUse>>>,
+    reservation_active: Arc<StdMutex<HashSet<Ulid>>>,
+    /// Hash states of in-place uploads, by provider upload id. Lost on restart, which only costs
+    /// a longer read at completion.
+    part_chains: Arc<StdMutex<HashMap<String, in_place::UploadState>>>,
+    /// Shutdown close for the blob write path, mirroring the storage close so a
+    /// mutation cannot land on a backend behind the final storage sync.
+    closed: Arc<AtomicBool>,
+    /// Serializes closing against the mutating dispatch: `close_writes` locks it,
+    /// each mutation read-locks across the close check and registering itself.
+    close_lock: Arc<StdRwLock<()>>,
+    rejected_writes: Arc<AtomicU64>,
+    frame_indexes: Arc<StdMutex<frames::IndexCache>>,
+    /// Reads that hold kept copies; eviction leaves those copies to the hidden sweep.
+    read_pins: read_pins::ReadPins,
+    /// This node's measurements of each external source. Memory only.
+    source_stats: Arc<StdMutex<source::SourceTable>>,
+    writes_in_flight: Arc<AtomicUsize>,
+    writes_drained: Arc<Notify>,
+    /// Stops the backend-status monitor at shutdown so its handler clone, and
+    /// with it the storage handle, is released before storage closes.
+    monitor_cancel: CancellationToken,
+    monitor_task: Arc<StdMutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Unlocked bucket keys of this node. Memory only, so a restart locks every bucket.
+    unlocks: Arc<StdMutex<unlock::UnlockRegistry>>,
+    /// Pithos working set in MiB permits, shared by archive opens, encoders and compositions.
+    pithos_budget: Arc<Semaphore>,
+    /// Writable disk directory of unnamed spool files; without one, spools fail.
+    spool_dir: Option<Arc<std::path::PathBuf>>,
+    /// Open spool files, each held until its read stream ends.
+    spool_files: Arc<Semaphore>,
+    /// Disk budget of local spools in MiB permits.
+    spool_budget: Arc<Semaphore>,
+    /// Node-local Git repositories, installed once by the node that serves Git.
+    git: Arc<std::sync::OnceLock<Arc<crate::git::GitStore>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BlobHandle {
+    handler: BlobHandler,
+}

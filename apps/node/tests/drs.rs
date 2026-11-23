@@ -1,0 +1,481 @@
+//! Tests DRS object lookup by content hash and the download of a version owned by another node.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::shared;
+
+use aruna_core::blob_paths::ResolvePathsOperation;
+use aruna_core::structs::storage::blob::HashIndex;
+use aruna_core::structs::storage::node_info::NodeUrls;
+use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_ops_work::node::info::flows::SeedInfoOperation;
+use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_runner::driver::drive;
+use aruna_runner::driver::node_facts;
+use aws_sdk_s3::primitives::ByteStream;
+use reqwest::StatusCode;
+use serde_json::Value;
+use shared::{
+    TestResult, create_bearer_token, create_group_http, create_onboarding_secret,
+    create_s3_credentials, s3_client, shutdown_pair, spawn_complete_joiner, spawn_complete_seed,
+    spawn_seed_node, wait_group_member, wait_realm_nodes, wait_until,
+};
+use ulid::Ulid;
+
+const FIXTURE_BYTES: &[u8] = b"drs placeholder fixture bytes";
+
+fn fixture_bytes() -> Vec<u8> {
+    FIXTURE_BYTES.to_vec()
+}
+
+async fn iter_hash_index(
+    context: &aruna_runner::driver::DriverContext,
+    hash: [u8; 32],
+) -> TestResult<Vec<HashIndex>> {
+    drive(ResolvePathsOperation::new(hash), context)
+        .await
+        .map_err(Into::into)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn content_hash_missing() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+
+    let result = async {
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+
+        let group = create_group_http(&seed.base_url, &bearer_token, "drs-hash-lookup-e2e")
+            .await?;
+        let seed_s3 = seed
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
+        let credentials =
+            create_s3_credentials(&seed.base_url, &bearer_token, &group.group_id)
+                .await?;
+        let s3 = s3_client(seed_s3, &credentials);
+
+        let bucket = "drs-hash-lookup-e2e";
+        let key = "fixtures/t8.shakespeare.txt";
+        let body = fixture_bytes();
+        let hash = *blake3::hash(&body).as_bytes();
+        let hash_hex = hex::encode(hash);
+        let local_object_id = format!(
+            "arn:aruna:{}:{}:ch/{}",
+            seed.realm_id,
+            seed.net.node_id(),
+            hash_hex
+        );
+        let foreign_node = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
+        assert_ne!(foreign_node, seed.net.node_id());
+        let foreign_object_id = format!(
+            "arn:aruna:{}:{}:ch/{}",
+            seed.realm_id, foreign_node, hash_hex
+        );
+
+        s3.create_bucket().bucket(bucket).send().await?;
+        s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body))
+            .send()
+            .await?;
+
+        let local_response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/objects/{}",
+                seed.base_url, local_object_id
+            ))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        let local_status = local_response.status();
+        let local_body = local_response.text().await?;
+        assert_eq!(
+            local_status,
+            StatusCode::OK,
+            "same-node DRS lookup failed for {local_object_id}: {local_body}"
+        );
+
+        let foreign_response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/objects/{}",
+                seed.base_url, foreign_object_id
+            ))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        let foreign_status = foreign_response.status();
+        let foreign_body = foreign_response.text().await?;
+
+        assert_eq!(
+            foreign_status,
+            StatusCode::NOT_FOUND,
+            "DRS lookup for foreign owner returned {foreign_status} for {foreign_object_id}: {foreign_body}"
+        );
+
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn crowded_hash_conflicts() -> TestResult<()> {
+    use aruna_core::blob_paths::MAX_HASH_ALIASES;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::PATHS_INDEX_KEYSPACE;
+
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let hash = *blake3::hash(b"one hash in many buckets").as_bytes();
+        let node_id = seed.net.node_id();
+        let mut writes = Vec::new();
+        for index in 0..=MAX_HASH_ALIASES {
+            let row = HashIndex::new(
+                hash,
+                Ulid::generate(),
+                seed.realm_id,
+                Ulid::generate(),
+                node_id,
+                "crowded",
+                format!("copy/{index}"),
+            );
+            let key = row.to_bytes()?;
+            writes.push((
+                PATHS_INDEX_KEYSPACE.to_string(),
+                key.into(),
+                Vec::new().into(),
+            ));
+        }
+        let write = StorageEffect::BatchWrite {
+            writes,
+            txn_id: None,
+        };
+        seed.context.storage_handle.send_storage_effect(write).await;
+        let object_id = format!(
+            "arn:aruna:{}:{}:ch/{}",
+            seed.realm_id,
+            node_id,
+            hex::encode(hash)
+        );
+        let response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/objects/{}",
+                seed.base_url, object_id
+            ))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "an oversized alias set is ambiguous, never an internal error"
+        );
+        Ok(())
+    }
+    .await;
+
+    seed.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_hash_resolves() -> TestResult<()> {
+    let seed = spawn_seed_node().await?;
+    let onboarding_secret =
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
+    let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
+
+    let result = async {
+        wait_realm_nodes(
+            &[seed.context.as_ref(), joiner.context.as_ref()],
+            &seed.realm_id,
+            2,
+        )
+        .await?;
+
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+
+        let group =
+            create_group_http(&seed.base_url, &bearer_token, "drs-historical-hash-e2e").await?;
+        wait_group_member(&joiner.base_url, &bearer_token, &group.group_id).await?;
+
+        let joiner_s3 = joiner
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
+        let credentials =
+            create_s3_credentials(&joiner.base_url, &bearer_token, &group.group_id).await?;
+        let s3 = s3_client(joiner_s3, &credentials);
+
+        let bucket = "drs-historical-hash-e2e";
+        let key = "fixtures/versioned.txt";
+        let old_body = fixture_bytes();
+        let new_body = b"historical drs replacement body".to_vec();
+        let old_hash = *blake3::hash(&old_body).as_bytes();
+        let new_hash = *blake3::hash(&new_body).as_bytes();
+
+        s3.create_bucket().bucket(bucket).send().await?;
+
+        let old_put = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(old_body.clone()))
+            .send()
+            .await?;
+        let old_version_id = Ulid::from_string(old_put.version_id().ok_or_else(|| {
+            std::io::Error::other("first put_object did not return a version id")
+        })?)?;
+
+        let new_put = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(new_body.clone()))
+            .send()
+            .await?;
+        let new_version_id = Ulid::from_string(new_put.version_id().ok_or_else(|| {
+            std::io::Error::other("second put_object did not return a version id")
+        })?)?;
+
+        let old_mappings = iter_hash_index(joiner.context.as_ref(), old_hash).await?;
+        assert!(
+            old_mappings.iter().any(|mapping| {
+                mapping.realm_id == seed.realm_id
+                    && mapping.node_id == joiner.config.node_id
+                    && mapping.bucket == bucket
+                    && mapping.key == key
+                    && mapping.version_id == old_version_id
+            }),
+            "hash-path index did not retain historical alias for {bucket}/{key}@{old_version_id}"
+        );
+
+        let new_mappings = iter_hash_index(joiner.context.as_ref(), new_hash).await?;
+        assert!(
+            new_mappings.iter().any(|mapping| {
+                mapping.realm_id == seed.realm_id
+                    && mapping.node_id == joiner.config.node_id
+                    && mapping.bucket == bucket
+                    && mapping.key == key
+                    && mapping.version_id == new_version_id
+            }),
+            "hash-path index did not contain current alias for {bucket}/{key}@{new_version_id}"
+        );
+
+        let old_head = drive(
+            HeadObjectOperation::new(HeadObjectInput {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: Some(old_version_id),
+            }),
+            joiner.context.as_ref(),
+        )
+        .await?;
+        let old_location = old_head.location.ok_or_else(|| {
+            std::io::Error::other("head_object returned no historical materialized location")
+        })?;
+        assert_eq!(old_location.get_blake3(), Some(old_hash.as_slice()));
+
+        let historical_object_id = format!(
+            "arn:aruna:{}:{}:ch/{}",
+            seed.realm_id,
+            joiner.config.node_id,
+            hex::encode(old_hash)
+        );
+
+        let object_response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/objects/{}",
+                joiner.base_url, historical_object_id
+            ))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        let object_status = object_response.status();
+        let object_body: Value = object_response.json().await?;
+        assert_eq!(
+            object_status,
+            StatusCode::OK,
+            "historical DRS lookup failed for {historical_object_id}: {object_body}"
+        );
+        assert_eq!(object_body["id"], historical_object_id);
+        assert_eq!(
+            object_body["aliases"],
+            Value::Array(vec![Value::String(format!(
+                "https://w3id.org/aruna/data/{}",
+                hex::encode(old_hash)
+            ))])
+        );
+
+        let download_response = reqwest::Client::new()
+            .get(format!(
+                "{}/api/v1/ga4gh/drs/v1/download?object_id={}",
+                joiner.base_url, historical_object_id
+            ))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        let download_status = download_response.status();
+        let download_body = download_response.bytes().await?;
+        assert_eq!(
+            download_status,
+            StatusCode::OK,
+            "historical DRS download failed for {historical_object_id}"
+        );
+        assert_eq!(download_body.as_ref(), old_body.as_slice());
+
+        Ok(())
+    }
+    .await;
+
+    shutdown_pair(joiner, seed).await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_version_downloads() -> TestResult<()> {
+    // Probing the owner opens a blob stream, which only a full node has.
+    let seed = spawn_complete_seed().await?;
+    let onboarding_secret =
+        create_onboarding_secret(&seed, aruna_core::onboarding::OnboardingMode::Server).await?;
+    let joiner = spawn_complete_joiner(&seed, onboarding_secret).await?;
+
+    let result = async {
+        wait_realm_nodes(
+            &[seed.context.as_ref(), joiner.context.as_ref()],
+            &seed.realm_id,
+            2,
+        )
+        .await?;
+        let bearer_token = create_bearer_token(
+            seed.context.as_ref(),
+            seed.user_id,
+            seed.realm_id,
+            seed.capabilities.clone(),
+        )
+        .await?;
+        let group = create_group_http(&seed.base_url, &bearer_token, "drs-remote-e2e").await?;
+        wait_group_member(&joiner.base_url, &bearer_token, &group.group_id).await?;
+
+        let joiner_s3 = joiner
+            .s3
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("joiner node did not start S3 server"))?;
+        let credentials =
+            create_s3_credentials(&joiner.base_url, &bearer_token, &group.group_id).await?;
+        let s3 = s3_client(joiner_s3, &credentials);
+
+        let bucket = "drs-remote-e2e";
+        let key = "fixtures/versioned.txt";
+        let old_body = fixture_bytes();
+        s3.create_bucket().bucket(bucket).send().await?;
+        let old_put = s3
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(old_body.clone()))
+            .send()
+            .await?;
+        let old_version_id = Ulid::from_string(old_put.version_id().ok_or_else(|| {
+            std::io::Error::other("first put_object did not return a version id")
+        })?)?;
+        // A newer head proves the download is pinned to the requested version.
+        s3.put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(b"newer remote head".to_vec()))
+            .send()
+            .await?;
+
+        // The fixture only seeds the joiner's document locally; the seed needs its published url.
+        let publish = SeedInfoOperation::new(
+            joiner.config.realm_id,
+            joiner.config.node_id,
+            NodeUrls {
+                api: joiner.config.api_public_url.clone(),
+                s3: joiner.config.s3_public_url.clone(),
+            },
+            node_facts(joiner.context.as_ref()),
+            true,
+        );
+        aruna_runner::driver::drive(publish, joiner.context.as_ref())
+            .await
+            .map_err(std::io::Error::other)?;
+
+        let object_id = VersionedObjectArn::new(
+            seed.realm_id,
+            joiner.config.node_id,
+            bucket,
+            key,
+            old_version_id,
+        )?
+        .to_string();
+        let object_url = format!("{}/api/v1/ga4gh/drs/v1/objects/{object_id}", seed.base_url);
+        // The seed answers 503 until the published document reaches it.
+        wait_until("routed DRS lookup", shared::WAIT_CAP, || {
+            let request = reqwest::Client::new()
+                .get(&object_url)
+                .bearer_auth(&bearer_token);
+            async move {
+                request
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status() == StatusCode::OK)
+            }
+        })
+        .await?;
+        let object_body: Value = reqwest::Client::new()
+            .get(&object_url)
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let access_url = object_body["access_methods"][0]["access_url"]["url"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other(format!("no access url: {object_body}")))?;
+        let published = "https://api.joiner.example.test";
+        let path = access_url
+            .strip_prefix(published)
+            .ok_or_else(|| std::io::Error::other(format!("not the owner's url: {access_url}")))?;
+        assert!(path.starts_with("/api/v1/ga4gh/drs/v1/download?object_id="));
+
+        // The published url is not routable in tests, so the same path goes to the owner's listener.
+        let download = reqwest::Client::new()
+            .get(format!("{}{path}", joiner.base_url))
+            .bearer_auth(&bearer_token)
+            .send()
+            .await?;
+        assert_eq!(download.status(), StatusCode::OK);
+        assert_eq!(download.bytes().await?.as_ref(), old_body.as_slice());
+        Ok(())
+    }
+    .await;
+
+    shutdown_pair(joiner, seed).await;
+    result
+}

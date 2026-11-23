@@ -1,8 +1,8 @@
 {
   "crate_allow": {
     "aruna-doctor": [
-      "aruna-net",
-      "aruna-tasks",
+      "aruna-p2p",
+      "aruna-scheduler",
       "aruna-wire"
     ]
   },

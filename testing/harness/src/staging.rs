@@ -1,0 +1,697 @@
+//! Sets up a driver context with blob and net handles plus test buckets and connectors.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::BackendRegistry;
+use aruna_core::egress::EgressPolicy;
+use aruna_core::jobs::ProgressReporter;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_core::search::ObjectKeyMatch;
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::execution::job::input::{JobPayload, StagingJobPrefix, StagingJobSpec};
+use aruna_core::structs::execution::job::local::{JobClaim, JobProgress, JobRecord};
+use aruna_core::structs::execution::source_access::{
+    ResolvedSourceAccess, ResolvedSourceConnector, SourceMetadata,
+};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+use aruna_core::structs::execution::table::TableImport;
+use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
+use aruna_core::structs::storage::format::Compression;
+use aruna_core::structs::storage::origin::VersionOrigin;
+use aruna_core::time::unix_timestamp_millis;
+use aruna_core::user::id::UserId;
+use aruna_ops_work::connectors::create_connector::{
+    SourceConnectorInput, SourceConnectorOperation,
+};
+use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_work::groups::routing::BucketRules;
+use aruna_ops_work::groups::routing::SnapshotOperation;
+use aruna_ops_work::metadata::api::object_search::search_objects;
+use aruna_ops_work::metadata::api::search_types::{ObjectQueryMode, SearchQueryRequest};
+use aruna_ops_work::placement::policy::gate::GateOperation;
+use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_work::s3::object::head::HeadObjectInput;
+use aruna_ops_work::s3::object::head::HeadObjectOperation;
+use aruna_ops_work::s3::object::put::PutObjectConfig;
+use aruna_ops_work::s3::object::put::PutObjectInput;
+use aruna_ops_work::s3::object::put::PutObjectOperation;
+use aruna_p2p::NetHandle;
+use aruna_runner::driver::{DriverContext, drive, node_routing};
+use aruna_runner::jobs::context::JobContext;
+use aruna_storage::storage;
+use axum::body::Body;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::Response;
+use bytes::Bytes;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
+use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
+use ulid::Ulid;
+
+pub struct StagingTestContext {
+    pub _tempdir: TempDir,
+    pub driver_context: DriverContext,
+}
+
+pub async fn setup_driver_context() -> StagingTestContext {
+    let tempdir = tempfile::tempdir().expect("tempdir must be created");
+    let temp_root = tempdir.path().to_str().expect("temp path must be utf-8");
+    let blob_root = format!("{temp_root}/blobstore");
+    std::fs::create_dir_all(&blob_root).expect("blob root must be created");
+
+    let storage_handle = storage::worker::FjallStorage::open(temp_root).expect("storage must open");
+    storage_handle.open_vault(aruna_core::node::vault::NodeVaultKey::random());
+    let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
+        .await
+        .expect("net handle must initialize");
+    // Verified reads of references spool their bytes before they are served.
+    let spool = Some(format!("{temp_root}/spool").into());
+    let blob_handle = BlobHandler::with_registry(
+        BackendRegistry::single(BackendConfig {
+            backend_type: Backend::FileSystem,
+            root: blob_root,
+            service_config: HashMap::new(),
+            bucket_prefix: Some("aruna-test-".to_string()),
+            max_bucket_size: Some(1),
+            multipart_bucket: Some("uploaded-parts".to_string()),
+            timeouts: Default::default(),
+        }),
+        storage_handle.clone(),
+        net_handle,
+        EgressPolicy::loopback(),
+        spool,
+    )
+    .await
+    .expect("blob handle must initialize");
+    let (http, policy) = blob_handle.repository_client();
+
+    StagingTestContext {
+        _tempdir: tempdir,
+        driver_context: DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: Some(blob_handle),
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: Some(aruna_egress::OutboundHandle::new(http, policy)),
+        },
+    }
+}
+
+pub async fn create_http_connector(
+    context: &DriverContext,
+    group_id: Ulid,
+    endpoint: &str,
+) -> SourceConnector {
+    drive(
+        SourceConnectorOperation::new(SourceConnectorInput {
+            group_id,
+            created_by: Default::default(),
+            name: "http-source".to_string(),
+            kind: SourceConnectorKind::Http,
+            public_config: HashMap::from([("endpoint".to_string(), endpoint.to_string())]),
+            secret_config: HashMap::new(),
+        }),
+        context,
+    )
+    .await
+    .expect("connector creation must succeed")
+    .connector
+}
+
+pub async fn create_test_bucket(
+    context: &DriverContext,
+    group_id: Ulid,
+    created_by: UserId,
+    bucket: &str,
+) -> BucketInfo {
+    let info = BucketInfo {
+        group_id,
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: None,
+    };
+    drive(
+        CreateBucketOperation::new(bucket.to_string(), info.clone()),
+        context,
+    )
+    .await
+    .expect("bucket creation must succeed");
+    info
+}
+
+pub fn sample_connector() -> SourceConnector {
+    SourceConnector::new(
+        Ulid::from_bytes([2u8; 16]),
+        Ulid::from_bytes([1u8; 16]),
+        "staging-http".to_string(),
+        SourceConnectorKind::Http,
+        HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH,
+        Default::default(),
+    )
+}
+
+pub fn sample_resolved_connector() -> ResolvedSourceConnector {
+    ResolvedSourceConnector {
+        connector: sample_connector(),
+        secret_fingerprint: None,
+        access: ResolvedSourceAccess::OpenDal {
+            kind: SourceConnectorKind::Http,
+            config: HashMap::from([("endpoint".to_string(), "http://127.0.0.1:1".to_string())]),
+            path: "folder/file.txt".to_string(),
+            version: None,
+        },
+    }
+}
+
+pub fn sample_metadata() -> SourceMetadata {
+    SourceMetadata {
+        content_length: 42,
+        content_type: Some("application/octet-stream".to_string()),
+        etag: Some("etag-1".to_string()),
+        last_modified: Some(SystemTime::UNIX_EPOCH),
+        source_version: None,
+        digests: Default::default(),
+    }
+}
+
+/// The NCBI assembly summary the table fixtures serve.
+pub const SUMMARY: &str = include_str!("../../../domain/core/tests/fixtures/assembly_summary.tsv");
+pub const COLI: &str = "all/GCF/000/005/845/GCF_000005845.2_ASM584v2/";
+pub const HUMAN: &str = "all/GCF/000/001/405/GCF_000001405.40_GRCh38.p14/";
+pub const STRUCTURE: &str = "GCF_000001405.40_GRCh38.p14_assembly_structure/";
+
+pub fn spec(targets: &[&str]) -> StagingJobSpec {
+    let mut spec = test_spec();
+    spec.prefixes = (targets.iter())
+        .map(|target| StagingJobPrefix {
+            source_prefix: format!("src/{target}"),
+            target_prefix: target.to_string(),
+        })
+        .collect();
+    spec
+}
+
+/// Files and index pages below `/genomes/`, and every request the server saw.
+#[derive(Default)]
+pub struct Site {
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub requests: Mutex<Vec<(Method, String)>>,
+    /// Answers every request with 429 and a one hour `Retry-After`.
+    pub throttled: bool,
+}
+
+impl Site {
+    pub fn ncbi(endpoint: &str) -> Self {
+        let base = format!("{endpoint}/genomes/");
+        let summary = SUMMARY.replace("https://ftp.ncbi.nlm.nih.gov/genomes/", &base);
+        let mut files = BTreeMap::new();
+        files.insert(
+            "ASSEMBLY_REPORTS/assembly_summary_refseq.txt".to_string(),
+            summary.into_bytes(),
+        );
+        files.insert(
+            format!("{COLI}GCF_000005845.2_ASM584v2_genomic.fna.gz"),
+            b"ACGT".to_vec(),
+        );
+        files.insert(format!("{COLI}md5checksums.txt"), b"sums".to_vec());
+        files.insert(format!("{HUMAN}README.txt"), b"readme".to_vec());
+        files.insert(format!("{HUMAN}{STRUCTURE}chr1.fna"), b"NNNN".to_vec());
+        files.insert(
+            "all/GCF/000/006/945/GCF_000006945.2_ASM694v2/x.txt".to_string(),
+            b"x".to_vec(),
+        );
+        Self {
+            files,
+            requests: Mutex::default(),
+            throttled: false,
+        }
+    }
+
+    pub fn count(&self, method: &Method, path: &str) -> usize {
+        let requests = self.requests.lock().unwrap();
+        requests
+            .iter()
+            .filter(|(seen, at)| seen == method && at == path)
+            .count()
+    }
+
+    /// An Apache style index of the direct children of `directory`, sizes rounded as NCBI does.
+    pub fn index(&self, directory: &str) -> Option<String> {
+        let mut rows = Vec::new();
+        for path in self.files.keys() {
+            let Some(rest) = path.strip_prefix(directory) else {
+                continue;
+            };
+            let row = match rest.split_once('/') {
+                Some((folder, _)) => {
+                    format!("<a href=\"{folder}/\">{folder}/</a>  2025-11-17 12:38    -")
+                }
+                None => format!("<a href=\"{rest}\">{rest}</a>  2025-11-17 12:38  1.0K"),
+            };
+            if !rows.contains(&row) {
+                rows.push(row);
+            }
+        }
+        (!rows.is_empty()).then(|| {
+            format!(
+                "<html><head><title>Index of /genomes/{directory}</title></head><body>\
+                 <h1>Index of /genomes/{directory}</h1><pre><a href=\"../\">Parent Directory</a>\n{}\
+                 \n</pre></body></html>",
+                rows.join("\n")
+            )
+        })
+    }
+
+    pub fn answer(&self, method: Method, uri: &Uri, headers: &HeaderMap) -> Response {
+        let path = uri
+            .path()
+            .strip_prefix("/genomes/")
+            .unwrap_or_default()
+            .to_string();
+        self.requests
+            .lock()
+            .unwrap()
+            .push((method.clone(), path.clone()));
+        if self.throttled {
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("retry-after", "3600")
+                .body(Body::empty())
+                .unwrap();
+        }
+        let Some(bytes) = self.files.get(&path) else {
+            return match self
+                .index(&path)
+                .filter(|_| path.is_empty() || path.ends_with('/'))
+            {
+                Some(html) => Response::builder()
+                    .header("content-type", "text/html")
+                    .body(Body::from(html))
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .unwrap(),
+            };
+        };
+        let range = (headers.get("range").and_then(|value| value.to_str().ok()))
+            .and_then(|value| value.strip_prefix("bytes="))
+            .and_then(|value| value.split_once('-'))
+            .map(|(start, end)| {
+                let start: usize = start.parse().unwrap_or(0);
+                let end = end
+                    .parse::<usize>()
+                    .map_or(bytes.len(), |end| (end + 1).min(bytes.len()));
+                (start, end)
+            });
+        let modified = "Mon, 17 Nov 2025 17:38:21 GMT";
+        let builder = Response::builder().header("last-modified", modified);
+        match (method, range) {
+            (Method::HEAD, _) => builder
+                .header("content-length", bytes.len())
+                .body(Body::empty())
+                .unwrap(),
+            (_, Some((start, end))) => builder
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(
+                    "content-range",
+                    format!("bytes {start}-{}/{}", end - 1, bytes.len()),
+                )
+                .body(Body::from(bytes[start..end].to_vec()))
+                .unwrap(),
+            (_, None) => builder.body(Body::from(bytes.clone())).unwrap(),
+        }
+    }
+}
+
+pub async fn serve(
+    site: impl FnOnce(&str) -> Site,
+) -> (String, Arc<Site>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let site = Arc::new(site(&endpoint));
+    let shared = site.clone();
+    let answer = move |method: Method, uri: Uri, headers: HeaderMap| {
+        let site = shared.clone();
+        async move { site.answer(method, &uri, &headers) }
+    };
+    let router = axum::Router::new().fallback(answer);
+    let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (endpoint, site, task)
+}
+
+pub struct Fixture {
+    pub driver: Arc<aruna_runner::driver::DriverContext>,
+    pub spec: StagingJobSpec,
+    pub _dir: tempfile::TempDir,
+}
+
+impl Fixture {
+    pub async fn new(endpoint: &str, table: serde_json::Value) -> Self {
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_ops_work::connectors::create_connector::{
+            SourceConnectorInput, SourceConnectorOperation,
+        };
+
+        let test = setup_driver_context().await;
+        let driver = test.driver_context;
+        let mut spec = test_spec();
+        spec.prefixes = Vec::<StagingJobPrefix>::new();
+        spec.table = Some(serde_json::from_value::<TableImport>(table).unwrap());
+        let input = SourceConnectorInput {
+            group_id: spec.group_id,
+            created_by: Default::default(),
+            name: "ncbi".to_string(),
+            kind: SourceConnectorKind::Http,
+            public_config: std::collections::HashMap::from([
+                ("endpoint".to_string(), endpoint.to_string()),
+                ("root".to_string(), "genomes".to_string()),
+            ]),
+            secret_config: Default::default(),
+        };
+        let connector = drive(SourceConnectorOperation::new(input), &driver)
+            .await
+            .unwrap();
+        spec.connector_id = connector.connector.connector_id;
+        let scope = (spec.auth_context.realm_id, spec.group_id, spec.node_id);
+        spec.auth_context = aruna_runner::testing::seed_access(&driver, scope, "/none").await;
+        let owner = spec.auth_context.user_id;
+        for name in ["lists", &spec.bucket] {
+            let bucket = create_test_bucket(&driver, spec.group_id, owner, name).await;
+            if name == spec.bucket {
+                spec.bucket_identity = bucket.identity();
+            }
+        }
+        Self {
+            driver: Arc::new(driver),
+            spec,
+            _dir: test._tempdir,
+        }
+    }
+
+    pub async fn context(&self, seed: u8) -> JobContext {
+        self.context_for(&self.spec, seed).await
+    }
+
+    /// A claimed job of `spec`.
+    pub async fn context_for(&self, spec: &StagingJobSpec, seed: u8) -> JobContext {
+        let (job_id, claim_token) = (JobId::from_bytes([seed; 16]), Ulid::from_bytes([seed; 16]));
+        let owner = spec.auth_context.user_id;
+        let payload = JobPayload::Staging(spec.clone());
+        let mut record = JobRecord::new(job_id, payload, owner, spec.node_id, 1, 1, None);
+        record.claim = Some(JobClaim {
+            holder_node_id: spec.node_id,
+            claim_token,
+            lease_expires_ms: u64::MAX,
+        });
+        aruna_runner::driver::drive(
+            aruna_ops_work::jobs::store::row_calls::insert_job(&record),
+            &self.driver,
+        )
+        .await
+        .unwrap();
+        JobContext {
+            driver: self.driver.clone(),
+            job_id,
+            owner_node_id: self.spec.node_id,
+            claim_token,
+            final_attempt: false,
+            cancel: CancellationToken::new(),
+            shutdown: CancellationToken::new(),
+            progress: ProgressReporter::from_progress(&JobProgress::new("items")),
+            range_turns: Default::default(),
+        }
+    }
+
+    pub async fn head(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Option<(Ulid, std::collections::HashMap<String, String>)> {
+        let input = HeadObjectInput {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: None,
+        };
+        let head = drive(HeadObjectOperation::new(input), &self.driver)
+            .await
+            .ok()?;
+        Some((head.version_id?, head.metadata))
+    }
+
+    pub async fn search(&self, query: &str) -> Vec<String> {
+        let hits = self.hits(query).await;
+        hits.into_iter().map(|hit| hit.key).collect()
+    }
+
+    pub async fn hits(&self, query: &str) -> Vec<aruna_core::search::ObjectInventoryHit> {
+        // The object search route's path in local mode: this node scans its own objects.
+        let auth = self.spec.auth_context.clone();
+        let request = SearchQueryRequest {
+            auth: auth.clone(),
+            bearer_token: None,
+            query: query.to_string(),
+            key_match: ObjectKeyMatch::Metadata,
+            bucket: Some(self.spec.bucket.clone()),
+            limit: 100,
+            cursor: None,
+            mode: ObjectQueryMode::Local,
+            target_nodes: None,
+        };
+        let indexed = self.driver.storage_handle.range_indexes().is_some();
+        let search = search_objects(auth.realm_id, self.spec.node_id, request, indexed);
+        drive(search, &self.driver).await.unwrap().hits
+    }
+
+    /// The source observation stored on the current reference version of `key`.
+    pub async fn observation(
+        &self,
+        key: &str,
+    ) -> aruna_core::structs::execution::source_access::SourceMetadata {
+        use aruna_core::structs::storage::blob::BlobVersionState;
+        match self.version(key).await.state {
+            BlobVersionState::Reference {
+                cached_metadata, ..
+            } => cached_metadata,
+            _ => panic!("the version must be a reference"),
+        }
+    }
+
+    /// The current version of `key` in the job's bucket.
+    pub async fn version(&self, key: &str) -> aruna_core::structs::storage::blob::BlobVersion {
+        use aruna_core::keyspaces::BLOB_VERSIONS_KEYSPACE;
+        use aruna_core::structs::storage::blob::{BlobVersion, VersionKey};
+        let bucket = self.spec.bucket.clone();
+        let (version_id, _) = self.head(&bucket, key).await.unwrap();
+        let read = aruna_core::effects::StorageEffect::Read {
+            key_space: BLOB_VERSIONS_KEYSPACE.to_string(),
+            key: VersionKey::new(&bucket, key, version_id)
+                .to_bytes()
+                .unwrap()
+                .into(),
+            txn_id: None,
+        };
+        let event = self.driver.storage_handle.send_storage_effect(read).await;
+        let aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
+            value: Some(value),
+            ..
+        }) = event
+        else {
+            panic!("the version must exist");
+        };
+        BlobVersion::from_bytes(&value).unwrap()
+    }
+
+    /// The origin of the current version of `key`.
+    pub async fn origin(
+        &self,
+        key: &str,
+    ) -> Option<aruna_core::structs::storage::origin::VersionOrigin> {
+        self.version(key).await.origin
+    }
+
+    /// The whole object read through the ordinary read, or why it was refused.
+    pub async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
+        use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
+        use futures_util::StreamExt;
+        let auth = &self.spec.auth_context;
+        let input = GetObjectInput {
+            bucket: self.spec.bucket.clone(),
+            key: key.to_string(),
+            version_id: None,
+            range: None,
+            group_id: self.spec.group_id,
+            user_identity: auth.user_id,
+            realm_id: auth.realm_id,
+            node_id: self.spec.node_id,
+        };
+        let operation = GetObjectOperation::new(input);
+        let mut blob = (drive(operation, &self.driver).await)
+            .map_err(|error| error.to_string())?
+            .blob;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = blob.next().await {
+            bytes.extend_from_slice(&chunk.map_err(|error| error.to_string())?);
+        }
+        Ok(bytes)
+    }
+}
+
+pub fn summary_table() -> serde_json::Value {
+    serde_json::json!({
+        "source": { "connector": "ASSEMBLY_REPORTS/assembly_summary_refseq.txt" },
+        "format": { "delimiter": "\t", "header": "last_comment", "comment": "#",
+                    "nulls": ["na", ""] },
+        "rows": {
+            "kind": "folder",
+            "source": "{ftp_path}",
+            "target": "{ftp_path|basename}",
+            "filter": [{ "column": "assembly_accession",
+                         "any_of": ["GCF_000005845.2", "GCF_000001405.40"] }],
+            "text": ["assembly_accession", "organism_name", "biosample"],
+            "exact": ["taxid", "species_taxid", "assembly_level", "group"]
+        },
+        "rate": 1000
+    })
+}
+
+/// Writes `body` at `key` through the ordinary put, as the submitter, and queues its replication;
+/// the version's origin is the job's import, like the references of its other rows.
+pub async fn write_object(
+    ctx: &JobContext,
+    spec: &StagingJobSpec,
+    (name, bucket): (&str, &BucketInfo),
+    key: &str,
+    (body, metadata): (Bytes, &BTreeMap<String, String>),
+) -> Result<(), String> {
+    let system = |error: String| error;
+    let routing = drive(
+        SnapshotOperation::new(
+            &node_routing(&ctx.driver),
+            (bucket).group_id,
+            BucketRules::of(bucket),
+        ),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| system(error.to_string()))?;
+    let auth = &spec.auth_context;
+    let gate = drive(
+        GateOperation::new(auth.realm_id, unix_timestamp_millis()),
+        &ctx.driver,
+    )
+    .await
+    .map_err(|error| system(error.to_string()))?;
+    let quota = drive(GetConfigOperation::new(auth.realm_id), &ctx.driver)
+        .await
+        .map_err(|error| system(error.to_string()))?
+        .quota
+        .effective_group_ceiling(&bucket.group_id);
+    let length = body.len() as u64;
+    let body = BackendStream::once(body);
+    let mut operation = PutObjectOperation::new(PutObjectConfig {
+        user_id: auth.user_id,
+        group_id: bucket.group_id,
+        realm_id: auth.realm_id,
+        node_id: spec.node_id,
+        request: PutObjectInput {
+            bucket: name.to_string(),
+            key: key.to_string(),
+            content_length: Some(length),
+            body: Some(body),
+        },
+        expected_checksums: Vec::new(),
+        checksum_type: None,
+        exists: false,
+        version_source: None,
+        preassigned_version_id: None,
+        quota_ceiling: quota,
+        routing,
+    })
+    .with_bucket_guard(bucket.clone())
+    .with_version_origin(Some(VersionOrigin::Source {
+        job_id: Some(ctx.job_id.as_ulid()),
+    }))
+    .with_restrictions(auth.path_restrictions.clone())
+    .with_metadata(metadata.clone().into_iter().collect::<HashMap<_, _>>());
+    if let Some(gate) = gate {
+        operation = operation.with_gate(gate);
+    }
+    let result = (drive(operation, &ctx.driver).await).map_err(|error| error.to_string())?;
+    drive(
+        LiveVersionOperation::new(LiveVersionInput {
+            local_node_id: spec.node_id,
+            auth_context: auth.clone(),
+            bucket: name.to_string(),
+            key: key.to_string(),
+            version_id: result.version_id,
+            delete_marker: false,
+        }),
+        &ctx.driver,
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("replication queue failed: {error}"))
+}
+
+/// A staging spec with one reference prefix that the staging tests vary.
+pub fn test_spec() -> aruna_core::structs::execution::job::input::StagingJobSpec {
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+    aruna_core::structs::execution::job::input::StagingJobSpec {
+        auth_context: aruna_core::structs::identity::auth::AuthContext {
+            user_id: aruna_core::user::id::UserId::local(ulid::Ulid::from_bytes([2; 16]), realm_id),
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        },
+        group_id: ulid::Ulid::from_bytes([3; 16]),
+        node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+        connector_id: ulid::Ulid::from_bytes([5; 16]),
+        bucket: "bucket".to_string(),
+        bucket_identity: (
+            ulid::Ulid::nil(),
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+        ),
+        strategy: aruna_core::structs::execution::staging::StagingStrategy::Reference,
+        items: Vec::new(),
+        prefixes: vec![
+            aruna_core::structs::execution::job::input::StagingJobPrefix {
+                source_prefix: "refseq".to_string(),
+                target_prefix: String::new(),
+            },
+        ],
+        checksum_manifest: None,
+        table: None,
+        mirrors: Vec::new(),
+    }
+}
+
+/// Source metadata of `length` bytes with an optional `etag` and nothing else.
+pub fn sized_source(
+    length: u64,
+    etag: Option<String>,
+) -> aruna_core::structs::execution::source_access::SourceMetadata {
+    aruna_core::structs::execution::source_access::SourceMetadata {
+        content_length: length,
+        content_type: None,
+        etag,
+        last_modified: None,
+        source_version: None,
+        digests: Default::default(),
+    }
+}

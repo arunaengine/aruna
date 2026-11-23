@@ -18,4 +18,4 @@ wit-bindgen = { workspace = true }
 
 # Only the fake host of the library's tests applies merge patches the way the host does.
 [dev-dependencies]
-aruna-plugin-types = { workspace = true }
+aruna-plugin-contract = { workspace = true }
