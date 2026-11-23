@@ -55,7 +55,7 @@ impl JobClassBudget {
 }
 
 /// What one drain pass did.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct JobDrainResult {
     pub claimed: Vec<JobRecord>,
     pub terminal: Vec<JobRecord>,
@@ -86,7 +86,7 @@ impl From<IoError> for DrainError {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum DrainStep {
     DuePage,
     DueDrop(&'static str),
@@ -103,7 +103,7 @@ enum DrainStep {
 /// Claims due jobs within each class's budget and re-queues expired leases. Only records owned
 /// by `owner_node_id` are claimed: a JobId executes on its immutable owner. A job whose class is
 /// saturated is skipped without a write, since claiming it would only release it again.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DrainJobsOperation {
     owner_node_id: NodeId,
     budget: JobClassBudget,

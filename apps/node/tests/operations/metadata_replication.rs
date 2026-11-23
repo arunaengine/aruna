@@ -62,7 +62,6 @@ use aruna_test_harness::metadata::export_rocrate_jsonld;
 use aruna_test_harness::metadata::process_materialization_batch;
 use aruna_test_harness::projection::project_create_events;
 use aruna_test_harness::projection::replay_event_log;
-use tokio::time::sleep;
 use ulid::Ulid;
 
 use crate::convergence;
@@ -217,6 +216,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         group_id,
         document_id,
         &initial_holders,
+        None,
     )
     .await?;
 
@@ -280,12 +280,19 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
         .find(|node| node.net.node_id() == replacement)
         .expect("replacement fixture node exists");
     // holder_node_ids is an event-time stamp; freshness is the shard guarantee (#395).
-    let registry =
-        wait_persisted_update(replacement_node, group_id, document_id, latest_update_id).await?;
+    let registry = wait_persisted_update(
+        replacement_node,
+        group_id,
+        document_id,
+        latest_update_id,
+        None,
+    )
+    .await?;
     assert_eq!(registry.last_event_id, latest_update_id);
     // The registry row rides the everywhere-bound registry class, so it can land on the
     // replacement before the document's own bucket topic delivers the event.
-    let refreshed_event = wait_event_value(replacement_node, document_id, latest_update_id).await?;
+    let refreshed_event =
+        wait_event_value(replacement_node, document_id, latest_update_id, None).await?;
     let refreshed_event: MetadataEventRecord = postcard::from_bytes(&refreshed_event)?;
     assert!(matches!(
         refreshed_event.payload,
@@ -304,7 +311,7 @@ async fn replan_reaches_replacement() -> Result<(), Box<dyn std::error::Error>> 
 #[tokio::test]
 async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([47u8; 32]);
-    let (nodes, config, refreshers) =
+    let (nodes, config) =
         build_pinned_realm(&realm_id, &[11, 12, 13, 14], &[false, true, true, true]).await?;
     let group_id = Ulid::generate();
     let document_id = mint_local(
@@ -345,9 +352,6 @@ async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
         &placement,
     )
     .await?;
-    for refresher in refreshers {
-        refresher.abort();
-    }
     shutdown_nodes(nodes).await;
     Ok(())
 }
@@ -356,7 +360,7 @@ async fn flush_after_drain() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
     let realm_id = RealmId([48u8; 32]);
-    let (nodes, config, refreshers) =
+    let (nodes, config) =
         build_pinned_realm(&realm_id, &[21, 22, 23, 24], &[false, true, true, true]).await?;
     let group_id = Ulid::generate();
     let document_id = mint_local(
@@ -392,9 +396,6 @@ async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
         &placement,
     )
     .await?;
-    for refresher in refreshers {
-        refresher.abort();
-    }
     shutdown_nodes(nodes).await;
     Ok(())
 }
@@ -403,6 +404,7 @@ async fn publish_before_drain() -> Result<(), Box<dyn std::error::Error>> {
 async fn drain_until_empty(node: &TestNode) -> Result<(), Box<dyn std::error::Error>> {
     let drainer = tokio::sync::Mutex::new(OutboxDrainer::new(node.context.clone()));
     wait_for_convergence("outbox never drained", || async {
+        renew_presence(Some(node)).await;
         drainer.lock().await.run_once().await;
         let remaining = read_outbox_records(&node.context.storage_handle, &[], None, 16).await?;
         Ok(remaining.records.len())
@@ -458,6 +460,7 @@ async fn seed_and_update(
         group_id,
         document_id,
         &initial_holders,
+        Some(&nodes[0]),
     )
     .await?;
     assert!(
@@ -543,10 +546,17 @@ async fn assert_update_reaches(
         .iter()
         .find(|node| node.net.node_id() == replacement)
         .ok_or("replacement fixture node exists")?;
-    let registry =
-        wait_persisted_update(replacement_node, group_id, document_id, update_event_id).await?;
+    let origin = Some(&nodes[0]);
+    let registry = wait_persisted_update(
+        replacement_node,
+        group_id,
+        document_id,
+        update_event_id,
+        origin,
+    )
+    .await?;
     assert_eq!(registry.last_event_id, update_event_id);
-    let event = wait_event_value(replacement_node, document_id, update_event_id).await?;
+    let event = wait_event_value(replacement_node, document_id, update_event_id, origin).await?;
     let event: MetadataEventRecord = postcard::from_bytes(&event)?;
     assert!(matches!(
         event.payload,
@@ -621,7 +631,7 @@ async fn remote_origin_converges() -> Result<(), Box<dyn std::error::Error>> {
     let mut holders = resolve_shard_holders(&config, &created.placement);
     sort_node_ids(&mut holders);
     assert!(holders.contains(&origin));
-    wait_holder_set(&nodes, &holders, group_id, document_id, &holders).await?;
+    wait_holder_set(&nodes, &holders, group_id, document_id, &holders, None).await?;
 
     shutdown_nodes(nodes).await;
     Ok(())
@@ -1214,14 +1224,7 @@ async fn build_pinned_realm(
     realm_id: &RealmId,
     secret_seeds: &[u8],
     start_tasks: &[bool],
-) -> Result<
-    (
-        Vec<TestNode>,
-        RealmConfigDocument,
-        Vec<tokio::task::JoinHandle<()>>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<(Vec<TestNode>, RealmConfigDocument), Box<dyn std::error::Error>> {
     let mut nodes = Vec::with_capacity(secret_seeds.len());
     for (index, seed) in secret_seeds.iter().enumerate() {
         let secret = iroh::SecretKey::from_bytes(&[*seed; 32]);
@@ -1229,33 +1232,26 @@ async fn build_pinned_realm(
             spawn_replica_with(*realm_id, Some(secret), true, true, start_tasks[index]).await?,
         );
     }
-    // A node with no auto loop cannot refresh its own realm presence, which expires after
-    // REALM_PRESENCE_TTL.
-    let mut refreshers = Vec::new();
-    for (index, node) in nodes.iter().enumerate() {
-        if start_tasks[index] {
-            continue;
-        }
-        let context = node.context.clone();
-        let node_id = node.net.node_id();
-        let realm_id = *realm_id;
-        refreshers.push(tokio::spawn(async move {
-            loop {
-                sleep(Duration::from_secs(5)).await;
-                let _ = drive(
-                    AnnouncePresenceOperation::new(AnnouncePresenceConfig {
-                        realm_id,
-                        node_id,
-                        schedule_refresh: false,
-                    }),
-                    context.as_ref(),
-                )
-                .await;
-            }
-        }));
-    }
     let config = finish_realm_setup(&nodes, realm_id).await?;
-    Ok((nodes, config, refreshers))
+    Ok((nodes, config))
+}
+
+// A hand-driven node runs no presence timer, so the polls of its tests renew its realm presence,
+// which expires after REALM_PRESENCE_TTL.
+async fn renew_presence(node: Option<&TestNode>) {
+    let Some(node) = node else {
+        return;
+    };
+    let config = AnnouncePresenceConfig {
+        realm_id: *node.net.realm_id(),
+        node_id: node.net.node_id(),
+        schedule_refresh: false,
+    };
+    let _ = drive(
+        AnnouncePresenceOperation::new(config),
+        node.context.as_ref(),
+    )
+    .await;
 }
 
 async fn finish_realm_setup(
@@ -1458,12 +1454,14 @@ async fn wait_event_value(
     node: &TestNode,
     document_id: Ulid,
     event_id: Ulid,
+    renew: Option<&TestNode>,
 ) -> Result<aruna_core::types::Value, Box<dyn std::error::Error>> {
     let context = format!(
         "node={} never persisted metadata event {event_id} of document {document_id}",
         node.net.node_id()
     );
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(&context, || async {
+        renew_presence(renew).await;
         Ok(usize::from(
             read_event_value(node, document_id, event_id)
                 .await?
@@ -1481,10 +1479,12 @@ async fn wait_persisted_update(
     group_id: Ulid,
     document_id: Ulid,
     expected_event_id: Ulid,
+    renew: Option<&TestNode>,
 ) -> Result<MetadataRegistryRecord, Box<dyn std::error::Error>> {
     wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
         &format!("replacement did not converge to update {expected_event_id}"),
         || async {
+            renew_presence(renew).await;
             Ok(match read_holder_set(node, group_id, document_id).await? {
                 Some((registry, _)) if registry.last_event_id == expected_event_id => 0,
                 _ => 1,
@@ -1507,10 +1507,12 @@ async fn wait_holder_set(
     group_id: Ulid,
     document_id: Ulid,
     expected_holders: &[aruna_core::id::NodeId],
+    renew: Option<&TestNode>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     wait_for_convergence(
         &format!("metadata holder indexes did not converge to {expected_holders:?}"),
         || async {
+            renew_presence(renew).await;
             let mut pending = 0;
             for node_id in node_ids {
                 let node = nodes

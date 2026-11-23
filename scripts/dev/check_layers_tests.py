@@ -389,11 +389,17 @@ class CratesTest(unittest.TestCase):
             "Cargo.toml": '[workspace]\nmembers = ["domain/ops-work", "runtime/storage", "runtime/p2p"]\n',
             "domain/ops-work/Cargo.toml": MANIFEST + "\n[dev-dependencies]\naruna-p2p = { workspace = true }\n",
             "runtime/storage/Cargo.toml": '[package]\nname = "aruna-storage"\n\n[dev-dependencies]\naruna-p2p = "1"\n',
-            "runtime/p2p/Cargo.toml": '[package]\nname = "aruna-p2p"\n\n[dependencies]\naruna-storage = "1"\n',
+            "runtime/p2p/Cargo.toml": '[package]\nname = "aruna-p2p"\n\n[dev-dependencies]\naruna-storage = "1"\n',
         }
         with tempfile.TemporaryDirectory() as root:
             write_tree(root, files)
             self.assertEqual(check_layers.crate_findings(root, {}), (["aruna-storage -> aruna-p2p"], []))
+            files["runtime/p2p/Cargo.toml"] = '[package]\nname = "aruna-p2p"\n\n[dependencies]\naruna-storage = "1"\n'
+            write_tree(root, files)
+            self.assertEqual(
+                check_layers.crate_findings(root, {}),
+                (["aruna-p2p -> aruna-storage", "aruna-storage -> aruna-p2p"], []),
+            )
 
 
 class GuardTest(unittest.TestCase):

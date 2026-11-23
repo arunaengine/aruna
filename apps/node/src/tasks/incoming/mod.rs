@@ -14,6 +14,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::execution::job::identity::JobExecutionClass;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::Key;
 use aruna_scheduler::shutdown::Shutdown;
@@ -37,12 +38,11 @@ impl Drop for OutboxBarrier {
     }
 }
 
+use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use crate::tasks::task_persistence::restore_task_timers;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use aruna_ops_work::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_ops_work::blob::sweep_timer::ArmSweepOperation;
-use aruna_ops_work::jobs::DRAIN_RETRY_AFTER;
-use aruna_ops_work::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
+use aruna_ops_work::jobs::drain::DrainTimerOperation;
 use aruna_ops_work::jobs::prune::PruneTimerOperation;
 use aruna_ops_work::jobs::store::job_calls;
 use aruna_ops_work::metadata::materialization_queue::{
@@ -61,13 +61,14 @@ use aruna_ops_work::sync::document_outbox::OutboxTimerOperation;
 use aruna_ops_work::sync::outbox::batches::OutboxLimits;
 use aruna_ops_work::sync::outbox::rotation::OutboxRotation;
 use aruna_ops_work::triggers::{
-    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
+    TimerHandoff, TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
 };
 use aruna_runner::driver::node_facts;
 use aruna_runner::driver::{DriverContext, drive, drive_retry, node_routing};
 use aruna_runner::effect_adapters::task::{arm_unless_stored, change_timer};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_storage::task_timers::delete_persisted_timer;
+use drained::remove_drained_backends;
 use folder_pass::{restore_publish_timer, restore_sync_timers};
 
 pub(crate) mod drained;
@@ -202,6 +203,8 @@ impl OperationsTaskHandler {
         let memory = self.kept_memory(&key);
         let needs = timer_needs(&key);
         let context = self.context.as_ref();
+        let runtime = self.jobs_runtime.as_ref();
+        let slots = |class| needs.jobs.then(|| runtime.available_slots_for(class));
         let input = TimerInput {
             now_ms: unix_timestamp_millis(),
             local_node: context.net_handle.as_ref().map(|net| net.node_id()),
@@ -233,10 +236,21 @@ impl OperationsTaskHandler {
             },
             rocrate_limits: self.rocrate_limits.clone(),
             outbox: self.outbox_limits,
+            jobs_started: needs.jobs && runtime.is_started(),
+            in_process_slots: slots(JobExecutionClass::InProcess).unwrap_or_default(),
+            external_slots: slots(JobExecutionClass::ExternalAttempt).unwrap_or_default(),
         };
         let Some(operation) = timer_operation(&key, &input) else {
             error!(task_id = ?key, "The trigger table names no operation for this timer");
             return;
+        };
+        // Jobs are claimed only while no stop drains the runtime, and stay gated until started.
+        let gate = match operation.claims_jobs() {
+            true => match claim_producer(runtime).await {
+                Some(gate) => Some(gate),
+                None => return,
+            },
+            false => None,
         };
         // A lost commit conflict reruns a fresh copy, as the operation's conflict hook decides.
         let seed = key
@@ -246,7 +260,7 @@ impl OperationsTaskHandler {
         let build = || operation.clone();
         let bulk = operation.bulk_lane().then(|| self.context.bulk());
         let context = bulk.as_ref().unwrap_or(self.context.as_ref());
-        let plan = match drive_retry(build, context, &seed).await {
+        let mut plan = match drive_retry(build, context, &seed).await {
             Ok(plan) => plan,
             Err(failure) => {
                 warn!(task_id = ?key, error = %failure, "Timer run failed");
@@ -256,7 +270,10 @@ impl OperationsTaskHandler {
                 }
             }
         };
+        let handoff = std::mem::take(&mut plan.memory.handoff);
         self.keep_memory(&key, plan.memory);
+        self.hand_off(handoff).await;
+        drop(gate);
         let Some(after) = plan.after else {
             return;
         };
@@ -265,6 +282,48 @@ impl OperationsTaskHandler {
             return self.rearm_stored(key, after).await;
         }
         self.rearm_live(TaskEffect::ResetTimer { key, after }).await;
+    }
+
+    /// Starts the work a timer run handed to this shell.
+    async fn hand_off(&self, handoff: TimerHandoff) {
+        match handoff {
+            TimerHandoff::Nothing => {}
+            TimerHandoff::RemoveBackends => {
+                if let Err(error) = remove_drained_backends(&self.context).await {
+                    warn!(error = %error, "Failed to remove drained storage backends");
+                }
+            }
+            TimerHandoff::StartJobs {
+                claimed,
+                lost_attempts,
+            } => self.start_jobs(claimed, lost_attempts).await,
+        }
+    }
+
+    /// Reconciles the lost attempts and starts the claimed jobs, releasing a claim whose class
+    /// filled up since the drain read its budget.
+    async fn start_jobs(&self, claimed: Vec<JobRecord>, lost_attempts: Vec<JobRecord>) {
+        for record in lost_attempts {
+            reconcile_lost_attempt(&self.jobs_runtime, self.context.as_ref(), record).await;
+        }
+        for record in claimed {
+            if self
+                .jobs_runtime
+                .available_slots_for(record.execution_class)
+                == 0
+            {
+                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+                    warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
+                    continue;
+                };
+                let release = job_calls::release_job(record.job_id, token, unix_timestamp_millis());
+                if let Err(error) = drive(release, self.context.as_ref()).await {
+                    warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
+                }
+                continue;
+            }
+            spawn_job(&self.jobs_runtime, self.context.clone(), record);
+        }
     }
 
     /// Rearms `key` unless a row stored while it ran holds a newer wake, also one no longer live
@@ -319,18 +378,14 @@ impl OperationsTaskHandler {
             TaskKey::PublishWatchInterest => Box::pin(self.run_trigger(key)),
             TaskKey::DrainWatchEvents => Box::pin(self.run_trigger(key)),
             TaskKey::DrainAppliedSync => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainJobQueue => Box::pin(async move {
-                self.drain_job_queue().await;
-            }),
+            TaskKey::DrainJobQueue => Box::pin(self.run_trigger(key)),
             TaskKey::PruneJobs => Box::pin(self.run_trigger(key)),
             TaskKey::PruneFamilies => Box::pin(self.run_trigger(key)),
             TaskKey::ConfigCatchUp => Box::pin(self.run_trigger(key)),
             TaskKey::DrainMirrorRepair => Box::pin(self.run_trigger(key)),
             TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCleanupQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainReclaimQueue => Box::pin(async move {
-                self.drain_blob_reclaim().await;
-            }),
+            TaskKey::DrainReclaimQueue => Box::pin(self.run_trigger(key)),
             TaskKey::MigrateCompression => Box::pin(self.run_trigger(key)),
             TaskKey::RefreshBlobHolders => Box::pin(self.run_trigger(key)),
             TaskKey::LockBucket {

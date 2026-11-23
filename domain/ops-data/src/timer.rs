@@ -13,6 +13,7 @@ use aruna_core::heartbeat::{HeldHeartbeat, RunningJobs};
 use aruna_core::id::NodeId;
 use aruna_core::node::facts::NodeFacts;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::routing::NodeRouting;
 use aruna_core::task::TaskKey;
@@ -44,6 +45,22 @@ pub struct TimerMemory {
     pub published: Arc<BTreeMap<Vec<u8>, Publication>>,
     /// Earliest timestamp in milliseconds when a throttled pass may run again.
     pub due_ms: u64,
+    /// Work this run hands to the shell; the shell takes it out before it keeps the memory.
+    pub handoff: TimerHandoff,
+}
+
+/// Work only the shell can start after a timer run, such as a spawned job or a backend claim.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum TimerHandoff {
+    #[default]
+    Nothing,
+    /// The reclaim sweep reached the end of its queue, so emptied backends can go.
+    RemoveBackends,
+    /// The job drain claimed these jobs and found these attempts lost.
+    StartJobs {
+        claimed: Vec<JobRecord>,
+        lost_attempts: Vec<JobRecord>,
+    },
 }
 
 /// Retry steps after which a timer's retry ladder stops doubling.
@@ -108,6 +125,11 @@ pub struct TimerInput {
     pub rocrate_limits: RoCrateLimits,
     /// The bounds of one document sync outbox invocation.
     pub outbox: OutboxLimits,
+    /// Whether the job runtime started, and its free slots per execution class, filled like
+    /// `facts`.
+    pub jobs_started: bool,
+    pub in_process_slots: usize,
+    pub external_slots: usize,
 }
 
 /// Which costly inputs a timer reads; the shell builds only these, since most runs never look
@@ -120,6 +142,8 @@ pub struct TimerNeeds {
     /// The fresh heartbeats and executor limits.
     pub cluster: bool,
     pub cores: bool,
+    /// The job runtime state and its free slots.
+    pub jobs: bool,
 }
 
 /// Whether the timer of `key` rearms after a run only without a row stored while it ran, so a
@@ -138,6 +162,7 @@ pub fn timer_needs(key: &TaskKey) -> TimerNeeds {
             | TaskKey::DrainReplicationQueue
             | TaskKey::DrainMaterializationQueue
             | TaskKey::MaintainRanges
+            | TaskKey::DrainReclaimQueue
     );
     TimerNeeds {
         facts: matches!(
@@ -148,6 +173,7 @@ pub fn timer_needs(key: &TaskKey) -> TimerNeeds {
         running: matches!(key, TaskKey::PublishNodeInfo),
         cluster: matches!(key, TaskKey::DrainWitnessQueue | TaskKey::MaintainRanges),
         cores: matches!(key, TaskKey::DrainMaterializationQueue),
+        jobs: matches!(key, TaskKey::DrainJobQueue),
     }
 }
 
@@ -169,6 +195,9 @@ impl TimerInput {
             limits: BTreeMap::new(),
             rocrate_limits: RoCrateLimits::default(),
             outbox: OutboxLimits::default(),
+            jobs_started: false,
+            in_process_slots: 0,
+            external_slots: 0,
         }
     }
 }

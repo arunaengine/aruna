@@ -40,12 +40,31 @@ fn main() {
         }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
     }
-    run_runtime();
+    start_runtime();
 }
 
-/// Synchronous runtime entry: creates the Tokio runtime once on the node path
-/// and maps the node outcome to its exit behavior.
-#[tokio::main]
+/// Stack of each runtime worker thread; deep node futures overflow the smaller default.
+const WORKER_STACK: usize = 8 << 20;
+
+/// Synchronous runtime entry: creates the Tokio runtime once on the node path. The node future
+/// is not `Send`, so it runs on its own thread with the worker stack instead of the main thread,
+/// whose stack is 1 MiB on Windows.
+fn start_runtime() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(WORKER_STACK)
+        .build()
+        .expect("build the node runtime");
+    let node = std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(move || runtime.block_on(run_runtime()))
+        .expect("start the node thread");
+    if let Err(panic) = node.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Runs the node and maps its outcome to the exit behavior.
 async fn run_runtime() {
     dotenv_optional(dotenvy::dotenv()).expect("Failed to load .env file");
     init_tracing();

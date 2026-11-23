@@ -59,13 +59,12 @@ CRATE_TARGETS = {
         "aruna-blob",
         "aruna-ops-work",
         "aruna-runner",
+        "aruna-wire",
     ),
     # The node configuration, settings and identity that the node and the doctor share.
     "aruna-config": (
         "aruna-core",
         "aruna-clock",
-        "aruna-p2p",
-        "aruna-storage",
         "aruna-wire",
     ),
     "aruna-cli": ("aruna-wire", "aruna-wasm-host", "aruna-plugin-contract"),
@@ -90,8 +89,8 @@ CRATE_TARGETS = {
         "aruna-egress",
     ),
     "aruna-storage": ("aruna-core", "aruna-clock"),
-    "aruna-p2p": ("aruna-core", "aruna-clock", "aruna-storage"),
-    "aruna-blob": ("aruna-core", "aruna-clock", "aruna-kpabe", "aruna-storage", "aruna-p2p"),
+    "aruna-p2p": ("aruna-core", "aruna-clock"),
+    "aruna-blob": ("aruna-core", "aruna-clock", "aruna-kpabe", "aruna-p2p"),
     "aruna-scheduler": ("aruna-core",),
     "aruna-compute": ("aruna-core", "aruna-clock"),
     "aruna-wasm-host": ("aruna-plugin-contract",),
@@ -124,10 +123,15 @@ CRATE_TARGETS = {
     "aruna-registry": ("aruna-core", "aruna-clock", "aruna-blob"),
     "aruna-compute-helper": (),
 }
-# Backends keep their table for test and build dependencies as well.
+# Backends keep their table for test and build dependencies as well, except for the explicit
+# dev-only storage test fixture allowance below (production edges stay strictly forbidden).
 BACKENDS = frozenset(
     "aruna-storage aruna-p2p aruna-blob aruna-scheduler aruna-compute aruna-wasm-host aruna-rdf-graph aruna-egress".split()
 )
+BACKEND_DEV_TARGETS = {
+    "aruna-p2p": ("aruna-storage",),
+    "aruna-blob": ("aruna-storage",),
+}
 TRIGGER_MATCHES = (
     ("apps/node/src/tasks/incoming/mod.rs", "TaskKey::"),
     ("apps/node/src/inbound.rs", "Alpn::"),
@@ -748,18 +752,24 @@ def crate_manifests(root):
     names = {data["package"]["name"] for data in manifests.values()}
     result = {}
     for data in manifests.values():
-        kinds = ("dependencies",)
-        if data["package"]["name"] in BACKENDS:
-            kinds = ("dependencies", "dev-dependencies", "build-dependencies")
+        crate = data["package"]["name"]
         sections = [data, *data.get("target", {}).values()]
-        tables = [section.get(kind, {}) for section in sections for kind in kinds]
-        deps = set()
-        for table in tables:
+        normal_deps = set()
+        for table in (section.get("dependencies", {}) for section in sections):
             for key, value in table.items():
                 name = value.get("package", renames.get(key, key)) if isinstance(value, dict) else key
                 if name in names:
-                    deps.add(name)
-        result[data["package"]["name"]] = deps
+                    normal_deps.add(name)
+        deps = set(normal_deps)
+        if crate in BACKENDS:
+            dev_allow = set(BACKEND_DEV_TARGETS.get(crate, ()))
+            for kind in ("dev-dependencies", "build-dependencies"):
+                for table in (section.get(kind, {}) for section in sections):
+                    for key, value in table.items():
+                        name = value.get("package", renames.get(key, key)) if isinstance(value, dict) else key
+                        if name in names and not (kind == "dev-dependencies" and name in dev_allow):
+                            deps.add(name)
+        result[crate] = deps
     return result
 
 

@@ -30,8 +30,8 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 pub use aruna_ops_data::timer::{
-    TIMER_RETRY_AFTER, TimerFailure, TimerInput, TimerMemory, TimerNeeds, TimerPlan, keeps_earlier,
-    timer_needs,
+    TIMER_RETRY_AFTER, TimerFailure, TimerHandoff, TimerInput, TimerMemory, TimerNeeds, TimerPlan,
+    keeps_earlier, timer_needs,
 };
 
 /// A timer operation decides when its timer runs again and what it keeps until then.
@@ -72,6 +72,7 @@ impl Operation for WaitOperation {
 
 use crate::federation::registration::RenewalTimerOperation;
 use crate::jobs::backend_import::schedule::RunDueOperation;
+use crate::jobs::drain::{DrainJobsOperation, JobClassBudget};
 use crate::jobs::lifecycle::outbox::OUTBOX_RETRY_AFTER;
 use crate::jobs::lifecycle::outbox::timers::FamilyTimerOperation;
 use crate::jobs::lifecycle::updates::{SETTLE_RETRY_AFTER, SettleTerminalsOperation};
@@ -81,7 +82,7 @@ use crate::jobs::protocol::{JobAnswer, JobRequestOperation};
 use crate::jobs::records::prune::pass::PruneFamiliesOperation;
 use crate::jobs::remote_key::{DeliverWakesOperation, Delivery, WAKE_RETRY};
 use crate::jobs::repository::link_queue::LinkRunOperation;
-use crate::jobs::{JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
+use crate::jobs::{DRAIN_RETRY_AFTER, JOB_PRUNE_PAGE, PRUNE_POLL_AFTER, PRUNE_RETRY_AFTER};
 use crate::node::applied_drain::AppliedDrainOperation;
 use crate::node::catch_up::{CATCH_UP_REFRESH, CatchUpOperation, next_pass};
 use crate::node::folder_timer::FolderTimerOperation;
@@ -110,7 +111,7 @@ use aruna_ops_data::blob::hidden::{
 };
 use aruna_ops_data::blob::holders::HoldersTimerOperation;
 use aruna_ops_data::blob::migration::drain::ProcessMigrationsOperation;
-use aruna_ops_data::blob::reclaim_sweep::RECLAIM_SWEEP_RETRY;
+use aruna_ops_data::blob::reclaim_sweep::{RECLAIM_SWEEP_RETRY, ReclaimTimerOperation};
 use aruna_ops_data::connectors::reference_prune::{PRUNE_RETRY, PruneReferencesOperation};
 use aruna_ops_data::device::publish_queue::DrainOutcome;
 use aruna_ops_data::device::sync::outbox::{
@@ -177,6 +178,8 @@ pub enum TimerOperation {
     DrainUploadOutbox(aruna_ops_data::device::sync::outbox::DrainOutboxOperation),
     DrainDeviceIntake(DrainPublishOperation),
     ReconcileSyncedFolders(FolderTimerOperation),
+    DrainReclaimQueue(ReclaimTimerOperation),
+    DrainJobQueue(DrainJobsOperation),
     /// A timer this node cannot run yet, which only plans its next run.
     Wait(WaitOperation),
 }
@@ -351,6 +354,23 @@ pub fn timer_operation(key: &TaskKey, input: &TimerInput) -> Option<TimerOperati
         TaskKey::ReconcileSyncedFolders => Some(TimerOperation::ReconcileSyncedFolders(
             FolderTimerOperation::new(input),
         )),
+        TaskKey::DrainReclaimQueue => Some(TimerOperation::DrainReclaimQueue(
+            ReclaimTimerOperation::new(input),
+        )),
+        TaskKey::DrainJobQueue => Some(match (input.jobs_started, input.local_node) {
+            (false, _) => TimerOperation::Wait(WaitOperation::after(None)),
+            (true, None) => TimerOperation::Wait(WaitOperation::after(Some(DRAIN_RETRY_AFTER))),
+            (true, Some(owner)) => {
+                // Per class: one aggregate would claim rows of a saturated class only to
+                // release them again on every pass.
+                let budget = JobClassBudget {
+                    in_process: input.in_process_slots,
+                    external: input.external_slots,
+                };
+                let drain = DrainJobsOperation::new(owner, budget, input.now_ms);
+                TimerOperation::DrainJobQueue(drain)
+            }
+        }),
         _ => None,
     }
 }
@@ -362,6 +382,11 @@ impl TimerOperation {
             self,
             TimerOperation::DrainMaterializationQueue(_) | TimerOperation::DrainPruneQueue(_)
         )
+    }
+
+    /// Whether the run claims jobs, which the shell may only do while no stop drains its jobs.
+    pub fn claims_jobs(&self) -> bool {
+        matches!(self, TimerOperation::DrainJobQueue(_))
     }
 }
 
@@ -406,6 +431,8 @@ macro_rules! each_timer {
             TimerOperation::DrainUploadOutbox($operation) => $body,
             TimerOperation::DrainDeviceIntake($operation) => $body,
             TimerOperation::ReconcileSyncedFolders($operation) => $body,
+            TimerOperation::DrainReclaimQueue($operation) => $body,
+            TimerOperation::DrainJobQueue($operation) => $body,
             TimerOperation::Wait($operation) => $body,
         }
     };
@@ -540,6 +567,38 @@ impl TimerRun for PlacementTimerOperation {
 impl TimerRun for CleanupTimerOperation {
     fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
         result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for ReclaimTimerOperation {
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        result.map_err(TimerFailure::from)
+    }
+}
+
+impl TimerRun for DrainJobsOperation {
+    /// Claimed jobs and lost attempts go to the shell. A batch a job error stopped, or due work a
+    /// saturated class left, runs again after a short wait rather than at once; otherwise the
+    /// timer waits for the next due job or lease.
+    fn rearm(result: Result<Self::Output, Self::Error>) -> Result<TimerPlan, TimerFailure> {
+        let drained = result.map_err(|error| TimerFailure {
+            retry_after: DRAIN_RETRY_AFTER,
+            reason: error.to_string(),
+        })?;
+        let after = match drained.next_due_after {
+            _ if drained.retry_after_error => Some(DRAIN_RETRY_AFTER),
+            Some(after) if after.is_zero() && drained.deferred_saturated => Some(DRAIN_RETRY_AFTER),
+            next => next,
+        };
+        let handoff = TimerHandoff::StartJobs {
+            claimed: drained.claimed,
+            lost_attempts: drained.lost_attempts,
+        };
+        let memory = TimerMemory {
+            handoff,
+            ..TimerMemory::default()
+        };
+        Ok(TimerPlan { after, memory })
     }
 }
 
@@ -1304,6 +1363,7 @@ impl Operation for PeerOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobs::drain::{DrainError, JobDrainResult};
     use crate::jobs::lifecycle::LifecycleError;
     use crate::jobs::prune::JobPruneOutcome;
     use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
@@ -1324,7 +1384,57 @@ mod tests {
 
     #[test]
     fn unconverted_keys_absent() {
-        assert!(timer_operation(&TaskKey::DrainJobQueue, &input()).is_none());
+        let key = TaskKey::LockBucket {
+            bucket_id: Ulid::nil(),
+            generation: 1,
+            session_id: Ulid::nil(),
+        };
+        assert!(timer_operation(&key, &input()).is_none());
+    }
+
+    // A stopped runtime waits for its start, a node without network retries soon, and a pass
+    // hands its claims to the shell; a stopped batch or a saturated class never reruns at once.
+    #[test]
+    fn job_drain_plans() {
+        let mut input = input();
+        let wait = |input: &TimerInput| timer_operation(&TaskKey::DrainJobQueue, input);
+        assert_eq!(
+            wait(&input),
+            Some(TimerOperation::Wait(WaitOperation::after(None)))
+        );
+        input.jobs_started = true;
+        let retry = WaitOperation::after(Some(DRAIN_RETRY_AFTER));
+        assert_eq!(wait(&input), Some(TimerOperation::Wait(retry)));
+        input.local_node = Some(crate::tests::locations::node_id(1));
+        assert!(wait(&input).is_some_and(|operation| operation.claims_jobs()));
+        let saturated = JobDrainResult {
+            next_due_after: Some(Duration::ZERO),
+            deferred_saturated: true,
+            ..JobDrainResult::default()
+        };
+        let plan = DrainJobsOperation::rearm(Ok(saturated)).unwrap();
+        assert_eq!(plan.after, Some(DRAIN_RETRY_AFTER));
+        let stopped = JobDrainResult {
+            retry_after_error: true,
+            next_due_after: Some(Duration::from_secs(9)),
+            ..JobDrainResult::default()
+        };
+        let plan = DrainJobsOperation::rearm(Ok(stopped)).unwrap();
+        assert_eq!(plan.after, Some(DRAIN_RETRY_AFTER));
+        let due = Some(Duration::from_secs(9));
+        let later = JobDrainResult {
+            next_due_after: due,
+            ..JobDrainResult::default()
+        };
+        let plan = DrainJobsOperation::rearm(Ok(later)).unwrap();
+        assert_eq!(plan.after, due);
+        let handed = TimerHandoff::StartJobs {
+            claimed: Vec::new(),
+            lost_attempts: Vec::new(),
+        };
+        assert_eq!(plan.memory.handoff, handed);
+        let failed = DrainJobsOperation::rearm(Err(DrainError("boom".to_string())));
+        assert_eq!(failed.unwrap_err().retry_after, DRAIN_RETRY_AFTER);
     }
 
     #[test]

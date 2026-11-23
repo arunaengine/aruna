@@ -72,8 +72,12 @@ impl Broker for Recorder {
                     json: format!(r#"{{"name":"{}"}}"#, "x".repeat(8192)),
                 });
             }
-            // Real time: a host call that takes wall time while the guest waits on it.
-            "slow" => tokio::time::sleep(Duration::from_millis(50)).await,
+            // A host call that stays pending across several polls while the guest waits on it.
+            "slow" => {
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
             "block" => {
                 self.blocked.notify_one();
                 std::future::pending::<()>().await;

@@ -26,7 +26,7 @@ use ulid::Ulid;
 
 use super::reclaim::{ReclaimBlobError, ReclaimBlobOperation, ReclaimVerdict};
 use crate::blob::pending_reclaim::ReclaimPendingOperation;
-use crate::timer::{TimerMemory, TimerPlan};
+use crate::timer::{TimerHandoff, TimerInput, TimerMemory, TimerPlan};
 use aruna_ops_identity::groups::backends::backend_key;
 
 pub const RECLAIM_SWEEP_AFTER: Duration = Duration::from_secs(15 * 60);
@@ -60,6 +60,50 @@ pub fn reclaim_plan(outcome: Option<&ReclaimOutcome>, memory: &TimerMemory) -> (
             memory.cursor = cursor;
             (plan(after, memory), true)
         }
+    }
+}
+
+/// One reclaim timer run: sweeps from the kept queue key and plans the next run. A sweep that
+/// reached the end of the queue hands the removal of emptied backends to the shell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReclaimTimerOperation {
+    catalog: BackendCatalog,
+    now: SystemTime,
+    memory: TimerMemory,
+}
+
+impl ReclaimTimerOperation {
+    pub fn new(input: &TimerInput) -> Self {
+        Self {
+            catalog: input.routing.catalog.clone(),
+            now: SystemTime::UNIX_EPOCH + Duration::from_millis(input.now_ms),
+            memory: input.memory.clone(),
+        }
+    }
+}
+
+impl Operation for ReclaimTimerOperation {
+    type Output = TimerPlan;
+    type Error = IoError;
+
+    fn first(&mut self) -> Result<Next<TimerPlan>, IoError> {
+        let start = self.memory.cursor.clone().map(Key::from);
+        let sweep = ReclaimSweepOperation::new(self.catalog.clone(), self.now, start);
+        Ok(Next::Call(IoCall::child(sweep)))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<TimerPlan>, IoError> {
+        let swept = result.child::<ReclaimOutcome, ReclaimSweepError>()?;
+        if let Err(error) = &swept {
+            warn!(error = %error, "Failed to drain blob reclaim");
+        }
+        let (mut plan, drained) = reclaim_plan(swept.as_ref().ok(), &self.memory);
+        // Removal walks whole keyspaces too, so it only rides a sweep that reached the end of
+        // the queue, never the fast retries behind a backlog.
+        if drained {
+            plan.memory.handoff = TimerHandoff::RemoveBackends;
+        }
+        Ok(Next::Done(plan))
     }
 }
 
@@ -554,6 +598,32 @@ mod tests {
         let (clean, drained) = reclaim_plan(Some(&ReclaimOutcome::default()), &plan.memory);
         assert_eq!((clean.after, drained), (Some(RECLAIM_SWEEP_AFTER), true));
         assert_eq!(clean.memory, TimerMemory::default());
+    }
+
+    // Only a sweep that reached the end of the queue hands the backend removal to the shell; a
+    // failed one climbs the retry ladder and keeps its queue key.
+    #[test]
+    fn sweep_hands_removal() {
+        let mut input = TimerInput::new(1_000, None);
+        input.memory.cursor = Some(b"kept".to_vec());
+        let swept = |outcome: Result<ReclaimOutcome, ReclaimSweepError>| {
+            let mut run = ReclaimTimerOperation::new(&input);
+            let Ok(Next::Call(IoCall::Child(_))) = run.first() else {
+                panic!("expected the sweep child");
+            };
+            let result = IoResult::Child(aruna_core::calls::ChildOutcome::new(outcome));
+            match run.next(result) {
+                Ok(Next::Done(plan)) => plan,
+                other => panic!("expected a plan, got {other:?}"),
+            }
+        };
+        let clean = swept(Ok(ReclaimOutcome::default()));
+        assert_eq!(clean.memory.handoff, TimerHandoff::RemoveBackends);
+        assert_eq!(clean.after, Some(RECLAIM_SWEEP_AFTER));
+        let failed = swept(Err(ReclaimSweepError::Io(IoError::Unfinished)));
+        assert_eq!(failed.memory.handoff, TimerHandoff::Nothing);
+        assert_eq!(failed.memory.cursor.as_deref(), Some(&b"kept"[..]));
+        assert_eq!(failed.after, Some(RECLAIM_SWEEP_RETRY));
     }
 
     fn sweep() -> ReclaimSweepOperation {

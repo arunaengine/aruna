@@ -2,13 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::drained::remove_drained_backends;
 use super::*;
-use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use aruna_ops_work::jobs::records::prune::pass::ArmFamiliesOperation;
 use aruna_ops_work::node::catch_up::catch_up_timer;
-use aruna_runner::driver::node_routing;
-use std::time::SystemTime;
 
 /// The first and the longest wait before an incomplete timer restoration resumes.
 const TIMER_RESUME_FIRST: Duration = Duration::from_secs(1);
@@ -432,115 +428,6 @@ impl TaskQueues {
             handler
                 .reschedule_timer(TaskKey::RefreshBlobHolders, Duration::ZERO)
                 .await;
-        }
-    }
-}
-
-impl OperationsTaskHandler {
-    pub(super) async fn drain_job_queue(&self) {
-        if !self.jobs_runtime.is_started() {
-            return;
-        }
-        let Some(owner_node_id) = self.context.net_handle.as_ref().map(|net| net.node_id()) else {
-            warn!(task_id = ?TaskKey::DrainJobQueue, "Cannot drain job queue without net handle");
-            self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
-                .await;
-            return;
-        };
-        let Some(claim_producer) = claim_producer(&self.jobs_runtime).await else {
-            return;
-        };
-        // Per class: one aggregate would claim rows of a saturated class only to
-        // release them again on every pass.
-        let budget = JobClassBudget {
-            in_process: self
-                .jobs_runtime
-                .available_slots_for(JobExecutionClass::InProcess),
-            external: self
-                .jobs_runtime
-                .available_slots_for(JobExecutionClass::ExternalAttempt),
-        };
-
-        let drain = DrainJobsOperation::new(owner_node_id, budget, unix_timestamp_millis());
-        let mut result = match drive(drain, self.context.as_ref()).await {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(task_id = ?TaskKey::DrainJobQueue, error = %error, "Failed to drain job queue");
-                self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
-                    .await;
-                return;
-            }
-        };
-
-        for record in std::mem::take(&mut result.lost_attempts) {
-            reconcile_lost_attempt(&self.jobs_runtime, self.context.as_ref(), record).await;
-        }
-
-        for record in result.claimed {
-            if self
-                .jobs_runtime
-                .available_slots_for(record.execution_class)
-                == 0
-            {
-                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
-                    warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
-                    continue;
-                };
-                if let Err(error) = drive(
-                    job_calls::release_job(record.job_id, token, unix_timestamp_millis()),
-                    self.context.as_ref(),
-                )
-                .await
-                {
-                    warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
-                }
-                continue;
-            }
-            spawn_job(&self.jobs_runtime, self.context.clone(), record);
-        }
-        drop(claim_producer);
-
-        // A per-job error stopped the batch after handing off what was claimed; back off
-        // and re-drive the remainder rather than hot-looping on the failure.
-        if result.retry_after_error {
-            self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
-                .await;
-            return;
-        }
-
-        // Due work left behind by a saturated class: wait for a completion kick, not
-        // a ZERO hot-loop.
-        match result.next_due_after {
-            Some(after) if after.is_zero() && result.deferred_saturated => {
-                self.reschedule_timer(TaskKey::DrainJobQueue, DRAIN_RETRY_AFTER)
-                    .await;
-            }
-            Some(after) => {
-                self.reschedule_timer(TaskKey::DrainJobQueue, after).await;
-            }
-            None => {}
-        }
-    }
-
-    pub(super) async fn drain_blob_reclaim(&self) {
-        let key = TaskKey::DrainReclaimQueue;
-        let memory = self.kept_memory(&key);
-        let catalog = node_routing(&self.context).catalog;
-        let start = memory.cursor.clone().map(Key::from);
-        let sweep = ReclaimSweepOperation::new(catalog, SystemTime::now(), start);
-        let outcome = drive(sweep, &self.context).await;
-        if let Err(error) = &outcome {
-            warn!(task_id = ?key, error = %error, "Failed to drain blob reclaim");
-        }
-        let (plan, drained) = reclaim_plan(outcome.as_ref().ok(), &memory);
-        self.keep_memory(&key, plan.memory);
-        // Removal walks whole keyspaces too, so it only rides a sweep that
-        // reached the end of the queue, never the fast retries behind a backlog.
-        if drained && let Err(error) = remove_drained_backends(&self.context).await {
-            warn!(error = %error, "Failed to remove drained storage backends");
-        }
-        if let Some(after) = plan.after {
-            self.reschedule_timer(key, after).await;
         }
     }
 }
