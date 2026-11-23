@@ -29,6 +29,7 @@
   <a href="#command-line-client">Command line client</a> ·
   <a href="#desktop-app">Desktop app</a> ·
   <a href="#concepts-in-brief">Concepts</a> ·
+  <a href="docs/deployment.md">Production setup</a> ·
   <a href="#operations">Operations</a> ·
   <a href="#feedback-and-contributions">Contributing</a>
 </p>
@@ -81,8 +82,9 @@ IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3
 docker pull "$IMAGE"
 ```
 
-The tag `v3` follows the newest v3 release. To pin one release, use its version as the tag, for
-example `v3.0.0-alpha.157`.
+The tag `v3` follows the newest v3 release. For persistent pre-production or production
+deployments, pin one release tag such as `v3.0.0-alpha.208` and follow the
+[production deployment guide](docs/deployment.md).
 
 To build the image from a checkout of this repository instead, run `docker build -t aruna:local .`
 and set `IMAGE=aruna:local`. A first build takes 10 to 30 minutes. A built image has no web portal
@@ -284,14 +286,18 @@ stays responsible for its own data.
 - **Realm registry**: a realm with public addresses lists itself in the global registry. Set
   `FEDERATION_REGISTRY_URL=` (empty) before the first start to opt out.
 
-The [operations guide](docs/operations.md) covers configuration, restore, encrypted buckets, your
-own storage, NFS settings, the registry and the trust between nodes in detail.
+The [production deployment guide](docs/deployment.md) covers release pinning, Docker Compose with
+Native HTTPS or a reverse proxy, DNS and firewall ports (REST, S3 and P2P QUIC), OIDC identity
+providers, storage backends, automated backups and upgrades. The
+[operations guide](docs/operations.md) covers day-to-day configuration, restore, encrypted buckets,
+your own storage, NFS settings, the registry and trust between nodes in detail.
 
 ## Learn more
 
 - [Portal documentation](https://v3.aruna-engine.org/app/docs/v1): how to use Aruna in the browser.
 - [Swagger UI](https://api.node-1.v3.aruna-engine.org/swagger-ui/): the full REST API.
-- [Operations guide](docs/operations.md): running nodes and managing storage.
+- [Production deployment guide](docs/deployment.md): deploying a persistent server node with Docker Compose, TLS, OIDC, storage backends and backups.
+- [Operations guide](docs/operations.md): running nodes, encrypted buckets, NFS imports and node trust.
 - [Native Git guide](scripts/arc-native/README.md): working with datasets as Git repositories.
 - [Repository structure](REPO_STRUCTURE.md): how the source code is organized.
 
