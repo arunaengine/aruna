@@ -44,23 +44,23 @@ use crate::jobs::repository::links::LinkError;
 use crate::jobs::repository::pull::{PullRunningOperation, SettleImportOperation};
 use crate::jobs::repository::{TransferError, is_reference};
 use crate::jobs::submit::local::SubmitLocalOperation;
-use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentResult,
-};
-use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
-use crate::metadata::forward::write::MetadataWriteError;
-use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::metadata::update_document::UpdateDocumentError;
-use crate::s3::object::delete::DeleteObjectError;
-use crate::s3::object::delete::bulk::{
-    BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
-};
-use crate::transfer::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
-use crate::transfer::release::BucketScope;
 use aruna_core::errors::StorageReadError;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 use aruna_core::metadata::api::{CreateDocumentPayload, UpdateDocumentMutation};
+use aruna_ops_data::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentOperation, CreateDocumentResult,
+};
+use aruna_ops_data::metadata::forward::route_create::RouteCreateOperation;
+use aruna_ops_data::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::metadata::update_document::UpdateDocumentError;
+use aruna_ops_data::s3::object::delete::DeleteObjectError;
+use aruna_ops_data::s3::object::delete::bulk::{
+    BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation, BulkDeleteOutcome,
+};
+use aruna_ops_data::transfer::pinned::{PinnedError, ReleaseGuards, VersionPinsOperation};
+use aruna_ops_data::transfer::release::BucketScope;
 
 fn actor_of(run: &ImportRun) -> Actor {
     let auth = &run.spec.auth_context;

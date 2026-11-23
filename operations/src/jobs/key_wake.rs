@@ -10,16 +10,16 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::encryption::BucketKeyRef;
 use thiserror::Error;
 
-use crate::blob::migration::queue::ResumeTransitionsOperation;
-use crate::blob::migration::shared::MigrationError;
-use crate::blob::promote::PromoteError;
-use crate::blob::unlocked::PromoteUnlockedOperation;
 use crate::jobs::remote_key::RemoteWakesOperation;
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::store::row_calls;
-use crate::replication::parking::WakeParkedOperation;
-use crate::replication::queue::BlobQueueError;
-use crate::s3::abe_copies::{CompleteCopiesError, CompleteCopiesOperation};
+use aruna_ops_data::blob::migration::queue::ResumeTransitionsOperation;
+use aruna_ops_data::blob::migration::shared::MigrationError;
+use aruna_ops_data::blob::promote::PromoteError;
+use aruna_ops_data::blob::unlocked::PromoteUnlockedOperation;
+use aruna_ops_data::replication::parking::WakeParkedOperation;
+use aruna_ops_data::replication::queue::BlobQueueError;
+use aruna_ops_data::s3::abe_copies::{CompleteCopiesError, CompleteCopiesOperation};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum KeyWakeError {
@@ -651,9 +651,9 @@ mod tests {
     async fn lock_after_precheck() {
         use crate::jobs::lifecycle::stage::stage_error;
         use crate::jobs::workflow::workspace::LOCKED_INPUT;
-        use crate::replication::bao_read::BaoReadError;
         use aruna_core::replication_protocol::BaoReadRefusal;
         use aruna_core::structs::execution::job::local::JobError;
+        use aruna_ops_data::replication::bao_read::BaoReadError;
         use aruna_test_support::jobs::read_key_waits;
 
         // The input copy is not converted yet; the locked bucket key still parks the job.

@@ -24,7 +24,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_drivers::driver::drive;
-use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::git::linked::unreadable_file;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
@@ -383,7 +383,8 @@ pub(crate) async fn ensure_readable_files(
     let context = state.get_ctx();
     match drive(unreadable_file(context.node_id(), auth, entities), &context).await {
         Ok(None) => Ok(()),
-        _ => Err(ServerError::Forbidden),
+        Ok(Some(_)) => Err(ServerError::Forbidden),
+        Err(_) => Err(ServerError::ServiceUnavailable),
     }
 }
 
@@ -400,13 +401,15 @@ async fn ensure_device_owner(state: &ServerState, auth: &AuthContext) -> ServerR
     if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
         return Ok(());
     }
-    let Ok(config) = drive(
+    let config = match drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
-    else {
-        return Ok(());
+    {
+        Ok(config) => config,
+        Err(GetConfigError::DocumentNotFound) => return Ok(()),
+        Err(_) => return Err(ServerError::ServiceUnavailable),
     };
     let node_id = state.get_node_id().to_string();
     let owner = config

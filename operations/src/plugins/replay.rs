@@ -30,7 +30,7 @@ use super::rows::{
     Row, Rows, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, unexpected, values,
 };
-use crate::realm::mutate_placement::node_kind;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 pub(crate) const COVERAGE_ROW: u8 = b'c';
 const REPLAY_ROW: u8 = b'r';
@@ -192,7 +192,7 @@ impl Operation for StartReplay {
     fn first(&mut self) -> Result<Next<()>, StoreError> {
         match &self.phase {
             StartPhase::Gaps(outbox) => Ok(Next::Call(outbox.gap_ask())),
-            _ => Err(StoreError("started twice".into())),
+            _ => Err(StoreError::Message("started twice".into())),
         }
     }
 
@@ -250,10 +250,20 @@ pub struct ReplayPage {
 enum PagePhase {
     Task,
     Journal(Box<ReplayRow>),
-    Counting(Box<ReplayRow>, Rows, bool, Counting),
+    Counting(Box<ReplayRow>, CoveredPage, Counting),
     Gaps(Box<Outbox>, Vec<Row>, (usize, bool)),
     Writing((usize, bool)),
     Deleting((usize, bool)),
+}
+
+/// A journal page cut at the replay's end, each row decoded once: how many rows it read, the
+/// last of them, its newly covered events and whether the replay ended.
+#[derive(Debug, PartialEq)]
+struct CoveredPage {
+    read: usize,
+    last: Option<Vec<u8>>,
+    events: Vec<(Vec<u8>, SourceEvent)>,
+    ended: bool,
 }
 
 impl ReplayPage {
@@ -261,13 +271,9 @@ impl ReplayPage {
         Ulid::from_bytes(self.key[1..].try_into().unwrap_or_default())
     }
 
-    /// The outbox of the page's matches, then the read of its gap rows.
-    fn matched(
-        &mut self,
-        mut task: ReplayRow,
-        (rows, more): (Rows, bool),
-        queued: BTreeMap<Ulid, usize>,
-    ) -> Result<Next<(usize, bool)>, StoreError> {
+    /// The page's rows before the replay's end, and the events among them the grown coverage
+    /// covers and the old one did not.
+    fn covered(&self, task: &ReplayRow, (rows, more): (Rows, bool)) -> CoveredPage {
         let install_id = self.install_id();
         let target = |coverage: &Coverage| Target {
             install_id,
@@ -277,47 +283,62 @@ impl ReplayPage {
             account: task.account,
         };
         let (new, old) = (target(&task.next.coverage), target(&task.old));
-        let mut outbox = Outbox::new(self.now_ms, queued);
-        let mut read = 0;
-        for (row, value) in rows.iter().take_while(|(row, _)| *row < task.until) {
+        let total = rows.len();
+        let (mut read, mut last, mut events) = (0, None, Vec::new());
+        for (row, value) in rows.into_iter().take_while(|(row, _)| *row < task.until) {
             read += 1;
-            task.after = row.clone();
-            let Ok(event) = SourceEvent::from_bytes(value) else {
-                continue;
-            };
-            if new.matches(&event) && !old.matches(&event) {
-                let stale = event.journaled_ms < self.now_ms.saturating_sub(JOURNAL_RETENTION_MS);
-                let install = (install_id, task.next.revision);
-                outbox.offer(install, row, &event, stale, EVENTS_QUEUED)?;
+            if let Ok(event) = SourceEvent::from_bytes(&value)
+                && new.matches(&event)
+                && !old.matches(&event)
+            {
+                events.push((row.clone(), event));
             }
+            last = Some(row);
         }
-        let ended = !more || read < rows.len();
-        let written = match ended {
+        let ended = !more || read < total;
+        CoveredPage {
+            read,
+            last,
+            events,
+            ended,
+        }
+    }
+
+    /// The outbox of the page's newly covered events, then the read of its gap rows.
+    fn matched(
+        &mut self,
+        mut task: ReplayRow,
+        page: CoveredPage,
+        queued: BTreeMap<Ulid, usize>,
+    ) -> Result<Next<(usize, bool)>, StoreError> {
+        let install_id = self.install_id();
+        let mut outbox = Outbox::new(self.now_ms, queued);
+        let install = (install_id, task.next.revision);
+        let stale_ms = self.now_ms.saturating_sub(JOURNAL_RETENTION_MS);
+        for (row, event) in &page.events {
+            let stale = event.journaled_ms < stale_ms;
+            outbox.offer(install, row, event, stale, EVENTS_QUEUED)?;
+        }
+        if let Some(last) = page.last {
+            task.after = last;
+        }
+        let written = match page.ended {
             true => {
                 let coverage = row_key(COVERAGE_ROW, install_id);
                 row_of(PLUGIN_REPLAYS_KEYSPACE, coverage, encode(&task.next)?)
             }
             false => row_of(PLUGIN_REPLAYS_KEYSPACE, self.key.clone(), encode(&task)?),
         };
+        let outcome = (page.read, page.ended);
+        if !outbox.counts_gaps() {
+            let mut rows = outbox.rows(Vec::new())?;
+            rows.push(written);
+            self.phase = PagePhase::Writing(outcome);
+            return Ok(Next::Call(IoCall::Write(rows)));
+        }
         let ask = outbox.gap_ask();
-        self.phase = PagePhase::Gaps(Box::new(outbox), vec![written], (read, ended));
+        self.phase = PagePhase::Gaps(Box::new(outbox), vec![written], outcome);
         Ok(Next::Call(ask))
-    }
-
-    /// Whether any row of the page is a newly covered event, so the install's queue is counted.
-    fn offers(&self, task: &ReplayRow, rows: &Rows) -> bool {
-        let install_id = self.install_id();
-        let target = |coverage: &Coverage| Target {
-            install_id,
-            group_id: task.group_id,
-            revision: task.next.revision,
-            coverage: coverage.clone(),
-            account: task.account,
-        };
-        let (new, old) = (target(&task.next.coverage), target(&task.old));
-        (rows.iter().take_while(|(row, _)| *row < task.until))
-            .filter_map(|(_, value)| SourceEvent::from_bytes(value).ok())
-            .any(|event| new.matches(&event) && !old.matches(&event))
     }
 }
 
@@ -355,18 +376,19 @@ impl Operation for ReplayPage {
             }
             PagePhase::Journal(task) => {
                 let (rows, next) = page_of(answer)?;
-                let more = next.is_some();
-                if !self.offers(&task, &rows) {
-                    return self.matched(*task, (rows, more), BTreeMap::new());
+                let page = self.covered(&task, (rows, next.is_some()));
+                // Only a page with newly covered events counts the install's queue.
+                if page.events.is_empty() {
+                    return self.matched(*task, page, BTreeMap::new());
                 }
                 let counting = Counting::new(BTreeSet::from([self.install_id()]), EVENTS_QUEUED);
                 let ask = counting.ask().ok_or_else(|| unexpected(IoResult::Done))?;
-                self.phase = PagePhase::Counting(task, rows, more, counting);
+                self.phase = PagePhase::Counting(task, page, counting);
                 Ok(Next::Call(ask))
             }
-            PagePhase::Counting(task, rows, more, mut counting) => {
+            PagePhase::Counting(task, page, mut counting) => {
                 counting.take(answer)?;
-                self.matched(*task, (rows, more), counting.counted())
+                self.matched(*task, page, counting.counted())
             }
             PagePhase::Gaps(outbox, mut written, outcome) => {
                 let values = all_values(answer)?;

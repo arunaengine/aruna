@@ -19,11 +19,13 @@ use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
 use aruna_core::telemetry::record_stage;
 use async_trait::async_trait;
+use byteview::ByteView;
 use crossfire::{TrySendError, mpsc};
 use tokio::sync::oneshot;
 use tracing::{Span, warn};
 use ulid::Ulid;
 
+use super::hot_cache::{HotCache, Row, cached_slot};
 use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
 use super::owner::TransactionOwner;
 use super::policies::PolicyPrograms;
@@ -102,6 +104,8 @@ pub struct StorageHandle {
     pub(super) range_indexes: Arc<OnceLock<Arc<RangeIndexes>>>,
     /// Compiled request policy sets by content, shared by every clone of the handle.
     pub(super) policies: Arc<PolicyPrograms>,
+    /// Point reads of read-mostly keyspaces; only a handle with its own worker keeps one.
+    pub(super) cache: Option<Arc<HotCache>>,
 }
 
 /// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
@@ -173,6 +177,7 @@ impl StorageHandle {
                 database: Arc::new(OnceLock::new()),
                 range_indexes: Arc::new(OnceLock::new()),
                 policies: Arc::new(PolicyPrograms::default()),
+                cache: None,
             },
             StorageReceivers { foreground, bulk },
         )
@@ -447,7 +452,7 @@ impl StorageHandle {
             },
             None => (effect, None),
         };
-        let mut event = self.dispatch_queued(effect).await;
+        let mut event = self.dispatch_cached(effect).await;
         if let (Some(key), Some(opening)) = (self.secret_key.get(), opening) {
             event = open_event(key, opening, event)
                 .unwrap_or_else(|error| self.observe_storage_event(StorageEvent::Error { error }));
@@ -458,6 +463,108 @@ impl StorageHandle {
         }
         record_stage("storage", started.elapsed());
         event
+    }
+
+    /// Answers point reads outside a transaction from the hot cache where it can, and fills
+    /// it from the rows read; every other effect goes to the worker unchanged.
+    async fn dispatch_cached(&self, effect: StorageEffect) -> StorageEvent {
+        // A closed worker channel answers every read with its error, as a cold read does.
+        let closed = self.metrics.channel_closed.load(Ordering::Relaxed);
+        let Some(cache) = self.cache.as_deref().filter(|_| !closed) else {
+            return self.dispatch_queued(effect).await;
+        };
+        match effect {
+            StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            } => {
+                let row = cached_slot(&key_space).map(|slot| (slot, key.clone()));
+                if let Some(value) = row.as_ref().and_then(|row| cache.get(row)) {
+                    return StorageEvent::ReadResult { key, value };
+                }
+                let generation = cache.generation();
+                let effect = StorageEffect::Read {
+                    key_space,
+                    key,
+                    txn_id: None,
+                };
+                let event = self.dispatch_queued(effect).await;
+                if let (Some(row), StorageEvent::ReadResult { value, .. }) = (row, &event) {
+                    cache.fill(generation, [(row, value.clone())]);
+                }
+                event
+            }
+            StorageEffect::BatchRead {
+                reads,
+                txn_id: None,
+            } if reads
+                .iter()
+                .any(|(key_space, _)| cached_slot(key_space).is_some()) =>
+            {
+                self.read_batch(cache, reads).await
+            }
+            effect => self.dispatch_queued(effect).await,
+        }
+    }
+
+    /// Reads only the rows the cache misses, in one batch. Hits are kept only while no cached
+    /// row changed until that batch was answered; else the whole batch reads one snapshot.
+    async fn read_batch(&self, cache: &HotCache, reads: Vec<(String, ByteView)>) -> StorageEvent {
+        let mut generation = cache.generation();
+        let rows: Vec<Option<Row>> = reads
+            .iter()
+            .map(|(key_space, key)| Some((cached_slot(key_space)?, key.clone())))
+            .collect();
+        let mut hits = cache.lookup(&rows);
+        let missing: Vec<_> = reads
+            .iter()
+            .zip(&hits)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(read, _)| read.clone())
+            .collect();
+        let mut event = StorageEvent::BatchReadResult { values: Vec::new() };
+        if !missing.is_empty() {
+            let mixed = missing.len() < reads.len();
+            let batch = StorageEffect::BatchRead {
+                reads: missing,
+                txn_id: None,
+            };
+            event = self.dispatch_queued(batch).await;
+            if mixed && cache.generation() != generation {
+                generation = cache.generation();
+                hits = vec![None; reads.len()];
+                let batch = StorageEffect::BatchRead {
+                    reads: reads.clone(),
+                    txn_id: None,
+                };
+                event = self.dispatch_queued(batch).await;
+            }
+        }
+        let StorageEvent::BatchReadResult { values: fetched } = event else {
+            return event;
+        };
+        let mut fetched = fetched.into_iter();
+        let mut values = Vec::with_capacity(reads.len());
+        let mut filled = Vec::new();
+        for (((_, key), row), hit) in reads.into_iter().zip(rows).zip(hits) {
+            let value = match hit {
+                Some(value) => value,
+                None => match fetched.next() {
+                    Some((_, value)) => {
+                        filled.extend(row.map(|row| (row, value.clone())));
+                        value
+                    }
+                    None => {
+                        let error = StorageError::ReadError("short batch read".to_string());
+                        return StorageEvent::Error { error };
+                    }
+                },
+            };
+            values.push((key, value));
+        }
+        cache.fill(generation, filled);
+        StorageEvent::BatchReadResult { values }
     }
 
     async fn dispatch_queued(&self, effect: StorageEffect) -> StorageEvent {

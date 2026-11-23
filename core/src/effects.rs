@@ -44,8 +44,8 @@ use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
 pub enum Effect {
-    Blob(BlobEffect),
-    StagingSource(StagingSourceEffect),
+    Blob(Box<BlobEffect>),
+    StagingSource(Box<StagingSourceEffect>),
     LocalFile(LocalFileEffect),
     Storage(StorageEffect),
     Net(NetEffect),
@@ -58,8 +58,6 @@ pub enum Effect {
     /// `TaskEvent::BackgroundStarted { started: true }`. The child's result goes nowhere.
     Detached(Box<dyn SubOperation>),
     Task(TaskEffect),
-    Search(),
-    Stream(),
     Index(Box<crate::key_index::IndexEffect>),
     /// Independent effects the runner runs at the same time; never persisted.
     Group(EffectGroup),
@@ -76,6 +74,62 @@ pub enum Effect {
     Job(crate::jobs::JobEffect),
     /// One call to this node's Git store; never persisted.
     Git(Box<crate::git::GitCall>),
+}
+
+impl Effect {
+    /// Boxes a blob effect so `Effect` stays compact on non-blob paths.
+    pub fn blob(effect: BlobEffect) -> Self {
+        Self::Blob(Box::new(effect))
+    }
+
+    /// Boxes a staging-source effect so `Effect` stays compact on other paths.
+    pub fn staging(effect: StagingSourceEffect) -> Self {
+        Self::StagingSource(Box::new(effect))
+    }
+
+    /// Borrows a blob effect when this effect is one.
+    pub fn as_blob(&self) -> Option<&BlobEffect> {
+        match self {
+            Self::Blob(effect) => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// Borrows a staging-source effect when this effect is one.
+    pub fn as_staging(&self) -> Option<&StagingSourceEffect> {
+        match self {
+            Self::StagingSource(effect) => Some(effect),
+            _ => None,
+        }
+    }
+
+    /// Unboxes a blob effect, or returns the effect unchanged.
+    pub fn into_blob(self) -> Result<BlobEffect, Self> {
+        match self {
+            Self::Blob(effect) => Ok(*effect),
+            other => Err(other),
+        }
+    }
+
+    /// Unboxes a staging-source effect, or returns the effect unchanged.
+    pub fn into_staging(self) -> Result<StagingSourceEffect, Self> {
+        match self {
+            Self::StagingSource(effect) => Ok(*effect),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<BlobEffect> for Effect {
+    fn from(effect: BlobEffect) -> Self {
+        Self::blob(effect)
+    }
+}
+
+impl From<StagingSourceEffect> for Effect {
+    fn from(effect: StagingSourceEffect) -> Self {
+        Self::staging(effect)
+    }
 }
 
 /// Independent effects or sub operations the runner runs at the same time, at most `limit` at
@@ -101,7 +155,6 @@ pub enum GroupForm {
 
 #[derive(Debug, PartialEq)]
 pub enum BlobEffect {
-    //GetOperator { bucket: Option<String>, },
     // ----- Blob read & write -----
     Write {
         bucket: String,
@@ -515,6 +568,38 @@ pub enum BlobEffect {
     Remote(Box<crate::repository::remote::RemoteRequest>),
 }
 
+impl BlobEffect {
+    /// Whether this effect does disk, object-store, or network I/O rather than in-memory
+    /// keystore, ABE, or reservation-table work.
+    pub fn is_external_io(&self) -> bool {
+        match self {
+            Self::Abe(abe) => match abe.as_ref() {
+                crate::structs::storage::abe::AbeEffect::Write { .. } => true,
+                crate::structs::storage::abe::AbeEffect::Issue(_)
+                | crate::structs::storage::abe::AbeEffect::Parameters { .. }
+                | crate::structs::storage::abe::AbeEffect::Admit { .. }
+                | crate::structs::storage::abe::AbeEffect::Envelope(_)
+                | crate::structs::storage::abe::AbeEffect::Copy { .. } => false,
+            },
+            Self::GenerateBucketKey
+            | Self::SealHolderCopies { .. }
+            | Self::SealUnlocked { .. }
+            | Self::PrepareKey { .. }
+            | Self::ActivateKey { .. }
+            | Self::DiscardKey { .. }
+            | Self::ReadKeyStatus { .. }
+            | Self::ExtendKey { .. }
+            | Self::LockKey { .. }
+            | Self::AdmitRead { .. }
+            | Self::ReadUnlockedKey { .. }
+            | Self::ReserveCompose { .. }
+            | Self::ReleaseReservation { .. }
+            | Self::ReadHeld { .. } => false,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StagingSourceEffect {
     /// Checks a download-capable local folder and publishes displaced files before listing it.
@@ -832,7 +917,7 @@ pub enum CatchUpEffect {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum NetEffect {
-    Dht(DhtEffect),
+    Dht(Box<DhtEffect>),
     DocumentSync(DocumentEffect),
     Stream(StreamEffect),
     JobControl(Box<JobControlEffect>),
@@ -965,7 +1050,7 @@ pub enum NetEffect {
         watch_id: ulid::Ulid,
         realm_id: crate::structs::identity::realm::RealmId,
         holder: NodeId,
-        entry: crate::structs::execution::notification_watch::WatchInterestEntry,
+        entry: Box<crate::structs::execution::notification_watch::WatchInterestEntry>,
     },
     /// Removes a watch a local user just deleted from this node's watch interest.
     RetractInterest(ulid::Ulid),
@@ -981,8 +1066,6 @@ pub enum NetEffect {
     },
 }
 
-/// One request of the metadata peer protocol, encoded by the operation that owns it. The adapter
-/// sends it to `peer`, waits at most `timeout`, and never routes or retries.
 /// The exact membership a set of shard topics should have.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardMembership {

@@ -288,11 +288,11 @@ async fn stop_node(node: RecoveryNode) {
 async fn presence_values(node: &RecoveryNode, realm_id: RealmId) -> Vec<DhtEntry> {
     let event = node
         .net
-        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
             key: aruna_core::keys::realm_presence_key(&realm_id),
             realm_filter: Some(realm_id),
             options: DhtGetOptions::exhaustive(RECOVERY_TEST_GUARD),
-        })))
+        }))))
         .await;
     match event {
         Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => values,

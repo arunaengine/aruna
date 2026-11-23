@@ -266,7 +266,6 @@ pub trait Broker: Send + Sync {
             "jobs are not run here",
         ))
     }
-    /// The status of a job of the install; a broker that runs no jobs refuses it.
     /// Starts a container task; a broker that runs no jobs refuses it.
     async fn jobs_start_task(
         &self,
@@ -278,6 +277,7 @@ pub trait Broker: Send + Sync {
             "jobs are not run here",
         ))
     }
+    /// The status of a job of the install; a broker that runs no jobs refuses it.
     async fn jobs_get(&self, _cx: &CallContext, _id: &str) -> Result<JobStatus, HostError> {
         Err(HostError::new(
             ErrorKind::Unavailable,

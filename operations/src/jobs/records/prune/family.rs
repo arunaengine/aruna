@@ -47,7 +47,7 @@ use crate::jobs::records::admit::MAX_PENDING_RECORDS;
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::reduce::reduce_family;
 use crate::jobs::route::JobRouteError;
-use crate::secrets::owner::WriterView;
+use aruna_ops_identity::secrets::owner::WriterView;
 
 #[derive(Debug, PartialEq)]
 enum FamilyStep {

@@ -104,13 +104,10 @@ pub async fn request_tracing_middleware(
     let query = request.uri().query().map(str::to_string);
     // Router::layer middleware runs after route matching, so the matched
     // route template is available and keeps the latency key cardinality low.
-    let matched_route = request
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|matched| matched.as_str().to_string());
-    let route = matched_route.clone().unwrap_or_else(|| path.clone());
-    // Prometheus label must never carry a raw path; unmatched requests collapse.
-    let metric_op = matched_route.unwrap_or_else(|| "unmatched".to_string());
+    let metric_op = request.extensions().get::<MatchedPath>().map_or_else(
+        || "unmatched".to_string(),
+        |matched| matched.as_str().to_string(),
+    );
     let span = make_request_span("http", request.headers(), &method, &path);
     let started = Instant::now();
 
@@ -129,7 +126,7 @@ pub async fn request_tracing_middleware(
     let elapsed = started.elapsed();
     let status_code = response.status().as_u16();
     emit_request_completed(&span, "http", status_code, started);
-    let route_key = format!("{method} {route}");
+    let route_key = format!("{method} {metric_op}");
     HTTP_LATENCY.record(&route_key, elapsed, Instant::now());
     let metrics = state.metrics();
     metrics

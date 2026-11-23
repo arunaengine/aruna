@@ -213,7 +213,7 @@ pub fn event(event: Event) -> IoResult {
 }
 
 pub fn remote(answer: Result<RemoteAnswer, RemoteFailure>) -> IoResult {
-    event(Event::Blob(BlobEvent::Remote(answer)))
+    event(Event::blob(BlobEvent::Remote(answer)))
 }
 
 pub fn body(value: Json) -> IoResult {

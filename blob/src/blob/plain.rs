@@ -478,7 +478,12 @@ impl BlobHandler {
         };
         let current = match storage.send_effect(Effect::Storage(read)).await {
             Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-            other => return Err(failed(other)),
+            other => {
+                let _ = storage
+                    .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
+                    .await;
+                return Err(failed(other));
+            }
         };
         let same = current
             .as_deref()
@@ -500,6 +505,9 @@ impl BlobHandler {
             return Ok(());
         }
         if !matches!(answer, Event::Storage(StorageEvent::DeleteResult { .. })) {
+            let _ = storage
+                .send_effect(Effect::Storage(StorageEffect::AbortTransaction { txn_id }))
+                .await;
             return Err(failed(answer));
         }
         let commit = StorageEffect::CommitTransaction { txn_id };

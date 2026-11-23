@@ -361,9 +361,7 @@ fn passes_other_calls() {
         IoCall::Effect(Box::new(Effect::Task(TaskEffect::CancelTimer {
             key: TaskKey::DrainSyncOutbox,
         }))),
-        IoCall::Effect(Box::new(Effect::Blob(BlobEffect::ReleaseReservation {
-            id,
-        }))),
+        IoCall::blob(BlobEffect::ReleaseReservation { id }),
         IoCall::Child(child),
         IoCall::Group(EffectGroup {
             members: vec![Effect::Delay(Duration::from_secs(1))],
@@ -377,7 +375,7 @@ fn passes_other_calls() {
         operation.start().as_slice(),
         [Effect::Task(TaskEffect::CancelTimer { .. })]
     ));
-    let blob = || Event::Blob(BlobEvent::ReservationReleased { id });
+    let blob = || Event::blob(BlobEvent::ReservationReleased { id });
     let child = || Event::SubOperation(SubOperationEvent::NotificationsEmitted);
     // Each answer leads to the next call's one effect.
     assert_eq!(operation.step(cancelled()).len(), 1);
@@ -466,7 +464,7 @@ fn refuses_wrong_event() {
     );
     operation.start();
     let id = ulid::Ulid::from(4u128);
-    operation.step(Event::Blob(BlobEvent::ReservationReleased { id }));
+    operation.step(Event::blob(BlobEvent::ReservationReleased { id }));
     let refused = IoError::Unexpected {
         expected: "a task event",
         got: "BlobEvent::ReservationReleased",
@@ -497,6 +495,165 @@ fn refuses_control_effect() {
         got: "a transaction control effect",
     };
     assert_eq!(operation.finalize(), Err(refused));
+}
+
+#[test]
+fn refuses_slow_calls() {
+    // Delays and blob calls are refused while a write transaction is open, aborting it.
+    let abort = || storage(StorageEffect::AbortTransaction { txn_id: txn() });
+    let delay = IoCall::Delay(Duration::from_secs(1));
+    let mut operation = run(script(vec![read_a(), delay]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "IoCall::Delay inside a transaction",
+        })
+    );
+
+    let external = || {
+        IoCall::blob(BlobEffect::ListHidden {
+            namespace: None,
+            cursor: None,
+        })
+    };
+    let mut operation = run(script(vec![read_a(), external()]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "Effect::Blob inside a write transaction",
+        })
+    );
+
+    // In-memory keystore blob calls stay allowed inside a write transaction.
+    let id = ulid::Ulid::from(8u128);
+    let key_status = IoCall::blob(BlobEffect::ReadKeyStatus { bucket_id: id });
+    let mut operation = run(script(vec![read_a(), key_status]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(
+        effects.as_slice(),
+        &[Effect::blob(BlobEffect::ReadKeyStatus { bucket_id: id })]
+    );
+
+    // Before the transaction opens, an external blob call still runs normally.
+    let mut operation = run(script(vec![external(), read_a()]), true);
+    assert!(matches!(operation.start().as_slice(), [Effect::Blob(_)]));
+}
+
+#[test]
+fn refuses_file_calls() {
+    // A local file call is refused in a write transaction and in a read snapshot alike.
+    let hash = || {
+        let effect = crate::effects::LocalFileEffect::Hash {
+            root: "/sync".to_string(),
+            relative: "a.txt".to_string(),
+        };
+        IoCall::Effect(Box::new(Effect::LocalFile(effect)))
+    };
+    let refused = IoError::Unexpected {
+        expected: "no slow external call inside a transaction",
+        got: "Effect::LocalFile inside a transaction",
+    };
+    for mode in [TransactionMode::Write, TransactionMode::ReadSnapshot] {
+        let mut procedure = script(vec![read_a(), hash()]);
+        procedure.mode = mode;
+        let mut operation = CallRun::new(procedure);
+        operation.start();
+        operation.step(started());
+        let values = vec![(key("a"), None)];
+        let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+        let abort = storage(StorageEffect::AbortTransaction { txn_id: txn() });
+        assert_eq!(effects.as_slice(), &[abort], "{mode:?}");
+        assert_eq!(operation.finalize(), Err(refused.clone()), "{mode:?}");
+    }
+    // Without a transaction the file call runs.
+    let mut operation = run(script(vec![hash()]), false);
+    assert!(matches!(
+        operation.start().as_slice(),
+        [Effect::LocalFile(_)]
+    ));
+}
+
+#[test]
+fn snapshot_keeps_blobs() {
+    // A read snapshot still runs blob and staging-source calls, which stream the rows they name.
+    let list = || BlobEffect::ListHidden {
+        namespace: None,
+        cursor: None,
+    };
+    let mut procedure = script(vec![read_a(), IoCall::blob(list())]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[Effect::blob(list())]);
+
+    let health = crate::effects::StagingSourceEffect::Health {
+        accesses: Vec::new(),
+    };
+    let mut procedure = script(vec![read_a(), IoCall::staging(health.clone())]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[Effect::staging(health.clone())]);
+
+    // A write transaction still refuses staging-source calls and grouped local-file calls.
+    let mut operation = run(script(vec![read_a(), IoCall::staging(health)]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let abort = || storage(StorageEffect::AbortTransaction { txn_id: txn() });
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "Effect::StagingSource inside a write transaction",
+        })
+    );
+
+    let file = Effect::LocalFile(crate::effects::LocalFileEffect::Hash {
+        root: "/sync".to_string(),
+        relative: "a.txt".to_string(),
+    });
+    let grouped = IoCall::Group(crate::effects::EffectGroup {
+        members: vec![file],
+        limit: 1,
+        form: crate::effects::GroupForm::All { deadline: None },
+    });
+    let mut operation = run(script(vec![read_a(), grouped]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "Effect::LocalFile inside a transaction",
+        })
+    );
 }
 
 #[test]
@@ -560,6 +717,7 @@ fn conflict_marks_retry() {
         error: StorageError::TransactionConflict,
     };
     assert!(operation.step(Event::Storage(conflict)).is_empty());
+    assert!(operation.lost_conflict(), "runner records storage conflict");
     assert!(operation.operation.rolled_back, "a refused commit is told");
     let Err(error) = operation.finalize() else {
         panic!("a lost commit fails");
@@ -702,7 +860,7 @@ fn adds_counters_inside() {
 #[test]
 fn abort_sends_cleanup() {
     let id = ulid::Ulid::from(5u128);
-    let release = || Effect::Blob(BlobEffect::ReleaseReservation { id });
+    let release = || Effect::blob(BlobEffect::ReleaseReservation { id });
     let mut procedure = script(vec![read_a()]);
     procedure.cleanup = vec![IoCall::Effect(Box::new(release()))];
     let mut operation = run(procedure, true);

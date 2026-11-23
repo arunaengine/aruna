@@ -724,12 +724,18 @@ fn fetch_range(handle: BlobHandle, location: BackendLocation, range: Range<u64>)
         let event = handle
             .send_blob_effect(BlobEffect::ReadHiddenRange { location, range })
             .await;
-        let Event::Blob(BlobEvent::HiddenRead { mut blob, .. }) = event else {
-            return match event {
-                Event::Blob(BlobEvent::Error(error)) => Err(io::Error::other(error.to_string())),
+        let Event::Blob(event) = event else {
+            return Err(io::Error::other(format!(
+                "unexpected hidden range event: {}",
+                event.label()
+            )));
+        };
+        let BlobEvent::HiddenRead { mut blob, .. } = *event else {
+            return match *event {
+                BlobEvent::Error(error) => Err(io::Error::other(error.to_string())),
                 other => Err(io::Error::other(format!(
                     "unexpected hidden range event: {}",
-                    other.label()
+                    Event::blob(other).label()
                 ))),
             };
         };

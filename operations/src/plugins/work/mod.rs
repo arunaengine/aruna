@@ -373,7 +373,7 @@ impl Operation for PruneKeepingWork {
             }
             KeepPhase::Holds(job_id) => {
                 let holds = result.child::<bool, StoreError>()?;
-                if holds.map_err(|error| PruneError(error.0))? {
+                if holds.map_err(|error| PruneError(error.detail()))? {
                     self.kept.insert(job_id);
                 }
                 self.check_next()
@@ -509,7 +509,7 @@ impl Operation for UpdateWork {
         let change = self
             .change
             .take()
-            .ok_or_else(|| StoreError("changed twice".into()))?;
+            .ok_or_else(|| StoreError::Message("changed twice".into()))?;
         change.apply(&mut row);
         let write = vec![row_of(key, &row)?];
         self.written = Some(Box::new(row));
@@ -654,7 +654,7 @@ impl Operation for PruneWork {
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {
             PrunePhase::Scanning(scan) => Ok(Next::Call(scan.ask())),
-            _ => Err(StoreError("prune started twice".into())),
+            _ => Err(StoreError::Message("prune started twice".into())),
         }
     }
 
@@ -747,7 +747,7 @@ impl Operation for ListWork {
         let page = self
             .page
             .take()
-            .ok_or_else(|| StoreError("listed twice".into()))?;
+            .ok_or_else(|| StoreError::Message("listed twice".into()))?;
         Ok(Next::Call(page))
     }
 

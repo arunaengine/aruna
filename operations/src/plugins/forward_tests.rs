@@ -715,7 +715,7 @@ mod outbox_pass {
         let mut send = pass(OutboxRoute::Remote);
         send.backoff.failed(node(2), 50);
         send.first().unwrap();
-        let failed = StoreError("no".to_string());
+        let failed = StoreError::Message("no".to_string());
         let answer = child_result(Err::<BTreeMap<NodeId, Requests>, _>(failed.clone()));
         let over = done(send.next(answer));
         assert_eq!(over.failure, Some(failed));

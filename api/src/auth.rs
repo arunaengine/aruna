@@ -513,10 +513,9 @@ pub async fn auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // Extract and validate token, get Option<AuthContext>
-    // We clone headers to avoid borrowing issues with the async function
-    let headers = request.headers().clone();
-    let (auth_ctx, bearer_token) = time_stage("auth", extract_auth_parts(&state, &headers)).await;
+    // Extract and validate token, getting Option<AuthContext>.
+    let (auth_ctx, bearer_token) =
+        time_stage("auth", extract_auth_parts(&state, request.headers())).await;
     record_auth_context(auth_ctx.as_ref());
 
     // Always insert (Some or None) - handlers decide if auth is required

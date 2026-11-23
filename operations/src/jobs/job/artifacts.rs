@@ -244,15 +244,15 @@ impl Operation for ArtifactRangeOperation {
             location: self.artifact.location.clone(),
             range: self.range.clone(),
         };
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(read)))))
+        Ok(Next::Call(IoCall::blob(read)))
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<ArtifactRead>, JobReadError> {
-        match result.event()? {
-            Event::Blob(BlobEvent::HiddenRead { blob, stream_size }) => {
+        match result.blob()? {
+            BlobEvent::HiddenRead { blob, stream_size } => {
                 Ok(Next::Done(ArtifactRead { blob, stream_size }))
             }
-            Event::Blob(BlobEvent::Error(error)) => Err(JobReadError(error.to_string())),
+            BlobEvent::Error(error) => Err(JobReadError(error.to_string())),
             event => Err(JobReadError(format!(
                 "unexpected hidden artifact read event: {}",
                 event.label()

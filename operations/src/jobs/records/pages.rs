@@ -28,11 +28,11 @@ use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::realm::peer_trust::is_sync_eligible;
 use aruna_core::metadata::protocol::{
     MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
 
 /// Upper bound of one page request; the transport's own step limits end it earlier.
 const FETCH_DEADLINE: Duration = Duration::from_secs(60);

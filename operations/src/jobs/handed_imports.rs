@@ -15,8 +15,8 @@ use super::records::pages::ServingNode;
 use super::store::mutation_error::JobMutationError;
 use super::store::store_call::RowBatch;
 use super::submit::local::HandedJobOperation;
-use crate::distribution::imports::{Kept, KeptStart};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_ops_data::distribution::imports::{Kept, KeptStart};
 
 /// Handed over imports could not start, or their row could not follow.
 #[derive(Debug, Error, PartialEq)]

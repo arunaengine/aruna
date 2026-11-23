@@ -402,7 +402,7 @@ impl Operation for ExpiredRuns {
     fn first(&mut self) -> Result<Next<Self::Output>, RunError> {
         match &self.phase {
             ExpiredPhase::Runs(scan) => Ok(Next::Call(scan.ask())),
-            _ => Err(StoreError("prune started twice".into()).into()),
+            _ => Err(StoreError::Message("prune started twice".into()).into()),
         }
     }
 
@@ -538,7 +538,7 @@ pub(crate) fn held_runs(rows: Rows) -> Result<Vec<Ulid>, StoreError> {
 pub fn audit_rows(audit: &AdminAuditRecord) -> Result<Vec<Row>, StoreError> {
     audit
         .entries()
-        .map_err(|error| StoreError(error.to_string()))
+        .map_err(|error| StoreError::Message(error.to_string()))
 }
 
 /// How often the worker looks for due runs.
@@ -717,7 +717,7 @@ impl Operation for EnqueueTimer {
                 // Occurrences count from the last activation, so a pause is never replayed.
                 let base =
                     (row.last_due_ms).max(self.install.active_since_ms.unwrap_or(self.now_ms));
-                if self.now_ms < base.saturating_add(self.interval_ms) {
+                if self.interval_ms == 0 || self.now_ms < base.saturating_add(self.interval_ms) {
                     return Ok(Next::Done(false));
                 }
                 let occurrence = base + (self.now_ms - base) / self.interval_ms * self.interval_ms;

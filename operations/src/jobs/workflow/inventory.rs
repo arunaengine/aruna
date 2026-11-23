@@ -13,10 +13,10 @@ use aruna_core::types::GroupId;
 use ulid::Ulid;
 
 use super::workspace::{insert_output, reserved_version};
-use crate::s3::object::head::{
+use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::s3::object::list::{
+use aruna_ops_data::s3::object::list::{
     ListBucketError, ListBucketInput, ListBucketOperation, ListBucketResult, ListContinuationToken,
 };
 

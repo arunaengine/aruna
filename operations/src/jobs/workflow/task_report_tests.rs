@@ -48,7 +48,7 @@ fn small_report_collected() {
     let collect = keep.next(opened(6));
     assert!(matches!(collect, Ok(Next::Call(IoCall::Effect(_)))));
     let bytes = Ok(b"mapped".to_vec());
-    let collected = Event::Blob(BlobEvent::StreamCollected { bytes });
+    let collected = Event::blob(BlobEvent::StreamCollected { bytes });
     let next = keep.next(IoResult::Event(Box::new(collected)));
     assert_eq!(next, Ok(stored(Some("mapped"))));
     assert_eq!(keep.next(kept(Ok(()))), Ok(Next::Done(())));

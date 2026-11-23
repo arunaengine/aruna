@@ -13,11 +13,11 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::GroupId;
 use ulid::Ulid;
 
-use crate::realm::mutate_placement::node_kind;
 use aruna_core::placement::resolver::{
     PlacementResolutionContext, meta_bucket_subject, strategy_for_target,
 };
 use aruna_core::placement::try_resolve_holders;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 /// The first eligible holder of the group's root metadata bucket, in holder order. A plugin
 /// with tasks passes the nodes that advertise an executor: then an eligible holder with one

@@ -11,5 +11,16 @@ runs:
     - name: Remove unused SDKs
       shell: bash
       run: |
-        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+        set -euo pipefail
+        # 55 GiB in KiB; runners with that much free space skip the slow deletes.
+        avail_kb="$(df --output=avail / | tail -n 1 | tr -d ' ')"
+        if [ "$avail_kb" -ge 57671680 ]; then
+          echo "enough free disk space, nothing removed"
+          df -h / /mnt
+          exit 0
+        fi
+        for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL; do
+          sudo rm -rf "$dir" &
+        done
+        wait
         df -h / /mnt

@@ -305,7 +305,7 @@ async fn place(context: &TestContext, name: &str, bytes: &[u8]) {
     let blob_handle = context.driver.blob_handle.as_ref().unwrap();
     let event = blob_handle.send_blob_effect(effect).await;
     assert!(
-        matches!(event, Event::Blob(BlobEvent::PlainWritten { .. })),
+        matches!(event.as_blob(), Some(BlobEvent::PlainWritten { .. })),
         "{event:?}"
     );
 }
@@ -607,9 +607,13 @@ async fn exists(context: &TestContext, name: &str) -> bool {
         path: format!("{}/raw/{name}", context.folder),
     };
     let blob = context.driver.blob_handle.as_ref().unwrap();
-    match blob.send_blob_effect(stat).await {
-        Event::Blob(BlobEvent::PlainStat { exists, .. }) => exists,
-        other => panic!("stat failed: {other:?}"),
+    match blob.send_blob_effect(stat).await.into_blob() {
+        Ok(BlobEvent::PlainStat { exists, .. }) => exists,
+        Ok(other) => {
+            let other = Event::blob(other);
+            panic!("stat failed: {other:?}")
+        }
+        Err(other) => panic!("stat failed: {other:?}"),
     }
 }
 
@@ -644,8 +648,8 @@ async fn content(context: &TestContext, key: &str, id: Ulid) -> Vec<u8> {
     };
     let location = BackendLocation::from_bytes(&value).unwrap();
     let blob = context.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) =
-        blob.send_blob_effect(BlobEffect::Read { location }).await
+    let Ok(BlobEvent::ReadFinished { blob, .. }) =
+        (blob.send_blob_effect(BlobEffect::Read { location }).await).into_blob()
     else {
         panic!("read failed")
     };

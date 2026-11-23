@@ -11,12 +11,12 @@ use aruna_core::user::id::UserId;
 
 use super::*;
 use crate::plugins::calls::*;
-use crate::secrets::SecretChange;
 use aruna_core::keyspaces::ADMIN_AUDIT_KEYSPACE;
 use aruna_core::plugin_installs::{InstallState, PluginInstall, SecretBinding};
 use aruna_core::plugins::Refusal;
 use aruna_core::secrets::{Delivery, SecretConsumer, SecretName};
 use aruna_core::structs::identity::admin_audit::AdminAuditRecord;
+use aruna_ops_identity::secrets::SecretChange;
 use aruna_test_support::plugins::Fixture;
 use aruna_test_support::plugins::rows::Txn;
 use aruna_test_support::plugins::{ORIGIN, TOKEN, bound, edit_config, hold_keys, secret};
@@ -141,8 +141,8 @@ async fn refusals_per_step() {
 
 #[tokio::test]
 async fn node_secrets_local() {
-    use crate::secrets::node::{NodeChange, NodeSecretOperation};
     use aruna_drivers::driver::drive;
+    use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
     let fixture = Fixture::keyed().await;
     fixture
         .ctx
@@ -209,7 +209,7 @@ async fn change_secret(
     change: SecretChange,
     seed: u128,
 ) {
-    use crate::secrets::owner::{OwnerChange, OwnerSecretOperation};
+    use aruna_ops_identity::secrets::owner::{OwnerChange, OwnerSecretOperation};
     let input = OwnerChange {
         realm_id: fixture.actor.realm_id,
         node_id: fixture.actor.node_id,

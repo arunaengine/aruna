@@ -31,36 +31,35 @@ They start an operation in the same way as an HTTP request does.
 
 | Layer | Crate | Owns |
 | --- | --- | --- |
-| Inputs | `api` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI |
-| Inputs | `aruna` | the node binary: settings, wiring, startup, shutdown |
-| Inputs | `aruna-doctor`, `cli` | operator tool on a stopped node; user client |
-| Operations | `operations` | use-case state machines by domain |
+| Inputs | `api`, `wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
+| Inputs | `aruna`, `config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
+| Inputs | `aruna-doctor`, `cli`, `registry` | operator tool on a stopped node; user client; standalone identifier registry |
+| Operations | `ops-identity`, `ops-data`, `operations` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-operations` facade + triggers) |
 | Drivers | `drivers` (`aruna-drivers`) | the drive loop, effect routing to the backends and the job runtime |
-| Backends | `storage`, `net`, `blob`, `tasks`, `compute`, `plugins` | Fjall, Iroh and document sync, blob backends, timers, executors, the WASM host |
-| Foundations | `core`, `kpabe` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers |
+| Backends | `storage`, `net`, `blob`, `graph`, `tasks`, `compute`, `outbound`, `plugins` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host |
+| Foundations | `core`, `kpabe`, `plugin-types` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers, plugin manifests/recipes |
 | Foundations | `clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
 | Tests | `test-support` (`aruna-test-support`) | test helpers that drive operations through the drivers; only dev-dependencies use it |
 
-Today `operations` also holds async services: handles, workers, queue drains,
-the timer map in `operations/src/tasks/incoming/mod.rs`, the peer message map in
-`operations/src/sync/incoming.rs` and the plugin broker. They are the part being
-migrated. Each is converted into operations that the drivers run, domain by
-domain. Do not add new async services there.
+`operations` holds only synchronous sans-IO state machines and the trigger tables
+(`operations/src/triggers.rs`). The small number of remaining unconverted timer
+and peer arms live in the `aruna` trigger shells (`aruna/src/tasks/incoming/mod.rs`
+and `aruna/src/inbound.rs`) and are tracked by `scripts/dev/layers_baseline.json`.
+Do not add new async services to `operations`.
 
 ## Call flows
 
 - **External request.** The `api` handler checks the input and builds the
-  operation. `aruna_drivers::driver::drive` calls `start`, sends each effect
-  to its backend, calls `step` with the answering event and ends with
-  `finalize`. The handler maps the result to a response.
-- **Timer.** `tasks` fires a timer key. Today the timer map in
-  `operations/src/tasks/incoming/mod.rs` runs the work. In the target the
-  trigger table in `operations` names the operation and the drivers run it; a
-  queue drain handles one page per run and schedules the next timer as an
-  effect.
-- **Peer message.** `net` receives a request or a document update. Today the
-  map in `operations/src/sync/incoming.rs` handles it. In the target the
-  trigger table names the operation and the answer goes back as a net effect.
+  operation. `aruna_drivers::driver::drive` wraps it in `CallRun`, calls `first`,
+  sends each effect to its backend, calls `next` with the answering result, and
+  returns the output or error. The handler maps the result to a response.
+- **Timer.** `tasks` fires a timer key. The shell in
+  `aruna/src/tasks/incoming/mod.rs` looks up `timer_operation` in
+  `operations/src/triggers.rs` and drives it; a queue drain handles one page per
+  run and returns its next schedule plan.
+- **Peer message.** `net` receives a request or a document update. The shell in
+  `aruna/src/inbound.rs` looks up `peer_operation` in
+  `operations/src/triggers.rs`, drives it, and writes the answer back on the stream.
 - **Sub-operation.** An operation emits a sub-operation effect, the drivers run
   the child operation and return its result as an event.
 - **Startup.** `aruna` builds the backends and the drivers, then runs the
@@ -125,13 +124,13 @@ the same change.
 1. Define the input, output, error and a private state enum in
    `operations/src/<area>/<verb>.rs`. Keep `Output` one domain value; failure
    belongs in the error type.
-2. Implement `Operation` (`core/src/operation.rs`): `start`, `step`,
-   `is_complete`, `finalize`, `abort`, and `expected_error` for ordinary client
-   outcomes such as not found. `step` rejects an event that does not fit the
-   current state.
-3. Test it with state and event combinations and no runtime: the success path,
-   every error event, events that do not fit, `abort` in every phase, early
-   `finalize`, and the exact effects of each step.
+2. Implement `Operation` (`core/src/operation.rs`): `first`, `next`, and as
+   needed `transaction`, `hold_scope`, `abort`, `stamp`, `seed`, `on_conflict`,
+   and `expected_error` for ordinary client outcomes such as not found. `next`
+   rejects any result that does not fit the current state.
+3. Test it with state and result combinations and no runtime: the success path,
+   every error result, unexpected results, `abort` in every phase, and the exact
+   calls of each step.
 4. Call it from inputs with `drive`; never build raw storage effects in a
    transport when a named operation exists.
 
@@ -151,10 +150,10 @@ the same change.
 
 1. Add the `TaskKey` variant in `core/src/task.rs`; stored keys keep their
    bytes, so new variants are appended.
-2. Today the work is wired in the timer map in
-   `operations/src/tasks/incoming/mod.rs`. Write the work itself as an
-   operation that handles one page and schedules the next run as an effect, so
-   the arm only starts it.
+2. Wire the timer operation in `operations/src/triggers.rs` (`timer_operation`)
+   so `aruna/src/tasks/incoming/mod.rs` drives it without adding a new trigger
+   arm. Write the work itself as an operation that handles one page and returns
+   its `TimerPlan`.
 3. Production startup starts queues in `aruna/src/startup/background.rs`
    (`STARTUP_PHASES`).
 4. Test the due and not-due decision with explicit times.
@@ -202,7 +201,7 @@ the same change.
   `operations/tests` and `aruna/tests`. Tests wait on progress with a hang cap
   and assert no speed.
 - Speed is measured on request with
-  `cargo run --release -p aruna-operations --example measure`, which prints
+  `cargo run --release -p aruna --example measure`, which prints
   rates for fixed workloads on real backends in temporary folders. Peak memory
   is read with `/usr/bin/time -v` around the built binary.
 - `core/tests/type_sizes.rs` fixes upper limits for the sizes of `Effect`,

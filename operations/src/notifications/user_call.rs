@@ -18,7 +18,6 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::client::{
     HolderRequestOperation, RemoteError, listed, marked_read, unread_counted, watch_created,
     watch_deleted, watches_listed,
@@ -36,6 +35,7 @@ use crate::notifications::watch::records::{
     WatchSubscriptionError, watch_delete_replication,
 };
 use crate::notifications::watch::store::{CreateWatchOperation, StoreWatchOperation};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Watch CRUD dispatch outcome. Distinguishes the per-user cap so the REST layer
 /// can answer 409, and an unauthorized watched path so it can answer 403, instead
@@ -327,7 +327,7 @@ impl UserCallOperation {
             watch_id: subscription.watch_id,
             realm_id: self.user.realm_id,
             holder,
-            entry,
+            entry: Box::new(entry),
         };
         let mut calls = Vec::new();
         if publish {

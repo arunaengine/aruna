@@ -24,10 +24,10 @@ use tracing::warn;
 
 use crate::notifications::setting_rows::{ReadSettingOperation, SettingError};
 use crate::notifications::unexpected_event;
-use crate::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
 use aruna_core::metadata::protocol::{
     MetadataReadError, MetadataTransportMessage, decode_message, encode_message, metadata_request,
 };
+use aruna_ops_identity::realm_vault::{SecretAnswer, ServeRequest, ServeSecretOperation};
 
 /// The first delay after no management node opened a secret; it doubles up to `BACKOFF_CAP_MS`.
 pub const BACKOFF_START_MS: u64 = 30_000;

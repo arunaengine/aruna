@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use parking_lot::RwLock;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::encoding::text::encode;
@@ -13,6 +12,7 @@ use prometheus_client::metrics::gauge::Gauge;
 use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::metrics::info::Info;
 use prometheus_client::registry::{Metric, Registry, Unit};
+use std::sync::{PoisonError, RwLock};
 
 /// Exponential request-duration buckets in seconds, spanning ~1 ms to 60 s.
 const DURATION_BUCKETS_SECONDS: [f64; 15] = [
@@ -200,6 +200,7 @@ impl NodeMetrics {
     pub fn register(&self, name: &str, help: &str, metric: impl Metric) {
         self.registry
             .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .register(name.to_string(), help.to_string(), metric);
     }
 
@@ -207,6 +208,7 @@ impl NodeMetrics {
     pub fn register_with_unit(&self, name: &str, help: &str, unit: Unit, metric: impl Metric) {
         self.registry
             .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .register_with_unit(name.to_string(), help.to_string(), unit, metric);
     }
 
@@ -215,12 +217,13 @@ impl NodeMetrics {
     pub fn register_collector(&self, collector: impl Collector) {
         self.registry
             .write()
+            .unwrap_or_else(PoisonError::into_inner)
             .register_collector(Box::new(collector));
     }
 
     /// Encodes the registry as Prometheus text.
     pub fn render(&self) -> String {
-        let registry = self.registry.read();
+        let registry = self.registry.read().unwrap_or_else(PoisonError::into_inner);
         let mut buffer = String::new();
         encode(&mut buffer, &registry)
             .expect("encoding prometheus metrics into a String is infallible");

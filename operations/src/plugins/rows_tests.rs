@@ -90,7 +90,7 @@ fn modes_and_conflicts() {
     assert_eq!(sync_all().first().unwrap(), Next::Call(IoCall::Sync));
     let conflict = StoreError::from(IoError::Conflict);
     assert!(<Writes as Operation>::is_conflict(&conflict));
-    assert!(!<Writes as Operation>::is_conflict(&StoreError(
+    assert!(!<Writes as Operation>::is_conflict(&StoreError::Message(
         "other".into()
     )));
 }

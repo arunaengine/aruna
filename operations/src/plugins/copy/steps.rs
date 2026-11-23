@@ -21,11 +21,11 @@ use super::super::check::{CallError, CopyGrants};
 use super::super::objects::{LocalObject, Unmarked};
 use super::super::transfer_steps::account;
 use crate::jobs::key_locks::{KeyCheckError, VersionWaitOperation};
-use crate::s3::object::get::GetObjectError;
-use crate::s3::object::head::{
+use aruna_ops_data::s3::object::get::GetObjectError;
+use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::transfer::copy::{
+use aruna_ops_data::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyReferences, CopySourceConditions,
 };
 

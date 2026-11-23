@@ -1,0 +1,17 @@
+//! Declares the routed metadata read and write modules.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod authorized_create;
+pub mod holder_reads;
+pub mod holders;
+pub mod pinned;
+pub mod profile_export;
+pub mod read;
+pub mod replay;
+pub mod route_create;
+pub mod routed;
+pub mod write;
+
+#[cfg(test)]
+mod tests;

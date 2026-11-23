@@ -8,11 +8,11 @@ use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::types::Effects;
 
-// Measured on 1feeab85c with the workspace toolchain. A change may lower a limit;
-// raising one needs the owner's approval.
-const EFFECT_LIMIT: usize = 416;
-const EVENT_LIMIT: usize = 384;
-const EFFECTS_LIMIT: usize = 1696;
+// Tightened after boxing large Blob/StagingSource and metadata outlier variants
+// and shrinking Effects inline capacity from 4 to 2. Raising a limit needs approval.
+const EFFECT_LIMIT: usize = 160;
+const EVENT_LIMIT: usize = 160;
+const EFFECTS_LIMIT: usize = 352;
 
 #[test]
 fn sizes_stay_bounded() {

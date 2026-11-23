@@ -6,19 +6,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aruna_core::structs::synced_folder::{FolderState, SyncedFolder};
+use aruna_core::structs::synced_folder::SyncedFolder;
 use aruna_core::task::{TaskEvent, TaskKey};
 use aruna_tasks::TaskHandle;
 use tracing::warn;
 
 use aruna_drivers::driver::{DriverContext, drive};
 use aruna_operations::device::publish_queue::DrainOutcome;
-use aruna_operations::device::sync::folders::bind::finish_binding;
-use aruna_operations::device::sync::folders::reads::list_folders;
-use aruna_operations::device::sync::folders::unbind::finish_unbind;
 use aruna_operations::device::sync::reconcile::ReconcilePlan;
 use aruna_operations::device::sync::{ReconcileFolderError, folder_pass, sync_timers};
 use aruna_operations::metadata::device::drain::publish_pending;
+use aruna_operations::node::folder_timer::ReconcileFoldersOperation;
 
 /// Reconciles one folder under its pass scope.
 pub async fn reconcile_folder(
@@ -34,43 +32,12 @@ pub async fn reconcile_folder(
 
 /// Reconciles every active folder once, and finishes interrupted binds and unbinds.
 pub async fn reconcile_folders(context: &Arc<DriverContext>) -> DrainOutcome {
-    let Some(node_id) = context.net_handle.as_ref().map(|net| net.node_id()) else {
-        return DrainOutcome::Deferred;
-    };
-    let Ok(folders) = drive(list_folders(), context).await else {
-        return DrainOutcome::Deferred;
-    };
-    let mut work = false;
-    for folder in folders {
-        let folder_id = folder.folder_id;
-        match folder.state {
-            // An unbind finishes here, also after a cancelled call or a restart.
-            FolderState::Deleting => {
-                let unbind = finish_unbind(context.node_and_realm(), folder_id, node_id);
-                if let Err(error) = drive(unbind, context).await {
-                    warn!(folder = %folder_id, reason = %error, "Could not finish the unbind");
-                }
-            }
-            // A bind cut short by a lost reply, a failed write or a restart finishes here.
-            FolderState::Binding { .. } => match drive(finish_binding(folder_id), context).await {
-                Ok(_) => work = true,
-                Err(error) => {
-                    warn!(folder = %folder_id, reason = %error, "Could not finish the folder binding");
-                }
-            },
-            FolderState::Active => match reconcile_folder(context, &folder).await {
-                Ok(plan) => work |= plan.uploads > 0 || plan.truncated,
-                Err(error) => {
-                    warn!(folder = %folder_id, reason = %error, "Could not reconcile the folder");
-                }
-            },
-            _ => {}
-        }
-    }
-    match work {
-        true => DrainOutcome::Recheck,
-        false => DrainOutcome::Idle,
-    }
+    drive(
+        ReconcileFoldersOperation::new(context.node_and_realm()),
+        context,
+    )
+    .await
+    .unwrap_or(DrainOutcome::Deferred)
 }
 
 /// Arms the device timers a starting node needs; a realm node with no folders schedules nothing.

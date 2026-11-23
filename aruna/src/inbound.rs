@@ -581,14 +581,11 @@ async fn handle_bao_stream(
     let realm_id = *net_handle.realm_id();
     let local_node = net_handle.node_id();
     // Only an authenticated sync-eligible realm peer may open the blob replication plane.
-    if bao_admission(context, realm_id, local_node, node_id)
-        .await
-        .is_none()
-    {
+    let Some(admission) = bao_admission(context, realm_id, local_node, node_id).await else {
         warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
         refuse_stream(stream);
         return;
-    }
+    };
     let stream_id = match blob_handle
         .accept_stream(node_id, stream, INBOUND_BAO_TIMEOUT)
         .await
@@ -602,11 +599,6 @@ async fn handle_bao_stream(
             error!(peer = %node_id, error = ?err, "Failed to register inbound bao stream");
             return;
         }
-    };
-    let Some(admission) = bao_admission(context, realm_id, local_node, node_id).await else {
-        warn!(peer = %node_id, "Rejecting bao stream from non-sync-eligible peer");
-        blob_handle.close_stream(stream_id).await;
-        return;
     };
     let payload = match blob_handle
         .first_frame(stream_id, INBOUND_BAO_TIMEOUT)
@@ -721,12 +713,8 @@ fn schedule_sync_maintenance(
     coalescer: Weak<DocumentReconcileCoalescer>,
     shutdown: &Shutdown,
 ) {
-    let jitter = Duration::from_secs(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|now| now.subsec_nanos() as u64 % MAINTENANCE_JITTER_SECS)
-            .unwrap_or(0),
-    );
+    let jitter =
+        Duration::from_secs(aruna_clock::unix_timestamp_millis() % MAINTENANCE_JITTER_SECS);
     // This loop writes the metadata store, so it has to stop before the
     // shutdown flushes it.
     let cancelled = shutdown.token();

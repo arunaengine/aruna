@@ -160,10 +160,10 @@ async fn refusals_start_nothing() {
 
 /// Writes the node secret `hook-key` of kind `header` on this node, checking `checked`.
 async fn node_secret(fixture: &Fixture, checked: &str, round: u64) {
-    use crate::secrets::SecretChange;
-    use crate::secrets::node::{NodeChange, NodeSecretOperation};
     use aruna_core::compute::Secret;
     use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretSettings};
+    use aruna_ops_identity::secrets::SecretChange;
+    use aruna_ops_identity::secrets::node::{NodeChange, NodeSecretOperation};
     let name = SecretName::try_from("hook-key".to_string()).unwrap();
     let settings = SecretSettings::from([("header".to_string(), checked.to_string())]);
     let change = match round {

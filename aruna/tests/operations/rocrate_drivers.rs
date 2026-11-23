@@ -1723,11 +1723,11 @@ async fn upload_media(
         .blob_handle
         .as_ref()
         .ok_or("blob handle is missing")?;
-    let Event::Blob(aruna_core::events::BlobEvent::HiddenSpooled {
+    let Ok(aruna_core::events::BlobEvent::HiddenSpooled {
         location,
         blake3,
         size: stored_size,
-    }) = handle
+    }) = (handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace: upload_id,
             name: "input".to_string(),
@@ -1736,7 +1736,8 @@ async fn upload_media(
             deadline: None,
             blob,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         return Err("RO-Crate fixture spool failed".into());
     };
@@ -1927,18 +1928,21 @@ async fn hidden_count(
         .blob_handle
         .as_ref()
         .ok_or("blob handle is missing")?;
-    match handle
+    match (handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
             cursor: None,
         })
-        .await
+        .await)
+        .into_blob()
     {
-        Event::Blob(aruna_core::events::BlobEvent::HiddenListed { entries, .. }) => {
-            Ok(entries.len())
+        Ok(aruna_core::events::BlobEvent::HiddenListed { entries, .. }) => Ok(entries.len()),
+        Ok(aruna_core::events::BlobEvent::Error(error)) => Err(error.to_string().into()),
+        Ok(other) => {
+            let other = Event::blob(other);
+            Err(format!("unexpected hidden list event: {other:?}").into())
         }
-        Event::Blob(aruna_core::events::BlobEvent::Error(error)) => Err(error.to_string().into()),
-        other => Err(format!("unexpected hidden list event: {other:?}").into()),
+        Err(other) => Err(format!("unexpected hidden list event: {other:?}").into()),
     }
 }
 

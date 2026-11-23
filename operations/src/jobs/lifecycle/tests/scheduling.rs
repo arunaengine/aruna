@@ -9,8 +9,8 @@ use std::collections::BTreeSet;
 use crate::jobs::lifecycle::stage::stage_error;
 use crate::jobs::lifecycle::witness::arm::witness_rank;
 use crate::jobs::lifecycle::witness::round::suppressed;
-use crate::replication::bao_read::BaoReadError;
 use crate::tests::records::{Family, node};
+use aruna_ops_data::replication::bao_read::BaoReadError;
 
 #[test]
 fn ranks_witnesses() {

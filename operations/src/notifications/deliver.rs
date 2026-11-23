@@ -90,9 +90,8 @@ impl DeliverBatchOperation {
             return reject(reason);
         }
         self.state = DeliverState::Upsert(Box::new(config));
-        Ok(Next::Call(IoCall::child(UpsertInboxOperation::new(
-            records,
-        ))))
+        let build = move || UpsertInboxOperation::new(records.clone());
+        Ok(Next::Call(IoCall::retry_with(build, b"notification-inbox")))
     }
 
     fn enqueue(

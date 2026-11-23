@@ -16,7 +16,7 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::sync::outbox::record::new_identified_record;
+use aruna_ops_identity::sync::outbox::record::new_identified_record;
 
 /// Stable reject reason for a cap-exceeded create; matched verbatim by the
 /// holder proxy to surface a 409 to the API layer.

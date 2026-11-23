@@ -19,11 +19,11 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use irokle::TopicId;
 use tracing::{error, info, warn};
 
-use crate::forward::realm::RelayAdminOperation;
-use crate::forward::transport::ForwardError;
-use crate::realm::peer_trust::is_sync_eligible;
-use crate::sync::document_outbox::DeleteOutboxPlan;
-use crate::sync::outbox::defer::DrainRecord;
+use aruna_ops_identity::forward::realm::RelayAdminOperation;
+use aruna_ops_identity::forward::transport::ForwardError;
+use aruna_ops_identity::realm::peer_trust::is_sync_eligible;
+use aruna_ops_identity::sync::document_outbox::DeleteOutboxPlan;
+use aruna_ops_identity::sync::outbox::defer::DrainRecord;
 
 /// Which records left this node's custody and how many stay undeliverable in the outbox, and
 /// whether a relay or its cleanup failed, so the drain runs again. A relay that did not go out
@@ -310,7 +310,7 @@ mod tests {
     use aruna_core::user::id::UserId;
     use ulid::Ulid;
 
-    use crate::sync::outbox::record::new_identified_record;
+    use aruna_ops_identity::sync::outbox::record::new_identified_record;
 
     fn node() -> NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()

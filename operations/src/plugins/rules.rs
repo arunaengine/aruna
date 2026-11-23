@@ -22,11 +22,11 @@ use ulid::Ulid;
 
 use super::entry::{EntryError, ReadEntry};
 use super::grants::InstallScope;
-use crate::auth::install_access::covers;
-use crate::auth::install_access::parse_grants;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::secrets::SecretChange;
-use crate::secrets::owner::{OwnerChange, OwnerSecretError, OwnerSecretOperation};
+use aruna_ops_identity::auth::install_access::covers;
+use aruna_ops_identity::auth::install_access::parse_grants;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::secrets::SecretChange;
+use aruna_ops_identity::secrets::owner::{OwnerChange, OwnerSecretError, OwnerSecretOperation};
 
 /// Which install state a rule edit may still write for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

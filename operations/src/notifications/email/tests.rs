@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::node_vault::{parse_secret, read_secret, write_secret};
 use crate::notifications::enqueue::EnqueueDeliveriesOperation;
 use crate::notifications::opt_in::{EmailOptIn, SetEmailOperation};
 use crate::notifications::setting_rows::SettingError;
@@ -30,6 +29,7 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_ops_identity::node_vault::{parse_secret, read_secret, write_secret};
 use aruna_outbound::OutboundHandle;
 use aruna_outbound::mail::{MailBuilder, MailSender};
 use aruna_test_support::jobs::find_dedup_plan;

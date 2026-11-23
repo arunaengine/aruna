@@ -70,14 +70,14 @@ impl Operation for KeepReport {
                             blob: body.bytes,
                             limit: Some(MAX_REPORT as u64),
                         };
-                        Ok(Next::Call(Effect::Blob(collect).into()))
+                        Ok(Next::Call(Effect::blob(collect).into()))
                     }
                     _ => self.keep(&[]),
                 },
                 _ => self.keep(&[]),
             },
-            ReportPhase::Collect => match result.event()? {
-                Event::Blob(BlobEvent::StreamCollected { bytes: Ok(bytes) }) => self.keep(&bytes),
+            ReportPhase::Collect => match result.blob()? {
+                BlobEvent::StreamCollected { bytes: Ok(bytes) } => self.keep(&bytes),
                 _ => self.keep(&[]),
             },
             ReportPhase::Keep => {

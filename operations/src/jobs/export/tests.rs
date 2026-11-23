@@ -23,7 +23,6 @@ use aruna_core::archive_path::synthesized_path;
 use aruna_core::blob_paths::MAX_HASH_ALIASES;
 use aruna_core::effects::BlobEffect;
 use aruna_core::events::BlobEvent;
-use aruna_core::events::Event;
 use aruna_core::stream::BackendStream;
 use aruna_core::stream::StreamError;
 use aruna_core::structs::storage::blob::BackendLocation;
@@ -261,11 +260,11 @@ async fn fixture_archive(jsonld: &str, eln: bool) -> Vec<u8> {
 async fn spool_fixture(handle: &BlobHandle, bytes: Vec<u8>, seed: u8) -> (BackendLocation, u64) {
     let expected_size = bytes.len() as u64;
     let expected_hash = *blake3::hash(&bytes).as_bytes();
-    let Event::Blob(BlobEvent::HiddenSpooled {
+    let Ok(BlobEvent::HiddenSpooled {
         location,
         blake3,
         size,
-    }) = handle
+    }) = (handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace: Ulid::from_bytes([seed; 16]),
             name: "fixture".to_string(),
@@ -274,7 +273,8 @@ async fn spool_fixture(handle: &BlobHandle, bytes: Vec<u8>, seed: u8) -> (Backen
             deadline: None,
             blob: fixture_stream(bytes),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("fixture spool failed")
     };

@@ -21,18 +21,18 @@ use super::walk::{
     authority_call, file_access, item_phase, local_ranges, record_failure, rules_call,
 };
 use super::{ItemFailure, PageFailure, StagingRun, pinned};
-use crate::auth::permission_rules::PermissionRules;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::s3::object::reference::{
+use aruna_core::errors::AuthorizationError;
+use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_ops_data::s3::object::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
     MaterializeReferenceResult,
 };
-use crate::staging::snapshot::{
+use aruna_ops_data::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, MaterializeSnapshotResult,
     StageSnapshotOperation,
 };
-use aruna_core::errors::AuthorizationError;
-use aruna_core::live_version::{LiveVersionInput, LiveVersionOperation};
+use aruna_ops_identity::auth::permission_rules::PermissionRules;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// The answer of a child that fails with anything printable, as a system failure.
 fn system<T: 'static, E: ToString + 'static>(result: IoResult) -> Result<T, ItemFailure> {

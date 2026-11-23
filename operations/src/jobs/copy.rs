@@ -18,18 +18,18 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::routing::NodeRouting;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::s3::object::get::GetObjectError;
-use crate::s3::object::head::{
+use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
+use aruna_core::jobs::JobRunOutcome;
+use aruna_ops_data::s3::object::get::GetObjectError;
+use aruna_ops_data::s3::object::head::{
     HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
 };
-use crate::s3::object::put::PutObjectError;
-use crate::transfer::copy::{
+use aruna_ops_data::s3::object::put::PutObjectError;
+use aruna_ops_data::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopyResultData,
     CopySourceConditions,
 };
-use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
-use aruna_core::jobs::JobRunOutcome;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 #[derive(Debug, PartialEq)]
 enum CopyStep {

@@ -162,7 +162,7 @@ fn assembling() -> AssembleOperation {
 }
 
 fn spooled(location: BackendLocation) -> GroupResult {
-    GroupResult::Done(Box::new(Event::Blob(BlobEvent::HiddenSpooled {
+    GroupResult::Done(Box::new(Event::blob(BlobEvent::HiddenSpooled {
         location,
         blake3: [1; 32],
         size: 4,
@@ -170,7 +170,7 @@ fn spooled(location: BackendLocation) -> GroupResult {
 }
 
 fn spool_error(error: BlobError) -> GroupResult {
-    GroupResult::Done(Box::new(Event::Blob(BlobEvent::Error(error))))
+    GroupResult::Done(Box::new(Event::blob(BlobEvent::Error(error))))
 }
 
 // A checkpoint without the rewritten crate cannot be assembled.
@@ -204,7 +204,7 @@ fn failed_write_discards() {
     let failed = Err(ExportFailure::Retryable("broken".to_string()));
     let turn = assemble.finished(spooled(hidden()), failed);
     assert!(matches!(turn, Ok(Next::Call(IoCall::Effect(_)))));
-    let deleted = IoResult::Event(Box::new(Event::Blob(BlobEvent::HiddenDeleted)));
+    let deleted = IoResult::Event(Box::new(Event::blob(BlobEvent::HiddenDeleted)));
     assert_eq!(
         assemble.next(deleted),
         Err(ExportFailure::Retryable("broken".to_string()))

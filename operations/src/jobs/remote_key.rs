@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::Effect;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::events::Event;
@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::jobs::{JobRequest, JobResponse, WaitTarget};
 use aruna_core::keyspaces::S3_BUCKET_KEYSPACE;
 use aruna_core::metadata::AuthToken;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::rows::read_row;
 use aruna_core::structs::execution::job::identity::{JobId, JobState};
 use aruna_core::structs::execution::job::key_wait::KeyWait;
@@ -29,8 +29,6 @@ use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::blob::unlocked::KeyUnlockedOperation;
 use crate::jobs::key_locks::{
     AliasPage, AliasPageOperation, FindAliasOperation, KeyCheckError, MAX_AWAITED,
     VersionWaitOperation,
@@ -42,6 +40,10 @@ use crate::jobs::store::remote_wait::{
     OwedPage, OwedWake, OwedWakesOperation, QueueWakesOperation, WaitRowOperation,
 };
 use crate::jobs::store::row_calls::{read_job_record, read_key_waits, satisfy_key_wait};
+use aruna_ops_data::blob::unlocked::KeyUnlockedOperation;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
 
 fn stored(error: JobMutationError) -> KeyCheckError {
     KeyCheckError(error.to_string())
@@ -474,10 +476,7 @@ impl RemoteWakesOperation {
     fn queue_page(&self) -> Next<()> {
         let key = self.key;
         let build = move || QueueWakesOperation::new(key);
-        let child = boxed_retry(build, &key.key(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Next::Call(IoCall::Child(child))
+        Next::Call(IoCall::retry_with(build, &key.key()))
     }
 }
 

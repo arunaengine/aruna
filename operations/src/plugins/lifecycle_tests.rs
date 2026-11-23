@@ -8,13 +8,13 @@ use crate::plugins::account::{AccountChange, EnsureRole, Teardown};
 use crate::plugins::calls::*;
 use crate::plugins::grants::role_paths;
 use crate::plugins::test_support::{group_role, install_as, install_request};
-use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation};
-use crate::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use aruna_core::structs::identity::admin_audit::AuditIndex;
 use aruna_core::structs::identity::auth::{PathRestriction, Permission as Access};
 use aruna_core::time::unix_timestamp_secs;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::drive;
+use aruna_ops_identity::users::account_status::{AccountStatusConfig, AccountStatusOperation};
+use aruna_ops_identity::users::admin_audit::{AuditPageInput, AuditPageOperation};
 use aruna_test_support::plugins::Fixture;
 use serde_json::json;
 
@@ -421,11 +421,11 @@ mod operations {
     use serde_json::json;
 
     use super::*;
-    use crate::document_repository::GetConfigError;
     use crate::plugins::fixtures::{self, config_result, is_child};
     use crate::plugins::rows::tests::child_result;
-    use crate::users::service_account::check::ServiceCheckError;
     use aruna_core::structs::identity::user::User;
+    use aruna_ops_identity::document_repository::GetConfigError;
+    use aruna_ops_identity::users::service_account::check::ServiceCheckError;
 
     fn open_manifest() -> serde_json::Value {
         json!({ "permissions": { "required": [] } })

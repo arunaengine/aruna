@@ -2,10 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::keyspaces::JOB_STATE_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::repository::link::{LinkStatus, LinkTarget, PushOutcome, RepositoryLink};
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::repository::{RepositoryDestination, RepositoryRecord};
@@ -59,11 +58,7 @@ pub(crate) fn save_checkpoint(
     let writes = vec![(space, key, bytes)];
     let (job_id, token) = (job.job_id, job.claim_token);
     let build = move || PutRowsOperation::new(job_id, token, writes.clone(), Vec::new());
-    Ok(IoCall::Child(boxed_retry(
-        build,
-        &job_id.to_bytes(),
-        |result| Event::Child(ChildOutcome::new(result)),
-    )))
+    Ok(IoCall::retry_with(build, &job_id.to_bytes()))
 }
 
 /// The end of a [`save_checkpoint`] child.

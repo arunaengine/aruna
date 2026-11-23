@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use super::*;
 use crate::plugins::calls::*;
 use crate::plugins::rows::tests::child_result;
-use crate::plugins::rows::tests::{page_result, values_result};
+use crate::plugins::rows::tests::page_result;
 use aruna_core::plugin_runs::EVENTS_QUEUED;
 use aruna_core::plugin_runs::journal_key;
 use aruna_core::structs::identity::realm::RealmNodeKind;
@@ -326,16 +326,8 @@ fn user_pending_dropped() {
     let event = plain_event(5);
     let pending = journal_key(PENDING_ROW, 5, Ulid::from_parts(3, 3));
     let rows = vec![(pending.clone(), event.to_bytes().unwrap())];
-    // A user node keeps no journal: nothing to count, no gap to read.
-    assert_eq!(
-        plan.next(page_result(rows, None)).unwrap(),
-        Next::Call(read_call(Vec::new()))
-    );
-    let Next::Call(IoCall::Write(written)) = plan.next(values_result(Vec::new())).unwrap() else {
-        panic!("the page writes no forward row");
-    };
-    assert!(written.is_empty());
-    let Next::Call(IoCall::Delete(keys)) = plan.next(IoResult::Done).unwrap() else {
+    // A user node keeps no journal: nothing to count, no gap to read and no row to write.
+    let Next::Call(IoCall::Delete(keys)) = plan.next(page_result(rows, None)).unwrap() else {
         panic!("the pending, kept and source rows go");
     };
     assert_eq!(keys.len(), 3);
@@ -368,7 +360,7 @@ fn journal_reads_pages() {
     let last = child_result(Ok::<usize, StoreError>(3));
     assert_eq!(matching.next(last), Ok(Next::Done(JOURNAL_PAGE + 3)));
     let mut failed = MatchJournal::new((Vec::new(), true), 5, 9);
-    let error = StoreError("down".into());
+    let error = StoreError::Message("down".into());
     let refused = failed.next(child_result(Err::<usize, _>(error.clone())));
     assert_eq!(refused, Err(error));
 }

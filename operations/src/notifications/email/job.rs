@@ -13,12 +13,12 @@ use aruna_core::structs::execution::job::local::{JobError, JobResultPayload};
 use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::send::{SendError, SendOperation, job_error};
 use crate::notifications::settings::{
     Delivery, DeliveryOperation, DeliveryOutcome, SettingWinner, managers,
 };
-use crate::realm_vault::{ReadSecretOperation, RealmSecretError};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm_vault::{ReadSecretOperation, RealmSecretError};
 
 #[derive(Clone, Debug, Default, PartialEq)]
 enum EmailState {

@@ -18,7 +18,7 @@ use aruna_plugin_types::permission::{Grant, Permission};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::install_access::{Grants, accesses, covers, patterns_for};
+use aruna_ops_identity::auth::install_access::{Grants, accesses, covers, patterns_for};
 
 pub const READ_ROLE: &str = "plugin-read";
 pub const WRITE_ROLE: &str = "plugin-write";

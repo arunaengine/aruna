@@ -18,7 +18,7 @@ use ulid::Ulid;
 use super::account::{AccountChange, AccountError, RepairAccount, StepError};
 use super::install::{InstallError, config_answer, config_call};
 use super::sweep::SweepOrphans;
-use crate::realm::mutate_placement::is_management;
+use aruna_ops_identity::realm::mutate_placement::is_management;
 
 /// The node a repair runs on.
 pub type RepairNode = (RealmId, NodeId);

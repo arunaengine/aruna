@@ -2,12 +2,14 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope};
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::usage::UsageCounters;
+use aruna_ops_data::s3::realm_usage::{
+    RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq)]

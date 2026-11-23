@@ -6,8 +6,10 @@
 use std::str::FromStr;
 
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
-use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::effects::BlobEffect;
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::id::NodeId;
 use aruna_core::operation::Operation;
 use aruna_core::plugin_installs::PluginInstall;
@@ -23,9 +25,11 @@ use super::host::steps::{Granted, GrantedCall};
 use super::marks::{MARKED, is_marked};
 use super::rows::{StoreError, mapped_child};
 use super::unavailable;
-use crate::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult};
-use crate::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 use aruna_core::bucket_read::GetBucketOperation;
+use aruna_ops_data::s3::object::get::{
+    GetObjectError, GetObjectInput, GetObjectOperation, GetObjectResult,
+};
+use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
 
 /// Whether a head found no such object or version.
 pub fn absent(error: &HeadObjectError) -> bool {
@@ -287,14 +291,14 @@ impl Operation for ReadObject {
                     blob: got.blob,
                     limit: Some(self.max_bytes as u64),
                 };
-                Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(collect)))))
+                Ok(Next::Call(IoCall::blob(collect)))
             }
-            ReadPhase::Collect => match result.event()? {
-                Event::Blob(BlobEvent::StreamCollected { bytes: Ok(bytes) }) => {
+            ReadPhase::Collect => match result.blob()? {
+                BlobEvent::StreamCollected { bytes: Ok(bytes) } => {
                     Ok(Next::Done(ObjectBytes(bytes)))
                 }
-                Event::Blob(BlobEvent::StreamTooLarge { .. }) => Err(self.too_large()),
-                Event::Blob(BlobEvent::StreamCollected { bytes: Err(error) }) => {
+                BlobEvent::StreamTooLarge { .. } => Err(self.too_large()),
+                BlobEvent::StreamCollected { bytes: Err(error) } => {
                     Err(CallError(unavailable(error)))
                 }
                 other => Err(IoError::Unexpected {

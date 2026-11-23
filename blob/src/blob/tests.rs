@@ -759,11 +759,12 @@ async fn committed_part_survives() {
         Event::Storage(StorageEvent::WriteResult { .. })
     ));
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(BlobEffect::ReleaseReservation { id: location.ulid })
-            .await,
-        Event::Blob(BlobEvent::ReservationReleased { .. })
+            .await)
+            .as_blob(),
+        Some(BlobEvent::ReservationReleased { .. })
     ));
 
     let mut stale = location.clone();
@@ -1145,7 +1146,7 @@ fn reports_connect_timeout() {
 async fn reuses_current_bucket() {
     let context = setup_blob_handle(2).await;
 
-    let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
+    let Ok(BlobEvent::WriteFinished { location: first }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -1155,12 +1156,13 @@ async fn reuses_current_bucket() {
             blob: stream_from_bytes(b"one"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("first write failed")
     };
 
-    let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
+    let Ok(BlobEvent::WriteFinished { location: second }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -1170,7 +1172,8 @@ async fn reuses_current_bucket() {
             blob: stream_from_bytes(b"two"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("second write failed")
     };
@@ -1193,7 +1196,7 @@ async fn hidden_bucket_registered() {
     let context = setup_blob_handle(5).await;
 
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(BlobEffect::SpoolHidden {
                 namespace: Ulid::from_bytes([2u8; 16]),
@@ -1203,8 +1206,9 @@ async fn hidden_bucket_registered() {
                 deadline: None,
                 blob: stream_from_bytes(b"x"),
             })
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 0 }))
+            .await)
+            .as_blob(),
+        Some(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 0 }))
     ));
     assert_eq!(
         keyspace_count(&context.storage_handle, BUCKET_STATS_DB).await,
@@ -1223,8 +1227,8 @@ async fn full_bucket_unselectable() {
         blob: stream_from_bytes(b"one"),
         size: None,
     };
-    let Event::Blob(BlobEvent::WriteFinished { location: first }) =
-        context.blob_handle.send_blob_effect(write("one.bin")).await
+    let Ok(BlobEvent::WriteFinished { location: first }) =
+        (context.blob_handle.send_blob_effect(write("one.bin")).await).into_blob()
     else {
         panic!("first write failed")
     };
@@ -1233,8 +1237,8 @@ async fn full_bucket_unselectable() {
         1,
         "a bucket below its limit stays selectable"
     );
-    let Event::Blob(BlobEvent::WriteFinished { location: second }) =
-        context.blob_handle.send_blob_effect(write("two.bin")).await
+    let Ok(BlobEvent::WriteFinished { location: second }) =
+        (context.blob_handle.send_blob_effect(write("two.bin")).await).into_blob()
     else {
         panic!("second write failed")
     };
@@ -1281,7 +1285,7 @@ async fn backfills_free_index() {
         keyspace_count(&context.storage_handle, BUCKET_FREE_INDEX).await,
         1
     );
-    let Event::Blob(BlobEvent::WriteFinished { location }) = restarted
+    let Ok(BlobEvent::WriteFinished { location }) = (restarted
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
             bucket: "bucket-a".to_string(),
@@ -1290,7 +1294,8 @@ async fn backfills_free_index() {
             blob: stream_from_bytes(b"one"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("write failed")
     };
@@ -1301,7 +1306,7 @@ async fn backfills_free_index() {
 async fn starts_fresh_bucket() {
     let context = setup_blob_handle(1).await;
 
-    let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
+    let Ok(BlobEvent::WriteFinished { location: first }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -1311,12 +1316,13 @@ async fn starts_fresh_bucket() {
             blob: stream_from_bytes(b"one"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("first write failed")
     };
 
-    let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
+    let Ok(BlobEvent::WriteFinished { location: second }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -1326,7 +1332,8 @@ async fn starts_fresh_bucket() {
             blob: stream_from_bytes(b"two"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("second write failed")
     };
@@ -1356,7 +1363,7 @@ async fn starts_fresh_bucket() {
 async fn keeps_bucket_reusable() {
     let context = setup_blob_handle(1).await;
 
-    let Event::Blob(BlobEvent::WriteFinished { location: first }) = context
+    let Ok(BlobEvent::WriteFinished { location: first }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -1366,17 +1373,19 @@ async fn keeps_bucket_reusable() {
             blob: stream_from_bytes(b"one"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("write failed")
     };
 
-    let Event::Blob(BlobEvent::DeleteFinished) = context
+    let Ok(BlobEvent::DeleteFinished) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Delete {
             location: first.clone(),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("delete failed")
     };
@@ -1391,7 +1400,7 @@ async fn keeps_bucket_reusable() {
         0
     );
 
-    let Event::Blob(BlobEvent::WriteFinished { location: second }) = context
+    let Ok(BlobEvent::WriteFinished { location: second }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -1401,7 +1410,8 @@ async fn keeps_bucket_reusable() {
             blob: stream_from_bytes(b"two"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("second write failed")
     };
@@ -1422,7 +1432,7 @@ async fn keeps_bucket_reusable() {
 async fn excludes_part_bucket() {
     let context = setup_blob_handle(5).await;
 
-    let Event::Blob(BlobEvent::WriteFinished { location }) = context
+    let Ok(BlobEvent::WriteFinished { location }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::WritePart {
             resolved: ResolvedBackend::node_default(),
@@ -1433,7 +1443,8 @@ async fn excludes_part_bucket() {
             size: None,
             blob: stream_from_bytes(b"part"),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("multipart write failed")
     };
@@ -1454,11 +1465,11 @@ async fn excludes_part_bucket() {
 async fn hidden_spool_roundtrip() {
     let context = setup_blob_handle(5).await;
     let namespace = Ulid::from_bytes([3u8; 16]);
-    let Event::Blob(BlobEvent::HiddenSpooled {
+    let Ok(BlobEvent::HiddenSpooled {
         location,
         blake3,
         size,
-    }) = context
+    }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace,
@@ -1468,7 +1479,8 @@ async fn hidden_spool_roundtrip() {
             deadline: None,
             blob: stream_from_bytes(b"hidden"),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden spool failed")
     };
@@ -1489,26 +1501,28 @@ async fn hidden_spool_roundtrip() {
         0
     );
 
-    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = context
+    let Ok(BlobEvent::HiddenListed { entries, .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
             cursor: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden list failed")
     };
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].key, HiddenBlobKey::try_from(&location).unwrap());
 
-    let Event::Blob(BlobEvent::HiddenRead { blob, stream_size }) = context
+    let Ok(BlobEvent::HiddenRead { blob, stream_size }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::ReadHiddenRange {
             location: location.clone(),
             range: 1..4,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden read failed")
     };
@@ -1517,32 +1531,35 @@ async fn hidden_spool_roundtrip() {
     assert_eq!(chunks.concat(), b"idd");
 
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(BlobEffect::ReadHiddenRange {
                 location: location.clone(),
                 range: 0..7,
             })
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::ReadError(_)))
+            .await)
+            .as_blob(),
+        Some(BlobEvent::Error(BlobError::ReadError(_)))
     ));
 
-    let Event::Blob(BlobEvent::HiddenDeleted) = context
+    let Ok(BlobEvent::HiddenDeleted) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::DeleteHidden {
             key: HiddenBlobKey::try_from(&location).unwrap(),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden delete failed")
     };
-    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = context
+    let Ok(BlobEvent::HiddenListed { entries, .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
             cursor: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden list failed")
     };
@@ -1553,7 +1570,7 @@ async fn hidden_spool_roundtrip() {
 async fn hidden_spool_limits() {
     let context = setup_blob_handle(5).await;
     let namespace = Ulid::from_bytes([5u8; 16]);
-    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
+    let Ok(BlobEvent::HiddenSpooled { location, .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace,
@@ -1563,7 +1580,8 @@ async fn hidden_spool_limits() {
             deadline: None,
             blob: stream_from_bytes(b"seed"),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("seed spool failed")
     };
@@ -1575,7 +1593,7 @@ async fn hidden_spool_limits() {
         .await;
 
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(BlobEffect::SpoolHidden {
                 namespace,
@@ -1585,16 +1603,18 @@ async fn hidden_spool_limits() {
                 deadline: None,
                 blob: stream_from_bytes(b"four"),
             })
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 3 }))
+            .await)
+            .as_blob(),
+        Some(BlobEvent::Error(BlobError::SizeLimitExceeded { limit: 3 }))
     ));
-    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = context
+    let Ok(BlobEvent::HiddenListed { entries, .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
             cursor: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden list failed")
     };
@@ -1617,10 +1637,11 @@ async fn local_spool_range() {
     let context = setup_blob_handle(5).await;
     let budget = context.blob_handle.handler.spool_budget.clone();
     let full = budget.available_permits();
-    let Event::Blob(BlobEvent::LocalSpooled { hashes, size, blob }) = context
+    let Ok(BlobEvent::LocalSpooled { hashes, size, blob }) = (context
         .blob_handle
         .send_blob_effect(local_spool(4, Some(1..3), b"four"))
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("local spool failed")
     };
@@ -1643,19 +1664,21 @@ async fn local_spool_length() {
     let full = budget.available_permits();
     for bytes in [&b"fours"[..], &b"for"[..]] {
         assert!(matches!(
-            context
+            (context
                 .blob_handle
                 .send_blob_effect(local_spool(4, None, bytes))
-                .await,
-            Event::Blob(BlobEvent::Error(BlobError::IntegrityCheckFailed(_)))
+                .await)
+                .as_blob(),
+            Some(BlobEvent::Error(BlobError::IntegrityCheckFailed(_)))
         ));
     }
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(local_spool(4, Some(2..5), b"four"))
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::ReadError(_)))
+            .await)
+            .as_blob(),
+        Some(BlobEvent::Error(BlobError::ReadError(_)))
     ));
     tokio::time::timeout(Duration::from_secs(30), async {
         while budget.available_permits() < full {
@@ -1672,10 +1695,11 @@ async fn local_spool_budget() {
     let context = setup_blob_handle(5).await;
     let budget = context.blob_handle.handler.spool_budget.clone();
     let full = budget.available_permits();
-    let Event::Blob(BlobEvent::LocalSpooled { blob, .. }) = context
+    let Ok(BlobEvent::LocalSpooled { blob, .. }) = (context
         .blob_handle
         .send_blob_effect(local_spool(4, None, b"four"))
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("local spool failed")
     };
@@ -1687,11 +1711,12 @@ async fn local_spool_budget() {
         .try_acquire_many_owned(u32::try_from(full).unwrap())
         .unwrap();
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(local_spool(4, None, b"four"))
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. }))
+            .await)
+            .as_blob(),
+        Some(BlobEvent::Error(BlobError::SpoolBudgetExhausted { .. }))
     ));
     drop(held);
     let limit = super::runtime::SPOOL_BUDGET_MIB as u64 * 1024 * 1024;
@@ -1700,7 +1725,7 @@ async fn local_spool_budget() {
             .blob_handle
             .send_blob_effect(local_spool(limit + 1, None, b"four"))
             .await,
-        Event::Blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit }))
+        Event::blob(BlobEvent::Error(BlobError::SpoolTooLarge { limit }))
     );
 }
 
@@ -1726,10 +1751,11 @@ async fn local_spool_unconfigured() {
         .await
         .unwrap();
     assert!(matches!(
-        blob_handle
+        (blob_handle
             .send_blob_effect(local_spool(4, None, b"four"))
-            .await,
-        Event::Blob(BlobEvent::Error(BlobError::WriteError(_)))
+            .await)
+            .as_blob(),
+        Some(BlobEvent::Error(BlobError::WriteError(_)))
     ));
 }
 
@@ -1770,7 +1796,7 @@ async fn sweeps_demoted_backend() {
     )
     .await
     .unwrap();
-    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = before
+    let Ok(BlobEvent::HiddenSpooled { location, .. }) = (before
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace,
             name: "leftover".to_string(),
@@ -1779,7 +1805,8 @@ async fn sweeps_demoted_backend() {
             deadline: None,
             blob: stream_from_bytes(b"leftover"),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden spool failed")
     };
@@ -1794,12 +1821,13 @@ async fn sweeps_demoted_backend() {
     )
     .await
     .unwrap();
-    let Event::Blob(BlobEvent::HiddenListed { entries, .. }) = after
+    let Ok(BlobEvent::HiddenListed { entries, .. }) = (after
         .send_blob_effect(BlobEffect::ListHidden {
             namespace: Some(namespace),
             cursor: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("hidden list failed")
     };
@@ -1813,7 +1841,7 @@ async fn range_passes_writes() {
     // Import readers fetch hidden ranges while a write consumes their payload.
     let context = setup_blob_handle(5).await;
     let namespace = Ulid::from_bytes([6u8; 16]);
-    let Event::Blob(BlobEvent::HiddenSpooled { location, .. }) = context
+    let Ok(BlobEvent::HiddenSpooled { location, .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace,
@@ -1823,7 +1851,8 @@ async fn range_passes_writes() {
             deadline: None,
             blob: stream_from_bytes(b"source"),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("source spool failed")
     };
@@ -1868,7 +1897,7 @@ async fn range_passes_writes() {
     )
     .await
     .expect("hidden range read deadlocked");
-    let Event::Blob(BlobEvent::HiddenRead { blob, .. }) = event else {
+    let Ok(BlobEvent::HiddenRead { blob, .. }) = event.into_blob() else {
         panic!("hidden range read failed")
     };
     let chunks: Vec<bytes::Bytes> = blob.try_collect().await.unwrap();
@@ -1880,11 +1909,12 @@ async fn range_passes_writes() {
         .unwrap();
     drop(body_sender);
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(30), write_task)
+        (tokio::time::timeout(Duration::from_secs(30), write_task)
             .await
             .expect("blob write did not finish")
-            .unwrap(),
-        Event::Blob(BlobEvent::WriteFinished { .. })
+            .unwrap())
+        .as_blob(),
+        Some(BlobEvent::WriteFinished { .. })
     ));
 }
 
@@ -2004,8 +2034,8 @@ async fn interlocked_writes_complete() {
             .expect("write starved")
             .unwrap();
         assert!(matches!(
-            event,
-            Event::Blob(BlobEvent::WriteFinished { .. })
+            event.as_blob(),
+            Some(BlobEvent::WriteFinished { .. })
         ));
     }
 }
@@ -2014,7 +2044,7 @@ async fn interlocked_writes_complete() {
 async fn tracks_concurrent_loads() {
     // Racing writes into one backend bucket must not lose load increments.
     let context = setup_blob_handle(64).await;
-    let Event::Blob(BlobEvent::WriteFinished { location }) = context
+    let Ok(BlobEvent::WriteFinished { location }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -2024,7 +2054,8 @@ async fn tracks_concurrent_loads() {
             blob: stream_from_bytes(b"seed"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("seed write failed")
     };
@@ -2057,8 +2088,8 @@ async fn tracks_concurrent_loads() {
             .expect("write starved")
             .unwrap();
         assert!(matches!(
-            event,
-            Event::Blob(BlobEvent::WriteFinished { .. })
+            event.as_blob(),
+            Some(BlobEvent::WriteFinished { .. })
         ));
     }
     let load = bucket_load(
@@ -2090,9 +2121,8 @@ async fn dispatches_staging_source() {
         .await;
 
     assert!(matches!(
-        event,
-        Event::StagingSource(StagingSourceEvent::Error { .. })
-            | Event::StagingSource(StagingSourceEvent::HeadResult { .. })
+        event.as_staging(),
+        Some(StagingSourceEvent::Error { .. }) | Some(StagingSourceEvent::HeadResult { .. })
     ));
 }
 
@@ -2554,7 +2584,7 @@ async fn compose_close_fails() {
     let context = setup_blob_handle(5).await;
     let handler = context.blob_handle.handler.clone();
 
-    let Event::Blob(BlobEvent::WriteFinished { location: part }) = context
+    let Ok(BlobEvent::WriteFinished { location: part }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -2564,7 +2594,8 @@ async fn compose_close_fails() {
             blob: stream_from_bytes(b"part-data"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("part write failed")
     };
@@ -2838,7 +2869,7 @@ async fn cancelled_spool_releases() {
     .await
     .expect("a cancelled spool must release its reservation");
 
-    let Event::Blob(BlobEvent::HiddenSpooled { .. }) = context
+    let Ok(BlobEvent::HiddenSpooled { .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::SpoolHidden {
             namespace,
@@ -2848,7 +2879,8 @@ async fn cancelled_spool_releases() {
             deadline: None,
             blob: stream_from_bytes(b"partial"),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("a later spool of the same content must succeed")
     };
@@ -2969,7 +3001,7 @@ fn rejects_replicated_traversal() {
 async fn read_holds_permit() {
     // The read slot must stay taken until the lazily consumed stream is dropped.
     let context = setup_blob_handle(8).await;
-    let Event::Blob(BlobEvent::WriteFinished { location }) = context
+    let Ok(BlobEvent::WriteFinished { location }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Write {
             resolved: ResolvedBackend::node_default(),
@@ -2979,17 +3011,19 @@ async fn read_holds_permit() {
             blob: stream_from_bytes(b"payload"),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("write failed")
     };
 
     let slots = context.blob_handle.handler.read_slots.clone();
     let free = slots.available_permits();
-    let Event::Blob(BlobEvent::ReadFinished { blob, .. }) = context
+    let Ok(BlobEvent::ReadFinished { blob, .. }) = (context
         .blob_handle
         .send_blob_effect(BlobEffect::Read { location })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("read failed")
     };
@@ -3034,8 +3068,9 @@ async fn reservation_forces_rollover() {
             .await
             .expect("write starved")
             .unwrap();
-        let Event::Blob(BlobEvent::WriteFinished { location }) = event else {
-            panic!("write failed: {event:?}")
+        let location = match event.into_blob() {
+            Ok(BlobEvent::WriteFinished { location }) => location,
+            other => panic!("write failed: {other:?}"),
         };
         buckets.push(location.storage_bucket);
     }
@@ -3755,13 +3790,14 @@ async fn s3_delayed_write() {
     let accepted = in_place_part(&handler, &upload, 1, &acknowledged).await;
     // The accepted attempt's operation commits and releases its reservation.
     assert!(matches!(
-        context
+        (context
             .blob_handle
             .send_blob_effect(BlobEffect::ReleaseReservation {
                 id: accepted.location.ulid,
             })
-            .await,
-        Event::Blob(BlobEvent::ReservationReleased { .. })
+            .await)
+            .as_blob(),
+        Some(BlobEvent::ReservationReleased { .. })
     ));
 
     let BlobEvent::WriteFinished { location } = handler
@@ -3971,8 +4007,8 @@ async fn close_blocks_writes() {
         .send_blob_effect(group_effect(Ulid::generate()))
         .await;
     assert!(matches!(
-        rejected,
-        Event::Blob(BlobEvent::Error(BlobError::Closed))
+        rejected.as_blob(),
+        Some(BlobEvent::Error(BlobError::Closed))
     ));
     assert_eq!(context.blob_handle.rejected_writes(), 1);
 
@@ -3985,8 +4021,8 @@ async fn close_blocks_writes() {
         })
         .await;
     assert!(!matches!(
-        listed,
-        Event::Blob(BlobEvent::Error(BlobError::Closed))
+        listed.as_blob(),
+        Some(BlobEvent::Error(BlobError::Closed))
     ));
 }
 

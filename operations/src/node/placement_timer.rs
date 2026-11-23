@@ -11,12 +11,14 @@ use aruna_core::structs::identity::realm::RealmId;
 use tracing::warn;
 
 use crate::node::info::flows::ObservePlacementOperation;
-use crate::placement::policy::subject::{SubjectScanError, SubjectScanResult};
-use crate::placement::process_placements::{
+use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
+use aruna_ops_identity::placement::policy::subject::{SubjectScanError, SubjectScanResult};
+use aruna_ops_identity::placement::process_placements::{
     PlacementReconcileOutcome, PlacementReconcileStatus, ReconcilePlacementsOperation,
 };
-use crate::sync::shard_placement::{PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX};
-use crate::triggers::{TimerInput, TimerMemory, TimerPlan};
+use aruna_ops_identity::sync::shard_placement::{
+    PLACEMENT_RETRY_AFTER, PULL_RETRY_AFTER, PULL_RETRY_MAX,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 enum PlacementStage {

@@ -42,7 +42,8 @@ sha2 = { workspace = true }
 ipnet = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
-futures = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
 prometheus-client = { workspace = true }
 ed25519-dalek = { workspace = true }
 url = { workspace = true, features = ["serde"] }
@@ -51,7 +52,6 @@ cel-interpreter = { workspace = true }
 globset = { workspace = true }
 opentelemetry = { workspace = true }
 oxrdf = { workspace = true }
-parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 regex = { workspace = true }
 serde_json = { workspace = true }
@@ -69,4 +69,5 @@ x25519-dalek = { workspace = true }
 [dev-dependencies]
 getrandom = { workspace = true }
 proptest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }

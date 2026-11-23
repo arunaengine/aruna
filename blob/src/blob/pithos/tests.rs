@@ -522,16 +522,18 @@ async fn leases_pin_archives() {
 async fn adapter_seals_keys() {
     use aruna_core::compute::SecretBytes;
     use aruna_core::effects::BlobEffect;
-    use aruna_core::events::Event;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::structs::storage::encryption::{CopyTarget, public_key_of};
 
     let context = setup_two_backends().await;
     let handle = &context.blob_handle;
-    let Event::Blob(BlobEvent::BucketKeyGenerated {
+    let Ok(BlobEvent::BucketKeyGenerated {
         public_key,
         private_key,
-    }) = handle.send_blob_effect(BlobEffect::GenerateBucketKey).await
+    }) = handle
+        .send_blob_effect(BlobEffect::GenerateBucketKey)
+        .await
+        .into_blob()
     else {
         panic!("no key generated")
     };
@@ -551,11 +553,14 @@ async fn adapter_seals_keys() {
         holders: vec![target.clone()],
     };
     let sealed = handle.send_blob_effect(seal(public_key)).await;
-    assert!(matches!(sealed, Event::Blob(BlobEvent::CopiesSealed { copies }) if copies.len() == 1));
+    assert!(matches!(
+        sealed.into_blob(),
+        Ok(BlobEvent::CopiesSealed { copies }) if copies.len() == 1
+    ));
     let wrong = handle.send_blob_effect(seal([9; 32])).await;
     assert!(matches!(
-        wrong,
-        Event::Blob(BlobEvent::Error(BlobError::BucketKey(_)))
+        wrong.into_blob(),
+        Ok(BlobEvent::Error(BlobError::BucketKey(_)))
     ));
 }
 

@@ -39,8 +39,8 @@ use super::rows::{
     Rows, Scan, StoreError, all_values, decode, delete_call, done, encode, page_call, page_of,
     read_call, row as row_of, values,
 };
-use crate::metadata::deletion_guard::metadata_call;
 use aruna_core::metadata::protocol::{MetadataReadError, MetadataTransportMessage};
+use aruna_ops_data::metadata::deletion_guard::metadata_call;
 
 /// Forward rows of one install read for sending in one pass at most.
 const BATCH: usize = 100;
@@ -62,7 +62,7 @@ impl Backoff {
         let tries = self.0.get(&node).map_or(0, |(tries, _)| *tries) + 1;
         let wait = capped_backoff(Duration::from_secs(1), MAX_BACKOFF, tries, 0);
         let wait = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
-        self.0.insert(node, (tries, now_ms + wait));
+        self.0.insert(node, (tries, now_ms.saturating_add(wait)));
     }
 
     /// A receiver that took every request is tried at once next time.
@@ -240,6 +240,9 @@ impl Operation for ExpireRows {
                     } else {
                         kept.push((key, value));
                     }
+                }
+                if expired.is_empty() {
+                    return Ok(Next::Done(kept));
                 }
                 let ask = outbox.gap_ask();
                 self.phase = ExpirePhase::Gaps(Box::new(outbox), kept, expired);
@@ -481,9 +484,9 @@ impl Operation for Unreadable {
             let applied = match answer.event()? {
                 Event::Metadata(MetadataEvent::ContainsDotResult { contains, .. }) => contains,
                 Event::Metadata(MetadataEvent::Error { error, .. }) => {
-                    return Err(StoreError(error.to_string()));
+                    return Err(StoreError::Message(error.to_string()));
                 }
-                other => return Err(StoreError(format!("unexpected {}", other.label()))),
+                other => return Err(StoreError::Message(format!("unexpected {}", other.label()))),
             };
             return Ok(Next::Done(!applied && !deleted));
         }
@@ -611,14 +614,18 @@ impl CollectOutbox {
         mut rows: VecDeque<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Next<BTreeMap<NodeId, Requests>>, StoreError> {
         while let Some((key, value)) = rows.pop_front() {
-            let install_id = Ulid::from_bytes(key[1..17].try_into().unwrap_or_default());
-            let Some(receiver) = self.kept(install_id) else {
+            let install_id = key
+                .get(1..17)
+                .and_then(|slice| <[u8; 16]>::try_from(slice).ok())
+                .map(Ulid::from_bytes);
+            let Some(receiver) = install_id.and_then(|id| self.kept(id)) else {
                 self.phase = CollectPhase::DroppingGap(rows);
                 return Ok(Next::Call(IoCall::child(drop_rows(
                     PLUGIN_GAPS_KEYSPACE,
                     key,
                 ))));
             };
+            let install_id = install_id.expect("receiver implies install id");
             let row: GapRow = decode(&value)?;
             if row.sequence > row.acked && self.open.contains(&receiver) {
                 let requests = receiver_requests(&mut self.batches, receiver, self.bound);

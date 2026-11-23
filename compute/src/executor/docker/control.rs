@@ -54,7 +54,7 @@ impl DaemonLock {
             }
         })
         .map_err(control_error)?;
-        Ok(ControlGuard(guard))
+        Ok(ControlGuard(Some(guard)))
     }
 
     pub fn read(&self, context: &FenceContext) -> Result<Option<ControlRecord>, BackendError> {
@@ -111,51 +111,78 @@ impl ControlState for ControlRecord {
     }
 }
 
-pub struct ControlGuard(StoredGuard<ControlRecord>);
+pub struct ControlGuard(Option<StoredGuard<ControlRecord>>);
 
 impl ControlGuard {
+    fn record(&self) -> Option<&ControlRecord> {
+        self.0.as_ref()?.record()
+    }
+
     pub fn started(&self) -> bool {
-        self.0.record().is_some_and(|record| record.started)
+        self.record().is_some_and(|record| record.started)
     }
 
     /// Fences the start request before the daemon is asked to start: from here
     /// on an absent container is lost evidence, never a licence to create one.
-    /// The durable write runs on the blocking pool while this guard keeps the lock.
     pub async fn mark_start(&mut self) -> Result<(), BackendError> {
-        let path = self.0.path().to_path_buf();
-        let record = self.0.record_mut().ok_or_else(missing_record)?;
-        if record.started {
+        if self.started() {
             return Ok(());
         }
-        record.started = true;
-        let record = record.clone();
-        tokio::task::spawn_blocking(move || control_store::write_json(&path, &record))
+        self.update(|record| record.started = true)
             .await
-            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?
-            .map_err(control_error)
+            .map(|_| ())
     }
 
     pub fn tombstone(&self) -> Option<TombstoneEvidence> {
-        let record = self.0.record()?;
+        let guard = self.0.as_ref()?;
+        let record = guard.record()?;
         record.tombstone.then(|| TombstoneEvidence {
             backend_ref: record
                 .tombstone_ref
                 .clone()
-                .unwrap_or_else(|| self.0.path().display().to_string()),
+                .unwrap_or_else(|| guard.path().display().to_string()),
             attempt_epoch: record.attempt_epoch,
         })
     }
 
-    pub fn store(&mut self, backend_ref: String) -> Result<TombstoneEvidence, BackendError> {
-        let record = self.0.record_mut().ok_or_else(missing_record)?;
-        record.tombstone = true;
-        record.tombstone_ref = Some(backend_ref.clone());
-        let attempt_epoch = record.attempt_epoch;
-        self.0.persist().map_err(control_error)?;
+    /// Records the tombstone durably on the blocking pool.
+    pub async fn store(&mut self, backend_ref: String) -> Result<TombstoneEvidence, BackendError> {
+        let stored = backend_ref.clone();
+        let attempt_epoch = self
+            .update(move |record| {
+                record.tombstone = true;
+                record.tombstone_ref = Some(stored);
+            })
+            .await?;
         Ok(TombstoneEvidence {
             backend_ref,
             attempt_epoch,
         })
+    }
+
+    /// Applies `change` and persists it on the blocking pool. The lock moves into
+    /// the task, so a cancelled caller never releases it before the write ends.
+    async fn update(
+        &mut self,
+        change: impl FnOnce(&mut ControlRecord) + Send + 'static,
+    ) -> Result<u64, BackendError> {
+        let mut guard = self.0.take().ok_or_else(missing_record)?;
+        let task = tokio::task::spawn_blocking(move || {
+            let written = match guard.record_mut() {
+                Some(record) => {
+                    change(record);
+                    let epoch = record.attempt_epoch;
+                    guard.persist().map(|()| epoch).map_err(control_error)
+                }
+                None => Err(missing_record()),
+            };
+            (guard, written)
+        });
+        let (guard, written) = task
+            .await
+            .map_err(|error| BackendError::Api(format!("Docker control task failed: {error}")))?;
+        self.0 = Some(guard);
+        written
     }
 }
 
@@ -240,12 +267,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retains_tombstone() {
+    #[tokio::test]
+    async fn retains_tombstone() {
         let directory = tempdir().unwrap();
         let daemon = DaemonLock::acquire(directory.path()).unwrap();
         let mut control = daemon.control(&fence(1)).unwrap();
-        control.store("control.json".to_string()).unwrap();
+        control.store("control.json".to_string()).await.unwrap();
         drop(control);
         assert!(daemon.control(&fence(2)).unwrap().tombstone().is_some());
     }

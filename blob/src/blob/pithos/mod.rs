@@ -688,7 +688,8 @@ impl BlobHandler {
             .expose()
             .try_into()
             .map_err(|_| BlobError::from(BucketKeyError::WrongKey))?;
-        let raw = Zeroizing::new(*bytes);
+        let mut raw = Zeroizing::new([0u8; 32]);
+        raw.copy_from_slice(bytes);
         Ok(AccessKeys::new().with_key(PrivateKey::from_raw(raw)))
     }
 }

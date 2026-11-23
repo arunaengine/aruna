@@ -11,9 +11,9 @@ use aruna_core::structs::execution::setting::SettingChannel;
 use aruna_core::structs::execution::webhook::{WebhookDeliverySpec, WebhookSubscription};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::send::{SendError, SendOperation, job_error};
 use crate::notifications::settings::{Delivery, DeliveryOperation, DeliveryOutcome, managers};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum WebhookState {

@@ -26,7 +26,6 @@ use super::alias::AliasFamilyOperation;
 use super::family_reads::{FamilyProjectionOperation, FamilyView};
 use super::routing::decidable;
 use super::updates::{PublishTerminalOperation, SETTLE_RETRY_AFTER, schedule_terminal_settle};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::RecordStoreError;
 use crate::jobs::records::admit::Admission;
 use crate::jobs::records::append::{
@@ -39,6 +38,7 @@ use crate::jobs::route::{JobRouteError, JobRouteOperation, JobRouteOutcome};
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::submit::schedule_drain_effect;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 fn unavailable(reason: impl std::fmt::Display) -> JobRouteError {
     JobRouteError::Unavailable(reason.to_string())

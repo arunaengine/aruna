@@ -45,15 +45,17 @@ use ulid::Ulid;
 use self::rewrite::{CrateValidationError, RewriteTarget, rewrite_document};
 use super::metadata_class::MetadataFailure;
 use super::repository::JobScope;
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::metadata::forward::write::MetadataWriteError;
-use crate::placement::policy::gate::GateContextError;
-use crate::s3::object::get::GetObjectError;
-use crate::s3::object::put::PutObjectError;
-use crate::staging::read_source::ReadSourceError;
 use aruna_core::bucket_read::{GetBucketError, GetBucketOperation};
 use aruna_core::jobs::JobRunOutcome;
 use aruna_core::repository::remote::NodeScope;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::s3::object::get::GetObjectError;
+use aruna_ops_data::s3::object::put::PutObjectError;
+use aruna_ops_data::staging::read_source::ReadSourceError;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::placement::policy::gate::GateContextError;
 
 /// What every operation of one import run knows about it.
 #[derive(Clone, Debug, PartialEq)]
@@ -288,16 +290,20 @@ pub(in crate::jobs) fn unexpected(expected: &'static str, event: &Event) -> IoEr
 /// Deletes a hidden blob.
 pub(in crate::jobs) fn hidden_delete(location: &BackendLocation) -> Result<IoCall, String> {
     let key = HiddenBlobKey::try_from(location).map_err(|error| error.to_string())?;
-    let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
+    let delete = Effect::blob(BlobEffect::DeleteHidden { key });
     Ok(IoCall::Effect(Box::new(delete)))
 }
 
 /// The answer to [`hidden_delete`].
 fn hidden_deleted(result: IoResult) -> Result<(), String> {
-    match result.event().map_err(|error| error.to_string())? {
-        Event::Blob(BlobEvent::HiddenDeleted) => Ok(()),
-        Event::Blob(BlobEvent::Error(error)) => Err(error.to_string()),
-        other => Err(format!(
+    match (result.event().map_err(|error| error.to_string())?).into_blob() {
+        Ok(BlobEvent::HiddenDeleted) => Ok(()),
+        Ok(BlobEvent::Error(error)) => Err(error.to_string()),
+        Ok(other) => Err(format!(
+            "unexpected hidden blob delete event: {}",
+            other.label()
+        )),
+        Err(other) => Err(format!(
             "unexpected hidden blob delete event: {}",
             other.label()
         )),
@@ -989,7 +995,7 @@ pub(crate) mod tests {
             completeness: aruna_core::metadata::ProfileValidationCompleteness::Incomplete,
         };
         let failure = classify_metadata(MetadataWriteError::Create(
-            crate::metadata::create_document::CreateDocumentError::MetadataError(
+            aruna_ops_data::metadata::create_document::CreateDocumentError::MetadataError(
                 aruna_core::metadata::MetadataError::ProfileValidation(vec![finding]),
             ),
         ));

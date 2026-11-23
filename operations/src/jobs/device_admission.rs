@@ -26,9 +26,9 @@ use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::workflow::DEFAULT_WALLTIME;
 use crate::jobs::workflow::compute::{compute_answer, compute_call};
 use crate::jobs::workflow::prepare::NETWORK_TAG_KEY;
-use crate::placement::policy::reconcile::LocalSubjectOperation;
-use crate::placement::policy::subject::SubjectScanError;
 use aruna_core::job_request::{effective_resources, session_of};
+use aruna_ops_identity::placement::policy::reconcile::LocalSubjectOperation;
+use aruna_ops_identity::placement::policy::subject::SubjectScanError;
 
 /// The network a session run asks for; `None` for a run that is no session.
 pub(crate) fn session_network(spec: &ExecutionSpec) -> Option<NetworkAccess> {

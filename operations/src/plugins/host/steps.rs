@@ -27,7 +27,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use ulid::Ulid;
 
-use super::super::check::{CallError, CheckCall, RunScope, authorize_call, matching};
+use super::super::check::{
+    CallError, CheckCall, Checked as CheckStep, RunScope, SharedChecks, matching,
+};
 use super::super::creates::write_outcome;
 use super::super::dataset::{
     content_urls, dataset_change, dataset_crate, dataset_of, file_entities, parse_document,
@@ -47,26 +49,28 @@ use super::super::submit::WorkRequest;
 use super::super::task::start::{StartTask, TaskRequest};
 use super::super::unavailable;
 use super::calls::{CallEnd, CallFailure, RecordCall, begun_reply};
-use crate::auth::install_access::Authorize;
-use crate::auth::install_access::{parse_grants, patterns_for};
 use crate::jobs::lifecycle::submit_external::IngressNode;
 use crate::jobs::records::pages::ServingNode;
-use crate::metadata::api::MetadataApiError;
-use crate::metadata::api::export_types::ExportMetadataRequest;
-use crate::metadata::api::list::ListVisibleOperation;
-use crate::metadata::api::list_types::{ListVisibleRequest, ListVisibleResult, MetadataListOrder};
-use crate::metadata::forward::authorized_create::CreateAuthorizedError;
-use crate::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
-use crate::metadata::forward::routed::export::RoutedExportOperation;
-use crate::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
-use crate::metadata::forward::write::MetadataWriteError;
-use crate::s3::object::head::{
-    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
-};
 use aruna_core::install_work::RequestContext;
 use aruna_core::metadata::api::{
     CreateDocumentPayload, ExportMetadataResult, RoCrateExportView, UpdateDocumentMutation,
 };
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
+use aruna_ops_data::metadata::api::list::ListVisibleOperation;
+use aruna_ops_data::metadata::api::list_types::{
+    ListVisibleRequest, ListVisibleResult, MetadataListOrder,
+};
+use aruna_ops_data::metadata::forward::authorized_create::CreateAuthorizedError;
+use aruna_ops_data::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_ops_data::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use aruna_ops_identity::auth::install_access::Authorize;
+use aruna_ops_identity::auth::install_access::{parse_grants, patterns_for};
 
 /// Entries of one metadata listing page.
 const LIST_PAGE: usize = 100;
@@ -290,10 +294,22 @@ fn document_of(
     }
 }
 
+/// The live check of `path` after the export: the install is still active and grants read on
+/// it. A path the admitted install does not cover is refused at once; the rate counts once.
+fn read_check(scope: &RunScope, install: &PluginInstall, path: &str) -> Result<IoCall, CallError> {
+    matching(install, Permission::MetadataRead, path)?;
+    let check = CheckCall::new(scope, Some((Permission::MetadataRead, path)));
+    Ok(IoCall::child(check))
+}
+
+fn authorized(result: IoResult) -> Result<(), CallError> {
+    result.child::<PluginInstall, CallError>()?.map(drop)
+}
+
 #[derive(Debug, PartialEq)]
 enum ReadPhase {
     Listing,
-    Export,
+    Export(Box<PluginInstall>),
     Check(Box<MetadataRegistryRecord>, String),
 }
 
@@ -328,23 +344,22 @@ impl Operation for ReadDataset {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<Document>, CallError> {
-        match std::mem::replace(&mut self.phase, ReadPhase::Export) {
+        match std::mem::replace(&mut self.phase, ReadPhase::Listing) {
             ReadPhase::Listing => {
-                let auth = granted(result)?.auth;
+                let Granted { install, auth } = granted(result)?;
                 let document = parse_document(&self.resource)?;
                 let read = (document, self.view);
+                self.phase = ReadPhase::Export(Box::new(install));
                 Ok(Next::Call(self.place.export(read, auth, (None, None))))
             }
-            ReadPhase::Export => {
+            ReadPhase::Export(install) => {
                 let (record, jsonld) = document_of(exported(result)?)?;
-                let path = &record.permission_path;
-                let scope = &self.place.scope;
-                let check = GrantedCall::target(scope, Permission::MetadataRead, path);
+                let check = read_check(&self.place.scope, &install, &record.permission_path)?;
                 self.phase = ReadPhase::Check(Box::new(record), jsonld);
-                Ok(Next::Call(granted_call(check)))
+                Ok(Next::Call(check))
             }
             ReadPhase::Check(record, jsonld) => {
-                granted(result)?;
+                authorized(result)?;
                 Ok(Next::Done(Document {
                     resource: self.resource.clone(),
                     revision: record.last_event_id.to_string(),
@@ -358,7 +373,7 @@ impl Operation for ReadDataset {
 #[derive(Debug, PartialEq)]
 enum FilesPhase {
     Listing,
-    Export,
+    Export(Box<PluginInstall>),
     Check(PageDraft),
 }
 
@@ -400,28 +415,27 @@ impl Operation for ReadFiles {
     }
 
     fn next(&mut self, result: IoResult) -> Result<Next<FilePage>, CallError> {
-        match std::mem::replace(&mut self.phase, FilesPhase::Export) {
+        match std::mem::replace(&mut self.phase, FilesPhase::Listing) {
             FilesPhase::Listing => {
-                let auth = granted(result)?.auth;
+                let Granted { install, auth } = granted(result)?;
                 let read = (parse_document(&self.resource)?, RoCrateExportView::Page);
                 let page = (Some(FILE_PAGE), self.cursor.take());
+                self.phase = FilesPhase::Export(Box::new(install));
                 Ok(Next::Call(self.place.export(read, auth, page)))
             }
-            FilesPhase::Export => {
+            FilesPhase::Export(install) => {
                 let ExportMetadataResult::Page { record, page } = exported(result)? else {
                     return Err(CallError(unavailable("the document has no page export")));
                 };
-                let path = &record.permission_path;
-                let scope = &self.place.scope;
-                let check = GrantedCall::target(scope, Permission::MetadataRead, path);
+                let check = read_check(&self.place.scope, &install, &record.permission_path)?;
                 self.phase = FilesPhase::Check(PageDraft {
                     jsonld: page.jsonld,
                     cursor: page.next_cursor,
                 });
-                Ok(Next::Call(granted_call(check)))
+                Ok(Next::Call(check))
             }
             FilesPhase::Check(page) => {
-                granted(result)?;
+                authorized(result)?;
                 Ok(Next::Done(FilePage {
                     files: file_entities(&page.jsonld)?,
                     cursor: page.cursor,
@@ -449,6 +463,7 @@ pub struct ListDatasets {
     current: Option<String>,
     resources: Vec<String>,
     next_cursor: Option<String>,
+    checks: SharedChecks,
     phase: ListPhase,
 }
 
@@ -462,25 +477,44 @@ impl ListDatasets {
             current: None,
             resources: Vec::new(),
             next_cursor: None,
+            checks: SharedChecks::default(),
             phase: ListPhase::Listing,
         }
     }
 
-    fn advance(&mut self, install: Box<PluginInstall>) -> Next<Listing> {
+    /// Checks the next covered document; the checks of a page share their reads and compile.
+    fn advance(&mut self, install: Box<PluginInstall>) -> Result<Next<Listing>, CallError> {
         while let Some((path, id)) = self.documents.pop_front() {
             let permission = Permission::MetadataRead;
             let Ok(patterns) = matching(&install, permission, &path) else {
                 continue;
             };
             let check = Authorize::call(&install, permission, &path, &patterns);
-            self.current = Some(id);
-            self.phase = ListPhase::Checking(install);
-            return Next::Call(authorize_call(check));
+            match self.checks.start(check) {
+                CheckStep::Ask(call) => {
+                    self.current = Some(id);
+                    self.phase = ListPhase::Checking(install);
+                    return Ok(Next::Call(call));
+                }
+                CheckStep::Done(decided) => self.decided(id, decided)?,
+            }
         }
-        Next::Done(Listing {
+        Ok(Next::Done(Listing {
             resources: std::mem::take(&mut self.resources),
             cursor: self.next_cursor.take(),
-        })
+        }))
+    }
+
+    /// Keeps an authorized document; only an unavailable check fails the page.
+    fn decided(&mut self, id: String, decided: Result<(), CallError>) -> Result<(), CallError> {
+        match decided {
+            Ok(()) => self.resources.push(id),
+            Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
+                return Err(CallError(error));
+            }
+            Err(_) => {}
+        }
+        Ok(())
     }
 }
 
@@ -527,19 +561,19 @@ impl Operation for ListDatasets {
                         (record.permission_path.clone(), id)
                     })
                     .collect();
-                Ok(self.advance(install))
+                self.advance(install)
             }
-            ListPhase::Checking(install) => {
-                let id = self.current.take().ok_or(IoError::Unfinished)?;
-                match result.child::<(), CallError>()? {
-                    Ok(()) => self.resources.push(id),
-                    Err(CallError(error)) if error.kind == ErrorKind::Unavailable => {
-                        return Err(CallError(error));
-                    }
-                    Err(_) => {}
+            ListPhase::Checking(install) => match self.checks.answer(result)? {
+                CheckStep::Ask(call) => {
+                    self.phase = ListPhase::Checking(install);
+                    Ok(Next::Call(call))
                 }
-                Ok(self.advance(install))
-            }
+                CheckStep::Done(decided) => {
+                    let id = self.current.take().ok_or(IoError::Unfinished)?;
+                    self.decided(id, decided)?;
+                    self.advance(install)
+                }
+            },
         }
     }
 }

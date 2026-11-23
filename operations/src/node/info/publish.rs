@@ -14,8 +14,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 
 use crate::node::info::write::PUBLISH_OWED_KEY;
-use crate::realm::mutate_placement::node_kind;
-use crate::sync::replicate_documents::{
+use aruna_ops_identity::realm::mutate_placement::node_kind;
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
 };
 
@@ -75,8 +75,15 @@ pub(crate) struct PublishInfoOperation {
     node_id: NodeId,
     /// Publish only while a committed revision is owed, as the heartbeat does.
     only_owed: bool,
+    /// Whether the document replicates, when the caller read the realm config already.
+    syncs: Option<bool>,
     owed: Option<u64>,
     phase: Phase,
+}
+
+/// A device's document belongs to no sync topic; a node missing from the config still syncs.
+fn document_syncs(config: &RealmConfigDocument, node_id: NodeId) -> bool {
+    node_kind(config, node_id).is_none_or(|kind| kind.is_sync_eligible())
 }
 
 impl PublishInfoOperation {
@@ -85,9 +92,16 @@ impl PublishInfoOperation {
             realm_id,
             node_id,
             only_owed,
+            syncs: None,
             owed: None,
             phase: Phase::Read,
         }
+    }
+
+    /// Takes the realm config the caller already read, so only the owed revision is read.
+    pub(crate) fn with_config(mut self, config: &RealmConfigDocument) -> Self {
+        self.syncs = Some(document_syncs(config, self.node_id));
+        self
     }
 
     fn read(&mut self, owed: Option<Value>, config: Option<Value>) -> Turn {
@@ -95,9 +109,14 @@ impl PublishInfoOperation {
         if self.only_owed && self.owed.is_none() {
             return Ok(Next::Done(()));
         }
-        let config = config.ok_or(PublishInfoError::ConfigMissing)?;
-        let config = RealmConfigDocument::from_bytes(&config)?;
-        if node_kind(&config, self.node_id).is_some_and(|kind| !kind.is_sync_eligible()) {
+        let syncs = match self.syncs {
+            Some(syncs) => syncs,
+            None => {
+                let config = config.ok_or(PublishInfoError::ConfigMissing)?;
+                document_syncs(&RealmConfigDocument::from_bytes(&config)?, self.node_id)
+            }
+        };
+        if !syncs {
             return Ok(self.settle());
         }
         self.phase = Phase::Replicate;
@@ -133,6 +152,9 @@ impl Operation for PublishInfoOperation {
     type Error = PublishInfoError;
 
     fn first(&mut self) -> Turn {
+        if self.syncs.is_some() {
+            return Ok(Next::Call(IoCall::Read(vec![owed_row()])));
+        }
         let config = DocumentTarget::RealmConfig {
             realm_id: self.realm_id,
         };
@@ -307,6 +329,21 @@ mod state_machine_tests {
         assert_eq!(local.next(read(Some(2), Some(config(device())))), settle(2));
         let mut nothing = PublishInfoOperation::new(REALM, node(), false);
         assert_eq!(nothing.next(read(None, Some(config(device())))), done());
+    }
+
+    #[test]
+    fn loaded_config_kept() {
+        // A config the caller read is not read again, and still decides replication.
+        let server = RealmConfigDocument::from_bytes(&config(RealmNodeKind::Server)).unwrap();
+        let mut operation = PublishInfoOperation::new(REALM, node(), false).with_config(&server);
+        let first = Ok(Next::Call(IoCall::Read(vec![owed_row()])));
+        assert_eq!(operation.first(), first);
+        let answer = operation.next(IoResult::Values(vec![revision(Some(3))]));
+        assert!(matches!(answer, Ok(Next::Call(IoCall::Child(_)))));
+        let user = RealmConfigDocument::from_bytes(&config(device())).unwrap();
+        let mut local = PublishInfoOperation::new(REALM, node(), false).with_config(&user);
+        let answer = local.next(IoResult::Values(vec![revision(Some(2))]));
+        assert_eq!(answer, settle(2));
     }
 
     #[test]

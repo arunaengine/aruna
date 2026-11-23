@@ -4,16 +4,11 @@
 
 use super::tests::hash_lookup;
 use super::*;
-use crate::auth::enforcement::PolicyBulkOperation;
-use crate::auth::permission_rules::PermissionRulesConfig;
-use crate::auth::permission_rules::PermissionRulesOperation;
 use crate::jobs::export::archive::failure_outcome;
 use crate::jobs::export::consent::UnheldBucketOperation;
 use crate::jobs::export::resolve::CandidateSource;
 use crate::jobs::export::resolve::ExportCandidate;
 use crate::jobs::export::sources::{AliasState, ResolveEntriesOperation, alias_allowed};
-use crate::replication::bao_read::BaoReadOutput;
-use crate::replication::plaintext::HolderCheckOperation;
 use crate::tests::export::{
     crate_document, job_context, open_candidate, probe_sources, recognized_entities, scope_of,
 };
@@ -44,6 +39,11 @@ use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::user::id::UserId;
 use aruna_drivers::driver::DriverContext;
 use aruna_drivers::driver::drive;
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
+use aruna_ops_data::replication::plaintext::HolderCheckOperation;
+use aruna_ops_identity::auth::enforcement::PolicyBulkOperation;
+use aruna_ops_identity::auth::permission_rules::PermissionRulesConfig;
+use aruna_ops_identity::auth::permission_rules::PermissionRulesOperation;
 use aruna_test_support::export::{
     BaoNode, FIXTURE_BYTES, byte_stream, encrypting_bucket, export_node, remote_spec, seed_bao,
 };
@@ -61,7 +61,7 @@ async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
     let version_id = Ulid::from_bytes([104; 16]);
     let node = export_node(realm_id, false).await;
     let node_id = node.net.node_id();
-    let Event::Blob(BlobEvent::WriteFinished { location }) = node
+    let Ok(BlobEvent::WriteFinished { location }) = (node
         .driver
         .blob_handle
         .as_ref()
@@ -74,7 +74,8 @@ async fn local_candidate() -> (BaoNode, UserId, ExportCandidate) {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("local blob write failed")
     };
@@ -109,7 +110,7 @@ async fn two_copies() -> (BaoNode, UserId, UserId, [ExportCandidate; 2]) {
     let node = export_node(realm_id, false).await;
     let node_id = node.net.node_id();
     let blob = node.driver.blob_handle.as_ref().unwrap();
-    let Event::Blob(BlobEvent::WriteFinished { location }) = blob
+    let Ok(BlobEvent::WriteFinished { location }) = (blob
         .send_blob_effect(BlobEffect::Write {
             resolved: aruna_core::structs::storage::blob::ResolvedBackend::node_default(),
             bucket: "remote".to_string(),
@@ -118,7 +119,8 @@ async fn two_copies() -> (BaoNode, UserId, UserId, [ExportCandidate; 2]) {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("blob write failed")
     };
@@ -308,7 +310,7 @@ async fn sealed_local_export() {
     };
     let resolved = aruna_core::structs::storage::blob::ResolvedBackend::node_default()
         .with_encryption(Some(plan));
-    let Event::Blob(BlobEvent::WriteFinished { location }) = blob
+    let Ok(BlobEvent::WriteFinished { location }) = (blob
         .send_blob_effect(BlobEffect::Write {
             resolved,
             bucket: "remote".to_string(),
@@ -317,7 +319,8 @@ async fn sealed_local_export() {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("sealed blob write failed")
     };
@@ -364,7 +367,7 @@ async fn sealed_local_export() {
         duration: None,
         max: None,
     };
-    let Event::Blob(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await
+    let Ok(BlobEvent::KeyPrepared { ticket }) = blob.send_blob_effect(prepare).await.into_blob()
     else {
         panic!("prepare failed")
     };

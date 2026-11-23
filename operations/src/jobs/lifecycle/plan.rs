@@ -34,19 +34,26 @@ use ulid::Ulid;
 
 use super::advertised::{Advertised, AdvertisementsOperation};
 use super::deferred::{DeferredTarget, Signal, reconsidered};
-use crate::auth::check_permissions::CheckPermissionsConfig;
-use crate::auth::enforcement::{PolicyEvaluator, compiled_policies, policy_reads, read_policies};
-use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::jobs::lifecycle::screen::{ScreenError, ScreenTask};
-use crate::placement::policy::resolve_set::{
-    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
-};
-use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::events::{Event, GroupEvent};
 use aruna_core::heartbeat::{HeldHeartbeat, live_telemetry};
-use aruna_core::operation::Operation;
+use aruna_core::keyspaces::AUTH_KEYSPACE;
+use aruna_core::node::state::{NodeInfoError, ReadInfoOperation};
+use aruna_core::operation::{Operation, boxed_suboperation};
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
-use aruna_core::types::Value;
+use aruna_core::types::{Key, Value};
+use aruna_ops_data::blob::holders::{GetHoldersError, GetHoldersOperation};
+use aruna_ops_identity::auth::check_permissions::CheckPermissionsConfig;
+use aruna_ops_identity::auth::enforcement::{
+    PolicyEvaluator, compiled_policies, policy_reads, read_policies,
+};
+use aruna_ops_identity::auth::permission_rules::{PermissionRules, read_rules};
+use aruna_ops_identity::placement::policy::resolve_set::{
+    PolicySetError, PolicySetResolver, Resolutions, ResolveMode,
+};
 
 /// Tag that pins the container network mode, shared with the executor path.
 const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
@@ -55,6 +62,9 @@ const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 /// staged files, so every realm job stages files. An S3 mount serves the head
 /// only and is reachable outside this lifecycle alone.
 pub(crate) const REALM_STAGING: StagingMode = StagingMode::Files;
+
+/// The holder lookups of one round run at most this many at a time.
+const HOLDER_LOOKUPS: usize = 8;
 
 #[derive(Debug, PartialEq, Error)]
 pub enum PlanBuildError {
@@ -92,11 +102,10 @@ pub struct PlanRound {
 #[derive(Debug, PartialEq)]
 enum PlanStep {
     Advertisements,
-    Holders(usize),
+    Holders,
     Policies,
     PolicyRows,
     PolicyCompile,
-    Grant(NodeId),
     Screen,
 }
 
@@ -109,11 +118,13 @@ pub struct BuildPlanOperation {
     documents: BTreeMap<NodeId, NodeInfoDocument>,
     unread: bool,
     inputs: Vec<ResolvedInput>,
+    /// The inputs whose holder lookups run, in the order of their group members.
+    lookups: Vec<usize>,
     policies: BTreeMap<Ulid, PolicyResolution>,
-    /// Candidate nodes whose grant is still to read, the next one last.
+    /// Candidate nodes whose policies and grants decide whether the submitter may write there.
     targets: Vec<NodeId>,
-    /// Whether the request policies allow the submitter's write on each candidate node.
-    policy_allows: BTreeMap<NodeId, bool>,
+    /// The submitter's grants in the group, collected once for every candidate node.
+    rules: Option<PermissionRules>,
     allowed: BTreeMap<NodeId, bool>,
     step: PlanStep,
 }
@@ -127,9 +138,10 @@ impl BuildPlanOperation {
             documents: BTreeMap::new(),
             unread: false,
             inputs: Vec::new(),
+            lookups: Vec::new(),
             policies: BTreeMap::new(),
             targets: Vec::new(),
-            policy_allows: BTreeMap::new(),
+            rules: None,
             allowed: BTreeMap::new(),
             step: PlanStep::Advertisements,
         }
@@ -154,21 +166,60 @@ impl BuildPlanOperation {
             .collect();
         self.round.excluded.extend(waiting);
         self.inputs = pinned_inputs(&self.round.config, &self.round.spec)?;
-        self.holders(0)
+        self.holders()
     }
 
-    /// Asks the DHT for the registered copies of input `index` onward; a reference has no
+    /// Asks the DHT for the registered copies of every input in one group; a reference has no
     /// stored copies to find by content, so its source stays its only holder.
-    fn holders(&mut self, mut index: usize) -> PlanNext {
-        while let Some(input) = self.inputs.get(index) {
+    fn holders(&mut self) -> PlanNext {
+        let (realm_id, local) = (self.round.spec.realm_id, self.round.local);
+        let mut members = Vec::new();
+        for (index, input) in self.inputs.iter().enumerate() {
             if let Some(blake3) = input.content.blake3() {
-                self.step = PlanStep::Holders(index);
-                let (realm_id, local) = (self.round.spec.realm_id, self.round.local);
                 let lookup = GetHoldersOperation::new(blake3, realm_id, local);
-                return Ok(Next::Call(IoCall::child(lookup)));
+                members.push(Effect::SubOperation(boxed_suboperation(lookup, |result| {
+                    Event::Child(ChildOutcome::new(result))
+                })));
+                self.lookups.push(index);
             }
-            index += 1;
         }
+        if members.is_empty() {
+            return self.resolve();
+        }
+        self.step = PlanStep::Holders;
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: HOLDER_LOOKUPS,
+            form: GroupForm::All { deadline: None },
+        })))
+    }
+
+    /// Adds the copies each lookup found to the holders of its input.
+    fn registered(&mut self, result: IoResult) -> PlanNext {
+        let IoResult::Group(GroupEvent::Finished { results }) = result else {
+            let got = result.label();
+            let expected = "the holder lookup group";
+            return Err(IoError::Unexpected { expected, got }.into());
+        };
+        let lookups = std::mem::take(&mut self.lookups);
+        for (index, member) in lookups.into_iter().zip(results) {
+            let registered = member.child_outcome::<Vec<NodeId>, GetHoldersError>();
+            let registered = registered.and_then(|lookup| {
+                (lookup.inspect_err(|error| {
+                    debug!(error = %error, "Blob holder lookup found no registered copy");
+                }))
+                .ok()
+            });
+            if let Some(input) = self.inputs.get_mut(index) {
+                let registered = registered.unwrap_or_default();
+                merge_holders(&self.round.config, &mut input.holders, registered);
+            }
+        }
+        self.resolve()
+    }
+
+    /// Resolves the placement policies of the inputs and outputs.
+    fn resolve(&mut self) -> PlanNext {
         self.step = PlanStep::Policies;
         let refs = self.inputs.iter().flat_map(|input| input.policies.clone());
         let refs: Vec<_> = refs
@@ -180,9 +231,9 @@ impl BuildPlanOperation {
         Ok(Next::Call(IoCall::child(resolve)))
     }
 
-    /// The nodes a candidate may run on, then the request policy rows of the group. A plugin
-    /// task passes the replicated task check instead of group WRITE: its account holds only
-    /// the scoped grants.
+    /// The nodes a candidate may run on, then the request policy rows of the group with the
+    /// realm authorization row. A plugin task passes the replicated task check instead of group
+    /// WRITE: its account holds only the scoped grants.
     fn targets(&mut self) -> PlanNext {
         let spec = &self.round.spec;
         if tagged(&spec.payload).is_some() {
@@ -192,41 +243,42 @@ impl BuildPlanOperation {
             return Ok(Next::Call(IoCall::child(ScreenTask::new(config, task))));
         }
         let existing = job_request::workspace_of(&spec.payload).0 == WorkspaceMode::Existing;
-        let mut targets: Vec<NodeId> = self
-            .documents
-            .keys()
+        self.targets = (self.documents.keys())
             .filter(|node| !existing || **node == spec.ingress_node_id)
             .filter(|node| node_kind(&self.round.config, **node).is_some())
             .copied()
             .collect();
-        targets.reverse();
-        self.targets = targets;
         self.step = PlanStep::PolicyRows;
-        let rows = policy_reads(spec.realm_id, Some(spec.group_id));
+        let mut rows = policy_reads(spec.realm_id, Some(spec.group_id));
+        let realm_auth = Key::from(spec.realm_id.as_bytes().to_vec());
+        rows.push((AUTH_KEYSPACE.to_string(), realm_auth));
         Ok(Next::Call(IoCall::Read(rows)))
     }
 
-    /// Compiles the group's request policy sets; missing state fails every node closed.
-    fn compile_policies(&mut self, values: Vec<Option<Value>>) -> PlanNext {
+    /// Collects the submitter's grants from the realm and group authorization rows, then
+    /// compiles the group's request policy sets; missing state fails every node closed.
+    fn compile_policies(&mut self, mut values: Vec<Option<Value>>) -> PlanNext {
+        let realm_auth = values.pop().flatten();
+        // The group authorization row closes the policy rows.
+        let group_auth = values.last().cloned().flatten();
         let spec = &self.round.spec;
+        self.rules = read_rules(&submitter(spec), vec![realm_auth, group_auth]).ok();
         match read_policies(spec.realm_id, Some(spec.group_id), values) {
             Ok(sets) => {
                 self.step = PlanStep::PolicyCompile;
                 Ok(Next::Call(sets.compile()))
             }
-            Err(_) => {
-                self.judge_policies(None);
-                self.grant()
-            }
+            Err(_) => self.judge(None),
         }
     }
 
-    /// Evaluates the request policies for every candidate node; missing state fails closed.
-    fn judge_policies(&mut self, evaluator: Option<PolicyEvaluator>) {
+    /// Allows a candidate node when the request policies and the submitter's grants both allow
+    /// the write there; missing state fails closed.
+    fn judge(&mut self, evaluator: Option<PolicyEvaluator>) -> PlanNext {
         let spec = &self.round.spec;
         for node in &self.targets {
-            let allows = evaluator.as_ref().is_some_and(|evaluator| {
-                let check = write_check(spec, *node);
+            let check = write_check(spec, *node);
+            let policy = evaluator.as_ref().is_some_and(|evaluator| {
                 let request = policy_request_with(
                     &check.path,
                     &Permission::WRITE,
@@ -235,26 +287,9 @@ impl BuildPlanOperation {
                 );
                 evaluator.evaluate(&request).is_ok()
             });
-            self.policy_allows.insert(*node, allows);
-        }
-    }
-
-    /// Reads the submitter's grants on the next candidate node the policies allow.
-    fn grant(&mut self) -> PlanNext {
-        while let Some(node) = self.targets.pop() {
-            let reads = match self.policy_allows.get(&node) {
-                Some(true) => write_check(&self.round.spec, node).reads().ok(),
-                _ => None,
-            };
-            match reads {
-                Some(reads) => {
-                    self.step = PlanStep::Grant(node);
-                    return Ok(Next::Call(IoCall::Read(reads)));
-                }
-                None => {
-                    self.allowed.insert(node, false);
-                }
-            }
+            let granted = (self.rules.as_ref())
+                .is_some_and(|rules| rules.allows(&check.path, &check.required_permission));
+            self.allowed.insert(*node, policy && granted);
         }
         self.finish()
     }
@@ -305,19 +340,7 @@ impl Operation for BuildPlanOperation {
                 let read = result.child::<Advertised, IoError>()??;
                 self.advertised(read)
             }
-            PlanStep::Holders(index) => {
-                let registered = result
-                    .child::<Vec<NodeId>, GetHoldersError>()?
-                    .unwrap_or_else(|error| {
-                        debug!(error = %error, "Blob holder lookup found no registered copy");
-                        Vec::new()
-                    });
-                let config = &self.round.config;
-                if let Some(input) = self.inputs.get_mut(index) {
-                    merge_holders(config, &mut input.holders, registered);
-                }
-                self.holders(index + 1)
-            }
+            PlanStep::Holders => self.registered(result),
             PlanStep::Policies => {
                 let resolved = result.child::<Resolutions, PolicySetError>()?;
                 self.policies = resolved.unwrap_or_else(|error| {
@@ -327,23 +350,13 @@ impl Operation for BuildPlanOperation {
                 self.targets()
             }
             PlanStep::PolicyRows => self.compile_policies(row_values(result)?),
-            PlanStep::PolicyCompile => {
-                self.judge_policies(compiled_policies(result).ok());
-                self.grant()
-            }
+            PlanStep::PolicyCompile => self.judge(compiled_policies(result).ok()),
             PlanStep::Screen => {
                 // Only the install's receiver may run the task, and only while it passes.
                 if let Ok(install) = result.child::<PluginInstall, ScreenError>()? {
                     self.allowed.insert(install.receiver, true);
                 }
                 self.finish()
-            }
-            PlanStep::Grant(node) => {
-                let values = row_values(result)?;
-                let check = write_check(&self.round.spec, node);
-                self.allowed
-                    .insert(node, check.allowed(values).unwrap_or(false));
-                self.grant()
             }
         }
     }
@@ -353,15 +366,20 @@ fn row_values(result: IoResult) -> Result<Vec<Option<Value>>, PlanBuildError> {
     result.values().map_err(Into::into)
 }
 
+/// The submitter's unrestricted context, the same on every node.
+fn submitter(spec: &LogicalJobSpec) -> AuthContext {
+    AuthContext {
+        user_id: spec.created_by,
+        realm_id: spec.realm_id,
+        path_restrictions: None,
+        session: None,
+    }
+}
+
 /// The submitter's write check on the group path of `node`.
 fn write_check(spec: &LogicalJobSpec, node: NodeId) -> CheckPermissionsConfig {
     CheckPermissionsConfig {
-        auth_context: AuthContext {
-            user_id: spec.created_by,
-            realm_id: spec.realm_id,
-            path_restrictions: None,
-            session: None,
-        },
+        auth_context: submitter(spec),
         path: group_permission_path(spec.realm_id, spec.group_id, node),
         required_permission: Permission::WRITE,
     }
@@ -486,14 +504,21 @@ impl Operation for DeferredReadyOperation {
     type Output = bool;
     type Error = IoError;
 
+    /// Reads only the target's advertisement; a node that is no sync-eligible member has none.
     fn first(&mut self) -> Result<Next<bool>, IoError> {
-        let read = AdvertisementsOperation::new(&self.round.config);
+        let node_id = self.entry.target.node_id;
+        let members = self.round.config.sync_eligible_nodes();
+        if !members.is_ok_and(|members| members.contains(&node_id)) {
+            return Ok(Next::Done(false));
+        }
+        let read = ReadInfoOperation::new(vec![node_id]);
         Ok(Next::Call(IoCall::child(read)))
     }
 
+    /// An unreadable advertisement leaves the target waiting.
     fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-        let (documents, _) = result.child::<Advertised, IoError>()??;
-        Ok(Next::Done(self.ready(documents)))
+        let read = result.child::<BTreeMap<NodeId, NodeInfoDocument>, NodeInfoError>()?;
+        Ok(Next::Done(self.ready(read.unwrap_or_default())))
     }
 }
 
@@ -705,7 +730,7 @@ mod tests {
     use crate::tests::records::{Family, REALM, context, node};
     use aruna_core::compute::{ExecutorCapability, MAX_ADVERTISED_EXECUTORS};
     use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::events::{Event, GroupResult, StorageEvent};
     use aruna_core::keyspaces::NODE_INFO_KEYSPACE;
     use aruna_core::scheduling::plan_execution;
     use aruna_core::structs::execution::job::input::{InputMode, InputSelection};
@@ -1070,9 +1095,14 @@ mod tests {
                     let read: Advertised = (BTreeMap::new(), true);
                     IoResult::Child(ChildOutcome::new(Ok::<_, IoError>(read)))
                 }
-                (PlanStep::Holders(_), IoCall::Child(_)) => IoResult::Child(ChildOutcome::new(
-                    Ok::<_, GetHoldersError>(Vec::<NodeId>::new()),
-                )),
+                (PlanStep::Holders, IoCall::Group(group)) => {
+                    let found = || {
+                        let found = Ok::<_, GetHoldersError>(Vec::<NodeId>::new());
+                        GroupResult::Done(Box::new(Event::Child(ChildOutcome::new(found))))
+                    };
+                    let results = group.members.iter().map(|_| found()).collect();
+                    IoResult::Group(GroupEvent::Finished { results })
+                }
                 (PlanStep::Policies, IoCall::Child(_)) => {
                     let resolved = Ok::<_, PolicySetError>(Resolutions::new());
                     IoResult::Child(ChildOutcome::new(resolved))

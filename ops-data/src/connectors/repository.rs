@@ -1,0 +1,203 @@
+//! Builds the keys, storage effects and read parsers for connector and secret rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::effects::{Effect, IterStart, StorageEffect};
+use aruna_core::errors::ConversionError;
+use aruna_core::events::Event;
+use aruna_core::keyspaces::{CONNECTOR_REFERENCE_KEYSPACE, SOURCE_INDEX_KEYSPACE};
+use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorSecret};
+use aruna_core::structs::storage::blob::{BlobVersion, BlobVersionState, VersionKey};
+use aruna_core::types::{GroupId, Key, TxnId, Value};
+use byteview::ByteView;
+use ulid::Ulid;
+
+use aruna_ops_identity::node_vault::{delete_secret, parse_secret, read_secret, write_secret};
+
+use aruna_core::errors::StorageReadError;
+use aruna_core::storage_read::{parse_storage_iter, parse_storage_read};
+
+pub const LIST_CONNECTOR_SIZE: usize = 128;
+pub const REFERENCE_PAGE_SIZE: usize = 128;
+
+pub fn source_connector_key(group_id: GroupId, connector_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes.extend_from_slice(&connector_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// The row naming the group that holds `connector_id` on this node.
+pub fn connector_id_key(connector_id: Ulid) -> Key {
+    ByteView::from(connector_id.to_bytes().to_vec())
+}
+
+/// The reference row of one version bound to `connector_id`; rows of a connector share a prefix.
+pub fn connector_reference_key(
+    connector_id: Ulid,
+    version_key: &VersionKey,
+) -> Result<Key, ConversionError> {
+    let mut bytes = connector_id.to_bytes().to_vec();
+    bytes.extend_from_slice(&version_key.to_bytes()?);
+    Ok(ByteView::from(bytes))
+}
+
+/// The rows a write adds beside a reference version, one per connector its sources name.
+pub fn connector_reference_write(
+    version: &BlobVersion,
+    version_key: &VersionKey,
+) -> Result<Vec<(String, Key, Value)>, ConversionError> {
+    let BlobVersionState::Reference { source, .. } = &version.state else {
+        return Ok(Vec::new());
+    };
+    (source.connector_ids().into_iter())
+        .map(|connector_id| {
+            Ok((
+                CONNECTOR_REFERENCE_KEYSPACE.to_string(),
+                connector_reference_key(connector_id, version_key)?,
+                ByteView::from(Vec::new()),
+            ))
+        })
+        .collect()
+}
+
+pub fn source_connector_prefix(group_id: GroupId) -> Key {
+    ByteView::from(group_id.to_bytes().to_vec())
+}
+
+pub fn read_connector_effect(
+    group_id: GroupId,
+    connector_id: Ulid,
+    txn_id: Option<TxnId>,
+) -> Effect {
+    Effect::Storage(StorageEffect::Read {
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+        key: source_connector_key(group_id, connector_id),
+        txn_id,
+    })
+}
+
+pub fn read_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+    read_secret(SourceConnectorSecret::vault_entry(connector_id), txn_id)
+}
+
+pub fn write_secret_effect(
+    secret: &SourceConnectorSecret,
+    txn_id: Option<TxnId>,
+) -> Result<Effect, ConversionError> {
+    let entry = SourceConnectorSecret::vault_entry(secret.connector_id);
+    Ok(write_secret(entry, secret.to_secret()?, txn_id))
+}
+
+pub fn delete_connector_effect(
+    group_id: GroupId,
+    connector_id: Ulid,
+    txn_id: Option<TxnId>,
+) -> Effect {
+    Effect::Storage(StorageEffect::Delete {
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+        key: source_connector_key(group_id, connector_id),
+        txn_id,
+    })
+}
+
+pub fn delete_secret_effect(connector_id: Ulid, txn_id: Option<TxnId>) -> Effect {
+    delete_secret(SourceConnectorSecret::vault_entry(connector_id), txn_id)
+}
+
+pub fn iter_connectors_effect(
+    group_id: GroupId,
+    start_after: Option<Key>,
+    txn_id: Option<TxnId>,
+) -> Effect {
+    Effect::Storage(StorageEffect::Iter {
+        key_space: SOURCE_INDEX_KEYSPACE.to_string(),
+        prefix: Some(source_connector_prefix(group_id)),
+        start: start_after.map(IterStart::After),
+        limit: LIST_CONNECTOR_SIZE,
+        txn_id,
+    })
+}
+
+pub fn parse_connector_read(event: Event) -> Result<Option<SourceConnector>, StorageReadError> {
+    parse_storage_read(event, SourceConnector::from_bytes)
+}
+
+pub fn parse_secret_read(
+    event: Event,
+    connector_id: Ulid,
+) -> Result<Option<SourceConnectorSecret>, StorageReadError> {
+    parse_secret(
+        event,
+        SourceConnectorSecret::vault_entry(connector_id),
+        SourceConnectorSecret::from_bytes,
+    )
+}
+
+pub fn parse_connector_iter(
+    event: Event,
+) -> Result<(Vec<SourceConnector>, Option<Key>), StorageReadError> {
+    parse_storage_iter(event, SourceConnector::from_bytes)
+}
+
+pub fn references_connector(version: &BlobVersion, connector_id: Ulid) -> bool {
+    matches!(
+        &version.state,
+        BlobVersionState::Reference { source, .. }
+            if source.connector_ids().contains(&connector_id)
+    )
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+    use aruna_core::events::StorageEvent;
+    use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
+    use std::collections::HashMap;
+    use std::time::SystemTime;
+
+    fn sample_record() -> SourceConnector {
+        SourceConnector::new(
+            Ulid::from_bytes([4u8; 16]),
+            Ulid::from_bytes([3u8; 16]),
+            "source-a".to_string(),
+            SourceConnectorKind::S3,
+            HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.com".to_string()),
+                ("region".to_string(), "eu-central-1".to_string()),
+            ]),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            Default::default(),
+        )
+    }
+
+    #[test]
+    fn prefix_matches_group() {
+        let record = sample_record();
+        let prefix = source_connector_prefix(record.group_id);
+        let key = source_connector_key(record.group_id, record.connector_id);
+
+        assert!(key.as_ref().starts_with(prefix.as_ref()));
+        assert_eq!(key.as_ref().len(), 32);
+    }
+
+    #[test]
+    fn decodes_connector_page() {
+        let record = sample_record();
+        let next_key = source_connector_key(record.group_id, Ulid::from_bytes([6u8; 16]));
+        let event = Event::Storage(StorageEvent::IterResult {
+            values: vec![(
+                source_connector_key(record.group_id, record.connector_id),
+                record.to_bytes().unwrap().into(),
+            )],
+            next_start_after: Some(next_key.clone()),
+        });
+
+        let (records, next_start_after) = parse_connector_iter(event).unwrap();
+
+        assert_eq!(records, vec![record]);
+        assert_eq!(next_start_after.unwrap().as_ref(), next_key.as_ref());
+    }
+}

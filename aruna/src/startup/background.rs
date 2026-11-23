@@ -43,8 +43,7 @@ fn spawn_index_feed(context: Arc<DriverContext>, shutdown: &Shutdown) {
     if context.storage_handle.range_indexes().is_none() {
         return;
     }
-    let mut bulk = (*context).clone();
-    bulk.storage_handle = context.storage_handle.bulk();
+    let bulk = context.bulk();
     let limits = FeedLimits::default();
     let mut cursors = FeedCursors::default();
     let token = shutdown.token();

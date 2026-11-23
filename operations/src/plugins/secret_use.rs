@@ -33,11 +33,11 @@ use super::artifacts::ServingNode;
 use super::entry::{EntryError, ReadEntry};
 use super::install::{pick_version, read_manifest};
 use super::rows::{Row, StoreError, read_call, values, write_rows};
-use crate::auth::enforcement::{compiled_policies, policy_reads, read_policies};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::secrets::node::{record_key, value_entry};
-use crate::secrets::owner::sealed_value;
-use crate::users::install_account::{owns_install, read_user_call, read_user_result};
+use aruna_ops_identity::auth::enforcement::{compiled_policies, policy_reads, read_policies};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::secrets::node::{record_key, value_entry};
+use aruna_ops_identity::secrets::owner::sealed_value;
+use aruna_ops_identity::users::install_account::{owns_install, read_user_call, read_user_result};
 
 /// A failed release, as the operations behind it report it.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

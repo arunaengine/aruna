@@ -18,9 +18,9 @@ use aruna_core::structs::storage::node_info::NodeInfoDocument;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::device_node::realm_documents::installed_management_urls;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::users::merge::{Coordinator, coordinator};
+use aruna_ops_identity::device_node::realm_documents::installed_management_urls;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::users::merge::{Coordinator, coordinator};
 
 /// Why no target of a relayed call is known.
 #[derive(Debug, Error, PartialEq)]

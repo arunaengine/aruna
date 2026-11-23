@@ -223,7 +223,7 @@ impl AdmitSubmissionOperation {
             ADMISSION_QUOTA_KEYSPACE.to_string(),
             Key::from(spec.group_id.to_bytes().as_slice()),
         );
-        let fence = crate::groups::fence::group_fence_key(spec.group_id);
+        let fence = aruna_ops_identity::groups::fence::group_fence_key(spec.group_id);
         self.state = AdmitState::ReadQuota;
         Ok(Next::Call(IoCall::Read(vec![quota, fence])))
     }

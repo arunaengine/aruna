@@ -321,7 +321,7 @@ impl Operation for CancelOrphans {
             }
             OrphanPhase::Entry(spec) => {
                 let entry = result.child::<InstallEntry, RecordError>()?;
-                let entry = entry.map_err(|error| StoreError(error.to_string()))?;
+                let entry = entry.map_err(|error| StoreError::Message(error.to_string()))?;
                 if !removal_confirmed(&entry, spec.created_by) {
                     return self.next_family();
                 }

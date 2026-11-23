@@ -5,7 +5,9 @@
 # Operations guide
 
 This guide is for people who run Aruna nodes and for group admins who manage storage. Start with
-the [README](../README.md) to get a node running.
+the [README](../README.md) for a quick local run, or the [production deployment guide](deployment.md)
+for an end-to-end server setup (release tags, DNS, firewall ports, Docker Compose, OIDC, backups and
+upgrades).
 
 ## Configuration
 
@@ -104,11 +106,12 @@ The container can listen on unprivileged ports and Docker maps host ports `80` a
 ```yaml
 services:
   aruna:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna:<tag>
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<tag>
     ports:
       - "443:8443"
       - "80:8080"
       - "3001:3001/udp"
+      - "127.0.0.1:3002:3002"
     volumes:
       - aruna-data:/data
       - ./tls:/tls:ro
@@ -122,9 +125,11 @@ services:
       S3_HOST: s3.example.org
       PORTAL_PUBLIC_URL: https://portal.example.org
       CORS_ALLOWED_ORIGINS: https://portal.example.org
+      PORTAL_MODE: artifact
       SOCKET_ADDRESS: 0.0.0.0:3000
       S3_ADDRESS: 0.0.0.0:1337
       PORTAL_SOCKET_ADDRESS: 127.0.0.1:3003
+      OPS_SOCKET_ADDRESS: 0.0.0.0:3002
       P2P_SOCKET_ADDRESS: 0.0.0.0:3001
 ```
 

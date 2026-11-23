@@ -225,10 +225,10 @@ mod operations {
     use crate::plugins::fixtures::{self, config_result, is_child};
     use crate::plugins::rate::tests::rate_answer;
     use crate::plugins::rows::tests::child_result;
-    use crate::users::service_account::check::ServiceCheckError;
     use aruna_core::plugin_installs::SecretBinding;
     use aruna_core::plugins::ReleaseError;
     use aruna_core::structs::identity::user::User;
+    use aruna_ops_identity::users::service_account::check::ServiceCheckError;
 
     fn manual() -> Value {
         json!({ "triggers": { "manual": {} } })

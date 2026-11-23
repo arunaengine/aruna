@@ -154,7 +154,7 @@ impl Operation for SendCall {
             }
             SendPhase::Begin => {
                 let begun = result.child::<Begun, StoreError>()?;
-                let begun = begun.map_err(|error| CallError(unavailable(error.0)))?;
+                let begun = begun.map_err(|error| CallError(unavailable(error.detail())))?;
                 match begun_reply(begun)? {
                     Some(reply) => Ok(Next::Done(stored_whole(&reply)?)),
                     None => self.send(),

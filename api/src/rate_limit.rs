@@ -308,8 +308,7 @@ pub async fn principal_middleware(
     let principal = request
         .extensions()
         .get::<Option<AuthContext>>()
-        .cloned()
-        .flatten()
+        .and_then(Option::as_ref)
         .map(|auth| auth.user_id);
     let Some(principal) = principal else {
         return next.run(request).await;

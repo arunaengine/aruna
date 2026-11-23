@@ -209,8 +209,6 @@ pub(super) fn effect_kind(effect: &Effect) -> &'static str {
         Effect::Background(_) => "background",
         Effect::Detached(_) => "detached",
         Effect::Task(_) => "task",
-        Effect::Search() => "search",
-        Effect::Stream() => "stream",
         Effect::Index(_) => "index",
         Effect::Group(_) => "group",
         Effect::Session(_) => "session",

@@ -1,5 +1,5 @@
-//! Tests the watch expansion as calls: the guard reads in its transaction and the retry row of
-//! the next page within the queue's caps.
+//! Tests the watch expansion as calls: the guard reads in its transaction, checks asked once per
+//! run, and the retry row of the next page within the queue's caps.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
@@ -104,6 +104,63 @@ fn guard_reads_authorization() {
     assert!(reads.contains(&realm_row) && reads.contains(&group_row));
     let changed = vec![Some(Value::from(vec![1])), None, None];
     assert_eq!(operation.guard_checked(changed), Err(ExpandError::Conflict));
+}
+
+/// One watch with a candidate for each of two events on the same path.
+fn twice_routed() -> WatchExpandOperation {
+    let mut operation = expanding(None);
+    let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+    let prefix = aruna_core::structs::execution::notification_watch::watch_resource_path(
+        Ulid::from_bytes([5; 16]),
+        node(),
+        "bucket",
+        "",
+    );
+    let watch = WatchSubscription::new(Ulid::generate(), user(4, 2), prefix, mask, 1);
+    let candidate = |seed| Candidate {
+        subscription: watch.clone(),
+        event: event(seed),
+        routed: Vec::new(),
+    };
+    operation.candidates = [candidate(1), candidate(2)].into();
+    operation
+}
+
+fn answered(answer: WatchAuthorization) -> IoResult {
+    IoResult::Child(ChildOutcome::new(Ok::<_, WatchCheckError>(answer)))
+}
+
+/// Equal scope and event checks of a later candidate are answered without another child.
+#[test]
+fn checks_asked_once() {
+    let mut operation = twice_routed();
+    let asked = operation.next_candidate();
+    assert!(matches!(asked, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, ExpandState::Scope);
+    let asked = operation.next(answered(WatchAuthorization::Authorized));
+    assert!(matches!(asked, Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(operation.state, ExpandState::Event);
+    let done = operation.next(answered(WatchAuthorization::Authorized));
+    assert_eq!(done, Ok(Next::Done(ExpandOutcome::default())));
+    assert_eq!(operation.answered.len(), 2);
+}
+
+/// A remembered denial still drops and records every candidate it denies.
+#[test]
+fn denial_counted_twice() {
+    use crate::notifications::watch::paths::WatchAuthorizationDenial;
+    let mut operation = twice_routed();
+    operation.next_candidate().unwrap();
+    let denied = WatchAuthorization::Denied(WatchAuthorizationDenial::PermissionDenied);
+    let marker = operation.next(answered(denied));
+    assert!(matches!(marker, Ok(Next::Call(IoCall::Write(_)))));
+    assert_eq!(operation.answered.len(), 1);
+    assert_eq!(operation.suppressed.len(), 2);
+    let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+        panic!("the suppressions are recorded after the commit");
+    };
+    assert!(output.dropped);
+    assert_eq!(calls.len(), 2);
 }
 
 /// A drained retry row that is gone meanwhile is a conflict; a present one is deleted.

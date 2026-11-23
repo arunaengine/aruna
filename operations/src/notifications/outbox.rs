@@ -11,9 +11,10 @@ use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetEvent, StorageEvent};
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{
-    InboxWriteOutcome, NotificationOutboxRecord, NotificationRecord,
+    InboxWriteOutcome, NotificationClass, NotificationOutboxRecord, NotificationRecord,
+    TRANSIENT_USER_CAP,
 };
 use aruna_core::structs::execution::notification::{
     NotificationRequest, NotificationTransportMessage,
@@ -21,6 +22,7 @@ use aruna_core::structs::execution::notification::{
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use crate::notifications::enqueue::{EnqueueDeliveriesOperation, EnqueueError};
@@ -37,7 +39,11 @@ pub(crate) const OUTBOX_RETENTION_MS: u64 = 48 * 60 * 60 * 1000;
 struct Page {
     has_more: bool,
     records: Vec<(Key, NotificationOutboxRecord)>,
-    local_keys: Vec<Key>,
+    local: Vec<(Key, NotificationRecord)>,
+    /// Held local records by realm, each queued against its own realm config.
+    held: VecDeque<(RealmId, Vec<NotificationRecord>)>,
+    /// Whether a realm's queue failed, so the local rows stay for the next run.
+    unqueued: bool,
     remote: VecDeque<(NodeId, Vec<NotificationRecord>, Vec<Key>)>,
 }
 
@@ -65,7 +71,7 @@ enum DrainState {
 
 type Turn = Result<Next<Option<Duration>>, IoError>;
 
-/// One drain run over a read snapshot, page by page, so a dead holder hides no healthy record.
+/// One drain run outside any transaction, page by page, so a dead holder hides no healthy record.
 /// Local records go to the inbox, others to their holder once per run; rows stay until
 /// delivered, expired ones are dropped. The output is when the drain runs again.
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +160,8 @@ impl DrainOutboxOperation {
             records: kept,
             ..Page::default()
         };
+        // Each page reads the configs again, so a placement change reaches the rows it holds.
+        self.configs.clear();
         if expired.is_empty() {
             return self.read_configs();
         }
@@ -200,8 +208,8 @@ impl DrainOutboxOperation {
         let Some(local) = self.local else {
             return self.close();
         };
-        let mut local_records = Vec::new();
         let mut remote: BTreeMap<NodeId, (Vec<NotificationRecord>, Vec<Key>)> = BTreeMap::new();
+        let mut transient: BTreeMap<UserId, usize> = BTreeMap::new();
         for (key, outbox) in std::mem::take(&mut self.page.records) {
             let record = outbox.record;
             let realm_id = record.recipient.realm_id;
@@ -223,11 +231,21 @@ impl DrainOutboxOperation {
                     continue;
                 }
             };
-            if holder == local {
-                local_records.push(record);
-                self.page.local_keys.push(key);
-            } else if self.failed_holders.contains(&holder) {
+            if holder != local && self.failed_holders.contains(&holder) {
                 self.retry = true;
+                continue;
+            }
+            // No batch holds more transient rows for one recipient than its inbox may keep.
+            if record.class == NotificationClass::Transient {
+                let count = transient.entry(record.recipient).or_default();
+                if *count >= TRANSIENT_USER_CAP {
+                    self.retry = true;
+                    continue;
+                }
+                *count += 1;
+            }
+            if holder == local {
+                self.page.local.push((key, record));
             } else {
                 let group = remote.entry(holder).or_default();
                 group.0.push(record);
@@ -237,40 +255,93 @@ impl DrainOutboxOperation {
         self.page.remote = (remote.into_iter())
             .map(|(holder, (records, keys))| (holder, records, keys))
             .collect();
-        if local_records.is_empty() {
+        self.upsert_local()
+    }
+
+    fn upsert_local(&mut self) -> Turn {
+        if self.page.local.is_empty() {
             return self.next_remote();
         }
+        let records: Vec<_> = (self.page.local.iter())
+            .map(|(_, record)| record.clone())
+            .collect();
         self.state = DrainState::Upsert;
-        Ok(Next::Call(IoCall::child(UpsertInboxOperation::new(
-            local_records,
-        ))))
+        let build = move || UpsertInboxOperation::new(records.clone());
+        Ok(Next::Call(IoCall::retry_with(build, b"notification-inbox")))
+    }
+
+    fn upserted(&mut self, result: Result<InboxWriteOutcome, InboxError>) -> Turn {
+        match result {
+            Ok(outcome) if outcome.recipients.is_empty() => self.run_enqueue(outcome.held),
+            Ok(outcome) => {
+                self.state = DrainState::Wake { held: outcome.held };
+                let wake = Effect::Net(NetEffect::WakeInbox(outcome.recipients));
+                Ok(Next::Call(IoCall::from(wake)))
+            }
+            // Only the full inbox waits: its later half of transient rows stays, so the rest fits.
+            Err(InboxError::TransientCap(recipient)) => {
+                warn!(%recipient, "Notification inbox is full; retrying its delivery");
+                self.retry = true;
+                let capped = |record: &NotificationRecord| {
+                    record.recipient == recipient && record.class == NotificationClass::Transient
+                };
+                let count = (self.page.local.iter())
+                    .filter(|(_, record)| capped(record))
+                    .count();
+                if count == 0 {
+                    return self.next_remote();
+                }
+                let mut kept = 0;
+                self.page.local.retain(|(_, record)| {
+                    kept += usize::from(capped(record));
+                    !capped(record) || kept <= count / 2
+                });
+                self.upsert_local()
+            }
+            Err(error) => {
+                warn!(%error, "Failed to deliver notifications to local inbox");
+                self.retry = true;
+                self.next_remote()
+            }
+        }
     }
 
     fn run_enqueue(&mut self, held: Vec<NotificationRecord>) -> Turn {
+        let mut realms: BTreeMap<RealmId, Vec<NotificationRecord>> = BTreeMap::new();
+        for record in held {
+            let realm_id = record.recipient.realm_id;
+            realms.entry(realm_id).or_default().push(record);
+        }
+        self.page.held = realms.into_iter().collect();
+        self.next_enqueue()
+    }
+
+    /// Queues the next realm's held records; the outbox rows stay until every realm's are queued.
+    fn next_enqueue(&mut self) -> Turn {
         let Some(local) = self.local else {
             return self.next_remote();
         };
-        let config = (held.first())
-            .and_then(|record| self.configs.get(&record.recipient.realm_id))
-            .and_then(Option::as_ref);
+        let Some((realm_id, held)) = self.page.held.pop_front() else {
+            if self.page.unqueued {
+                return self.next_remote();
+            }
+            let rows = std::mem::take(&mut self.page.local);
+            let keys = rows.into_iter().map(|(key, _)| key).collect();
+            return self.delete(DrainState::DeleteLocal, keys);
+        };
+        let config = self.configs.get(&realm_id).and_then(Option::as_ref);
         let enqueue = EnqueueDeliveriesOperation::new(local, config, &held, self.now_ms);
         self.state = DrainState::Enqueue;
         Ok(Next::Call(IoCall::child(enqueue)))
     }
 
-    /// The outbox rows stay until their deliveries are queued.
     fn enqueued(&mut self, result: Result<(), EnqueueError>) -> Turn {
-        match result {
-            Ok(()) => {
-                let keys = std::mem::take(&mut self.page.local_keys);
-                self.delete(DrainState::DeleteLocal, keys)
-            }
-            Err(error) => {
-                warn!(%error, "Failed to queue notification deliveries");
-                self.retry = true;
-                self.next_remote()
-            }
+        if let Err(error) = result {
+            warn!(%error, "Failed to queue notification deliveries");
+            self.retry = true;
+            self.page.unqueued = true;
         }
+        self.next_enqueue()
     }
 
     fn next_remote(&mut self) -> Turn {
@@ -319,7 +390,7 @@ impl DrainOutboxOperation {
     }
 }
 
-/// The check for rows appended during the run; it reads outside the snapshot, as an effect.
+/// The check for rows appended during the run, sent as an effect.
 fn head_call() -> IoCall {
     IoCall::from(Effect::Storage(StorageEffect::Iter {
         key_space: NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
@@ -367,10 +438,6 @@ impl Operation for DrainOutboxOperation {
     type Output = Option<Duration>;
     type Error = IoError;
 
-    fn transaction(&self) -> TransactionMode {
-        TransactionMode::ReadSnapshot
-    }
-
     fn first(&mut self) -> Turn {
         if self.local.is_none() {
             warn!("Cannot drain notification outbox without net handle");
@@ -390,19 +457,7 @@ impl Operation for DrainOutboxOperation {
                 self.configs_read(realms, values)
             }
             (DrainState::Upsert, result) => {
-                match result.child::<InboxWriteOutcome, InboxError>()? {
-                    Ok(outcome) if outcome.recipients.is_empty() => self.run_enqueue(outcome.held),
-                    Ok(outcome) => {
-                        self.state = DrainState::Wake { held: outcome.held };
-                        let wake = Effect::Net(NetEffect::WakeInbox(outcome.recipients));
-                        Ok(Next::Call(IoCall::from(wake)))
-                    }
-                    Err(error) => {
-                        warn!(%error, "Failed to deliver notifications to local inbox");
-                        self.retry = true;
-                        self.next_remote()
-                    }
-                }
+                self.upserted(result.child::<InboxWriteOutcome, InboxError>()?)
             }
             (DrainState::Wake { held }, IoResult::Event(event))
                 if matches!(*event, Event::Net(NetEvent::InboxWoken)) =>
@@ -499,8 +554,10 @@ mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::operation::TransactionMode;
     use aruna_core::storage_entries::outbox_write_entry;
-    use aruna_core::structs::execution::notification::NotificationClass;
+    use aruna_core::structs::execution::notification::{NotificationClass, NotificationKind};
     use aruna_core::structs::identity::auth::Actor;
     use aruna_core::structs::identity::realm::RealmNodeKind;
     use aruna_core::user::id::UserId;
@@ -610,7 +667,7 @@ mod call_tests {
         assert_eq!(operation.next(ack), delete_call(key));
         assert_eq!(operation.next(delete_result()), Ok(Next::Call(head_call())));
         assert_eq!(operation.next(head(Vec::new())), Ok(Next::Done(None)));
-        assert_eq!(operation.transaction(), TransactionMode::ReadSnapshot);
+        assert_eq!(operation.transaction(), TransactionMode::None);
     }
 
     /// A failed delete keeps the rows, goes on with the run and asks for a retry.
@@ -642,9 +699,194 @@ mod call_tests {
             Ok(Next::Call(IoCall::Child(_)))
         ));
         let failed = Err::<InboxWriteOutcome, _>(InboxError::Conflict);
-        let failed = IoResult::Child(aruna_core::calls::ChildOutcome::new(failed));
+        let failed = IoResult::Child(ChildOutcome::new(failed));
         assert_eq!(
             operation.next(failed),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
+    }
+
+    /// A full inbox keeps only its own rows; the other recipient's notices go on.
+    #[test]
+    fn full_inbox_isolated() {
+        let capped = record(user(1, 2), NotificationClass::Transient, NOW_MS);
+        let other = record(user(1, 3), NotificationClass::Transient, NOW_MS);
+        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        operation.page.local = vec![
+            (Key::from(vec![1]), capped.clone()),
+            (Key::from(vec![2]), other.clone()),
+        ];
+        let upsert = operation.upsert_local();
+        assert!(matches!(upsert, Ok(Next::Call(IoCall::Child(_)))));
+        let full = Err::<InboxWriteOutcome, _>(InboxError::TransientCap(capped.recipient));
+        let upsert = operation.next(IoResult::Child(ChildOutcome::new(full)));
+        assert!(matches!(upsert, Ok(Next::Call(IoCall::Child(_)))));
+        assert_eq!(operation.page.local, vec![(Key::from(vec![2]), other)]);
+        let stored = Ok::<_, InboxError>(InboxWriteOutcome::default());
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(stored))),
+            delete_call(Key::from(vec![2]))
+        );
+        assert_eq!(
+            operation.next(delete_result()),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
+    }
+
+    fn deletes(keys: Vec<Key>) -> Turn {
+        let space = || NOTIFICATION_OUTBOX_KEYSPACE.to_string();
+        let delete = StorageEffect::BatchDelete {
+            deletes: keys.into_iter().map(|key| (space(), key)).collect(),
+            txn_id: None,
+        };
+        Ok(Next::Call(IoCall::from(Effect::Storage(delete))))
+    }
+
+    /// A drain that holds the realm config of `user(1, 2)` with this node as its holder.
+    fn local_drain() -> DrainOutboxOperation {
+        let local = node_id(1);
+        let (realm_id, config) = config_bytes(local);
+        let config = RealmConfigDocument::from_bytes(&config).expect("config decodes");
+        let mut operation = DrainOutboxOperation::new(Some(local), NOW_MS);
+        operation.configs.insert(realm_id, Some(config));
+        operation
+    }
+
+    /// One page with more transient notices for one recipient than its inbox keeps.
+    #[test]
+    fn transient_cap_progresses() {
+        let mut operation = local_drain();
+        let notice = record(user(1, 2), NotificationClass::Transient, NOW_MS);
+        let keys: Vec<Key> = (0..=TRANSIENT_USER_CAP)
+            .map(|at| Key::from((at as u32).to_be_bytes().to_vec()))
+            .collect();
+        operation.page.records = (keys.iter().enumerate())
+            .map(|(at, key)| {
+                let outbox = NotificationOutboxRecord {
+                    outbox_id: Ulid::from_parts(NOW_MS - 1_000, at as u128),
+                    record: notice.clone(),
+                };
+                (key.clone(), outbox)
+            })
+            .collect();
+        assert!(matches!(
+            operation.group(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.page.local.len(), TRANSIENT_USER_CAP);
+        assert!(operation.retry);
+        // The first 500 commit and leave, the last stays queued for the next run.
+        let stored = Ok::<_, InboxError>(InboxWriteOutcome::default());
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(stored))),
+            deletes(keys[..TRANSIENT_USER_CAP].to_vec())
+        );
+        assert_eq!(
+            operation.next(delete_result()),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
+    }
+
+    /// A full inbox halves the recipient's transient rows and keeps its direct ones.
+    #[test]
+    fn capped_direct_commits() {
+        let recipient = user(1, 2);
+        let transient = record(recipient, NotificationClass::Transient, NOW_MS);
+        let direct = record(recipient, NotificationClass::Direct, NOW_MS);
+        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        operation.page.local = vec![
+            (Key::from(vec![1]), transient.clone()),
+            (Key::from(vec![2]), direct.clone()),
+            (Key::from(vec![3]), transient.clone()),
+        ];
+        operation.upsert_local().unwrap();
+        let full = || {
+            let full = Err::<InboxWriteOutcome, _>(InboxError::TransientCap(recipient));
+            IoResult::Child(ChildOutcome::new(full))
+        };
+        assert!(matches!(
+            operation.next(full()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let halved = vec![
+            (Key::from(vec![1]), transient),
+            (Key::from(vec![2]), direct.clone()),
+        ];
+        assert_eq!(operation.page.local, halved);
+        assert!(matches!(
+            operation.next(full()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.page.local, vec![(Key::from(vec![2]), direct)]);
+        let stored = Ok::<_, InboxError>(InboxWriteOutcome::default());
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(stored))),
+            delete_call(Key::from(vec![2]))
+        );
+    }
+
+    /// A new page reads its realm configs again instead of a config an earlier page read.
+    #[test]
+    fn page_rereads_configs() {
+        let mut operation = local_drain();
+        let (key, value) = outbox_row(record(user(1, 2), NotificationClass::Direct, NOW_MS));
+        let realm_id = user(1, 2).realm_id;
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(rows(vec![(key, value)])),
+            Ok(Next::Call(IoCall::Read(vec![(
+                REALM_CONFIG_KEYSPACE.to_string(),
+                Key::from(realm_id.as_bytes().to_vec())
+            )])))
+        );
+    }
+
+    /// An upload notice for `recipient`, which queues a webhook job.
+    fn upload(recipient: UserId) -> NotificationRecord {
+        let mut notice = record(recipient, NotificationClass::Direct, NOW_MS);
+        notice.kind = NotificationKind::ShareUpload {
+            share_id: Ulid::from_parts(4, 4),
+            node_id: node_id(3),
+            group_id: Ulid::from_parts(5, 5),
+            bucket: "inbox".to_string(),
+            key: "a.csv".to_string(),
+            size_bytes: 9,
+        };
+        notice
+    }
+
+    /// Each realm's held notices queue against that realm's own config.
+    #[test]
+    fn realms_queue_apart() {
+        let local = node_id(1);
+        let (first, second) = (upload(user(1, 2)), upload(user(2, 2)));
+        let mut placed = RealmConfigDocument::new(first.recipient.realm_id, Vec::new(), 3);
+        placed.seed_default_placement();
+        placed.seed_job_control(local, 0);
+        let unplaced = RealmConfigDocument::new(second.recipient.realm_id, Vec::new(), 3);
+        let mut operation = DrainOutboxOperation::new(Some(local), NOW_MS);
+        let configs = [(&first, &placed), (&second, &unplaced)];
+        for (notice, config) in configs {
+            let realm_id = notice.recipient.realm_id;
+            operation.configs.insert(realm_id, Some(config.clone()));
+        }
+        let queue = |(notice, config): (&NotificationRecord, &RealmConfigDocument)| -> Turn {
+            let held = std::slice::from_ref(notice);
+            let enqueue = EnqueueDeliveriesOperation::new(local, Some(config), held, NOW_MS);
+            Ok(Next::Call(IoCall::child(enqueue)))
+        };
+        let held = vec![second.clone(), first.clone()];
+        assert_eq!(operation.run_enqueue(held), queue(configs[0]));
+        let queued = Ok::<_, EnqueueError>(());
+        let turn = operation.next(IoResult::Child(ChildOutcome::new(queued)));
+        assert_eq!(turn, queue(configs[1]));
+        // The second realm has no job placement, so the local rows stay for the next run.
+        let failed = Err::<(), _>(EnqueueError::Submit {
+            channel: "webhook",
+            reason: "unplaced".to_string(),
+        });
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(failed))),
             Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
         );
     }

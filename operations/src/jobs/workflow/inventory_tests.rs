@@ -10,7 +10,7 @@ use aruna_core::structs::execution::job::local::{JobErrorKind, OutputCommitInten
 use aruna_core::structs::storage::blob::BlobHeadKey;
 
 use super::*;
-use crate::s3::object::list::ListedObject;
+use aruna_ops_data::s3::object::list::ListedObject;
 
 const BUCKET: &str = "work";
 

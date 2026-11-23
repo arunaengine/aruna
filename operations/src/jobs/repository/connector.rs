@@ -14,13 +14,13 @@ use ulid::Ulid;
 
 use super::TransferError;
 use super::invenio::Session;
-use crate::auth::error::{AuthorizeError, PolicyEnforcementError};
-use crate::auth::request_authorization::AuthorizeOperation;
-use crate::connectors::harvest_rows::{
-    INVENIO_TOKEN as CONNECTOR_TOKEN, parse_secret_read, read_secret_effect,
-};
 use crate::harvest::read_connector::{ConnectorView, GetRepositoryOperation, ReadConnectorError};
 use aruna_core::request_policy::PolicyRequestExtras;
+use aruna_ops_data::connectors::harvest_rows::{
+    INVENIO_TOKEN as CONNECTOR_TOKEN, parse_secret_read, read_secret_effect,
+};
+use aruna_ops_identity::auth::error::{AuthorizeError, PolicyEnforcementError};
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 
 /// Reads the group's repository connector, with the failures a transfer reports.
 #[derive(Debug, PartialEq)]

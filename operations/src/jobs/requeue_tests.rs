@@ -87,11 +87,11 @@ async fn panicked_import_kept() {
     });
     insert_job(&driver, &record).await.unwrap();
 
-    let Event::Blob(BlobEvent::HiddenSpooled {
+    let Ok(BlobEvent::HiddenSpooled {
         location,
         blake3,
         size,
-    }) = driver
+    }) = (driver
         .blob_handle
         .as_ref()
         .unwrap()
@@ -105,7 +105,8 @@ async fn panicked_import_kept() {
                 b"archive bytes".to_vec(),
             ))),
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("input spool failed")
     };

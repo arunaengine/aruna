@@ -80,10 +80,12 @@ impl ProfileShaclEngine {
         profile: &ProfileShapes,
         jsonld: &str,
     ) -> Result<ProfileShaclReport, ProfileShaclError> {
-        let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
-        let index = self.install_shapes(&mut cached, profile)?;
         let prepared = self.prepare(jsonld)?;
-        let policy = self.compiled_policy(&mut cached, index, prepared.detected_version)?;
+        let policy = {
+            let mut cached = self.cached.lock().unwrap_or_else(PoisonError::into_inner);
+            let index = self.install_shapes(&mut cached, profile)?;
+            self.compiled_policy(&mut cached, index, prepared.detected_version)?
+        };
         let report = self
             .node
             .evaluate_rocrate_policy(

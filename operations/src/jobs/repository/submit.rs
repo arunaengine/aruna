@@ -2,11 +2,10 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::repository::remote::NodeScope;
 use aruna_core::structs::execution::job::input::{
     ExportRoCrateSpec, ImportRoCrateSpec, JobPayload,
@@ -16,10 +15,10 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::secondary_id::RegisterIdentifiersSpec;
 use tracing::warn;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::submit::execution::mint_unplaced;
 use crate::jobs::submit::{SubmitJobOperation, SubmitJobSpec};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// A job a repository link starts.
 #[derive(Clone, Debug, PartialEq)]
@@ -119,10 +118,7 @@ impl LinkJobOperation {
         let spec = job.spec(self.scope.node_or(self.owner), key, self.now_ms);
         self.step = SubmitStep::Submit;
         let build = move || SubmitJobOperation::new(spec.clone(), job_id);
-        let child = boxed_retry(build, &job_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 }
 

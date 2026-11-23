@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
@@ -13,7 +13,7 @@ use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{AUTH_KEYSPACE, WATCH_INTEREST_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE};
 use aruna_core::metrics::WatchMetricReason;
-use aruna_core::operation::{Operation, TransactionMode, boxed_retry};
+use aruna_core::operation::{Operation, TransactionMode};
 use aruna_core::structs::execution::notification::{InboxWriteOutcome, NotificationRecord};
 use aruna_core::structs::execution::notification_watch::{
     WatchEvent, WatchEventDetail, WatchEventRetry, WatchSubscription, dirty_marker_write,
@@ -96,6 +96,7 @@ enum ExpandState {
 }
 
 type Turn = Result<Next<ExpandOutcome>, ExpandError>;
+type Answer = Result<WatchAuthorization, WatchCheckError>;
 
 fn fatal(error: impl ToString) -> ExpandError {
     ExpandError::Fatal(error.to_string())
@@ -148,6 +149,10 @@ pub struct WatchExpandOperation {
     guarded: Vec<WatchSubscription>,
     candidates: VecDeque<Candidate>,
     current: Option<Candidate>,
+    /// The check running as a child, and every check this run answered, so an equal check of
+    /// a later candidate is answered without another child.
+    asked: Option<WatchCheckOperation>,
+    answered: Vec<(WatchCheckOperation, WatchAuthorization)>,
     records: Vec<NotificationRecord>,
     queue_changed: bool,
     /// The suppressed deliveries, recorded as metrics once the run ends either way.
@@ -183,6 +188,8 @@ impl WatchExpandOperation {
             guarded: Vec::new(),
             candidates: VecDeque::new(),
             current: None,
+            asked: None,
+            answered: Vec::new(),
             records: Vec::new(),
             queue_changed: false,
             suppressed: Vec::new(),
@@ -300,45 +307,76 @@ impl WatchExpandOperation {
         self.next_candidate()
     }
 
-    /// Checks the next candidate's watch scope, or upserts the authorized records.
+    /// Checks the next candidates' watch scopes, then upserts the authorized records. A check
+    /// this run already answered is answered again in this loop, without a child.
     fn next_candidate(&mut self) -> Turn {
-        let Some(candidate) = self.candidates.pop_front() else {
-            return self.upsert();
-        };
-        let watch = &candidate.subscription;
-        let check = WatchCheckOperation::delivery(
-            self.realm_id,
-            watch.owner,
-            &watch.path_prefix,
-            watch.event_mask,
-            &watch.authorization,
-        );
-        self.current = Some(candidate);
-        self.state = ExpandState::Scope;
-        Ok(Next::Call(IoCall::child(check)))
+        while let Some(candidate) = self.candidates.pop_front() {
+            let watch = &candidate.subscription;
+            let check = WatchCheckOperation::delivery(
+                self.realm_id,
+                watch.owner,
+                &watch.path_prefix,
+                watch.event_mask,
+                &watch.authorization,
+            );
+            self.current = Some(candidate);
+            let Some(answer) = self.known(&check) else {
+                return Ok(self.ask(check, ExpandState::Scope));
+            };
+            if let Some(next) = self.scope_checked(Ok(answer))? {
+                return Ok(next);
+            }
+        }
+        self.upsert()
     }
 
-    fn scope_checked(&mut self, check: Result<WatchAuthorization, WatchCheckError>) -> Turn {
+    /// The stored answer of a check equal to `check`, if this run asked one.
+    fn known(&self, check: &WatchCheckOperation) -> Option<WatchAuthorization> {
+        (self.answered.iter())
+            .find(|(asked, _)| asked == check)
+            .map(|(_, answer)| answer.clone())
+    }
+
+    fn ask(&mut self, check: WatchCheckOperation, state: ExpandState) -> Next<ExpandOutcome> {
+        self.asked = Some(check.clone());
+        self.state = state;
+        Next::Call(IoCall::child(check))
+    }
+
+    /// The answer of the asked check, stored for equal checks later in this run.
+    fn answer(&mut self, result: IoResult) -> Result<Answer, ExpandError> {
+        let check = result.child::<WatchAuthorization, WatchCheckError>()?;
+        if let (Some(asked), Ok(answer)) = (self.asked.take(), &check) {
+            self.answered.push((asked, answer.clone()));
+        }
+        Ok(check)
+    }
+
+    /// Goes on to the event check of an authorized scope; `None` once the candidate is done.
+    fn scope_checked(&mut self, check: Answer) -> Result<Option<Next<ExpandOutcome>>, ExpandError> {
         match check {
             Ok(WatchAuthorization::Authorized) => {
                 let candidate = self.current.as_ref().ok_or(IoError::Unfinished)?;
                 let watch = &candidate.subscription;
                 let check =
                     WatchCheckOperation::event(watch.owner, &watch.authorization, &candidate.event);
-                self.state = ExpandState::Event;
-                Ok(Next::Call(IoCall::child(check)))
+                let Some(answer) = self.known(&check) else {
+                    return Ok(Some(self.ask(check, ExpandState::Event)));
+                };
+                self.event_checked(Ok(answer))?;
+                Ok(None)
             }
             Ok(WatchAuthorization::Denied(reason)) => {
                 self.suppressed.push(reason.metric_reason());
                 self.outcome.dropped = true;
-                self.next_candidate()
+                Ok(None)
             }
             Ok(WatchAuthorization::Unavailable(error)) => Err(self.unavailable(error)),
             Err(error) => Err(self.unavailable(error.to_string())),
         }
     }
 
-    fn event_checked(&mut self, check: Result<WatchAuthorization, WatchCheckError>) -> Turn {
+    fn event_checked(&mut self, check: Answer) -> Result<(), ExpandError> {
         let candidate = self.current.take().ok_or(IoError::Unfinished)?;
         match check {
             Ok(WatchAuthorization::Authorized) => self.records.extend(candidate.routed),
@@ -348,7 +386,7 @@ impl WatchExpandOperation {
             Ok(WatchAuthorization::Unavailable(error)) => return Err(self.unavailable(error)),
             Err(error) => return Err(self.unavailable(error.to_string())),
         }
-        self.next_candidate()
+        Ok(())
     }
 
     /// Runs the inbox upsert inside this transaction.
@@ -529,10 +567,16 @@ impl Operation for WatchExpandOperation {
             }
             ExpandState::Guard => self.guard_checked(result.values()?),
             ExpandState::Scope => {
-                self.scope_checked(result.child::<WatchAuthorization, WatchCheckError>()?)
+                let check = self.answer(result)?;
+                match self.scope_checked(check)? {
+                    Some(next) => Ok(next),
+                    None => self.next_candidate(),
+                }
             }
             ExpandState::Event => {
-                self.event_checked(result.child::<WatchAuthorization, WatchCheckError>()?)
+                let check = self.answer(result)?;
+                self.event_checked(check)?;
+                self.next_candidate()
             }
             ExpandState::Upsert(mut upsert) => {
                 let turn = upsert.next(result);
@@ -667,11 +711,9 @@ impl RetryDrainOperation {
             let events = retry.events.clone();
             WatchExpandOperation::new(realm_id, config.clone(), local, events, resume)
         };
-        let expand = boxed_retry(build, &seed, |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
+        let expand = IoCall::retry_with(build, &seed);
         self.state = DrainState::Expand;
-        Ok(Next::Call(IoCall::Child(expand)))
+        Ok(Next::Call(expand))
     }
 
     /// Keeps the realm's interest marker, so the queued work runs again, and fails with `error`.

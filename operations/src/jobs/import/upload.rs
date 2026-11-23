@@ -109,14 +109,22 @@ impl CreateRoCrateOperation {
 
     /// Writes the record of the spooled blob.
     fn spooled(&mut self, event: Event) -> Step {
-        let location = match event {
-            Event::Blob(BlobEvent::HiddenSpooled {
+        let location = match event.into_blob() {
+            Ok(BlobEvent::HiddenSpooled {
                 location,
                 blake3,
                 size,
             }) => (location, blake3, size),
-            Event::Blob(BlobEvent::Error(error)) => return Err(error.into()),
-            other => {
+            Ok(BlobEvent::Error(error)) => return Err(error.into()),
+            Ok(other) => {
+                return Err(CreateRoCrateError::UnexpectedEvent {
+                    state: "spool",
+                    expected: "Event::Blob(BlobEvent::HiddenSpooled | BlobEvent::Error)",
+                    got: other.label(),
+                });
+            }
+
+            Err(other) => {
                 return Err(CreateRoCrateError::UnexpectedEvent {
                     state: "spool",
                     expected: "Event::Blob(BlobEvent::HiddenSpooled | BlobEvent::Error)",
@@ -154,16 +162,14 @@ impl Operation for CreateRoCrateOperation {
 
     fn first(&mut self) -> Step {
         let blob = self.blob.take().ok_or(CreateRoCrateError::NotFinished)?;
-        Ok(Next::Call(IoCall::Effect(Box::new(Effect::Blob(
-            BlobEffect::SpoolHidden {
-                namespace: self.upload_id,
-                name: "input".to_string(),
-                created_by: self.owner,
-                max_bytes: Some(self.max_bytes),
-                deadline: self.deadline,
-                blob,
-            },
-        )))))
+        Ok(Next::Call(IoCall::blob(BlobEffect::SpoolHidden {
+            namespace: self.upload_id,
+            name: "input".to_string(),
+            created_by: self.owner,
+            max_bytes: Some(self.max_bytes),
+            deadline: self.deadline,
+            blob,
+        })))
     }
 
     fn next(&mut self, result: IoResult) -> Step {
@@ -202,9 +208,7 @@ impl Operation for CreateRoCrateOperation {
                 ByteView::from(value),
             )]));
         }
-        calls.push(IoCall::Effect(Box::new(Effect::Blob(
-            BlobEffect::DeleteHidden { key: hidden_key },
-        ))));
+        calls.push(IoCall::blob(BlobEffect::DeleteHidden { key: hidden_key }));
         calls.push(IoCall::Effect(Box::new(Effect::Task(
             TaskEffect::ShortenTimer {
                 key: TaskKey::SweepHiddenBlobs,
@@ -354,7 +358,7 @@ pub(crate) mod tests {
     }
 
     fn spooled(location: BackendLocation) -> IoResult {
-        IoResult::Event(Box::new(Event::Blob(BlobEvent::HiddenSpooled {
+        IoResult::Event(Box::new(Event::blob(BlobEvent::HiddenSpooled {
             location,
             blake3: [4u8; 32],
             size: 7,
@@ -368,9 +372,9 @@ pub(crate) mod tests {
         let Ok(Next::Call(IoCall::Effect(effect))) = operation.first() else {
             panic!("expected hidden spool call")
         };
-        let Effect::Blob(BlobEffect::SpoolHidden {
+        let Ok(BlobEffect::SpoolHidden {
             deadline: actual, ..
-        }) = *effect
+        }) = (*effect).into_blob()
         else {
             panic!("expected hidden spool effect")
         };
@@ -396,7 +400,7 @@ pub(crate) mod tests {
     fn spool_failure_clean() {
         let (mut operation, _) = upload_operation();
         operation.first().expect("spool call");
-        let failed = IoResult::Event(Box::new(Event::Blob(BlobEvent::Error(
+        let failed = IoResult::Event(Box::new(Event::blob(BlobEvent::Error(
             BlobError::ChannelClosed,
         ))));
         assert_eq!(
@@ -423,7 +427,7 @@ pub(crate) mod tests {
                 IoCall::Effect(timer),
             ] if records[0].0 == ROCRATE_UPLOAD_KEYSPACE
                 && cleanups[0].0 == UPLOAD_CLEANUP_KEYSPACE
-                && matches!(**blob, Effect::Blob(BlobEffect::DeleteHidden { .. }))
+                && matches!((**blob).as_blob(), Some(BlobEffect::DeleteHidden { .. }))
                 && matches!(
                     **timer,
                     Effect::Task(TaskEffect::ShortenTimer {

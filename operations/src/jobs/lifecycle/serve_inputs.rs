@@ -19,10 +19,10 @@ use super::input_capture::{CaptureCaller, CaptureInputsOperation};
 use super::input_walk::{FollowLinkOperation, InputCaller};
 use super::submission_rules::{fits, peer_refusal, refusal_of, resolver_admits};
 use super::submit_external::IngressNode;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::forward::write_peer::WritePeerOperation;
 use crate::jobs::JOB_RETENTION_MS;
 use aruna_core::job_request::SubmitJobError;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::forward::write_peer::WritePeerOperation;
 
 #[derive(Debug, PartialEq)]
 enum ServeStep {

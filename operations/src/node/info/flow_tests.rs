@@ -23,7 +23,6 @@ use crate::node::info::flows::{
 };
 use crate::node::info::inputs::{HeldDocumentsOperation, advertises_executors, held_placement_set};
 use crate::node::info::write::PUBLISH_OWED_KEY;
-use crate::placement::policy::subject::{SubjectScanError, SubjectScanResult};
 use aruna_core::compute::quota::ComputeDemandSnapshot;
 use aruna_core::compute::quota::ComputeReservationSnapshot;
 use aruna_core::compute::quota::{
@@ -64,6 +63,7 @@ use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::types::Key;
 use aruna_core::types::Value;
 use aruna_drivers::driver::{DriverContext, drive, node_facts};
+use aruna_ops_identity::placement::policy::subject::{SubjectScanError, SubjectScanResult};
 use aruna_storage::storage::worker::FjallStorage;
 use tempfile::tempdir;
 use ulid::Ulid;

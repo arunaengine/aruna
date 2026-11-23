@@ -382,3 +382,43 @@ async fn prunes_input_pages() {
     assert!(!stored_page(&ctx, &family, &own).await);
     assert!(stored_page(&ctx, &family, &shared).await);
 }
+
+// A finished job family blocks its group until the prune pass deleted it; then nothing of it is
+// left to block the deletion.
+#[tokio::test]
+async fn pruned_families_pass() {
+    use aruna_core::structs::identity::group_delete::GroupDeletionError;
+    use aruna_ops_identity::groups::deletion::check::ScanOperation;
+    use aruna_test_support::groups::{Fixture, node, write as write_group_row};
+
+    let fixture = Fixture::new(&[1]).await;
+    let group_id = crate::tests::records::payload().group_id;
+    let family = Family::new([95u8; 32]);
+    for envelope in &family.stopped_run() {
+        let key = record_key(&envelope.key()).to_vec();
+        let value = to_bytes(envelope).unwrap();
+        write_group_row(&fixture.context, FAMILY_RECORD_KEYSPACE, key, value).await;
+    }
+    write(&fixture.context, index(&family, 2_000)).await;
+    let scan = || {
+        drive(
+            ScanOperation::new(&fixture.auth, group_id, node(1)),
+            &fixture.context,
+        )
+    };
+    assert_eq!(
+        scan().await,
+        Err(GroupDeletionError::NotEmpty {
+            kinds: vec!["job families".to_string()],
+            buckets: Vec::new(),
+            more: false,
+            hidden: 0,
+        })
+    );
+
+    for _ in 0..3 {
+        pass(&fixture.context).await;
+    }
+
+    assert_eq!(scan().await, Ok(()));
+}

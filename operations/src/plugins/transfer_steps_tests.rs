@@ -234,6 +234,6 @@ fn reply_kept_whole() {
 fn reply_store_failure() {
     let mut kept = keep(500, None);
     kept.first().unwrap();
-    let failed = child_result(Err::<Option<WorkRow>, _>(StoreError("no".into())));
+    let failed = child_result(Err::<Option<WorkRow>, _>(StoreError::Message("no".into())));
     assert_eq!(kept.next(failed), Err(TransferEnd::Retry("no".into())));
 }

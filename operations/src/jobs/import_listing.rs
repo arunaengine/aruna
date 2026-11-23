@@ -16,8 +16,8 @@ use aruna_core::types::{Key, Value};
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::s3::imports::folders::shares_folder;
-use crate::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
+use aruna_ops_data::s3::imports::folders::shares_folder;
+use aruna_ops_data::s3::purge_fence::{PurgeFenceError, check_fence_row, fence_key};
 
 /// Rules one page of the folder sharing check reads.
 const SHARING_PAGE: usize = 128;

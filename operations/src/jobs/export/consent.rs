@@ -19,7 +19,7 @@ use super::archive::recognize_entities;
 use super::resolve::CandidateSource;
 use super::sources::{AliasState, ResolveEntriesOperation, Resolved};
 use super::{ExportEntity, ExportFailure, SourceScope};
-use crate::replication::plaintext::{HolderCheckOperation, PlaintextError};
+use aruna_ops_data::replication::plaintext::{HolderCheckOperation, PlaintextError};
 
 /// Why the consent check could not finish.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

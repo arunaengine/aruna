@@ -16,8 +16,8 @@ use irokle::TopicId;
 use ulid::Ulid;
 
 use crate::node::outbox::finish_batch::{FinishBatchOperation, FinishedBatch};
-use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
-use crate::sync::reconcile::SyncTopicsOperation;
+use aruna_ops_identity::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome};
+use aruna_ops_identity::sync::reconcile::SyncTopicsOperation;
 
 type SyncTurn = Result<Next<FinishedBatch>, IoError>;
 
@@ -125,7 +125,7 @@ mod tests {
     use super::*;
     use aruna_core::calls::ChildOutcome;
 
-    use crate::sync::outbox::batches::RowStamp;
+    use aruna_ops_identity::sync::outbox::batches::RowStamp;
 
     fn batch() -> DrainSubBatch {
         let peer = iroh::SecretKey::from_bytes(&[2; 32]).public();

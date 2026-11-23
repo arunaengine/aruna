@@ -8,7 +8,9 @@ use std::time::Duration;
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::compute::quota::JobReservationRecord;
 use aruna_core::effects::{BlobEffect, Effect};
-use aruna_core::events::{BlobEvent, Event};
+use aruna_core::events::BlobEvent;
+#[cfg(test)]
+use aruna_core::events::Event;
 use aruna_core::keyspaces::{ARTIFACT_TOMBSTONE_KEYSPACE, SCHEDULE_INDEX_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::identity::{JobId, PRUNE_INDEX_PREFIX};
@@ -342,7 +344,7 @@ impl PruneJobsOperation {
         let Some(key) = artifact_key(&record)? else {
             return self.record_gone(record);
         };
-        let delete = Effect::Blob(BlobEffect::DeleteHidden { key });
+        let delete = Effect::blob(BlobEffect::DeleteHidden { key });
         self.call(
             PruneStep::Artifact(record),
             IoCall::Effect(Box::new(delete)),
@@ -419,9 +421,9 @@ impl Operation for PruneJobsOperation {
                 result.child::<(), JobMutationError>()??;
                 self.delete_artifact(record)
             }
-            PruneStep::Artifact(record) => match result.event()? {
-                Event::Blob(BlobEvent::HiddenDeleted) => self.record_gone(record),
-                Event::Blob(BlobEvent::Error(error)) => Err(PruneError(error.to_string())),
+            PruneStep::Artifact(record) => match result.blob()? {
+                BlobEvent::HiddenDeleted => self.record_gone(record),
+                BlobEvent::Error(error) => Err(PruneError(error.to_string())),
                 other => Err(PruneError(format!(
                     "unexpected hidden artifact delete event: {}",
                     other.label()

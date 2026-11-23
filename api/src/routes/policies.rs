@@ -9,8 +9,9 @@ use crate::lookup::actor;
 use crate::routes::access::groups::refuse_group_edit;
 use crate::server::state::ServerState;
 use aruna_core::request_policy::{
-    CompiledPolicySet, PolicyDecision, PolicyKind, PolicyRequest, PolicySession, PolicyTraceEntry,
-    RequestPolicy, analyze_policy_source, policy_set_hash, validate_policy_set,
+    CompiledPolicySet, MAX_EXPRESSION_BYTES, POLICIES_PER_SCOPE, PolicyDecision, PolicyKind,
+    PolicyRequest, PolicySession, PolicyTraceEntry, RequestPolicy, analyze_policy_source,
+    policy_set_hash,
 };
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_drivers::driver::drive;
@@ -944,9 +945,7 @@ pub async fn dry_run_policy(
         reason: None,
         trace: Vec::new(),
     };
-    for (label, policies) in scopes {
-        let set = CompiledPolicySet::compile(&policies)
-            .map_err(|error| ServerError::BadRequestMessage(error.reason))?;
+    for (label, set) in scopes {
         let traced = set.evaluate_traced(&policy_request);
         for entry in traced.trace {
             trace.push(ScopedTraceEntry {
@@ -966,38 +965,34 @@ pub async fn dry_run_policy(
     Ok((StatusCode::OK, Json(response)))
 }
 
-/// Resolves the ordered (scope, policies) list a dry run evaluates: ad hoc
+/// Resolves and compiles, once each, the ordered scopes a dry run evaluates: ad hoc
 /// candidates when given, otherwise the requested stored scope. Candidate
-/// expressions are size- and compile-checked before use (S10).
+/// expressions are size-checked before they compile (S10).
 async fn dry_run_scopes(
     state: &ServerState,
     auth: &AuthContext,
     request: &DryRunRequest,
-) -> ServerResult<Vec<(String, Vec<RequestPolicy>)>> {
+) -> ServerResult<Vec<(String, CompiledPolicySet)>> {
     if let Some(candidates) = &request.candidate_policies {
         let policies = candidates
             .iter()
             .map(to_request_policy)
             .collect::<ServerResult<Vec<_>>>()?;
-        validate_policy_set(&policies).map_err(ServerError::BadRequestMessage)?;
-        return Ok(vec![("candidate".to_string(), policies)]);
+        return Ok(vec![("candidate".to_string(), candidate_set(&policies)?)]);
     }
     let scope = request.scope.as_deref().unwrap_or("realm");
-    match scope {
-        "realm" => Ok(vec![(
-            "realm".to_string(),
-            realm_policies(state, auth).await?,
-        )]),
+    let scopes = match scope {
+        "realm" => vec![("realm".to_string(), realm_policies(state, auth).await?)],
         "group" => {
             let group_id = request
                 .group_id
                 .as_deref()
                 .ok_or(ServerError::BadRequest)
                 .and_then(parse_group_id)?;
-            Ok(vec![(
+            vec![(
                 format!("group({group_id})"),
                 group_policies(state, auth, group_id).await?,
-            )])
+            )]
         }
         "effective" => {
             let mut scopes = vec![("realm".to_string(), realm_policies(state, auth).await?)];
@@ -1008,12 +1003,42 @@ async fn dry_run_scopes(
                     group_policies(state, auth, group_id).await?,
                 ));
             }
-            Ok(scopes)
+            scopes
         }
-        other => Err(ServerError::BadRequestMessage(format!(
-            "unknown scope `{other}`"
-        ))),
+        other => {
+            return Err(ServerError::BadRequestMessage(format!(
+                "unknown scope `{other}`"
+            )));
+        }
+    };
+    let compile = |(label, policies): (String, Vec<RequestPolicy>)| {
+        let set = CompiledPolicySet::compile(&policies);
+        let set = set.map_err(|error| ServerError::BadRequestMessage(error.reason));
+        set.map(|set| (label, set))
+    };
+    scopes.into_iter().map(compile).collect()
+}
+
+/// Compiles candidate policies once, after the limits `validate_policy_set` applies, so an
+/// oversized set or expression is refused before anything compiles.
+fn candidate_set(policies: &[RequestPolicy]) -> ServerResult<CompiledPolicySet> {
+    let refused = ServerError::BadRequestMessage;
+    if policies.len() > POLICIES_PER_SCOPE {
+        let message = format!("more than {POLICIES_PER_SCOPE} policies in one scope");
+        return Err(refused(message));
     }
+    for policy in policies {
+        let guard = policy.when.iter().map(|guard| (guard, " guard"));
+        for (source, part) in std::iter::once((&policy.expression, "")).chain(guard) {
+            if source.len() > MAX_EXPRESSION_BYTES {
+                let name = &policy.name;
+                let limit = format!("expression exceeds {MAX_EXPRESSION_BYTES} bytes");
+                return Err(refused(format!("policy `{name}`{part}: {limit}")));
+            }
+        }
+    }
+    let set = CompiledPolicySet::compile(policies);
+    set.map_err(|error| refused(format!("policy `{}`: {}", error.name, error.reason)))
 }
 
 #[cfg(test)]

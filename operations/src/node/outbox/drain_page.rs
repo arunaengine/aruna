@@ -29,23 +29,23 @@ use aruna_core::task::TaskKey;
 use irokle::TopicId;
 use tracing::warn;
 
-use crate::groups::deletion::coordinator::SyncDecisionOperation;
 use crate::node::outbox::finish_batch::{FinishBatchOperation, FinishedBatch};
 use crate::node::outbox::publish_batches::{PublishBatchesOperation, PublishedBatches};
 use crate::node::outbox::relay_records::{RelayRecordsOperation, RelayedRecords};
-use crate::sync::document_outbox::{OutboxPagePlan, OutboxReadBatch};
-use crate::sync::outbox::batches::{
+use aruna_ops_identity::groups::deletion::coordinator::SyncDecisionOperation;
+use aruna_ops_identity::sync::document_outbox::{OutboxPagePlan, OutboxReadBatch};
+use aruna_ops_identity::sync::outbox::batches::{
     DrainInvocation, DrainSyncOutcome, RowStamp, build_drain_batches, resolve_publish_placement,
 };
-use crate::sync::outbox::cleanup::{
+use aruna_ops_identity::sync::outbox::cleanup::{
     Lineages, Publication, lineage_call, lineages, row_digest, standing,
 };
-use crate::sync::outbox::defer::{
+use aruna_ops_identity::sync::outbox::defer::{
     DrainRecord, classify_deferred_record, hold_relays, partition_drain_records,
 };
-use crate::sync::outbox::rotation::OutboxRotation;
-use crate::sync::reconcile::SyncTopicsOperation;
-use crate::sync::shard_placement::sort_node_ids;
+use aruna_ops_identity::sync::outbox::rotation::OutboxRotation;
+use aruna_ops_identity::sync::reconcile::SyncTopicsOperation;
+use aruna_ops_identity::sync::shard_placement::sort_node_ids;
 
 /// How long a record may wait for its shard topic's genesis before the drain stops treating the
 /// wait as normal and says so at error level.
@@ -100,7 +100,7 @@ pub struct DrainPageOperation {
     config: Option<Arc<RealmConfigDocument>>,
     rotation: OutboxRotation,
     limit: usize,
-    published_before: BTreeMap<Vec<u8>, Publication>,
+    published_before: Arc<BTreeMap<Vec<u8>, Publication>>,
     digests: BTreeMap<Vec<u8>, [u8; 32]>,
     topics: Vec<TopicId>,
     page: Option<DrainedPage>,
@@ -126,7 +126,7 @@ impl DrainPageOperation {
         rotation: OutboxRotation,
         invocation: DrainInvocation,
         limit: usize,
-        published_before: BTreeMap<Vec<u8>, Publication>,
+        published_before: Arc<BTreeMap<Vec<u8>, Publication>>,
     ) -> Self {
         let page = DrainedPage {
             invocation,
@@ -642,7 +642,7 @@ mod tests {
         let serving = (local, RealmId::from_bytes([3; 32]));
         let rotation = OutboxRotation::default();
         let invocation = DrainInvocation::new(&rotation);
-        DrainPageOperation::new(serving, None, rotation, invocation, 8, BTreeMap::new())
+        DrainPageOperation::new(serving, None, rotation, invocation, 8, Arc::default())
     }
 
     fn read(result: Result<OutboxReadBatch, ApplyError>) -> IoResult {
@@ -731,7 +731,7 @@ mod tests {
         };
         let (id, placement) = (ulid::Ulid::from_parts(10, 2), PlacementRef::NIL);
         let event = DocumentOutboxEvent::admin(event);
-        let record = crate::sync::outbox::record::new_identified_record(
+        let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
             id,
             origin,
             target,

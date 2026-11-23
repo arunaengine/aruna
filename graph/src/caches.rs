@@ -311,7 +311,9 @@ impl VisibilityCache {
 
     /// Marks every entry expired, so the next read takes the stale path.
     pub(crate) fn expire_now(&self) {
-        let expired = Instant::now() - Duration::from_secs(1);
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
         if let Some(entry) = locked(&self.registry).as_mut() {
             entry.expires_at = expired;
         }
@@ -464,7 +466,7 @@ impl crate::GraphHandle {
         Ok(match effect {
             MetadataEffect::QueryCacheGet { key } => {
                 let stamp = queries.stamp(generation());
-                let entry = queries.get(&key, stamp, Instant::now());
+                let entry = queries.get(&key, stamp, Instant::now()).map(Box::new);
                 MetadataEvent::QueryCacheEntry { stamp, entry }
             }
             MetadataEffect::QueryCachePut {

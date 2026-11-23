@@ -97,7 +97,7 @@ fn cancel_discards() {
         run.next(stops(true, false)),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
-    let deleted = IoResult::Event(Box::new(Event::Blob(
+    let deleted = IoResult::Event(Box::new(Event::blob(
         aruna_core::events::BlobEvent::HiddenDeleted,
     )));
     assert!(matches!(

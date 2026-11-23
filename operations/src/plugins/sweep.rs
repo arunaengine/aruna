@@ -23,7 +23,7 @@ use ulid::Ulid;
 
 use super::account::{AccountError, RealmAdmin};
 use super::rows::{StoreError, page_call, page_of};
-use crate::users::account_status::{
+use aruna_ops_identity::users::account_status::{
     AccountStatusConfig, AccountStatusError, AccountStatusOperation,
 };
 

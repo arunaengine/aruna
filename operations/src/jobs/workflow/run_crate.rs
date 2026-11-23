@@ -49,21 +49,6 @@ use super::super::store::row_calls::{
     put_crate_outcome, put_crate_status, put_local_crate, read_crate_status, read_job_record,
     read_launch_record, read_run_link,
 };
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::create_document::{
-    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
-};
-use crate::metadata::create_entry::DocumentMintOperation;
-use crate::metadata::forward::route_create::RouteCreateOperation;
-use crate::metadata::forward::write::MetadataWriteError;
-use crate::metadata::record_reads::DocumentRecordOperation;
-use crate::realm::mutate_placement::node_kind;
-use crate::replication::locations::LocationSummaryError;
-use crate::replication::locations::remote::RemoteLocationOperation;
-use crate::s3::object::head::{
-    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
-};
 use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::errors::StorageReadError;
 use aruna_core::jobs::JobRunOutcome;
@@ -72,6 +57,23 @@ use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::operation::Operation;
 use aruna_core::replication_protocol::{LocationSummary, LocationSummaryRequest};
 use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_ops_data::metadata::create_document::{
+    CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, CreateDocumentResult,
+};
+use aruna_ops_data::metadata::create_entry::DocumentMintOperation;
+use aruna_ops_data::metadata::forward::route_create::RouteCreateOperation;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::replication::locations::LocationSummaryError;
+use aruna_ops_data::replication::locations::remote::RemoteLocationOperation;
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 use tracing::warn;
 
 /// How a run-crate job ended.
@@ -1360,11 +1362,11 @@ mod run_tests;
 #[cfg(test)]
 mod pure_tests {
     use super::*;
-    use crate::metadata::create_document::CreateDocumentError;
     use aruna_core::metadata::{
         MetadataError, ProfileValidationCompleteness, ProfileValidationFinding,
         ProfileValidationSeverity,
     };
+    use aruna_ops_data::metadata::create_document::CreateDocumentError;
 
     fn profile_rejection(code: &str) -> MetadataWriteError {
         MetadataWriteError::Create(CreateDocumentError::MetadataError(
@@ -2291,9 +2293,9 @@ mod tests {
     #[test]
     fn meets_builtin_profile() {
         // The built-in shapes must accept what this generator writes.
-        use crate::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
         use aruna_core::profile_shapes::ProfileShapes;
         use aruna_graph::shacl::ProfileShaclEngine;
+        use aruna_ops_data::metadata::builtin::{BUILTIN_REVISION, builtin_shapes};
 
         let (record, spec) = execution_record();
         // An input from a device carries its provenance entity, which the shapes must accept.

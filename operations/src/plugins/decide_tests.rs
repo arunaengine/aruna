@@ -344,12 +344,8 @@ fn reports_keep_newest() {
     assert_eq!(reads.len(), 1);
     // A newer kept report wins and nothing is written.
     let kept = values_result(vec![Some(encode(&report(5).1).unwrap())]);
-    assert_eq!(
-        plan.next(kept).unwrap(),
-        Next::Call(IoCall::Write(Vec::new()))
-    );
     let acked = vec![(install, SourceKind::DatasetCreated, GapReason::Full, 5)];
-    assert_eq!(plan.next(IoResult::Done).unwrap(), Next::Done(acked));
+    assert_eq!(plan.next(kept).unwrap(), Next::Done(acked));
 }
 
 #[test]

@@ -29,13 +29,13 @@ use super::credential::{
 };
 use super::input_view::{CachedKeysOperation, ViewEntry, ViewError, view_bucket, view_entries};
 use super::inputs::LoadInputsOperation;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::alias::AliasFamilyOperation;
 use crate::jobs::lifecycle::held::HeldReservations;
 use crate::jobs::lifecycle::screen::{AdmitTask, ScreenError, ScreenTask};
 use crate::jobs::route::JobRouteError;
 use aruna_core::job_request::session_of;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 pub const NETWORK_TAG_KEY: &str = "aruna-engine.org/network";
 

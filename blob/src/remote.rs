@@ -181,8 +181,14 @@ impl BlobHandle {
     ) -> Result<BackendStream<Result<Bytes, StreamError>>, RemoteFailure> {
         let effect = BlobEffect::ReadHiddenRange { location, range };
         match self.nested(effect).await {
-            Event::Blob(BlobEvent::HiddenRead { blob, .. }) => Ok(blob),
-            Event::Blob(BlobEvent::Error(error)) => Err(retryable(error.to_string())),
+            Event::Blob(event) => match *event {
+                BlobEvent::HiddenRead { blob, .. } => Ok(blob),
+                BlobEvent::Error(error) => Err(retryable(error.to_string())),
+                other => Err(retryable(format!(
+                    "unexpected hidden artifact read event: {}",
+                    Event::blob(other).label()
+                ))),
+            },
             event => Err(retryable(format!(
                 "unexpected hidden artifact read event: {}",
                 event.label()
@@ -268,25 +274,31 @@ impl BlobHandle {
         });
         let (written, event) = tokio::join!(write, store);
         match event {
-            Event::Blob(BlobEvent::HiddenSpooled {
-                location,
-                size,
-                blake3,
-            }) => {
-                if let Err(error) = written {
-                    self.discard_archive(&location).await;
-                    return Err(error);
-                }
-                Ok(RemoteAnswer::Artifact(ArtifactRef {
+            Event::Blob(event) => match *event {
+                BlobEvent::HiddenSpooled {
                     location,
                     size,
                     blake3,
-                    expires_at_ms: 0,
-                }))
-            }
-            Event::Blob(BlobEvent::Error(BlobError::SizeLimitExceeded { .. })) => {
-                Err(permanent("repository archive exceeds import source limit"))
-            }
+                } => {
+                    if let Err(error) = written {
+                        self.discard_archive(&location).await;
+                        return Err(error);
+                    }
+                    Ok(RemoteAnswer::Artifact(ArtifactRef {
+                        location,
+                        size,
+                        blake3,
+                        expires_at_ms: 0,
+                    }))
+                }
+                BlobEvent::Error(BlobError::SizeLimitExceeded { .. }) => {
+                    Err(permanent("repository archive exceeds import source limit"))
+                }
+                _ => {
+                    written?;
+                    Err(retryable("repository archive spool failed"))
+                }
+            },
             _ => {
                 written?;
                 Err(retryable("repository archive spool failed"))

@@ -62,12 +62,13 @@ impl AdminAuth {
     /// Admin sign-in from the token variable; unset or empty disables the admin API.
     pub fn from_env() -> Result<Self, AuthSetupError> {
         match std::env::var(TOKEN_VAR) {
-            Ok(token) if !token.is_empty() => Self::token(&token),
+            Ok(token) if !token.trim().is_empty() => Self::token(&token),
             _ => Ok(Self::Disabled),
         }
     }
 
     pub fn token(token: &str) -> Result<Self, AuthSetupError> {
+        let token = token.trim();
         if token.chars().count() < MIN_TOKEN_LEN {
             return Err(AuthSetupError::ShortToken);
         }

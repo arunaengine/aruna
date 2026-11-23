@@ -4,11 +4,10 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
-use aruna_core::events::Event;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::email::{EMAIL_CATEGORIES, EmailDeliverySpec};
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
@@ -121,10 +120,7 @@ impl EnqueueDeliveriesOperation {
             EnqueueError::Submit { channel, reason }
         })?;
         let build = move || SubmitJobOperation::new(spec.clone(), job_id);
-        let submit = boxed_retry(build, &job_id.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(submit)))
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 }
 
@@ -167,6 +163,7 @@ mod call_tests {
     use super::*;
     use crate::tests::locations::node_id;
     use crate::tests::notifications::{record, user};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::notification::NotificationClass;
 

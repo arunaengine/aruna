@@ -8,7 +8,7 @@ use aruna_core::secret_registers::{SecretEntry, SecretOwner};
 use aruna_core::secrets::SecretName;
 use aruna_core::structs::identity::realm::RealmId;
 
-use crate::secrets::owner::{EntryReader, OwnerSecretError};
+use aruna_ops_identity::secrets::owner::{EntryReader, OwnerSecretError};
 
 /// A failed entry read: the register reader refused an answer, or the runner refused a call.
 #[derive(Debug, PartialEq, thiserror::Error)]

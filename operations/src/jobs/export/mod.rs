@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use super::repository::JobScope;
-use crate::replication::bao_read::BaoReadOutput;
 use archive::blocking_omissions;
 use aruna_core::repository::remote::NodeScope;
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
 use resolve::ExportCandidate;
 
 pub mod archive;

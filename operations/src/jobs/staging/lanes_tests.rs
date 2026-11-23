@@ -267,7 +267,7 @@ fn opener_writes_lanes() {
         Ok(Next::Call(IoCall::Child(_)))
     ));
     let listed = |path: Option<&str>, open: &mut OpenPrefixOperation| {
-        let page = crate::staging::list_source::ListStagingResult {
+        let page = aruna_ops_data::staging::list_source::ListStagingResult {
             entries: path.into_iter().map(entry).collect(),
             next_cursor: None,
             connector: test_connector(),

@@ -605,8 +605,8 @@ impl SchedulerState {
                             .await;
                     }
                 });
+                aborted += 1;
             }
-            aborted += 1;
         }
         aborted
     }
@@ -1152,13 +1152,14 @@ impl TaskHandle {
                 scheduler_unavailable: true,
             };
         }
-        match settled.await {
-            Ok(()) => TaskShutdownReport {
+        let settle_timeout = drain.max(Duration::from_secs(5));
+        match tokio::time::timeout(settle_timeout, settled).await {
+            Ok(Ok(())) => TaskShutdownReport {
                 in_flight,
                 aborted,
                 scheduler_unavailable: false,
             },
-            Err(_) => TaskShutdownReport {
+            Ok(Err(_)) | Err(_) => TaskShutdownReport {
                 in_flight,
                 aborted,
                 scheduler_unavailable: true,

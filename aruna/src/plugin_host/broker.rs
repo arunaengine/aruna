@@ -561,9 +561,9 @@ impl Broker for RunBroker {
     }
 
     async fn log(&self, _cx: &CallContext, level: &str, message: &str) {
-        let message = &self.scrub(message);
         let admit = AdmitCall::new(&self.scope, None);
         if drive(admit, &self.ctx).await.is_ok() {
+            let message = self.scrub(message);
             let mut run = self
                 .log
                 .lock()
@@ -571,7 +571,7 @@ impl Broker for RunBroker {
             run.push_log(LogLine {
                 at_ms: unix_timestamp_millis(),
                 level: level.to_string(),
-                message: message.to_string(),
+                message,
             });
         }
     }

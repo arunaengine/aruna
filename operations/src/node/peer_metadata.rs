@@ -26,9 +26,9 @@ use crate::jobs::lifecycle::serve_inputs::ServeInputsOperation;
 use crate::jobs::node_inputs::{ingress_node, launch_node};
 use crate::jobs::records::pages::{PageReadError, ServePageOperation};
 use crate::jobs::records::transport::{ServeLaunchOperation, ServeRecordOperation};
-use crate::metadata::serve::forwards::needs_view;
-use crate::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 use crate::plugins::peer::{AnswerPeer, PeerAnswer as PluginAnswer};
+use aruna_ops_data::metadata::serve::forwards::needs_view;
+use aruna_ops_data::metadata::serve::{ServeNode, ServeRequestOperation, ServedReply};
 
 /// What this node offers a metadata request, read by the shell before the run; the costly parts
 /// only when [`metadata_needs`] asks for them.

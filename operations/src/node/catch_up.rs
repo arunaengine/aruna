@@ -20,10 +20,10 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, Value};
 use tracing::{debug, warn};
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::fence::{LiftFenceOperation, catch_up_peers};
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::held::HeldReservations;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Spacing of the passes after the node caught up; each one refreshes the last contact.
 pub const CATCH_UP_REFRESH: Duration = Duration::from_secs(300);

@@ -205,7 +205,7 @@ impl AppendRecordOperation {
             ),
         ];
         if let Some(group_id) = self.spec_group() {
-            reads.push(crate::groups::fence::group_fence_key(group_id));
+            reads.push(aruna_ops_identity::groups::fence::group_fence_key(group_id));
         }
         Ok(Next::Call(IoCall::Read(reads)))
     }

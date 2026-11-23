@@ -3,14 +3,13 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![cfg(all(feature = "runtime", feature = "build"))]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 
+use crate::common::{limits, require};
 use aruna_plugin_types::calls::{
     Created, Document, Entry, ErrorKind, FilePage, HostError, Intent, Listing, Method, ObjectInfo,
     ObjectPage, Response,
@@ -24,9 +23,6 @@ use aruna_plugins::host::wit::aruna::plugin::types::Trigger;
 use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
 use aruna_plugins::runtime::{Invocation, Runtime};
-use common::{limits, require};
-
-mod common;
 
 const DATASET: &str = "01JD000000000000000000000C";
 

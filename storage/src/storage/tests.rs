@@ -41,6 +41,7 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::handle::StorageReceiv
         realm_keys: std::sync::Arc::new(std::sync::OnceLock::new()),
         range_indexes: std::sync::Arc::new(std::sync::OnceLock::new()),
         policies: std::sync::Arc::new(super::policies::PolicyPrograms::default()),
+        cache: None,
     };
     (handle, super::handle::StorageReceivers { foreground, bulk })
 }
@@ -347,6 +348,7 @@ fn bulk_full_rejects() {
         usage_shadow: std::collections::HashSet::new(),
         usage_views: std::collections::HashSet::new(),
         txn_rows: std::collections::HashMap::new(),
+        cache: Default::default(),
     };
     let metrics = std::sync::Arc::new(super::metrics::StorageMetrics::default());
     let read_effect = || StorageEffect::Read {
@@ -570,6 +572,7 @@ fn worker_exit_latches() {
         realm_keys: _,
         range_indexes: _,
         policies: _,
+        cache: _,
     } = handle;
 
     assert!(!metrics.channel_closed.load(Ordering::Relaxed));
@@ -1346,6 +1349,7 @@ fn unknown_commit_runs() {
         usage_shadow: std::collections::HashSet::new(),
         usage_views: std::collections::HashSet::new(),
         txn_rows: std::collections::HashMap::new(),
+        cache: Default::default(),
     };
 
     let event = storage.commit_transaction(txn_id);
@@ -1404,6 +1408,7 @@ fn unknown_commit_retires() {
         usage_shadow: std::collections::HashSet::new(),
         usage_views: std::collections::HashSet::new(),
         txn_rows: std::collections::HashMap::new(),
+        cache: Default::default(),
     };
 
     for _ in 0..=super::handle::MAX_CLEANUP_ATTEMPTS {
@@ -1456,6 +1461,7 @@ fn retry_skips_queued() {
         usage_shadow: std::collections::HashSet::new(),
         usage_views: std::collections::HashSet::new(),
         txn_rows: std::collections::HashMap::new(),
+        cache: Default::default(),
     };
 
     storage.retry_cleanup();

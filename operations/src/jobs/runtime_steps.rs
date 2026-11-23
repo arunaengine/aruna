@@ -28,8 +28,8 @@ use super::store::mutation_error::JobMutationError;
 use super::store::park_wake::AwaitOutcome;
 use super::store::row_calls::{park_job, read_job_record, satisfy_key_wait};
 use super::store::store_call::StoreCall;
-use crate::blob::unlocked::KeyUnlockedOperation;
 use aruna_core::jobs::JobRunOutcome;
+use aruna_ops_data::blob::unlocked::KeyUnlockedOperation;
 
 const WRITE_MAX_ATTEMPTS: u32 = 5;
 /// How long a deferred job waits before it may run again.

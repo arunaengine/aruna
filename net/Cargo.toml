@@ -25,7 +25,6 @@ iroh = { workspace = true }
 irokle = { workspace = true }
 lru = { workspace = true }
 fjall = { workspace = true }
-opentelemetry = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -46,6 +45,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-core = { workspace = true, features = ["test-hooks"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]
 name = "integration"

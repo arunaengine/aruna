@@ -494,7 +494,7 @@ fn materialization_effect(event: &MetadataEventRecord) -> MetadataEffect {
             date_published,
             license,
         } => MetadataEffect::CreateCrate {
-            request: MetadataCrateRequest {
+            request: Box::new(MetadataCrateRequest {
                 graph_iri: event.record.graph_iri.clone(),
                 name: name.clone(),
                 description: description.clone(),
@@ -503,7 +503,7 @@ fn materialization_effect(event: &MetadataEventRecord) -> MetadataEffect {
                 policy,
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor,
-            },
+            }),
         },
         MetadataEventPayload::RoCrate { jsonld }
         | MetadataEventPayload::ReplaceRoCrate { jsonld } => MetadataEffect::ApplyRoCrate {

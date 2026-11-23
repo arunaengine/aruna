@@ -13,7 +13,7 @@ use aruna_core::metadata::{MetadataError, MetadataGraphPolicy};
 use aruna_core::profile_shapes::ProfileShaclError;
 use craqle::{
     ActorId, AllowAllAuthorizer, CraqleError, CraqleIrokleOptions, CraqleNode, CraqleOptions,
-    GraphId, SearchStorage,
+    GraphId,
 };
 use tokio::sync::{OwnedMutexGuard, Semaphore};
 
@@ -40,22 +40,7 @@ const SLOW_CALL: Duration = Duration::from_millis(100);
 static CRAQLE_LATENCY: LazyLock<aruna_core::telemetry::LatencyAggregator> =
     LazyLock::new(|| aruna_core::telemetry::LatencyAggregator::new("craqle"));
 
-/// Where craqle keeps its full-text search index.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MetadataSearchStorage {
-    #[default]
-    Disk,
-    Memory,
-}
-
-impl From<MetadataSearchStorage> for SearchStorage {
-    fn from(search_storage: MetadataSearchStorage) -> Self {
-        match search_storage {
-            MetadataSearchStorage::Disk => SearchStorage::Disk,
-            MetadataSearchStorage::Memory => SearchStorage::Memory,
-        }
-    }
-}
+pub use aruna_core::search::MetadataSearchStorage;
 
 /// How the graph store is opened.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -218,11 +203,15 @@ impl GraphHandle {
 
     /// Removes the local copy of one graph.
     pub async fn delete_graph(&self, graph_iri: String) -> Result<(), MetadataError> {
+        let graph = graph_iri.clone();
         self.blocking(move |node| {
-            node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph_iri))
+            node.delete_graph(&AllowAllAuthorizer, &GraphId::new(&graph))
                 .map_err(Box::new)
         })
-        .await
+        .await?;
+        self.inner.summaries.remove(&graph_iri);
+        self.inner.queries.bump_apply();
+        Ok(())
     }
 
     /// The IRIs of every graph in the store.

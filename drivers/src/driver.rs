@@ -364,10 +364,14 @@ fn commit_done(transaction: Option<TransactionEffect>, event: &Event) -> bool {
 /// commit acknowledgement is never lost.
 pub(crate) fn managed_effect(effect: &Effect) -> bool {
     match effect {
-        Effect::Blob(BlobEffect::ReleaseReservation { .. }) => true,
-        Effect::Blob(BlobEffect::SpoolHidden {
-            deadline: Some(_), ..
-        }) => true,
+        Effect::Blob(blob) => matches!(
+            blob.as_ref(),
+            BlobEffect::ReleaseReservation { .. }
+                | BlobEffect::SpoolHidden {
+                    deadline: Some(_),
+                    ..
+                }
+        ),
         Effect::Storage(StorageEffect::CommitTransaction { .. }) => true,
         Effect::Storage(StorageEffect::Write {
             key_space,
@@ -634,8 +638,7 @@ struct ParentRun<'a, P: Operation>(&'a mut CallRun<P>, Option<u64>);
 
 impl<P: Operation> Drive for ParentRun<'_, P> {
     fn start(&mut self) -> Effects {
-        let entropy = clock::next_entropy();
-        let now = clock::stamp_time();
+        let (now, entropy) = clock::start_stamp();
         self.1 = recorder::begin(type_name::<CallRun<P>>(), now, &*self.0, entropy);
         self.0.stamp(now);
         self.0.seed(entropy);
@@ -663,8 +666,7 @@ struct SubRun<'a>(&'a mut dyn SubOperation, Option<u64>);
 
 impl Drive for SubRun<'_> {
     fn start(&mut self) -> Effects {
-        let entropy = clock::next_entropy();
-        let now = clock::stamp_time();
+        let (now, entropy) = clock::start_stamp();
         let name = type_name_of_val(&*self.0);
         self.1 = recorder::begin(name, now, &*self.0, entropy);
         self.0.stamp(now);
@@ -729,34 +731,7 @@ fn adapter_dispatch(context: &DriverContext, depth: usize) -> Box<Dispatch<'_>> 
     Box::new(move |effect, until| Box::pin(dispatch_bounded(effect, context, depth, until, limits)))
 }
 
-/// How long the runner waits for the adapter of each effect kind before it answers
-/// `Event::Hung`; `None` waits without a limit. Blob streams, local files, sub operations,
-/// groups, delays and managed effects have no limit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HangLimits {
-    pub storage: Option<Duration>,
-    pub net: Option<Duration>,
-    pub metadata: Option<Duration>,
-    pub task: Option<Duration>,
-    pub staging_source: Option<Duration>,
-}
-
-impl HangLimits {
-    /// Generous bounds far above every adapter's own timeouts; they only catch a hung adapter.
-    pub const DEFAULT: Self = Self {
-        storage: Some(Duration::from_secs(60)),
-        net: Some(Duration::from_secs(30 * 60)),
-        metadata: Some(Duration::from_secs(30 * 60)),
-        task: Some(Duration::from_secs(60)),
-        staging_source: Some(Duration::from_secs(15 * 60)),
-    };
-}
-
-impl Default for HangLimits {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
+pub use aruna_core::calls::HangLimits;
 
 static HANG_LIMITS: std::sync::RwLock<HangLimits> = std::sync::RwLock::new(HangLimits::DEFAULT);
 
@@ -796,9 +771,7 @@ fn hang_limit(effect: &Effect, limits: HangLimits) -> Option<Duration> {
         | Effect::Group(_)
         | Effect::Delay(_)
         | Effect::Job(_)
-        | Effect::Git(_)
-        | Effect::Search()
-        | Effect::Stream() => None,
+        | Effect::Git(_) => None,
     }
 }
 
@@ -813,12 +786,7 @@ async fn dispatch_bounded(
 ) -> Event {
     let limit = hang_limit(&effect, limits);
     let kind = effect_adapters::effect_kind(&effect);
-    let dispatch: BoxFuture<'_, Event> = match until {
-        Some(_) => Box::pin(effect_adapters::dispatch_effect_until(
-            effect, context, depth, until,
-        )),
-        None => Box::pin(effect_adapters::dispatch_effect(effect, context, depth)),
-    };
+    let dispatch = effect_adapters::dispatch_effect_until(effect, context, depth, until);
     match limit {
         Some(limit) => tokio::time::timeout(limit, dispatch)
             .await
@@ -1064,6 +1032,7 @@ async fn drive_effects(
 ) -> RunState {
     let mut queue: VecDeque<Effect> = executable.start().into_iter().collect();
     let mut state = RunState::new(context);
+    let limits = hang_limits();
 
     // A run that fails in its first step is complete at once; its cleanup effects still run.
     while !executable.is_complete() || !queue.is_empty() {
@@ -1121,7 +1090,7 @@ async fn drive_effects(
                 };
                 let Ok(event) = tokio::time::timeout_at(
                     cleanup_deadline,
-                    effect_adapters::dispatch_effect(effect, context, depth),
+                    Box::pin(effect_adapters::dispatch_effect(effect, context, depth)),
                 )
                 .await
                 else {
@@ -1129,20 +1098,12 @@ async fn drive_effects(
                     break;
                 };
                 event
-            } else if let Some(deadline) = deadline {
+            } else {
                 // Managed effects own their timeout, and a child applies this deadline itself and
                 // then runs its cleanup; cutting either here would drop that work.
                 let managed = managed_effect(&effect) || matches!(effect, Effect::SubOperation(_));
-                let dispatch: BoxFuture<'_, Event> = Box::pin(dispatch_bounded(
-                    effect,
-                    context,
-                    depth,
-                    Some(deadline),
-                    hang_limits(),
-                ));
-                if managed {
-                    dispatch.await
-                } else {
+                let dispatch = dispatch_bounded(effect, context, depth, deadline, limits);
+                if let Some(deadline) = deadline.filter(|_| !managed) {
                     match tokio::time::timeout_at(deadline, dispatch).await {
                         Ok(event) => event,
                         Err(_) => {
@@ -1164,16 +1125,9 @@ async fn drive_effects(
                             }
                         }
                     }
+                } else {
+                    dispatch.await
                 }
-            } else {
-                Box::pin(dispatch_bounded(
-                    effect,
-                    context,
-                    depth,
-                    None,
-                    hang_limits(),
-                ))
-                .await
             };
             state.record_outcome(transaction, &event);
             if !executable.is_complete() {
@@ -1204,7 +1158,7 @@ pub(crate) fn drive_suboperation<'a>(
     depth: usize,
     deadline: Option<tokio::time::Instant>,
 ) -> Pin<Box<dyn Future<Output = Event> + Send + 'a>> {
-    let operation_name = type_name_of_val(&*operation).to_string();
+    let operation_name = type_name_of_val(&*operation);
     Box::pin(async move {
         let span = debug_span!("suboperation", operation = %operation_name, depth);
         async move {
@@ -1333,66 +1287,9 @@ pub async fn drive_until<O: Operation>(
     context: &DriverContext,
     deadline: tokio::time::Instant,
 ) -> Result<O::Output, O::Error> {
-    machine_until(CallRun::new(operation), context, deadline).await
-}
-
-async fn machine_until<P: Operation>(
-    mut operation: CallRun<P>,
-    context: &DriverContext,
-    deadline: tokio::time::Instant,
-) -> Result<P::Output, P::Error> {
-    let scope = operation.hold_scope();
-    let hold = take_hold(context, scope);
-    let Ok(_hold) = tokio::time::timeout_at(deadline, hold).await else {
-        warn!(
-            operation = %type_name::<CallRun<P>>(),
-            "Operation deadline expired while it waited for its backend hold"
-        );
-        let _ = operation.abort();
-        return operation.finalize();
-    };
-    let mut run = ParentRun(&mut operation, None);
-    let effects = drive_effects(
-        &mut run,
-        context,
-        0,
-        Some(deadline),
-        Some(type_name::<CallRun<P>>()),
-    );
-    let mut state = holding(scope, effects).await;
-    let record = run.1;
-    if !operation.is_complete() {
-        // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
-        // tracker resolve any transaction they name.
-        let _ = operation.abort();
-    }
-    abort_leaked_transaction(
-        &mut state.tracker,
-        context,
-        0,
-        Some(state.cleanup_deadline.unwrap_or(deadline)),
-    )
-    .await;
-    let result = operation.finalize();
-    record_end(record, &result);
-    if let Err(error) = &result {
-        if P::expected_error(error) {
-            debug!(
-                event = "operation.rejected",
-                operation = %type_name::<CallRun<P>>(),
-                error = ?error,
-                "Operation rejected"
-            );
-        } else {
-            error!(
-                event = "operation.failed",
-                operation = %type_name::<CallRun<P>>(),
-                error = ?error,
-                "Operation failed"
-            );
-        }
-    }
-    result
+    run_machine(CallRun::new(operation), context, Some(deadline))
+        .await
+        .0
 }
 
 /// Drives an operation without a deadline. Transaction ownership and the effect
@@ -1407,41 +1304,67 @@ pub async fn drive<O: Operation>(
     operation: O,
     context: &DriverContext,
 ) -> Result<O::Output, O::Error> {
-    drive_machine(CallRun::new(operation), context).await
+    run_machine(CallRun::new(operation), context, None).await.0
 }
 
-async fn drive_machine<P: Operation>(
+/// Drives one `CallRun`, returning its outcome and whether the runner saw a storage conflict.
+async fn run_machine<P: Operation>(
     mut operation: CallRun<P>,
     context: &DriverContext,
-) -> Result<P::Output, P::Error> {
+    deadline: Option<tokio::time::Instant>,
+) -> (Result<P::Output, P::Error>, bool) {
     let operation_name = type_name::<CallRun<P>>();
-
-    trace!(
-        event = "operation.started",
-        operation = %operation_name,
-        "Starting operation"
-    );
+    if deadline.is_none() {
+        trace!(
+            event = "operation.started",
+            operation = %operation_name,
+            "Starting operation"
+        );
+    }
 
     let scope = operation.hold_scope();
-    let _hold = take_hold(context, scope).await;
+    let _hold = match deadline {
+        Some(limit) => match tokio::time::timeout_at(limit, take_hold(context, scope)).await {
+            Ok(hold) => hold,
+            Err(_) => {
+                warn!(
+                    operation = %operation_name,
+                    "Operation deadline expired while it waited for its backend hold"
+                );
+                let _ = operation.abort();
+                let conflicted = operation.lost_conflict();
+                return (operation.finalize(), conflicted);
+            }
+        },
+        None => take_hold(context, scope).await,
+    };
     let mut run = ParentRun(&mut operation, None);
+    let label = deadline.map(|_| operation_name);
     // Heap the effect loop: an adapter may drive another operation inline, and
     // nested effect-loop futures otherwise stack up in one caller's future.
     let mut state = Box::pin(holding(
         scope,
-        drive_effects(&mut run, context, 0, None, None),
+        drive_effects(&mut run, context, 0, deadline, label),
     ))
     .await;
     let record = run.1;
-    abort_leaked_transaction(&mut state.tracker, context, 0, None).await;
+    if deadline.is_some() && !operation.is_complete() {
+        // Nonterminal operations cannot finalize. Drop late cleanup effects and let the
+        // tracker resolve any transaction they name.
+        let _ = operation.abort();
+    }
+    let cleanup_until = deadline.map(|limit| state.cleanup_deadline.unwrap_or(limit));
+    abort_leaked_transaction(&mut state.tracker, context, 0, cleanup_until).await;
+    let conflicted = operation.lost_conflict();
     let result = operation.finalize();
     record_end(record, &result);
     match &result {
-        Ok(_) => trace!(
+        Ok(_) if deadline.is_none() => trace!(
             event = "operation.completed",
             operation = %operation_name,
             "Completed operation"
         ),
+        Ok(_) => {}
         Err(error) if P::expected_error(error) => debug!(
             event = "operation.rejected",
             operation = %operation_name,
@@ -1455,12 +1378,11 @@ async fn drive_machine<P: Operation>(
             "Operation failed"
         ),
     }
-    result
+    (result, conflicted)
 }
 
-/// Drives a fresh operation from `build`; after a conflict (`is_conflict`) it builds the next
-/// attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`, finish or fail.
-/// The same seed gives the same waits; distinct seeds spread conflicting writers out.
+/// Drives a fresh operation from `build`; after a conflict (`lost_conflict` or `is_conflict`) it
+/// builds the next attempt and asks its `on_conflict` to rerun after a backoff seeded by `seed`.
 pub async fn drive_retry<O: Operation>(
     mut build: impl FnMut() -> O,
     context: &DriverContext,
@@ -1490,12 +1412,9 @@ async fn retry_machine<P: Operation>(
     let mut operation = build();
     let mut attempt: u32 = 0;
     loop {
-        let result = match deadline {
-            Some(deadline) => machine_until(operation, context, deadline).await,
-            None => drive_machine(operation, context).await,
-        };
+        let (result, conflicted) = run_machine(operation, context, deadline).await;
         let error = match result {
-            Err(error) if P::is_conflict(&error) => error,
+            Err(error) if conflicted || P::is_conflict(&error) => error,
             result => return result,
         };
         attempt = attempt.saturating_add(1);
@@ -1618,17 +1537,10 @@ mod test {
         }
     }
 
-    /// Stages a marker in a write transaction, then waits on a spool that never ends.
-    #[derive(Debug)]
+    /// Stages a marker in a write transaction, then waits on a stalled read.
+    #[derive(Debug, PartialEq)]
     struct DeadlineOperation {
         staged: bool,
-        ready: Arc<tokio::sync::Notify>,
-    }
-
-    impl PartialEq for DeadlineOperation {
-        fn eq(&self, other: &Self) -> bool {
-            self.staged == other.staged
-        }
     }
 
     impl Operation for DeadlineOperation {
@@ -1652,8 +1564,7 @@ mod test {
             }
             result.done()?;
             self.staged = true;
-            self.ready.notify_one();
-            Ok(Next::Call(IoCall::from(pending_blob())))
+            Ok(Next::Call(parked_read()))
         }
     }
 
@@ -1887,12 +1798,12 @@ mod test {
             &mut queue,
             smallvec::smallvec![
                 Effect::Storage(StorageEffect::AbortTransaction { txn_id: id }),
-                Effect::Search(),
+                Effect::Delay(Duration::ZERO),
             ],
             &tracker,
         );
         assert_eq!(queue.len(), 1);
-        assert!(matches!(queue.pop_front(), Some(Effect::Search())));
+        assert!(matches!(queue.pop_front(), Some(Effect::Delay(_))));
     }
 
     #[tokio::test]
@@ -1966,22 +1877,16 @@ mod test {
 
     #[tokio::test]
     async fn dropped_drive_aborts() {
-        let (_directory, context) = blob_context().await;
+        let (_directory, mut context) = test_context();
         let ready = Arc::new(tokio::sync::Notify::new());
-        let task_ready = ready.clone();
+        context.storage_handle = stalling_storage(context.storage_handle, ready.clone());
         let task_context = context.clone();
-        let task = tokio::spawn(async move {
-            drive(
-                DeadlineOperation {
-                    staged: false,
-                    ready: task_ready,
-                },
-                &task_context,
-            )
-            .await
-        });
+        let task =
+            tokio::spawn(
+                async move { drive(DeadlineOperation { staged: false }, &task_context).await },
+            );
 
-        // The transaction is open while the blob effect is waiting.
+        // The transaction is open while the storage read is stalled.
         // Cancellation must transfer it to storage rather than strand it.
         ready.notified().await;
         task.abort();
@@ -1993,48 +1898,14 @@ mod test {
 
     #[tokio::test]
     async fn deadline_rollback() {
-        let temp_dir = tempdir().unwrap();
-        let temp_root = temp_dir.path().to_str().unwrap().to_string();
-        let blob_root = format!("{temp_root}/blobstore");
-        std::fs::create_dir_all(&blob_root).unwrap();
-        let storage_handle = storage::worker::FjallStorage::open(&temp_root).unwrap();
-        let net_handle =
-            aruna_net::NetHandle::new(crate::testing::local_net(), storage_handle.clone())
-                .await
-                .unwrap();
-        let blob_handle = aruna_blob::blob::BlobHandler::new(
-            aruna_core::structs::storage::blob::BackendConfig {
-                backend_type: aruna_core::structs::storage::blob::Backend::FileSystem,
-                root: blob_root,
-                service_config: std::collections::HashMap::new(),
-                bucket_prefix: Some("aruna-test-".to_string()),
-                max_bucket_size: Some(1),
-                multipart_bucket: Some("uploaded-parts".to_string()),
-                timeouts: Default::default(),
-            },
-            storage_handle.clone(),
-            net_handle,
-        )
-        .await
-        .unwrap();
-        let context = DriverContext {
-            storage_handle,
-            net_handle: None,
-            blob_handle: Some(blob_handle),
-            graph_handle: None,
-            task_handle: None,
-            compute_handle: None,
-            outbound_handle: None,
-        };
+        let (_directory, mut context) = test_context();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        context.storage_handle = stalling_storage(context.storage_handle, ready.clone());
         // Paused only now: the handles above wait on real I/O, and auto-advance would fire
         // their setup timeouts on a slow machine.
         tokio::time::pause();
         let _clock = freeze_clock();
-        let ready = Arc::new(tokio::sync::Notify::new());
-        let operation = DeadlineOperation {
-            staged: false,
-            ready: ready.clone(),
-        };
+        let operation = DeadlineOperation { staged: false };
         // Shorter than STORAGE_REQUEST_TIMEOUT so the advance below can only
         // fire the drive deadline, never a tied storage request timeout.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2169,7 +2040,7 @@ mod test {
             >();
             wait.await
         });
-        Effect::Blob(BlobEffect::SpoolHidden {
+        Effect::blob(BlobEffect::SpoolHidden {
             namespace: ulid::Ulid::from_bytes([8u8; 16]),
             name: "after-commit".to_string(),
             created_by: aruna_core::user::id::UserId::default(),
@@ -2225,22 +2096,52 @@ mod test {
         closed
     }
 
-    fn pending_blob() -> Effect {
-        Effect::Blob(BlobEffect::SpoolHidden {
-            namespace: ulid::Ulid::from_bytes([9u8; 16]),
-            name: "nested-deadline".to_string(),
-            created_by: aruna_core::user::id::UserId::default(),
-            max_bytes: None,
-            deadline: None,
-            blob: aruna_core::stream::BackendStream::new(futures_util::stream::pending::<
-                Result<bytes::Bytes, aruna_core::stream::StreamError>,
-            >()),
-        })
+    /// A storage read key that [`stalling_storage`] holds without answering.
+    const STALL_KEY: &[u8] = b"wait-stall";
+
+    fn parked_read() -> IoCall {
+        IoCall::Read(vec![("default".to_string(), ByteView::from(STALL_KEY))])
     }
 
-    /// Stages a row in a write transaction and waits on a spool that never ends: before the
-    /// commit, or after it when `commit` holds. Its cleanup sets `aborted` and writes the row
-    /// `nested-cleanup`.
+    /// A storage proxy that stalls reads of [`STALL_KEY`] after notifying `ready`, while
+    /// forwarding every other storage effect so abort and cleanup paths still run.
+    fn stalling_storage(
+        real: storage::handle::StorageHandle,
+        ready: Arc<tokio::sync::Notify>,
+    ) -> storage::handle::StorageHandle {
+        let (handle, receivers) = storage::handle::StorageHandle::new();
+        for receiver in [receivers.foreground, receivers.bulk] {
+            let (real, ready) = (real.clone(), ready.clone());
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let mut parked = Vec::new();
+                while let Ok((effect, response, ..)) = receiver.recv() {
+                    let stalls = matches!(
+                        &effect,
+                        StorageEffect::BatchRead { reads, .. }
+                            if reads.iter().any(|(_, key)| key.as_ref() == STALL_KEY)
+                    );
+                    if stalls {
+                        parked.push(response);
+                        ready.notify_one();
+                        continue;
+                    }
+                    let Event::Storage(event) = runtime.block_on(real.send_storage_effect(effect))
+                    else {
+                        panic!("storage answers with storage events");
+                    };
+                    response.send(event);
+                }
+            });
+        }
+        handle
+    }
+
+    /// Stages a row in a write transaction and waits on a stalled read before the commit, or on
+    /// a spool after it when `commit` holds. Its cleanup sets `aborted` and writes `nested-cleanup`.
     #[derive(Debug)]
     struct PendingTxn {
         staged: bool,
@@ -2283,8 +2184,7 @@ mod test {
                     calls: vec![wait],
                 });
             }
-            self.ready.notify_one();
-            Ok(Next::Call(IoCall::from(pending_blob())))
+            Ok(Next::Call(parked_read()))
         }
 
         fn abort(&mut self) -> Vec<IoCall> {
@@ -2355,13 +2255,13 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn nested_deadline_cleanup() {
         tokio::time::resume();
-        let (_directory, mut context) = blob_context().await;
+        let (_directory, mut context) = test_context();
+        let ready = Arc::new(tokio::sync::Notify::new());
         let (storage, started) = started_ids(context.storage_handle.clone());
-        context.storage_handle = storage;
+        context.storage_handle = stalling_storage(storage, ready.clone());
         tokio::time::pause();
         let _clock = freeze_clock();
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ready = Arc::new(tokio::sync::Notify::new());
         let operation = NestedDeadline {
             commit: false,
             aborted: aborted.clone(),
@@ -2437,11 +2337,12 @@ mod test {
     #[tokio::test(start_paused = true)]
     async fn group_child_cleanup() {
         tokio::time::resume();
-        let (_directory, context) = blob_context().await;
+        let (_directory, mut context) = test_context();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        context.storage_handle = stalling_storage(context.storage_handle, ready.clone());
         tokio::time::pause();
         let _clock = freeze_clock();
         let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let ready = Arc::new(tokio::sync::Notify::new());
         let operation = GroupedChild {
             aborted: aborted.clone(),
             ready: ready.clone(),
@@ -2686,14 +2587,11 @@ mod test {
                     version: None,
                 },
             };
-            Ok(Next::Call(IoCall::from(Effect::StagingSource(head))))
+            Ok(Next::Call(IoCall::staging(head)))
         }
 
         fn next(&mut self, result: IoResult) -> Result<Next<bool>, IoError> {
-            let answered = matches!(
-                result.event()?,
-                Event::StagingSource(StagingSourceEvent::Error { .. })
-            );
+            let answered = matches!(result.staging()?, StagingSourceEvent::Error { .. });
             Ok(Next::Done(answered))
         }
     }
@@ -2857,9 +2755,12 @@ mod test {
                         u64::from(key[0]),
                         Event::Storage(StorageEvent::ReadResult { key, value: None }),
                     ),
-                    Effect::Blob(BlobEffect::ReleaseReservation { id }) => {
-                        (3, Event::Blob(BlobEvent::ReservationReleased { id }))
-                    }
+                    Effect::Blob(blob) => match *blob {
+                        BlobEffect::ReleaseReservation { id } => {
+                            (3, Event::blob(BlobEvent::ReservationReleased { id }))
+                        }
+                        other => panic!("unexpected member {other:?}"),
+                    },
                     other => panic!("unexpected member {other:?}"),
                 };
                 tokio::time::sleep_until(Instant::now() + Duration::from_secs(seconds)).await;
@@ -2935,7 +2836,7 @@ mod test {
         let id = ulid::Ulid::from_bytes([3u8; 16]);
         run.add([
             slow_read(5),
-            Effect::Blob(BlobEffect::ReleaseReservation { id }),
+            Effect::blob(BlobEffect::ReleaseReservation { id }),
         ]);
         let started = Instant::now();
         let results = run_all(&mut run, &mut Vec::new()).await;
@@ -2943,7 +2844,7 @@ mod test {
             results,
             [
                 GroupResult::Unfinished,
-                GroupResult::Done(Box::new(Event::Blob(BlobEvent::ReservationReleased { id }))),
+                GroupResult::Done(Box::new(Event::blob(BlobEvent::ReservationReleased { id }))),
             ]
         );
         // The managed release finishes after the deadline instead of being cut off.
@@ -3110,7 +3011,7 @@ mod test {
                 hashes: Default::default(),
             };
             Ok(Next::Call(IoCall::Group(EffectGroup {
-                members: vec![Effect::Blob(BlobEffect::Delete { location })],
+                members: vec![Effect::blob(BlobEffect::Delete { location })],
                 limit: 1,
                 form: GroupForm::All { deadline: None },
             })))
@@ -3331,16 +3232,14 @@ mod test {
                 let _ = gate.await;
                 Ok::<_, aruna_core::stream::StreamError>(bytes::Bytes::new())
             });
-            Ok(Next::Call(IoCall::from(Effect::Blob(
-                BlobEffect::SpoolHidden {
-                    namespace: ulid::Ulid::from_bytes([5u8; 16]),
-                    name: self.name.to_string(),
-                    created_by: aruna_core::user::id::UserId::default(),
-                    max_bytes: None,
-                    deadline: None,
-                    blob: aruna_core::stream::BackendStream::new(blob),
-                },
-            ))))
+            Ok(Next::Call(IoCall::blob(BlobEffect::SpoolHidden {
+                namespace: ulid::Ulid::from_bytes([5u8; 16]),
+                name: self.name.to_string(),
+                created_by: aruna_core::user::id::UserId::default(),
+                max_bytes: None,
+                deadline: None,
+                blob: aruna_core::stream::BackendStream::new(blob),
+            })))
         }
 
         fn next(&mut self, _: IoResult) -> Result<Next<()>, IoError> {

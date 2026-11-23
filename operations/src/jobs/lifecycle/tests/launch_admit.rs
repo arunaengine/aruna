@@ -15,7 +15,6 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use ulid::Ulid;
 
 use super::admission_race::{config, envelope};
-use crate::document_repository::GetConfigError;
 use crate::jobs::fence::fence_read;
 use crate::jobs::lifecycle::LifecycleError;
 use crate::jobs::lifecycle::launch_admit::{
@@ -28,6 +27,7 @@ use crate::jobs::records::append::AppendOutcome;
 use crate::jobs::records::family::FamilyReadError;
 use crate::jobs::records::pages::PageReadError;
 use crate::tests::records::{Family, REALM, node};
+use aruna_ops_identity::document_repository::GetConfigError;
 
 fn child<T, E>(result: Result<T, E>) -> IoResult
 where

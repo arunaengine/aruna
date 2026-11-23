@@ -260,9 +260,9 @@ pub fn router(state: Arc<ServerState>, cors: &CorsConfig, api_public_url: Option
         .with_allowed_origins(cors.mcp_origins())
         .with_max_request_body_bytes(MCP_BODY_LIMIT)
         .with_cancellation_token(state.shutdown_token());
-    let handler_state = state.clone();
+    let mcp = McpServer::new(state.clone());
     let service: StreamableHttpService<McpServer, NeverSessionManager> = StreamableHttpService::new(
-        move || Ok(McpServer::new(handler_state.clone())),
+        move || Ok(mcp.clone()),
         Arc::new(NeverSessionManager::default()),
         config,
     );

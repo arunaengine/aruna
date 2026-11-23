@@ -11,20 +11,20 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::{info, warn};
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::node::usage_publish::{PublishUsageOperation, PublishedUsage, UsagePublishError};
-use crate::placement::process_placements::{
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::placement::process_placements::{
     PlacementReconcileOutcome, PlacementReconcileStatus, ReconcilePlacementsOperation,
 };
-use crate::realm::announce_presence::{
+use aruna_ops_identity::realm::announce_presence::{
     AnnouncePresenceConfig, AnnouncePresenceError, AnnouncePresenceOperation,
 };
-use crate::shard::recovery::{
+use aruna_ops_identity::shard::recovery::{
     PhaseOutcome, RecoveryBaseline, RecoveryDecision, RecoveryError, RecoveryOutcome, RecoveryPass,
     RecoveryRotation, RecoveryStatus, RecoveryStop, apply_recovery_pass,
 };
-use crate::shard::restore::plan::{ShardRestoreCursor, sync_eligible_node};
-use crate::shard::restore::{RestorePassOperation, RestoredPass};
+use aruna_ops_identity::shard::restore::plan::{ShardRestoreCursor, sync_eligible_node};
+use aruna_ops_identity::shard::restore::{RestorePassOperation, RestoredPass};
 
 /// Shortest wait between two bounded recovery passes while work remains local.
 pub const RECOVERY_RETRY_BASE: Duration = Duration::from_millis(250);
@@ -430,8 +430,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
-    use crate::shard::recovery::RecoveryState;
-    use crate::shard::restore::plan::ShardRestorePass;
+    use aruna_ops_identity::shard::recovery::RecoveryState;
+    use aruna_ops_identity::shard::restore::plan::ShardRestorePass;
 
     fn node() -> NodeId {
         iroh::SecretKey::from_bytes(&[1; 32]).public()

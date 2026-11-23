@@ -56,10 +56,10 @@ use super::submit::WorkRequest;
 use super::sweep::SweepOrphans;
 use super::waiting::RecheckWaiting;
 use super::work::calls::{JobOutputs, JobRow};
-use crate::document_repository::GetConfigOperation;
-use crate::realm::mutate_placement::node_kind;
 use aruna_core::install_work::WorkRow;
 use aruna_drivers::driver::{DriverContext, drive};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 fn local_of(ctx: &DriverContext) -> Option<NodeId> {
     ctx.net_handle.as_ref().map(|net| net.node_id())

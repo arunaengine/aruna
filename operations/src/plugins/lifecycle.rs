@@ -36,8 +36,8 @@ use super::matcher::Target;
 use super::records::{InstallEntryConfig, InstallEntryOperation, ReadEntry, RecordError};
 use super::rules::RulesFailure;
 use super::settings::check_settings;
-use crate::auth::install_access::{Grants, parse_grants, patterns_for};
-use crate::realm::mutate_placement::node_kind;
+use aruna_ops_identity::auth::install_access::{Grants, parse_grants, patterns_for};
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 /// An install as the realm config holds it now, for a caller proven group admin.
 #[derive(Debug, PartialEq)]

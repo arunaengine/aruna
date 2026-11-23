@@ -4,7 +4,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures_core::Stream;
+use futures_util::{StreamExt, future, stream};
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
@@ -88,12 +89,12 @@ impl<T> BackendStream<Result<T, StreamError>> {
 impl<T: Send + Sync + 'static> BackendStream<Result<T, StreamError>> {
     /// A stream that ends at once.
     pub fn empty() -> Self {
-        BackendStream(Box::pin(futures::stream::empty()))
+        BackendStream(Box::pin(stream::empty()))
     }
 
     /// A stream of the one `item`.
     pub fn once(item: T) -> Self {
-        BackendStream(Box::pin(futures::stream::iter([Ok(item)])))
+        BackendStream(Box::pin(stream::iter([Ok(item)])))
     }
 
     /// Keeps `guard` alive until the stream is dropped.
@@ -122,7 +123,7 @@ impl BackendStream<Result<Bytes, StreamError>> {
             .scan(0u64, move |offset, chunk| {
                 let start = *offset;
                 let item = match chunk {
-                    Ok(_) if start >= range.end => return futures::future::ready(None),
+                    Ok(_) if start >= range.end => return future::ready(None),
                     Ok(chunk) => {
                         let len = chunk.len() as u64;
                         *offset = start + len;
@@ -132,9 +133,9 @@ impl BackendStream<Result<Bytes, StreamError>> {
                     }
                     Err(error) => Some(Err(error)),
                 };
-                futures::future::ready(Some(item))
+                future::ready(Some(item))
             })
-            .filter_map(futures::future::ready);
+            .filter_map(future::ready);
         BackendStream(Box::pin(sliced))
     }
 }
@@ -285,76 +286,68 @@ impl<T> Stream for BackendStream<T> {
 #[cfg(test)]
 mod tests {
     use super::BackendStream;
-    use futures::{StreamExt, stream};
+    use futures_util::{StreamExt, stream};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
 
-    #[test]
-    fn on_success_completion() {
-        futures::executor::block_on(async {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let calls_for_callback = calls.clone();
-            let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
-                .on_success(move || {
-                    calls_for_callback.fetch_add(1, Ordering::SeqCst);
-                });
-
-            assert_eq!(stream.next().await.unwrap().unwrap(), 1);
-            assert!(stream.next().await.is_none());
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-        });
-    }
-
-    #[test]
-    fn on_success_error() {
-        futures::executor::block_on(async {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let calls_for_callback = calls.clone();
-            let mut stream = BackendStream::new(stream::iter(vec![Err::<i32, _>(
-                std::io::Error::other("boom"),
-            )]))
+    #[tokio::test]
+    async fn on_success_completion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_callback = calls.clone();
+        let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
             .on_success(move || {
                 calls_for_callback.fetch_add(1, Ordering::SeqCst);
             });
 
-            assert!(stream.next().await.unwrap().is_err());
-            assert!(stream.next().await.is_none());
-            assert_eq!(calls.load(Ordering::SeqCst), 0);
-        });
+        assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
-    #[test]
-    fn on_async_completion() {
-        futures::executor::block_on(async {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let calls_for_callback = calls.clone();
-            let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
-                .on_success_async(move || async move {
-                    calls_for_callback.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
-                });
-
-            assert_eq!(stream.next().await.unwrap().unwrap(), 1);
-            assert!(stream.next().await.is_none());
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
+    #[tokio::test]
+    async fn on_success_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_callback = calls.clone();
+        let mut stream = BackendStream::new(stream::iter(vec![Err::<i32, _>(
+            std::io::Error::other("boom"),
+        )]))
+        .on_success(move || {
+            calls_for_callback.fetch_add(1, Ordering::SeqCst);
         });
+
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn on_async_error() {
-        futures::executor::block_on(async {
-            let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
-                .on_success_async(move || async move {
-                    Err(super::StreamError(Box::new(std::io::Error::other(
-                        "callback failed",
-                    ))))
-                });
+    #[tokio::test]
+    async fn on_async_completion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_callback = calls.clone();
+        let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
+            .on_success_async(move || async move {
+                calls_for_callback.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
 
-            assert_eq!(stream.next().await.unwrap().unwrap(), 1);
-            assert!(stream.next().await.unwrap().is_err());
-            assert!(stream.next().await.is_none());
-        });
+        assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn on_async_error() {
+        let mut stream = BackendStream::new(stream::iter(vec![Ok::<_, std::io::Error>(1)]))
+            .on_success_async(move || async move {
+                Err(super::StreamError(Box::new(std::io::Error::other(
+                    "callback failed",
+                ))))
+            });
+
+        assert_eq!(stream.next().await.unwrap().unwrap(), 1);
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
     }
 }

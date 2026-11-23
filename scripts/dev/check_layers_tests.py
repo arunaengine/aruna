@@ -183,6 +183,23 @@ class ReferencesTest(unittest.TestCase):
         counts, _ = self.counts({"operations/src/abe/inner.rs": "use super::super::jobs::run;\n"})
         self.assertEqual(counts["pure_async_refs"], 1)
 
+    def test_split_crates(self):
+        counts, details = self.counts(
+            {
+                "ops-identity/src/auth/mod.rs": "pub struct A;\n",
+                "ops-data/src/s3/mod.rs": "use aruna_ops_identity::auth::A;\npub struct B;\n",
+                "operations/src/jobs/mod.rs": "use aruna_ops_data::s3::B;\n",
+            }
+        )
+        self.assertEqual(counts["upward_refs"], 0, details["upward_refs"])
+        counts, _ = self.counts(
+            {
+                "ops-identity/src/auth/mod.rs": "use aruna_ops_data::s3::B;\n",
+                "ops-data/src/s3/mod.rs": "pub struct B;\n",
+            }
+        )
+        self.assertEqual(counts["upward_refs"], 1)
+
     def test_group_cycles(self):
         counts, details = self.counts(
             {

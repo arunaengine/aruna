@@ -29,7 +29,7 @@ fn spooled() -> IoResult {
         blake3: [1; 32],
         size: 4,
     };
-    IoResult::Event(Box::new(Event::Blob(event)))
+    IoResult::Event(Box::new(Event::blob(event)))
 }
 
 // An upload source starts with its claim.
@@ -98,6 +98,6 @@ fn spool_discards_stopped() {
         spool.next(stops(true, false)),
         Ok(Next::Call(IoCall::Effect(_)))
     ));
-    let failed = IoResult::Event(Box::new(Event::Blob(BlobEvent::HiddenDeleted)));
+    let failed = IoResult::Event(Box::new(Event::blob(BlobEvent::HiddenDeleted)));
     assert_eq!(spool.next(failed), Err(ImportFailure::Cancelled));
 }

@@ -20,7 +20,7 @@ use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
@@ -30,23 +30,21 @@ struct OutboxBarrier {
 #[cfg(debug_assertions)]
 impl Drop for OutboxBarrier {
     fn drop(&mut self) {
-        info!(event = "test.outbox.joined", "Outbox drain joined");
+        tracing::info!(event = "test.outbox.joined", "Outbox drain joined");
         if let Err(error) = std::fs::write(&self.marker, b"joined") {
             warn!(error = %error, "Failed to record outbox join");
         }
     }
 }
 
+use crate::tasks::task_persistence::restore_task_timers;
+use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
+use aruna_drivers::driver::node_facts;
 use aruna_drivers::driver::{DriverContext, drive, drive_retry, node_routing};
 use aruna_drivers::effect_adapters::task::{arm_unless_stored, change_timer};
 use aruna_drivers::jobs::runtime::JobsRuntime;
 use aruna_operations::blob::reclaim_sweep::{ReclaimSweepOperation, reclaim_plan};
 use aruna_operations::blob::sweep_timer::ArmSweepOperation;
-use aruna_operations::device::publish_queue::DrainOutcome;
-use aruna_operations::device::sync::{
-    RECONCILE_CONTINUE_AFTER, RECONCILE_IDLE_AFTER, RECONCILE_RETRY_AFTER,
-};
-use aruna_operations::device_node::sync_note::{NoteSyncOperation, SyncNote};
 use aruna_operations::jobs::DRAIN_RETRY_AFTER;
 use aruna_operations::jobs::drain::{DrainJobsOperation, DrainTimerOperation, JobClassBudget};
 use aruna_operations::jobs::prune::PruneTimerOperation;
@@ -56,6 +54,27 @@ use aruna_operations::metadata::materialization_queue::{
 };
 use aruna_operations::metadata::projection::ProjectionTimerOperation;
 use aruna_operations::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
+use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
+use aruna_operations::notifications::prune::RestorePruneOperation;
+use aruna_operations::notifications::watch::digest::InterestOperation;
+use aruna_operations::notifications::watch::table::RebuildTableOperation;
+use aruna_operations::replication::drain::RestoreDrainOperation;
+use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
+use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
+use aruna_operations::sync::document_outbox::OutboxTimerOperation;
+use aruna_operations::sync::outbox::batches::OutboxLimits;
+use aruna_operations::sync::outbox::rotation::OutboxRotation;
+use aruna_operations::triggers::{
+    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
+};
+use aruna_storage::task_timers::delete_persisted_timer;
+use folder_pass::{restore_publish_timer, restore_sync_timers};
+
+pub(crate) mod drained;
+pub mod folder_pass;
+pub mod git_drain;
+pub mod outbox;
+pub mod restore;
 
 /// The logical cores this host offers, as the operating system reports them.
 fn host_cores() -> usize {
@@ -86,45 +105,12 @@ async fn restore_graph_prune(
         Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
     }
 }
-use crate::tasks::task_persistence::restore_task_timers;
-use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use aruna_drivers::driver::node_facts;
-use aruna_operations::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
-use aruna_operations::notifications::prune::RestorePruneOperation;
-use aruna_operations::notifications::watch::digest::InterestOperation;
-use aruna_operations::notifications::watch::table::RebuildTableOperation;
-use aruna_operations::queue_backoff::retry_delay_ms;
-use aruna_operations::replication::drain::RestoreDrainOperation;
-use aruna_operations::replication::mirror_repair::drain::RestoreTimerOperation;
-use aruna_operations::s3::bucket::key::lock::LockBucketOperation;
-use aruna_operations::sync::document_outbox::OutboxTimerOperation;
-use aruna_operations::sync::outbox::batches::OutboxLimits;
-use aruna_operations::sync::outbox::rotation::OutboxRotation;
-use aruna_operations::triggers::{
-    TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
-};
-use aruna_storage::task_timers::delete_persisted_timer;
-use folder_pass::{restore_publish_timer, restore_sync_timers};
-
-pub(crate) mod drained;
-pub mod folder_pass;
-pub mod git_drain;
-pub mod outbox;
-pub mod restore;
 
 const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
-
-/// How long a device keeps its copy of the realm documents before asking for
-/// them again. A revocation reaches it within this window at the latest.
-const REALM_DOCUMENTS_AFTER: Duration = Duration::from_secs(60);
-
-/// How long one attempt may spend on the realm as a whole. The folder cadence
-/// is what it shares that time with, so it is bounded once, not per node.
-const REALM_DOCUMENTS_BUDGET: Duration = Duration::from_secs(20);
 /// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
 const DEAD_LETTER_TICKS: usize = 12;
 
-/// One drained outbox record with its resolved publish topic.
+/// Dispatches scheduled tasks and background drains to their operations.
 pub(crate) struct OperationsTaskHandler {
     context: Arc<DriverContext>,
     jobs_runtime: Arc<JobsRuntime>,
@@ -133,10 +119,6 @@ pub(crate) struct OperationsTaskHandler {
     // restart is fine: a restarted timer starts afresh.
     timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
     outbox_limits: OutboxLimits,
-    // When a device may next fetch the realm documents, and how many attempts
-    // have failed. Loss on restart is fine: a restart fetches them anyway.
-    realm_documents: std::sync::Mutex<(u32, u64)>,
-    // Signs registry publications; `None` where no node identity was supplied.
 }
 
 impl OperationsTaskHandler {
@@ -147,7 +129,6 @@ impl OperationsTaskHandler {
             rocrate_limits: RoCrateLimits::default(),
             timer_memory: std::sync::Mutex::new(HashMap::new()),
             outbox_limits: OutboxLimits::default(),
-            realm_documents: std::sync::Mutex::new((0, 0)),
         }
     }
 
@@ -214,66 +195,6 @@ impl OperationsTaskHandler {
     pub(super) async fn arm_backend_imports(&self) {
         self.keep_retrying(TaskKey::RunBackendImports, Duration::ZERO)
             .await;
-    }
-
-    /// Fetches the realm documents on a device, at most once per backoff
-    /// window. A device is judged by state it does not hold, so this is the one
-    /// beat that keeps a revocation or an eviction reaching it.
-    async fn fetch_realm_documents(&self) {
-        let now = unix_timestamp_millis();
-        {
-            let due = self
-                .realm_documents
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if due.1 > now {
-                return;
-            }
-        }
-        let fetched = drive(
-            aruna_operations::device_node::realm_documents::fetch_realm_documents(
-                self.context.node_and_realm(),
-                REALM_DOCUMENTS_BUDGET,
-            ),
-            &self.context,
-        )
-        .await
-        .unwrap_or(false);
-        let note = match fetched {
-            true => SyncNote::Contact,
-            false => SyncNote::Failure,
-        };
-        let note = NoteSyncOperation::new(note, unix_timestamp_millis());
-        if let Err(error) = drive(note, &self.context).await {
-            warn!(%error, "Failed to note the device sync state");
-        }
-        let mut state = self
-            .realm_documents
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let attempts = match fetched {
-            true => 0,
-            false => state.0.saturating_add(1),
-        };
-        let after = match fetched {
-            true => REALM_DOCUMENTS_AFTER.as_millis() as u64,
-            false => retry_delay_ms(attempts),
-        };
-        *state = (attempts, now.saturating_add(after));
-    }
-
-    /// Refreshes the metadata replicas this device keeps, on the same beat the
-    /// folders run on. A node that keeps none does nothing.
-    async fn refresh_device_replicas(&self) {
-        let pass = aruna_operations::metadata::device::refresh::refresh_replicas(
-            self.context.node_and_realm(),
-        );
-        if drive(pass, &self.context).await.unwrap_or(0) > 0 {
-            let note = NoteSyncOperation::new(SyncNote::Finished, unix_timestamp_millis());
-            if let Err(error) = drive(note, &self.context).await {
-                warn!(%error, "Failed to note the device sync state");
-            }
-        }
     }
 
     /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
@@ -461,19 +382,7 @@ impl OperationsTaskHandler {
             TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
             TaskKey::DrainLinkQueue => Box::pin(self.run_trigger(key)),
             TaskKey::DrainCaptures => Box::pin(self.run_trigger(key)),
-            TaskKey::ReconcileSyncedFolders => Box::pin(async move {
-                let after = match folder_pass::reconcile_folders(&self.context).await {
-                    DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
-                    DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
-                    DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
-                };
-                self.reschedule_timer(TaskKey::ReconcileSyncedFolders, after)
-                    .await;
-                // After the folders, never before them: an unreachable realm
-                // must not hold up the owner's own files.
-                self.fetch_realm_documents().await;
-                self.refresh_device_replicas().await;
-            }),
+            TaskKey::ReconcileSyncedFolders => Box::pin(self.run_trigger(key)),
             TaskKey::DrainUploadOutbox => Box::pin(self.run_trigger(key)),
             TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),
         }

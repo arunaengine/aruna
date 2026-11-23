@@ -34,10 +34,10 @@ use super::rows::{
     read_call, row as row_of, unexpected, values,
 };
 use super::runs::{Admission, RunError, event_run};
-use crate::document_repository::GetConfigOperation;
-use crate::realm::mutate_placement::node_kind;
 use aruna_core::metadata::protocol::MetadataReadError;
 use aruna_core::plugin_runs::Outcome;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::mutate_placement::node_kind;
 
 /// The decision a resend of an event gets, with its anchor for the dedup retention.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,7 +195,7 @@ impl Operation for DecideEvent {
                 Ok(Next::Call(ask))
             }
             DecidePhase::Denying(reason) => self.decided(Outcome::Denied(reason), Vec::new()),
-            DecidePhase::Writing(_) => Err(StoreError("decided twice".into())),
+            DecidePhase::Writing(_) => Err(StoreError::Message("decided twice".into())),
         }
     }
 
@@ -210,7 +210,7 @@ impl Operation for DecideEvent {
                 Ok(Some(rows)) => self.decided(Outcome::Queued, rows),
                 Err(RunError::Full(_)) => Ok(Next::Done(Outcome::Busy)),
                 Err(RunError::Store(error)) => Err(error),
-                Err(error) => Err(StoreError(error.to_string())),
+                Err(error) => Err(StoreError::Message(error.to_string())),
             },
             DecidePhase::Holding(mut hold) => match hold.take(answer)? {
                 Slot::More(ask) => {
@@ -430,6 +430,9 @@ impl Operation for KeepReports {
     }
 
     fn first(&mut self) -> Result<Next<Self::Output>, StoreError> {
+        if self.reports.is_empty() {
+            return Ok(Next::Done(Vec::new()));
+        }
         let reads = (self.reports.iter())
             .map(|(install_id, report)| {
                 let key = reported_key(self.sender, *install_id, report.kind, report.reason);
@@ -456,6 +459,9 @@ impl Operation for KeepReports {
                 let key = reported_key(self.sender, install_id, kind, reason);
                 writes.push(row_of(PLUGIN_GAPS_KEYSPACE, key, encode(&report)?));
             }
+        }
+        if writes.is_empty() {
+            return Ok(Next::Done(acked));
         }
         self.acked = Some(acked);
         Ok(Next::Call(IoCall::Write(writes)))
@@ -504,7 +510,7 @@ impl Operation for EventDelivery {
     fn first(&mut self) -> Result<Next<Delivery>, StoreError> {
         match &self.phase {
             DeliveryPhase::Waiting(scan) => Ok(Next::Call(scan.ask())),
-            _ => Err(StoreError("read twice".into())),
+            _ => Err(StoreError::Message("read twice".into())),
         }
     }
 
@@ -651,7 +657,7 @@ impl Operation for Judge {
         match std::mem::replace(&mut self.phase, JudgePhase::Prerequisites) {
             JudgePhase::Prerequisites => {
                 let held = answer.child::<bool, AccountError>()?;
-                match held.map_err(|error| StoreError(error.0))? {
+                match held.map_err(|error| StoreError::Message(error.0))? {
                     true => self.check(),
                     false => Ok(Next::Done(Verdict::Unready)),
                 }

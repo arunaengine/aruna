@@ -34,10 +34,10 @@ use crate::identity::enrollment::{
 };
 use crate::identity::{IdentityError, IdentityStore};
 use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
+use aruna_core::search::MetadataSearchStorage;
 use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeState, PersistedNodeStatus,
 };
-use aruna_graph::MetadataSearchStorage;
 use aruna_storage::errors::StorageLibError;
 use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
@@ -577,7 +577,12 @@ fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
         match component {
             std::path::Component::CurDir => {}
             std::path::Component::ParentDir => {
-                if !folded.pop() {
+                if matches!(
+                    folded.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    folded.pop();
+                } else if !folded.has_root() {
                     folded.push(component.as_os_str());
                 }
             }
@@ -1094,5 +1099,19 @@ mod tests {
         );
         let identity = crate::identity::IdentityStore::from_storage(storage);
         assert!(identity.load().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn folds_root_parents() {
+        let root = std::path::Path::new("/");
+        assert_eq!(super::fold_components(std::path::Path::new("/..")), root);
+        assert_eq!(
+            super::fold_components(std::path::Path::new("/a/../..")),
+            root
+        );
+        assert_eq!(
+            super::fold_components(std::path::Path::new("../..")),
+            std::path::Path::new("../..")
+        );
     }
 }

@@ -115,7 +115,7 @@ async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), 
     let event = aruna_drivers::testing::send_metadata_effect(
         handle,
         MetadataEffect::CreateCrate {
-            request: MetadataCrateRequest {
+            request: Box::new(MetadataCrateRequest {
                 graph_iri: graph_iri(index),
                 name: format!("Cold Start Dataset {index:05}"),
                 description: format!("Cold start corpus graph {index}"),
@@ -127,7 +127,7 @@ async fn create_crate_graph(handle: &DriverContext, index: usize) -> Result<(), 
                 },
                 durability: MetadataRequestDurability::WalAlreadyDurable,
                 deterministic_actor: None,
-            },
+            }),
         },
     )
     .await;

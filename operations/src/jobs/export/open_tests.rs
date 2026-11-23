@@ -24,7 +24,7 @@ fn reading() -> OpenCandidateOperation {
 }
 
 fn blob_error(error: BlobError) -> IoResult {
-    event(Event::Blob(BlobEvent::Error(error)))
+    event(Event::blob(BlobEvent::Error(error)))
 }
 
 // An export into a realm never reads from another node.

@@ -25,18 +25,20 @@ use super::resolve::{
     ResolveResult,
 };
 use super::{ExportEntity, ExportFailure, MAX_LOCAL_CANDIDATES, REMOTE_ATTEMPTS, SourceScope};
-use crate::auth::enforcement::{PolicyBulkOperation, PolicyEvaluator, PolicyEvaluators};
-use crate::auth::error::PolicyEnforcementError;
-use crate::auth::permission_rules::{
-    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
-};
-use crate::blob::holders::{GetHoldersError, GetHoldersOperation};
 use crate::jobs::import::{job_call, stops_of};
-use crate::s3::object::head::{
-    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
-};
 use aruna_core::blob_paths::{MAX_HASH_ALIASES, ResolvePathsError, ResolvePathsOperation};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_ops_data::blob::holders::{GetHoldersError, GetHoldersOperation};
+use aruna_ops_data::s3::object::head::{
+    HeadObjectError, HeadObjectInput, HeadObjectOperation, HeadObjectResult,
+};
+use aruna_ops_identity::auth::enforcement::{
+    PolicyBulkOperation, PolicyEvaluator, PolicyEvaluators,
+};
+use aruna_ops_identity::auth::error::PolicyEnforcementError;
+use aruna_ops_identity::auth::permission_rules::{
+    PermissionRules, PermissionRulesConfig, PermissionRulesOperation,
+};
 
 /// What the source lookups of one export run have learned, so each is asked only once.
 #[derive(Debug, Default, PartialEq)]

@@ -18,6 +18,8 @@ members = [
     "storage",
     "net",
     "tasks",
+    "ops-identity",
+    "ops-data",
     "operations",
     "drivers",
     "outbound",
@@ -59,6 +61,8 @@ aruna-core = { path = "core" }
 aruna-graph = { path = "graph" }
 aruna-net = { path = "net" }
 aruna-operations = { path = "operations" }
+aruna-ops-data = { path = "ops-data" }
+aruna-ops-identity = { path = "ops-identity" }
 aruna-drivers = { path = "drivers" }
 aruna-outbound = { path = "outbound" }
 aruna-plugin = { path = "plugins/sdk" }
@@ -204,7 +208,7 @@ opentelemetry_sdk = { version = "0.33.1", default-features = false, features = [
 ] }
 oxrdf = "0.3.4"
 oxttl = "0.2.4"
-parking_lot = { version = "0.13.0", features = ["deadlock_detection"] }
+parking_lot = "0.13.0"
 pbkdf2 = "0.13.0"
 percent-encoding = "2.3.2"
 pithos_lib = { git = "https://github.com/arunaengine/pithos", rev = "2996df4269dd93fff3421e516fdd11f1a47c3be7", default-features = false, features = ["async"] }
@@ -239,7 +243,7 @@ kube = { version = "5.1.0", default-features = false, features = [
 ] }
 k8s-openapi = { version = "0.29.0", features = ["v1_33"] }
 s3s = "0.17.0"
-schemars = "1.2.2"
+schemars = { version = "1.2.2", features = ["chrono04"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.152", features = ["raw_value"] }
 serde-saphyr = "2.2.0"
@@ -322,8 +326,74 @@ zstd = "0.14.2"
 [profile.release]
 panic = "abort"
 
-# Tests spin up real multi-node clusters, so unoptimized dependencies dominate
-# their runtime; workspace crates stay at opt-level 0 for compile speed and
-# coverage fidelity.
+# Line tables keep full file:line backtraces while cutting DWARF codegen,
+# artifact sizes and link time; workspace crates stay at opt-level 0.
+[profile.dev]
+debug = "line-tables-only"
+
+# Build scripts and proc-macros need neither debuginfo nor optimization.
+[profile.dev.build-override]
+opt-level = 0
+debug = 0
+
+# Third-party crates need no DWARF and build much faster at opt-level 1 than
+# opt-level 3; only the test-runtime CPU hotspots below run at opt-level 2.
 [profile.dev.package."*"]
-opt-level = 3
+opt-level = 1
+debug = 0
+
+# Crypto, LSM, compression and transport hotspots for multi-node cluster tests.
+[profile.dev.package.aes-gcm]
+opt-level = 2
+[profile.dev.package.argon2]
+opt-level = 2
+[profile.dev.package.aws-lc-rs]
+opt-level = 2
+[profile.dev.package.bao-tree]
+opt-level = 2
+[profile.dev.package.blake3]
+opt-level = 2
+[profile.dev.package.bls12_381_plus]
+opt-level = 2
+[profile.dev.package.chacha20poly1305]
+opt-level = 2
+[profile.dev.package.curve25519-dalek]
+opt-level = 2
+[profile.dev.package.ed25519-dalek]
+opt-level = 2
+[profile.dev.package.fjall]
+opt-level = 2
+[profile.dev.package.flate2]
+opt-level = 2
+[profile.dev.package.lsm-tree]
+opt-level = 2
+[profile.dev.package.noq]
+opt-level = 2
+[profile.dev.package.noq-proto]
+opt-level = 2
+[profile.dev.package.pbkdf2]
+opt-level = 2
+[profile.dev.package.pithos_lib]
+opt-level = 2
+[profile.dev.package.ring]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2
+[profile.dev.package.x25519-dalek]
+opt-level = 2
+[profile.dev.package.zstd-sys]
+opt-level = 2
+
+# Unoptimized profile for fast cross-platform unit tests and Windows checks.
+[profile.ci-platform]
+inherits = "dev"
+opt-level = 0
+debug = 0
+
+[profile.ci-platform.build-override]
+opt-level = 0
+debug = 0
+
+[profile.ci-platform.package."*"]
+opt-level = 0
+debug = 0

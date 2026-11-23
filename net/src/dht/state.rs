@@ -29,7 +29,7 @@ use super::rpc::{
     signed_record_bytes, verify_stored_value,
 };
 use super::storage::{
-    DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, entry_is_fresh, merge_entry,
+    DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, entry_is_fresh, merge_validated,
     retained_entries, retention_deadline,
 };
 use crate::streams::PeerKinds;
@@ -851,7 +851,7 @@ impl DhtStateMachine {
                     if existing.is_some_and(|existing| entry.revision <= existing.revision) {
                         continue;
                     }
-                    let merged = match merge_entry(
+                    let merged = match merge_validated(
                         &op.key,
                         op.cache_entries.clone(),
                         stored.clone(),

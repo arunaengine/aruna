@@ -226,12 +226,12 @@ async fn dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
     let value = b"replicated-value".to_vec();
 
     let put = handle_a
-        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
             key,
             realm_id: RealmId::from_bytes([1u8; 32]),
             value: value.clone(),
             ttl: Duration::from_secs(3600),
-        })))
+        }))))
         .await;
     assert!(
         matches!(
@@ -245,11 +245,11 @@ async fn dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let get = handle_b
-        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Get {
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
             key,
             realm_filter: None,
             options: DhtGetOptions::default(),
-        })))
+        }))))
         .await;
     let found = match &get {
         Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => {
@@ -779,12 +779,12 @@ async fn seed_presence(
     realm_id: RealmId,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let published = handle
-        .send_effect(Effect::Net(NetEffect::Dht(DhtEffect::Put {
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
             key,
             realm_id,
             value: Vec::new(),
             ttl: Duration::from_secs(300),
-        })))
+        }))))
         .await;
     assert!(matches!(
         published,
@@ -804,11 +804,11 @@ async fn realm_fanout_inner() -> Result<(), Box<dyn std::error::Error>> {
     fixture.b.shutdown().await;
     let first = fixture.a.pool_counts();
     let request = || {
-        Effect::Net(NetEffect::Dht(DhtEffect::Get {
+        Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
             key,
             realm_filter: Some(realm_id),
             options: DhtGetOptions::presence(Duration::from_secs(4), realm_id),
-        }))
+        })))
     };
     let _ = fixture.a.send_effect(request()).await;
     let after_first = fixture.a.pool_counts();

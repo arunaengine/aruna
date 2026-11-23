@@ -21,9 +21,9 @@ use ulid::Ulid;
 use super::links::{ChangeLinkOperation, LinkChange, LinkError, id_key};
 use super::push::creator_auth;
 use super::submit::{LinkJob, LinkJobOperation};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route_for};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_ops_data::metadata::id_mapping::{MappingRoute, PersistentIdError, mapping_route_for};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 const LINK_PAGE: usize = 256;
 

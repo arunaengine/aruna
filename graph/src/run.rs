@@ -300,7 +300,7 @@ fn validate_effect(
             let started = Instant::now();
             let result = call_span
                 .in_scope(|| {
-                    node.validate_create_crate(auth, craqle_create_request(request))
+                    node.validate_create_crate(auth, craqle_create_request(*request))
                         .map_err(Box::new)
                 })
                 .map(|_| MetadataEvent::ValidationResult {
@@ -380,7 +380,7 @@ fn crate_effect(
             let result = call_span.in_scope(|| {
                 node.create_crate_with_durability_as(
                     auth,
-                    craqle_create_request(request.clone()),
+                    craqle_create_request((*request).clone()),
                     craqle_request_durability(durability),
                     actor,
                 )
@@ -729,7 +729,7 @@ fn export_effect(
                 call_span.record("total_data_entities", page.total_data_entities as u64);
                 MetadataEvent::RoCratePageResult {
                     graph_iri: graph_iri.clone(),
-                    page: page_from_craqle(page),
+                    page: Box::new(page_from_craqle(page)),
                 }
             });
             record_metadata_result(

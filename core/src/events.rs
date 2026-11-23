@@ -40,18 +40,15 @@ use std::time::Duration;
 use ulid::Ulid;
 
 #[derive(Debug, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum Event {
-    Blob(BlobEvent),
-    StagingSource(StagingSourceEvent),
+    Blob(Box<BlobEvent>),
+    StagingSource(Box<StagingSourceEvent>),
     LocalFile(LocalFileEvent),
     Storage(StorageEvent),
     Net(NetEvent),
     Metadata(MetadataEvent),
     SubOperation(SubOperationEvent),
     Task(TaskEvent),
-    Search(),
-    Stream(),
     Index(IndexEvent),
     Group(GroupEvent),
     Session(Box<crate::compute::session::SessionAnswer>),
@@ -71,6 +68,62 @@ pub enum Event {
     Job(crate::jobs::JobEvent),
     /// Answers `Effect::Git`; never persisted.
     Git(Box<crate::git::GitAnswer>),
+}
+
+impl Event {
+    /// Boxes a blob event so `Event` stays compact on non-blob paths.
+    pub fn blob(event: BlobEvent) -> Self {
+        Self::Blob(Box::new(event))
+    }
+
+    /// Boxes a staging-source event so `Event` stays compact on other paths.
+    pub fn staging(event: StagingSourceEvent) -> Self {
+        Self::StagingSource(Box::new(event))
+    }
+
+    /// Borrows a blob event when this event is one.
+    pub fn as_blob(&self) -> Option<&BlobEvent> {
+        match self {
+            Self::Blob(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    /// Borrows a staging-source event when this event is one.
+    pub fn as_staging(&self) -> Option<&StagingSourceEvent> {
+        match self {
+            Self::StagingSource(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    /// Unboxes a blob event, or returns the event unchanged.
+    pub fn into_blob(self) -> Result<BlobEvent, Self> {
+        match self {
+            Self::Blob(event) => Ok(*event),
+            other => Err(other),
+        }
+    }
+
+    /// Unboxes a staging-source event, or returns the event unchanged.
+    pub fn into_staging(self) -> Result<StagingSourceEvent, Self> {
+        match self {
+            Self::StagingSource(event) => Ok(*event),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<BlobEvent> for Event {
+    fn from(event: BlobEvent) -> Self {
+        Self::blob(event)
+    }
+}
+
+impl From<StagingSourceEvent> for Event {
+    fn from(event: StagingSourceEvent) -> Self {
+        Self::staging(event)
+    }
 }
 
 /// Results of a [`crate::effects::EffectGroup`]; never persisted.
@@ -125,7 +178,7 @@ pub enum SubOperationEvent {
         result: Box<Result<ResolvedSourceConnector, SourceResolutionError>>,
     },
     VersionAccessResolved {
-        result: Result<ResolvedSourceAccess, SourceResolutionError>,
+        result: Box<Result<ResolvedSourceAccess, SourceResolutionError>>,
     },
     LiveReplicationQueued {
         result: Result<(), String>,
@@ -137,7 +190,7 @@ pub enum SubOperationEvent {
         result: Result<(), String>,
     },
     GroupRoutingLoaded {
-        result: Result<GroupRoutingInputs, String>,
+        result: Box<Result<GroupRoutingInputs, String>>,
     },
     NotificationsEmitted,
     /// A share link's access log entry and use counters were written.
@@ -728,7 +781,7 @@ pub enum ExecutionSignEvent {
 pub enum VaultFetchEvent {
     Fetched {
         holder: NodeId,
-        records: VaultRecords,
+        records: Box<VaultRecords>,
     },
     /// Every reached holder answered without records.
     NotFound,
@@ -983,76 +1036,90 @@ impl MetadataEvent {
     }
 }
 
+impl BlobEvent {
+    /// Names the blob event variant without its values.
+    pub fn label(&self) -> &'static str {
+        variant_label!(
+            self,
+            BlobEvent {
+                WriteFinished,
+                ReadFinished,
+                DeleteFinished,
+                ReservationReleased,
+                StreamCollected,
+                ReservationReconciled,
+                HiddenSpooled,
+                HiddenRead,
+                LocalSpooled,
+                HiddenDeleted,
+                PinnedRead,
+                ReadHeld,
+                HiddenListed,
+                ConnectionEstablished,
+                ConnectionClosed,
+                MessageReceived,
+                MessageSent,
+                ReplicationFinished,
+                ReadServed,
+                GroupBackendChecked,
+                UploadOpened,
+                PartWritten,
+                UploadAborted,
+                BucketKeyGenerated,
+                CopiesSealed,
+                KeyPrepared,
+                KeyActivated,
+                KeyDiscarded,
+                KeyStatus,
+                KeyExtended,
+                KeyLocked,
+                ReadAdmitted,
+                Error,
+                CopyRewritten,
+                PieceWritten,
+                UnlockedKeyRead,
+                ArchiveHashed,
+                ComposeReserved,
+                Abe,
+                ExternalListed,
+                ExternalHashed,
+                PlainStat,
+                ExternalStat,
+                CopyStat,
+                PlainWritten,
+                BucketReady,
+                BucketExists,
+                BucketDeleted,
+                Remote,
+                StreamTooLarge,
+            }
+        )
+    }
+}
+
+impl StagingSourceEvent {
+    /// Names the staging-source event variant without its values.
+    pub fn label(&self) -> &'static str {
+        variant_label!(
+            self,
+            StagingSourceEvent {
+                CheckResult,
+                HeadResult,
+                ListResult,
+                ReadResult,
+                HealthResult,
+                Error,
+            }
+        )
+    }
+}
+
 impl Event {
     /// Names the event variant without its values, for logs and unexpected-event errors.
     pub fn label(&self) -> &'static str {
         match self {
-            Event::Blob(event) => variant_label!(
-                event,
-                BlobEvent {
-                    WriteFinished,
-                    ReadFinished,
-                    DeleteFinished,
-                    ReservationReleased,
-                    StreamCollected,
-                    ReservationReconciled,
-                    HiddenSpooled,
-                    HiddenRead,
-                    LocalSpooled,
-                    HiddenDeleted,
-                    PinnedRead,
-                    ReadHeld,
-                    HiddenListed,
-                    ConnectionEstablished,
-                    ConnectionClosed,
-                    MessageReceived,
-                    MessageSent,
-                    ReplicationFinished,
-                    ReadServed,
-                    GroupBackendChecked,
-                    UploadOpened,
-                    PartWritten,
-                    UploadAborted,
-                    BucketKeyGenerated,
-                    CopiesSealed,
-                    KeyPrepared,
-                    KeyActivated,
-                    KeyDiscarded,
-                    KeyStatus,
-                    KeyExtended,
-                    KeyLocked,
-                    ReadAdmitted,
-                    Error,
-                    CopyRewritten,
-                    PieceWritten,
-                    UnlockedKeyRead,
-                    ArchiveHashed,
-                    ComposeReserved,
-                    Abe,
-                    ExternalListed,
-                    ExternalHashed,
-                    PlainStat,
-                    ExternalStat,
-                    CopyStat,
-                    PlainWritten,
-                    BucketReady,
-                    BucketExists,
-                    BucketDeleted,
-                    Remote,
-                    StreamTooLarge,
-                }
-            ),
-            Event::StagingSource(event) => variant_label!(
-                event,
-                StagingSourceEvent {
-                    CheckResult,
-                    HeadResult,
-                    ListResult,
-                    ReadResult,
-                    HealthResult,
-                    Error,
-                }
-            ),
+            Event::Blob(event) => event.label(),
+            Event::StagingSource(event) => event.label(),
             Event::LocalFile(event) => variant_label!(
                 event,
                 LocalFileEvent {
@@ -1179,8 +1246,6 @@ impl Event {
             Event::Job(_) => "Event::Job",
             Event::Git(_) => "Event::Git",
             Event::Plugin(_) => "Event::Plugin",
-            Event::Search() => "Event::Search",
-            Event::Stream() => "Event::Stream",
             Event::Index(event) => variant_label!(
                 event,
                 IndexEvent {
@@ -1240,7 +1305,7 @@ mod tests {
             message: "private detail".to_string(),
         });
         assert_eq!(event.label(), "TaskEvent::Error");
-        assert_eq!(Event::Search().label(), "Event::Search");
+        assert_eq!(Event::Delayed.label(), "Event::Delayed");
     }
 
     #[test]

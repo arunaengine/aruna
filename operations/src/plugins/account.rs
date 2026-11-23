@@ -23,12 +23,16 @@ use aruna_core::user::id::UserId;
 
 use super::grants::{InstallScope, READ_ROLE, WRITE_ROLE, role_name, role_paths};
 use super::rows::{StoreError, mapped_child, read_call, values};
-use crate::auth::install_access::parse_grants;
-use crate::groups::add_role::{AddRoleConfig, AddRoleOperation};
-use crate::groups::remove_role::{RemoveGroupConfig, RemoveGroupOperation};
-use crate::users::account_status::{AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE};
-use crate::users::install_account::{owns_install, read_user_call, read_user_result};
-use crate::users::service_account::create::{CreateServiceConfig, CreateServiceOperation};
+use aruna_ops_identity::auth::install_access::parse_grants;
+use aruna_ops_identity::groups::add_role::{AddRoleConfig, AddRoleOperation};
+use aruna_ops_identity::groups::remove_role::{RemoveGroupConfig, RemoveGroupOperation};
+use aruna_ops_identity::users::account_status::{
+    AccountStatusConfig, AccountStatusOperation, REALM_ADMIN_ROLE,
+};
+use aruna_ops_identity::users::install_account::{owns_install, read_user_call, read_user_result};
+use aruna_ops_identity::users::service_account::create::{
+    CreateServiceConfig, CreateServiceOperation,
+};
 
 /// Why an account or role of an install could not be read, made right or checked.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -43,7 +47,7 @@ impl From<IoError> for AccountError {
 
 impl From<StoreError> for AccountError {
     fn from(error: StoreError) -> Self {
-        Self(error.0)
+        Self(error.detail())
     }
 }
 

@@ -23,9 +23,6 @@ use aruna_core::user::id::UserId;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
-use crate::auth::error::PolicyEnforcementError;
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::paths::{
@@ -34,6 +31,11 @@ use crate::notifications::watch::paths::{
 };
 use crate::notifications::watch::records::WatchSubscriptionError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
+use aruna_ops_identity::auth::error::PolicyEnforcementError;
 
 const WATCH_CREATE_OPERATION: &str = "notifications.create_watch";
 const WATCH_LIST_OPERATION: &str = "notifications.list_watches";

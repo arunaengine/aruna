@@ -2,8 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![cfg(feature = "build")]
-
 use aruna_plugin_types::artifact::read_manifest;
 use aruna_plugin_types::manifest::{Manifest, ManifestError};
 use aruna_plugin_types::trigger::TriggerKind;

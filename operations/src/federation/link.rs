@@ -24,11 +24,13 @@ use byteview::ByteView;
 use thiserror::Error;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::revoke_token::{
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
-use crate::users::update_user::{
+use aruna_ops_identity::users::update_user::{
     AliasChange, UpdateUserError, UpdateUserInput, UpdateUserOperation,
 };
 
@@ -416,7 +418,6 @@ impl Operation for UnlinkLoginOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::users::update_user::{UserWrite, UserWritten};
     use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
     use aruna_core::federation::{
         AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode,
@@ -429,6 +430,7 @@ mod tests {
     use aruna_core::types::{Key, KeySpace, Value};
     use aruna_drivers::driver::drive_retry;
     use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_ops_identity::users::update_user::{UserWrite, UserWritten};
     use ed25519_dalek::SigningKey;
     use tempfile::{TempDir, tempdir};
     use url::Url;

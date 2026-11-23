@@ -28,12 +28,14 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::realm::mutate_placement::is_management;
-use crate::sync::outbox::record::{
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::realm::mutate_placement::is_management;
+use aruna_ops_identity::sync::outbox::record::{
     new_identified_record, outbox_write_entry, schedule_drain_effect,
 };
-use crate::users::service_account::group_admin_path;
+use aruna_ops_identity::users::service_account::group_admin_path;
 
 #[derive(Debug, PartialEq)]
 pub struct InstallEntryConfig {

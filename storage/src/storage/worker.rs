@@ -26,6 +26,7 @@ use super::handle::{
     StorageReceivers, cleanup_effect, effect_txn_id, finish_cleanup, observe_cleanup,
     storage_effect_mutates,
 };
+use super::hot_cache::CacheWriter;
 use super::metrics::{StorageMetrics, record_storage_call};
 use super::persistence::FjallPersistPolicy;
 use super::records::run_read;
@@ -189,6 +190,8 @@ pub struct FjallStorage {
     pub(super) usage_views: HashSet<Ulid>,
     /// Source rows each open write transaction changed, for their kept values at commit.
     pub(super) txn_rows: HashMap<Ulid, Vec<(String, ByteView)>>,
+    /// The handle's hot cache, whose changed rows are dropped before a write replies.
+    pub(super) cache: CacheWriter,
 }
 
 impl FjallStorage {
@@ -222,6 +225,7 @@ impl FjallStorage {
         self.txn_usage.remove(&txn_id);
         self.txn_rows.remove(&txn_id);
         self.config_txns.remove(&txn_id);
+        self.cache.take(txn_id);
         // Dropping the last handle rolls the transaction back.
         self.txns.remove(&txn_id);
         if let Some(entry) = self
@@ -239,6 +243,11 @@ impl FjallStorage {
 
     pub(super) fn process_effect(&mut self, effect: StorageEffect) -> StorageEvent {
         let config_txn = touches_config(&effect).then(|| effect_txn_id(&effect));
+        let rows = self.cache.rows(&effect);
+        let rows_txn = effect_txn_id(&effect);
+        if rows_txn.is_none() {
+            self.cache.begin(&rows);
+        }
         let event = match effect {
             StorageEffect::StartTransaction { read } => self.start_transaction(read),
             StorageEffect::AbortTransaction { txn_id } => self.abort_transaction(txn_id),
@@ -305,6 +314,11 @@ impl FjallStorage {
             StorageEffect::BeginUsageRebuild { key_space } => self.begin_usage_rebuild(key_space),
             StorageEffect::FinishUsageRebuild { key_space } => self.finish_usage_rebuild(key_space),
         };
+        match rows_txn {
+            Some(txn_id) if self.txns.contains_key(&txn_id) => self.cache.hold(txn_id, rows),
+            Some(_) => {}
+            None => self.cache.finish(&rows),
+        }
         match config_txn {
             Some(Some(txn_id)) if self.txns.contains_key(&txn_id) => {
                 self.config_txns.insert(txn_id);
@@ -632,9 +646,15 @@ impl FjallStorage {
             }
         }
 
+        let rows: Vec<_> = prepared
+            .iter()
+            .flat_map(|((effect, ..), _)| self.cache.rows(effect))
+            .collect();
+        self.cache.begin(&rows);
         let group_error = match self.commit_buffered(tx) {
             Ok(()) => self.persist_journal().err(),
             Err(StorageError::TransactionConflict) => {
+                self.cache.finish(&rows);
                 for (item, _) in prepared {
                     self.process_single(item, slow_queue);
                 }
@@ -642,6 +662,7 @@ impl FjallStorage {
             }
             Err(error) => Some(error),
         };
+        self.cache.finish(&rows);
         if prepared
             .iter()
             .any(|((effect, ..), _)| touches_config(effect))

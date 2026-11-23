@@ -139,10 +139,10 @@ fn remote_create_registers() {
         watch_id: subscription().watch_id,
         realm_id: owner().realm_id,
         holder,
-        entry: WatchInterestEntry {
+        entry: Box::new(WatchInterestEntry {
             path_prefix: subscription().path_prefix,
             event_mask: subscription().event_mask,
-        },
+        }),
     };
     assert_eq!(calls, vec![IoCall::from(Effect::Net(register))]);
 

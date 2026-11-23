@@ -278,12 +278,12 @@ fn attach_permit(event: BlobEvent, permit: Option<OwnedSemaphorePermit>) -> Blob
 impl Handle for BlobHandle {
     async fn send_effect(&self, effect: Effect) -> Event {
         match effect {
-            Effect::Blob(blob_effect) => self.send_blob_effect(blob_effect).await,
+            Effect::Blob(blob_effect) => self.send_blob_effect(*blob_effect).await,
             Effect::StagingSource(staging_source_effect) => {
-                self.send_staging_effect(staging_source_effect).await
+                self.send_staging_effect(*staging_source_effect).await
             }
             Effect::LocalFile(file_effect) => self.send_file_effect(file_effect).await,
-            _ => Event::Blob(BlobEvent::Error(BlobError::InvalidEffect)),
+            _ => Event::blob(BlobEvent::Error(BlobError::InvalidEffect)),
         }
     }
 }
@@ -344,7 +344,7 @@ impl BlobHandle {
                     effect = kind,
                     "Rejected a blob write issued after the shutdown close"
                 );
-                return Event::Blob(BlobEvent::Error(BlobError::Closed));
+                return Event::blob(BlobEvent::Error(BlobError::Closed));
             }
             Some(BlobWriteGuard::new(&self.handler))
         } else {
@@ -377,7 +377,7 @@ impl BlobHandle {
                     {
                         Ok(permit) => permit,
                         Err(_) => {
-                            return Event::Blob(BlobEvent::Error(BlobError::WriteError(
+                            return Event::blob(BlobEvent::Error(BlobError::WriteError(
                                 "blob effect deadline expired".to_string(),
                             )));
                         }
@@ -399,7 +399,14 @@ impl BlobHandle {
             None => None,
         };
 
+        struct InflightGuard<'a>(&'a AtomicUsize);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _inflight = InflightGuard(&self.handler.inflight);
         let started = Instant::now();
         // Its own task, so the effect starts on a fresh stack instead of under the caller's frames.
         let handler = self.handler.clone();
@@ -412,7 +419,7 @@ impl BlobHandle {
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
             Err(_) => BlobEvent::Error(BlobError::Closed),
         };
-        self.handler.inflight.fetch_sub(1, Ordering::Relaxed);
+        drop(_inflight);
         // Read events carry a lazy stream, so the slot follows the stream.
         let blob_event = if class == EffectClass::Read {
             attach_permit(blob_event, permit)
@@ -429,7 +436,7 @@ impl BlobHandle {
                 "Slow blob effect"
             );
         }
-        Event::Blob(blob_event)
+        Event::blob(blob_event)
     }
 
     /// Executes one write into a folder the owner bound on this machine. The
@@ -504,7 +511,7 @@ impl BlobHandle {
             StagingSourceEffect::Health { accesses } => self.handler.source_health(&accesses),
         };
 
-        Event::StagingSource(staging_source_event)
+        Event::staging(staging_source_event)
     }
 
     /// Node-local routing inputs for callers assembling an operation config.
@@ -737,7 +744,7 @@ impl BlobHandler {
         }
     }
 
-    // Effects run concurrently on their caller's task; per-operation ordering
+    // Effects run on their own spawned task; per-operation ordering
     // is preserved by the driver awaiting each effect before the next.
     pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
         // A settlement of a recorded upload names its backend only in the record.

@@ -3,8 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#![cfg(all(feature = "runtime", feature = "build"))]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -28,9 +26,7 @@ use aruna_plugins::limits::RuntimeConfig;
 use aruna_plugins::package::build_project;
 use aruna_plugins::runtime::{Compiled, Invocation, InvokeError, Runtime};
 
-use common::{limits, require};
-
-mod common;
+use crate::common::{limits, require};
 
 /// Items of one page of a fake listing.
 const PAGE: usize = 2;

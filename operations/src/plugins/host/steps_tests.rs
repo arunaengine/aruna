@@ -9,11 +9,13 @@ use serde_json::json;
 
 use super::*;
 use crate::jobs::repository::test_support::registry_record;
-use crate::metadata::api::list_types::ListedMetadataDocument;
+use crate::plugins::check::tests::access_rows;
 use crate::plugins::fixtures::{self, config_result, is_child, node};
 use crate::plugins::rate::tests::rate_answer;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::submit::CopyRequest;
+use crate::tests::calls::compiled;
+use aruna_ops_data::metadata::api::list_types::ListedMetadataDocument;
 use aruna_test_support::plugins::queued;
 
 fn meta_root() -> String {
@@ -145,8 +147,57 @@ fn read_checks_path() {
     assert!(is_child(&read.first()));
     assert!(is_child(&read.next(granted_result())));
     assert!(is_child(&read.next(summary(&jsonld.to_string()))));
-    let denied = child_result(Err::<Granted, _>(refusal()));
+    let denied = child_result(Err::<PluginInstall, _>(refusal()));
     assert_eq!(read.next(denied).unwrap_err(), refusal());
+}
+
+#[test]
+fn read_reuses_admission() {
+    // The exported path is matched against the install the listing admitted, so the call is
+    // checked and rated once: a covered path needs only its authorization.
+    let jsonld = json!({"@graph": [{"@id": "ro-crate-metadata.json"}, {"@id": "./"}]});
+    let view = RoCrateExportView::Summary;
+    let mut read = ReadDataset::new(place(), &resource(), view);
+    read.first().unwrap();
+    read.next(granted_result()).unwrap();
+    read.next(summary(&jsonld.to_string())).unwrap();
+    let Ok(Next::Done(document)) = read.next(checked_install()) else {
+        panic!("an authorized path reads the dataset");
+    };
+    assert_eq!(document.revision, record().last_event_id.to_string());
+    // A path outside the grants is refused at once, without another call.
+    let mut outside = ReadDataset::new(place(), &resource(), view);
+    outside.first().unwrap();
+    outside.next(granted_result()).unwrap();
+    let mut elsewhere = record();
+    elsewhere.permission_path = "/elsewhere".to_string();
+    let export = child_result(Ok::<_, MetadataApiError>(ExportMetadataResult::Summary {
+        record: elsewhere,
+        jsonld: jsonld.to_string(),
+    }));
+    let Err(CallError(error)) = outside.next(export) else {
+        panic!("an uncovered path is refused");
+    };
+    assert_eq!(error.kind, ErrorKind::NotGranted);
+}
+
+#[test]
+fn read_rechecks_install() {
+    // After the export the live install is checked again, without a second rate call; an
+    // install paused meanwhile is refused.
+    let jsonld = json!({"@graph": [{"@id": "ro-crate-metadata.json"}, {"@id": "./"}]});
+    let mut read = ReadDataset::new(place(), &resource(), RoCrateExportView::Summary);
+    read.first().unwrap();
+    read.next(granted_result()).unwrap();
+    let path = record().permission_path;
+    let live = CheckCall::new(&scope(), Some((Permission::MetadataRead, &path)));
+    assert_eq!(
+        read.next(summary(&jsonld.to_string())),
+        Ok(Next::Call(IoCall::child(live)))
+    );
+    let paused = CallError(HostError::new(ErrorKind::Denied, "the install is paused"));
+    let answer = child_result(Err::<PluginInstall, _>(paused.clone()));
+    assert_eq!(read.next(answer), Err(paused));
 }
 
 #[test]
@@ -181,18 +232,24 @@ fn listed(paths: &[String]) -> IoResult {
     child_result(Ok::<_, MetadataApiError>(result))
 }
 
+// The documents of a page share one read of the rules and the policies and one compile.
 #[test]
 fn list_keeps_authorized() {
-    let covered = format!("{}/doc", meta_root());
+    let covered = |name: &str| format!("{}/{name}", meta_root());
     let mut list = ListDatasets::new(&scope(), None);
     assert!(is_child(&list.first()));
     assert!(is_child(&list.next(granted_result())));
-    let answer = listed(&["/outside".to_string(), covered]);
-    assert!(is_child(&list.next(answer)));
-    let Ok(Next::Done(listing)) = list.next(child_result(Ok::<(), CallError>(()))) else {
-        panic!("the last check ends the page");
+    let answer = listed(&["/outside".to_string(), covered("a"), covered("b")]);
+    let [rules, policies] = access_rows(&install(), &format!("{}/**", meta_root()));
+    assert!(matches!(list.next(answer), Ok(Next::Call(IoCall::Read(_)))));
+    assert!(matches!(list.next(rules), Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(compile)) = list.next(policies) else {
+        panic!("the read policies compile");
     };
-    assert_eq!(listing.resources.len(), 1);
+    let Ok(Next::Done(listing)) = list.next(compiled(compile)) else {
+        panic!("the second document needs no more reads");
+    };
+    assert_eq!(listing.resources.len(), 2);
     assert_eq!(listing.cursor, None);
 }
 
@@ -210,9 +267,10 @@ fn list_stops_unavailable() {
     list.next(granted_result()).unwrap();
     list.next(listed(&[format!("{}/doc", meta_root())]))
         .unwrap();
-    let down = CallError(unavailable("down"));
-    let answer = child_result(Err::<(), _>(down.clone()));
-    assert_eq!(list.next(answer).unwrap_err(), down);
+    let Err(CallError(error)) = list.next(IoResult::Done) else {
+        panic!("a failed check fails the page");
+    };
+    assert_eq!(error.kind, ErrorKind::Unavailable);
 }
 
 fn object_path() -> String {

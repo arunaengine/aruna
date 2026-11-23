@@ -39,8 +39,8 @@ use tracing::warn;
 use ulid::Ulid;
 
 use super::{JOB_LEASE_MS, JOB_MAX_ATTEMPTS, JOB_PRUNE_PAGE, MUTATE_MAX_ATTEMPTS};
-use crate::queue_backoff::retry_delay_ms;
 use aruna_core::job_request::session_of;
+use aruna_ops_identity::queue_backoff::retry_delay_ms;
 
 pub mod attempt_intent;
 pub mod control_mutation;

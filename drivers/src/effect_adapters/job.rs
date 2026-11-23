@@ -11,7 +11,6 @@ use std::sync::Arc;
 use aruna_blob::archive::{self, EntrySpan};
 use aruna_compute::registry::ExecutorRegistry;
 use aruna_compute::session::Session;
-use aruna_core::effects::Effect;
 use aruna_core::events::Event;
 use aruna_core::jobs::{
     ArchiveEntryRead, ArchiveRead, ByteStream, GzipBroken, GzipWork, JobEffect, JobEvent,
@@ -25,7 +24,7 @@ use futures_util::future::BoxFuture;
 use tokio::sync::mpsc;
 use ulid::Ulid;
 
-use super::dispatch_effect_until;
+use super::dispatch_suboperation;
 use crate::driver::DriverContext;
 
 const NO_BLOB_HANDLE: &str = "this job needs a blob handle";
@@ -75,7 +74,7 @@ pub(super) async fn dispatch_job(
     deadline: Option<tokio::time::Instant>,
 ) -> Event {
     let host = current_host();
-    let run = |child| dispatch_effect_until(Effect::SubOperation(child), context, depth, deadline);
+    let run = |child| dispatch_suboperation(child, context, depth, deadline);
     Event::Job(match effect {
         JobEffect::Stops => JobEvent::Stops(host.map_or_else(JobStops::default, |it| it.stops())),
         JobEffect::Report(report) => {

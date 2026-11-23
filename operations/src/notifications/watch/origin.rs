@@ -5,11 +5,11 @@
 
 use std::collections::VecDeque;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::id::NodeId;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{WatchEvent, watch_path_matches};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
@@ -18,7 +18,6 @@ use aruna_core::user::id::UserId;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::client::{HolderRequestOperation, RemoteError};
 use crate::notifications::placement::filter_local_subscriptions;
 use crate::notifications::unexpected_event;
@@ -26,6 +25,7 @@ use crate::notifications::watch::digest::{InterestError, InterestOperation};
 use crate::notifications::watch::expansion::{ExpandError, ExpandOutcome, WatchExpandOperation};
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 #[derive(Debug, Default, PartialEq)]
 enum EmitState {
@@ -225,11 +225,9 @@ impl EmitWatchOperation {
             let events = vec![event.clone()];
             WatchExpandOperation::new(realm_id, config.clone(), local, events, None)
         };
-        let expand = boxed_retry(build, realm_id.as_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
+        let expand = IoCall::retry_with(build, realm_id.as_bytes());
         self.state = EmitState::Expand;
-        Ok(Next::Call(IoCall::Child(expand)))
+        Ok(Next::Call(expand))
     }
 
     fn expanded(&mut self, outcome: Result<ExpandOutcome, ExpandError>) -> Turn {

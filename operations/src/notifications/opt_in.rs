@@ -22,11 +22,11 @@ use aruna_core::user::id::UserId;
 use aruna_core::user::validation::{EMAIL_HASH_ATTRIBUTE, email_hash};
 use thiserror::Error;
 
-use crate::document_repository::{GetConfigError, read_effect};
 use crate::notifications::setting_rows::{
     SettingError, SettingValue, SettingWrite, WriteSettingOperation,
 };
 use crate::notifications::{unexpected, unexpected_event};
+use aruna_ops_identity::document_repository::{GetConfigError, read_effect};
 
 #[derive(Debug, Error, PartialEq)]
 pub enum EmailError {

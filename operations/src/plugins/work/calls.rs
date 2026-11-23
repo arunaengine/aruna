@@ -26,10 +26,10 @@ use super::super::marks::is_marked;
 use super::super::rows::StoreError;
 use super::super::unavailable;
 use super::read_work;
-use crate::auth::install_access::Authorize;
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::users::install_account::{read_user_call, read_user_result};
 use aruna_core::install_work::WorkRow;
+use aruna_ops_identity::auth::install_access::Authorize;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::users::install_account::{read_user_call, read_user_result};
 
 /// Outputs of one page.
 const OUTPUT_PAGE: usize = 100;
@@ -279,7 +279,7 @@ impl Operation for JobRow {
 
     fn next(&mut self, result: IoResult) -> Result<Next<WorkRow>, CallError> {
         let row = result.child::<Option<WorkRow>, StoreError>()?;
-        let row = row.map_err(|error| CallError(unavailable(error.0)))?;
+        let row = row.map_err(|error| CallError(unavailable(error.detail())))?;
         let row = row.filter(|row| row.account == self.account);
         Ok(Next::Done(row.ok_or_else(|| self.missing())?))
     }

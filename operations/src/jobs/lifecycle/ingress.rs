@@ -52,9 +52,9 @@ mod tests {
     // its key, not refused because this member holds no copy.
     #[tokio::test]
     async fn routes_range_holder() {
-        use crate::distribution::test_record::{binding, record, secret};
-        use crate::distribution::test_store::{context, open};
-        let (_dir, handle) = open();
+        use aruna_ops_data::distribution::test_record::{binding, record, secret};
+        let (_dir, context) = aruna_drivers::testing::temp_context();
+        let handle = context.storage_handle.clone();
         let (snapshot, bytes) = record(true);
         aruna_drivers::testing::write_value(
             &handle,
@@ -81,7 +81,6 @@ mod tests {
             txn_id: None,
         };
         handle.send_storage_effect(write).await;
-        let context = context(&handle);
         let input = |key: &str| InputSelection {
             source: InputSource::S3 {
                 bucket: "refseq".to_string(),
@@ -194,7 +193,7 @@ mod tests {
         kind: aruna_core::structs::execution::source_connector::SourceConnectorKind,
         etag: Option<&str>,
         digested: bool,
-    ) -> crate::s3::object::head::HeadObjectResult {
+    ) -> aruna_ops_data::s3::object::head::HeadObjectResult {
         use aruna_core::structs::checksum::ChecksumAlgorithm;
         use aruna_core::structs::execution::source_access::{
             DigestOrigin, DigestScope, SourceDigest, SourceMetadata,
@@ -213,7 +212,7 @@ mod tests {
                 },
             );
         }
-        crate::s3::object::head::HeadObjectResult {
+        aruna_ops_data::s3::object::head::HeadObjectResult {
             location: None,
             metadata: Default::default(),
             source_metadata: Some(SourceMetadata {

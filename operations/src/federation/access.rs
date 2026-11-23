@@ -8,10 +8,12 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 
-use crate::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use crate::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
-use crate::auth::error::PolicyEnforcementError;
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::auth::enforcement::{PolicyEvaluator, PolicyLoadOperation};
+use aruna_ops_identity::auth::error::PolicyEnforcementError;
 
 /// Whether `auth` holds `permission` on `path` and no policy denies the request. A check that
 /// cannot be decided counts as denied, so a federation step fails closed.

@@ -20,7 +20,6 @@ use aruna_core::types::{Key, KeySpace, Value};
 use thiserror::Error;
 use tracing::warn;
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::notifications::protocol::DIRTY_REALM_CAP;
 use crate::notifications::watch::check::{
     AuthorizedWatchSubscriptions, WatchCheckError, WatchFilterOperation,
@@ -32,7 +31,8 @@ use crate::notifications::watch::expansion::{RetryDrainError, RetryDrainOperatio
 use crate::notifications::watch::listing::{ListWatchesOperation, WatchPage, WatchScope};
 use crate::notifications::watch::records::WatchSubscriptionError;
 use crate::notifications::watch::table::RebuildTableOperation;
-use crate::sync::replicate_documents::{
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
 };
 

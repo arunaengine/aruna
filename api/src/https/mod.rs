@@ -20,14 +20,18 @@ use axum::response::{IntoResponse, Response};
 /// The host of a request, from the URI authority (HTTP/2 or absolute form) or else
 /// `Host`, in lower case and without a port.
 pub fn request_host(uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    let parsed;
     let authority = match uri.authority() {
-        Some(authority) => authority.clone(),
-        None => headers
-            .get(header::HOST)?
-            .to_str()
-            .ok()?
-            .parse::<http::uri::Authority>()
-            .ok()?,
+        Some(authority) => authority,
+        None => {
+            parsed = headers
+                .get(header::HOST)?
+                .to_str()
+                .ok()?
+                .parse::<http::uri::Authority>()
+                .ok()?;
+            &parsed
+        }
     };
     let host = authority.host().trim_end_matches('.');
     (!host.is_empty()).then(|| host.to_ascii_lowercase())

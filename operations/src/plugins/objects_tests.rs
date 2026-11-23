@@ -109,7 +109,7 @@ fn read_shows_size() {
     let collected = BlobEvent::StreamCollected {
         bytes: Ok(b"object body".to_vec()),
     };
-    let answer = read.next(IoResult::Event(Box::new(Event::Blob(collected))));
+    let answer = read.next(IoResult::Event(Box::new(Event::blob(collected))));
     let Ok(Next::Done(bytes)) = answer else {
         panic!("the collected bytes answer the read");
     };

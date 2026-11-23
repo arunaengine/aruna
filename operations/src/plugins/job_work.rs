@@ -229,7 +229,7 @@ impl Operation for ReconcileWork {
             return Ok(Next::Done(Some(job)));
         }
         let found = result.child::<Option<(JobId, [u8; 32])>, SubmitJobError>()?;
-        let found = found.map_err(|error| StoreError(error.to_string()))?;
+        let found = found.map_err(|error| StoreError::Message(error.to_string()))?;
         let Some((job, _)) = found else {
             return Ok(Next::Done(None));
         };
@@ -326,7 +326,7 @@ impl Operation for CancelWork {
             CancelPhase::Reconcile => match reconcile_answer(result)? {
                 Ok(Some(job)) => Ok(self.cancel(job)),
                 Ok(None) => Err(call_unavailable("the job is not submitted yet")),
-                Err(error) => Err(call_unavailable(error.0)),
+                Err(error) => Err(call_unavailable(error.detail())),
             },
             CancelPhase::Cancel => {
                 match result.child::<CancelRequestOutcome, JobMutationError>()? {
@@ -335,9 +335,10 @@ impl Operation for CancelWork {
                 }
             }
             CancelPhase::Task(row) => {
-                let [task] = values::<1>(result).map_err(|error| call_unavailable(error.0))?;
+                let [task] =
+                    values::<1>(result).map_err(|error| call_unavailable(error.detail()))?;
                 let task = task.map(|bytes| decode::<TaskRow>(&bytes)).transpose();
-                let task = task.map_err(|error| call_unavailable(error.0))?;
+                let task = task.map_err(|error| call_unavailable(error.detail()))?;
                 self.cancel_task(&row, task)
             }
             CancelPhase::Config(alias, family) => {
@@ -436,7 +437,7 @@ impl Operation for SettleWork {
                 None => self.advance(),
             },
             SettlePhase::Record(install_id, work_id) => {
-                let record = record_answer(result)?.map_err(StoreError)?;
+                let record = record_answer(result)?.map_err(StoreError::Message)?;
                 let Some(summary) = summary_of(record.as_ref()) else {
                     return self.advance();
                 };
@@ -575,7 +576,7 @@ impl Operation for RetireWork {
                 self.advance()
             }
             RetirePhase::Record(item, job) => {
-                let record = record_answer(result)?.map_err(StoreError)?;
+                let record = record_answer(result)?.map_err(StoreError::Message)?;
                 let Some(record) = record else {
                     self.drop_row(*item);
                     return self.advance();
@@ -756,7 +757,7 @@ impl Operation for StartWork {
             }
             StartPhase::Record(work_id) => {
                 let recorded = result.child::<Option<WorkRow>, StoreError>()?;
-                recorded.map_err(|error| call_unavailable(error.0))?;
+                recorded.map_err(|error| call_unavailable(error.detail()))?;
                 Ok(Next::Done(work_id))
             }
         }

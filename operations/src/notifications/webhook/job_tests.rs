@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
-use crate::document_repository::GetConfigError;
 use crate::notifications::settings::SettingWinner;
 use crate::tests::notifications::user;
 use aruna_core::calls::ChildOutcome;
@@ -13,6 +12,7 @@ use aruna_core::structs::execution::job::local::{JobError, JobErrorKind};
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
+use aruna_ops_identity::document_repository::GetConfigError;
 use std::time::Duration;
 use ulid::Ulid;
 

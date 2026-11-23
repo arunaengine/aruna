@@ -177,7 +177,7 @@ impl BlobHandler {
                         abandoned,
                         Some(&operator),
                         Some(&path),
-                        None,
+                        Some(&location),
                     )
                     .await;
                 match cleaned {

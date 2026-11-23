@@ -24,9 +24,9 @@ use tracing::{debug, warn};
 
 use super::super::LifecycleError;
 use super::super::deferred::{DeferKind, DeferredTarget};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::records::family::{FamilyReadError, LoadFamilyOperation};
 use crate::jobs::records::verify::FamilyView;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Domain of the stable witness order.
 const WITNESS_RANK_DOMAIN: &[u8] = b"aruna-job-witness-v1";

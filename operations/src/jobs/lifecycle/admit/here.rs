@@ -6,14 +6,14 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
 use aruna_core::effects::{Effect, JobRecordFrame, NetEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, ExecutionSignEvent, NetEvent};
 use aruna_core::heartbeat::HeldHeartbeat;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{FAMILY_PROJECTION_KEYSPACE, FAMILY_RECORD_KEYSPACE};
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::structs::execution::job::family::{
     ExecutionClaim, JobAdmissionRecord, JobFamilyId, JobFamilyRecord, JobRecordKind,
     JobRetryPolicy, LogicalJobSpec, LogicalJobState, SubmissionClaim, SubmissionId,
@@ -163,10 +163,7 @@ impl Operation for ObservedStateOperation {
                 rebuild: false,
             })
         };
-        let child = boxed_retry(build, &family.to_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
-        Ok(Next::Call(IoCall::Child(child)))
+        Ok(Next::Call(IoCall::retry_with(build, &family.to_bytes())))
     }
 }
 
@@ -473,6 +470,7 @@ impl Operation for AdmitHereOperation {
 mod tests {
     use super::*;
     use crate::tests::records::{Family, payload, user};
+    use aruna_core::calls::ChildOutcome;
     use aruna_core::events::StorageEvent;
     use aruna_core::job_request::{SubmissionScope, store_workspace};
     use aruna_core::structs::execution::job::family::{JobProjection, OutputSet};

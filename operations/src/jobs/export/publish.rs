@@ -35,10 +35,10 @@ use crate::jobs::run_rows::{
 };
 use crate::jobs::store::mutation_error::JobMutationError;
 use crate::jobs::submit::local::SubmitLocalOperation;
-use crate::metadata::profile::validation::{
+use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
+use aruna_ops_data::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, profile_verdict,
 };
-use aruna_core::job_request::{SubmitJobError, SubmitJobResult};
 
 /// Reads the entries of a stored artifact.
 #[derive(Debug, PartialEq)]

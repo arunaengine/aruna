@@ -24,6 +24,11 @@ pub fn next_entropy() -> u128 {
     RUN_CLOCK.entropy()
 }
 
+/// The start time and entropy of a new run from one lock acquisition.
+pub fn start_stamp() -> (u64, u128) {
+    RUN_CLOCK.start()
+}
+
 /// A checked clock and run sequence over an environment that tests pin.
 pub struct RunClock<E: IdEnvironment> {
     env: E,
@@ -61,15 +66,39 @@ impl<E: IdEnvironment> RunClock<E> {
     /// the skew bound ahead of the monotonic clock since the last good reading, the time follows
     /// the monotonic clock instead, as the old id generator refused such a jump.
     pub fn now_ms(&self) -> u64 {
-        let (wall, monotonic) = loop {
+        let (wall, monotonic) = self.read_clocks();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.advance_ms(&mut state, wall, monotonic)
+    }
+
+    /// The entropy of the next run: this process's bits and the next run slot. Slots repeat only
+    /// after 2^32 runs; when they wrap, later stamps move past every time handed out before.
+    pub fn entropy(&self) -> u128 {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        self.take_entropy(&mut state)
+    }
+
+    /// Reads the start time and run entropy under one lock, keeping wrap bumps before the stamp.
+    pub fn start(&self) -> (u64, u128) {
+        let (wall, monotonic) = self.read_clocks();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let entropy = self.take_entropy(&mut state);
+        let now = self.advance_ms(&mut state, wall, monotonic);
+        (now, entropy)
+    }
+
+    fn read_clocks(&self) -> (u64, u64) {
+        loop {
             let before = self.env.monotonic_ms();
             let wall = self.env.now_ms();
             let monotonic = self.env.monotonic_ms();
             if monotonic.saturating_sub(before) <= self.max_skew_ms {
-                break (wall, monotonic);
+                return (wall, monotonic);
             }
-        };
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn advance_ms(&self, state: &mut ClockState, wall: u64, monotonic: u64) -> u64 {
         let expected = (state.anchor).map(|(anchor_wall, anchor_monotonic)| {
             anchor_wall.saturating_add(monotonic.saturating_sub(anchor_monotonic))
         });
@@ -96,10 +125,7 @@ impl<E: IdEnvironment> RunClock<E> {
         state.last_ms
     }
 
-    /// The entropy of the next run: this process's bits and the next run slot. Slots repeat only
-    /// after 2^32 runs; when they wrap, later stamps move past every time handed out before.
-    pub fn entropy(&self) -> u128 {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+    fn take_entropy(&self, state: &mut ClockState) -> u128 {
         let slot = self.base.wrapping_add(state.runs as u32);
         if slot == 0 && state.runs > 0 {
             state.last_ms += 1;

@@ -25,7 +25,6 @@ use super::super::marks::{MARKED, is_marked};
 use super::super::rows::{StoreError, decode, read_call, values};
 use super::super::unavailable;
 use super::change::{ChangeTask, Changed, SendOutcome, TaskChange};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::admit::here::AcceptedSubmission;
 use crate::jobs::lifecycle::screen::{ScreenError, ScreenTask};
 use crate::jobs::lifecycle::submit_external::IngressNode;
@@ -36,6 +35,7 @@ use crate::jobs::records::pages::{LoadChainOperation, PageReadError, StoreEntrie
 use aruna_core::install_work::{ADMIT_WINDOW_MS, TaskRow, task_place};
 use aruna_core::job_request::SubmitJobError;
 use aruna_core::job_request::{self, RequestIdentity, SubmissionRequest};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// What one send proved.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,7 +101,7 @@ fn prepare_error(error: SubmitJobError) -> CallError {
 }
 
 fn stored(error: StoreError) -> CallError {
-    CallError(unavailable(error.0))
+    CallError(unavailable(error.detail()))
 }
 
 #[derive(Debug, PartialEq)]

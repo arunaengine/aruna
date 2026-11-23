@@ -198,6 +198,11 @@ pub fn issue(
         rows: Zeroizing::new(Vec::with_capacity(labels.len())),
         fingerprint: parameters.fingerprint,
     };
+    let shares = Zeroizing::new([
+        G1Projective::GENERATOR * master.scalars[4],
+        G1Projective::GENERATOR * master.scalars[5],
+        G1Projective::GENERATOR * master.scalars[6],
+    ]);
     for (label, row) in labels.iter().zip(matrix) {
         let sigma = Zeroizing::new(random_scalar(rng)?);
         let mut values = Zeroizing::new([G1Projective::IDENTITY; 3]);
@@ -212,15 +217,13 @@ pub fn issue(
                     component,
                 )? * (r[coordinate] * inverse[component]);
             }
-            let share = Zeroizing::new(G1Projective::GENERATOR * master.scalars[4 + component]);
-            values[component] += signed(&share, row[0]);
+            values[component] += signed(&shares[component], row[0]);
             for column in 1..columns {
                 values[component] += signed(&terms[column - 1][component], row[column]);
             }
         }
         values[2] = G1Projective::GENERATOR * -*sigma;
-        let share = Zeroizing::new(G1Projective::GENERATOR * master.scalars[6]);
-        values[2] += signed(&share, row[0]);
+        values[2] += signed(&shares[2], row[0]);
         for column in 1..columns {
             values[2] += signed(&terms[column - 1][2], row[column]);
         }

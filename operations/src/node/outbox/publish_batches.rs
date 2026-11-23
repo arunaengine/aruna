@@ -20,9 +20,9 @@ use tracing::warn;
 
 use crate::node::outbox::finish_batch::FinishedBatch;
 use crate::node::outbox::sync_batch::SyncBatchOperation;
-use crate::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome, RowStamp};
-use crate::sync::outbox::cleanup::Publication;
-use crate::sync::outbox::defer::SyncWait;
+use aruna_ops_identity::sync::outbox::batches::{DrainSubBatch, DrainSyncOutcome, RowStamp};
+use aruna_ops_identity::sync::outbox::cleanup::Publication;
+use aruna_ops_identity::sync::outbox::defer::SyncWait;
 
 /// What publishing the sub-batches left: the sync outcome, the time the publishes took, the
 /// records this run published with the lineage their topic had, and those it deleted.
@@ -473,8 +473,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::node::outbox::finish_batch::FinishBatchOperation;
-    use crate::sync::outbox::cleanup::{Lineages, standing};
-    use crate::sync::outbox::record::new_identified_record;
+    use aruna_ops_identity::sync::outbox::cleanup::{Lineages, standing};
+    use aruna_ops_identity::sync::outbox::record::new_identified_record;
 
     fn serving() -> (NodeId, RealmId) {
         let node = iroh::SecretKey::from_bytes(&[1; 32]).public();

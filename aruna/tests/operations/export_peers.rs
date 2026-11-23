@@ -68,7 +68,7 @@ async fn remote_read_ephemeral() {
     let (source, _source_incoming) = bao_node(realm_id).await;
     client.net.add_peer_addr(source.net.endpoint_addr()).await;
     source.net.add_peer_addr(client.net.endpoint_addr()).await;
-    let Event::Blob(BlobEvent::WriteFinished { location }) = source
+    let Ok(BlobEvent::WriteFinished { location }) = (source
         .driver
         .blob_handle
         .as_ref()
@@ -81,7 +81,8 @@ async fn remote_read_ephemeral() {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("source blob write failed")
     };
@@ -160,7 +161,7 @@ async fn locked_remote_export() {
     let (source, _source_incoming) = bao_node(realm_id).await;
     client.net.add_peer_addr(source.net.endpoint_addr()).await;
     source.net.add_peer_addr(client.net.endpoint_addr()).await;
-    let Event::Blob(BlobEvent::WriteFinished { location }) = source
+    let Ok(BlobEvent::WriteFinished { location }) = (source
         .driver
         .blob_handle
         .as_ref()
@@ -173,7 +174,8 @@ async fn locked_remote_export() {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("source blob write failed")
     };
@@ -239,7 +241,7 @@ async fn plaintext_export_parks() {
     let (source, _source_incoming) = node_with(realm_id, true).await;
     client.net.add_peer_addr(source.net.endpoint_addr()).await;
     source.net.add_peer_addr(client.net.endpoint_addr()).await;
-    let Event::Blob(BlobEvent::WriteFinished { location }) = source
+    let Ok(BlobEvent::WriteFinished { location }) = (source
         .driver
         .blob_handle
         .as_ref()
@@ -252,7 +254,8 @@ async fn plaintext_export_parks() {
             blob: byte_stream(FIXTURE_BYTES),
             size: None,
         })
-        .await
+        .await)
+        .into_blob()
     else {
         panic!("source blob write failed")
     };

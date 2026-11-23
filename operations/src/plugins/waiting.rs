@@ -101,7 +101,7 @@ impl Operation for SettleWaiting {
                 }
                 Ok(Some(rows)) => self.record(Outcome::Queued, rows),
                 Err(RunError::Store(error)) => Err(error),
-                Err(error) => Err(StoreError(error.to_string())),
+                Err(error) => Err(StoreError::Message(error.to_string())),
             },
             SettlePhase::Counting(mut gap) => {
                 let counted = gap.take(answer)?;
@@ -180,7 +180,7 @@ impl Operation for RecheckWaiting {
     fn first(&mut self) -> Result<Next<usize>, StoreError> {
         match &self.phase {
             RecheckPhase::Scanning(scan) => Ok(Next::Call(scan.ask())),
-            _ => Err(StoreError("the recheck started twice".into())),
+            _ => Err(StoreError::Message("the recheck started twice".into())),
         }
     }
 

@@ -21,11 +21,11 @@ use aruna_core::task::{TaskEffect, TaskKey};
 use aruna_core::types::{Key, KeySpace, Value};
 use tracing::{info, warn};
 
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use crate::jobs::lifecycle::membership::MembershipViewOperation;
 use crate::jobs::store::job_calls::{CancelRequestOutcome, set_cancel_requested};
 use crate::jobs::store::mutation_error::JobMutationError;
-use crate::secrets::owner::WriterView;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::secrets::owner::WriterView;
 
 /// Delay after which fenced work is looked at again.
 pub const FENCE_RECHECK: Duration = Duration::from_secs(10);

@@ -17,7 +17,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from check_style import CHAR_RE, iter_rust_files, read_source, scan_block
 
-OPERATIONS_SRC = "operations/src"
+OPERATIONS_SRCS = ("ops-identity/src", "ops-data/src", "operations/src")
+OPERATIONS_CRATES = ("aruna_ops_identity", "aruna_ops_data")
 BASELINE_PATH = "scripts/dev/layers_baseline.json"
 # Domain groups of target-architecture.md section 5, lowest first. A module may
 # use its own group and lower groups only.
@@ -63,14 +64,19 @@ CRATE_TARGETS = {
     "aruna-config": (
         "aruna-core",
         "aruna-clock",
-        "aruna-drivers",
-        "aruna-graph",
         "aruna-net",
         "aruna-storage",
         "aruna-wire",
     ),
     "aruna-cli": ("aruna-wire", "aruna-plugins", "aruna-plugin-types"),
-    "aruna-operations": ("aruna-core", "aruna-plugin-types"),
+    "aruna-ops-identity": ("aruna-core", "aruna-plugin-types"),
+    "aruna-ops-data": ("aruna-core", "aruna-ops-identity"),
+    "aruna-operations": (
+        "aruna-core",
+        "aruna-plugin-types",
+        "aruna-ops-identity",
+        "aruna-ops-data",
+    ),
     "aruna-drivers": (
         "aruna-core",
         "aruna-clock",
@@ -179,8 +185,8 @@ ARM_RE = re.compile(r"=>|[()\[\]{},]")
 ASYNC_RE = re.compile(r"\basync\b|\.await\b")
 OPERATION_RE = re.compile(r"\bimpl(?:\s*<[^{;]*?>)?\s+(?:[\w:]+::)?(?:Sub|Effect)?Operation\s+for\b")
 DEF_RE = re.compile(r"\b(?:struct|enum|trait|type|fn|const|static|mod|union)\s+([A-Za-z_]\w*)")
-USE_RE = re.compile(r"\buse\s+((?:crate|super|self)\b[^;]*);")
-INLINE_RE = re.compile(r"\bcrate(?:::\w+)+")
+USE_RE = re.compile(r"\buse\s+((?:crate|super|self|aruna_ops_identity|aruna_ops_data)\b[^;]*);")
+INLINE_RE = re.compile(r"\b(?:crate|aruna_ops_identity|aruna_ops_data)(?:::\w+)+")
 FN_RE = re.compile(r"\bfn\s+([A-Za-z_]\w*)")
 DRIVE_RE = re.compile(r"\bdrive\s*\(")
 MATCH_RE = re.compile(r"\bmatch\b")
@@ -337,20 +343,28 @@ def rust_files(root):
     return sorted(os.path.relpath(path, root).replace(os.sep, "/") for path in iter_rust_files(root))
 
 
+def ops_root(rel):
+    for prefix in OPERATIONS_SRCS:
+        if rel.startswith(prefix + "/"):
+            return prefix
+    return None
+
+
 def module_path(rel):
-    parts = rel[len(OPERATIONS_SRC) + 1 : -3].split("/")
+    prefix = ops_root(rel)
+    parts = rel[len(prefix) + 1 : -3].split("/")
     if parts[-1] in ("mod", "lib", "main"):
         parts = parts[:-1]
     return tuple(parts)
 
 
 class Operations:
-    """Production files of operations/src with their class, module and resolved references."""
+    """Production files of operations crates with their class, module and resolved references."""
 
     def __init__(self, sources):
         self.files = {}
         for source in sources:
-            if not source.rel.startswith(OPERATIONS_SRC + "/") or is_test(source.rel):
+            if not ops_root(source.rel) or is_test(source.rel):
                 continue
             path = module_path(source.rel)
             has_op = bool(OPERATION_RE.search(source.masked))
@@ -395,7 +409,7 @@ class Operations:
 
     def resolve(self, path, here):
         head, rest = path[0], list(path[1:])
-        if head == "crate":
+        if head == "crate" or head in OPERATIONS_CRATES:
             base = []
         elif head == "self":
             base = list(here)
@@ -781,7 +795,7 @@ def measure(root):
     details["async_parallel"] = [source.rel for source in operations if PARALLEL_RE.search(source.masked)]
     details["test_sleeps"], details["silent_skips"] = test_habits(sources)
     details["core_clocks"] = core_clocks(sources)
-    details["operation_clocks"] = core_clocks(sources, OPERATIONS_SRC + "/")
+    details["operation_clocks"] = core_clocks(sources, OPERATIONS_SRCS)
     duplicates = duplicate_groups(sources)
     details["duplicate_groups"] = [" | ".join(group) for group in duplicates]
     for key in (
@@ -820,7 +834,8 @@ def hook_modules(sources):
 
 def core_clocks(sources, root="core/src/"):
     """Clock, random and id-mint calls in a crate's production code; test hooks are helpers."""
-    core = [source for source in sources if source.rel.startswith(root)]
+    prefixes = tuple(item.rstrip("/") + "/" for item in root) if isinstance(root, tuple) else (root,)
+    core = [source for source in sources if source.rel.startswith(prefixes)]
     hooked = hook_modules(core)
     found = []
     for source in core:

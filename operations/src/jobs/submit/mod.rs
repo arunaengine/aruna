@@ -37,8 +37,8 @@ use tracing::warn;
 
 use super::import::upload::claim_upload;
 use crate::harvest::repository::source_key;
-use crate::s3::imports::cron::is_running;
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, UploadClaimError};
+use aruna_ops_data::s3::imports::cron::is_running;
 
 /// Kick the drain so a submitted job is claimed promptly; this timer is never persisted.
 pub fn schedule_drain_effect() -> Effect {
@@ -225,7 +225,7 @@ impl SubmitJobOperation {
         if !self.group_checked
             && let Some(group_id) = self.record.payload.owner_group()
         {
-            let (key_space, key) = crate::groups::fence::group_fence_key(group_id);
+            let (key_space, key) = aruna_ops_identity::groups::fence::group_fence_key(group_id);
             return self.read(SubmitState::GroupFence, &key_space, key);
         }
         // An upload-backed import claims its upload with the job, so it keeps it across expiry.

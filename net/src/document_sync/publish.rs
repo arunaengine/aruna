@@ -68,7 +68,8 @@ impl DocumentSyncService {
                 target: outcome
                     .retry_indices
                     .first()
-                    .and_then(|index| targets.get(*index).cloned()),
+                    .and_then(|index| targets.get(*index).cloned())
+                    .map(Box::new),
                 error: outcome
                     .retry_error
                     .unwrap_or_else(|| "Document sync topic not ready".to_string()),

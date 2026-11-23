@@ -23,8 +23,8 @@ use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use super::{SubmitJobOperation, SubmitJobSpec};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_core::job_request::{SubmitJobError, SubmitJobResult, mint_configured_job, mint_job_id};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// Normalizes one execution request and enforces every bound that holds
 /// regardless of where the job runs: composition, the shared output bound, and
@@ -201,8 +201,9 @@ impl SubmitExecutionOperation {
             active_cap: submission.active_cap,
         };
         let admission = submission.local_admission.clone();
-        let submit = SubmitJobOperation::new(spec, job_id).with_admission(admission);
-        Ok(Next::Call(IoCall::child(submit)))
+        let build =
+            move || SubmitJobOperation::new(spec.clone(), job_id).with_admission(admission.clone());
+        Ok(Next::Call(IoCall::retry_with(build, &job_id.to_bytes())))
     }
 }
 

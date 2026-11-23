@@ -237,9 +237,18 @@ pub(super) fn job_phase(job: &JobState, cancel_requested: bool) -> AttemptPhase 
 }
 
 pub(super) fn write_private(path: &Path, text: &str) -> Result<(), BackendError> {
-    std::fs::write(path, text).map_err(io_error)?;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io_error)?;
     let mode = std::fs::Permissions::from_mode(0o600);
-    std::fs::set_permissions(path, mode).map_err(io_error)
+    file.set_permissions(mode).map_err(io_error)?;
+    file.write_all(text.as_bytes()).map_err(io_error)
 }
 
 /// Quotes `text` as one POSIX shell word.

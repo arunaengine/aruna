@@ -33,7 +33,8 @@ fn purge_root(root: &Path, failed: &mut Vec<PathBuf>) {
             continue;
         };
         let path = entry.path();
-        let removed = if path.is_dir() {
+        let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+        let removed = if is_dir {
             fs::remove_dir_all(&path)
         } else {
             fs::remove_file(&path)

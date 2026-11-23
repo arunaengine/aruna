@@ -1,0 +1,1036 @@
+//! Creates a realm: its config, its authorization document and the founding node entry.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::admin_documents::{
+    AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
+};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::{DocumentOutboxEvent, DocumentTarget};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::{AUTH_KEYSPACE, REALM_CONFIG_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState};
+use aruna_core::storage_entries::reducer_state_entry;
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::{
+    OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+};
+use aruna_core::structs::placement::record::{
+    BandPool, DocumentClass, FIRST_GRANTABLE_HANDLE, HANDLE_BANDS, HANDLE_RANGE_SIZE, HandleRange,
+    NodePlacementEntry, PlacementBinding, PlacementScope, band_start, normalize_placement_input,
+};
+use aruna_core::structured_id::{FieldError, PlacementHandle};
+use aruna_core::types::{Key, Value};
+use thiserror::Error;
+
+use crate::sync::outbox::record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
+use aruna_core::placement::target_placement_ref;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateRealmConfig {
+    pub actor: Actor,
+    pub realm_description: String,
+    pub oidc_providers: Vec<OidcProviderConfig>,
+    /// Creating node's placement location (`None` ⇒ realm default).
+    pub node_location: Option<String>,
+    /// Creating node's placement weight (`None` ⇒ default weight).
+    pub node_weight: Option<u32>,
+    /// Creating node's placement labels (config-sourced, reserved key rejected
+    /// at parse time). Flow into the node's placement-map entry.
+    pub node_labels: std::collections::BTreeMap<String, String>,
+}
+
+/// The created realm config and authorization document.
+pub type CreatedRealm = (RealmConfigDocument, RealmAuthorizationDocument);
+
+/// Writes the realm's authorization document, its config with the founding node and the seeded
+/// admin events in one write transaction.
+#[derive(Debug, PartialEq)]
+pub struct CreateRealmOperation {
+    config: CreateRealmConfig,
+    auth_doc: Option<RealmAuthorizationDocument>,
+    config_doc: Option<RealmConfigDocument>,
+    now_ms: u64,
+    ids: IdMint,
+}
+
+impl CreateRealmOperation {
+    pub fn new(config: CreateRealmConfig) -> Self {
+        CreateRealmOperation {
+            config,
+            auth_doc: None,
+            config_doc: None,
+            now_ms: 0,
+            ids: IdMint::default(),
+        }
+    }
+
+    /// The default authorization document of the realm.
+    fn auth_write(&mut self) -> Result<(String, Key, Value), CreateRealmError> {
+        let realm_id = self.config.actor.realm_id;
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let value = auth_doc.to_bytes(&self.config.actor)?.into();
+        self.auth_doc = Some(auth_doc);
+        Ok((
+            AUTH_KEYSPACE.to_string(),
+            (*realm_id.as_bytes()).into(),
+            value,
+        ))
+    }
+
+    /// The config document with the founding node, its placement seeds and the seeded admin
+    /// state and events.
+    fn config_writes(&mut self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
+        let realm_id = self.config.actor.realm_id;
+        let mut config_doc =
+            RealmConfigDocument::default_for_realm(realm_id, self.config.oidc_providers.clone());
+        config_doc.description = self.config.realm_description.clone();
+        config_doc.ensure_node(self.config.actor.node_id, RealmNodeKind::Management);
+        // The creator owns the root pool and consumes its first band before onboarding peers.
+        config_doc.band_pools.push(BandPool {
+            pool_id: self.ids.mint(self.now_ms),
+            parent: None,
+            issuer: self.config.actor.node_id,
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: band_start(HANDLE_BANDS),
+        });
+        let creator_range = HandleRange {
+            range_id: self.ids.mint(self.now_ms),
+            owner: self.config.actor.node_id,
+            start: FIRST_GRANTABLE_HANDLE,
+            end: FIRST_GRANTABLE_HANDLE + HANDLE_RANGE_SIZE,
+        };
+        config_doc.placement_handle_ranges.push(creator_range);
+        seed_placement_defaults(&mut config_doc);
+        // The band's reserved first handle is the creator's JobControl handle.
+        let handle = PlacementHandle::new(creator_range.start)?;
+        let strategy_id = config_doc
+            .default_strategy_id
+            .ok_or(CreateRealmError::DefaultStrategyMissing)?;
+        config_doc.placement_bindings.push(PlacementBinding {
+            handle,
+            scope: PlacementScope::Realm(realm_id),
+            document_class: DocumentClass::JobControl,
+            strategy_id,
+            allocator_range_id: Some(creator_range.range_id),
+            allocated_by: Some(self.config.actor.node_id),
+            allocated_at_ms: Some(self.now_ms),
+        });
+        config_doc
+            .placement_map
+            .push(self.creating_node_placement()?);
+        // Epoch one and its reducer events make the creator's seeded activations advanceable.
+        config_doc.snapshot_candidate_map();
+        self.config_doc = Some(config_doc.clone());
+
+        let key = (*realm_id.as_bytes()).into();
+        let value = config_doc.to_bytes(&self.config.actor)?.into();
+        let mut writes = vec![(REALM_CONFIG_KEYSPACE.to_string(), key, value)];
+        writes.extend(self.reducer_seed_writes()?);
+        Ok(writes)
+    }
+
+    fn creating_node_placement(&self) -> Result<NodePlacementEntry, CreateRealmError> {
+        let (location, weight) = normalize_placement_input(
+            self.config.node_location.as_deref(),
+            self.config.node_weight,
+        )
+        .map_err(|_| CreateRealmError::LongNodeLocation)?;
+        Ok(NodePlacementEntry {
+            node_id: self.config.actor.node_id,
+            location,
+            weight,
+            full: false,
+            draining: false,
+            labels: self.config.node_labels.clone(),
+        })
+    }
+
+    fn reducer_seed_writes(&mut self) -> Result<Vec<(String, Key, Value)>, CreateRealmError> {
+        let realm_id = self.config.actor.realm_id;
+        let config_doc = self
+            .config_doc
+            .as_ref()
+            .ok_or(CreateRealmError::ConfigDocMissing)?;
+        let auth_doc = self
+            .auth_doc
+            .as_ref()
+            .ok_or(CreateRealmError::DocNotFound)?;
+        let realm_admin_role = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "realm_admin")
+            .ok_or(CreateRealmError::AdminRoleMissing)?;
+
+        let realm_target = AdminDocumentTarget::Realm { realm_id };
+        let mut realm_state = AdminDocumentState::new(realm_target);
+        let realm_role_event = realm_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::RealmRoleCreated {
+                role: AdminRoleDefinition::from(realm_admin_role),
+            },
+            self.ids.mint(self.now_ms),
+        )?;
+
+        let config_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let mut config_state = AdminDocumentState::new(config_target);
+        let config_node_event = config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::ConfigNodeEnsured {
+                node_id: self.config.actor.node_id,
+                kind: RealmNodeKind::Management,
+            },
+            self.ids.mint(self.now_ms),
+        )?;
+        let mut config_events = vec![config_node_event];
+        for pool in &config_doc.band_pools {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::BandPoolAssigned { pool: *pool },
+                self.ids.mint(self.now_ms),
+            )?);
+        }
+        for range in &config_doc.placement_handle_ranges {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::HandleRangeGranted { range: *range },
+                self.ids.mint(self.now_ms),
+            )?);
+        }
+        let mut oidc_providers = self.config.oidc_providers.clone();
+        oidc_providers.sort_by(|left, right| left.id.cmp(&right.id));
+        for provider in oidc_providers {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::OidcProviderUpserted { provider },
+                self.ids.mint(self.now_ms),
+            )?);
+        }
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::ConfigSettingsSet {
+                metadata_replication: config_doc.metadata_replication.clone(),
+                discovery: config_doc.discovery.clone(),
+            },
+            self.ids.mint(self.now_ms),
+        )?);
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::ConfigDescriptionSet {
+                description: config_doc.description.clone(),
+            },
+            self.ids.mint(self.now_ms),
+        )?);
+        config_events.extend(seed_placement_events(
+            &mut config_state,
+            &self.config.actor,
+            config_doc,
+            &mut self.ids,
+            self.now_ms,
+        )?);
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::NodePlacementSet {
+                entry: self.creating_node_placement()?,
+            },
+            self.ids.mint(self.now_ms),
+        )?);
+        for map in &config_doc.candidate_maps {
+            config_events.push(config_state.apply_operation(
+                &self.config.actor,
+                AdminDocumentOperation::CandidateMapPublished { map: map.clone() },
+                self.ids.mint(self.now_ms),
+            )?);
+            for strategy in &config_doc.strategies {
+                config_events.push(config_state.apply_operation(
+                    &self.config.actor,
+                    AdminDocumentOperation::ConfigActivationsInitialized {
+                        strategy_id: strategy.strategy_id,
+                        candidate_map_epoch: map.epoch,
+                    },
+                    self.ids.mint(self.now_ms),
+                )?);
+            }
+        }
+        // The creating node runs account merges until it hands that role on.
+        config_events.push(config_state.apply_operation(
+            &self.config.actor,
+            AdminDocumentOperation::MergeCoordinatorSet {
+                node_id: self.config.actor.node_id,
+            },
+            self.ids.mint(self.now_ms),
+        )?);
+
+        let realm_auth_target = DocumentTarget::RealmAuthorization { realm_id };
+        let realm_config_target = DocumentTarget::RealmConfig { realm_id };
+        let realm_auth_placement =
+            target_placement_ref(config_doc, &realm_auth_target, Default::default());
+        let realm_config_placement =
+            target_placement_ref(config_doc, &realm_config_target, Default::default());
+        let realm_auth_record = new_identified_record(
+            realm_role_event.event_id,
+            self.config.actor.node_id,
+            realm_auth_target,
+            Vec::new(),
+            DocumentOutboxEvent::admin(realm_role_event),
+            realm_auth_placement,
+            true,
+        );
+        let mut writes = vec![
+            reducer_state_entry(&realm_state)?,
+            reducer_state_entry(&config_state)?,
+            outbox_write_entry(&realm_auth_record).map_err(ConversionError::from)?,
+        ];
+        for event in config_events {
+            let record = new_identified_record(
+                event.event_id,
+                self.config.actor.node_id,
+                realm_config_target.clone(),
+                Vec::new(),
+                DocumentOutboxEvent::admin(event),
+                realm_config_placement,
+                true,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+        }
+
+        Ok(writes)
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum CreateRealmError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    AdminDocumentError(#[from] AdminDocumentError),
+    #[error("authorization document not found")]
+    DocNotFound,
+    #[error("realm config document not found")]
+    ConfigDocMissing,
+    #[error("realm_admin role not found")]
+    AdminRoleMissing,
+    #[error("placement location must be at most 64 characters")]
+    LongNodeLocation,
+    #[error(transparent)]
+    InvalidHandle(#[from] FieldError),
+    #[error("realm config seed produced no default placement strategy")]
+    DefaultStrategyMissing,
+    #[error("creating realm did not finish")]
+    NotFinished,
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: &'static str,
+    },
+}
+
+impl From<IoError> for CreateRealmError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "CreateRealm".to_string(),
+                expected,
+                got,
+            },
+            _ => Self::NotFinished,
+        }
+    }
+}
+
+impl Operation for CreateRealmOperation {
+    type Output = CreatedRealm;
+    type Error = CreateRealmError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<CreatedRealm>, CreateRealmError> {
+        let mut writes = vec![self.auth_write()?];
+        writes.extend(self.config_writes()?);
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn next(&mut self, result: IoResult) -> Result<Next<CreatedRealm>, CreateRealmError> {
+        result.done()?;
+        let (Some(config), Some(auth)) = (self.config_doc.clone(), self.auth_doc.clone()) else {
+            return Err(CreateRealmError::ConfigDocMissing);
+        };
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then {
+            output: (config, auth),
+            calls,
+        })
+    }
+}
+
+fn seed_placement_defaults(config: &mut RealmConfigDocument) {
+    config.seed_default_placement();
+}
+
+/// Reducer events that seed one fresh realm config's placement identity:
+/// strategies, seeded placement bindings, default/job-family strategies and class
+/// bindings. Every bootstrap path applies them, so rebuilds materialize identically.
+pub fn seed_placement_events(
+    state: &mut AdminDocumentState,
+    actor: &Actor,
+    document: &RealmConfigDocument,
+    ids: &mut IdMint,
+    now_ms: u64,
+) -> Result<Vec<AdminDocumentEvent>, AdminDocumentError> {
+    let mut events = Vec::new();
+    for strategy in &document.strategies {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::PlacementStrategyUpserted {
+                strategy: strategy.clone(),
+            },
+            ids.mint(now_ms),
+        )?);
+    }
+    for binding in &document.placement_bindings {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::PlacementBindingAppended {
+                binding: binding.clone(),
+            },
+            ids.mint(now_ms),
+        )?);
+    }
+    if let Some(strategy_id) = document.default_strategy_id {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::ConfigStrategySet { strategy_id },
+            ids.mint(now_ms),
+        )?);
+    }
+    events.push(state.apply_operation(
+        actor,
+        AdminDocumentOperation::JobFamilySet {
+            strategy_id: document.family_strategy_id,
+        },
+        ids.mint(now_ms),
+    )?);
+    for binding in &document.strategy_bindings {
+        events.push(state.apply_operation(
+            actor,
+            AdminDocumentOperation::StrategyBindingSet {
+                binding: binding.clone(),
+            },
+            ids.mint(now_ms),
+        )?);
+    }
+    Ok(events)
+}
+
+#[cfg(test)]
+mod test {
+    use aruna_core::keys::generate_signing_key;
+
+    use aruna_core::admin_documents::{
+        AdminDocumentOperation, AdminDocumentTarget, AdminRoleDefinition,
+    };
+    use aruna_core::calls::{IoCall, IoResult, Next};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
+    use aruna_core::keyspaces::{
+        DOCUMENT_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+    };
+    use aruna_core::operation::{Operation, TransactionMode};
+    use aruna_core::reducer::AdminDocumentState;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::{
+        OidcProviderConfig, RealmAuthorizationDocument, RealmConfigDocument, RealmId, RealmNodeKind,
+    };
+    use aruna_core::structs::placement::record::{
+        BindingScope, DEFAULT_NODE_WEIGHT, DocumentClass, NodePlacementEntry,
+    };
+    use aruna_core::types::{Key, KeySpace, Value};
+    use aruna_core::user::id::UserId;
+    use aruna_net::NetHandle;
+    use aruna_net::config::{DiscoveryMethod, NetConfig, RelayMethod};
+    use aruna_storage::storage;
+    use aruna_tasks::TaskHandle;
+    use ed25519_dalek::SigningKey;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_drivers::driver::{DriverContext, drive};
+
+    fn actor(realm_id: RealmId, node_seed: u8, user_seed: u8) -> Actor {
+        Actor {
+            node_id: iroh::SecretKey::from_bytes(&[node_seed; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([user_seed; 16]), realm_id),
+            realm_id,
+        }
+    }
+
+    fn config(actor: Actor) -> CreateRealmConfig {
+        CreateRealmConfig {
+            actor,
+            realm_description: "A realm description".to_string(),
+            oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
+        }
+    }
+
+    #[test]
+    fn placement_clamps_values() {
+        let realm_id = RealmId::from_bytes([31; 32]);
+        let actor = actor(realm_id, 1, 2);
+
+        let mut clamped = config(actor.clone());
+        clamped.node_weight = Some(50_000);
+        clamped.node_location = Some("  eu-west  ".to_string());
+        let entry = CreateRealmOperation::new(clamped)
+            .creating_node_placement()
+            .unwrap();
+        assert_eq!(
+            entry.weight,
+            aruna_core::structs::placement::record::MAX_NODE_WEIGHT
+        );
+        assert_eq!(entry.location, "eu-west");
+
+        let mut too_long = config(actor);
+        too_long.node_location = Some("x".repeat(65));
+        assert_eq!(
+            CreateRealmOperation::new(too_long).creating_node_placement(),
+            Err(super::CreateRealmError::LongNodeLocation)
+        );
+    }
+
+    fn oidc_provider(id: &str) -> OidcProviderConfig {
+        OidcProviderConfig {
+            id: id.to_string(),
+            issuer: format!("https://issuer.example/{id}"),
+            audience: format!("audience-{id}"),
+            discovery_url: format!("https://issuer.example/{id}/.well-known/openid-configuration"),
+        }
+    }
+
+    fn write_values<'a>(writes: &'a [(KeySpace, Key, Value)], keyspace: &str) -> Vec<&'a Value> {
+        writes
+            .iter()
+            .filter(|(candidate, _, _)| candidate == keyspace)
+            .map(|(_, _, value)| value)
+            .collect()
+    }
+
+    #[test]
+    fn seeds_admin_state() {
+        let realm_id = RealmId::from_bytes([2; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let auth_doc = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let realm_admin_role = auth_doc
+            .roles
+            .values()
+            .find(|role| role.name == "realm_admin")
+            .unwrap()
+            .clone();
+        let alpha_provider = oidc_provider("alpha");
+        let beta_provider = oidc_provider("beta");
+        let mut realm_config = config(actor.clone());
+        realm_config.oidc_providers = vec![beta_provider.clone(), alpha_provider.clone()];
+        let mut operation = CreateRealmOperation::new(realm_config);
+        operation.auth_doc = Some(auth_doc);
+
+        let writes = &operation.config_writes().unwrap();
+
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        assert!(config_doc.has_node(actor.node_id));
+        assert_eq!(config_doc.description, "A realm description");
+
+        let states = write_values(writes, DOCUMENT_STATE_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<AdminDocumentState>(value.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        let realm_target = AdminDocumentTarget::Realm { realm_id };
+        let config_target = AdminDocumentTarget::RealmConfig { realm_id };
+        let realm_state = states
+            .iter()
+            .find(|state| state.target == realm_target)
+            .unwrap();
+        let config_state = states
+            .iter()
+            .find(|state| state.target == config_target)
+            .unwrap();
+        assert!(
+            realm_state
+                .materialized_realm_roles()
+                .contains(&realm_admin_role.role_id)
+        );
+        assert!(realm_state.materialized_realm_assignments().is_empty());
+        assert_eq!(
+            config_state.materialized_config_nodes()[&actor.node_id],
+            RealmNodeKind::Management
+        );
+        let materialized_providers = config_state.materialized_oidc_providers();
+        assert_eq!(materialized_providers.len(), 2);
+        assert_eq!(materialized_providers.get("alpha"), Some(&alpha_provider));
+        assert_eq!(materialized_providers.get("beta"), Some(&beta_provider));
+        assert_eq!(
+            config_state.materialized_metadata_replication(),
+            Some(config_doc.metadata_replication.clone())
+        );
+        assert_eq!(
+            config_state.materialized_realm_discovery(),
+            Some(config_doc.discovery.clone())
+        );
+        assert_eq!(
+            config_state.materialized_realm_description().as_deref(),
+            Some(config_doc.description.as_str())
+        );
+
+        let seeded_strategies = config_doc.strategies.clone();
+        let default_strategy_id = config_doc.default_strategy_id.unwrap();
+        let family_strategy_id = config_doc.family_strategy_id;
+        let seeded_bindings = config_doc.strategy_bindings.clone();
+        let seeded_placements = config_doc.placement_bindings.clone();
+        assert_eq!(seeded_strategies.len(), 3);
+        assert_eq!(seeded_strategies[0].name, "default");
+        assert_eq!(seeded_strategies[0].replica_count, Some(3));
+        assert_eq!(seeded_strategies[1].name, "everywhere");
+        assert_eq!(seeded_strategies[1].replica_count, None);
+        assert_eq!(seeded_strategies[2].name, "job-family");
+        assert_eq!(
+            config_doc.default_strategy_id,
+            Some(seeded_strategies[0].strategy_id)
+        );
+        assert_eq!(family_strategy_id, seeded_strategies[2].strategy_id);
+        assert_eq!(seeded_bindings.len(), 6);
+        assert_eq!(seeded_placements.len(), 2);
+        assert_eq!(
+            config_state.materialized_default_strategy(),
+            Some(default_strategy_id)
+        );
+        assert_eq!(config_state.materialized_strategies().len(), 3);
+        assert_eq!(
+            config_state.materialized_family_strategy(),
+            Some(family_strategy_id)
+        );
+        assert_eq!(config_state.materialized_strategy_bindings().len(), 6);
+        assert_eq!(config_state.materialized_placement_bindings().len(), 2);
+
+        let outbox_records = write_values(writes, SYNC_OUTBOX_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<DocumentOutboxRecord>(value.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outbox_records.len(), 27);
+        assert!(outbox_records.iter().any(|record| {
+            record.target == DocumentTarget::RealmAuthorization { realm_id }
+                && matches!(
+                    &record.event,
+                    DocumentOutboxEvent::AdminOperation { event, .. }
+                        if event.target == realm_target
+                            && matches!(
+                                &event.op,
+                                AdminDocumentOperation::RealmRoleCreated { role }
+                                    if role == &AdminRoleDefinition::from(&realm_admin_role)
+                            )
+                )
+        }));
+        let config_events = outbox_records
+            .iter()
+            .filter_map(|record| {
+                if record.target != (DocumentTarget::RealmConfig { realm_id }) {
+                    return None;
+                }
+
+                let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
+                    return None;
+                };
+
+                if event.target != config_target {
+                    return None;
+                }
+
+                Some((event.origin_seq, event.op.clone()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            config_events,
+            vec![
+                (
+                    1,
+                    AdminDocumentOperation::ConfigNodeEnsured {
+                        node_id: actor.node_id,
+                        kind: RealmNodeKind::Management,
+                    },
+                ),
+                (
+                    2,
+                    AdminDocumentOperation::BandPoolAssigned {
+                        pool: config_doc.band_pools[0],
+                    },
+                ),
+                (
+                    3,
+                    AdminDocumentOperation::HandleRangeGranted {
+                        range: config_doc.placement_handle_ranges[0],
+                    },
+                ),
+                (
+                    4,
+                    AdminDocumentOperation::OidcProviderUpserted {
+                        provider: alpha_provider,
+                    },
+                ),
+                (
+                    5,
+                    AdminDocumentOperation::OidcProviderUpserted {
+                        provider: beta_provider,
+                    },
+                ),
+                (
+                    6,
+                    AdminDocumentOperation::ConfigSettingsSet {
+                        metadata_replication: config_doc.metadata_replication,
+                        discovery: config_doc.discovery,
+                    },
+                ),
+                (
+                    7,
+                    AdminDocumentOperation::ConfigDescriptionSet {
+                        description: config_doc.description,
+                    },
+                ),
+                (
+                    8,
+                    AdminDocumentOperation::PlacementStrategyUpserted {
+                        strategy: seeded_strategies[0].clone(),
+                    },
+                ),
+                (
+                    9,
+                    AdminDocumentOperation::PlacementStrategyUpserted {
+                        strategy: seeded_strategies[1].clone(),
+                    },
+                ),
+                (
+                    10,
+                    AdminDocumentOperation::PlacementStrategyUpserted {
+                        strategy: seeded_strategies[2].clone(),
+                    },
+                ),
+                (
+                    11,
+                    AdminDocumentOperation::PlacementBindingAppended {
+                        binding: seeded_placements[0].clone(),
+                    },
+                ),
+                (
+                    12,
+                    AdminDocumentOperation::PlacementBindingAppended {
+                        binding: seeded_placements[1].clone(),
+                    },
+                ),
+                (
+                    13,
+                    AdminDocumentOperation::ConfigStrategySet {
+                        strategy_id: default_strategy_id,
+                    },
+                ),
+                (
+                    14,
+                    AdminDocumentOperation::JobFamilySet {
+                        strategy_id: family_strategy_id,
+                    },
+                ),
+                (
+                    15,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[0].clone(),
+                    },
+                ),
+                (
+                    16,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[1].clone(),
+                    },
+                ),
+                (
+                    17,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[2].clone(),
+                    },
+                ),
+                (
+                    18,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[3].clone(),
+                    },
+                ),
+                (
+                    19,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[4].clone(),
+                    },
+                ),
+                (
+                    20,
+                    AdminDocumentOperation::StrategyBindingSet {
+                        binding: seeded_bindings[5].clone(),
+                    },
+                ),
+                (
+                    21,
+                    AdminDocumentOperation::NodePlacementSet {
+                        entry: NodePlacementEntry {
+                            node_id: actor.node_id,
+                            location: String::new(),
+                            weight: DEFAULT_NODE_WEIGHT,
+                            full: false,
+                            draining: false,
+                            labels: std::collections::BTreeMap::new(),
+                        },
+                    },
+                ),
+                (
+                    22,
+                    AdminDocumentOperation::CandidateMapPublished {
+                        map: config_doc.candidate_maps[0].clone(),
+                    },
+                ),
+                (
+                    23,
+                    AdminDocumentOperation::ConfigActivationsInitialized {
+                        strategy_id: seeded_strategies[0].strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                ),
+                (
+                    24,
+                    AdminDocumentOperation::ConfigActivationsInitialized {
+                        strategy_id: seeded_strategies[1].strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                ),
+                (
+                    25,
+                    AdminDocumentOperation::ConfigActivationsInitialized {
+                        strategy_id: seeded_strategies[2].strategy_id,
+                        candidate_map_epoch: 1,
+                    },
+                ),
+                (
+                    26,
+                    AdminDocumentOperation::MergeCoordinatorSet {
+                        node_id: actor.node_id,
+                    },
+                ),
+            ]
+        );
+        assert_eq!(
+            config_state.materialized_merge_coordinator(),
+            Some(actor.node_id)
+        );
+    }
+
+    // The creator's own view is activated at realm creation, through the
+    // reducer: a literal activation could never advance with a transition.
+    #[test]
+    fn seeds_activated_map() {
+        let realm_id = RealmId::from_bytes([27; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.auth_doc = Some(RealmAuthorizationDocument::default_realm_doc(realm_id));
+
+        let writes = &operation.config_writes().unwrap();
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        let config_state = write_values(writes, DOCUMENT_STATE_KEYSPACE)
+            .into_iter()
+            .map(|value| postcard::from_bytes::<AdminDocumentState>(value.as_ref()).unwrap())
+            .find(|state| state.target == (AdminDocumentTarget::RealmConfig { realm_id }))
+            .expect("the config reducer state is seeded");
+
+        let map = config_doc.candidate_map(1).expect("epoch one is published");
+        assert_eq!(map.nodes.len(), 1);
+        assert_eq!(map.nodes[0].node_id, actor.node_id);
+        for strategy in &config_doc.strategies {
+            assert_eq!(
+                config_state
+                    .materialized_activation_epochs()
+                    .get(&strategy.strategy_id),
+                Some(&1)
+            );
+            let activation = config_doc
+                .activation(&strategy.strategy_id, 0)
+                .expect("bucket zero is activated");
+            assert_eq!(activation.candidate_map_epoch, 1);
+            assert_eq!(activation.activation_epoch, 1);
+        }
+    }
+
+    #[test]
+    fn seeds_default_strategies() {
+        let realm_id = RealmId::from_bytes([21; 32]);
+        let actor = actor(realm_id, 3, 4);
+        let mut operation = CreateRealmOperation::new(config(actor.clone()));
+        operation.auth_doc = Some(RealmAuthorizationDocument::default_realm_doc(realm_id));
+
+        let writes = &operation.config_writes().unwrap();
+        let config_doc = RealmConfigDocument::from_bytes(
+            write_values(writes, REALM_CONFIG_KEYSPACE)
+                .first()
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+
+        let default = config_doc
+            .strategies
+            .iter()
+            .find(|strategy| strategy.name == "default")
+            .unwrap();
+        let everywhere = config_doc
+            .strategies
+            .iter()
+            .find(|strategy| strategy.name == "everywhere")
+            .unwrap();
+        assert_eq!(config_doc.default_strategy_id, Some(default.strategy_id));
+        assert_eq!(default.replica_count, Some(3));
+        assert!(!default.distinct_locations);
+        assert_eq!(everywhere.replica_count, None);
+
+        let bound_scopes = config_doc
+            .strategy_bindings
+            .iter()
+            .filter(|binding| binding.strategy_id == everywhere.strategy_id)
+            .map(|binding| binding.scope.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(config_doc.strategy_bindings.len(), 6);
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::MetadataRegistry)));
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Admin)));
+        // Group (which covers group authorization documents) and user documents
+        // must reach every node: the permission check reads them locally.
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::Group)));
+        assert!(bound_scopes.contains(&BindingScope::Class(DocumentClass::User)));
+        // Policy documents bind to the replica-capped default, never everywhere:
+        // non-holders must exist for resolution by id to mean anything.
+        assert!(!bound_scopes.contains(&BindingScope::Class(DocumentClass::PlacementPolicy)));
+        let policy_binding = config_doc
+            .strategy_bindings
+            .iter()
+            .find(|binding| binding.scope == BindingScope::Class(DocumentClass::PlacementPolicy))
+            .expect("policy class is bound");
+        assert_eq!(policy_binding.strategy_id, default.strategy_id);
+        let vault_binding = config_doc
+            .strategy_bindings
+            .iter()
+            .find(|binding| binding.scope == BindingScope::Class(DocumentClass::UserVault))
+            .expect("vault class is bound");
+        assert_eq!(vault_binding.strategy_id, default.strategy_id);
+    }
+
+    #[test]
+    fn schedules_outbox_drain() {
+        // One write holds every row; the created documents come out with the drain wake.
+        let realm_id = RealmId::from_bytes([5; 32]);
+        let mut operation = CreateRealmOperation::new(config(actor(realm_id, 6, 7)));
+        assert_eq!(operation.transaction(), TransactionMode::Write);
+        assert!(matches!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Write(_)))
+        ));
+        let Ok(Next::Then { output, calls }) = operation.next(IoResult::Done) else {
+            panic!("expected the realm documents with the drain wake");
+        };
+        assert_eq!(output.0.description, "A realm description");
+        assert_eq!(output.1.realm_id, realm_id);
+        assert!(matches!(calls.as_slice(), [IoCall::Effect(_)]));
+    }
+
+    #[tokio::test]
+    pub async fn test_realm_creation() {
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+        let net_handle = NetHandle::new(
+            NetConfig {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                discovery_method: DiscoveryMethod::None,
+                relay_method: RelayMethod::None,
+                ..NetConfig::default()
+            },
+            storage_handle.clone(),
+        )
+        .await
+        .unwrap();
+        let task_handle = TaskHandle::new();
+
+        let context = DriverContext {
+            storage_handle,
+            blob_handle: None,
+            net_handle: Some(net_handle.clone()),
+            graph_handle: None,
+            task_handle: Some(task_handle),
+            compute_handle: None,
+            outbound_handle: None,
+        };
+
+        let realm_signing_key: SigningKey = generate_signing_key();
+        let pubkey = realm_signing_key.verifying_key().to_bytes();
+        let realm_id = RealmId::from_bytes(pubkey);
+        let node_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let realm_admin = UserId::local(Ulid::generate(), realm_id);
+
+        let realm_config = CreateRealmConfig {
+            actor: Actor {
+                node_id,
+                user_id: realm_admin,
+                realm_id,
+            },
+            realm_description: "A realm description".to_string(),
+            oidc_providers: Vec::new(),
+            node_location: None,
+            node_weight: None,
+            node_labels: Default::default(),
+        };
+        let realm_operation = CreateRealmOperation::new(realm_config.clone());
+        let result = drive(realm_operation, &context).await.unwrap();
+        assert_eq!(result.0.description, realm_config.realm_description);
+        assert_eq!(result.0.realm_id, realm_config.actor.realm_id);
+        assert!(
+            result.1.roles.iter().any(|(_id, role)| {
+                role.name == "realm_admin" && role.assigned_users.is_empty()
+            })
+        );
+        assert!(result.1.operation_restrictions.is_empty());
+
+        net_handle.shutdown().await;
+    }
+}

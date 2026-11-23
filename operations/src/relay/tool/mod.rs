@@ -21,8 +21,8 @@ use thiserror::Error;
 use ulid::Ulid;
 
 use super::call::{MAX_REPLY_BYTES, NodeCall, NodeCallOperation, RelayFailure, RelayReply};
-use crate::document_repository::{GetConfigError, GetConfigOperation};
-use crate::s3::object::member::rest::{API_PREFIX, RELAY_NODE_HEADER};
+use aruna_ops_data::s3::object::member::rest::{API_PREFIX, RELAY_NODE_HEADER};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 
 /// How long a forwarded call may take, its answer included; a scan may run for a while.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);

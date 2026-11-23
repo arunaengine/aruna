@@ -3,12 +3,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+use aruna_core::calls::{IoCall, IoResult, Next};
 use aruna_core::effects::{Effect, NetEffect};
 use aruna_core::events::{Event, NetEvent};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
-use aruna_core::operation::{Operation, boxed_retry};
+use aruna_core::operation::Operation;
 use aruna_core::rows::{read_row, values};
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
 use aruna_core::structs::execution::notification_watch::{
@@ -322,11 +322,9 @@ impl WatchEventsOperation {
             let (config, events) = (config.clone(), events.clone());
             WatchExpandOperation::new(realm_id, config, input.local, events, None)
         };
-        let expand = boxed_retry(build, realm_id.as_bytes(), |result| {
-            Event::Child(ChildOutcome::new(result))
-        });
+        let expand = IoCall::retry_with(build, realm_id.as_bytes());
         self.state = EventsState::Expand;
-        Ok(Next::Call(IoCall::Child(expand)))
+        Ok(Next::Call(expand))
     }
 
     fn expanded(&mut self, outcome: Result<ExpandOutcome, ExpandError>) -> AnswerTurn {

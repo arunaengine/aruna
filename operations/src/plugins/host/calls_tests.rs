@@ -3,8 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::*;
+use crate::plugins::check::tests::access_rows;
 use crate::plugins::rows::tests::child_result;
 use crate::plugins::work::tests::sample_install;
+use crate::tests::calls::{compiled, values_of};
 
 fn intent(ordinal: u32) -> CallIntent {
     CallIntent {
@@ -67,7 +69,7 @@ fn reply_settles_intent() {
 fn lost_settlement_unknown() {
     let mut record = RecordCall::new(run(), intent(1), Ok("r".into()));
     record.first().unwrap();
-    let failed = child_result(Err::<(), _>(StoreError("down".into())));
+    let failed = child_result(Err::<(), _>(StoreError::Message("down".into())));
     assert!(is_child(record.next(failed).unwrap()));
     assert_eq!(kind_of(record.next(written())), ErrorKind::UnknownOutcome);
 }
@@ -85,7 +87,7 @@ fn refusal_clears_intent() {
         Err(CallEnd::None(HostError::new(ErrorKind::Denied, "no"))),
     );
     failing.first().unwrap();
-    let failed = child_result(Err::<(), _>(StoreError("down".into())));
+    let failed = child_result(Err::<(), _>(StoreError::Message("down".into())));
     assert_eq!(kind_of(failing.next(failed)), ErrorKind::Unavailable);
 }
 
@@ -159,6 +161,19 @@ fn refused_put_recorded() {
     let failure = CallFailure::from(HostError::new(ErrorKind::Limit, "full"));
     let recorded = child_result(Err::<String, _>(failure.clone()));
     assert_eq!(call.next(recorded), Err(failure));
+}
+
+#[test]
+fn lost_conflict_clears() {
+    // Every attempt rolled back on its conflict, so the intent clears instead of turning unknown.
+    let mut call = put(1);
+    call.next(begun(Begun::Fresh)).unwrap();
+    let lost = PutError::from(IoError::Conflict);
+    let answer = call.next(child_result(Err::<u64, _>(lost)));
+    let detail = StoreError::Io(IoError::Conflict).detail();
+    let end = CallEnd::None(HostError::new(ErrorKind::Conflict, detail));
+    let record = RecordCall::new(run(), intent(1), Err(end));
+    assert_eq!(answer, Ok(Next::Call(IoCall::child(record))));
 }
 
 #[test]
@@ -255,29 +270,52 @@ fn ungranted_objects_hidden() {
     assert_eq!(visible.first(), Ok(Next::Done(Vec::new())));
 }
 
-fn authorizing() -> VisibleObjects {
-    let install = sample_install(Ulid::from_parts(1, 1));
-    let mut visible = VisibleObjects::new(place(&install), &install, "b", Vec::new());
-    visible.phase = Some(VisiblePhase::Authorizing(listed_object()));
-    visible
+/// The pattern below bucket `b` of the test install.
+fn bucket_pattern(install: &PluginInstall) -> String {
+    let realm = install.account.realm_id;
+    object_permission_path(realm, install.group_id, install.receiver, "b", "**")
+}
+
+/// Bucket `b` listing `listed`, the install granted read on all of it; the first check asks.
+fn authorizing(listed: Vec<ListedObject>) -> (VisibleObjects, PluginInstall) {
+    let mut install = sample_install(Ulid::from_parts(1, 1));
+    let read = vec![bucket_pattern(&install)];
+    install.grants = std::collections::BTreeMap::from([("read".to_string(), read)]);
+    let mut visible = VisibleObjects::new(place(&install), &install, "b", listed);
+    assert!(matches!(visible.first(), Ok(Next::Call(IoCall::Read(_)))));
+    (visible, install)
 }
 
 #[test]
 fn denied_objects_hidden() {
-    let denied = CallError(HostError::new(ErrorKind::Denied, "no"));
-    let mut visible = authorizing();
-    let answer = visible.next(child_result(Err::<(), _>(denied)));
+    let (mut visible, _) = authorizing(vec![listed_object()]);
+    let answer = visible.next(values_of(vec![None, None]));
     assert_eq!(answer, Ok(Next::Done(Vec::new())));
-    let down = CallError(unavailable("later"));
-    let answer = authorizing().next(child_result(Err::<(), _>(down)));
-    assert_eq!(kind_of(answer), ErrorKind::Unavailable);
+    let (mut visible, _) = authorizing(vec![listed_object()]);
+    assert_eq!(
+        kind_of(visible.next(IoResult::Done)),
+        ErrorKind::Unavailable
+    );
 }
 
+// Both objects are shown after one read of the rules and the policies and one compile.
 #[test]
 fn allowed_object_shown() {
-    let mut visible = authorizing();
-    let Next::Done(shown) = visible.next(child_result(Ok::<(), CallError>(()))).unwrap() else {
+    let other = ("l".to_string(), 2, "w".to_string());
+    let (mut visible, install) = authorizing(vec![listed_object(), other]);
+    let [rules, policies] = access_rows(&install, &bucket_pattern(&install));
+    assert!(matches!(
+        visible.next(rules),
+        Ok(Next::Call(IoCall::Read(_)))
+    ));
+    let Ok(Next::Call(compile)) = visible.next(policies) else {
+        panic!("the read policies compile");
+    };
+    let Next::Done(shown) = visible.next(compiled(compile)).unwrap() else {
         panic!("a version that is no id has no mark to read");
     };
-    assert_eq!((shown[0].path.as_str(), shown[0].marked), ("b/k", false));
+    let paths: Vec<_> = (shown.iter())
+        .map(|info| (info.path.as_str(), info.marked))
+        .collect();
+    assert_eq!(paths, [("b/k", false), ("b/l", false)]);
 }

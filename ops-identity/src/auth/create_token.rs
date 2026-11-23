@@ -1,0 +1,306 @@
+//! Mints a signed bearer token for a user after capability and lifetime checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::auth::valid_token_lifetime;
+use aruna_core::calls::{IoError, IoResult, Next};
+use aruna_core::compute::Secret;
+use aruna_core::id_mint::IdMint;
+use aruna_core::operation::Operation;
+use aruna_core::permission_path::validate_restriction_limits;
+use aruna_core::structs::identity::auth::{
+    NodeCapabilities, PathRestriction, SessionRef, TokenClaims,
+};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
+use base64::Engine;
+use chrono::Months;
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
+use thiserror::Error;
+use ulid::Ulid;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateTokenConfig {
+    pub time: u64,
+    pub expiry: Option<u64>,
+    pub user_id: UserId,
+    pub realm_id: RealmId,
+    pub node_capabilities: NodeCapabilities,
+    pub session: Option<SessionRef>,
+    pub restrictions: Option<Vec<PathRestriction>>,
+}
+
+/// Mints the token without I/O; the keys are part of the node capabilities.
+#[derive(Debug, PartialEq)]
+pub struct CreateTokenOperation {
+    config: CreateTokenConfig,
+    now_ms: u64,
+    ids: IdMint,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum CreateTokenError {
+    #[error("Node has no capability to create tokens")]
+    NotEnoughCapabilities,
+    #[error("Creating token did not finish")]
+    NotFinished,
+    #[error("Invalid timestamp")]
+    InvalidTimestamp,
+    #[error("Token lifetime exceeds the revocable maximum")]
+    LifetimeTooLong,
+    #[error("Token restrictions exceed the allowed size")]
+    RestrictionsTooLarge,
+    #[error(transparent)]
+    EncodingError(#[from] jsonwebtoken::errors::Error),
+}
+
+impl From<IoError> for CreateTokenError {
+    fn from(_: IoError) -> Self {
+        Self::NotFinished
+    }
+}
+
+/// Mints a token with the token id `jti`.
+pub fn mint_token(config: &CreateTokenConfig, jti: Ulid) -> Result<String, CreateTokenError> {
+    mint_login_token(config, None, jti)
+}
+
+/// Mints a token that carries the time of the primary login it descends from.
+pub fn mint_login_token(
+    config: &CreateTokenConfig,
+    auth_time: Option<u64>,
+    jti: Ulid,
+) -> Result<String, CreateTokenError> {
+    let iat = config.time;
+    let exp = match config.expiry {
+        Some(exp) if exp > iat => exp,
+        Some(_) => return Err(CreateTokenError::InvalidTimestamp),
+        None => {
+            let time = chrono::DateTime::from_timestamp_secs(iat as i64)
+                .ok_or(CreateTokenError::InvalidTimestamp)?;
+            time.checked_add_months(Months::new(12))
+                .ok_or(CreateTokenError::InvalidTimestamp)?
+                .timestamp() as u64
+        }
+    };
+    if !valid_token_lifetime(iat, exp) {
+        return Err(CreateTokenError::LifetimeTooLong);
+    }
+    if let Some(restrictions) = &config.restrictions {
+        validate_restriction_limits(restrictions)
+            .map_err(|_| CreateTokenError::RestrictionsTooLarge)?;
+    }
+
+    let claims = |issuer_pubkey, delegation_signature| TokenClaims {
+        sub: config.user_id.to_string(),
+        iss: config.realm_id.to_string(),
+        iat,
+        exp,
+        jti: jti.to_string(),
+        sid: config.session.as_ref().map(|session| session.sid.clone()),
+        session_kind: config.session.as_ref().map(|session| session.kind),
+        restrictions: config.restrictions.clone(),
+        issuer_pubkey,
+        delegation_signature,
+        name: config
+            .session
+            .as_ref()
+            .and_then(|session| session.name.clone()),
+        via: config
+            .session
+            .as_ref()
+            .and_then(|session| session.via)
+            .map(|via| via.to_string()),
+        auth_time,
+    };
+    let header = Header::new(Algorithm::EdDSA);
+    match &config.node_capabilities {
+        NodeCapabilities::Management {
+            realm_encoding_key, ..
+        } => Ok(encode(
+            &header,
+            &claims(None, None),
+            &EncodingKey::from_ed_pem(realm_encoding_key)?,
+        )?),
+        NodeCapabilities::Server {
+            issuer_signing_key,
+            issuer_encoding_key,
+            delegation_signature,
+            ..
+        } => Ok(encode(
+            &header,
+            &claims(
+                Some(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(issuer_signing_key.verifying_key().to_bytes()),
+                ),
+                Some(delegation_signature.clone()),
+            ),
+            &EncodingKey::from_ed_pem(issuer_encoding_key)?,
+        )?),
+        NodeCapabilities::User { .. } => Err(CreateTokenError::NotEnoughCapabilities),
+    }
+}
+
+impl CreateTokenOperation {
+    pub fn new(config: CreateTokenConfig) -> Result<Self, CreateTokenError> {
+        if matches!(config.node_capabilities, NodeCapabilities::User { .. }) {
+            return Err(CreateTokenError::NotEnoughCapabilities);
+        }
+        Ok(CreateTokenOperation {
+            config,
+            now_ms: 0,
+            ids: IdMint::default(),
+        })
+    }
+}
+
+impl Operation for CreateTokenOperation {
+    type Output = Secret;
+    type Error = CreateTokenError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn first(&mut self) -> Result<Next<Secret>, CreateTokenError> {
+        let jti = self.ids.mint(self.now_ms);
+        mint_token(&self.config, jti)
+            .map(Secret::new)
+            .map(Next::Done)
+    }
+
+    fn next(&mut self, _result: IoResult) -> Result<Next<Secret>, CreateTokenError> {
+        Err(CreateTokenError::NotFinished)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::auth::create_token::{
+        CreateTokenConfig, CreateTokenError, CreateTokenOperation, mint_token,
+    };
+    use aruna_core::keys::generate_signing_key;
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::auth::{
+        NodeCapabilities, SessionKind, SessionRef, TokenClaims,
+    };
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::user::id::UserId;
+    use aruna_drivers::driver::{DriverContext, drive};
+    use aruna_storage::storage;
+    use ed25519_dalek::SigningKey;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    #[tokio::test]
+    pub async fn test_token_creation() {
+        let random_path = tempdir().unwrap();
+        let storage_handle =
+            storage::worker::FjallStorage::open(random_path.path().to_str().unwrap()).unwrap();
+
+        let context = DriverContext {
+            storage_handle,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
+
+        let signing_key: SigningKey = generate_signing_key();
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let realm_id = RealmId::from_bytes(pubkey);
+        let capabilities = NodeCapabilities::management_node(signing_key).unwrap();
+
+        let token_config = CreateTokenConfig {
+            time: chrono::Utc::now().timestamp() as u64,
+            expiry: None,
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            node_capabilities: capabilities,
+
+            session: None,
+            restrictions: None,
+        };
+
+        let token_operation = CreateTokenOperation::new(token_config.clone()).unwrap();
+        drive(token_operation, &context).await.unwrap();
+    }
+
+    #[test]
+    fn output_hides_token() {
+        let signing_key: SigningKey = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let mut operation = CreateTokenOperation::new(CreateTokenConfig {
+            time: 1_000_000,
+            expiry: None,
+            user_id: UserId::local(Ulid::from_bytes([1; 16]), realm_id),
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+            session: None,
+            restrictions: None,
+        })
+        .unwrap();
+        let Ok(aruna_core::calls::Next::Done(token)) = operation.first() else {
+            panic!("expected a token");
+        };
+        assert!(!format!("{token:?}").contains(token.expose()));
+    }
+
+    #[test]
+    fn rejects_overlong_expiry() {
+        // Minting must not hand out an expiry that validation rejects.
+        let signing_key: SigningKey = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let time = 1_000_000;
+        let mut operation = CreateTokenOperation::new(CreateTokenConfig {
+            time,
+            expiry: Some(time + aruna_core::auth::MAX_TOKEN_LIFETIME + 1),
+            user_id: UserId::local(Ulid::generate(), realm_id),
+            realm_id,
+            node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+            session: None,
+            restrictions: None,
+        })
+        .unwrap();
+
+        assert_eq!(operation.first(), Err(CreateTokenError::LifetimeTooLong));
+    }
+
+    #[test]
+    fn claims_carry_session() {
+        let signing_key: SigningKey = generate_signing_key();
+        let realm_id = RealmId::from_bytes(signing_key.verifying_key().to_bytes());
+        let sid = Ulid::from_bytes([7; 16]).to_string();
+        let token = mint_token(
+            &CreateTokenConfig {
+                time: 1_800_000_000,
+                expiry: Some(1_800_000_600),
+                user_id: UserId::local(Ulid::from_bytes([8; 16]), realm_id),
+                realm_id,
+                node_capabilities: NodeCapabilities::management_node(signing_key).unwrap(),
+                session: Some(SessionRef {
+                    sid: sid.clone(),
+                    kind: SessionKind::Assistant,
+                    name: None,
+                    via: None,
+                }),
+                restrictions: None,
+            },
+            Ulid::from_parts(1_800_000_000_000, 9),
+        )
+        .unwrap();
+        let claims = jsonwebtoken::dangerous::insecure_decode::<TokenClaims>(&token)
+            .unwrap()
+            .claims;
+
+        assert_eq!(claims.sid.as_deref(), Some(sid.as_str()));
+        assert_eq!(claims.session_kind, Some(SessionKind::Assistant));
+    }
+}
