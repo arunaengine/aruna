@@ -355,6 +355,7 @@ async fn copy_restarts_rekey() {
         epoch: 1,
         cursor: b"foo/b".to_vec(),
         rekeyed: 2,
+        revision: 0,
     };
     let row = postcard::to_allocvec(&progress).unwrap();
     put(storage, ABE_REKEY_KEYSPACE, id.clone(), row).await;
@@ -443,6 +444,7 @@ async fn copy_resets_page() {
         epoch: 1,
         cursor: Vec::new(),
         rekeyed: 0,
+        revision: 0,
     };
     let row = postcard::to_allocvec(&progress).unwrap();
     put(storage, ABE_REKEY_KEYSPACE, id.clone(), row.clone()).await;
@@ -458,6 +460,7 @@ async fn copy_resets_page() {
         epoch: 1,
         cursor: Vec::new(),
         rekeyed: 7,
+        revision: 0,
     };
     let reset = postcard::to_allocvec(&reset).unwrap();
     let written = (
@@ -473,6 +476,62 @@ async fn copy_resets_page() {
     assert!(drive(raced, &context).await.is_ok());
     let kept = get(storage, ABE_REKEY_KEYSPACE, id).await.unwrap();
     assert_eq!(kept, reset);
+}
+
+#[tokio::test]
+async fn copy_resets_empty() {
+    // A copy into foo/ while the first page runs changes even an empty pass row, so it stays.
+    let (_temp, context) = context();
+    let storage = &context.storage_handle;
+    let (sealed, source_id, _) = sealed(storage).await;
+    let id = sealed.location.format.bucket_key().unwrap().bucket_id;
+    let id = id.to_bytes().to_vec();
+    let progress = RekeyProgress {
+        prefix: "foo/".into(),
+        epoch: 1,
+        cursor: Vec::new(),
+        rekeyed: 0,
+        revision: 0,
+    };
+    let row = postcard::to_allocvec(&progress).unwrap();
+    put(storage, ABE_REKEY_KEYSPACE, id.clone(), row.clone()).await;
+    let copy = copy_input(&sealed, (SOURCE, source_id), "foo/a");
+    run(
+        SealedCopyOperation::new(copy),
+        storage,
+        Some(&sealed),
+        Race::Off,
+    )
+    .await
+    .unwrap();
+    let reset = get(storage, ABE_REKEY_KEYSPACE, id.clone()).await.unwrap();
+    let saved: RekeyProgress = postcard::from_bytes(&reset).unwrap();
+    assert_eq!(
+        (saved.cursor.len(), saved.rekeyed, saved.revision),
+        (0, 0, 1)
+    );
+    // The page read the row before the copy reset it.
+    put(storage, ABE_REKEY_KEYSPACE, id.clone(), row.clone()).await;
+    let target = TransitionTarget {
+        compression: Compression::Off,
+        plan: None,
+    };
+    let unit = EncryptionTransition::new(TransitionKind::Rotate, None, target, 0, 0);
+    let scope = PageScope::new("bucket", "foo/", 4, None, SystemTime::UNIX_EPOCH);
+    let page = RekeyPage::new(scope, unit, id.clone().into(), progress, row.into());
+    let written = (
+        ABE_REKEY_KEYSPACE.to_string(),
+        Key::from(id.clone()),
+        Value::from(reset.clone()),
+    );
+    let raced = RacedPage {
+        page,
+        race: Some(RaceWrite(vec![written])),
+        held: None,
+    };
+    assert!(drive(raced, &context).await.is_ok());
+    let kept = get(storage, ABE_REKEY_KEYSPACE, id).await;
+    assert_eq!(kept, Some(reset));
 }
 
 /// A walk over one pending copy row, stopped at the step after its quota read.

@@ -1277,6 +1277,7 @@ mod tests {
                 epoch: 4,
                 cursor: b"raw/a".to_vec(),
                 rekeyed: 7,
+                revision: 0,
             }),
         });
         let status = build_status("bucket".to_string(), &abe, None, user(1), 100);

@@ -162,7 +162,9 @@ pub struct FolderTimerOperation {
     started_ms: u64,
     now_ms: u64,
     memory: TimerMemory,
-    after: Duration,
+    /// When the next folder pass is due, fixed once the folders finish, so the refreshes after
+    /// them never push it later.
+    deadline_ms: u64,
     step: TimerStep,
 }
 
@@ -173,7 +175,9 @@ impl FolderTimerOperation {
             started_ms: input.now_ms,
             now_ms: input.now_ms,
             memory: input.memory.clone(),
-            after: RECONCILE_IDLE_AFTER,
+            deadline_ms: input
+                .now_ms
+                .saturating_add(RECONCILE_IDLE_AFTER.as_millis() as u64),
             step: TimerStep::Folders,
         }
     }
@@ -195,8 +199,9 @@ impl FolderTimerOperation {
     }
 
     fn finish(&self) -> Result<Next<TimerPlan>, IoError> {
+        let left = self.deadline_ms.saturating_sub(self.now_ms);
         Ok(Next::Done(TimerPlan {
-            after: Some(self.after),
+            after: Some(Duration::from_millis(left)),
             memory: self.memory.clone(),
         }))
     }
@@ -221,11 +226,12 @@ impl Operation for FolderTimerOperation {
                 let outcome = result
                     .child::<DrainOutcome, IoError>()?
                     .unwrap_or(DrainOutcome::Deferred);
-                self.after = match outcome {
+                let after = match outcome {
                     DrainOutcome::Deferred => RECONCILE_RETRY_AFTER,
                     DrainOutcome::Recheck => RECONCILE_CONTINUE_AFTER,
                     DrainOutcome::Idle => RECONCILE_IDLE_AFTER,
                 };
+                self.deadline_ms = self.now_ms.saturating_add(after.as_millis() as u64);
                 self.fetch_documents()
             }
             TimerStep::Documents => {
@@ -327,7 +333,9 @@ mod state_machine_tests {
         let Ok(Next::Done(plan)) = operation.next(IoResult::Child(refreshed)) else {
             panic!("timer ends with plan");
         };
-        assert_eq!(plan.after, Some(RECONCILE_IDLE_AFTER));
+        // The second the refresh took comes off the folder delay.
+        let left = RECONCILE_IDLE_AFTER - Duration::from_millis(1_000);
+        assert_eq!(plan.after, Some(left));
         assert_eq!(plan.memory.attempts, 1);
         assert_eq!(plan.memory.due_ms, 10_000 + retry_delay_ms(1));
 
@@ -353,5 +361,23 @@ mod state_machine_tests {
             panic!("timer ends after replica note");
         };
         assert_eq!(plan.after, Some(RECONCILE_CONTINUE_AFTER));
+    }
+
+    #[test]
+    fn slow_refresh_due() {
+        // A refresh that outlasts the folder delay leaves the next pass due at once.
+        let mut input = TimerInput::new(10_000, serving().map(|(node, _)| node));
+        input.serving = serving();
+        input.memory.due_ms = u64::MAX;
+        let mut operation = FolderTimerOperation::new(&input);
+        operation.first().unwrap();
+        let recheck = ChildOutcome::new(Ok::<DrainOutcome, IoError>(DrainOutcome::Recheck));
+        operation.next(IoResult::Child(recheck)).unwrap();
+        operation.stamp(10_000 + RECONCILE_CONTINUE_AFTER.as_millis() as u64 + 1);
+        let refreshed = ChildOutcome::new(Ok::<usize, IoError>(0));
+        let Ok(Next::Done(plan)) = operation.next(IoResult::Child(refreshed)) else {
+            panic!("timer ends with plan");
+        };
+        assert_eq!(plan.after, Some(Duration::ZERO));
     }
 }

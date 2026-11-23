@@ -152,12 +152,13 @@ jobs:
       - name: Run instrumented native Git tests
         run: |
           set -euo pipefail
-          if [ -z "$(cargo-nextest nextest list --no-pager \
+          listing="$(cargo-nextest nextest list --no-pager \
             --cargo-metadata target/nextest/cargo-metadata.json \
             --binaries-metadata target/nextest/binaries-metadata.json \
             --target-dir-remap target --workspace-remap . \
             --profile ci --run-ignored only --partition hash:${{ matrix.shard }}/4 \
-            -E 'package(aruna) & binary(integration) & test(/^git_native::/)')" ]; then
+            -E 'package(aruna) & binary(integration) & test(/^git_native::/)')"
+          if [ -z "$listing" ]; then
             echo "no native Git tests in shard ${{ matrix.shard }}/4"
             exit 0
           fi

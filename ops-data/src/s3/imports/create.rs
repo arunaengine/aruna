@@ -124,6 +124,13 @@ impl CreateImportOperation {
         }
     }
 
+    /// Takes a provider bucket the caller ensured before its transaction, so the rule never
+    /// ensures it again and notes whether Aruna created it.
+    pub fn bucket_ready(mut self, backend_id: Ulid, bucket: String, created: bool) -> Self {
+        self.checked.push((backend_id, bucket, created));
+        self
+    }
+
     /// A read before the transaction; a nested rule reads in its caller's transaction.
     fn staged(&self, call: IoCall) -> IoCall {
         match self.nested {
@@ -192,8 +199,13 @@ impl CreateImportOperation {
             (write_backend, self.write_folder().to_string()),
         ];
         for (storage, folder) in folders {
+            let ready = |bucket: &str| {
+                let mut checked = self.checked.iter();
+                checked.any(|(id, name, _)| (*id, name.as_str()) == (storage.backend_id, bucket))
+            };
             if let Some(bucket) = check_folder(&storage, &folder)?
                 && !self.pending.contains(&(storage.backend_id, bucket.clone()))
+                && !ready(&bucket)
             {
                 self.pending.push((storage.backend_id, bucket));
             }

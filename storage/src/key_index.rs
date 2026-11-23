@@ -9,7 +9,7 @@
 use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::ops::{Bound, RangeBounds};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aruna_core::key_index::{IndexEffect, IndexError, IndexEvent, KeyChange, KeyPage, KeyQuery};
@@ -115,8 +115,9 @@ pub const RANGE_INDEX_DIR: &str = "range-indexes";
 pub struct RangeIndexes {
     root: PathBuf,
     open: Mutex<HashMap<PathBuf, OpenIndex>>,
-    /// Held while an index is created, so two openers never both write its first metadata.
-    creating: Mutex<()>,
+    /// Shared by opens of existing directories; exclusive for directory creation and `prune`,
+    /// so no open loads or creates files while a generation is removed.
+    creating: RwLock<()>,
     /// Directories whose index holds a writer, the most recently used last.
     writers: Mutex<VecDeque<PathBuf>>,
     permits: Arc<Semaphore>,
@@ -138,7 +139,7 @@ impl RangeIndexes {
         Self {
             root: root.into(),
             open: Mutex::new(HashMap::new()),
-            creating: Mutex::new(()),
+            creating: RwLock::new(()),
             writers: Mutex::new(VecDeque::new()),
             permits: Arc::new(Semaphore::new(INDEX_PERMITS)),
             scan_limit: MATCH_SCAN_LIMIT,
@@ -316,6 +317,7 @@ impl RangeIndexes {
         let dir = self.range_dir(set_id, range_id);
         let keep = keep.map(|generation| generation.to_string());
         self.blocking(move |indexes| {
+            let _creating = (indexes.creating.write()).unwrap_or_else(|poison| poison.into_inner());
             let entries = match std::fs::read_dir(&dir) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -360,46 +362,48 @@ impl RangeIndexes {
         .map_err(|error| KeyIndexError::Task(error.to_string()))?
     }
 
-    /// The open index of `dir`. Disk work runs outside the cache lock; when two callers open
-    /// one index at once, the first one cached wins and the other copy is dropped.
+    /// The open index of `dir`. Disk work runs outside the cache lock; a shared directory lock
+    /// lets opens run in parallel while keeping `prune` and directory creation exclusive.
     fn open_index(&self, dir: &Path, create: bool) -> Result<OpenIndex, KeyIndexError> {
-        let cached = (self.open.lock()).unwrap_or_else(|poison| poison.into_inner());
-        if let Some(index) = cached.get(dir) {
-            return Ok(index.clone());
+        if let Some(index) = self.cached_index(dir) {
+            return Ok(index);
         }
-        drop(cached);
-        let loaded = self.load_index(dir, create)?;
+        {
+            let _read = (self.creating.read()).unwrap_or_else(|poison| poison.into_inner());
+            if let Some(index) = self.cached_index(dir) {
+                return Ok(index);
+            }
+            if dir.join("meta.json").exists() {
+                return Ok(self.cache_index(dir, load_existing(dir)?));
+            }
+            if !create {
+                return Err(KeyIndexError::Missing(dir.to_path_buf()));
+            }
+        }
+        let _write = (self.creating.write()).unwrap_or_else(|poison| poison.into_inner());
+        if let Some(index) = self.cached_index(dir) {
+            return Ok(index);
+        }
+        std::fs::create_dir_all(dir)?;
+        let index = Index::open_or_create(MmapDirectory::open(dir)?, schema())?;
+        Ok(self.cache_index(dir, build_open(index)?))
+    }
+
+    fn cached_index(&self, dir: &Path) -> Option<OpenIndex> {
+        let open = (self.open.lock()).unwrap_or_else(|poison| poison.into_inner());
+        open.get(dir).cloned()
+    }
+
+    fn cache_index(&self, dir: &Path, loaded: OpenIndex) -> OpenIndex {
         let mut open = (self.open.lock()).unwrap_or_else(|poison| poison.into_inner());
         if let Some(index) = open.get(dir) {
-            return Ok(index.clone());
+            return index.clone();
         }
         if open.len() >= OPEN_INDEXES {
             evict_idle(&mut open);
         }
         open.insert(dir.to_path_buf(), loaded.clone());
-        Ok(loaded)
-    }
-
-    fn load_index(&self, dir: &Path, create: bool) -> Result<OpenIndex, KeyIndexError> {
-        let _creating = match dir.join("meta.json").exists() {
-            true => None,
-            false if !create => return Err(KeyIndexError::Missing(dir.to_path_buf())),
-            false => {
-                let guard = (self.creating.lock()).unwrap_or_else(|poison| poison.into_inner());
-                std::fs::create_dir_all(dir)?;
-                Some(guard)
-            }
-        };
-        let index = Index::open_or_create(MmapDirectory::open(dir)?, schema())?;
-        let reader = index
-            .reader_builder()
-            .reload_policy(ReloadPolicy::Manual)
-            .try_into()?;
-        Ok(OpenIndex {
-            index,
-            reader,
-            writer: Arc::new(Mutex::new(None)),
-        })
+        loaded
     }
 
     /// Applies `changes` with the index's kept writer and commits them, so they are durable and
@@ -467,10 +471,33 @@ impl RangeIndexes {
     }
 }
 
-/// Drops the open indexes without a writer. One that holds or builds a writer stays, so a later
-/// open never starts a second writer on its directory.
+fn load_existing(dir: &Path) -> Result<OpenIndex, KeyIndexError> {
+    let index = Index::open(MmapDirectory::open(dir)?)?;
+    if index.schema() != schema() {
+        return Err(TantivyError::SchemaError("range index schema differs".to_string()).into());
+    }
+    build_open(index)
+}
+
+fn build_open(index: Index) -> Result<OpenIndex, KeyIndexError> {
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()?;
+    Ok(OpenIndex {
+        index,
+        reader,
+        writer: Arc::new(Mutex::new(None)),
+    })
+}
+
+/// Drops the open indexes without a writer that no caller holds. One in use stays, so a later
+/// open never starts a second writer or a second reader on its directory.
 fn evict_idle(open: &mut HashMap<PathBuf, OpenIndex>) {
-    open.retain(|_, index| !matches!(index.writer.try_lock().as_deref(), Ok(None)));
+    open.retain(|_, index| {
+        Arc::strong_count(&index.writer) > 1
+            || !matches!(index.writer.try_lock().as_deref(), Ok(None))
+    });
 }
 
 fn ignore_missing(error: std::io::Error) -> std::io::Result<()> {
@@ -1312,8 +1339,10 @@ mod tests {
             .writer_with_num_threads(1, WRITER_BYTES)
             .unwrap();
         *holding.writer.lock().unwrap() = Some(writer);
+        let held = Arc::downgrade(&holding.writer);
+        drop(holding);
         let building = indexes.open_index(&path(2), true).unwrap();
-        let idle = indexes.open_index(&path(3), true).unwrap();
+        let idle = Arc::downgrade(&indexes.open_index(&path(3), true).unwrap().writer);
         let busy = building.writer.lock().unwrap();
 
         evict_idle(&mut indexes.open.lock().unwrap());
@@ -1324,11 +1353,58 @@ mod tests {
         assert!(!open.contains_key(&path(3)), "an idle index is dropped");
         drop(open);
         let reopened = indexes.open_index(&path(1), true).unwrap();
-        assert!(Arc::ptr_eq(&reopened.writer, &holding.writer));
-        assert!(!Arc::ptr_eq(
-            &indexes.open_index(&path(3), true).unwrap().writer,
-            &idle.writer
-        ));
+        assert!(Arc::ptr_eq(&reopened.writer, &held.upgrade().unwrap()));
+        assert!(idle.upgrade().is_none());
+    }
+
+    // An idle index a caller still holds stays cached, so no second reader replaces it.
+    #[test]
+    fn eviction_keeps_borrowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = RangeIndexes::new(dir.path());
+        let path = |generation| indexes.directory(set(), range(), generation);
+        let held = indexes.open_index(&path(1), true).unwrap();
+        drop(indexes.open_index(&path(2), true).unwrap());
+
+        evict_idle(&mut indexes.open.lock().unwrap());
+
+        let open = indexes.open.lock().unwrap();
+        assert!(open.contains_key(&path(1)), "a held index stays");
+        assert!(
+            !open.contains_key(&path(2)),
+            "an unheld idle index is dropped"
+        );
+        drop(open);
+        let reopened = indexes.open_index(&path(1), true).unwrap();
+        assert!(Arc::ptr_eq(&reopened.writer, &held.writer));
+    }
+
+    // Opens that race a prune never leave the pruned generation in the cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn prune_drops_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexes = Arc::new(RangeIndexes::new(dir.path()));
+        let all = query(Bound::Unbounded, Bound::Unbounded, None, 10);
+        for generation in 1..=20 {
+            indexes
+                .apply(set(), range(), generation, vec![put("k")])
+                .await
+                .unwrap();
+            let searches: Vec<_> = (0..4)
+                .map(|_| {
+                    let (indexes, all) = (indexes.clone(), all.clone());
+                    tokio::spawn(
+                        async move { indexes.search(set(), range(), generation, all).await },
+                    )
+                })
+                .collect();
+            indexes.prune(set(), range(), None).await.unwrap();
+            for search in searches {
+                let _ = search.await.unwrap();
+            }
+            let pruned = indexes.directory(set(), range(), generation);
+            assert!(!indexes.open.lock().unwrap().contains_key(&pruned));
+        }
     }
 
     // Callers that open one new index at once all get the same cached index.

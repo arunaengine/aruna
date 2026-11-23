@@ -164,6 +164,19 @@ fn refused_put_recorded() {
 }
 
 #[test]
+fn lost_conflict_clears() {
+    // Every attempt rolled back on its conflict, so the intent clears instead of turning unknown.
+    let mut call = put(1);
+    call.next(begun(Begun::Fresh)).unwrap();
+    let lost = PutError::from(IoError::Conflict);
+    let answer = call.next(child_result(Err::<u64, _>(lost)));
+    let detail = StoreError::Io(IoError::Conflict).detail();
+    let end = CallEnd::None(HostError::new(ErrorKind::Conflict, detail));
+    let record = RecordCall::new(run(), intent(1), Err(end));
+    assert_eq!(answer, Ok(Next::Call(IoCall::child(record))));
+}
+
+#[test]
 fn removal_answers_zero() {
     let mut call = remove();
     call.next(begun(Begun::Fresh)).unwrap();

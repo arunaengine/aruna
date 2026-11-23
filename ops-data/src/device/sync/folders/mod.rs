@@ -774,6 +774,15 @@ mod tests {
         assert_eq!(finish_binding(folder.folder_id).hold_scope(), scope);
         let unbind = finish_unbind(None, folder.folder_id, node());
         assert_eq!(unbind.hold_scope(), scope);
+        let input = super::super::actions::ApplyActionInput {
+            folder_id: folder.folder_id,
+            kind: aruna_core::structs::synced_folder::ActionKind::RemoveLocal,
+            scope: aruna_core::structs::synced_folder::ActionScope::AllPending,
+            expected: None,
+            actor: folder.created_by,
+        };
+        let action = super::super::actions::apply_action(None, input);
+        assert_eq!(action.hold_scope(), scope);
         let shard = |seed: u8| folder_scope(Ulid::from_bytes([seed; 16]));
         assert_eq!(shard(1), shard(65));
         assert_ne!(shard(1), shard(2));

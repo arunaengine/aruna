@@ -468,7 +468,9 @@ impl StorageHandle {
     /// Answers point reads outside a transaction from the hot cache where it can, and fills
     /// it from the rows read; every other effect goes to the worker unchanged.
     async fn dispatch_cached(&self, effect: StorageEffect) -> StorageEvent {
-        let Some(cache) = self.cache.as_deref() else {
+        // A closed worker channel answers every read with its error, as a cold read does.
+        let closed = self.metrics.channel_closed.load(Ordering::Relaxed);
+        let Some(cache) = self.cache.as_deref().filter(|_| !closed) else {
             return self.dispatch_queued(effect).await;
         };
         match effect {

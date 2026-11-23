@@ -372,18 +372,20 @@ impl Operation for SpoolSourceOperation {
                 let resolved = result.child::<ResolvedSourceAccess, SourceResolutionError>()?;
                 self.read(resolved.map_err(|error| spool_error(error.to_string()))?)
             }
-            SpoolStep::Read => match result.staging()? {
-                StagingSourceEvent::ReadResult { metadata, stream } => self.spool(metadata, stream),
-                StagingSourceEvent::Error { error } => Err(spool_error(error.to_string())),
+            SpoolStep::Read => match result.event()?.into_staging() {
+                Ok(StagingSourceEvent::ReadResult { metadata, stream }) => {
+                    self.spool(metadata, stream)
+                }
+                Ok(StagingSourceEvent::Error { error }) => Err(spool_error(error.to_string())),
                 _ => Err(spool_error("unexpected answer to the source read")),
             },
-            SpoolStep::Spool => match result.blob()? {
-                BlobEvent::HiddenSpooled {
+            SpoolStep::Spool => match result.event()?.into_blob() {
+                Ok(BlobEvent::HiddenSpooled {
                     location,
                     blake3,
                     size,
-                } => self.check((location, blake3, size)),
-                BlobEvent::Error(error) => Err(spool_error(error.to_string())),
+                }) => self.check((location, blake3, size)),
+                Ok(BlobEvent::Error(error)) => Err(spool_error(error.to_string())),
                 _ => Err(spool_error("unexpected answer to the copy write")),
             },
             SpoolStep::Drop => {

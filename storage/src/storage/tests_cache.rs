@@ -5,12 +5,15 @@
 use std::sync::Arc;
 
 use super::handle::StorageHandle;
-use super::hot_cache::{CAPACITY, HotCache, Row, cached_slot};
+use super::hot_cache::{CAPACITY, CacheWriter, HotCache, Row, cached_slot};
 use super::tests::{commit_transaction, poll_queued, start_write_transaction, worker};
 use super::worker::{FjallStorage, SlowQueueAggregator};
 use aruna_core::effects::StorageEffect;
+use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{AUTH_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::storage::distribution::accounting::RangeCounters;
+use aruna_core::structs::storage::usage::{BucketDelta, UsageDelta};
 use byteview::ByteView;
 use tempfile::{TempDir, tempdir};
 use ulid::Ulid;
@@ -318,4 +321,64 @@ fn stale_fill_skipped() {
     assert_eq!(cache.lookup(&[Some(rows[0].clone())]), vec![None]);
     cache.finish(&rows);
     assert_eq!(cache.get(&rows[0]), None);
+}
+
+#[tokio::test]
+async fn closed_bypasses_cache() {
+    // Once the worker is gone, cached reads report its failure like cold reads do.
+    let (mut handle, receivers) = StorageHandle::new();
+    handle.cache = Some(Arc::new(HotCache::default()));
+    plant(&handle, AUTH_KEYSPACE, TOKEN, b"planted");
+    drop(receivers);
+    let closed = |event: Event| {
+        matches!(
+            event,
+            Event::Storage(StorageEvent::Error {
+                error: StorageError::ChannelClosed
+            })
+        )
+    };
+    let cold = StorageEffect::Read {
+        key_space: OTHER.to_string(),
+        key: ByteView::from(TOKEN),
+        txn_id: None,
+    };
+    assert!(closed(handle.send_storage_effect(cold).await));
+
+    let point = StorageEffect::Read {
+        key_space: AUTH_KEYSPACE.to_string(),
+        key: ByteView::from(TOKEN),
+        txn_id: None,
+    };
+    assert!(closed(handle.send_storage_effect(point).await));
+    let reads = vec![(AUTH_KEYSPACE.to_string(), ByteView::from(TOKEN))];
+    let batch = StorageEffect::BatchRead {
+        reads,
+        txn_id: None,
+    };
+    assert!(closed(handle.send_storage_effect(batch).await));
+}
+
+#[test]
+fn counters_drop_rows() {
+    // Counter deltas on a cached keyspace drop its rows, as every other write does.
+    let writer = CacheWriter::new(Some(Arc::new(HotCache::default())));
+    let usage = StorageEffect::AddUsage {
+        key_space: AUTH_KEYSPACE.to_string(),
+        deltas: vec![(ByteView::from(TOKEN), UsageDelta::default())],
+        buckets: vec![(ByteView::from("bucket"), BucketDelta::default())],
+        txn_id: Ulid::default(),
+    };
+    let expected = vec![row(AUTH_KEYSPACE, TOKEN), row(AUTH_KEYSPACE, b"bucket")];
+    assert_eq!(writer.rows(&usage), expected);
+    let counters = |key_space: &str| StorageEffect::AddCounters {
+        key_space: key_space.to_string(),
+        deltas: vec![(ByteView::from(TOKEN), RangeCounters::default())],
+        txn_id: Ulid::default(),
+    };
+    assert_eq!(
+        writer.rows(&counters(S3_BUCKET_KEYSPACE)),
+        vec![row(S3_BUCKET_KEYSPACE, TOKEN)]
+    );
+    assert!(writer.rows(&counters(OTHER)).is_empty());
 }

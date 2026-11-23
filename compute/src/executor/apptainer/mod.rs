@@ -41,8 +41,9 @@ pub mod slurm;
 mod state;
 
 use state::{
-    AttemptRecord, BindMount, ControlRecord, LaunchRecord, OciMetadata, PayloadRecord,
-    ProcessRecord, StateRoot, StatusRecord, read_json, read_optional, sync_dir, write_json,
+    AttemptRecord, BindMount, ControlGuard, ControlRecord, LaunchRecord, OciMetadata,
+    PayloadRecord, ProcessRecord, StateRoot, StatusRecord, read_json, read_optional, sync_dir,
+    write_json,
 };
 
 pub struct ApptainerBackend {
@@ -98,13 +99,16 @@ impl ApptainerBackend {
             .join(context.attempt.external_name())
     }
 
+    /// Stages the attempt directory. `guard` moves into each blocking task, so a
+    /// cancelled caller never releases the fence while files are still replaced.
     async fn prepare_attempt(
         &self,
+        guard: ControlGuard,
         context: &FenceContext,
         spec: &TaskSpec,
         sif: PathBuf,
         metadata: OciMetadata,
-    ) -> Result<PathBuf, BackendError> {
+    ) -> Result<(ControlGuard, PathBuf), BackendError> {
         let mut plan = StagePlan::from_spec(spec)?;
         // The helper's socket lives in the working directory, so a session
         // needs it bound as a host directory the node can reach.
@@ -121,10 +125,11 @@ impl ApptainerBackend {
         let temp =
             directory.with_file_name(format!("{}.{}.tmp", name, context.controller_generation));
         let (target, staging) = (directory.clone(), temp.clone());
-        tokio::task::spawn_blocking(move || -> Result<(), BackendError> {
+        let guard = tokio::task::spawn_blocking(move || -> Result<ControlGuard, BackendError> {
             remove_staging_temps(&target)?;
             std::fs::create_dir_all(staging.join("workspace/root")).map_err(io_error)?;
-            std::fs::create_dir_all(staging.join("logs")).map_err(io_error)
+            std::fs::create_dir_all(staging.join("logs")).map_err(io_error)?;
+            Ok(guard)
         })
         .await
         .map_err(|error| BackendError::Api(format!("Apptainer staging task failed: {error}")))??;
@@ -160,7 +165,7 @@ impl ApptainerBackend {
             cpu_cores: u32::try_from(cores).unwrap_or(u32::MAX),
             isolated_network: spec.security.network == NetworkAccess::Isolated,
         };
-        tokio::task::spawn_blocking(move || -> Result<PathBuf, BackendError> {
+        tokio::task::spawn_blocking(move || -> Result<(ControlGuard, PathBuf), BackendError> {
             write_json(&temp.join("attempt.json"), &record)?;
             write_json(&temp.join("launch.json"), &launch)?;
             sync_dir(&temp)?;
@@ -171,7 +176,7 @@ impl ApptainerBackend {
                     .parent()
                     .ok_or_else(|| BackendError::Api("attempt path has no parent".to_string()))?,
             )?;
-            Ok(directory)
+            Ok((guard, directory))
         })
         .await
         .map_err(|error| BackendError::Api(format!("Apptainer attempt task failed: {error}")))?
@@ -405,7 +410,9 @@ impl ExecutorBackend for ApptainerBackend {
             return Err(BackendError::Cancelled);
         }
         let (sif, metadata) = self.ensure_sif(&spec.image, cancel).await?;
-        let directory = self.prepare_attempt(context, spec, sif, metadata).await?;
+        let (_guard, directory) = self
+            .prepare_attempt(guard, context, spec, sif, metadata)
+            .await?;
         self.spawn_supervisor(&directory, spec, cancel).await
     }
 
@@ -1305,8 +1312,12 @@ mod tests {
             entrypoint: vec!["/bin/true".to_string()],
             command: Vec::new(),
         };
-        let directory = backend
-            .prepare_attempt(&context, spec, PathBuf::from("/image.sif"), metadata)
+        let guard = backend
+            .state
+            .control(&context)
+            .map_err(|error| error.to_string())?;
+        let (_guard, directory) = backend
+            .prepare_attempt(guard, &context, spec, PathBuf::from("/image.sif"), metadata)
             .await
             .map_err(|error| error.to_string())?;
         read_json(&directory.join("launch.json")).map_err(|error| error.to_string())
@@ -1486,9 +1497,16 @@ mod tests {
             entrypoint: vec!["/bin/true".to_string()],
             command: Vec::new(),
         };
+        let guard = backend.state.control(&context).unwrap();
         assert!(
             backend
-                .prepare_attempt(&context, &spec, PathBuf::from("/image.sif"), metadata)
+                .prepare_attempt(
+                    guard,
+                    &context,
+                    &spec,
+                    PathBuf::from("/image.sif"),
+                    metadata
+                )
                 .await
                 .is_err()
         );

@@ -245,6 +245,10 @@ impl StateCall {
                 };
                 self.record(CallEnd::None(HostError::new(kind, message)))
             }
+            // Every attempt lost its conflict and rolled back, so the write had no effect.
+            Err(PutError::Store(error @ StoreError::Io(IoError::Conflict))) => self.record(
+                CallEnd::None(HostError::new(ErrorKind::Conflict, error.detail())),
+            ),
             Err(PutError::Store(error)) => self.record(CallEnd::Maybe(error.detail())),
         }
     }

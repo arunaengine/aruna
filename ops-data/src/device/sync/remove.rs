@@ -8,12 +8,13 @@ use aruna_core::effects::{Effect, LocalFileEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, LocalFileEvent, LocalFileRefusal};
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
-use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::operation::{HoldScope, Operation, TransactionMode};
 use aruna_core::structs::synced_folder::{
     ActionOutcome, SyncActionRecord, SyncedFolder, WriteGuard,
 };
 
 use super::actions::ActionError;
+use super::folder_scope;
 use super::materialize::CommitMaterialize;
 use super::repository::{action_entry, base_key};
 
@@ -122,6 +123,11 @@ impl Operation for RemoveEntryOperation {
     fn transaction(&self) -> TransactionMode {
         TransactionMode::None
     }
+
+    /// The folder's pass scope; a child of an action runs under the action's own hold.
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(folder_scope(self.folder.folder_id))
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +180,8 @@ mod tests {
     fn drops_base_row() {
         let mut remove = remove();
         assert_eq!(remove.transaction(), TransactionMode::None);
+        let scope = super::super::folder_scope(folder().folder_id);
+        assert_eq!(remove.hold_scope(), Some(scope));
         assert!(matches!(remove.first(), Ok(Next::Call(IoCall::Effect(_)))));
         let moved = Event::LocalFile(LocalFileEvent::Moved {
             to: ".trash/a.txt".to_string(),

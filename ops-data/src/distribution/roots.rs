@@ -250,8 +250,8 @@ impl Operation for RootsCheckOperation {
                     Err(error) => self.probed(Some(error.to_string())),
                 }
             }
-            State::Check => match result.staging()? {
-                StagingSourceEvent::CheckResult => {
+            State::Check => match result.event()?.into_staging() {
+                Ok(StagingSourceEvent::CheckResult) => {
                     let (digest, _) = self.probing.as_ref().ok_or(RootsError::NotFinished)?;
                     let row = (
                         SOURCE_ROOT_KEYSPACE.to_string(),
@@ -261,8 +261,9 @@ impl Operation for RootsCheckOperation {
                     self.state = State::Mark;
                     Ok(Next::Call(IoCall::Write(vec![row])))
                 }
-                StagingSourceEvent::Error { error } => self.probed(Some(error.to_string())),
-                other => Err(RootsError::UnexpectedEvent(other.label())),
+                Ok(StagingSourceEvent::Error { error }) => self.probed(Some(error.to_string())),
+                Ok(other) => Err(RootsError::UnexpectedEvent(other.label())),
+                Err(other) => Err(RootsError::UnexpectedEvent(other.label())),
             },
             State::Mark => {
                 result.done()?;

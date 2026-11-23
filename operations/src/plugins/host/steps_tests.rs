@@ -147,7 +147,7 @@ fn read_checks_path() {
     assert!(is_child(&read.first()));
     assert!(is_child(&read.next(granted_result())));
     assert!(is_child(&read.next(summary(&jsonld.to_string()))));
-    let denied = child_result(Err::<(), _>(refusal()));
+    let denied = child_result(Err::<PluginInstall, _>(refusal()));
     assert_eq!(read.next(denied).unwrap_err(), refusal());
 }
 
@@ -161,7 +161,7 @@ fn read_reuses_admission() {
     read.first().unwrap();
     read.next(granted_result()).unwrap();
     read.next(summary(&jsonld.to_string())).unwrap();
-    let Ok(Next::Done(document)) = read.next(child_result(Ok::<_, CallError>(()))) else {
+    let Ok(Next::Done(document)) = read.next(checked_install()) else {
         panic!("an authorized path reads the dataset");
     };
     assert_eq!(document.revision, record().last_event_id.to_string());
@@ -179,6 +179,25 @@ fn read_reuses_admission() {
         panic!("an uncovered path is refused");
     };
     assert_eq!(error.kind, ErrorKind::NotGranted);
+}
+
+#[test]
+fn read_rechecks_install() {
+    // After the export the live install is checked again, without a second rate call; an
+    // install paused meanwhile is refused.
+    let jsonld = json!({"@graph": [{"@id": "ro-crate-metadata.json"}, {"@id": "./"}]});
+    let mut read = ReadDataset::new(place(), &resource(), RoCrateExportView::Summary);
+    read.first().unwrap();
+    read.next(granted_result()).unwrap();
+    let path = record().permission_path;
+    let live = CheckCall::new(&scope(), Some((Permission::MetadataRead, &path)));
+    assert_eq!(
+        read.next(summary(&jsonld.to_string())),
+        Ok(Next::Call(IoCall::child(live)))
+    );
+    let paused = CallError(HostError::new(ErrorKind::Denied, "the install is paused"));
+    let answer = child_result(Err::<PluginInstall, _>(paused.clone()));
+    assert_eq!(read.next(answer), Err(paused));
 }
 
 #[test]

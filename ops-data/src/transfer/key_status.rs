@@ -273,7 +273,7 @@ fn parse_abe(
         epoch: u64::from_be_bytes(epoch),
         due: due.is_some(),
         rekey: rekey
-            .map(|value| postcard::from_bytes(&value))
+            .map(|value| RekeyProgress::decode(&value))
             .transpose()?,
     }))
 }
@@ -443,6 +443,7 @@ mod tests {
             epoch: 3,
             cursor: b"raw/a".to_vec(),
             rekeyed: 5,
+            revision: 0,
         };
         let turn = operation.next(batch(vec![
             None,

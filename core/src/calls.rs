@@ -616,7 +616,19 @@ impl<P: Operation> CallRun<P> {
                 members,
                 form: GroupForm::Window,
                 ..
-            }))) => members.into_iter().collect(),
+            }))) => {
+                if self.txn_id.is_some()
+                    && let Some(got) = members
+                        .iter()
+                        .find_map(|effect| forbidden_effect(effect, self.mode))
+                {
+                    return self.fail_io(unexpected(
+                        "no slow external call inside a transaction",
+                        got,
+                    ));
+                }
+                members.into_iter().collect()
+            }
             Ok(Next::Call(mut call)) => {
                 if self.txn_id.is_some()
                     && let Some(got) = forbidden_in_txn(&call, self.mode)
@@ -919,23 +931,34 @@ fn empty_result(call: &IoCall) -> Option<IoResult> {
     }
 }
 
-/// Slow external calls refused while a storage transaction is open; blob calls only in a write
-/// transaction, as snapshot reads stream blobs.
+/// Slow external effects refused while a storage transaction is open; blob and staging-source
+/// calls only in a write transaction, as snapshot reads stream both.
+fn forbidden_effect(effect: &Effect, mode: TransactionMode) -> Option<&'static str> {
+    match effect {
+        Effect::LocalFile(_) => Some("Effect::LocalFile inside a transaction"),
+        Effect::Outbound(_) => Some("Effect::Outbound inside a transaction"),
+        Effect::Compute(_) => Some("Effect::Compute inside a transaction"),
+        Effect::Git(_) => Some("Effect::Git inside a transaction"),
+        Effect::Plugin(_) => Some("Effect::Plugin inside a transaction"),
+        Effect::StagingSource(_) if mode == TransactionMode::Write => {
+            Some("Effect::StagingSource inside a write transaction")
+        }
+        Effect::Blob(blob) if mode == TransactionMode::Write && blob.is_external_io() => {
+            Some("Effect::Blob inside a write transaction")
+        }
+        _ => None,
+    }
+}
+
+/// Slow external calls refused while a storage transaction is open, including group members.
 fn forbidden_in_txn(call: &IoCall, mode: TransactionMode) -> Option<&'static str> {
     match call {
         IoCall::Delay(_) => Some("IoCall::Delay inside a transaction"),
-        IoCall::Effect(effect) => match effect.as_ref() {
-            Effect::LocalFile(_) => Some("Effect::LocalFile inside a transaction"),
-            Effect::StagingSource(_) => Some("Effect::StagingSource inside a transaction"),
-            Effect::Outbound(_) => Some("Effect::Outbound inside a transaction"),
-            Effect::Compute(_) => Some("Effect::Compute inside a transaction"),
-            Effect::Git(_) => Some("Effect::Git inside a transaction"),
-            Effect::Plugin(_) => Some("Effect::Plugin inside a transaction"),
-            Effect::Blob(blob) if mode == TransactionMode::Write && blob.is_external_io() => {
-                Some("Effect::Blob inside a write transaction")
-            }
-            _ => None,
-        },
+        IoCall::Effect(effect) => forbidden_effect(effect, mode),
+        IoCall::Group(group) => group
+            .members
+            .iter()
+            .find_map(|effect| forbidden_effect(effect, mode)),
         _ => None,
     }
 }

@@ -429,7 +429,10 @@ impl McpServer {
     ) -> Result<Json<JsonPayload>, CallToolResult> {
         let auth = request_auth(&parts)?;
         let document_id = parse_document(&input.id)?;
-        let jsonld = stored_crate(self, &auth, &input.rocrate.0).await?;
+        let entities = crate::metadata::crate_entities(&input.rocrate.0);
+        crate::metadata::ensure_readable_files(&self.state, &auth, &entities)
+            .await
+            .map_err(files_error)?;
         let extras = tool_extras("replace_dataset", &input)?;
         let record =
             crate::metadata::local_write_record(&self.state, &auth, document_id, extras.clone())
@@ -438,6 +441,10 @@ impl McpServer {
         if record.is_none() {
             metadata_probe(self, &auth, "replace_dataset", extras).await?;
         }
+        let normalized = crate::metadata::with_global_ids(&self.state, &input.rocrate.0)
+            .await
+            .map_err(server_error)?;
+        let jsonld = rocrate_json(&normalized)?;
         let updated = aruna_drivers::driver::drive(
             RouteUpdateOperation::new(
                 (

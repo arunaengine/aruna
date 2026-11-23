@@ -572,24 +572,31 @@ impl BlobEffect {
     /// Whether this effect does disk, object-store, or network I/O rather than in-memory
     /// keystore, ABE, or reservation-table work.
     pub fn is_external_io(&self) -> bool {
-        !matches!(
-            self,
-            Self::Abe(_)
-                | Self::GenerateBucketKey
-                | Self::SealHolderCopies { .. }
-                | Self::SealUnlocked { .. }
-                | Self::PrepareKey { .. }
-                | Self::ActivateKey { .. }
-                | Self::DiscardKey { .. }
-                | Self::ReadKeyStatus { .. }
-                | Self::ExtendKey { .. }
-                | Self::LockKey { .. }
-                | Self::AdmitRead { .. }
-                | Self::ReadUnlockedKey { .. }
-                | Self::ReserveCompose { .. }
-                | Self::ReleaseReservation { .. }
-                | Self::ReadHeld { .. }
-        )
+        match self {
+            Self::Abe(abe) => match abe.as_ref() {
+                crate::structs::storage::abe::AbeEffect::Write { .. } => true,
+                crate::structs::storage::abe::AbeEffect::Issue(_)
+                | crate::structs::storage::abe::AbeEffect::Parameters { .. }
+                | crate::structs::storage::abe::AbeEffect::Admit { .. }
+                | crate::structs::storage::abe::AbeEffect::Envelope(_)
+                | crate::structs::storage::abe::AbeEffect::Copy { .. } => false,
+            },
+            Self::GenerateBucketKey
+            | Self::SealHolderCopies { .. }
+            | Self::SealUnlocked { .. }
+            | Self::PrepareKey { .. }
+            | Self::ActivateKey { .. }
+            | Self::DiscardKey { .. }
+            | Self::ReadKeyStatus { .. }
+            | Self::ExtendKey { .. }
+            | Self::LockKey { .. }
+            | Self::AdmitRead { .. }
+            | Self::ReadUnlockedKey { .. }
+            | Self::ReserveCompose { .. }
+            | Self::ReleaseReservation { .. }
+            | Self::ReadHeld { .. } => false,
+            _ => true,
+        }
     }
 }
 

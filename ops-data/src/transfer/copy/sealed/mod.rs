@@ -666,13 +666,13 @@ impl SealedCopyOperation {
         let (Some(key), Some(value)) = (self.rekey_key(), value) else {
             return self.register();
         };
-        let mut progress: RekeyProgress =
-            postcard::from_bytes(&value).map_err(|_| abe(AbeError::Context))?;
+        let mut progress = RekeyProgress::decode(&value).map_err(|_| abe(AbeError::Context))?;
         if !self.input.dest_key.starts_with(&progress.prefix) {
             return self.register();
         }
         progress.cursor.clear();
         progress.rekeyed = 0;
+        progress.revision = progress.revision.wrapping_add(1);
         let value = postcard::to_allocvec(&progress).map_err(|_| abe(AbeError::Context))?;
         self.step = Step::ResetRekey;
         let row = (ABE_REKEY_KEYSPACE.to_string(), key, value.into());

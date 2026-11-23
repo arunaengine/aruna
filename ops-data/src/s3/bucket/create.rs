@@ -9,14 +9,16 @@ use crate::s3::usage::{
     RowChange, UsageCounterUpdate, UsageUpdateError, schedule_snapshot_publish,
 };
 use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::BlobEffect;
 use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{BlobEvent, Event};
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::{
     BACKEND_IMPORT_KEYSPACE, BUCKET_CREATION_KEYSPACE, GROUP_KEYSPACE, S3_BUCKET_KEYSPACE,
     STORAGE_BACKEND_KEYSPACE, STORAGE_ROUTING_KEYSPACE,
 };
 use aruna_core::operation::{Operation, TransactionMode};
-use aruna_core::rows::read_row;
+use aruna_core::rows::{StagedCall, outside_answer, read_row};
 use aruna_core::structs::identity::group::Group;
 use aruna_core::structs::identity::group_delete::check_group_write;
 use aruna_core::structs::storage::backend_import::BackendImport;
@@ -37,6 +39,7 @@ pub enum CreateBucketState {
     ReadRouting,
     ReadStorage,
     ScanLinks,
+    Ensure,
     CreateBucket,
     UpdateUsage,
     Link,
@@ -83,6 +86,10 @@ pub struct CreateBucketOperation {
     link: Option<CreateImportOperation>,
     /// The group storage and provider bucket of the automatic link.
     provider: Option<(ulid::Ulid, String)>,
+    /// A mapped create checks outside the transaction first, so the ensure runs before it.
+    preflight: bool,
+    /// The provider bucket ensured before the transaction, and whether Aruna created it.
+    ensured: Option<(ulid::Ulid, String, bool)>,
 }
 
 /// Rules one scan page of the automatic link check reads.
@@ -101,6 +108,8 @@ impl CreateBucketOperation {
             mapped: false,
             link: None,
             provider: None,
+            preflight: false,
+            ensured: None,
         }
     }
 
@@ -108,7 +117,56 @@ impl CreateBucketOperation {
     /// `bucket_template`.
     pub fn mapped(mut self) -> Self {
         self.mapped = true;
+        self.preflight = true;
         self
+    }
+
+    /// A check before the transaction runs outside it; the transaction checks again.
+    fn staged(&self, call: IoCall) -> IoCall {
+        match self.preflight {
+            true => StagedCall::Outside(call).into_call(),
+            false => call,
+        }
+    }
+
+    /// Ends the checks: before the transaction with the provider bucket's ensure, else with
+    /// the bucket write.
+    fn checked(&mut self) -> Turn {
+        if !self.preflight {
+            return self.write_bucket();
+        }
+        let Some((backend_id, bucket)) = self.provider.clone() else {
+            return self.restart();
+        };
+        self.state = CreateBucketState::Ensure;
+        Ok(Next::Call(IoCall::blob(BlobEffect::EnsureBucket {
+            backend: BackendRef::Group(backend_id),
+            bucket,
+        })))
+    }
+
+    fn bucket_ensured(&mut self, event: Event) -> Turn {
+        let failed =
+            |reason: String| CreateBucketError::ProviderBucket(ImportRuleError::Invalid(reason));
+        match event.into_blob() {
+            Ok(BlobEvent::BucketReady { created }) => {
+                let provider = self.provider.clone();
+                let (backend_id, bucket) = provider.ok_or(CreateBucketError::CreateBucketFailed)?;
+                self.ensured = Some((backend_id, bucket, created));
+                self.restart()
+            }
+            Ok(BlobEvent::Error(error)) => Err(failed(error.reason())),
+            _ => Err(CreateBucketError::ProviderBucket(
+                ImportRuleError::Unexpected("Ensure"),
+            )),
+        }
+    }
+
+    /// Runs every check again in the transaction, which opens with its first read.
+    fn restart(&mut self) -> Turn {
+        self.preflight = false;
+        self.provider = None;
+        self.first()
     }
 
     fn handle_bucket_checked(&mut self, values: Vec<Option<Value>>) -> Turn {
@@ -122,7 +180,9 @@ impl CreateBucketOperation {
         if self.mapped {
             self.state = CreateBucketState::ReadRouting;
             let key = routing_key(self.bucket_info.group_id);
-            return Ok(Next::Call(read_row(STORAGE_ROUTING_KEYSPACE, key)));
+            return Ok(Next::Call(
+                self.staged(read_row(STORAGE_ROUTING_KEYSPACE, key)),
+            ));
         }
         self.write_bucket()
     }
@@ -135,15 +195,15 @@ impl CreateBucketOperation {
             Some(RoutingTarget::Backend(BackendRef::Group(backend_id))) => {
                 self.state = CreateBucketState::ReadStorage;
                 let group = self.bucket_info.group_id.to_bytes().to_vec().into();
-                Ok(Next::Call(IoCall::Read(vec![
+                Ok(Next::Call(self.staged(IoCall::Read(vec![
                     (
                         STORAGE_BACKEND_KEYSPACE.to_string(),
                         backend_key(backend_id),
                     ),
                     (GROUP_KEYSPACE.to_string(), group),
-                ])))
+                ]))))
             }
-            _ => self.write_bucket(),
+            _ => self.checked(),
         }
     }
 
@@ -153,7 +213,7 @@ impl CreateBucketOperation {
         let storage = storage.map(|value| GroupStorage::from_bytes(&value));
         let group = group.map(|value| Group::from_bytes(&value));
         let (Some(storage), group) = (storage.transpose()?, group.transpose()?) else {
-            return self.write_bucket();
+            return self.checked();
         };
         let name = group.map(|group| group.display_name).unwrap_or_default();
         if let (Some(template), false, true) = (
@@ -169,6 +229,19 @@ impl CreateBucketOperation {
                     reason,
                 )));
             }
+            self.provider = Some((storage.backend_id, provider.clone()));
+            if self.preflight {
+                return self.scan_links(None);
+            }
+            let ensured = self.ensured.clone();
+            let Some((_, _, created)) = ensured.filter(|(backend_id, bucket, _)| {
+                (*backend_id, bucket.as_str()) == (storage.backend_id, provider.as_str())
+            }) else {
+                let reason = "the group storage changed during the create; try again".to_string();
+                return Err(CreateBucketError::ProviderBucket(
+                    ImportRuleError::Conflict(reason),
+                ));
+            };
             let input = CreateImportInput {
                 group_id: storage.group_id,
                 created_by: self.bucket_info.created_by,
@@ -184,25 +257,25 @@ impl CreateBucketOperation {
                 move_existing: false,
                 import_roots: Default::default(),
             };
-            let mut link = CreateImportOperation::within(input);
+            let link = CreateImportOperation::within(input);
+            let mut link = link.bucket_ready(storage.backend_id, provider, created);
             link.stamp(self.now_ms);
             link.seed(self.entropy.wrapping_add(1));
             self.link = Some(link);
-            self.provider = Some((storage.backend_id, provider));
             return self.scan_links(None);
         }
-        self.write_bucket()
+        self.checked()
     }
 
     /// Reads the group's rules, so no automatic link takes a provider bucket a rule uses.
     fn scan_links(&mut self, start: Option<Key>) -> Turn {
         self.state = CreateBucketState::ScanLinks;
-        Ok(Next::Call(IoCall::Page {
+        Ok(Next::Call(self.staged(IoCall::Page {
             space: BACKEND_IMPORT_KEYSPACE.to_string(),
             prefix: self.bucket_info.group_id.to_bytes().to_vec().into(),
             after: start,
             limit: LINK_PAGE,
-        }))
+        })))
     }
 
     fn links_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Turn {
@@ -224,7 +297,7 @@ impl CreateBucketOperation {
         }
         match next {
             Some(next) => self.scan_links(Some(next)),
-            None => self.write_bucket(),
+            None => self.checked(),
         }
     }
 
@@ -303,13 +376,17 @@ impl Operation for CreateBucketOperation {
     fn first(&mut self) -> Turn {
         self.state = CreateBucketState::CheckExists;
         let key: Key = self.bucket.as_bytes().into();
-        Ok(Next::Call(IoCall::Read(vec![
+        Ok(Next::Call(self.staged(IoCall::Read(vec![
             (S3_BUCKET_KEYSPACE.to_string(), key),
             group_fence_key(self.bucket_info.group_id),
-        ])))
+        ]))))
     }
 
     fn next(&mut self, result: IoResult) -> Turn {
+        let result = match self.preflight {
+            true => outside_answer(result)?,
+            false => result,
+        };
         match self.state {
             CreateBucketState::CheckExists => self.handle_bucket_checked(result.values()?),
             CreateBucketState::ReadRouting => self.routing_read(result.value()?),
@@ -318,6 +395,7 @@ impl Operation for CreateBucketOperation {
                 let (rows, next) = result.page()?;
                 self.links_scanned(rows, next)
             }
+            CreateBucketState::Ensure => self.bucket_ensured(result.event()?),
             CreateBucketState::CreateBucket => {
                 result.done()?;
                 self.handle_bucket_created()
@@ -450,45 +528,78 @@ mod mapped_tests {
         postcard::to_allocvec(&group).unwrap().into()
     }
 
-    /// Runs a mapped create up to the ensure of the provider bucket.
-    fn until_ensure(txn_id: TxnId) -> (Stepper, Effects) {
-        until_ensure_on(txn_id, storage())
+    fn no_rules() -> Event {
+        Event::Storage(StorageEvent::IterResult {
+            values: Vec::new(),
+            next_start_after: None,
+        })
     }
 
-    fn until_ensure_on(txn_id: TxnId, storage: Value) -> (Stepper, Effects) {
-        let (mut operation, _) =
+    /// Fails when `effects` open a transaction or run a storage call in one.
+    fn assert_outside(effects: &Effects) {
+        let inside = |effect: &Effect| {
+            matches!(
+                effect,
+                Effect::Storage(
+                    StorageEffect::StartTransaction { .. }
+                        | StorageEffect::Read {
+                            txn_id: Some(_),
+                            ..
+                        }
+                        | StorageEffect::BatchRead {
+                            txn_id: Some(_),
+                            ..
+                        }
+                        | StorageEffect::Iter {
+                            txn_id: Some(_),
+                            ..
+                        }
+                )
+            )
+        };
+        assert!(!effects.iter().any(inside), "{effects:?}");
+    }
+
+    /// Runs a mapped create up to the ensure of the provider bucket, all outside a transaction.
+    fn until_ensure() -> (Stepper, Effects) {
+        until_ensure_on(storage())
+    }
+
+    fn until_ensure_on(storage: Value) -> (Stepper, Effects) {
+        let (mut operation, mut effects) =
             Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
+        assert_outside(&effects);
+        for event in [
+            batch(vec![None, None]),
+            batch(vec![Some(routing())]),
+            batch(vec![Some(storage), Some(group())]),
+            no_rules(),
+        ] {
+            effects = operation.step(event);
+            assert_outside(&effects);
+        }
+        (operation, effects)
+    }
+
+    /// Answers the checks the transaction runs again after the ensure.
+    fn rechecked(operation: &mut Stepper, txn_id: TxnId, storage: Value) -> Effects {
+        let effects = operation.step(Event::blob(BlobEvent::BucketReady { created: true }));
+        assert_eq!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::StartTransaction {
+                read: false
+            })]
+        );
         operation.step(Event::Storage(StorageEvent::TransactionStarted { txn_id }));
         operation.step(batch(vec![None, None]));
         operation.step(batch(vec![Some(routing())]));
-        operation.step(batch(vec![Some(storage.clone()), Some(group())]));
-        operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        operation.step(written());
-        operation.step(written());
-        operation.step(written());
-        let bucket: Value = info().to_bytes().unwrap().into();
-        let reads = vec![
-            Some(bucket),
-            None,
-            Some(storage.clone()),
-            None,
-            Some(storage),
-        ];
-        operation.step(batch(reads));
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
-        (operation, effects)
+        operation.step(batch(vec![Some(storage), Some(group())]))
     }
 
     #[test]
     fn links_provider_bucket() {
         let txn_id = TxnId::default();
-        let (mut operation, effects) = until_ensure(txn_id);
+        let (mut operation, effects) = until_ensure();
         assert_eq!(
             effects.as_slice(),
             [Effect::blob(BlobEffect::EnsureBucket {
@@ -496,19 +607,24 @@ mod mapped_tests {
                 bucket: "team-a-x".to_string(),
             })]
         );
-        operation.step(Event::blob(BlobEvent::BucketReady { created: true }));
+        rechecked(&mut operation, txn_id, storage());
+        operation.step(no_rules());
+        operation.step(written());
+        operation.step(written());
+        operation.step(written());
         let bucket: Value = info().to_bytes().unwrap().into();
-        operation.step(batch(vec![
-            Some(bucket),
-            None,
-            Some(storage()),
-            None,
-            Some(storage()),
-        ]));
-        let effects = operation.step(Event::Storage(StorageEvent::IterResult {
-            values: Vec::new(),
-            next_start_after: None,
-        }));
+        let reads = vec![Some(bucket), None, Some(storage()), None, Some(storage())];
+        // The link skips the ensured bucket and goes on to its transaction reads.
+        let effects = operation.step(batch(reads.clone()));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Storage(StorageEffect::BatchRead {
+                txn_id: Some(_),
+                ..
+            })]
+        ));
+        operation.step(batch(reads));
+        let effects = operation.step(no_rules());
         let [
             Effect::Storage(StorageEffect::BatchWrite {
                 writes,
@@ -558,7 +674,7 @@ mod mapped_tests {
     #[test]
     fn fills_bucket_template() {
         let storage = storage_with(("bucket_template", "aruna-{group}-{bucket}"));
-        let (_, effects) = until_ensure_on(TxnId::default(), storage);
+        let (_, effects) = until_ensure_on(storage);
         assert_eq!(
             effects.as_slice(),
             [Effect::blob(BlobEffect::EnsureBucket {
@@ -576,9 +692,6 @@ mod mapped_tests {
         odd.display_name = "lab/sub".to_string();
         let (mut operation, _) =
             Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
         operation.step(batch(vec![None, None]));
         operation.step(batch(vec![Some(routing())]));
         let odd = postcard::to_allocvec(&odd).unwrap().into();
@@ -593,9 +706,6 @@ mod mapped_tests {
         // A provider bucket another rule uses is never linked again.
         let (mut operation, _) =
             Stepper::new(CreateBucketOperation::new("x".to_string(), info()).mapped());
-        operation.step(Event::Storage(StorageEvent::TransactionStarted {
-            txn_id: TxnId::default(),
-        }));
         operation.step(batch(vec![None, None]));
         operation.step(batch(vec![Some(routing())]));
         operation.step(batch(vec![Some(template), Some(group())]));
@@ -629,15 +739,31 @@ mod mapped_tests {
     }
 
     #[test]
-    fn ensure_failure_aborts() {
+    fn rechecks_in_transaction() {
+        // A template changed after the ensure names another bucket, which the create refuses.
         let txn_id = TxnId::default();
-        let (mut operation, _) = until_ensure(txn_id);
-        let refused = BlobError::WriteError("No access to bucket `team-a-x`.".to_string());
-        let effects = operation.step(Event::blob(BlobEvent::Error(refused)));
+        let (mut operation, _) = until_ensure();
+        let other = storage_with(("bucket_template", "aruna-{group}-{bucket}"));
+        let effects = rechecked(&mut operation, txn_id, other);
         assert_eq!(
             effects.as_slice(),
             [Effect::Storage(StorageEffect::AbortTransaction { txn_id })]
         );
+        assert!(matches!(
+            operation.finish(),
+            Err(CreateBucketError::ProviderBucket(
+                ImportRuleError::Conflict(_)
+            ))
+        ));
+    }
+
+    #[test]
+    fn ensure_failure_aborts() {
+        // The ensure runs before the transaction, so a refusal has nothing to abort.
+        let (mut operation, _) = until_ensure();
+        let refused = BlobError::WriteError("No access to bucket `team-a-x`.".to_string());
+        let effects = operation.step(Event::blob(BlobEvent::Error(refused)));
+        assert!(effects.is_empty(), "{effects:?}");
         assert!(operation.is_complete());
         assert!(matches!(
             operation.finish(),

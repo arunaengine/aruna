@@ -304,8 +304,8 @@ impl Operation for SourceHealthOperation {
                 self.sources.push((place(&single), access.ok()));
                 self.resolve_next()
             }
-            HealthStep::Measure => match result.staging()? {
-                StagingSourceEvent::HealthResult { stats, .. } => self.finish(stats),
+            HealthStep::Measure => match result.event()?.into_staging() {
+                Ok(StagingSourceEvent::HealthResult { stats, .. }) => self.finish(stats),
                 _ => Err(storage("no source health answer")),
             },
         }

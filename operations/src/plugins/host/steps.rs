@@ -28,7 +28,7 @@ use std::sync::Arc;
 use ulid::Ulid;
 
 use super::super::check::{
-    CallError, CheckCall, Checked as CheckStep, RunScope, SharedChecks, authorize_call, matching,
+    CallError, CheckCall, Checked as CheckStep, RunScope, SharedChecks, matching,
 };
 use super::super::creates::write_outcome;
 use super::super::dataset::{
@@ -294,16 +294,16 @@ fn document_of(
     }
 }
 
-/// The read grants of `install` that cover `path`, authorized as one call under the admission
-/// the listing already counted, so the call is checked and rated once.
-fn read_check(install: &PluginInstall, path: &str) -> Result<IoCall, CallError> {
-    let patterns = matching(install, Permission::MetadataRead, path)?;
-    let check = Authorize::call(install, Permission::MetadataRead, path, &patterns);
-    Ok(authorize_call(check))
+/// The live check of `path` after the export: the install is still active and grants read on
+/// it. A path the admitted install does not cover is refused at once; the rate counts once.
+fn read_check(scope: &RunScope, install: &PluginInstall, path: &str) -> Result<IoCall, CallError> {
+    matching(install, Permission::MetadataRead, path)?;
+    let check = CheckCall::new(scope, Some((Permission::MetadataRead, path)));
+    Ok(IoCall::child(check))
 }
 
 fn authorized(result: IoResult) -> Result<(), CallError> {
-    result.child::<(), CallError>()?
+    result.child::<PluginInstall, CallError>()?.map(drop)
 }
 
 #[derive(Debug, PartialEq)]
@@ -354,7 +354,7 @@ impl Operation for ReadDataset {
             }
             ReadPhase::Export(install) => {
                 let (record, jsonld) = document_of(exported(result)?)?;
-                let check = read_check(&install, &record.permission_path)?;
+                let check = read_check(&self.place.scope, &install, &record.permission_path)?;
                 self.phase = ReadPhase::Check(Box::new(record), jsonld);
                 Ok(Next::Call(check))
             }
@@ -427,7 +427,7 @@ impl Operation for ReadFiles {
                 let ExportMetadataResult::Page { record, page } = exported(result)? else {
                     return Err(CallError(unavailable("the document has no page export")));
                 };
-                let check = read_check(&install, &record.permission_path)?;
+                let check = read_check(&self.place.scope, &install, &record.permission_path)?;
                 self.phase = FilesPhase::Check(PageDraft {
                     jsonld: page.jsonld,
                     cursor: page.next_cursor,

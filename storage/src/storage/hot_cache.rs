@@ -151,6 +151,21 @@ impl CacheWriter {
                 .iter()
                 .filter_map(|(key_space, key)| row(key_space, key))
                 .collect(),
+            StorageEffect::AddUsage {
+                key_space,
+                deltas,
+                buckets,
+                ..
+            } => (deltas.iter().map(|(key, _)| key))
+                .chain(buckets.iter().map(|(key, _)| key))
+                .filter_map(|key| row(key_space, key))
+                .collect(),
+            StorageEffect::AddCounters {
+                key_space, deltas, ..
+            } => deltas
+                .iter()
+                .filter_map(|(key, _)| row(key_space, key))
+                .collect(),
             _ => Vec::new(),
         }
     }

@@ -10,7 +10,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::id_mint::IdMint;
 use aruna_core::keyspaces::SYNC_BASE_KEYSPACE;
-use aruna_core::operation::Operation;
+use aruna_core::operation::{HoldScope, Operation};
 use aruna_core::rows::{outside_answer, outside_call, read_row};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::synced_folder::{
@@ -34,6 +34,7 @@ use super::remove::RemoveEntryOperation;
 use super::repository::{
     SyncUpload, UploadState, action_entry, base_entry, base_key, upload_entry,
 };
+use crate::device::sync::folder_scope;
 use crate::device::sync::folders::reads::{list_entries, read_bound};
 
 /// The identity of the bytes the owner acted on. A replace applies to exactly
@@ -214,6 +215,11 @@ impl Operation for ApplyActionOperation {
 
     fn seed(&mut self, entropy: u128) {
         self.ids = IdMint::new(entropy);
+    }
+
+    /// The folder's pass scope, so no reconcile writes a base row this action replaces or drops.
+    fn hold_scope(&self) -> Option<HoldScope> {
+        Some(folder_scope(self.input.folder_id))
     }
 
     fn first(&mut self) -> ActionTurn {

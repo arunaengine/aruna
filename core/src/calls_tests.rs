@@ -590,7 +590,7 @@ fn refuses_file_calls() {
 
 #[test]
 fn snapshot_keeps_blobs() {
-    // A read snapshot still runs blob calls, which stream the blobs its rows name.
+    // A read snapshot still runs blob and staging-source calls, which stream the rows they name.
     let list = || BlobEffect::ListHidden {
         namespace: None,
         cursor: None,
@@ -603,6 +603,57 @@ fn snapshot_keeps_blobs() {
     let values = vec![(key("a"), None)];
     let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
     assert_eq!(effects.as_slice(), &[Effect::blob(list())]);
+
+    let health = crate::effects::StagingSourceEffect::Health {
+        accesses: Vec::new(),
+    };
+    let mut procedure = script(vec![read_a(), IoCall::staging(health.clone())]);
+    procedure.mode = TransactionMode::ReadSnapshot;
+    let mut operation = CallRun::new(procedure);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[Effect::staging(health.clone())]);
+
+    // A write transaction still refuses staging-source calls and grouped local-file calls.
+    let mut operation = run(script(vec![read_a(), IoCall::staging(health)]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    let abort = || storage(StorageEffect::AbortTransaction { txn_id: txn() });
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "Effect::StagingSource inside a write transaction",
+        })
+    );
+
+    let file = Effect::LocalFile(crate::effects::LocalFileEffect::Hash {
+        root: "/sync".to_string(),
+        relative: "a.txt".to_string(),
+    });
+    let grouped = IoCall::Group(crate::effects::EffectGroup {
+        members: vec![file],
+        limit: 1,
+        form: crate::effects::GroupForm::All { deadline: None },
+    });
+    let mut operation = run(script(vec![read_a(), grouped]), true);
+    operation.start();
+    operation.step(started());
+    let values = vec![(key("a"), None)];
+    let effects = operation.step(Event::Storage(StorageEvent::BatchReadResult { values }));
+    assert_eq!(effects.as_slice(), &[abort()]);
+    assert_eq!(
+        operation.finalize(),
+        Err(IoError::Unexpected {
+            expected: "no slow external call inside a transaction",
+            got: "Effect::LocalFile inside a transaction",
+        })
+    );
 }
 
 #[test]

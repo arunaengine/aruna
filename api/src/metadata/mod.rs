@@ -24,7 +24,7 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_drivers::driver::drive;
-use aruna_operations::document_repository::GetConfigOperation;
+use aruna_operations::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_operations::git::linked::unreadable_file;
 use aruna_operations::metadata::api::MetadataApiError;
 use aruna_operations::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
@@ -401,12 +401,16 @@ async fn ensure_device_owner(state: &ServerState, auth: &AuthContext) -> ServerR
     if !matches!(state.node_capabilities(), NodeCapabilities::User { .. }) {
         return Ok(());
     }
-    let config = drive(
+    let config = match drive(
         GetConfigOperation::new(state.get_realm_id()),
         &state.get_ctx(),
     )
     .await
-    .map_err(|_| ServerError::ServiceUnavailable)?;
+    {
+        Ok(config) => config,
+        Err(GetConfigError::DocumentNotFound) => return Ok(()),
+        Err(_) => return Err(ServerError::ServiceUnavailable),
+    };
     let node_id = state.get_node_id().to_string();
     let owner = config
         .nodes
@@ -414,8 +418,10 @@ async fn ensure_device_owner(state: &ServerState, auth: &AuthContext) -> ServerR
         .find(|node| node.node_id == node_id)
         .and_then(|node| node.kind.owner());
     match owner {
-        Some(owner) if owner == auth.user_id && auth.path_restrictions.is_none() => Ok(()),
-        _ => Err(ServerError::Forbidden),
+        Some(owner) if owner != auth.user_id || auth.path_restrictions.is_some() => {
+            Err(ServerError::Forbidden)
+        }
+        _ => Ok(()),
     }
 }
 

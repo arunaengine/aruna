@@ -36,6 +36,31 @@ pub struct RekeyProgress {
     /// The last version row handled.
     pub cursor: Vec<u8>,
     pub rekeyed: u64,
+    /// Grows with every save and reset, so a reset of an empty pass still changes the row.
+    pub revision: u64,
+}
+
+impl RekeyProgress {
+    /// Decodes a stored pass, reading older four-field rows with revision zero.
+    pub fn decode(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        if let Ok((progress, rest)) = postcard::take_from_bytes::<Self>(bytes)
+            && rest.is_empty()
+        {
+            return Ok(progress);
+        }
+        let ((prefix, epoch, cursor, rekeyed), rest) =
+            postcard::take_from_bytes::<(String, u64, Vec<u8>, u64)>(bytes)?;
+        if !rest.is_empty() {
+            return Err(postcard::Error::DeserializeBadEncoding);
+        }
+        Ok(Self {
+            prefix,
+            epoch,
+            cursor,
+            rekeyed,
+            revision: 0,
+        })
+    }
 }
 
 fn epoch_of(row: Option<&Value>) -> Option<u64> {
@@ -171,6 +196,7 @@ impl RekeyOperation {
             epoch,
             cursor: Vec::new(),
             rekeyed: 0,
+            revision: 0,
         };
         let target = TransitionTarget {
             compression: info.compression,
@@ -272,7 +298,7 @@ type ClaimTurn = Result<Next<(RekeyProgress, Value)>, KeyError>;
 
 impl ClaimRekey {
     fn claim(&mut self, value: Option<Value>) -> ClaimTurn {
-        let saved = value.as_deref().map(postcard::from_bytes::<RekeyProgress>);
+        let saved = value.as_deref().map(RekeyProgress::decode);
         let progress = match saved {
             None => self.fresh.clone(),
             Some(Ok(saved)) if saved.prefix != self.prefix => return Err(KeyError::Busy),
@@ -564,6 +590,7 @@ impl SaveRekey {
             progress.cursor.clear();
             progress.rekeyed = 0;
         }
+        progress.revision = progress.revision.wrapping_add(1);
         let done = !self.more && !restart;
         let call = if done {
             IoCall::Delete(vec![(ABE_REKEY_KEYSPACE.to_string(), self.id.clone())])
@@ -623,6 +650,7 @@ mod tests {
             epoch: 2,
             cursor: Vec::new(),
             rekeyed: 0,
+            revision: 0,
         }
     }
 
@@ -706,8 +734,8 @@ mod tests {
         let (save, turn) = saved(&operation, Some(seen_row()));
         let progress = written(turn);
         assert_eq!(
-            (progress.cursor, progress.rekeyed),
-            (row("foo/a").to_vec(), 1)
+            (progress.cursor, progress.rekeyed, progress.revision),
+            (row("foo/a").to_vec(), 1, 1)
         );
         let end = page_end(&mut operation, save);
         assert_eq!(
@@ -885,5 +913,31 @@ mod tests {
         let turn = operation.next(IoResult::Child(ChildOutcome::new(absent)));
         assert!(matches!(turn, Ok(Next::Call(IoCall::Read(_)))));
         assert_eq!(operation.scope.quota, None);
+    }
+
+    #[test]
+    fn legacy_rekey_decodes() {
+        // Older four-field rows without a revision still decode cleanly.
+        let old = postcard::to_allocvec(&("foo/".to_string(), 2u64, vec![1u8, 2], 5u64)).unwrap();
+        let decoded = RekeyProgress::decode(&old).unwrap();
+        assert_eq!(
+            decoded,
+            RekeyProgress {
+                prefix: "foo/".to_string(),
+                epoch: 2,
+                cursor: vec![1, 2],
+                rekeyed: 5,
+                revision: 0,
+            }
+        );
+        let current = RekeyProgress {
+            revision: 9,
+            ..decoded
+        };
+        let bytes = postcard::to_allocvec(&current).unwrap();
+        assert_eq!(RekeyProgress::decode(&bytes).unwrap(), current);
+        let mut corrupt = old;
+        corrupt.push(0xFF);
+        assert!(RekeyProgress::decode(&corrupt).is_err());
     }
 }

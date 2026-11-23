@@ -406,3 +406,25 @@ async fn end_wakes_ask() {
     ));
     assert!(session.replies.lock().unwrap().is_empty());
 }
+
+#[tokio::test(start_paused = true)]
+async fn end_unblocks_send() {
+    // An ask stuck on a full request queue returns once the session ends.
+    let (session, _channel) = ready(600_000);
+    let mut id = 0;
+    while session
+        .requests
+        .try_send(HelperRequest::Status { id })
+        .is_ok()
+    {
+        id += 1;
+    }
+    let mut asked = Box::pin(session.list_scratch("data"));
+    assert!(poll_once(&mut asked).await.is_pending());
+    session.end(EndReason::Ended);
+    let woken = poll_once(&mut asked).await;
+    assert!(matches!(
+        woken,
+        std::task::Poll::Ready(Err(SessionError::Ended))
+    ));
+}

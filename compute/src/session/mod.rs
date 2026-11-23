@@ -490,10 +490,12 @@ impl Session {
         if self.lock().phase == SessionPhase::Ended {
             return Err(SessionError::Ended);
         }
-        self.requests
-            .send(request)
-            .await
-            .map_err(|_| SessionError::Ended)?;
+        // A full queue must not outlive `end`, so the send yields to it.
+        tokio::select! {
+            biased;
+            _ = self.done.cancelled() => return Err(SessionError::Ended),
+            sent = self.requests.send(request) => sent.map_err(|_| SessionError::Ended)?,
+        }
         let body = timeout(REPLY_TIMEOUT, receiver)
             .await
             .map_err(|_| SessionError::NoReply)?

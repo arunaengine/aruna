@@ -13,7 +13,8 @@ use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{NOTIFICATION_OUTBOX_KEYSPACE, REALM_CONFIG_KEYSPACE};
 use aruna_core::operation::Operation;
 use aruna_core::structs::execution::notification::{
-    InboxWriteOutcome, NotificationOutboxRecord, NotificationRecord,
+    InboxWriteOutcome, NotificationClass, NotificationOutboxRecord, NotificationRecord,
+    TRANSIENT_USER_CAP,
 };
 use aruna_core::structs::execution::notification::{
     NotificationRequest, NotificationTransportMessage,
@@ -21,6 +22,7 @@ use aruna_core::structs::execution::notification::{
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
 use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
 use tracing::warn;
 
 use crate::notifications::enqueue::{EnqueueDeliveriesOperation, EnqueueError};
@@ -158,6 +160,8 @@ impl DrainOutboxOperation {
             records: kept,
             ..Page::default()
         };
+        // Each page reads the configs again, so a placement change reaches the rows it holds.
+        self.configs.clear();
         if expired.is_empty() {
             return self.read_configs();
         }
@@ -205,6 +209,7 @@ impl DrainOutboxOperation {
             return self.close();
         };
         let mut remote: BTreeMap<NodeId, (Vec<NotificationRecord>, Vec<Key>)> = BTreeMap::new();
+        let mut transient: BTreeMap<UserId, usize> = BTreeMap::new();
         for (key, outbox) in std::mem::take(&mut self.page.records) {
             let record = outbox.record;
             let realm_id = record.recipient.realm_id;
@@ -226,10 +231,21 @@ impl DrainOutboxOperation {
                     continue;
                 }
             };
+            if holder != local && self.failed_holders.contains(&holder) {
+                self.retry = true;
+                continue;
+            }
+            // No batch holds more transient rows for one recipient than its inbox may keep.
+            if record.class == NotificationClass::Transient {
+                let count = transient.entry(record.recipient).or_default();
+                if *count >= TRANSIENT_USER_CAP {
+                    self.retry = true;
+                    continue;
+                }
+                *count += 1;
+            }
             if holder == local {
                 self.page.local.push((key, record));
-            } else if self.failed_holders.contains(&holder) {
-                self.retry = true;
             } else {
                 let group = remote.entry(holder).or_default();
                 group.0.push(record);
@@ -262,17 +278,24 @@ impl DrainOutboxOperation {
                 let wake = Effect::Net(NetEffect::WakeInbox(outcome.recipients));
                 Ok(Next::Call(IoCall::from(wake)))
             }
-            // Only the full inbox waits; its rows stay while the others go on.
+            // Only the full inbox waits: its later half of transient rows stays, so the rest fits.
             Err(InboxError::TransientCap(recipient)) => {
                 warn!(%recipient, "Notification inbox is full; retrying its delivery");
                 self.retry = true;
-                let before = self.page.local.len();
-                self.page
-                    .local
-                    .retain(|(_, record)| record.recipient != recipient);
-                if self.page.local.len() == before {
+                let capped = |record: &NotificationRecord| {
+                    record.recipient == recipient && record.class == NotificationClass::Transient
+                };
+                let count = (self.page.local.iter())
+                    .filter(|(_, record)| capped(record))
+                    .count();
+                if count == 0 {
                     return self.next_remote();
                 }
+                let mut kept = 0;
+                self.page.local.retain(|(_, record)| {
+                    kept += usize::from(capped(record));
+                    !capped(record) || kept <= count / 2
+                });
                 self.upsert_local()
             }
             Err(error) => {
@@ -707,6 +730,114 @@ mod call_tests {
         assert_eq!(
             operation.next(delete_result()),
             Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
+    }
+
+    fn deletes(keys: Vec<Key>) -> Turn {
+        let space = || NOTIFICATION_OUTBOX_KEYSPACE.to_string();
+        let delete = StorageEffect::BatchDelete {
+            deletes: keys.into_iter().map(|key| (space(), key)).collect(),
+            txn_id: None,
+        };
+        Ok(Next::Call(IoCall::from(Effect::Storage(delete))))
+    }
+
+    /// A drain that holds the realm config of `user(1, 2)` with this node as its holder.
+    fn local_drain() -> DrainOutboxOperation {
+        let local = node_id(1);
+        let (realm_id, config) = config_bytes(local);
+        let config = RealmConfigDocument::from_bytes(&config).expect("config decodes");
+        let mut operation = DrainOutboxOperation::new(Some(local), NOW_MS);
+        operation.configs.insert(realm_id, Some(config));
+        operation
+    }
+
+    /// One page with more transient notices for one recipient than its inbox keeps.
+    #[test]
+    fn transient_cap_progresses() {
+        let mut operation = local_drain();
+        let notice = record(user(1, 2), NotificationClass::Transient, NOW_MS);
+        let keys: Vec<Key> = (0..=TRANSIENT_USER_CAP)
+            .map(|at| Key::from((at as u32).to_be_bytes().to_vec()))
+            .collect();
+        operation.page.records = (keys.iter().enumerate())
+            .map(|(at, key)| {
+                let outbox = NotificationOutboxRecord {
+                    outbox_id: Ulid::from_parts(NOW_MS - 1_000, at as u128),
+                    record: notice.clone(),
+                };
+                (key.clone(), outbox)
+            })
+            .collect();
+        assert!(matches!(
+            operation.group(),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.page.local.len(), TRANSIENT_USER_CAP);
+        assert!(operation.retry);
+        // The first 500 commit and leave, the last stays queued for the next run.
+        let stored = Ok::<_, InboxError>(InboxWriteOutcome::default());
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(stored))),
+            deletes(keys[..TRANSIENT_USER_CAP].to_vec())
+        );
+        assert_eq!(
+            operation.next(delete_result()),
+            Ok(Next::Done(Some(DELIVERY_RETRY_AFTER)))
+        );
+    }
+
+    /// A full inbox halves the recipient's transient rows and keeps its direct ones.
+    #[test]
+    fn capped_direct_commits() {
+        let recipient = user(1, 2);
+        let transient = record(recipient, NotificationClass::Transient, NOW_MS);
+        let direct = record(recipient, NotificationClass::Direct, NOW_MS);
+        let mut operation = DrainOutboxOperation::new(Some(node_id(1)), NOW_MS);
+        operation.page.local = vec![
+            (Key::from(vec![1]), transient.clone()),
+            (Key::from(vec![2]), direct.clone()),
+            (Key::from(vec![3]), transient.clone()),
+        ];
+        operation.upsert_local().unwrap();
+        let full = || {
+            let full = Err::<InboxWriteOutcome, _>(InboxError::TransientCap(recipient));
+            IoResult::Child(ChildOutcome::new(full))
+        };
+        assert!(matches!(
+            operation.next(full()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        let halved = vec![
+            (Key::from(vec![1]), transient),
+            (Key::from(vec![2]), direct.clone()),
+        ];
+        assert_eq!(operation.page.local, halved);
+        assert!(matches!(
+            operation.next(full()),
+            Ok(Next::Call(IoCall::Child(_)))
+        ));
+        assert_eq!(operation.page.local, vec![(Key::from(vec![2]), direct)]);
+        let stored = Ok::<_, InboxError>(InboxWriteOutcome::default());
+        assert_eq!(
+            operation.next(IoResult::Child(ChildOutcome::new(stored))),
+            delete_call(Key::from(vec![2]))
+        );
+    }
+
+    /// A new page reads its realm configs again instead of a config an earlier page read.
+    #[test]
+    fn page_rereads_configs() {
+        let mut operation = local_drain();
+        let (key, value) = outbox_row(record(user(1, 2), NotificationClass::Direct, NOW_MS));
+        let realm_id = user(1, 2).realm_id;
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(rows(vec![(key, value)])),
+            Ok(Next::Call(IoCall::Read(vec![(
+                REALM_CONFIG_KEYSPACE.to_string(),
+                Key::from(realm_id.as_bytes().to_vec())
+            )])))
         );
     }
 
