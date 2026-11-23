@@ -81,7 +81,7 @@ pub async fn get_email(
     settings_node(&state, &auth).await?;
     let preference = drive(ReadEmailOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(response(preference.ok_or(ServerError::NotFound)?)))
 }
 
@@ -146,7 +146,7 @@ pub async fn set_email(
     );
     let preference = drive(SetEmailOperation::new(opt_in), &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(response(preference)))
 }
 
@@ -183,7 +183,9 @@ pub async fn delete_email(
     settings_node(&state, &auth).await?;
     let remove =
         RemoveEmailOperation::new(auth.user_id, state.get_node_id(), unix_timestamp_millis());
-    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
+    drive(remove, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -207,15 +209,17 @@ fn response(preference: EmailPreference) -> EmailResponse {
     }
 }
 
-fn map_error(error: EmailError) -> ServerError {
-    match error {
-        EmailError::InvalidCategories | EmailError::NotVerified => {
-            ServerError::BadRequestReason(error.to_string())
-        }
-        EmailError::NotConfigured => ServerError::Conflict(error.to_string()),
-        EmailError::Setting(error) => setting_error(error),
-        EmailError::Storage(_) | EmailError::Conversion(_) => {
-            ServerError::InternalError(error.into())
+impl From<EmailError> for ServerError {
+    fn from(error: EmailError) -> Self {
+        match error {
+            EmailError::InvalidCategories | EmailError::NotVerified => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            EmailError::NotConfigured => ServerError::Conflict(error.to_string()),
+            EmailError::Setting(error) => setting_error(error),
+            EmailError::Storage(_) | EmailError::Conversion(_) => {
+                ServerError::InternalError(error.into())
+            }
         }
     }
 }

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::git_node;
-use super::map_error;
 use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -216,7 +215,7 @@ pub(super) fn failure(error: GitError) -> Response {
             return (StatusCode::CONFLICT, Json(body)).into_response();
         }
         GitError::Authorization(error) => {
-            return map_error(GitError::Authorization(error)).into_response();
+            return ServerError::from(GitError::Authorization(error)).into_response();
         }
         GitError::NotHolder => (StatusCode::NOT_FOUND, "not_holder"),
         GitError::NotFound => (StatusCode::NOT_FOUND, "not_found"),

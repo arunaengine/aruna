@@ -4,6 +4,7 @@
 
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
+use crate::error::ServerError;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::model::{
     ExcludedFormResponse, MetadataReferencesParams, MetadataReferencesResponse, PreflightBody,
@@ -11,9 +12,7 @@ use crate::metadata::model::{
     PreflightResponse, PreflightStorageBody, PreflightTargetBody, PreflightTargetResponse,
     PreflightVisibleResponse,
 };
-use crate::metadata::{
-    bearer_token_string, map_api_error, map_query_mode, map_references_response,
-};
+use crate::metadata::{bearer_token_string, map_query_mode, map_references_response};
 use crate::server::state::ServerState;
 use aruna_core::metadata::api::MetadataIndexState;
 use aruna_ops_data::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
@@ -129,7 +128,7 @@ pub async fn metadata_references(
         ctx.as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(map_references_response(execution))))
 }
 
@@ -284,7 +283,7 @@ pub async fn metadata_reference_preflight(
     );
     let execution = drive(execution, state.get_ctx().as_ref())
         .await
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(map_preflight_response(execution))))
 }
 

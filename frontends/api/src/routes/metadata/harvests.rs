@@ -25,7 +25,6 @@ use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::job_urls;
 use crate::metadata::ensure_metadata_scope;
-use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -138,7 +137,7 @@ pub async fn submit_harvest(
             JobPayload::Harvest(spec.clone()).plan_digest(),
         )
         .await
-        .map_err(map_submit_error)?,
+        .map_err(ServerError::from)?,
         None => None,
     };
     let result = match replay {
@@ -152,7 +151,7 @@ pub async fn submit_harvest(
             request.idempotency_key,
         )
         .await
-        .map_err(map_submit_error)?,
+        .map_err(ServerError::from)?,
     };
     let urls = job_urls(&state, result.job_id).await?;
     Ok((

@@ -17,7 +17,7 @@ use aruna_ops_data::device::publish_queue::{PublishEntry, PublishState};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::Json;
 use axum::extract::State;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use ulid::Ulid;
 /// A user node enrolled for `owner`, holding only the realm configuration.
 async fn user_node() -> (tempfile::TempDir, Arc<ServerState>, AuthContext) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let owner = UserId::local(Ulid::from_bytes([9u8; 16]), realm_id);

@@ -50,7 +50,7 @@ use crate::auth::require_owner;
 use crate::auth::{ValidatedBearer, require_unrestricted_auth};
 use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, external_base_url};
-use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
+use crate::routes::execution::jobs::ExecutionTarget;
 use crate::server::state::ServerState;
 use aruna_ops_identity::auth::bearer_token::AccountDeactivatedOperation;
 use aruna_ops_identity::auth::bearer_token::UserCutoffOperation;
@@ -731,7 +731,7 @@ pub async fn create_task(
                     id: result.job_id.to_string(),
                 },
             ),
-            Err(error) => TesError::from_server(map_local_error(error)).into_response(),
+            Err(error) => TesError::from_server(ServerError::from(error)).into_response(),
         };
     }
 
@@ -2321,7 +2321,7 @@ impl TesError {
     /// Task creation shares the REST submit mapping, so a refusal a TES client
     /// must not retry never reaches it as a retryable 500.
     fn from_submit(error: aruna_core::job_request::SubmitJobError) -> Self {
-        Self::from_server(super::jobs::map_submit_error(error))
+        Self::from_server(ServerError::from(error))
     }
 
     fn from_job_route(error: JobRouteError) -> Self {

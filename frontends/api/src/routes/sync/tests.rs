@@ -740,7 +740,7 @@ fn gateway_names_cause() {
         ServerError::BadGatewayReason(_)
     ));
     assert!(matches!(
-        map_create_error(SyncRelationshipError::RolledBack),
+        ServerError::from(SyncRelationshipError::RolledBack),
         ServerError::BadGatewayReason(reason) if reason.contains("rolled back")
     ));
 }

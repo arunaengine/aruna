@@ -84,7 +84,7 @@ pub async fn get_webhook(
     settings_node(&state, &auth).await?;
     let subscription = drive(ReadWebhookOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     let subscription = subscription.ok_or(ServerError::NotFound)?;
     Ok(Json(response(subscription, None)))
 }
@@ -153,7 +153,9 @@ pub async fn set_webhook(
         secret,
         unix_timestamp_millis(),
     );
-    let outcome = drive(set, &state.get_ctx()).await.map_err(map_error)?;
+    let outcome = drive(set, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(Json(response(outcome.subscription, Some(outcome.secret))))
 }
 
@@ -190,7 +192,9 @@ pub async fn delete_webhook(
     settings_node(&state, &auth).await?;
     let remove =
         RemoveWebhookOperation::new(auth.user_id, state.get_node_id(), unix_timestamp_millis());
-    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
+    drive(remove, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -204,11 +208,13 @@ fn response(subscription: WebhookSubscription, secret: Option<String>) -> Webhoo
     }
 }
 
-fn map_error(error: WebhookError) -> ServerError {
-    match error {
-        WebhookError::InvalidUrl => ServerError::BadRequestReason(error.to_string()),
-        WebhookError::Setting(error) => setting_error(error),
-        WebhookError::Conversion(_) => ServerError::InternalError(error.into()),
+impl From<WebhookError> for ServerError {
+    fn from(error: WebhookError) -> Self {
+        match error {
+            WebhookError::InvalidUrl => ServerError::BadRequestReason(error.to_string()),
+            WebhookError::Setting(error) => setting_error(error),
+            WebhookError::Conversion(_) => ServerError::InternalError(error.into()),
+        }
     }
 }
 

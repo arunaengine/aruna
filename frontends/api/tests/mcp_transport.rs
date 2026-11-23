@@ -38,7 +38,7 @@ use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::http::{HeaderValue, header};
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
@@ -85,7 +85,7 @@ async fn write_value(state: &ServerState, key_space: &str, key: Vec<u8>, value: 
 
 async fn setup_fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(root.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let net = NetHandle::new(aruna_runner::testing::local_net(), storage.clone())
         .await
         .unwrap();

@@ -24,7 +24,7 @@ use utoipa_axum::routes;
 
 use super::distributed::{
     AdmissionResponse, BehaviourName, SettingsRequest, StrategyName, admission_example,
-    admission_response, behaviour, map_create_error, node, owned_status, settings_of, strategy,
+    admission_response, behaviour, node, owned_status, settings_of, strategy,
 };
 use super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
@@ -230,7 +230,7 @@ pub async fn join_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::CREATED, Json(admission_response(report))))
 }
 
@@ -274,7 +274,7 @@ pub async fn leave_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(change_response(set_id, revision)))
 }
 
@@ -338,7 +338,7 @@ pub async fn copy_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::ACCEPTED, Json(admission_response(report))))
 }
 
@@ -404,7 +404,7 @@ pub async fn split_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(SplitResponse {
         set_id: set_id.to_string(),
         revision: revision.map(|revision| revision.number),
@@ -479,7 +479,7 @@ pub async fn transfer_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(change_response(set_id, revision)),
@@ -533,7 +533,7 @@ pub async fn settings_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(change_response(set_id, revision)))
 }
 
@@ -579,7 +579,7 @@ pub async fn delete_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::ACCEPTED,
         Json(change_response(set_id, revision)),

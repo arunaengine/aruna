@@ -14,10 +14,9 @@ use crate::metadata::model::{
 };
 use crate::metadata::{
     commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
-    load_document_record, local_write_record, map_api_error, map_export_response, map_export_view,
-    map_write_error, parse_document_id, serialize_jsonld_object, with_global_ids,
+    load_document_record, local_write_record, map_export_response, map_export_view,
+    parse_document_id, serialize_jsonld_object, with_global_ids,
 };
-use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::repository::links::{
     connector, ensure_capable, ensure_requirements, validate_record_id,
 };
@@ -275,7 +274,7 @@ pub async fn export_metadata_rocrate(
             drive(export, ctx.as_ref()).await
         }
     }
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     let response = map_export_response(export, &params, view)?;
     Ok((StatusCode::OK, Json(response)))
 }
@@ -454,7 +453,7 @@ pub async fn submit_rocrate_export(
         request.idempotency_key,
     )
     .await
-    .map_err(map_submit_error)?;
+    .map_err(ServerError::from)?;
     let urls = job_urls(&state, result.job_id).await?;
     Ok((
         StatusCode::ACCEPTED,
@@ -601,7 +600,7 @@ pub async fn replace_metadata_rocrate(
         &ctx,
     )
     .await
-    .map_err(map_write_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -712,7 +711,7 @@ pub async fn add_data_entity(
         &ctx,
     )
     .await
-    .map_err(map_write_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -816,7 +815,7 @@ pub async fn remove_data_entity(
         &ctx,
     )
     .await
-    .map_err(map_write_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -924,7 +923,7 @@ pub async fn add_contextual_entity(
         &ctx,
     )
     .await
-    .map_err(map_write_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,

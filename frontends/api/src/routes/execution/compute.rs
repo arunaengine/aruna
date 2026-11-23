@@ -278,10 +278,12 @@ fn compute_config(body: ComputeConfigBody) -> ServerResult<RealmComputeConfig> {
 
 /// Only a genuinely absent document is a 404; a storage or decode failure must
 /// not read as "this realm has no configuration".
-fn map_config_error(error: GetConfigError) -> ServerError {
-    match error {
-        GetConfigError::DocumentNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
+impl From<GetConfigError> for ServerError {
+    fn from(error: GetConfigError) -> Self {
+        match error {
+            GetConfigError::DocumentNotFound => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -355,7 +357,7 @@ pub async fn get_compute_config(
     let auth = require_config_admin(&state, auth, Permission::READ).await?;
     let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
         .await
-        .map_err(map_config_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(config_body(&config.compute)))
 }
 
@@ -484,23 +486,25 @@ pub async fn put_compute_config(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_compute_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(config_body(&stored.compute)))
 }
 
-fn map_compute_error(error: SetComputeError) -> ServerError {
-    use aruna_core::errors::StorageError;
-    match error {
-        SetComputeError::ConfigMissing => ServerError::NotFound,
-        SetComputeError::Unauthorized | SetComputeError::NotManagementNode => {
-            ServerError::Forbidden
+impl From<SetComputeError> for ServerError {
+    fn from(error: SetComputeError) -> Self {
+        use aruna_core::errors::StorageError;
+        match error {
+            SetComputeError::ConfigMissing => ServerError::NotFound,
+            SetComputeError::Unauthorized | SetComputeError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
+            SetComputeError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::config_conflict()
+            }
+            SetComputeError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        SetComputeError::InvalidCompute { reason } => ServerError::BadRequestReason(reason),
-        SetComputeError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::config_conflict()
-        }
-        SetComputeError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -597,7 +601,7 @@ pub async fn get_compute_snapshots(
     let context = state.get_ctx();
     let config = drive(GetConfigOperation::new(auth.realm_id), &context)
         .await
-        .map_err(map_config_error)?;
+        .map_err(ServerError::from)?;
     let members = config
         .node_ids()
         .map_err(|error| ServerError::InternalError(error.into()))?;

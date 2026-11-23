@@ -32,7 +32,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::Extension;
 use axum::extract::{Path, Query, State};
 use byteview::ByteView;
@@ -92,8 +92,7 @@ async fn write_fixture(state: &ServerState, key_space: &str, key: Vec<u8>, value
 /// names, so a name can be resolved locally.
 async fn setup(owner: UserId) -> (TempDir, Arc<ServerState>, Ulid) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let realm_id = realm_id();
     let state = Arc::new(
         ServerState::new(

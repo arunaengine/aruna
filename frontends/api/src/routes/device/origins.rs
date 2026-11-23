@@ -19,8 +19,6 @@ use crate::server::state::ServerState;
 use aruna_ops_data::device::sync::outbox::local_origin;
 use aruna_runner::driver::drive;
 
-use super::folders::map_folder_error;
-
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(get_local_origin))
 }
@@ -79,7 +77,7 @@ async fn get_local_origin(
     let version_id = Ulid::from_str(&version_id).map_err(|_| ServerError::BadRequest)?;
     let origin = drive(local_origin(version_id), &state.get_ctx())
         .await
-        .map_err(map_folder_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
     Ok(Json(DeviceOrigin {
         version_id: version_id.to_string(),

@@ -100,29 +100,31 @@ fn not_coordinator(message: String) -> ServerError {
     ServerError::Refused(StatusCode::SERVICE_UNAVAILABLE, "not_coordinator", message)
 }
 
-fn map_merge_error(error: MergeError) -> ServerError {
-    let message = error.to_string();
-    match error {
-        MergeError::StaleLogin
-        | MergeError::TokenInvalid
-        | MergeError::SameAccount
-        | MergeError::OtherRealm
-        | MergeError::Inactive
-        | MergeError::ServiceAccount => refused(message),
-        MergeError::VaultPresent => {
-            ServerError::Refused(StatusCode::CONFLICT, "vault_present", message)
+impl From<MergeError> for ServerError {
+    fn from(error: MergeError) -> Self {
+        let message = error.to_string();
+        match error {
+            MergeError::StaleLogin
+            | MergeError::TokenInvalid
+            | MergeError::SameAccount
+            | MergeError::OtherRealm
+            | MergeError::Inactive
+            | MergeError::ServiceAccount => refused(message),
+            MergeError::VaultPresent => {
+                ServerError::Refused(StatusCode::CONFLICT, "vault_present", message)
+            }
+            MergeError::RoleConflict(_) => {
+                ServerError::Refused(StatusCode::CONFLICT, "role_conflict", message)
+            }
+            MergeError::NotFound => ServerError::NotFound,
+            MergeError::Unauthorized => ServerError::Forbidden,
+            MergeError::InvalidCoordinator => ServerError::BadRequestReason(message),
+            MergeError::NotCoordinator => not_coordinator(message),
+            MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
+                ServerError::ServiceUnavailableReason(message)
+            }
+            _ => ServerError::InternalError(message.into()),
         }
-        MergeError::RoleConflict(_) => {
-            ServerError::Refused(StatusCode::CONFLICT, "role_conflict", message)
-        }
-        MergeError::NotFound => ServerError::NotFound,
-        MergeError::Unauthorized => ServerError::Forbidden,
-        MergeError::InvalidCoordinator => ServerError::BadRequestReason(message),
-        MergeError::NotCoordinator => not_coordinator(message),
-        MergeError::Storage(_) | MergeError::Vault(_) | MergeError::PlacementFenced => {
-            ServerError::ServiceUnavailableReason(message)
-        }
-        _ => ServerError::InternalError(message.into()),
     }
 }
 
@@ -224,7 +226,7 @@ async fn merge_account(
     };
     let outcome = drive(MergeUsersOperation::new(config), &state.get_ctx())
         .await
-        .map_err(map_merge_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(MergeAccountResponse {
         user_id: outcome.survivor.to_string(),
         merged_user_id: outcome.merged.to_string(),
@@ -378,7 +380,7 @@ async fn hand_off(
     };
     drive(HandoffOperation::new(config), &state.get_ctx())
         .await
-        .map_err(map_merge_error)?;
+        .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -3,14 +3,14 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::auth::{ValidatedBearer, parse_group_id};
+use crate::error::ServerError;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::model::{
     MetadataQueryMode, MetadataQueryResponse, MetadataSearchParams, SearchResultsResponse,
     SparqlQueryRequest,
 };
 use crate::metadata::{
-    bearer_token_string, map_api_error, map_query_mode, map_query_results, map_search_hit,
-    parse_document_id,
+    bearer_token_string, map_query_mode, map_query_results, map_search_hit, parse_document_id,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -151,7 +151,7 @@ pub async fn query_metadata_document(
         ctx.as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     let serialize_started = Instant::now();
     let response = map_query_results(result.results, result.fanout_stats)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
@@ -286,7 +286,7 @@ pub async fn query_all_metadata(
         ctx.as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     let serialize_started = Instant::now();
     let response = map_query_results(result.results, result.fanout_stats)?;
     aruna_core::telemetry::record_stage("serialize", serialize_started.elapsed());
@@ -433,7 +433,7 @@ pub async fn search_metadata(
         ctx.as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::OK,
         Json(SearchResultsResponse {

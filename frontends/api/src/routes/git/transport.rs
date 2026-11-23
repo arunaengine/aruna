@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use super::git_node;
-use super::{api_url, base_url, map_error, repository_id};
+use super::{api_url, base_url, repository_id};
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
@@ -62,7 +62,7 @@ pub async fn advertise(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     serve(
         state,
         auth,
@@ -111,7 +111,7 @@ pub async fn rpc(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let body = to_bytes(body, MAX_GIT_BYTES)
         .await
         .map_err(|_| ServerError::PayloadTooLarge("Git request exceeds limit".into()))?;
@@ -153,7 +153,7 @@ async fn serve(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let request = GitRequest {
         repository,
         method: method.into(),
@@ -181,7 +181,9 @@ async fn serve(
         push_key: String::new(),
     };
     let serve = git::transport::transport(&git_node(&state), &auth, request);
-    let result = drive(serve, &state.get_ctx()).await.map_err(map_error)?;
+    let result = drive(serve, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     let GitEvent::Response {
         status,
         headers,

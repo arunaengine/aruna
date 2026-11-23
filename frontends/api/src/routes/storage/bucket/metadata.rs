@@ -25,7 +25,6 @@ use utoipa::ToSchema;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use super::super::distributed::map_create_error;
 use super::super::routing::ensure_group_admin;
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};
@@ -189,7 +188,7 @@ pub(crate) async fn write_metadata(
                 &state.get_ctx(),
             )
             .await
-            .map_err(map_create_error)?;
+            .map_err(ServerError::from)?;
         }
         None => {
             let mut put = PutMetadataOperation::new(

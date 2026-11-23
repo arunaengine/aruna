@@ -349,11 +349,11 @@ fn list_preserves_reason() {
 fn referenced_connector_conflicts() {
     // A still-referenced credential is a policy refusal, not an internal error.
     assert!(matches!(
-        map_replace_error(ReplaceSourceError::ReferencedObjectVersion),
+        ServerError::from(ReplaceSourceError::ReferencedObjectVersion),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_delete_error(DeleteSourceError::ReferencedObjectVersion),
+        ServerError::from(DeleteSourceError::ReferencedObjectVersion),
         ServerError::Conflict(_)
     ));
 }
@@ -492,19 +492,19 @@ fn requests_hide_secrets() {
 fn pending_references_retry() {
     // A connector whose references are still being checked can be replaced or deleted later.
     assert!(matches!(
-        map_replace_error(ReplaceSourceError::ReferencesPending),
+        ServerError::from(ReplaceSourceError::ReferencesPending),
         ServerError::ServiceUnavailableReason(_)
     ));
     assert!(matches!(
-        map_delete_error(DeleteSourceError::ReferencesPending),
+        ServerError::from(DeleteSourceError::ReferencesPending),
         ServerError::ServiceUnavailableReason(_)
     ));
     assert!(matches!(
-        map_replace_error(ReplaceSourceError::ReferencedObjectVersion),
+        ServerError::from(ReplaceSourceError::ReferencedObjectVersion),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_delete_error(DeleteSourceError::NotFound),
+        ServerError::from(DeleteSourceError::NotFound),
         ServerError::NotFound
     ));
 }

@@ -297,21 +297,21 @@ fn staging_submit_classifies() {
     use aruna_core::job_request::SubmitJobError;
 
     assert_eq!(
-        map_submit_error(SubmitJobError::PlacementUnavailable(
+        ServerError::from(SubmitJobError::PlacementUnavailable(
             "no binding".to_string()
         ))
         .status_code(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     assert_eq!(
-        map_submit_error(SubmitJobError::InvalidWorkspace("bad".to_string())).status_code(),
+        ServerError::from(SubmitJobError::InvalidWorkspace("bad".to_string())).status_code(),
         StatusCode::BAD_REQUEST
     );
 }
 
 #[test]
 fn quota_maps_forbidden() {
-    let error = map_snapshot_error(MaterializeSnapshotError::Write(
+    let error = ServerError::from(MaterializeSnapshotError::Write(
         PutObjectError::QuotaExceeded {
             limit: 100,
             usage: 200,

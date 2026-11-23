@@ -23,8 +23,6 @@ use aruna_ops_data::device::sync::folders::RealmBucketInput;
 use aruna_ops_data::device::sync::folders::bind::create_realm_bucket;
 use aruna_runner::driver::drive;
 
-use super::folders::map_folder_error;
-
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(create_device_bucket))
 }
@@ -116,7 +114,7 @@ pub(super) async fn create_device_bucket(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_folder_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::CREATED,
         Json(CreatedBucket {

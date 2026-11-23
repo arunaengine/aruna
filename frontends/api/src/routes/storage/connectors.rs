@@ -9,7 +9,6 @@ use std::sync::Arc;
 use crate::auth::parse_group_id;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::staging::map_resolution_error;
 use crate::server::state::ServerState;
 use aruna_core::structs::execution::source_access::{
     ListCursor, ListRequest, ResolvedSourceAccess, SourceEntryKind,
@@ -376,7 +375,7 @@ pub async fn create_source_connector(
     };
     let result = drive(operation, &state.get_ctx())
         .await
-        .map_err(map_create_error)?;
+        .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::CREATED,
@@ -536,7 +535,7 @@ pub async fn get_source_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_get_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -661,7 +660,7 @@ pub async fn replace_source_connector(
     )
     .await
     .and_then(|result| result.ok_or(ReplaceSourceError::ReferencesPending))
-    .map_err(map_replace_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -742,7 +741,7 @@ pub async fn delete_source_connector(
     )
     .await
     .and_then(|result| result.ok_or(DeleteSourceError::ReferencesPending))
-    .map_err(map_delete_error)?;
+    .map_err(ServerError::from)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -846,7 +845,7 @@ pub async fn check_source_connector(
     .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
 
     let access = resolve_inline_access(kind, &request.public_config, request.secret_config)
-        .map_err(map_resolution_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(run_connector_check(&state, access).await))
 }
 
@@ -934,7 +933,7 @@ pub async fn check_stored_connector(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_resolution_error)?;
+    .map_err(ServerError::from)?;
 
     Ok(Json(run_connector_check(&state, resolved.access).await))
 }
@@ -1166,7 +1165,7 @@ fn normalize_browse_path(path: &str) -> ServerResult<String> {
     if path.trim().is_empty() {
         return Ok(String::new());
     }
-    validate_source_path(path, false).map_err(map_resolution_error)?;
+    validate_source_path(path, false).map_err(ServerError::from)?;
     Ok(format!("{}/", path.trim().trim_end_matches('/')))
 }
 
@@ -1192,11 +1191,13 @@ pub(crate) async fn ensure_data_permission(
 async fn connector_has_secret(state: &ServerState, connector_id: Ulid) -> ServerResult<bool> {
     drive(HasConfigOperation::new(connector_id), &state.get_ctx())
         .await
-        .map_err(map_secret_error)
+        .map_err(ServerError::from)
 }
 
-fn map_secret_error(error: HasConfigError) -> ServerError {
-    ServerError::InternalError(error.into())
+impl From<HasConfigError> for ServerError {
+    fn from(error: HasConfigError) -> Self {
+        ServerError::InternalError(error.into())
+    }
 }
 
 fn map_connector_response(
@@ -1220,11 +1221,13 @@ fn format_system_time(value: std::time::SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
 }
 
-fn map_create_error(error: SourceConnectorError) -> ServerError {
-    match error {
-        SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
-        SourceConnectorError::IdTaken => ServerError::Conflict(error.to_string()),
-        _ => ServerError::InternalError(error.into()),
+impl From<SourceConnectorError> for ServerError {
+    fn from(error: SourceConnectorError) -> Self {
+        match error {
+            SourceConnectorError::ValidationError(_) => ServerError::BadRequest,
+            SourceConnectorError::IdTaken => ServerError::Conflict(error.to_string()),
+            _ => ServerError::InternalError(error.into()),
+        }
     }
 }
 
@@ -1232,41 +1235,47 @@ fn map_connector_list(error: ListSourceError) -> ServerError {
     ServerError::InternalError(error.into())
 }
 
-fn map_get_error(error: aruna_ops_data::connectors::get_connector::GetSourceError) -> ServerError {
-    match error {
-        GetSourceError::NotFound => ServerError::NotFound,
-        GetSourceError::StorageError(_) | GetSourceError::ConversionError(_) => {
-            ServerError::InternalError(error.into())
+impl From<aruna_ops_data::connectors::get_connector::GetSourceError> for ServerError {
+    fn from(error: aruna_ops_data::connectors::get_connector::GetSourceError) -> Self {
+        match error {
+            GetSourceError::NotFound => ServerError::NotFound,
+            GetSourceError::StorageError(_) | GetSourceError::ConversionError(_) => {
+                ServerError::InternalError(error.into())
+            }
         }
     }
 }
 
-fn map_replace_error(error: ReplaceSourceError) -> ServerError {
-    match error {
-        ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
-        ReplaceSourceError::NotFound => ServerError::NotFound,
-        ReplaceSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
-        ReplaceSourceError::ReferencesPending => {
-            ServerError::ServiceUnavailableReason(error.to_string())
+impl From<ReplaceSourceError> for ServerError {
+    fn from(error: ReplaceSourceError) -> Self {
+        match error {
+            ReplaceSourceError::ValidationError(_) => ServerError::BadRequest,
+            ReplaceSourceError::NotFound => ServerError::NotFound,
+            ReplaceSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
+            ReplaceSourceError::ReferencesPending => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            _ => ServerError::InternalError(error.into()),
         }
-        _ => ServerError::InternalError(error.into()),
     }
 }
 
-fn map_delete_error(error: DeleteSourceError) -> ServerError {
-    match error {
-        DeleteSourceError::NotFound => ServerError::NotFound,
-        DeleteSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
-        DeleteSourceError::ReferencesPending => {
-            ServerError::ServiceUnavailableReason(error.to_string())
+impl From<DeleteSourceError> for ServerError {
+    fn from(error: DeleteSourceError) -> Self {
+        match error {
+            DeleteSourceError::NotFound => ServerError::NotFound,
+            DeleteSourceError::ReferencedObjectVersion => ServerError::Conflict(error.to_string()),
+            DeleteSourceError::ReferencesPending => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            _ => ServerError::InternalError(error.into()),
         }
-        _ => ServerError::InternalError(error.into()),
     }
 }
 
 fn map_list_error(error: ListStagingError) -> ServerError {
     match error {
-        ListStagingError::Resolve(error) => map_resolution_error(error),
+        ListStagingError::Resolve(error) => ServerError::from(error),
         ListStagingError::Staging(aruna_core::errors::StagingSourceError::NotFound) => {
             ServerError::NotFound
         }

@@ -49,7 +49,6 @@ use crate::auth::{ensure_permission, require_unrestricted_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::job_urls;
 use crate::lookup::bucket_info;
-use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 
 const ZIP_MEDIA_TYPE: &str = "application/zip";
@@ -262,7 +261,7 @@ pub async fn upload_rocrate(
         deadline,
     )
     .await
-    .map_err(map_upload_error)?;
+    .map_err(ServerError::from)?;
     drop(upload_slot);
     let record = match &push {
         Some(push) => {
@@ -427,7 +426,7 @@ pub async fn submit_import(
             JobPayload::ImportRoCrate(spec.clone()).plan_digest(),
         )
         .await
-        .map_err(map_submit_error)?
+        .map_err(ServerError::from)?
     } else {
         None
     };
@@ -446,7 +445,7 @@ pub async fn submit_import(
         );
         let document_id = drive(mint, state.get_ctx().as_ref())
             .await
-            .map_err(crate::metadata::map_create_error)?
+            .map_err(ServerError::from)?
             .as_ulid();
         spec.document_id = document_id;
         fast_source_check(
@@ -465,7 +464,7 @@ pub async fn submit_import(
             request.idempotency_key,
         )
         .await
-        .map_err(map_submit_error)?
+        .map_err(ServerError::from)?
     };
     let urls = job_urls(&state, result.job_id).await?;
     Ok((
@@ -688,7 +687,7 @@ async fn fast_source_check(
             .await
             {
                 Ok(result) => result,
-                Err(error) => return Err(map_head_error(error)),
+                Err(error) => return Err(ServerError::from(error)),
             };
             if result
                 .location
@@ -817,15 +816,17 @@ pub(crate) fn upload_body_stream(
     }))
 }
 
-pub(crate) fn map_upload_error(error: CreateRoCrateError) -> ServerError {
-    match error {
-        CreateRoCrateError::Blob(BlobError::SizeLimitExceeded { limit }) => {
-            ServerError::PayloadTooLarge(format!("upload exceeds limit {limit}"))
+impl From<CreateRoCrateError> for ServerError {
+    fn from(error: CreateRoCrateError) -> Self {
+        match error {
+            CreateRoCrateError::Blob(BlobError::SizeLimitExceeded { limit }) => {
+                ServerError::PayloadTooLarge(format!("upload exceeds limit {limit}"))
+            }
+            CreateRoCrateError::Blob(BlobError::HandleMissing) => {
+                ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        CreateRoCrateError::Blob(BlobError::HandleMissing) => {
-            ServerError::ServiceUnavailableReason("blob storage is unavailable".to_string())
-        }
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -863,12 +864,14 @@ fn validate_source_path(path: &str) -> ServerResult<()> {
 }
 
 /// A missing object reads as 404 like a missing bucket; anything else is the node's own failure.
-pub(crate) fn map_head_error(error: HeadObjectError) -> ServerError {
-    match error {
-        HeadObjectError::NoSuchKey
-        | HeadObjectError::NoSuchVersion
-        | HeadObjectError::DeleteMarker => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
+impl From<HeadObjectError> for ServerError {
+    fn from(error: HeadObjectError) -> Self {
+        match error {
+            HeadObjectError::NoSuchKey
+            | HeadObjectError::NoSuchVersion
+            | HeadObjectError::DeleteMarker => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 

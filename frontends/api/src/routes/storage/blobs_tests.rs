@@ -25,7 +25,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::user::id::UserId;
 use aruna_ops_data::replication::locations::LocationSummaryError;
 use aruna_runner::driver::DriverContext;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::Extension;
 use axum::extract::{Query, State};
 use byteview::ByteView;
@@ -311,8 +311,7 @@ fn realm_for(seed: u8) -> RealmId {
 /// A realm holding one group whose owner may read `TEST_BUCKET`.
 async fn setup_bucket(realm_id: RealmId, owner: UserId) -> (TempDir, Arc<ServerState>) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let state = Arc::new(
         ServerState::new(
             Arc::new(DriverContext {

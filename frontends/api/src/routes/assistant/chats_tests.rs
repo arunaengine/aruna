@@ -396,22 +396,22 @@ async fn requires_unrestricted_token() {
 #[test]
 fn maps_store_errors() {
     assert_eq!(
-        map_chat_error(IoError::Unfinished.into())
+        ServerError::from(ChatStoreError::from(IoError::Unfinished))
             .into_response()
             .status(),
         StatusCode::INTERNAL_SERVER_ERROR
     );
     assert_eq!(
-        map_chat_error(ChatStoreError::Storage(StorageError::TransactionConflict))
+        ServerError::from(ChatStoreError::Storage(StorageError::TransactionConflict))
             .into_response()
             .status(),
         StatusCode::CONFLICT
     );
-    let stale = map_chat_error(ChatStoreError::StaleTurn { next_seq: 7 });
+    let stale = ServerError::from(ChatStoreError::StaleTurn { next_seq: 7 });
     assert!(stale.to_string().contains('7'));
     assert_eq!(stale.into_response().status(), StatusCode::CONFLICT);
     assert_eq!(
-        map_chat_error(ChatStoreError::Deleted)
+        ServerError::from(ChatStoreError::Deleted)
             .into_response()
             .status(),
         StatusCode::GONE

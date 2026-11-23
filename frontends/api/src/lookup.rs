@@ -68,16 +68,20 @@ pub(crate) fn actor(state: &ServerState, auth: &AuthContext) -> Actor {
 
 /// A write this member of a distributed bucket may not take now: 503 when a retry or the
 /// coordinator can take it, 409 when the bucket state refuses it.
-pub(crate) fn map_guard_error(error: GuardError) -> ServerError {
-    match error {
-        GuardError::NotCoordinator { .. }
-        | GuardError::RecordMissing(_)
-        | GuardError::Unreadable(_)
-        | GuardError::Route(
-            RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
-        ) => ServerError::ServiceUnavailableReason(error.to_string()),
-        GuardError::Route(_) | GuardError::Unbound(_) => ServerError::Conflict(error.to_string()),
-        GuardError::Conversion(error) => ServerError::InternalError(error.into()),
+impl From<GuardError> for ServerError {
+    fn from(error: GuardError) -> Self {
+        match error {
+            GuardError::NotCoordinator { .. }
+            | GuardError::RecordMissing(_)
+            | GuardError::Unreadable(_)
+            | GuardError::Route(
+                RouteError::Pending(_) | RouteError::Moving(_) | RouteError::StaleRange(_),
+            ) => ServerError::ServiceUnavailableReason(error.to_string()),
+            GuardError::Route(_) | GuardError::Unbound(_) => {
+                ServerError::Conflict(error.to_string())
+            }
+            GuardError::Conversion(error) => ServerError::InternalError(error.into()),
+        }
     }
 }
 

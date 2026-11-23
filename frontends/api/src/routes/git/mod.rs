@@ -11,7 +11,6 @@ mod transport;
 pub(crate) mod versions;
 
 use crate::auth::UnrestrictedAuth;
-use crate::auth::map_authorize_error;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::GitNode;
@@ -98,22 +97,26 @@ fn repository_id(value: &str) -> ServerResult<Ulid> {
         .map_err(|_| ServerError::BadRequest)
 }
 
-fn map_error(error: GitError) -> ServerError {
-    match error {
-        GitError::NotFound => ServerError::NotFound,
-        GitError::Invalid => ServerError::BadRequest,
-        GitError::Conflict => ServerError::Conflict("repository binding differs".into()),
-        GitError::Authorization(error) => map_authorize_error(error),
-        GitError::Unavailable | GitError::Full => ServerError::ServiceUnavailable,
-        GitError::NotHolder => ServerError::NotFound,
-        GitError::Locked(path) => {
-            ServerError::Conflict(format!("{path} is locked by another user"))
+impl From<GitError> for ServerError {
+    fn from(error: GitError) -> Self {
+        match error {
+            GitError::NotFound => ServerError::NotFound,
+            GitError::Invalid => ServerError::BadRequest,
+            GitError::Conflict => ServerError::Conflict("repository binding differs".into()),
+            GitError::Authorization(error) => ServerError::from(error),
+            GitError::Unavailable | GitError::Full => ServerError::ServiceUnavailable,
+            GitError::NotHolder => ServerError::NotFound,
+            GitError::Locked(path) => {
+                ServerError::Conflict(format!("{path} is locked by another user"))
+            }
+            GitError::Stale => ServerError::PreconditionFailed(error.to_string()),
+            GitError::Exists | GitError::MergeConflict(_) => {
+                ServerError::Conflict(error.to_string())
+            }
+            GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
+            GitError::NotHook => ServerError::Forbidden,
+            GitError::BranchMissing => ServerError::NotFound,
         }
-        GitError::Stale => ServerError::PreconditionFailed(error.to_string()),
-        GitError::Exists | GitError::MergeConflict(_) => ServerError::Conflict(error.to_string()),
-        GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
-        GitError::NotHook => ServerError::Forbidden,
-        GitError::BranchMissing => ServerError::NotFound,
     }
 }
 
@@ -149,7 +152,7 @@ pub async fn push(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ServerResult<StatusCode> {
-    let (request, pack) = git::push::decode(body).map_err(map_error)?;
+    let (request, pack) = git::push::decode(body).map_err(ServerError::from)?;
     let key = headers
         .get("x-aruna-push-key")
         .and_then(|value| value.to_str().ok())
@@ -159,6 +162,6 @@ pub async fn push(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }

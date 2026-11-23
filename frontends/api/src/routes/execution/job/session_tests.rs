@@ -53,7 +53,7 @@ use aruna_ops_work::jobs::store::job_calls::{ClaimOutcome, change_job};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::jobs::insert_job;
 use aruna_test_harness::jobs::put_job_entry;
 use aruna_test_harness::jobs::{cancel_running_job, claim_job, read_job_record};
@@ -209,7 +209,7 @@ fn session_spec() -> ExecutionSpec {
 /// of its channel.
 async fn build_node(owner: UserId) -> (TempDir, Arc<ServerState>, JobId, DuplexStream) {
     let dir = tempfile::tempdir().expect("a temporary store");
-    let storage = FjallStorage::open(dir.path().to_str().expect("a store path")).expect("a store");
+    let storage = MemoryStorage::open();
     let (node_side, helper) = tokio::io::duplex(64 * 1024);
     let backend = Arc::new(FakeBackend {
         helper: AsyncMutex::new(Some(node_side)),

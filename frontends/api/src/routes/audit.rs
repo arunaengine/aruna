@@ -6,7 +6,6 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, parse_group_id};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::user_origin;
-use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::metadata_registry::MetadataAuditOperation;
@@ -217,12 +216,12 @@ pub async fn list_audit(
         let carrier = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         Some(
             forwarded_bearer(Some(carrier.as_str()))
-                .map_err(map_api_error)?
+                .map_err(ServerError::from)?
                 .ok_or(ServerError::Unauthorized)?,
         )
     } else {
         forwarded_bearer(bearer_token.as_ref().map(|carrier| carrier.as_str()))
-            .map_err(map_api_error)?
+            .map_err(ServerError::from)?
     };
     let request = ListAuditRequest {
         group_id,

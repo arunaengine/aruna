@@ -273,22 +273,30 @@ impl From<StorageRoutingRule> for RoutingRuleRequest {
     }
 }
 
-fn map_group_error(error: PutGroupError) -> ServerError {
-    match error {
-        PutGroupError::InvalidTarget(reason) => ServerError::BadRequestReason(reason.to_string()),
-        PutGroupError::Invalid(message) => ServerError::BadRequestMessage(message),
-        PutGroupError::Unusable(error) => ServerError::BadRequestMessage(error.reason()),
-        PutGroupError::Conflict(message) => ServerError::Conflict(message),
-        PutGroupError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
-        other => ServerError::InternalError(other.into()),
+impl From<PutGroupError> for ServerError {
+    fn from(error: PutGroupError) -> Self {
+        match error {
+            PutGroupError::InvalidTarget(reason) => {
+                ServerError::BadRequestReason(reason.to_string())
+            }
+            PutGroupError::Invalid(message) => ServerError::BadRequestMessage(message),
+            PutGroupError::Unusable(error) => ServerError::BadRequestMessage(error.reason()),
+            PutGroupError::Conflict(message) => ServerError::Conflict(message),
+            PutGroupError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
-fn map_put_error(error: PutRoutingError) -> ServerError {
-    match error {
-        PutRoutingError::NoSuchBucket | PutRoutingError::GroupMismatch => ServerError::NotFound,
-        PutRoutingError::InvalidRules(reason) => ServerError::BadRequestReason(reason.to_string()),
-        other => ServerError::InternalError(other.into()),
+impl From<PutRoutingError> for ServerError {
+    fn from(error: PutRoutingError) -> Self {
+        match error {
+            PutRoutingError::NoSuchBucket | PutRoutingError::GroupMismatch => ServerError::NotFound,
+            PutRoutingError::InvalidRules(reason) => {
+                ServerError::BadRequestReason(reason.to_string())
+            }
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -505,7 +513,7 @@ pub async fn put_bucket_routing(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_put_error)?;
+    .map_err(ServerError::from)?;
 
     let warnings = warnings_for(&state, group_id, stored.iter().map(|rule| &rule.target)).await;
     Ok(Json(BucketRoutingResponse {
@@ -674,7 +682,7 @@ pub async fn put_group_routing(
             drive(operation, &state.get_ctx()).await
         }
     }
-    .map_err(map_group_error)?;
+    .map_err(ServerError::from)?;
 
     let target = record.default_target;
     let warnings = warnings_for(&state, group_id, target.iter()).await;

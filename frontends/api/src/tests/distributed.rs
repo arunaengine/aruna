@@ -39,7 +39,7 @@ use aruna_ops_data::distribution::inventory::open_ranges;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::Router;
 use axum::http::{StatusCode, Uri};
 use std::collections::HashMap;
@@ -79,7 +79,7 @@ pub(crate) struct Node {
 pub(crate) async fn node_state() -> Node {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_str().unwrap();
-    let storage = FjallStorage::open(root).unwrap();
+    let storage = MemoryStorage::open();
     storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId([3; 32]);
     let config = NetConfig {

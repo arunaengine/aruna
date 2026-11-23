@@ -6,7 +6,6 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, claims_for_revocation, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::user_origin;
-use crate::metadata::map_api_error;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
@@ -113,7 +112,7 @@ pub async fn revoke_token(
     if user_origin {
         let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
-            .map_err(map_api_error)?
+            .map_err(ServerError::from)?
             .ok_or(ServerError::Unauthorized)?;
         drive(
             ForwardRevokeOperation::new(
@@ -127,7 +126,7 @@ pub async fn revoke_token(
         )
         .await
         .map_err(MetadataApiError::from)
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -151,7 +150,7 @@ pub async fn revoke_token(
         ctx.as_ref(),
     )
     .await
-    .map_err(map_revoke_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -160,13 +159,15 @@ fn revokes_self(caller: Option<&ValidatedBearer>, token: &str) -> bool {
     caller.is_some_and(|caller| bearer_token_hash(caller.as_str()) == bearer_token_hash(token))
 }
 
-fn map_revoke_error(error: RevokeTokenError) -> ServerError {
-    match error {
-        RevokeTokenError::CapacityReached => {
-            ServerError::ServiceUnavailableReason("token_revocation_capacity_reached".to_string())
+impl From<RevokeTokenError> for ServerError {
+    fn from(error: RevokeTokenError) -> Self {
+        match error {
+            RevokeTokenError::CapacityReached => ServerError::ServiceUnavailableReason(
+                "token_revocation_capacity_reached".to_string(),
+            ),
+            RevokeTokenError::InvalidTokenExpiry => ServerError::BadRequest,
+            error => ServerError::InternalError(error.into()),
         }
-        RevokeTokenError::InvalidTokenExpiry => ServerError::BadRequest,
-        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -184,21 +185,21 @@ mod tests {
     use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_runner::driver::DriverContext;
     use aruna_runner::jobs::runtime::JobsRuntime;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use axum::response::IntoResponse;
     use ed25519_dalek::SigningKey;
     use ulid::Ulid;
 
     #[test]
     fn capacity_maps_503() {
-        let response = map_revoke_error(RevokeTokenError::CapacityReached).into_response();
+        let response = ServerError::from(RevokeTokenError::CapacityReached).into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     async fn state_with_token() -> (tempfile::TempDir, Arc<ServerState>, RealmId, UserId, String) {
         let dir = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         let ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

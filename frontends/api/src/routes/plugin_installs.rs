@@ -329,13 +329,13 @@ pub async fn install(
     }
     let place = (state.get_realm_id(), local_node(&ctx));
     let prepare = PrepareInstall::new(&auth, place, &request);
-    let prepared = drive(prepare, &ctx).await.map_err(map_error)?;
+    let prepared = drive(prepare, &ctx).await.map_err(ServerError::from)?;
     if preview {
         let summary = InstallSummary::from(prepared_summary(&prepared));
         return Ok(Json(summary).into_response());
     }
     let install = InstallPrepared::new(caller(&state, &auth), prepared);
-    let installed = drive(install, &ctx).await.map_err(map_error)?;
+    let installed = drive(install, &ctx).await.map_err(ServerError::from)?;
     let view = view(&state, installed).await?;
     Ok((StatusCode::CREATED, Json(view)).into_response())
 }
@@ -470,7 +470,9 @@ pub async fn remove(
     };
     secret_session(&state, &auth, (Some(install_id), None)).await?;
     let remove = RemoveInstall::new(caller(&state, &auth), install_id);
-    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
+    drive(remove, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -500,7 +502,9 @@ async fn remove_conflicted(
         secret_session(state, &auth, (None, Some(&candidate.digest))).await?;
     }
     let remove = RemoveConflicted::new(caller(state, &auth), (install_id, proven));
-    drive(remove, &state.get_ctx()).await.map_err(map_error)?;
+    drive(remove, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -619,30 +623,32 @@ fn view_in(config: &RealmConfigDocument, install: PluginInstall) -> InstallView 
     }
 }
 
-pub(crate) fn map_error(error: InstallError) -> ServerError {
-    let message = error.to_string();
-    match error {
-        InstallError::Unauthorized | InstallError::NotHeld(_) => ServerError::Forbidden,
-        InstallError::NotPublished | InstallError::NotFound => ServerError::NotFound,
-        InstallError::Grant(GrantError::Unsupported(_))
-        | InstallError::Grant(_)
-        | InstallError::Setting(_)
-        | InstallError::Binding(_) => ServerError::BadRequestReason(message),
-        InstallError::Changed | InstallError::State(_) | InstallError::Step { .. } => {
-            ServerError::Conflict(message)
-        }
-        InstallError::Record(RecordError::Unauthorized | RecordError::NotManagementNode) => {
-            ServerError::Forbidden
-        }
-        InstallError::Record(
-            RecordError::Stale(_)
-            | RecordError::Retired
-            | RecordError::Unproven
-            | RecordError::StorageError(StorageError::TransactionConflict),
-        ) => ServerError::Conflict(message),
-        InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
-        InstallError::Manifest(_) | InstallError::Record(_) => {
-            ServerError::InternalError(message.into())
+impl From<InstallError> for ServerError {
+    fn from(error: InstallError) -> Self {
+        let message = error.to_string();
+        match error {
+            InstallError::Unauthorized | InstallError::NotHeld(_) => ServerError::Forbidden,
+            InstallError::NotPublished | InstallError::NotFound => ServerError::NotFound,
+            InstallError::Grant(GrantError::Unsupported(_))
+            | InstallError::Grant(_)
+            | InstallError::Setting(_)
+            | InstallError::Binding(_) => ServerError::BadRequestReason(message),
+            InstallError::Changed | InstallError::State(_) | InstallError::Step { .. } => {
+                ServerError::Conflict(message)
+            }
+            InstallError::Record(RecordError::Unauthorized | RecordError::NotManagementNode) => {
+                ServerError::Forbidden
+            }
+            InstallError::Record(
+                RecordError::Stale(_)
+                | RecordError::Retired
+                | RecordError::Unproven
+                | RecordError::StorageError(StorageError::TransactionConflict),
+            ) => ServerError::Conflict(message),
+            InstallError::Unavailable(_) => ServerError::ServiceUnavailableReason(message),
+            InstallError::Manifest(_) | InstallError::Record(_) => {
+                ServerError::InternalError(message.into())
+            }
         }
     }
 }

@@ -121,22 +121,26 @@ pub async fn set_portal_features(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_portal_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(PortalFeatures {
         features: stored.portal_features,
     }))
 }
 
-fn map_portal_error(error: SetPortalError) -> ServerError {
-    match error {
-        SetPortalError::ConfigMissing => ServerError::NotFound,
-        SetPortalError::Unauthorized | SetPortalError::NotManagementNode => ServerError::Forbidden,
-        SetPortalError::InvalidFeatures { reason } => ServerError::BadRequestReason(reason),
-        SetPortalError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::config_conflict()
+impl From<SetPortalError> for ServerError {
+    fn from(error: SetPortalError) -> Self {
+        match error {
+            SetPortalError::ConfigMissing => ServerError::NotFound,
+            SetPortalError::Unauthorized | SetPortalError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetPortalError::InvalidFeatures { reason } => ServerError::BadRequestReason(reason),
+            SetPortalError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::config_conflict()
+            }
+            SetPortalError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        SetPortalError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 

@@ -21,7 +21,7 @@ use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOper
 use aruna_ops_identity::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -46,7 +46,7 @@ fn node(seed: u8) -> aruna_core::id::NodeId {
 /// and its members are produced by the operations enrollment uses.
 async fn setup_devices() -> Fixture {
     let dir = tempdir().unwrap();
-    let storage_handle = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = MemoryStorage::open();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,

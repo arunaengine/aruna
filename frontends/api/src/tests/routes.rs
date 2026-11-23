@@ -18,7 +18,7 @@ use aruna_core::user::id::UserId;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::{Extension, Router};
@@ -31,7 +31,7 @@ use utoipa_axum::router::OpenApiRouter;
 
 pub(crate) fn test_storage() -> (TempDir, StorageHandle) {
     let directory = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     (directory, storage)
 }

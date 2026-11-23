@@ -1229,10 +1229,10 @@ mod tests {
             &Payload::Framed { checksum: None }
         ));
     }
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
 
-    fn provider(path: &str) -> AuthProvider {
-        let storage = FjallStorage::open(path).unwrap();
+    fn provider() -> AuthProvider {
+        let storage = MemoryStorage::open();
         let driver_ctx = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,
@@ -1339,8 +1339,7 @@ mod tests {
         use aruna_core::effects::StorageEffect;
         use aruna_core::structs::identity::realm::{RealmConfigDocument, TokenRevocation};
         use ulid::Ulid;
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let user = UserId::local(Ulid::generate(), provider.realm_id);
         let cutoff = aruna_clock::unix_timestamp_secs() + 60;
         let mut config = RealmConfigDocument::new(provider.realm_id, Vec::new(), 3);
@@ -1388,8 +1387,7 @@ mod tests {
         use aruna_core::keyspaces::USER_KEYSPACE;
         use aruna_core::structs::identity::user::User;
         use aruna_core::user::validation::DEACTIVATED_ATTRIBUTE;
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let refused = issued_access(&provider, *provider.node_id.as_bytes());
         let active = issued_access(&provider, *provider.node_id.as_bytes());
         let owner = refused.user_identity;
@@ -1437,8 +1435,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_legacy_key() {
         // Legacy `{ulid}@{ulid}:workspace-{ulid}` ids must fail before any lookup.
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let legacy = "01ARZ3NDEKTSV4RRFFQ69G5FAV@01ARZ3NDEKTSV4RRFFQ69G5FAW:workspace-01ARZ3";
         let error = provider.get_secret_key(legacy).await.unwrap_err();
         assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidAccessKeyId);
@@ -1448,8 +1445,7 @@ mod tests {
     async fn revoked_spends_nothing() {
         // A revoked credential must be rejected before it charges the owner's
         // shared rate budget, so a replayed revoked key cannot starve the owner.
-        let dir = tempfile::tempdir().unwrap();
-        let mut provider = provider(dir.path().to_str().unwrap());
+        let mut provider = provider();
         provider.rate_limits = Arc::new(crate::rate_limit::ApiRateLimits::for_test(1));
 
         let live = issued_access(&provider, *provider.node_id.as_bytes());
@@ -1467,8 +1463,7 @@ mod tests {
 
     #[tokio::test]
     async fn decrypts_on_issuer() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
 
         let local = issued_access(&provider, *provider.node_id.as_bytes());
         store_access(&provider, &local).await;
@@ -1487,8 +1482,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_required_exact() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
         let session = issued_session(
             &provider,
@@ -1522,8 +1516,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_never_degrades() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let mut long_lived = issued_access(&provider, *provider.node_id.as_bytes());
         long_lived.access_key =
             S3Session::build_access_key(&ulid::Ulid::generate().to_string()).unwrap();
@@ -1558,8 +1551,7 @@ mod tests {
     async fn refreshed_keeps_signed() {
         // A request signed before a refresh carries the old token and verifies with the old secret.
         use aruna_core::structs::identity::s3_session::PreviousCredential;
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let now = SystemTime::now();
         let node = *provider.node_id.as_bytes();
         let mut old = issued_session(&provider, node, now + std::time::Duration::from_secs(120));
@@ -1608,8 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn wrong_node_rejects() {
-        let dir = tempfile::tempdir().unwrap();
-        let provider = provider(dir.path().to_str().unwrap());
+        let provider = provider();
         let expiry = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2_000);
         let local = issued_session(&provider, *provider.node_id.as_bytes(), expiry);
         store_session(&provider, &local).await;

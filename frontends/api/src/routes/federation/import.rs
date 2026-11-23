@@ -10,8 +10,8 @@ use crate::routes::federation::export::{
 };
 use crate::routes::rocrate_import::{
     ImportMetadataRequest, ImportSourceRequest, ImportTargetRequest, SubmitImportRequest,
-    SubmitImportResponse, UploadRoCrateResponse, map_upload_error, owner_node_url,
-    parse_import_metadata, parse_import_target, submit_import, upload_response,
+    SubmitImportResponse, UploadRoCrateResponse, owner_node_url, parse_import_metadata,
+    parse_import_target, submit_import, upload_response,
 };
 use crate::server::state::ServerState;
 use aruna_clock::{unix_timestamp_millis, unix_timestamp_secs};
@@ -359,7 +359,7 @@ async fn pull_artifact(
     };
     drive(CreateRoCrateOperation::new(config), &context)
         .await
-        .map_err(map_upload_error)
+        .map_err(ServerError::from)
 }
 
 #[utoipa::path(

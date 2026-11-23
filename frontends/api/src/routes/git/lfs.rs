@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{base_url, map_error, repository_id};
+use super::{base_url, repository_id};
 use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -58,7 +58,7 @@ pub async fn batch(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let objects: Vec<LfsObject> =
         serde_json::from_value(body["objects"].clone()).map_err(|_| ServerError::BadRequest)?;
     if objects.len() > 1000 {
@@ -94,7 +94,7 @@ pub async fn batch(
             Err(error) => {
                 let code = match error {
                     GitError::Invalid => 422,
-                    other => map_error(other).into_response().status().as_u16(),
+                    other => ServerError::from(other).into_response().status().as_u16(),
                 };
                 item["error"] = json!({"code":code,"message":"object unavailable"});
             }
@@ -147,7 +147,7 @@ pub async fn upload(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::OK)
 }
 
@@ -167,7 +167,7 @@ pub async fn download(
     let context = state.get_ctx();
     let id = repository_id(&repository)?;
     let read = git::download::download(context.node_and_realm(), &auth, id, &oid);
-    let (blob, size) = drive(read, &context).await.map_err(map_error)?;
+    let (blob, size) = drive(read, &context).await.map_err(ServerError::from)?;
     Response::builder()
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, size)

@@ -4,9 +4,13 @@
 
 use super::bucket::MAX_REPLICATION_TARGETS;
 use super::listing::next_marker_of;
+use super::listing::{marker_continuation_token, next_marker_for};
+use super::multipart::parse_upload_marker;
+use super::response::{attach_reference_refresh, object_metadata};
 use super::*;
 use crate::s3::checksum::UploadChecksumRequest;
 use crate::s3::scope::resolve_scope;
+use crate::s3::server::body::DeleteObjectsBody;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
@@ -14,6 +18,8 @@ use aruna_core::keyspaces::{
     NOTIFICATION_INBOX_KEYSPACE, REALM_CONFIG_KEYSPACE, REPLICATION_OBLIGATION_KEYSPACE,
     S3_BUCKET_KEYSPACE,
 };
+use aruna_core::stream::BackendStream;
+use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::execution::notification::{
     NotificationClass, NotificationKind, NotificationRecord,
 };
@@ -40,6 +46,7 @@ use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::object_read::ObjectInfo;
+use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::user::id::UserId;
 use aruna_ops_data::s3::object::list::ListContinuationToken;
@@ -57,12 +64,15 @@ use aruna_storage::storage;
 use futures_util::{StreamExt, stream};
 use http::Extensions;
 use hyper::{HeaderMap, Method, Uri, body::Bytes};
+use s3s::S3ErrorCode;
 use s3s::dto::{
     ChecksumType, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination,
     ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
 };
+use s3s::dto::{EncodingType, MetadataDirective};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 use std::time::{Duration, UNIX_EPOCH};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -78,8 +88,7 @@ struct TestState {
 
 fn parser_service(realm_id: RealmId, node_id: NodeId) -> (TempDir, ArunaS3Service) {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let state = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -396,9 +405,7 @@ fn upload_marker_ignored() {
 
 #[tokio::test]
 async fn put_survives_queue() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -487,8 +494,7 @@ async fn build_watch_context(
     secret: [u8; 32],
 ) -> (TempDir, Arc<DriverContext>, NetHandle) {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -756,9 +762,7 @@ async fn anonymous_put_silent() {
 
 #[tokio::test]
 async fn refresh_failure_hidden() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -870,8 +874,7 @@ async fn newer_refresh_updates() {
 
 fn setup_state() -> TestState {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -2439,8 +2442,7 @@ async fn setup_copy_authorization(
     public: bool,
 ) -> (TempDir, ArunaS3Service, UserAccess, BucketInfo) {
     let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -2627,9 +2629,7 @@ async fn part_copy_scopes() {
 async fn source_policy_denied() {
     // A group deny policy on the source path blocks the copy even when RBAC
     // and destination write are allowed.
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -2724,9 +2724,7 @@ async fn source_policy_denied() {
 async fn delete_uses_context() {
     // The per-object policy must see the real query parameters and allowlisted
     // headers the access hook captured, not an empty operation-only context.
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -2900,9 +2898,7 @@ fn list_request(
 
 #[tokio::test]
 async fn delimiter_groups_results() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -2980,9 +2976,7 @@ async fn delimiter_groups_results() {
 
 #[tokio::test]
 async fn delimiter_paginates() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3135,9 +3129,7 @@ fn marker_rescues_page() {
 
 #[tokio::test]
 async fn prefix_page_complete() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3203,9 +3195,7 @@ async fn prefix_page_complete() {
 
 #[tokio::test]
 async fn listing_counts_entries() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3326,9 +3316,7 @@ async fn listing_counts_entries() {
 
 #[tokio::test]
 async fn large_group_collapses() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3412,9 +3400,7 @@ async fn large_group_collapses() {
 
 #[tokio::test]
 async fn reference_returns_metadata() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3597,9 +3583,7 @@ async fn bare_reference_head() {
 
 #[tokio::test]
 async fn zero_max_honored() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3664,9 +3648,7 @@ async fn zero_max_honored() {
 
 #[tokio::test]
 async fn start_after_prefixes() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3741,9 +3723,7 @@ async fn start_after_prefixes() {
 
 #[tokio::test]
 async fn listing_requires_access() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3780,9 +3760,7 @@ async fn listing_requires_access() {
 
 #[tokio::test]
 async fn max_keys_validated() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3843,9 +3821,7 @@ async fn max_keys_validated() {
 
 #[tokio::test]
 async fn listing_applies_encoding() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,
@@ -3920,9 +3896,7 @@ async fn listing_applies_encoding() {
 
 #[tokio::test]
 async fn fetch_owner_group() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage_handle.clone(),
         net_handle: None,

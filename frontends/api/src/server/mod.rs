@@ -213,10 +213,7 @@ mod tests {
         use aruna_core::structs::identity::auth::NodeCapabilities;
         use aruna_core::structs::identity::realm::RealmId;
 
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
                 .verifying_key()
@@ -278,10 +275,7 @@ mod tests {
         use aruna_core::structs::identity::auth::NodeCapabilities;
         use aruna_core::structs::identity::realm::RealmId;
 
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let realm_id = RealmId::from_bytes(
             ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
                 .verifying_key()

@@ -391,7 +391,7 @@ pub async fn create_onboarding_secret(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
 
     let enroll_url = match request.mode {
         RequestedOnboardingMode::User => Some(enroll_url(
@@ -564,7 +564,7 @@ pub async fn revoke_onboarding_secret(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_delete_error)?;
+    .map_err(ServerError::from)?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -761,7 +761,7 @@ pub async fn bootstrap_onboarding(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_inspect_error)?;
+    .map_err(ServerError::from)?;
 
     // Only node-enrollment secrets may bootstrap a node; an initial-admin
     // secret is rejected here before any reserve or consume.
@@ -831,7 +831,7 @@ pub async fn bootstrap_onboarding(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_finalize_error)?;
+    .map_err(ServerError::from)?;
 
     let realm_endpoints = realm_endpoints(&state, node_id).await?;
 
@@ -910,74 +910,86 @@ fn declared_endpoints(config: &RealmConfigDocument, joiner: &str) -> Vec<StaticR
         .collect()
 }
 
-pub(crate) fn map_consume_error(error: ConsumeSecretError) -> ServerError {
-    match error {
-        ConsumeSecretError::NotFound
-        | ConsumeSecretError::Expired
-        | ConsumeSecretError::AlreadyClaimed
-        | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.into()),
+impl From<ConsumeSecretError> for ServerError {
+    fn from(error: ConsumeSecretError) -> Self {
+        match error {
+            ConsumeSecretError::NotFound
+            | ConsumeSecretError::Expired
+            | ConsumeSecretError::AlreadyClaimed
+            | ConsumeSecretError::InvalidSecret => ServerError::Unauthorized,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
-fn map_finalize_error(error: BootstrapFinalizeError) -> ServerError {
-    match error {
-        BootstrapFinalizeError::Reserve(
-            ReserveSecretError::NotFound
-            | ReserveSecretError::Expired
-            | ReserveSecretError::AlreadyClaimed
-            | ReserveSecretError::InvalidSecret,
-        ) => ServerError::Unauthorized,
-        BootstrapFinalizeError::Reserve(ReserveSecretError::DeviceCapExceeded { .. }) => {
-            ServerError::Conflict(error.to_string())
+impl From<BootstrapFinalizeError> for ServerError {
+    fn from(error: BootstrapFinalizeError) -> Self {
+        match error {
+            BootstrapFinalizeError::Reserve(
+                ReserveSecretError::NotFound
+                | ReserveSecretError::Expired
+                | ReserveSecretError::AlreadyClaimed
+                | ReserveSecretError::InvalidSecret,
+            ) => ServerError::Unauthorized,
+            BootstrapFinalizeError::Reserve(ReserveSecretError::DeviceCapExceeded { .. }) => {
+                ServerError::Conflict(error.to_string())
+            }
+            // The cap re-check reads a range, so a concurrent mint or redemption on
+            // this node can lose the transaction; the joiner may simply retry.
+            BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
+                StorageError::TransactionConflict,
+            )) => ServerError::Conflict("concurrent enrollment conflict; retry".to_string()),
+            BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(error)) => {
+                error.into()
+            }
+            BootstrapFinalizeError::Consume(error) => ServerError::from(error),
+            BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::DeletionPending) => {
+                ServerError::Conflict("group deletion is pending; retry enrollment".into())
+            }
+            BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::NodeKindMismatch {
+                ..
+            }) => ServerError::BadRequest,
+            BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::HandleSpaceExhausted) => {
+                ServerError::Conflict("realm handle space is exhausted".to_string())
+            }
+            BootstrapFinalizeError::ReservedNodeLabel(label) => ServerError::ReservedLabel(label),
+            BootstrapFinalizeError::LongNodeLocation => ServerError::BadRequest,
+            other => ServerError::InternalError(other.into()),
         }
-        // The cap re-check reads a range, so a concurrent mint or redemption on
-        // this node can lose the transaction; the joiner may simply retry.
-        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(
-            StorageError::TransactionConflict,
-        )) => ServerError::Conflict("concurrent enrollment conflict; retry".to_string()),
-        BootstrapFinalizeError::Reserve(ReserveSecretError::StorageError(error)) => error.into(),
-        BootstrapFinalizeError::Consume(error) => map_consume_error(error),
-        BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::DeletionPending) => {
-            ServerError::Conflict("group deletion is pending; retry enrollment".into())
-        }
-        BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::NodeKindMismatch {
-            ..
-        }) => ServerError::BadRequest,
-        BootstrapFinalizeError::EnsureRealmConfig(EnsureConfigError::HandleSpaceExhausted) => {
-            ServerError::Conflict("realm handle space is exhausted".to_string())
-        }
-        BootstrapFinalizeError::ReservedNodeLabel(label) => ServerError::ReservedLabel(label),
-        BootstrapFinalizeError::LongNodeLocation => ServerError::BadRequest,
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-pub(crate) fn map_inspect_error(error: InspectSecretError) -> ServerError {
-    match error {
-        InspectSecretError::NotFound
-        | InspectSecretError::Expired
-        | InspectSecretError::AlreadyClaimed
-        | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
-        other => ServerError::InternalError(other.into()),
-    }
-}
-
-fn map_create_error(error: CreateSecretError) -> ServerError {
-    match error {
-        CreateSecretError::DeviceCapExceeded { .. } => ServerError::Conflict(error.to_string()),
-        CreateSecretError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::Conflict("concurrent enrollment secret conflict; retry".to_string())
+impl From<InspectSecretError> for ServerError {
+    fn from(error: InspectSecretError) -> Self {
+        match error {
+            InspectSecretError::NotFound
+            | InspectSecretError::Expired
+            | InspectSecretError::AlreadyClaimed
+            | InspectSecretError::InvalidSecret => ServerError::Unauthorized,
+            other => ServerError::InternalError(other.into()),
         }
-        CreateSecretError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_delete_error(error: DeleteSecretError) -> ServerError {
-    match error {
-        DeleteSecretError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
+impl From<CreateSecretError> for ServerError {
+    fn from(error: CreateSecretError) -> Self {
+        match error {
+            CreateSecretError::DeviceCapExceeded { .. } => ServerError::Conflict(error.to_string()),
+            CreateSecretError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::Conflict("concurrent enrollment secret conflict; retry".to_string())
+            }
+            CreateSecretError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
+        }
+    }
+}
+
+impl From<DeleteSecretError> for ServerError {
+    fn from(error: DeleteSecretError) -> Self {
+        match error {
+            DeleteSecretError::NotFound => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 

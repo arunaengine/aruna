@@ -393,30 +393,34 @@ pub async fn set_realm_federation(
     };
     let stored = drive(SetFederationOperation::new(config), &state.get_ctx())
         .await
-        .map_err(map_federation_error)?;
+        .map_err(ServerError::from)?;
     let settings = stored.federation.as_ref().ok_or_else(|| {
         ServerError::InternalError("federation settings missing".to_string().into())
     })?;
     settings_response(settings)
 }
 
-fn map_federation_error(error: SetFederationError) -> ServerError {
-    match error {
-        SetFederationError::ConfigMissing => config_missing(),
-        SetFederationError::SettingsChanged => ServerError::Refused(
-            StatusCode::PRECONDITION_FAILED,
-            "settings_changed",
-            "the federation settings changed since they were read; reload them".to_string(),
-        ),
-        SetFederationError::Unauthorized | SetFederationError::NotManagementNode => {
-            ServerError::Forbidden
+impl From<SetFederationError> for ServerError {
+    fn from(error: SetFederationError) -> Self {
+        match error {
+            SetFederationError::ConfigMissing => config_missing(),
+            SetFederationError::SettingsChanged => ServerError::Refused(
+                StatusCode::PRECONDITION_FAILED,
+                "settings_changed",
+                "the federation settings changed since they were read; reload them".to_string(),
+            ),
+            SetFederationError::Unauthorized | SetFederationError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetFederationError::InvalidSettings { reason } => ServerError::BadRequestReason(reason),
+            SetFederationError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::Conflict(
+                    "concurrent realm federation update conflict; retry".to_string(),
+                )
+            }
+            SetFederationError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        SetFederationError::InvalidSettings { reason } => ServerError::BadRequestReason(reason),
-        SetFederationError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::Conflict("concurrent realm federation update conflict; retry".to_string())
-        }
-        SetFederationError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 

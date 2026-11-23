@@ -478,46 +478,50 @@ fn encode_report_cursor(
         .transpose()
 }
 
-pub(crate) fn map_submit_error(error: aruna_core::job_request::SubmitJobError) -> ServerError {
-    use aruna_core::job_request::SubmitJobError;
-    match error {
-        SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(
-            format!("idempotency key already bound to job {existing_job_id}"),
-        ),
-        SubmitJobError::ActiveJobLimit { limit } => {
-            ServerError::Conflict(format!("active job limit of {limit} reached"))
-        }
-        SubmitJobError::InvalidWorkspace(reason) => ServerError::BadRequestMessage(reason),
-        SubmitJobError::TooManyOutputs { limit } => {
-            ServerError::BadRequestMessage(format!("a job may declare at most {limit} outputs"))
-        }
-        SubmitJobError::Composition(CompositionError::KeyConflict(key)) => {
-            ServerError::Conflict(format!("composition key conflict on {key}"))
-        }
-        SubmitJobError::Composition(other) => ServerError::BadRequestMessage(other.to_string()),
-        SubmitJobError::ClockHealth(_) => {
-            ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
-        }
-        SubmitJobError::PlacementUnavailable(_) => {
-            ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
-        }
-        SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
-        SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_) => ServerError::Forbidden,
-        running @ SubmitJobError::SourceRunning => ServerError::Conflict(running.to_string()),
-        moving @ SubmitJobError::RangeMoving(_) => {
-            ServerError::ServiceUnavailableReason(moving.to_string())
-        }
-        SubmitJobError::Upload(error) => {
-            use aruna_core::job_request::UploadClaimError;
-            match error {
-                UploadClaimError::NotFound => ServerError::NotFound,
-                UploadClaimError::WrongOwner => ServerError::Forbidden,
-                UploadClaimError::Expired => ServerError::BadRequestReason(error.to_string()),
-                UploadClaimError::AlreadyClaimed => ServerError::Conflict(error.to_string()),
-                other => ServerError::InternalError(other.into()),
+impl From<aruna_core::job_request::SubmitJobError> for ServerError {
+    fn from(error: aruna_core::job_request::SubmitJobError) -> Self {
+        use aruna_core::job_request::SubmitJobError;
+        match error {
+            SubmitJobError::JobPlanConflict { existing_job_id } => ServerError::JobPlanConflict(
+                format!("idempotency key already bound to job {existing_job_id}"),
+            ),
+            SubmitJobError::ActiveJobLimit { limit } => {
+                ServerError::Conflict(format!("active job limit of {limit} reached"))
             }
+            SubmitJobError::InvalidWorkspace(reason) => ServerError::BadRequestMessage(reason),
+            SubmitJobError::TooManyOutputs { limit } => {
+                ServerError::BadRequestMessage(format!("a job may declare at most {limit} outputs"))
+            }
+            SubmitJobError::Composition(CompositionError::KeyConflict(key)) => {
+                ServerError::Conflict(format!("composition key conflict on {key}"))
+            }
+            SubmitJobError::Composition(other) => ServerError::BadRequestMessage(other.to_string()),
+            SubmitJobError::ClockHealth(_) => {
+                ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
+            }
+            SubmitJobError::PlacementUnavailable(_) => {
+                ServerError::ServiceUnavailableReason("job_placement_unavailable".to_string())
+            }
+            SubmitJobError::QuotaDenied(denied) => ServerError::ComputeQuotaDenied(denied),
+            SubmitJobError::AuthorityDenied | SubmitJobError::InputDenied(_) => {
+                ServerError::Forbidden
+            }
+            running @ SubmitJobError::SourceRunning => ServerError::Conflict(running.to_string()),
+            moving @ SubmitJobError::RangeMoving(_) => {
+                ServerError::ServiceUnavailableReason(moving.to_string())
+            }
+            SubmitJobError::Upload(error) => {
+                use aruna_core::job_request::UploadClaimError;
+                match error {
+                    UploadClaimError::NotFound => ServerError::NotFound,
+                    UploadClaimError::WrongOwner => ServerError::Forbidden,
+                    UploadClaimError::Expired => ServerError::BadRequestReason(error.to_string()),
+                    UploadClaimError::AlreadyClaimed => ServerError::Conflict(error.to_string()),
+                    other => ServerError::InternalError(other.into()),
+                }
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -853,25 +857,27 @@ pub async fn submit_job(
     ))
 }
 
-pub(crate) fn map_local_error(error: LocalExecutionError) -> ServerError {
-    match error {
-        LocalExecutionError::NotADevice => ServerError::BadRequestMessage(
-            "target `local` is served by a user device only".to_string(),
-        ),
-        LocalExecutionError::NotOwner => ServerError::Forbidden,
-        LocalExecutionError::Paused | LocalExecutionError::NoExecutor => {
-            ServerError::Conflict(error.to_string())
+impl From<LocalExecutionError> for ServerError {
+    fn from(error: LocalExecutionError) -> Self {
+        match error {
+            LocalExecutionError::NotADevice => ServerError::BadRequestMessage(
+                "target `local` is served by a user device only".to_string(),
+            ),
+            LocalExecutionError::NotOwner => ServerError::Forbidden,
+            LocalExecutionError::Paused | LocalExecutionError::NoExecutor => {
+                ServerError::Conflict(error.to_string())
+            }
+            LocalExecutionError::Unsupported(_)
+            | LocalExecutionError::Refused(_)
+            | LocalExecutionError::InputNotLocal { .. }
+            | LocalExecutionError::InputRefused { .. } => {
+                ServerError::BadRequestMessage(error.to_string())
+            }
+            LocalExecutionError::Unavailable(_) => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            LocalExecutionError::Submit(error) => ServerError::from(error),
         }
-        LocalExecutionError::Unsupported(_)
-        | LocalExecutionError::Refused(_)
-        | LocalExecutionError::InputNotLocal { .. }
-        | LocalExecutionError::InputRefused { .. } => {
-            ServerError::BadRequestMessage(error.to_string())
-        }
-        LocalExecutionError::Unavailable(_) => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
-        LocalExecutionError::Submit(error) => map_submit_error(error),
     }
 }
 

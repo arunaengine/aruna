@@ -15,13 +15,12 @@ use aruna_core::structs::sync_relationship::{
 };
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use std::time::SystemTime;
 
 #[tokio::test]
 async fn preflight_discloses_cleanup() {
-    let storage_dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     storage.open_vault(aruna_core::node::vault::NodeVaultKey::random());
     let realm_id = RealmId::from_bytes(
         ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])

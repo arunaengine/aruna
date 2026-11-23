@@ -658,7 +658,7 @@ mod tests {
     use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
     use aruna_ops_identity::shard::recovery::RecoveryError;
     use aruna_storage::storage::handle::StorageHandle;
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::memory::MemoryStorage;
     use axum::body::{Body, to_bytes};
     use byteview::ByteView;
     use http::Request;
@@ -678,7 +678,7 @@ mod tests {
 
     fn fjall_ctx() -> (tempfile::TempDir, Arc<DriverContext>) {
         let temp = tempfile::tempdir().unwrap();
-        let storage = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
         (temp, ctx_with_storage(storage))
     }
 

@@ -2,9 +2,9 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::base_url;
 use super::git_node;
 use super::location::StorageLocation;
-use super::{base_url, map_error};
 use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -72,8 +72,9 @@ pub async fn repository_status(
     Path(id): Path<Ulid>,
 ) -> ServerResult<Json<RepositoryStatus>> {
     let read = git::snapshot::status(&git_node(&state), &auth, id);
-    let (status, projection, layout, document, pending) =
-        drive(read, &state.get_ctx()).await.map_err(map_error)?;
+    let (status, projection, layout, document, pending) = drive(read, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     let storage_location = git::location::chosen(&document, projection.state.location.clone());
     let clone_url = base_url(&state, id).await?;
     Ok(Json(RepositoryStatus {
@@ -124,7 +125,9 @@ pub async fn export_revision(
     Query(query): Query<RevisionQuery>,
 ) -> ServerResult<Json<Value>> {
     let export = git::snapshot::export(&git_node(&state), &auth, id, query.revision);
-    let bytes = drive(export, &state.get_ctx()).await.map_err(map_error)?;
+    let bytes = drive(export, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     let result: Value =
         serde_json::from_slice(&bytes).map_err(|_| ServerError::ServiceUnavailable)?;
     Ok(Json(result))

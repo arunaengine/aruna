@@ -307,7 +307,7 @@ async fn change_profile(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_email_error)?;
+    .map_err(ServerError::from)?;
     let refresh = RefreshMailOperation::new(state.get_realm_id());
     if let Err(error) = drive(refresh, &state.get_ctx()).await {
         tracing::warn!(%error, "Mail settings refresh stopped after a profile change");
@@ -315,18 +315,22 @@ async fn change_profile(
     Ok(stored)
 }
 
-fn map_email_error(error: SetEmailError) -> ServerError {
-    match error {
-        SetEmailError::ConfigMissing => ServerError::NotFound,
-        SetEmailError::Unauthorized | SetEmailError::NotManagementNode => ServerError::Forbidden,
-        SetEmailError::InvalidProfile { .. } | SetEmailError::PasswordRequired => {
-            ServerError::BadRequestReason(error.to_string())
+impl From<SetEmailError> for ServerError {
+    fn from(error: SetEmailError) -> Self {
+        match error {
+            SetEmailError::ConfigMissing => ServerError::NotFound,
+            SetEmailError::Unauthorized | SetEmailError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetEmailError::InvalidProfile { .. } | SetEmailError::PasswordRequired => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            SetEmailError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::config_conflict()
+            }
+            SetEmailError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        SetEmailError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::config_conflict()
-        }
-        SetEmailError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 

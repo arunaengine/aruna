@@ -4,14 +4,14 @@
 
 use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id};
+use crate::error::ServerError;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::metadata::model::{
     ProfileCapabilitiesResponse, ProfilePreviewRequest, ProfilePreviewResponse,
     ProfileValidationResponse,
 };
 use crate::metadata::{
-    ensure_metadata_scope, forwarded_auth_token, map_api_error, map_metadata_error,
-    parse_document_id, serialize_jsonld_object,
+    ensure_metadata_scope, forwarded_auth_token, parse_document_id, serialize_jsonld_object,
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -214,7 +214,7 @@ pub async fn preview_profile_validation(
     let context = state.get_ctx();
     let local_node = context.net_handle.as_ref().map(|net| net.node_id());
     let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
-    let preview = drive(preview, &context).await.map_err(map_metadata_error)?;
+    let preview = drive(preview, &context).await.map_err(ServerError::from)?;
     let mut response = ProfilePreviewResponse::from(preview);
     if request.public {
         let node = (state.get_realm_id(), state.get_node_id());
@@ -222,7 +222,7 @@ pub async fn preview_profile_validation(
         response.set_restricted(
             drive(restricted, &context)
                 .await
-                .map_err(map_metadata_error)?,
+                .map_err(ServerError::from)?,
         );
     }
     Ok((StatusCode::OK, Json(response)))
@@ -297,7 +297,7 @@ pub async fn get_validation_status(
         state.get_ctx().as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(status.into())))
 }
 
@@ -360,6 +360,6 @@ pub async fn revalidate_profile(
         state.get_ctx().as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(status.into())))
 }

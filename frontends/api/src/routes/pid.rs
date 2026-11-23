@@ -49,7 +49,7 @@ use aruna_runner::driver::drive;
 use crate::auth::UnrestrictedAuth;
 use crate::auth::{ValidatedBearer, ensure_permission};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::metadata::{forwarded_auth_token, map_api_error};
+use crate::metadata::forwarded_auth_token;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -778,7 +778,7 @@ pub(crate) async fn lookup_identifier(
     );
     let (matches, incomplete) = drive(lookup, state.get_ctx().as_ref())
         .await
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
     match (matches.is_empty(), incomplete) {
         (true, true) => Err(ServerError::ServiceUnavailable),
         (true, false) => Err(ServerError::NotFound),
@@ -870,7 +870,7 @@ async fn withdraw_pid(
     let existing = pid_request(&ctx, state.get_realm_id(), document_id, status, None)
         .await
         .and_then(outcome_status)
-        .map_err(map_api_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
     if request.confirm_pid != existing.pid {
         return Err(ServerError::BadRequest);
@@ -884,7 +884,7 @@ async fn withdraw_pid(
     let (mapping, _) = pid_request(&ctx, state.get_realm_id(), document_id, request, token)
         .await
         .and_then(outcome_mapping)
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
     if mapping.status != PersistentIdStatus::AdminWithdrawn {
         return Err(ServerError::ServiceUnavailable);
     }

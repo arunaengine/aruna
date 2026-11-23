@@ -195,12 +195,16 @@ impl From<GroupStorage> for GroupBackendResponse {
     }
 }
 
-fn map_create_error(error: CreateBackendError) -> ServerError {
-    match error {
-        CreateBackendError::NotFound => ServerError::NotFound,
-        CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
-        CreateBackendError::Unreachable(error) => ServerError::BadRequestMessage(error.reason()),
-        other => ServerError::InternalError(other.into()),
+impl From<CreateBackendError> for ServerError {
+    fn from(error: CreateBackendError) -> Self {
+        match error {
+            CreateBackendError::NotFound => ServerError::NotFound,
+            CreateBackendError::Invalid(error) => ServerError::BadRequestMessage(error.to_string()),
+            CreateBackendError::Unreachable(error) => {
+                ServerError::BadRequestMessage(error.reason())
+            }
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -340,7 +344,7 @@ pub async fn create_group_backend(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((StatusCode::CREATED, Json(record.into())))
 }
@@ -656,7 +660,7 @@ pub async fn replace_group_backend(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
 
     Ok(Json(record.into()))
 }

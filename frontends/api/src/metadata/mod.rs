@@ -108,10 +108,10 @@ pub(crate) async fn run_create_metadata(
         .map_err(|error| match error {
             CreateAuthorizedError::EmptyPath => ServerError::BadRequest,
             CreateAuthorizedError::Forbidden => ServerError::Forbidden,
-            CreateAuthorizedError::Api(error) => map_api_error(error),
-            CreateAuthorizedError::Create(error) => map_create_error(error),
-            CreateAuthorizedError::Authorize(error) => crate::auth::map_authorize_error(error),
-            CreateAuthorizedError::Write(error) => map_write_error(error),
+            CreateAuthorizedError::Api(error) => ServerError::from(error),
+            CreateAuthorizedError::Create(error) => ServerError::from(error),
+            CreateAuthorizedError::Authorize(error) => ServerError::from(error),
+            CreateAuthorizedError::Write(error) => ServerError::from(error),
         })
 }
 
@@ -165,7 +165,7 @@ pub(crate) async fn run_document_list(
         auth,
     };
     let list = ListVisibleOperation::new(state.get_realm_id(), request);
-    let result = drive(list, ctx.as_ref()).await.map_err(map_api_error)?;
+    let result = drive(list, ctx.as_ref()).await.map_err(ServerError::from)?;
 
     let mut documents = Vec::with_capacity(result.documents.len());
     for document in result.documents {
@@ -242,53 +242,59 @@ pub(crate) fn serialize_jsonld_object(value: &Value) -> ServerResult<String> {
 /// A write that could neither be applied locally nor forwarded to a holder is a
 /// loud failure: the caller is told it was not accepted, rather than being
 /// answered `201` for a record that can never replicate.
-pub(crate) fn map_write_error(error: MetadataWriteError) -> ServerError {
-    match error {
-        MetadataWriteError::Unauthorized => ServerError::Unauthorized,
-        MetadataWriteError::Forbidden => ServerError::Forbidden,
-        MetadataWriteError::NotFound => ServerError::NotFound,
-        MetadataWriteError::Create(error) => map_create_error(error),
-        MetadataWriteError::Update(error) => map_update_error(error),
-        MetadataWriteError::Delete(error) => ServerError::InternalError(error.into()),
-        MetadataWriteError::Undeliverable(error) => ServerError::ServiceUnavailableReason(format!(
-            "metadata write is undeliverable: {error}"
-        )),
+impl From<MetadataWriteError> for ServerError {
+    fn from(error: MetadataWriteError) -> Self {
+        match error {
+            MetadataWriteError::Unauthorized => ServerError::Unauthorized,
+            MetadataWriteError::Forbidden => ServerError::Forbidden,
+            MetadataWriteError::NotFound => ServerError::NotFound,
+            MetadataWriteError::Create(error) => ServerError::from(error),
+            MetadataWriteError::Update(error) => ServerError::from(error),
+            MetadataWriteError::Delete(error) => ServerError::InternalError(error.into()),
+            MetadataWriteError::Undeliverable(error) => ServerError::ServiceUnavailableReason(
+                format!("metadata write is undeliverable: {error}"),
+            ),
+        }
     }
 }
 
-pub(crate) fn map_create_error(error: CreateDocumentError) -> ServerError {
-    match error {
-        CreateDocumentError::MetadataError(metadata_error) => map_metadata_error(metadata_error),
-        CreateDocumentError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
+impl From<CreateDocumentError> for ServerError {
+    fn from(error: CreateDocumentError) -> Self {
+        match error {
+            CreateDocumentError::MetadataError(metadata_error) => ServerError::from(metadata_error),
+            CreateDocumentError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::Conflict("concurrent metadata create conflict; retry".to_string())
+            }
+            CreateDocumentError::PlacementBinding(
+                aruna_core::structs::placement::binding_directory::BindingError::Conflicted(_),
+            ) => ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string()),
+            CreateDocumentError::PlacementBinding(_)
+            | CreateDocumentError::PlacementBindingUnavailable(_) => {
+                ServerError::ServiceUnavailableReason("placement_binding_unavailable".to_string())
+            }
+            CreateDocumentError::ClockHealth(_) => {
+                ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
+            }
+            CreateDocumentError::RawLimit => ServerError::ServiceUnavailable,
+            other => ServerError::InternalError(other.into()),
         }
-        CreateDocumentError::PlacementBinding(
-            aruna_core::structs::placement::binding_directory::BindingError::Conflicted(_),
-        ) => ServerError::ServiceUnavailableReason("placement_binding_conflict".to_string()),
-        CreateDocumentError::PlacementBinding(_)
-        | CreateDocumentError::PlacementBindingUnavailable(_) => {
-            ServerError::ServiceUnavailableReason("placement_binding_unavailable".to_string())
-        }
-        CreateDocumentError::ClockHealth(_) => {
-            ServerError::ServiceUnavailableReason("structured_id_clock_unhealthy".to_string())
-        }
-        CreateDocumentError::RawLimit => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
-    match error {
-        UpdateDocumentError::DocumentNotFound => ServerError::NotFound,
-        UpdateDocumentError::RawLimit => ServerError::ServiceUnavailable,
-        UpdateDocumentError::MetadataError(metadata_error) => map_metadata_error(metadata_error),
-        UpdateDocumentError::RevisionConflict { .. } | UpdateDocumentError::GraphChanged => {
-            ServerError::PreconditionFailed(error.to_string())
+impl From<UpdateDocumentError> for ServerError {
+    fn from(error: UpdateDocumentError) -> Self {
+        match error {
+            UpdateDocumentError::DocumentNotFound => ServerError::NotFound,
+            UpdateDocumentError::RawLimit => ServerError::ServiceUnavailable,
+            UpdateDocumentError::MetadataError(metadata_error) => ServerError::from(metadata_error),
+            UpdateDocumentError::RevisionConflict { .. } | UpdateDocumentError::GraphChanged => {
+                ServerError::PreconditionFailed(error.to_string())
+            }
+            UpdateDocumentError::GraphPending { .. } => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        UpdateDocumentError::GraphPending { .. } => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
-        other => ServerError::InternalError(other.into()),
     }
 }
 /// The caller's own bearer token, carried to the holder a write is forwarded to
@@ -296,41 +302,47 @@ pub(crate) fn map_update_error(error: UpdateDocumentError) -> ServerError {
 pub(crate) fn forwarded_auth_token(
     bearer_token: Option<ValidatedBearer>,
 ) -> ServerResult<Option<aruna_core::metadata::AuthToken>> {
-    forwarded_bearer(bearer_token_string(bearer_token).as_deref()).map_err(map_api_error)
+    forwarded_bearer(bearer_token_string(bearer_token).as_deref()).map_err(ServerError::from)
 }
 
-pub(crate) fn map_metadata_error(error: MetadataError) -> ServerError {
-    match error {
-        MetadataError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
-        MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
-        MetadataError::ProfileValidation(findings) => {
-            ServerError::MetadataProfileValidation(findings)
+impl From<MetadataError> for ServerError {
+    fn from(error: MetadataError) -> Self {
+        match error {
+            MetadataError::InvalidInput(reason) => ServerError::BadRequestReason(reason),
+            MetadataError::Validation(violations) => ServerError::MetadataValidation(violations),
+            MetadataError::ProfileValidation(findings) => {
+                ServerError::MetadataProfileValidation(findings)
+            }
+            MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
+            other => ServerError::InternalError(other.into()),
         }
-        MetadataError::GraphNotFound => ServerError::ServiceUnavailable,
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-pub(crate) fn map_api_error(error: MetadataApiError) -> ServerError {
-    match error {
-        MetadataApiError::BadRequest => ServerError::BadRequest,
-        MetadataApiError::Unauthorized => ServerError::Unauthorized,
-        MetadataApiError::Forbidden => ServerError::Forbidden,
-        MetadataApiError::NotFound => ServerError::NotFound,
-        MetadataApiError::ServiceUnavailable | MetadataApiError::TooLarge => {
-            ServerError::ServiceUnavailable
+impl From<MetadataApiError> for ServerError {
+    fn from(error: MetadataApiError) -> Self {
+        match error {
+            MetadataApiError::BadRequest => ServerError::BadRequest,
+            MetadataApiError::Unauthorized => ServerError::Unauthorized,
+            MetadataApiError::Forbidden => ServerError::Forbidden,
+            MetadataApiError::NotFound => ServerError::NotFound,
+            MetadataApiError::ServiceUnavailable | MetadataApiError::TooLarge => {
+                ServerError::ServiceUnavailable
+            }
+            MetadataApiError::SearchIncomplete(reason) => {
+                ServerError::ServiceUnavailableReason(reason)
+            }
+            MetadataApiError::PlacementUnavailable(
+                aruna_core::placement::PlacementResolveError::ActivationConflicted(_),
+            ) => ServerError::ServiceUnavailableReason("placement_activation_conflict".to_string()),
+            MetadataApiError::PlacementUnavailable(_) => ServerError::ServiceUnavailableReason(
+                "placement_activation_unavailable".to_string(),
+            ),
+            MetadataApiError::InvalidCursor(message) | MetadataApiError::InvalidQuery(message) => {
+                ServerError::BadRequestMessage(message)
+            }
+            MetadataApiError::Internal(message) => ServerError::InternalError(message.into()),
         }
-        MetadataApiError::SearchIncomplete(reason) => ServerError::ServiceUnavailableReason(reason),
-        MetadataApiError::PlacementUnavailable(
-            aruna_core::placement::PlacementResolveError::ActivationConflicted(_),
-        ) => ServerError::ServiceUnavailableReason("placement_activation_conflict".to_string()),
-        MetadataApiError::PlacementUnavailable(_) => {
-            ServerError::ServiceUnavailableReason("placement_activation_unavailable".to_string())
-        }
-        MetadataApiError::InvalidCursor(message) | MetadataApiError::InvalidQuery(message) => {
-            ServerError::BadRequestMessage(message)
-        }
-        MetadataApiError::Internal(message) => ServerError::InternalError(message.into()),
     }
 }
 

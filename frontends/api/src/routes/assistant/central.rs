@@ -87,19 +87,21 @@ pub struct CentralTestResponse {
     pub models: Vec<ProviderModel>,
 }
 
-fn map_central_error(error: CentralStoreError) -> ServerError {
-    match error {
-        CentralStoreError::Stale => {
-            ServerError::Conflict("central assistant changed concurrently".to_string())
+impl From<CentralStoreError> for ServerError {
+    fn from(error: CentralStoreError) -> Self {
+        match error {
+            CentralStoreError::Stale => {
+                ServerError::Conflict("central assistant changed concurrently".to_string())
+            }
+            error => ServerError::InternalError(error.into()),
         }
-        error => ServerError::InternalError(error.into()),
     }
 }
 
 async fn load_central(state: &ServerState, user_id: UserId) -> ServerResult<CentralRead> {
     drive(GetCentralOperation::new(user_id), &state.get_ctx())
         .await
-        .map_err(map_central_error)
+        .map_err(ServerError::from)
 }
 
 async fn require_admin(state: &ServerState, auth: AuthContext) -> ServerResult<AuthContext> {
@@ -361,7 +363,7 @@ pub async fn put_central(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_central_error)?;
+    .map_err(ServerError::from)?;
     info!(
         user_id = %auth.user_id,
         action = "set",
@@ -408,7 +410,7 @@ pub async fn delete_central(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_central_error)?;
+    .map_err(ServerError::from)?;
     info!(
         user_id = %auth.user_id,
         action = "delete",
@@ -659,7 +661,7 @@ where
                 limit: reached.limit,
                 retry_after: secs_to_midnight(now),
             }),
-            Err(error) => Err(map_central_error(error)),
+            Err(error) => Err(ServerError::from(error)),
         };
     }
     Err(ServerError::ServiceUnavailableReason(

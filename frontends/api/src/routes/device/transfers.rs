@@ -21,7 +21,7 @@ use aruna_ops_data::device::sync::folders::reads::{
 use ulid::Ulid;
 
 use super::dto::{DeviceTransfer, DeviceTransferList, download_view, transfer_view};
-use super::folders::map_folder_error;
+use crate::error::ServerError;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(list_device_transfers))
@@ -85,14 +85,14 @@ async fn list_device_transfers(
     let context = state.get_ctx();
     let folders: HashMap<Ulid, SyncedFolder> = drive(list_folders(), &context)
         .await
-        .map_err(map_folder_error)?
+        .map_err(ServerError::from)?
         .into_iter()
         .map(|folder| (folder.folder_id, folder))
         .collect();
 
     let uploads = drive(read_uploads(), &context)
         .await
-        .map_err(map_folder_error)?
+        .map_err(ServerError::from)?
         .into_iter()
         .filter_map(|upload| {
             let folder = folders.get(&upload.folder_id)?;
@@ -107,7 +107,7 @@ async fn list_device_transfers(
         loop {
             let (entries, next) = drive(list_entries(folder.folder_id, None, cursor), &context)
                 .await
-                .map_err(map_folder_error)?;
+                .map_err(ServerError::from)?;
             for (path, base) in entries {
                 if !matches!(
                     base.entry,

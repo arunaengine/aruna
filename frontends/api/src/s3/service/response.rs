@@ -427,9 +427,7 @@ mod tests {
 
     async fn test_service() -> (tempfile::TempDir, ArunaS3Service) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = aruna_storage::storage::memory::MemoryStorage::open();
         let context = Arc::new(DriverContext {
             storage_handle: storage,
             net_handle: None,

@@ -119,11 +119,13 @@ async fn authorize_quarantine_admin(
     Ok(auth)
 }
 
-fn map_admin_error(error: QuarantineAdminError) -> ServerError {
-    match error {
-        QuarantineAdminError::Storage(error) => ServerError::InternalError(error.into()),
-        QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.into()),
-        QuarantineAdminError::Io(_) => ServerError::ServiceUnavailable,
+impl From<QuarantineAdminError> for ServerError {
+    fn from(error: QuarantineAdminError) -> Self {
+        match error {
+            QuarantineAdminError::Storage(error) => ServerError::InternalError(error.into()),
+            QuarantineAdminError::Conversion(error) => ServerError::InternalError(error.into()),
+            QuarantineAdminError::Io(_) => ServerError::ServiceUnavailable,
+        }
     }
 }
 
@@ -244,7 +246,7 @@ pub async fn list_quarantine(
     let operation = ListQuarantineOperation::new(page_request(&query)?);
     let page = drive(operation, &state.get_ctx())
         .await
-        .map_err(map_admin_error)?;
+        .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -310,7 +312,7 @@ pub async fn inspect_quarantine(
     let key = hex::decode(&record_id).map_err(|_| ServerError::BadRequest)?;
     let record = drive(ReadQuarantineOperation::new(key), &state.get_ctx())
         .await
-        .map_err(map_admin_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
 
     Ok((
@@ -373,7 +375,7 @@ pub async fn acknowledge_quarantine(
     let key = hex::decode(&record_id).map_err(|_| ServerError::BadRequest)?;
     let record = drive(AcknowledgeQuarantineOperation::new(key), &state.get_ctx())
         .await
-        .map_err(map_admin_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
 
     Ok((StatusCode::OK, Json(map_record(&record))))
@@ -438,7 +440,7 @@ pub async fn prune_quarantine(
     let build = || PruneQuarantineOperation::new(request.clone());
     let result = drive_retry(build, &state.get_ctx(), b"sync-quarantine-prune")
         .await
-        .map_err(map_admin_error)?;
+        .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,

@@ -5,7 +5,7 @@
 
 use crate::auth::UnrestrictedAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::access::sessions::{CreateSessionResponse, map_create_error, unix_rfc3339};
+use crate::routes::access::sessions::{CreateSessionResponse, unix_rfc3339};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
@@ -288,7 +288,7 @@ pub async fn create_federated_session(
             FederatedLoginError::CutOff => {
                 ServerError::Refused(StatusCode::FORBIDDEN, "login_cut_off", error.to_string())
             }
-            FederatedLoginError::Session(error) => map_create_error(error),
+            FederatedLoginError::Session(error) => ServerError::from(error),
             error => ServerError::InternalError(error.into()),
         })?;
     let account = created.session.user_id;

@@ -16,9 +16,10 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use super::plugin_installs::{
-    InstallView, admin_call, caller, local_node, map_error, secret_session, view, view_example,
+    InstallView, admin_call, caller, local_node, secret_session, view, view_example,
 };
 use crate::auth::RealmAuth;
+use crate::error::ServerError;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 
@@ -90,7 +91,9 @@ pub async fn put_grants(
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     secret_session(&state, &auth, (Some(install_id), None)).await?;
     let change = SetGrants::new(caller(&state, &auth), install_id, &body.grants);
-    let changed = drive(change, &state.get_ctx()).await.map_err(map_error)?;
+    let changed = drive(change, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(Json(view(&state, changed).await?))
 }
 
@@ -133,7 +136,7 @@ pub async fn put_version(
     let who = (caller(&state, &auth), local_node(&ctx));
     let settings = body.settings.as_ref();
     let update = UpdateInstall::new(who, install_id, &body.version, settings);
-    let (updated, missing) = drive(update, &ctx).await.map_err(map_error)?;
+    let (updated, missing) = drive(update, &ctx).await.map_err(ServerError::from)?;
     let install = view(&state, updated).await?;
     Ok(Json(UpdateView { install, missing }))
 }
@@ -166,7 +169,9 @@ pub async fn pause(
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     let pause = SetPaused::new(caller(&state, &auth), install_id, true);
-    let paused = drive(pause, &state.get_ctx()).await.map_err(map_error)?;
+    let paused = drive(pause, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(Json(view(&state, paused).await?))
 }
 
@@ -198,6 +203,8 @@ pub async fn resume(
 ) -> ServerResult<Json<InstallView>> {
     let (auth, install_id) = admin_call(&state, auth, &id).await?;
     let resume = SetPaused::new(caller(&state, &auth), install_id, false);
-    let resumed = drive(resume, &state.get_ctx()).await.map_err(map_error)?;
+    let resumed = drive(resume, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
     Ok(Json(view(&state, resumed).await?))
 }

@@ -15,7 +15,6 @@ use serde::{Deserialize, Serialize};
 use super::{BulkRunRequest, BulkRunResponse, CoverageQuery, CoverageResponse};
 use crate::auth::ValidatedBearer;
 use crate::error::{ServerError, ServerResult};
-use crate::lookup::map_guard_error;
 use crate::routes::storage::relay::{RestForward, relay_get, relay_json};
 use crate::server::state::ServerState;
 
@@ -51,7 +50,7 @@ pub(super) async fn coordinators(
 ) -> ServerResult<Vec<RestForward>> {
     let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
-        .map_err(map_guard_error)?;
+        .map_err(ServerError::from)?;
     let snapshot = view.snapshot();
     let mut nodes: Vec<RestForward> = Vec::new();
     for range in &snapshot.config.ranges {
@@ -79,7 +78,7 @@ pub(super) async fn set_members(
 ) -> ServerResult<Vec<NodeId>> {
     let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
-        .map_err(map_guard_error)?;
+        .map_err(ServerError::from)?;
     let members = &view.snapshot().config.members;
     Ok(members.iter().map(|member| member.node_id).collect())
 }

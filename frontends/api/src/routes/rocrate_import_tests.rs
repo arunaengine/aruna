@@ -29,7 +29,7 @@ use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::http::StatusCode;
 use axum::http::{HeaderValue, Request};
 use byteview::ByteView;
@@ -481,7 +481,7 @@ fn submit_request(
 
 async fn plain_state(limits: RoCrateLimits) -> (TempDir, Arc<ServerState>, UserId) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let node_id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
     let user = UserId::local(Ulid::generate(), realm());
     let ctx = Arc::new(DriverContext {
@@ -543,7 +543,7 @@ async fn blob_state(limits: RoCrateLimits) -> (TempDir, TempDir, Arc<ServerState
     let blob_dir = tempfile::tempdir().unwrap();
     let blob_root = blob_dir.path().join("blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

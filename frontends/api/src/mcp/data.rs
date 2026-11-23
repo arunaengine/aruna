@@ -7,6 +7,7 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, explained, internal_error, request_auth,
     server_error, tool_extras,
 };
+use crate::error::ServerError;
 use crate::lookup::ObjectOutput;
 use crate::routes::storage::objects::object_page;
 use crate::routes::storage::relay::{relay_json, rest_target};
@@ -381,7 +382,7 @@ impl McpServer {
             self.state.get_ctx().as_ref(),
         )
         .await
-        .map_err(crate::metadata::map_api_error)
+        .map_err(ServerError::from)
         .map_err(server_error)?;
         let buckets = result
             .hits
@@ -1373,7 +1374,7 @@ fn put_server_error(error: PutObjectError) -> crate::error::ServerError {
         error @ PutObjectError::UsageRebuilding => {
             ServerError::ServiceUnavailableReason(error.to_string())
         }
-        PutObjectError::Distribution(error) => crate::lookup::map_guard_error(error),
+        PutObjectError::Distribution(error) => ServerError::from(error),
         PutObjectError::InvalidOperationState => {
             ServerError::InternalError("invalid object write state".to_string().into())
         }

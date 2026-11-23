@@ -3,7 +3,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::imports::{admin_of_group, existing_rule, map_error};
+use super::imports::{admin_of_group, existing_rule};
 use crate::auth::RealmAuth;
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -263,7 +263,7 @@ async fn caller(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok((rule, auth, access))
 }
 
@@ -415,7 +415,7 @@ pub async fn preview_move(
     let preview = RemapPreviewOperation::new(&plan, &scope, (filter, after, limit));
     let page = drive(preview, &state.get_ctx())
         .await
-        .map_err(super::rename::map_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(MovePreview {
         total: page.total,
         complete: page.complete,
@@ -794,7 +794,7 @@ pub async fn link_status(
     let context = state.get_ctx();
     let run = drive(LastRunOperation::new(&rule), &context)
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     let Some(run) = run else {
         return Ok(Json(LinkStatus {
             files: None,
@@ -810,13 +810,13 @@ pub async fn link_status(
         &context,
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let earlier = drive(
         aruna_ops_data::s3::imports::ReadEarlierOperation::new(rule.import_id),
         &context,
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let mut conflicts = Vec::new();
     for failure in run.checkpoint.errors {
         let keys = file_keys(&context, (&rule, &earlier, &rules), &failure.key).await?;

@@ -10,7 +10,6 @@ use crate::job_service::{read_artifact_routed, read_owned_job, submit_export_job
 use crate::jobs::job_urls;
 use crate::metadata::model::SubmitExportResponse;
 use crate::metadata::{load_document_record, parse_document_id};
-use crate::routes::execution::jobs::map_submit_error;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::federation::{RealmDescriptor, Signed};
@@ -229,7 +228,7 @@ pub async fn create_export(
     }
     let result = submit_export_job(&state.get_ctx(), spec, state.get_node_id(), Some(key))
         .await
-        .map_err(map_submit_error)?;
+        .map_err(ServerError::from)?;
     let urls = job_urls(&state, result.job_id).await?;
     Ok((
         StatusCode::ACCEPTED,

@@ -4,7 +4,7 @@
 
 use super::{
     ListSecretsQuery, ServerError, bootstrap_onboarding, create_onboarding_secret,
-    get_secret_status, list_onboarding_secrets, map_finalize_error, revoke_onboarding_secret,
+    get_secret_status, list_onboarding_secrets, revoke_onboarding_secret,
 };
 use crate::server::state::ServerState;
 use aruna_core::admin_documents::AdminDocumentTarget;
@@ -59,8 +59,7 @@ async fn setup_management_state() -> (
     TempDir,
 ) {
     let tempdir = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let net_handle = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -168,11 +167,11 @@ fn declares_dialable_members() {
 #[test]
 fn placement_errors_badrequest() {
     assert!(matches!(
-        map_finalize_error(BootstrapFinalizeError::ReservedNodeLabel(String::new())),
+        ServerError::from(BootstrapFinalizeError::ReservedNodeLabel(String::new())),
         ServerError::ReservedLabel(_)
     ));
     assert!(matches!(
-        map_finalize_error(BootstrapFinalizeError::LongNodeLocation),
+        ServerError::from(BootstrapFinalizeError::LongNodeLocation),
         ServerError::BadRequest
     ));
 }

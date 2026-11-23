@@ -128,17 +128,21 @@ fn response(entry: JoinRequestState) -> ServerResult<JoinResponse> {
     })
 }
 
-fn map_error(error: GroupJoinError) -> ServerError {
-    match error {
-        GroupJoinError::Unauthorized => ServerError::Forbidden,
-        GroupJoinError::NotFound => ServerError::NotFound,
-        GroupJoinError::Conflict => ServerError::Conflict(error.to_string()),
-        GroupJoinError::Storage(aruna_core::errors::StorageError::TransactionConflict)
-        | GroupJoinError::PlacementFenced => {
-            ServerError::Conflict("concurrent membership update; refresh and retry".into())
+impl From<GroupJoinError> for ServerError {
+    fn from(error: GroupJoinError) -> Self {
+        match error {
+            GroupJoinError::Unauthorized => ServerError::Forbidden,
+            GroupJoinError::NotFound => ServerError::NotFound,
+            GroupJoinError::Conflict => ServerError::Conflict(error.to_string()),
+            GroupJoinError::Storage(aruna_core::errors::StorageError::TransactionConflict)
+            | GroupJoinError::PlacementFenced => {
+                ServerError::Conflict("concurrent membership update; refresh and retry".into())
+            }
+            GroupJoinError::InvalidMessage | GroupJoinError::InvalidRoles => {
+                ServerError::BadRequest
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        GroupJoinError::InvalidMessage | GroupJoinError::InvalidRoles => ServerError::BadRequest,
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -193,7 +197,7 @@ async fn mutate(
             &state.get_ctx(),
         )
         .await
-        .map_err(map_error)?,
+        .map_err(ServerError::from)?,
     )
 }
 

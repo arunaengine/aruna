@@ -92,18 +92,22 @@ fn parse_session_kind(kind: &str) -> ServerResult<SessionKind> {
     }
 }
 
-pub(crate) fn map_create_error(error: CreateSessionError) -> ServerError {
-    match error {
-        CreateSessionError::InvalidExpiry => {
-            ServerError::BadRequestReason("session expiry is invalid".to_string())
+impl From<CreateSessionError> for ServerError {
+    fn from(error: CreateSessionError) -> Self {
+        match error {
+            CreateSessionError::InvalidExpiry => {
+                ServerError::BadRequestReason("session expiry is invalid".to_string())
+            }
+            CreateSessionError::LimitReached { .. } => {
+                ServerError::Conflict("active session limit reached".to_string())
+            }
+            CreateSessionError::Token(CreateTokenError::RestrictionsTooLarge) => {
+                ServerError::BadRequestReason(
+                    "path restrictions exceed the allowed size".to_string(),
+                )
+            }
+            error => ServerError::InternalError(error.into()),
         }
-        CreateSessionError::LimitReached { .. } => {
-            ServerError::Conflict("active session limit reached".to_string())
-        }
-        CreateSessionError::Token(CreateTokenError::RestrictionsTooLarge) => {
-            ServerError::BadRequestReason("path restrictions exceed the allowed size".to_string())
-        }
-        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -132,10 +136,12 @@ pub(crate) async fn session_restrictions(
     Ok(Some(narrowed))
 }
 
-fn map_revoke_error(error: RevokeSessionError) -> ServerError {
-    match error {
-        RevokeSessionError::NotFound => ServerError::NotFound,
-        error => ServerError::InternalError(error.into()),
+impl From<RevokeSessionError> for ServerError {
+    fn from(error: RevokeSessionError) -> Self {
+        match error {
+            RevokeSessionError::NotFound => ServerError::NotFound,
+            error => ServerError::InternalError(error.into()),
+        }
     }
 }
 
@@ -219,7 +225,7 @@ pub async fn create_session(
     }
     let now = unix_timestamp_secs();
     let expiry = bound_session_expiry(now, request.expires_in_seconds, bearer.expires_at_secs())
-        .map_err(map_create_error)?;
+        .map_err(ServerError::from)?;
     crate::routes::access::users::ensure_active(&state, auth.user_id).await?;
     let restrictions = session_restrictions(&state, &auth, request.path_restrictions).await?;
     let config = CreateSessionConfig {
@@ -241,7 +247,7 @@ pub async fn create_session(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {
@@ -344,7 +350,7 @@ pub async fn delete_session(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_revoke_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

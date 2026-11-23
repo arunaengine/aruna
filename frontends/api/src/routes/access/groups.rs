@@ -8,7 +8,6 @@ use crate::auth::{
 };
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::user_origin;
-use crate::metadata::map_api_error;
 use crate::routes::git::location::StorageLocationRequest;
 use crate::routes::plugin_installs::{refuse_plugin_account, refuse_plugin_role};
 use crate::routes::storage::objects::object_page;
@@ -377,13 +376,15 @@ pub(crate) async fn load_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_group_error)
+    .map_err(ServerError::from)
 }
 
-fn map_group_error(error: GetGroupError) -> ServerError {
-    match error {
-        GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
+impl From<GetGroupError> for ServerError {
+    fn from(error: GetGroupError) -> Self {
+        match error {
+            GetGroupError::GroupNotFound | GetGroupError::DocNotFound => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -503,7 +504,7 @@ pub async fn create_group(
     if user_origin(&state).await? {
         let caller_token = bearer_token.as_ref().ok_or(ServerError::Unauthorized)?;
         let auth_token = forwarded_bearer(Some(caller_token.as_str()))
-            .map_err(map_api_error)?
+            .map_err(ServerError::from)?
             .ok_or(ServerError::Unauthorized)?;
         let local = ctx.node_and_realm().map(|(node_id, _)| node_id);
         let forward =
@@ -514,11 +515,11 @@ pub async fn create_group(
                 .map_err(|err| match err {
                     ForwardGroupError::Conflict(reason) => ServerError::Conflict(reason),
                     ForwardGroupError::Unauthorized => {
-                        map_api_error(MetadataApiError::Unauthorized)
+                        ServerError::from(MetadataApiError::Unauthorized)
                     }
-                    ForwardGroupError::Forbidden => map_api_error(MetadataApiError::Forbidden),
+                    ForwardGroupError::Forbidden => ServerError::from(MetadataApiError::Forbidden),
                     ForwardGroupError::Unavailable => {
-                        map_api_error(MetadataApiError::ServiceUnavailable)
+                        ServerError::from(MetadataApiError::ServiceUnavailable)
                     }
                 })?;
         request_span.record("group_id", field::display(forwarded.0.group_id));
@@ -903,7 +904,7 @@ pub async fn update_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_rename_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::OK,
@@ -931,7 +932,7 @@ pub(crate) async fn ensure_group_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(crate::auth::map_authorize_error)
+    .map_err(ServerError::from)
 }
 
 #[utoipa::path(
@@ -1003,7 +1004,7 @@ pub async fn set_group_location(
         .await
         .map_err(|error| match error {
             GitError::Refused(reason) => ServerError::BadRequestMessage(reason),
-            GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+            GitError::Authorization(error) => ServerError::from(error),
             _ => ServerError::ServiceUnavailable,
         })?;
     }
@@ -1017,7 +1018,7 @@ pub async fn set_group_location(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_rename_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::OK,
         Json(run_get_group(&state, Some(auth), &group_id.to_string()).await?),
@@ -1064,8 +1065,8 @@ pub async fn delete_group(
         return Err(ServerError::Forbidden);
     }
     let group_id = parse_group_id(&group_id)?;
-    let token =
-        forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str())).map_err(map_api_error)?;
+    let token = forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str()))
+        .map_err(ServerError::from)?;
     let ctx = state.get_ctx();
     let delete = aruna_ops_identity::groups::deletion::coordinator::DeleteGroupOperation::new(
         ctx.node_and_realm(),
@@ -1225,56 +1226,64 @@ pub async fn get_deletion_blockers(
     Ok(Json(DeletionBlockersResponse { nodes }))
 }
 
-fn map_rename_error(error: UpdateGroupError) -> ServerError {
-    match error {
-        UpdateGroupError::Unauthorized => ServerError::Forbidden,
-        UpdateGroupError::GroupNotFound => ServerError::NotFound,
-        UpdateGroupError::InvalidDisplayName
-        | UpdateGroupError::InvalidLocation
-        | UpdateGroupError::ConversionError(_) => ServerError::BadRequest,
-        UpdateGroupError::PlacementFenced => {
-            ServerError::Conflict("the group moved to a new holder set; retry".to_string())
+impl From<UpdateGroupError> for ServerError {
+    fn from(error: UpdateGroupError) -> Self {
+        match error {
+            UpdateGroupError::Unauthorized => ServerError::Forbidden,
+            UpdateGroupError::GroupNotFound => ServerError::NotFound,
+            UpdateGroupError::InvalidDisplayName
+            | UpdateGroupError::InvalidLocation
+            | UpdateGroupError::ConversionError(_) => ServerError::BadRequest,
+            UpdateGroupError::PlacementFenced => {
+                ServerError::Conflict("the group moved to a new holder set; retry".to_string())
+            }
+            UpdateGroupError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::Conflict("concurrent group update conflict; retry".to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        UpdateGroupError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::Conflict("concurrent group update conflict; retry".to_string())
-        }
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_member_error(error: AddUserError) -> ServerError {
-    match error {
-        AddUserError::Unauthorized => ServerError::Forbidden,
-        AddUserError::InvalidUserId => ServerError::BadRequest,
-        AddUserError::RoleNotFound | AddUserError::DocNotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
-    }
-}
-
-fn map_role_error(error: AddRoleError) -> ServerError {
-    match error {
-        AddRoleError::Unauthorized => ServerError::Forbidden,
-        AddRoleError::InvalidPublicRole
-        | AddRoleError::InvalidAssignedUser
-        | AddRoleError::UnconfinedRolePath
-        | AddRoleError::ReservedRoleName => ServerError::BadRequest,
-        AddRoleError::GroupNotFound => ServerError::NotFound,
-        AddRoleError::CheckPermissionsError(
-            AuthorizationError::GroupNotFound | AuthorizationError::DocNotFound,
-        ) => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
-    }
-}
-
-fn map_removal_error(error: RemoveFromError) -> ServerError {
-    match error {
-        RemoveFromError::Unauthorized => ServerError::Forbidden,
-        RemoveFromError::InvalidUserId => ServerError::BadRequest,
-        RemoveFromError::RoleNotFound | RemoveFromError::DocNotFound => ServerError::NotFound,
-        RemoveFromError::LastAdmin => {
-            ServerError::Conflict("the last admin of a group cannot be removed".to_string())
+impl From<AddUserError> for ServerError {
+    fn from(error: AddUserError) -> Self {
+        match error {
+            AddUserError::Unauthorized => ServerError::Forbidden,
+            AddUserError::InvalidUserId => ServerError::BadRequest,
+            AddUserError::RoleNotFound | AddUserError::DocNotFound => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
         }
-        other => ServerError::InternalError(other.into()),
+    }
+}
+
+impl From<AddRoleError> for ServerError {
+    fn from(error: AddRoleError) -> Self {
+        match error {
+            AddRoleError::Unauthorized => ServerError::Forbidden,
+            AddRoleError::InvalidPublicRole
+            | AddRoleError::InvalidAssignedUser
+            | AddRoleError::UnconfinedRolePath
+            | AddRoleError::ReservedRoleName => ServerError::BadRequest,
+            AddRoleError::GroupNotFound => ServerError::NotFound,
+            AddRoleError::CheckPermissionsError(
+                AuthorizationError::GroupNotFound | AuthorizationError::DocNotFound,
+            ) => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        }
+    }
+}
+
+impl From<RemoveFromError> for ServerError {
+    fn from(error: RemoveFromError) -> Self {
+        match error {
+            RemoveFromError::Unauthorized => ServerError::Forbidden,
+            RemoveFromError::InvalidUserId => ServerError::BadRequest,
+            RemoveFromError::RoleNotFound | RemoveFromError::DocNotFound => ServerError::NotFound,
+            RemoveFromError::LastAdmin => {
+                ServerError::Conflict("the last admin of a group cannot be removed".to_string())
+            }
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -1667,7 +1676,7 @@ pub async fn add_group_member(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_member_error)?;
+    .map_err(ServerError::from)?;
     let members = vec![user_id];
     let keys =
         crate::routes::storage::abe::records::member_requests(&state, &auth, group_id, members)
@@ -1758,7 +1767,7 @@ pub async fn remove_group_member(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_removal_error)?;
+    .map_err(ServerError::from)?;
     crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1809,7 +1818,7 @@ pub async fn leave_group(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_removal_error)?;
+    .map_err(ServerError::from)?;
     crate::routes::storage::abe::records::epoch_due(&state, &auth, Some(group_id)).await;
 
     Ok(StatusCode::NO_CONTENT)
@@ -1960,7 +1969,7 @@ pub async fn create_group_role(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_role_error)?;
+    .map_err(ServerError::from)?;
 
     let role = map_roles(auth_doc, realm_id)
         .into_iter()

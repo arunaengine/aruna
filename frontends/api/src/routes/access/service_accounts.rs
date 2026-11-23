@@ -9,9 +9,7 @@ use crate::routes::access::credentials::{
     CreatePathRestriction, CreateS3Response, authorize_credential_issuance,
     build_credential_restrictions, credential_expiry, serialize_restrictions,
 };
-use crate::routes::access::sessions::{
-    CreateSessionResponse, map_create_error, session_restrictions, unix_rfc3339,
-};
+use crate::routes::access::sessions::{CreateSessionResponse, session_restrictions, unix_rfc3339};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
@@ -88,14 +86,16 @@ fn account_response(user: User) -> ServiceAccountResponse {
     }
 }
 
-fn map_check_error(error: ServiceCheckError) -> ServerError {
-    match error {
-        ServiceCheckError::Refused => ServerError::Forbidden,
-        ServiceCheckError::NotFound => ServerError::NotFound,
-        ServiceCheckError::Deactivated => {
-            ServerError::Conflict("the service account is deactivated".to_string())
+impl From<ServiceCheckError> for ServerError {
+    fn from(error: ServiceCheckError) -> Self {
+        match error {
+            ServiceCheckError::Refused => ServerError::Forbidden,
+            ServiceCheckError::NotFound => ServerError::NotFound,
+            ServiceCheckError::Deactivated => {
+                ServerError::Conflict("the service account is deactivated".to_string())
+            }
+            error => ServerError::InternalError(error.into()),
         }
-        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -269,7 +269,7 @@ async fn create_token(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_check_error)?;
+    .map_err(ServerError::from)?;
     let account = AuthContext {
         user_id: account_id,
         realm_id: auth.realm_id,
@@ -279,7 +279,7 @@ async fn create_token(
     let restrictions = session_restrictions(&state, &account, request.path_restrictions).await?;
     let now = unix_timestamp_secs();
     let expiry = bound_session_expiry(now, request.expires_in_seconds, now + MAX_SESSION_TTL)
-        .map_err(map_create_error)?;
+        .map_err(ServerError::from)?;
     let created = drive(
         CreateSessionOperation::new(CreateSessionConfig {
             time: now,
@@ -299,7 +299,7 @@ async fn create_token(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::CREATED,
         Json(CreateSessionResponse {
@@ -384,7 +384,7 @@ async fn create_credential(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_check_error)?;
+    .map_err(ServerError::from)?;
     if request
         .path_restrictions
         .as_ref()

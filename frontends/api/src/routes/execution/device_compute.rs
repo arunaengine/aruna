@@ -26,7 +26,6 @@ use aruna_runner::driver::{DriverContext, drive};
 
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::execution::jobs::map_local_error;
 use crate::server::state::ServerState;
 
 pub fn router() -> OpenApiRouter<Arc<ServerState>> {
@@ -133,7 +132,7 @@ async fn get_device_compute(
 ) -> ServerResult<Json<DeviceComputeResponse>> {
     let status = compute_status(&state.get_ctx(), auth.user_id)
         .await
-        .map_err(map_local_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(status.into()))
 }
 
@@ -205,29 +204,31 @@ impl From<PublishedRun> for PublishRunResponse {
     }
 }
 
-fn map_publish_error(error: PublishRunError) -> ServerError {
-    match error {
-        PublishRunError::NotFound => ServerError::NotFound,
-        PublishRunError::NotFinished
-        | PublishRunError::Collision(_)
-        | PublishRunError::TargetChanged => ServerError::Conflict(error.to_string()),
-        PublishRunError::NotRealmNode(_)
-        | PublishRunError::Refused {
-            refusal: SyncRefusal::NotFound | SyncRefusal::Invalid(_),
-            ..
-        } => ServerError::BadRequestReason(error.to_string()),
-        PublishRunError::Refused {
-            refusal: SyncRefusal::Unauthorized | SyncRefusal::Forbidden,
-            ..
-        } => ServerError::Forbidden,
-        PublishRunError::Unreachable(_) => ServerError::BadGatewayReason(error.to_string()),
-        PublishRunError::Refused {
-            refusal: SyncRefusal::Unavailable | SyncRefusal::Coordinator(_),
-            ..
-        }
-        | PublishRunError::Crate(_)
-        | PublishRunError::Unavailable(_) => {
-            ServerError::ServiceUnavailableReason(error.to_string())
+impl From<PublishRunError> for ServerError {
+    fn from(error: PublishRunError) -> Self {
+        match error {
+            PublishRunError::NotFound => ServerError::NotFound,
+            PublishRunError::NotFinished
+            | PublishRunError::Collision(_)
+            | PublishRunError::TargetChanged => ServerError::Conflict(error.to_string()),
+            PublishRunError::NotRealmNode(_)
+            | PublishRunError::Refused {
+                refusal: SyncRefusal::NotFound | SyncRefusal::Invalid(_),
+                ..
+            } => ServerError::BadRequestReason(error.to_string()),
+            PublishRunError::Refused {
+                refusal: SyncRefusal::Unauthorized | SyncRefusal::Forbidden,
+                ..
+            } => ServerError::Forbidden,
+            PublishRunError::Unreachable(_) => ServerError::BadGatewayReason(error.to_string()),
+            PublishRunError::Refused {
+                refusal: SyncRefusal::Unavailable | SyncRefusal::Coordinator(_),
+                ..
+            }
+            | PublishRunError::Crate(_)
+            | PublishRunError::Unavailable(_) => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
         }
     }
 }
@@ -304,7 +305,7 @@ async fn publish_device_run(
             },
         },
     );
-    let published = drive(publish, &context).await.map_err(map_publish_error)?;
+    let published = drive(publish, &context).await.map_err(ServerError::from)?;
     Ok(Json(published.into()))
 }
 
@@ -347,7 +348,7 @@ async fn get_local_crate(
     let job_id = crate::jobs::parse_job_id(&job_id).map_err(ServerError::from)?;
     let jsonld = drive(local_run_crate(job_id, auth.user_id), &state.get_ctx())
         .await
-        .map_err(map_publish_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(jsonld))
 }
 

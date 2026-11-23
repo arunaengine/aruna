@@ -22,7 +22,7 @@ use aruna_ops_data::device::sync::repository::{action_entry, base_entry, folder_
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::http::StatusCode;
 use ed25519_dalek::SigningKey;
 use tempfile::TempDir;
@@ -62,7 +62,7 @@ async fn seed_row(state: &ServerState, row: (String, Key, Value)) {
 
 async fn setup_with(capabilities: NodeCapabilities) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -133,8 +133,8 @@ impl aruna_scheduler::InboundTaskHandler for Fired {
 /// A device that reads local directories and reports the timers it fires. No pass runs.
 async fn local_setup() -> (Fixture, tokio::sync::mpsc::UnboundedReceiver<TaskKey>) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().to_str().unwrap().to_string();
-    let storage = FjallStorage::open(&path).unwrap();
+    let path = dir.path().to_str().unwrap();
+    let storage = MemoryStorage::open();
     let net = aruna_p2p::NetHandle::new(
         aruna_p2p::config::NetConfig {
             bind_addr: "127.0.0.1:0".parse().unwrap(),

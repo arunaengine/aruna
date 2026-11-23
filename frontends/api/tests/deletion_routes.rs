@@ -36,7 +36,7 @@ use aruna_core::user::id::UserId;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Extension, Json};
@@ -52,7 +52,7 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes(
         SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()

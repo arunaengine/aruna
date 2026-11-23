@@ -1172,9 +1172,9 @@ async fn activate_sync(state: &ServerState, relationship: &SyncRelationship) -> 
         Ok(_) => return Ok(()),
         Err(SyncRelationshipError::RolledBack) => {
             let _ = drive(KickRepairOperation::new(), &context).await;
-            return Err(map_create_error(SyncRelationshipError::RolledBack));
+            return Err(ServerError::from(SyncRelationshipError::RolledBack));
         }
-        Err(error) => map_create_error(error),
+        Err(error) => ServerError::from(error),
     };
     if let Err(stage_error) = drive(
         MirrorRecordOperation::stage(relationship.clone(), SyncMirrorIntent::Delete),
@@ -1231,16 +1231,18 @@ fn map_mirror_error(error: MetadataError) -> ServerError {
     }
 }
 
-fn map_create_error(error: SyncRelationshipError) -> ServerError {
-    match error {
-        SyncRelationshipError::Duplicate => {
-            ServerError::Conflict("sync relationship already exists".to_string())
+impl From<SyncRelationshipError> for ServerError {
+    fn from(error: SyncRelationshipError) -> Self {
+        match error {
+            SyncRelationshipError::Duplicate => {
+                ServerError::Conflict("sync relationship already exists".to_string())
+            }
+            // The target's answer was lost and repair rolls the mirror back; the caller may retry.
+            SyncRelationshipError::RolledBack => ServerError::BadGatewayReason(
+                "the target did not confirm the mirror and it was rolled back".to_string(),
+            ),
+            other => ServerError::InternalError(other.into()),
         }
-        // The target's answer was lost and repair rolls the mirror back; the caller may retry.
-        SyncRelationshipError::RolledBack => ServerError::BadGatewayReason(
-            "the target did not confirm the mirror and it was rolled back".to_string(),
-        ),
-        other => ServerError::InternalError(other.into()),
     }
 }
 

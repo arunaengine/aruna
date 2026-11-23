@@ -141,7 +141,7 @@ pub async fn publish(
     let publish = PublishPlugin::new(actor, auth, body);
     let published = drive(publish, &state.get_ctx())
         .await
-        .map_err(map_publish_error)?;
+        .map_err(ServerError::from)?;
     Ok((StatusCode::CREATED, Json(published.into())))
 }
 
@@ -247,28 +247,32 @@ fn page(plugins: Vec<PublishedPlugin>, query: &PluginQuery, limit: usize) -> Plu
     }
 }
 
-fn map_publish_error(error: PublishError) -> ServerError {
-    match error {
-        PublishError::TooLarge => ServerError::PayloadTooLarge(error.to_string()),
-        PublishError::Invalid(_) => ServerError::BadRequestReason(error.to_string()),
-        PublishError::Unauthorized | PublishError::NotManagementNode => ServerError::Forbidden,
-        PublishError::VersionTaken(_) | PublishError::Entry(EntryError::VersionTaken(_)) => {
-            ServerError::Conflict(error.to_string())
+impl From<PublishError> for ServerError {
+    fn from(error: PublishError) -> Self {
+        match error {
+            PublishError::TooLarge => ServerError::PayloadTooLarge(error.to_string()),
+            PublishError::Invalid(_) => ServerError::BadRequestReason(error.to_string()),
+            PublishError::Unauthorized | PublishError::NotManagementNode => ServerError::Forbidden,
+            PublishError::VersionTaken(_) | PublishError::Entry(EntryError::VersionTaken(_)) => {
+                ServerError::Conflict(error.to_string())
+            }
+            PublishError::Entry(EntryError::StorageError(StorageError::TransactionConflict)) => {
+                ServerError::config_conflict()
+            }
+            PublishError::Entry(EntryError::Unauthorized | EntryError::NotManagementNode) => {
+                ServerError::Forbidden
+            }
+            PublishError::TooFewCopies { .. }
+            | PublishError::Entry(EntryError::TooFewCopies { .. })
+            | PublishError::Artifact(ArtifactError::Busy)
+            | PublishError::Unavailable(_) => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            PublishError::Artifact(ArtifactError::Unavailable(_)) => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        PublishError::Entry(EntryError::StorageError(StorageError::TransactionConflict)) => {
-            ServerError::config_conflict()
-        }
-        PublishError::Entry(EntryError::Unauthorized | EntryError::NotManagementNode) => {
-            ServerError::Forbidden
-        }
-        PublishError::TooFewCopies { .. }
-        | PublishError::Entry(EntryError::TooFewCopies { .. })
-        | PublishError::Artifact(ArtifactError::Busy)
-        | PublishError::Unavailable(_) => ServerError::ServiceUnavailableReason(error.to_string()),
-        PublishError::Artifact(ArtifactError::Unavailable(_)) => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
-        other => ServerError::InternalError(other.into()),
     }
 }
 

@@ -543,20 +543,22 @@ pub(crate) fn status_response(status: DistributionStatus) -> DistributedResponse
     }
 }
 
-pub(crate) fn map_create_error(error: CreateError) -> ServerError {
-    match error {
-        CreateError::Invalid(message) => ServerError::BadRequestMessage(message),
-        CreateError::Distribution(error) => ServerError::BadRequestMessage(error.to_string()),
-        CreateError::Publish(PublishRefusal::Unauthorized) => ServerError::Unauthorized,
-        CreateError::Publish(PublishRefusal::Forbidden) => ServerError::Forbidden,
-        CreateError::Publish(refusal @ PublishRefusal::Unavailable(_)) => {
-            ServerError::ServiceUnavailableReason(refusal.to_string())
+impl From<CreateError> for ServerError {
+    fn from(error: CreateError) -> Self {
+        match error {
+            CreateError::Invalid(message) => ServerError::BadRequestMessage(message),
+            CreateError::Distribution(error) => ServerError::BadRequestMessage(error.to_string()),
+            CreateError::Publish(PublishRefusal::Unauthorized) => ServerError::Unauthorized,
+            CreateError::Publish(PublishRefusal::Forbidden) => ServerError::Forbidden,
+            CreateError::Publish(refusal @ PublishRefusal::Unavailable(_)) => {
+                ServerError::ServiceUnavailableReason(refusal.to_string())
+            }
+            CreateError::Publish(refusal) => ServerError::Conflict(refusal.to_string()),
+            CreateError::UnknownSet(_) => ServerError::NotFound,
+            CreateError::Conflicted => ServerError::Conflict(error.to_string()),
+            CreateError::Status(error) => ServerError::InternalError(error.into()),
+            CreateError::Blocked(message) => ServerError::ServiceUnavailableReason(message),
         }
-        CreateError::Publish(refusal) => ServerError::Conflict(refusal.to_string()),
-        CreateError::UnknownSet(_) => ServerError::NotFound,
-        CreateError::Conflicted => ServerError::Conflict(error.to_string()),
-        CreateError::Status(error) => ServerError::InternalError(error.into()),
-        CreateError::Blocked(message) => ServerError::ServiceUnavailableReason(message),
     }
 }
 
@@ -702,7 +704,7 @@ pub async fn create_distributed(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::CREATED, Json(admission_response(report))))
 }
 
@@ -754,7 +756,7 @@ pub async fn retry_admission(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_create_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(admission_response(report)))
 }
 

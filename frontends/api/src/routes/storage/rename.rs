@@ -94,16 +94,18 @@ fn plan_response(bucket: String, plan: RenamePlan) -> RenameResponse {
     }
 }
 
-pub(super) fn map_error(error: RenameError) -> ServerError {
-    match error {
-        RenameError::Invalid(message) => ServerError::BadRequestMessage(message),
-        RenameError::Conflict(message) => ServerError::Conflict(message),
-        RenameError::NotFound => ServerError::NotFound,
-        RenameError::Forbidden => ServerError::Forbidden,
-        RenameError::Storage(StorageError::TransactionConflict) => {
-            ServerError::Conflict("the bucket changed during the rename; try again".to_string())
+impl From<RenameError> for ServerError {
+    fn from(error: RenameError) -> Self {
+        match error {
+            RenameError::Invalid(message) => ServerError::BadRequestMessage(message),
+            RenameError::Conflict(message) => ServerError::Conflict(message),
+            RenameError::NotFound => ServerError::NotFound,
+            RenameError::Forbidden => ServerError::Forbidden,
+            RenameError::Storage(StorageError::TransactionConflict) => {
+                ServerError::Conflict("the bucket changed during the rename; try again".to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -222,7 +224,7 @@ pub async fn preview_rename(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(plan_response(bucket, plan)))
 }
 
@@ -296,7 +298,7 @@ pub async fn rename_keys(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(plan_response(bucket, plan)))
 }
 

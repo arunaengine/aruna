@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::imports::map_error;
 use crate::auth::RealmAuth;
 use crate::auth::parse_group_id;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
@@ -147,11 +146,11 @@ pub async fn get_discovery(
     let context = state.get_ctx();
     drive(ReadImportOperation::new(group_id, import_id), &context)
         .await
-        .map_err(map_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
     let rules = drive(ReadDiscoveryOperation::new(group_id, import_id), &context)
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(from_rules(rules)))
 }
 
@@ -236,16 +235,18 @@ pub async fn put_discovery(
     let context = state.get_ctx();
     let rule = drive(ReadImportOperation::new(group_id, import_id), &context)
         .await
-        .map_err(map_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
     drive(
         RuleAccessOperation::new(&auth, state.get_node_id(), &rule),
         &context,
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let operation = SetDiscoveryOperation::new(group_id, import_id, to_rules(request.rules));
-    let rules = drive(operation, &context).await.map_err(map_error)?;
+    let rules = drive(operation, &context)
+        .await
+        .map_err(ServerError::from)?;
     Ok(Json(from_rules(rules)))
 }
 
@@ -321,7 +322,7 @@ pub async fn preview_rules(
     let context = state.get_ctx();
     let rule = drive(ReadImportOperation::new(group_id, import_id), &context)
         .await
-        .map_err(map_error)?
+        .map_err(ServerError::from)?
         .ok_or(ServerError::NotFound)?;
     let rules = to_rules(request.rules);
     let caller = (&auth, state.get_node_id());
@@ -330,7 +331,7 @@ pub async fn preview_rules(
         &context,
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let files = preview
         .files
         .into_iter()

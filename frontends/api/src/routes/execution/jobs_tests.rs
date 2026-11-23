@@ -582,7 +582,7 @@ async fn report_pending_typed() {
 #[test]
 fn submit_conflict_typed() {
     let existing_job_id = JobId::from_bytes([15u8; 16]);
-    let error = map_submit_error(aruna_core::job_request::SubmitJobError::JobPlanConflict {
+    let error = ServerError::from(aruna_core::job_request::SubmitJobError::JobPlanConflict {
         existing_job_id,
     });
     assert!(matches!(

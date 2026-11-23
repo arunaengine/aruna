@@ -481,70 +481,81 @@ fn policy_response(document: &PlacementPolicyDocument) -> ServerResult<PolicyRes
     })
 }
 
-fn map_create_error(error: PolicyForwardError) -> ServerError {
-    match error {
-        PolicyForwardError::Create(CreatePolicyError::Unauthorized) => ServerError::Forbidden,
-        PolicyForwardError::Create(CreatePolicyError::Policy(
-            PlacementPolicyError::PolicyIdReuse { .. },
-        )) => ServerError::Conflict("policy id already carries another definition".to_string()),
-        PolicyForwardError::Create(CreatePolicyError::Policy(reason)) => {
-            ServerError::BadRequestReason(reason.to_string())
+impl From<PolicyForwardError> for ServerError {
+    fn from(error: PolicyForwardError) -> Self {
+        match error {
+            PolicyForwardError::Create(CreatePolicyError::Unauthorized) => ServerError::Forbidden,
+            PolicyForwardError::Create(CreatePolicyError::Policy(
+                PlacementPolicyError::PolicyIdReuse { .. },
+            )) => ServerError::Conflict("policy id already carries another definition".to_string()),
+            PolicyForwardError::Create(CreatePolicyError::Policy(reason)) => {
+                ServerError::BadRequestReason(reason.to_string())
+            }
+            PolicyForwardError::Forward(HolderWriteError::Unauthorized) => {
+                ServerError::Unauthorized
+            }
+            PolicyForwardError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
+            other => ServerError::ServiceUnavailableReason(other.to_string()),
         }
-        PolicyForwardError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
-        PolicyForwardError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
-        other => ServerError::ServiceUnavailableReason(other.to_string()),
     }
 }
 
-fn map_read_error(error: ReadPolicyError) -> ServerError {
-    match error {
-        ReadPolicyError::NotFound { .. }
-        | ReadPolicyError::DigestMismatch
-        | ReadPolicyError::RealmMismatch => ServerError::NotFound,
-        ReadPolicyError::Unavailable(_) | ReadPolicyError::PlacementUnavailable => {
-            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+impl From<ReadPolicyError> for ServerError {
+    fn from(error: ReadPolicyError) -> Self {
+        match error {
+            ReadPolicyError::NotFound { .. }
+            | ReadPolicyError::DigestMismatch
+            | ReadPolicyError::RealmMismatch => ServerError::NotFound,
+            ReadPolicyError::Unavailable(_) | ReadPolicyError::PlacementUnavailable => {
+                ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+            }
+            ReadPolicyError::Authority(_) => {
+                ServerError::ServiceUnavailableReason("placement_policy_unverified".to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        ReadPolicyError::Authority(_) => {
-            ServerError::ServiceUnavailableReason("placement_policy_unverified".to_string())
-        }
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_default_error(error: PutPlacementError) -> ServerError {
-    match error {
-        PutPlacementError::Unauthorized => ServerError::Forbidden,
-        PutPlacementError::NoSuchBucket | PutPlacementError::GroupMismatch => ServerError::NotFound,
-        PutPlacementError::GenerationConflict { .. } | PutPlacementError::GenerationExhausted => {
-            ServerError::Conflict(error.to_string())
+impl From<PutPlacementError> for ServerError {
+    fn from(error: PutPlacementError) -> Self {
+        match error {
+            PutPlacementError::Unauthorized => ServerError::Forbidden,
+            PutPlacementError::NoSuchBucket | PutPlacementError::GroupMismatch => {
+                ServerError::NotFound
+            }
+            PutPlacementError::GenerationConflict { .. }
+            | PutPlacementError::GenerationExhausted => ServerError::Conflict(error.to_string()),
+            PutPlacementError::PolicyUnavailable { .. } => {
+                ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+            }
+            PutPlacementError::Policy(_) => policy_denied(),
+            PutPlacementError::ForeignPolicy { .. } => foreign_policy(),
+            other => ServerError::InternalError(other.into()),
         }
-        PutPlacementError::PolicyUnavailable { .. } => {
-            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
-        }
-        PutPlacementError::Policy(_) => policy_denied(),
-        PutPlacementError::ForeignPolicy { .. } => foreign_policy(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_successor_error(error: SuccessorError) -> ServerError {
-    match error {
-        SuccessorError::HeadConflict { .. }
-        | SuccessorError::BucketChanged
-        | SuccessorError::DefaultChanged { .. }
-        | SuccessorError::MutationConflict(_)
-        | SuccessorError::VersionCollision(_)
-        | SuccessorError::IntentConflict
-        | SuccessorError::HeadDeleted => ServerError::Conflict(error.to_string()),
-        SuccessorError::VersionMissing => ServerError::NotFound,
-        SuccessorError::Policy(_) => policy_denied(),
-        // The subject moved under the plan, so the evaluation it carries is
-        // stale rather than wrong; nothing was written.
-        SuccessorError::SubjectDrift => {
-            ServerError::ServiceUnavailableReason("placement_subject_drift".to_string())
+impl From<SuccessorError> for ServerError {
+    fn from(error: SuccessorError) -> Self {
+        match error {
+            SuccessorError::HeadConflict { .. }
+            | SuccessorError::BucketChanged
+            | SuccessorError::DefaultChanged { .. }
+            | SuccessorError::MutationConflict(_)
+            | SuccessorError::VersionCollision(_)
+            | SuccessorError::IntentConflict
+            | SuccessorError::HeadDeleted => ServerError::Conflict(error.to_string()),
+            SuccessorError::VersionMissing => ServerError::NotFound,
+            SuccessorError::Policy(_) => policy_denied(),
+            // The subject moved under the plan, so the evaluation it carries is
+            // stale rather than wrong; nothing was written.
+            SuccessorError::SubjectDrift => {
+                ServerError::ServiceUnavailableReason("placement_subject_drift".to_string())
+            }
+            SuccessorError::Gate(error) => ServerError::from(error),
+            other => ServerError::InternalError(other.into()),
         }
-        SuccessorError::Gate(error) => map_gate_error(error),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -589,44 +600,50 @@ fn policy_denied() -> ServerError {
     ServerError::BadRequestReason("placement_policy_denied".to_string())
 }
 
-fn map_gate_error(error: PolicyGateError) -> ServerError {
-    match error {
-        PolicyGateError::ForeignPolicy { .. } => foreign_policy(),
-        PolicyGateError::Denied { .. }
-        | PolicyGateError::NoSubject
-        | PolicyGateError::Invalid
-        | PolicyGateError::Policy(_) => policy_denied(),
-        PolicyGateError::Unavailable { .. }
-        | PolicyGateError::Required { .. }
-        | PolicyGateError::Drift
-        | PolicyGateError::AdmissionStopped
-        | PolicyGateError::Read(_) => {
-            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+impl From<PolicyGateError> for ServerError {
+    fn from(error: PolicyGateError) -> Self {
+        match error {
+            PolicyGateError::ForeignPolicy { .. } => foreign_policy(),
+            PolicyGateError::Denied { .. }
+            | PolicyGateError::NoSubject
+            | PolicyGateError::Invalid
+            | PolicyGateError::Policy(_) => policy_denied(),
+            PolicyGateError::Unavailable { .. }
+            | PolicyGateError::Required { .. }
+            | PolicyGateError::Drift
+            | PolicyGateError::AdmissionStopped
+            | PolicyGateError::Read(_) => {
+                ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+            }
+            other => ServerError::InternalError(other.into()),
         }
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_mutation_error(error: PolicyMutationError) -> ServerError {
-    match error {
-        PolicyMutationError::Unauthorized => ServerError::Forbidden,
-        PolicyMutationError::PolicyUnavailable { .. } => {
-            ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+impl From<PolicyMutationError> for ServerError {
+    fn from(error: PolicyMutationError) -> Self {
+        match error {
+            PolicyMutationError::Unauthorized => ServerError::Forbidden,
+            PolicyMutationError::PolicyUnavailable { .. } => {
+                ServerError::ServiceUnavailableReason("placement_policy_unavailable".to_string())
+            }
+            PolicyMutationError::Successor(error) => ServerError::from(error),
+            PolicyMutationError::ForeignPolicy { .. } => foreign_policy(),
+            other => ServerError::InternalError(other.into()),
         }
-        PolicyMutationError::Successor(error) => map_successor_error(error),
-        PolicyMutationError::ForeignPolicy { .. } => foreign_policy(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_bulk_error(error: BulkError) -> ServerError {
-    match error {
-        BulkError::Unauthorized => ServerError::Forbidden,
-        BulkError::NoSuchBucket => ServerError::NotFound,
-        BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
-        BulkError::ForeignPolicy { .. } => foreign_policy(),
-        BulkError::Distribution(error) => crate::lookup::map_guard_error(error),
-        other => ServerError::InternalError(other.into()),
+impl From<BulkError> for ServerError {
+    fn from(error: BulkError) -> Self {
+        match error {
+            BulkError::Unauthorized => ServerError::Forbidden,
+            BulkError::NoSuchBucket => ServerError::NotFound,
+            BulkError::BucketChanged => ServerError::Conflict(error.to_string()),
+            BulkError::ForeignPolicy { .. } => foreign_policy(),
+            BulkError::Distribution(error) => ServerError::from(error),
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -791,7 +808,7 @@ pub async fn create_placement_policy(
     let create = CreateRoutedOperation::new(config, forwarded_auth_token(bearer_token)?, local);
     let document = aruna_runner::driver::drive(create, &ctx)
         .await
-        .map_err(map_create_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(policy_response(&document)?))
 }
 
@@ -857,7 +874,7 @@ pub async fn get_placement_policy(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_read_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(policy_response(&authentic.document)?))
 }
 
@@ -1071,7 +1088,7 @@ pub async fn put_bucket_placement(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_default_error)?;
+    .map_err(ServerError::from)?;
     let policies = named_refs(&state, realm_id, stored.policies).await?;
     Ok(Json(BucketPlacementResponse {
         bucket,
@@ -1307,7 +1324,7 @@ pub async fn mint_object_placement(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_mutation_error)?;
+    .map_err(ServerError::from)?;
     let mut response = mutation_response(&outcome);
     response.policies = named_refs(&state, realm_id, outcome.refs()).await?;
     Ok(Json(response))
@@ -1476,7 +1493,7 @@ async fn run_here(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_bulk_error)?;
+    .map_err(ServerError::from)?;
     let target_policies = named_refs(state, realm_id, report.target_refs).await?;
     Ok(BulkRunResponse {
         operation_id: report.operation_id.to_string(),
@@ -1632,7 +1649,7 @@ async fn coverage_here(
     .map_err(|error| match error {
         CoverageError::Unauthorized => ServerError::Forbidden,
         CoverageError::NoSuchBucket => ServerError::NotFound,
-        CoverageError::Distribution(error) => crate::lookup::map_guard_error(error),
+        CoverageError::Distribution(error) => ServerError::from(error),
         other => ServerError::InternalError(other.into()),
     })?;
     Ok(coverage_response(bucket, report))

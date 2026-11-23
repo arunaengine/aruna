@@ -82,47 +82,53 @@ fn vault_response(heads: Vec<VaultRevision>) -> VaultResponse {
     VaultResponse { heads }
 }
 
-fn map_read_error(error: ReadVaultError) -> ServerError {
-    match error {
-        ReadVaultError::Denied => ServerError::Forbidden,
-        ReadVaultError::Unavailable(_)
-        | ReadVaultError::PlacementResolve(_)
-        | ReadVaultError::PlacementUnavailable
-        | ReadVaultError::RealmConfigMissing => {
-            ServerError::ServiceUnavailableReason("vault_unavailable".to_string())
+impl From<ReadVaultError> for ServerError {
+    fn from(error: ReadVaultError) -> Self {
+        match error {
+            ReadVaultError::Denied => ServerError::Forbidden,
+            ReadVaultError::Unavailable(_)
+            | ReadVaultError::PlacementResolve(_)
+            | ReadVaultError::PlacementUnavailable
+            | ReadVaultError::RealmConfigMissing => {
+                ServerError::ServiceUnavailableReason("vault_unavailable".to_string())
+            }
+            error => ServerError::InternalError(error.into()),
         }
-        error => ServerError::InternalError(error.into()),
     }
 }
 
-fn map_route_error(error: VaultRouteError) -> ServerError {
-    match error {
-        VaultRouteError::Append(AppendVaultError::Record(VaultRecordError::TooLarge)) => {
-            ServerError::PayloadTooLarge("a vault payload may hold at most 64 KiB".to_string())
+impl From<VaultRouteError> for ServerError {
+    fn from(error: VaultRouteError) -> Self {
+        match error {
+            VaultRouteError::Append(AppendVaultError::Record(VaultRecordError::TooLarge)) => {
+                ServerError::PayloadTooLarge("a vault payload may hold at most 64 KiB".to_string())
+            }
+            VaultRouteError::Append(AppendVaultError::Record(error)) => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            VaultRouteError::Refused(VaultRefusal::Invalid) => {
+                ServerError::BadRequestReason("the vault holder refused the record".to_string())
+            }
+            VaultRouteError::Append(AppendVaultError::TooManyKeys)
+            | VaultRouteError::Refused(VaultRefusal::TooManyKeys) => ServerError::Conflict(
+                "the user has published the most key records allowed".to_string(),
+            ),
+            VaultRouteError::Append(AppendVaultError::Storage(
+                StorageError::TransactionConflict,
+            )) => {
+                ServerError::Conflict("the vault is being written concurrently; retry".to_string())
+            }
+            VaultRouteError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
+            VaultRouteError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
+            VaultRouteError::Forward(_)
+            | VaultRouteError::Append(
+                AppendVaultError::PlacementResolve(_)
+                | AppendVaultError::PlacementUnavailable
+                | AppendVaultError::PlacementFenced
+                | AppendVaultError::RealmConfigMissing,
+            ) => ServerError::ServiceUnavailableReason("vault_unavailable".to_string()),
+            error => ServerError::InternalError(error.into()),
         }
-        VaultRouteError::Append(AppendVaultError::Record(error)) => {
-            ServerError::BadRequestReason(error.to_string())
-        }
-        VaultRouteError::Refused(VaultRefusal::Invalid) => {
-            ServerError::BadRequestReason("the vault holder refused the record".to_string())
-        }
-        VaultRouteError::Append(AppendVaultError::TooManyKeys)
-        | VaultRouteError::Refused(VaultRefusal::TooManyKeys) => {
-            ServerError::Conflict("the user has published the most key records allowed".to_string())
-        }
-        VaultRouteError::Append(AppendVaultError::Storage(StorageError::TransactionConflict)) => {
-            ServerError::Conflict("the vault is being written concurrently; retry".to_string())
-        }
-        VaultRouteError::Forward(HolderWriteError::Unauthorized) => ServerError::Unauthorized,
-        VaultRouteError::Forward(HolderWriteError::Forbidden) => ServerError::Forbidden,
-        VaultRouteError::Forward(_)
-        | VaultRouteError::Append(
-            AppendVaultError::PlacementResolve(_)
-            | AppendVaultError::PlacementUnavailable
-            | AppendVaultError::PlacementFenced
-            | AppendVaultError::RealmConfigMissing,
-        ) => ServerError::ServiceUnavailableReason("vault_unavailable".to_string()),
-        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -157,7 +163,7 @@ pub(super) async fn append(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_route_error)
+    .map_err(ServerError::from)
 }
 
 pub(super) async fn read(
@@ -174,7 +180,7 @@ pub(super) async fn read(
     };
     drive(ReadVaultOperation::new(config), &state.get_ctx())
         .await
-        .map_err(map_read_error)
+        .map_err(ServerError::from)
 }
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {

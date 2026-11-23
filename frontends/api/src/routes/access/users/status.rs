@@ -31,14 +31,16 @@ pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new().routes(routes!(put_status))
 }
 
-fn map_status_error(error: AccountStatusError) -> ServerError {
-    match error {
-        AccountStatusError::NotFound => ServerError::NotFound,
-        AccountStatusError::Unauthorized => ServerError::Forbidden,
-        AccountStatusError::Administrator => ServerError::Conflict(
-            "a realm administrator cannot be deactivated; remove the role first".to_string(),
-        ),
-        error => ServerError::InternalError(error.into()),
+impl From<AccountStatusError> for ServerError {
+    fn from(error: AccountStatusError) -> Self {
+        match error {
+            AccountStatusError::NotFound => ServerError::NotFound,
+            AccountStatusError::Unauthorized => ServerError::Forbidden,
+            AccountStatusError::Administrator => ServerError::Conflict(
+                "a realm administrator cannot be deactivated; remove the role first".to_string(),
+            ),
+            error => ServerError::InternalError(error.into()),
+        }
     }
 }
 
@@ -102,6 +104,6 @@ async fn put_status(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_status_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }

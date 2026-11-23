@@ -23,7 +23,7 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, permission_granted, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::metadata::{bearer_token_string, map_api_error};
+use crate::metadata::bearer_token_string;
 use crate::routes::storage::relay::{node_read, query_path};
 use crate::server::state::ServerState;
 
@@ -254,7 +254,7 @@ pub async fn bucket_links(
             let queries = file_queries((realm_id, node_id), &bucket, &key, params.version_id);
             drive(queries, state.get_ctx().as_ref())
                 .await
-                .map_err(map_api_error)?
+                .map_err(ServerError::from)?
         }
         (None, Some(prefix)) => {
             let path = bucket_permission_path(realm_id, info.group_id, node_id, &bucket);
@@ -302,7 +302,7 @@ async fn run(
     let links = links_distributed(node, Some(auth), bearer_token_string(bearer_token), request);
     let page = drive(links, state.get_ctx().as_ref())
         .await
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(page.into()))
 }
 
@@ -391,7 +391,7 @@ pub async fn file_part_of(
     let found = part_of((realm_id, node_id), caller, &bucket, &params.key);
     let found = drive(found, state.get_ctx().as_ref())
         .await
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
     let encoded: String = url::form_urlencoded::byte_serialize(params.key.as_bytes()).collect();
     Ok(Json(PartOfResponse {
         datasets: found
@@ -494,7 +494,7 @@ pub async fn part_target(
         state.get_ctx().as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     // Signed out, a part of another node's bucket resolves only as that node answers.
     if let Some(owner) = target.node_id.filter(|owner| *owner != state.get_node_id())
         && signed_out

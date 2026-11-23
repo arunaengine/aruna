@@ -52,8 +52,7 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::jobs::{JobStatusResponse, job_status_response};
 use crate::jobs::{owned_session_job, session_call};
 use crate::lookup::bucket_info;
-use crate::routes::execution::jobs::{coded_response, map_submit_error};
-use crate::routes::rocrate_import::map_head_error;
+use crate::routes::execution::jobs::coded_response;
 use crate::routes::staging::queue_live_replication;
 use crate::server::state::ServerState;
 
@@ -1056,7 +1055,7 @@ async fn stage_one(
         &context,
     )
     .await
-    .map_err(map_head_error)?;
+    .map_err(ServerError::from)?;
     // The version's own refs must admit where the session's workers run, and the copy takes
     // exactly that version, so a write after the check cannot bring in other refs.
     if let Some(operation) = write_gate(gate, &head.source_policies, None).map_err(gate_refusal)? {
@@ -1175,7 +1174,7 @@ async fn queue_copy(
         state.rocrate_limits().artifact_retention_ms,
     )
     .await
-    .map_err(map_submit_error)?;
+    .map_err(ServerError::from)?;
     Ok(PendingInputResponse {
         dest_key: dest_key.to_string(),
         job_id: result.job_id.to_string(),

@@ -40,9 +40,8 @@ struct Fixture {
     member: AuthContext,
 }
 
-fn context(dir: &TempDir) -> Arc<DriverContext> {
-    let storage =
-        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+fn context(_dir: &TempDir) -> Arc<DriverContext> {
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
     Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,

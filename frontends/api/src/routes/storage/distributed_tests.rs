@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::lookup::map_guard_error;
 use aruna_core::id::NodeId;
 use aruna_core::structs::storage::distribution::DistributionRevision;
 use aruna_core::structs::storage::distribution::route::RouteError;
@@ -76,17 +75,17 @@ fn create_request_converts() {
 fn publisher_outage_unavailable() {
     let unavailable = PublishRefusal::Unavailable("publisher node x is unreachable".to_string());
     let ServerError::ServiceUnavailableReason(message) =
-        map_create_error(CreateError::Publish(unavailable))
+        ServerError::from(CreateError::Publish(unavailable))
     else {
         panic!("an unreachable publisher answers 503");
     };
     assert!(message.starts_with("configuration changes unavailable"));
     assert!(matches!(
-        map_create_error(CreateError::Publish(PublishRefusal::Forbidden)),
+        ServerError::from(CreateError::Publish(PublishRefusal::Forbidden)),
         ServerError::Forbidden
     ));
     assert!(matches!(
-        map_create_error(CreateError::UnknownSet(Ulid::nil())),
+        ServerError::from(CreateError::UnknownSet(Ulid::nil())),
         ServerError::NotFound
     ));
 }
@@ -280,11 +279,11 @@ fn guard_refusals_map() {
         node_id: node_text(2).parse().unwrap(),
     };
     assert!(matches!(
-        map_guard_error(wrong),
+        ServerError::from(wrong),
         ServerError::ServiceUnavailableReason(_)
     ));
     assert!(matches!(
-        map_guard_error(GuardError::Unbound(set_id)),
+        ServerError::from(GuardError::Unbound(set_id)),
         ServerError::Conflict(_)
     ));
 }
@@ -377,20 +376,20 @@ fn errors_map_status() {
         GuardError::Route(RouteError::StaleRange(set_id)),
     ] {
         assert!(matches!(
-            map_guard_error(retryable),
+            ServerError::from(retryable),
             ServerError::ServiceUnavailableReason(_)
         ));
     }
     for refused in [RouteError::Deleting(set_id), RouteError::NoRange(set_id)] {
         assert!(matches!(
-            map_guard_error(GuardError::Route(refused)),
+            ServerError::from(GuardError::Route(refused)),
             ServerError::Conflict(_)
         ));
     }
     let conversion =
         aruna_core::errors::ConversionError::from(postcard::Error::DeserializeUnexpectedEnd);
     assert!(matches!(
-        map_guard_error(GuardError::Conversion(conversion)),
+        ServerError::from(GuardError::Conversion(conversion)),
         ServerError::InternalError(_)
     ));
     let cases = [
@@ -405,7 +404,7 @@ fn errors_map_status() {
         (CreateError::Blocked("degraded".into()), "503"),
     ];
     for (error, status) in cases {
-        let mapped = match map_create_error(error) {
+        let mapped = match ServerError::from(error) {
             ServerError::BadRequestMessage(_) => "400",
             ServerError::Unauthorized => "401",
             ServerError::Conflict(_) => "409",

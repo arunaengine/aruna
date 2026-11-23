@@ -14,7 +14,7 @@ use aruna_core::user::id::UserId;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -38,7 +38,7 @@ async fn write_row(state: &ServerState, key_space: &str, key: Vec<u8>, value: Ve
 
 async fn setup(installed: Vec<String>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes(
         SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()

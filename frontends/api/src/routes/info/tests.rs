@@ -2,13 +2,12 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+use super::node::{map_realm_nodes, presence_nodes};
 use super::{
-    GroupCapOverride, InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, NodeKindInfo,
-    PublicNode, RealmBinding, RealmBindingScope, RealmConnectionStatus, RealmPlacementOverride,
-    RealmPlacementRequest, RealmPlacementStrategy, RealmQuotaConfig, RealmQuotaOverride,
-    ServiceStatus, TelemetryState, UsageResponse, get_info, get_realm_info, get_realm_placement,
-    get_usage, map_handle_error, map_placement_error, map_quota_error, map_realm_nodes,
-    mutate_realm_placement, presence_nodes, run_realm_info, set_realm_quota,
+    GroupCapOverride, NodeKindInfo, PublicNode, RealmBinding, RealmBindingScope,
+    RealmConnectionStatus, RealmPlacementOverride, RealmPlacementRequest, RealmPlacementStrategy,
+    RealmQuotaConfig, RealmQuotaOverride, TelemetryState, UsageResponse, get_info, get_realm_info,
+    get_realm_placement, get_usage, mutate_realm_placement, run_realm_info, set_realm_quota,
 };
 use crate::auth::extract;
 use crate::auth::{RealmAuth, UnrestrictedAuth};
@@ -45,6 +44,9 @@ use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::test_context;
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage;
+use aruna_wire::info::{
+    InterfaceServicesStatus, InterfaceStatus, NodeCapabilityKind, ServiceStatus,
+};
 use axum::body::Body;
 use axum::extract::{FromRequest, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -259,7 +261,7 @@ fn peer_error_visibility() {
         retry_in_secs: Some(5),
     };
 
-    let member = super::map_peer_connection(&peer, false);
+    let member = super::node::map_peer_connection(&peer, false);
     assert!(
         member.last_error.is_none(),
         "non-admin must not see peer errors"
@@ -267,7 +269,7 @@ fn peer_error_visibility() {
     assert_eq!(member.next_retry_secs, Some(5));
     assert_eq!(member.peer_id, peer.node_id.to_string());
 
-    let admin = super::map_peer_connection(&peer, true);
+    let admin = super::node::map_peer_connection(&peer, true);
     assert_eq!(
         admin.last_error.as_deref(),
         Some("dial refused: 10.0.0.9:4433")
@@ -403,10 +405,8 @@ async fn usage_counts_documents() {
     use aruna_core::structs::placement::record::PlacementRef;
     use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 
-    let storage_dir = tempdir().unwrap();
     let metadata_dir = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_rdf_graph::GraphHandle::open(
         metadata_dir.path(),
@@ -556,7 +556,7 @@ fn openapi_includes_quota() {
 
 #[test]
 fn quota_conflict_maps() {
-    let error = map_quota_error(SetQuotaError::StorageError(
+    let error = ServerError::from(SetQuotaError::StorageError(
         StorageError::TransactionConflict,
     ));
 
@@ -569,15 +569,14 @@ fn quota_conflict_maps() {
 #[test]
 fn quota_capacity_unavailable() {
     // Cleanup capacity is transient, so it must not read as an internal error.
-    let error = map_quota_error(SetQuotaError::StorageError(StorageError::CleanupCapacity));
+    let error = ServerError::from(SetQuotaError::StorageError(StorageError::CleanupCapacity));
 
     assert!(matches!(error, ServerError::ServiceUnavailableReason(_)));
 }
 
 async fn setup_management_state() -> (Arc<ServerState>, RealmId, UserId, TempDir) {
     let tempdir = tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+    let storage_handle = storage::memory::MemoryStorage::open();
     let driver_ctx = Arc::new(DriverContext {
         storage_handle,
         net_handle: None,
@@ -1110,7 +1109,7 @@ fn openapi_registers_placement() {
 
 #[test]
 fn placement_conflict_maps() {
-    let error = map_placement_error(MutatePlacementError::StorageError(
+    let error = ServerError::from(MutatePlacementError::StorageError(
         StorageError::TransactionConflict,
     ));
     assert!(matches!(
@@ -1122,7 +1121,7 @@ fn placement_conflict_maps() {
 #[test]
 fn placement_missing_config() {
     assert!(matches!(
-        map_placement_error(MutatePlacementError::ConfigMissing),
+        ServerError::from(MutatePlacementError::ConfigMissing),
         ServerError::NotFound
     ));
 }
@@ -1131,13 +1130,13 @@ fn placement_missing_config() {
 fn placement_capacity_unavailable() {
     // Cleanup capacity is transient on both placement paths.
     assert!(matches!(
-        map_placement_error(MutatePlacementError::StorageError(
+        ServerError::from(MutatePlacementError::StorageError(
             StorageError::CleanupCapacity
         )),
         ServerError::ServiceUnavailableReason(_)
     ));
     assert!(matches!(
-        map_handle_error(HandleAllocationError::Storage(
+        ServerError::from(HandleAllocationError::Storage(
             StorageError::CleanupCapacity
         )),
         ServerError::ServiceUnavailableReason(_)
@@ -1782,7 +1781,7 @@ async fn realm_node_details() {
         age_ms: 0,
         received_at_ms: 1_700_000_001_000,
     };
-    let utilization = super::map_node_document(&document, Some(&held)).utilization;
+    let utilization = super::realm::map_node_document(&document, Some(&held)).utilization;
     assert_eq!(utilization.jobs_running, Some(9));
     assert_eq!(utilization.imports_running, Some(8));
 }

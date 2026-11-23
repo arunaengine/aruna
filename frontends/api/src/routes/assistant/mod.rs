@@ -324,7 +324,7 @@ pub(super) async fn load_provider(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_store_error)?
+    .map_err(ServerError::from)?
     .ok_or(ServerError::NotFound)
 }
 
@@ -339,19 +339,21 @@ pub(super) async fn save_provider(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_store_error)
+    .map_err(ServerError::from)
 }
 
-fn map_store_error(error: ProviderStoreError) -> ServerError {
-    match error {
-        ProviderStoreError::NotFound => ServerError::NotFound,
-        ProviderStoreError::IdCollision => {
-            ServerError::Conflict("provider id collision".to_string())
+impl From<ProviderStoreError> for ServerError {
+    fn from(error: ProviderStoreError) -> Self {
+        match error {
+            ProviderStoreError::NotFound => ServerError::NotFound,
+            ProviderStoreError::IdCollision => {
+                ServerError::Conflict("provider id collision".to_string())
+            }
+            ProviderStoreError::Stale => {
+                ServerError::Conflict("provider changed concurrently".to_string())
+            }
+            error => ServerError::InternalError(error.into()),
         }
-        ProviderStoreError::Stale => {
-            ServerError::Conflict("provider changed concurrently".to_string())
-        }
-        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -420,7 +422,7 @@ pub async fn list_providers(
     ensure_enabled(&state)?;
     let providers = drive(ListProviderOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(map_store_error)?
+        .map_err(ServerError::from)?
         .iter()
         .map(provider_summary)
         .collect();
@@ -526,7 +528,7 @@ pub async fn create_provider(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_store_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::CREATED, Json(provider_summary(&provider))))
 }
 
@@ -669,7 +671,7 @@ pub async fn delete_provider(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_store_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

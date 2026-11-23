@@ -28,7 +28,6 @@ use utoipa_axum::routes;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::lookup::map_guard_error;
 use crate::lookup::{ObjectOutput, object_output};
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::relay::relayed_set;
@@ -134,7 +133,7 @@ pub(crate) fn page_error(error: PageError) -> ServerError {
     match error {
         PageError::Cursor => ServerError::BadRequestReason(error.to_string()),
         PageError::Unanswered { .. } => ServerError::ServiceUnavailableReason(error.to_string()),
-        PageError::Guard(error) => map_guard_error(error),
+        PageError::Guard(error) => ServerError::from(error),
         PageError::Internal(error) => ServerError::InternalError(error.into()),
         PageError::Relay(refusal) => refusal_error(refusal),
     }
@@ -229,7 +228,7 @@ async fn relayed_bounds(
         Ok(false) => Err(ServerError::ServiceUnavailableReason(
             "this member does not list the named key range".into(),
         )),
-        Err(error) => Err(map_guard_error(error)),
+        Err(error) => Err(ServerError::from(error)),
     }
 }
 

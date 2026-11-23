@@ -185,65 +185,75 @@ fn decode_cursor(cursor: Option<String>) -> ServerResult<Option<Key>> {
         .transpose()
 }
 
-pub(super) fn map_folder_error(error: FolderError) -> ServerError {
-    match error {
-        FolderError::NotFound => ServerError::NotFound,
-        FolderError::TooManyFolders(_)
-        | FolderError::RootOverlaps(_)
-        | FolderError::BucketBound(_)
-        | FolderError::RemoteBucketConflict { .. } => ServerError::Conflict(error.to_string()),
-        FolderError::NotRealmNode(_) | FolderError::RemoteBucketMissing { .. } => {
-            ServerError::BadRequestReason(error.to_string())
+impl From<FolderError> for ServerError {
+    fn from(error: FolderError) -> Self {
+        match error {
+            FolderError::NotFound => ServerError::NotFound,
+            FolderError::TooManyFolders(_)
+            | FolderError::RootOverlaps(_)
+            | FolderError::BucketBound(_)
+            | FolderError::RemoteBucketConflict { .. } => ServerError::Conflict(error.to_string()),
+            FolderError::NotRealmNode(_) | FolderError::RemoteBucketMissing { .. } => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
+            FolderError::DownloadOnly | FolderError::StillBinding => {
+                ServerError::Conflict(error.to_string())
+            }
+            FolderError::RemoteUnreachable { .. } => {
+                ServerError::BadGatewayReason(error.to_string())
+            }
+            FolderError::BucketExists { .. } => {
+                ServerError::Refused(StatusCode::CONFLICT, "bucket_exists", error.to_string())
+            }
+            FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
+            FolderError::Offer(offer) => ServerError::from(offer),
+            FolderError::ListVersions(_)
+            | FolderError::DeleteObject(_)
+            | FolderError::DeleteBucket(_)
+            | FolderError::ListUploads(_)
+            | FolderError::AbortUpload(_) => ServerError::InternalError(error.into()),
         }
-        FolderError::RemoteForbidden { .. } => ServerError::Forbidden,
-        FolderError::DownloadOnly | FolderError::StillBinding => {
-            ServerError::Conflict(error.to_string())
-        }
-        FolderError::RemoteUnreachable { .. } => ServerError::BadGatewayReason(error.to_string()),
-        FolderError::BucketExists { .. } => {
-            ServerError::Refused(StatusCode::CONFLICT, "bucket_exists", error.to_string())
-        }
-        FolderError::Unavailable => ServerError::ServiceUnavailableReason(error.to_string()),
-        FolderError::Offer(offer) => map_offer_error(offer),
-        FolderError::ListVersions(_)
-        | FolderError::DeleteObject(_)
-        | FolderError::DeleteBucket(_)
-        | FolderError::ListUploads(_)
-        | FolderError::AbortUpload(_) => ServerError::InternalError(error.into()),
     }
 }
 
 /// An unusable directory is the owner's problem, not this node's.
-fn map_offer_error(error: OfferedDirectoryError) -> ServerError {
-    match error {
-        OfferedDirectoryError::BucketTaken(_) | OfferedDirectoryError::ReadOnly(_) => {
-            ServerError::Conflict(error.to_string())
+impl From<OfferedDirectoryError> for ServerError {
+    fn from(error: OfferedDirectoryError) -> Self {
+        match error {
+            OfferedDirectoryError::BucketTaken(_) | OfferedDirectoryError::ReadOnly(_) => {
+                ServerError::Conflict(error.to_string())
+            }
+            OfferedDirectoryError::NotOffered(_) => ServerError::NotFound,
+            OfferedDirectoryError::TooManyFiles(_) => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            OfferedDirectoryError::HandleMissing => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            OfferedDirectoryError::Source(
+                source @ (StagingSourceError::NotFound
+                | StagingSourceError::AccessDenied
+                | StagingSourceError::CheckError(_)),
+            ) => ServerError::BadRequestReason(format!("the directory is unusable: {source}")),
+            other => ServerError::InternalError(other.into()),
         }
-        OfferedDirectoryError::NotOffered(_) => ServerError::NotFound,
-        OfferedDirectoryError::TooManyFiles(_) => ServerError::BadRequestReason(error.to_string()),
-        OfferedDirectoryError::HandleMissing => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
-        OfferedDirectoryError::Source(
-            source @ (StagingSourceError::NotFound
-            | StagingSourceError::AccessDenied
-            | StagingSourceError::CheckError(_)),
-        ) => ServerError::BadRequestReason(format!("the directory is unusable: {source}")),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
-fn map_action_error(error: ActionError) -> ServerError {
-    match error {
-        ActionError::NotFound => ServerError::NotFound,
-        ActionError::NoRemoteVersion | ActionError::ExpectedMissing => {
-            ServerError::BadRequestReason(error.to_string())
+impl From<ActionError> for ServerError {
+    fn from(error: ActionError) -> Self {
+        match error {
+            ActionError::NotFound => ServerError::NotFound,
+            ActionError::NoRemoteVersion | ActionError::ExpectedMissing => {
+                ServerError::BadRequestReason(error.to_string())
+            }
+            ActionError::RemoteUnavailable | ActionError::Unavailable => {
+                ServerError::ServiceUnavailableReason(error.to_string())
+            }
+            ActionError::Folder(folder) => ServerError::from(folder),
+            ActionError::Storage(error) => ServerError::InternalError(error.into()),
         }
-        ActionError::RemoteUnavailable | ActionError::Unavailable => {
-            ServerError::ServiceUnavailableReason(error.to_string())
-        }
-        ActionError::Folder(folder) => map_folder_error(folder),
-        ActionError::Storage(error) => ServerError::InternalError(error.into()),
     }
 }
 
@@ -254,7 +264,7 @@ async fn folder_detail(
 ) -> ServerResult<SyncedFolderView> {
     let counters = drive(folder_counters(folder.folder_id), &state.get_ctx())
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     Ok(folder_view(folder, counters))
 }
 
@@ -389,13 +399,13 @@ async fn bind_synced_folder(
     });
     let folder_id = drive(bind, &context)
         .await
-        .map_err(map_folder_error)?
+        .map_err(ServerError::from)?
         .folder_id;
     // Detached, so a dropped request still records the outcome; a crash leaves it to the next pass.
     let folder = tokio::spawn(async move { drive(finish_binding(folder_id), &context).await })
         .await
-        .map_err(|_| map_folder_error(FolderError::Unavailable))?
-        .map_err(map_folder_error)?;
+        .map_err(|_| ServerError::from(FolderError::Unavailable))?
+        .map_err(ServerError::from)?;
     Ok((
         StatusCode::CREATED,
         Json(folder_detail(&state, folder).await?),
@@ -454,7 +464,7 @@ async fn list_synced_folders(
 ) -> ServerResult<Json<SyncedFolderList>> {
     let bound = drive(list_folders(), &state.get_ctx())
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     let mut folders = Vec::with_capacity(bound.len());
     for folder in bound {
         folders.push(folder_detail(&state, folder).await?);
@@ -517,7 +527,7 @@ async fn get_synced_folder(
     let folder_id = parse_folder_id(&folder_id)?;
     let folder = drive(read_bound(folder_id), &state.get_ctx())
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -585,7 +595,7 @@ async fn update_synced_folder(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_folder_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -626,7 +636,7 @@ async fn unbind_synced_folder(
     let folder_id = parse_folder_id(&folder_id)?;
     drive(unbind_folder(folder_id), &state.get_ctx())
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(UnboundFolder {
         folder_id: folder_id.to_string(),
     }))
@@ -691,7 +701,7 @@ async fn pause_folder(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_folder_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -751,7 +761,7 @@ async fn resume_folder(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_folder_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -816,7 +826,7 @@ async fn sync_folder(
     let context = state.get_ctx();
     let folder = drive(read_bound(folder_id), &context)
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     if folder.state != FolderState::Active {
         return Err(ServerError::Conflict(
             "the folder is not active".to_string(),
@@ -824,7 +834,7 @@ async fn sync_folder(
     }
     drive(request_sync(&folder), &context)
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -886,7 +896,7 @@ async fn list_folder_entries(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_folder_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(FolderEntryPage {
         entries: entries
             .into_iter()
@@ -1003,7 +1013,7 @@ async fn act_on_entry(
             actor: auth.user_id,
         },
     );
-    let record = drive(action, &context).await.map_err(map_action_error)?;
+    let record = drive(action, &context).await.map_err(ServerError::from)?;
     if record.outcome == ActionOutcome::Stale {
         return Err(ServerError::PreconditionFailed(
             "the file changed since the owner saw it".to_string(),
@@ -1011,7 +1021,7 @@ async fn act_on_entry(
     }
     let base = drive(read_entry(folder_id, &path), &context)
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(entry_view(path, base)))
 }
 
@@ -1099,7 +1109,7 @@ async fn act_on_folder(
     let context = state.get_ctx();
     let folder = drive(read_bound(folder_id), &context)
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     if request.confirm != folder_name(&folder.root) {
         return Err(ServerError::Conflict(
             "the confirmation must name this folder".to_string(),
@@ -1115,7 +1125,7 @@ async fn act_on_folder(
             actor: auth.user_id,
         },
     );
-    drive(action, &context).await.map_err(map_action_error)?;
+    drive(action, &context).await.map_err(ServerError::from)?;
     Ok(Json(folder_detail(&state, folder).await?))
 }
 
@@ -1164,7 +1174,7 @@ async fn list_folder_actions(
     let cursor = decode_cursor(query.cursor)?;
     let (actions, next) = drive(list_actions(folder_id, cursor), &state.get_ctx())
         .await
-        .map_err(map_folder_error)?;
+        .map_err(ServerError::from)?;
     Ok(Json(ActionRecordPage {
         actions: actions.into_iter().map(action_view).collect(),
         next_cursor: encode_cursor(next),

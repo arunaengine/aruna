@@ -11,7 +11,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::{OidcIdentity, bearer_token, ensure_permission};
 use crate::auth::{RealmAuth, TokenAuth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::routes::onboarding::{authorize_onboarding_admin, map_consume_error, map_inspect_error};
+use crate::routes::onboarding::authorize_onboarding_admin;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs as now_timestamp;
 use aruna_core::onboarding::{OnboardingPurpose, OnboardingSecret};
@@ -334,7 +334,7 @@ async fn issue_user_session(
 async fn ensure_token_subject(state: &Arc<ServerState>, user_id: UserId) -> ServerResult<()> {
     drive(SubjectCheckOperation::new(user_id), &state.get_ctx())
         .await
-        .map_err(map_subject_error)
+        .map_err(ServerError::from)
 }
 
 /// Refuses new tokens for a deactivated account; an account this node does not know passes.
@@ -349,7 +349,7 @@ pub(crate) async fn ensure_active(state: &ServerState, user_id: UserId) -> Serve
 async fn read_current_user(state: &ServerState, user_id: UserId) -> ServerResult<User> {
     drive(ReadUserOperation::new(user_id), &state.get_ctx())
         .await
-        .map_err(map_user_error)
+        .map_err(ServerError::from)
 }
 
 async fn read_realm_authorization(
@@ -360,26 +360,32 @@ async fn read_realm_authorization(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_realm_error)
+    .map_err(ServerError::from)
 }
 
-fn map_subject_error(error: SubjectCheckError) -> ServerError {
-    match error {
-        SubjectCheckError::Unauthorized => ServerError::Unauthorized,
-        SubjectCheckError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.into()),
+impl From<SubjectCheckError> for ServerError {
+    fn from(error: SubjectCheckError) -> Self {
+        match error {
+            SubjectCheckError::Unauthorized => ServerError::Unauthorized,
+            SubjectCheckError::Forbidden => ServerError::Forbidden,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
-fn map_user_error(error: ReadUserError) -> ServerError {
-    match error {
-        ReadUserError::NotFound => ServerError::NotFound,
-        other => ServerError::InternalError(other.into()),
+impl From<ReadUserError> for ServerError {
+    fn from(error: ReadUserError) -> Self {
+        match error {
+            ReadUserError::NotFound => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
-fn map_realm_error(error: ReadAuthorizationError) -> ServerError {
-    ServerError::InternalError(error.into())
+impl From<ReadAuthorizationError> for ServerError {
+    fn from(error: ReadAuthorizationError) -> Self {
+        ServerError::InternalError(error.into())
+    }
 }
 
 fn collect_realm_roles(
@@ -464,7 +470,7 @@ async fn build_user_response(
         let name = match drive(ReadUserOperation::new(user_id), &state.get_ctx()).await {
             Ok(merged) => Some(merged.name),
             Err(ReadUserError::NotFound) => None,
-            Err(error) => return Err(map_user_error(error)),
+            Err(error) => return Err(ServerError::from(error)),
         };
         merged_users.push(MergedUserResponse {
             user_id: user_id.to_string(),
@@ -546,7 +552,7 @@ async fn register_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_inspect_error)?;
+    .map_err(ServerError::from)?;
     if inspected.purpose != OnboardingPurpose::InitialAdministrator {
         return Err(ServerError::Forbidden);
     }
@@ -561,7 +567,7 @@ async fn register_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_consume_error)?;
+    .map_err(ServerError::from)?;
 
     let user = drive(
         ResolveOidcOperation::new(ResolveOidcInput {
@@ -828,7 +834,7 @@ async fn get_token(
         query.expires_in_seconds,
         now.saturating_add(TOKEN_EXPIRY_SECONDS),
     )
-    .map_err(crate::routes::access::sessions::map_create_error)?;
+    .map_err(ServerError::from)?;
     let token = issue_user_session(&state, user_id, expiry, kind, restrictions, auth_time).await?;
 
     Ok((StatusCode::OK, Json(GetTokenResponse { token })))

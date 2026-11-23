@@ -173,19 +173,19 @@ fn forbidden_header_names() {
 fn store_error_mapping() {
     use aruna_ops_work::assistant::provider::ProviderStoreError;
     assert!(matches!(
-        map_store_error(ProviderStoreError::NotFound),
+        ServerError::from(ProviderStoreError::NotFound),
         ServerError::NotFound
     ));
     assert!(matches!(
-        map_store_error(ProviderStoreError::IdCollision),
+        ServerError::from(ProviderStoreError::IdCollision),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_store_error(ProviderStoreError::Stale),
+        ServerError::from(ProviderStoreError::Stale),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_store_error(IoError::Unfinished.into()),
+        ServerError::from(ProviderStoreError::from(IoError::Unfinished)),
         ServerError::InternalError(_)
     ));
 }

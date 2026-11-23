@@ -100,7 +100,7 @@ pub async fn promote_server_node(
     };
     let ready = drive(PromoteNodeOperation::new(config), &state.get_ctx())
         .await
-        .map_err(map_promote_error)?;
+        .map_err(ServerError::from)?;
     let status = match ready {
         true => StatusCode::OK,
         false => StatusCode::ACCEPTED,
@@ -108,36 +108,38 @@ pub async fn promote_server_node(
     Ok((status, Json(PromoteNodeResponse { ready })))
 }
 
-fn map_promote_error(error: PromoteNodeError) -> ServerError {
-    match error {
-        PromoteNodeError::ConfigMissing | PromoteNodeError::NodeNotFound { .. } => {
-            ServerError::NotFound
+impl From<PromoteNodeError> for ServerError {
+    fn from(error: PromoteNodeError) -> Self {
+        match error {
+            PromoteNodeError::ConfigMissing | PromoteNodeError::NodeNotFound { .. } => {
+                ServerError::NotFound
+            }
+            PromoteNodeError::NotManagementNode => ServerError::Forbidden,
+            PromoteNodeError::NotServer => {
+                ServerError::Conflict("only another server node can be promoted".to_string())
+            }
+            error @ PromoteNodeError::OwnerChange => ServerError::Conflict(error.to_string()),
+            PromoteNodeError::Unreachable(_) | PromoteNodeError::Refused(_) => {
+                ServerError::ServiceUnavailableReason(
+                    "the node did not take the realm key; the realm is unchanged, retry".to_string(),
+                )
+            }
+            PromoteNodeError::KeyUncertain(_) => ServerError::Refused(
+                StatusCode::BAD_GATEWAY,
+                "realm_key_uncertain",
+                "the node's answer was lost, so it may already hold the realm key, which cannot be taken \
+                 back; the realm configuration is unchanged, repeat the call to finish the promotion"
+                    .to_string(),
+            ),
+            PromoteNodeError::Ensure(EnsureConfigError::DeletionPending) => {
+                ServerError::Conflict("group deletion is pending; retry the promotion".to_string())
+            }
+            PromoteNodeError::Ensure(EnsureConfigError::StorageError(
+                StorageError::TransactionConflict,
+            )) => ServerError::Conflict("concurrent realm configuration update; retry".to_string()),
+            PromoteNodeError::Ensure(EnsureConfigError::StorageError(error)) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        PromoteNodeError::NotManagementNode => ServerError::Forbidden,
-        PromoteNodeError::NotServer => {
-            ServerError::Conflict("only another server node can be promoted".to_string())
-        }
-        error @ PromoteNodeError::OwnerChange => ServerError::Conflict(error.to_string()),
-        PromoteNodeError::Unreachable(_) | PromoteNodeError::Refused(_) => {
-            ServerError::ServiceUnavailableReason(
-                "the node did not take the realm key; the realm is unchanged, retry".to_string(),
-            )
-        }
-        PromoteNodeError::KeyUncertain(_) => ServerError::Refused(
-            StatusCode::BAD_GATEWAY,
-            "realm_key_uncertain",
-            "the node's answer was lost, so it may already hold the realm key, which cannot be taken \
-             back; the realm configuration is unchanged, repeat the call to finish the promotion"
-                .to_string(),
-        ),
-        PromoteNodeError::Ensure(EnsureConfigError::DeletionPending) => {
-            ServerError::Conflict("group deletion is pending; retry the promotion".to_string())
-        }
-        PromoteNodeError::Ensure(EnsureConfigError::StorageError(
-            StorageError::TransactionConflict,
-        )) => ServerError::Conflict("concurrent realm configuration update; retry".to_string()),
-        PromoteNodeError::Ensure(EnsureConfigError::StorageError(error)) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 
@@ -147,7 +149,7 @@ mod tests {
 
     #[test]
     fn lost_answer_reported() {
-        let error = map_promote_error(PromoteNodeError::KeyUncertain("closed".to_string()));
+        let error = ServerError::from(PromoteNodeError::KeyUncertain("closed".to_string()));
         let ServerError::Refused(status, code, message) = error else {
             panic!("a lost answer is reported as uncertain");
         };

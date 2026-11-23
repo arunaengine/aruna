@@ -6,7 +6,7 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, parse_group_id, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::metadata::model::{MetadataQueryMode, SearchHitResponse};
-use crate::metadata::{map_api_error, map_query_mode, map_search_hit};
+use crate::metadata::{map_query_mode, map_search_hit};
 use crate::routes::access::users::MIN_QUERY_CHARS;
 use crate::server::state::ServerState;
 use aruna_core::search::ObjectKeyMatch;
@@ -503,7 +503,7 @@ pub async fn bucket_search(
         state.get_ctx().as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     let mut section = map_bucket_section(result);
     describe_hits(&state, &auth, bearer.as_deref(), &mut section).await;
     Ok((StatusCode::OK, Json(section)))
@@ -676,7 +676,7 @@ pub async fn object_search(
         state.get_ctx().as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(map_search_response(result, mode))))
 }
 
@@ -975,7 +975,7 @@ async fn run_buckets(
         state.get_ctx().as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     let mut section = map_bucket_section(result);
     describe_hits(state, auth, bearer_token.as_deref(), &mut section).await;
     Ok(Some(section))
@@ -1087,7 +1087,7 @@ async fn run_documents(
         ctx.as_ref(),
     )
     .await
-    .map_err(map_api_error)?;
+    .map_err(ServerError::from)?;
     Ok(Some(map_documents_section(result)))
 }
 

@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 #[test]
 fn maps_conflict_409() {
     use axum::response::IntoResponse;
-    let mapped = map_create_error(CreateDocumentError::StorageError(
+    let mapped = ServerError::from(CreateDocumentError::StorageError(
         StorageError::TransactionConflict,
     ));
     assert!(matches!(mapped, ServerError::Conflict(_)));

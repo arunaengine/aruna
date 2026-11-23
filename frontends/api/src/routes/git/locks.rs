@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{map_error, repository_id};
+use super::repository_id;
 use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -63,7 +63,7 @@ pub async fn create(
             &state.get_ctx(),
         )
         .await
-        .map_err(map_error)?
+        .map_err(ServerError::from)?
         {
             LockOutcome::Locked(lock) => reply(StatusCode::CREATED, json!({"lock": view(&lock)})),
             LockOutcome::Taken(lock) => reply(
@@ -105,7 +105,7 @@ pub async fn list(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let locks: Vec<_> = locks
         .iter()
         .filter(|lock| filter.path.as_ref().is_none_or(|path| *path == lock.path))
@@ -148,13 +148,13 @@ pub async fn verify(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let locks = drive(
         git::locks::list(state.get_ctx().node_id(), &auth, id),
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let (ours, theirs): (Vec<_>, Vec<_>) =
         locks.iter().partition(|lock| lock.user_id == auth.user_id);
     let ours: Vec<_> = ours.into_iter().map(view).collect();
@@ -200,6 +200,6 @@ pub async fn unlock(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok(reply(StatusCode::OK, json!({"lock": view(&released)})))
 }

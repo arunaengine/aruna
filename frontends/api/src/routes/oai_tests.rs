@@ -39,8 +39,7 @@ fn actor(realm_id: RealmId) -> Actor {
 
 async fn fixture(limits: RoCrateLimits) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage_handle = aruna_storage::storage::memory::MemoryStorage::open();
     let realm_id = RealmId::from_bytes(
         *ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()

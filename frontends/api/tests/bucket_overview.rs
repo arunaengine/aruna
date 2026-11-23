@@ -36,7 +36,7 @@ use aruna_ops_data::s3::usage_rebuild::RebuildStatsOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
 use ed25519_dalek::SigningKey;
@@ -75,7 +75,7 @@ fn open_upload(group_id: Ulid, created_by: UserId) -> MultipartUpload {
 /// multipart upload, plus a viewer who only holds group data read.
 async fn setup() -> Fixture {
     let directory = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes(
         SigningKey::from_bytes(&[7u8; 32])
             .verifying_key()

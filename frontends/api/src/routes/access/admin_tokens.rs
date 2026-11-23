@@ -134,17 +134,19 @@ fn map_revocation(message: String) -> ServerError {
     }
 }
 
-fn map_tokens_error(error: GroupTokensError) -> ServerError {
-    match error {
-        GroupTokensError::Refused => ServerError::Forbidden,
-        GroupTokensError::NotFound => ServerError::NotFound,
-        GroupTokensError::NotConfined => ServerError::Conflict(
-            "a service account's bearer sessions are not confined to one group; a user \
-             administrator ends them with DELETE /access/users/{id}/tokens"
-                .to_string(),
-        ),
-        GroupTokensError::Revocation(message) => map_revocation(message),
-        error => ServerError::InternalError(error.into()),
+impl From<GroupTokensError> for ServerError {
+    fn from(error: GroupTokensError) -> Self {
+        match error {
+            GroupTokensError::Refused => ServerError::Forbidden,
+            GroupTokensError::NotFound => ServerError::NotFound,
+            GroupTokensError::NotConfined => ServerError::Conflict(
+                "a service account's bearer sessions are not confined to one group; a user \
+                 administrator ends them with DELETE /access/users/{id}/tokens"
+                    .to_string(),
+            ),
+            GroupTokensError::Revocation(message) => map_revocation(message),
+            error => ServerError::InternalError(error.into()),
+        }
     }
 }
 
@@ -166,7 +168,7 @@ async fn run_revocation(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_tokens_error)?;
+    .map_err(ServerError::from)?;
     if revocation.credentials > 0 {
         crate::routes::storage::abe::records::epoch_due(state, &auth, Some(group_id)).await;
     }
@@ -248,7 +250,7 @@ pub async fn list_group_tokens(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_tokens_error)?;
+    .map_err(ServerError::from)?;
     Ok((
         StatusCode::OK,
         Json(GroupTokensResponse {

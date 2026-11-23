@@ -33,7 +33,6 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::auth::UnrestrictedAuth;
-use crate::auth::map_authorize_error;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
@@ -337,7 +336,7 @@ async fn share_policies(
         &state.get_ctx(),
     )
     .await
-    .map_err(|error| map_authorize_error(AuthorizeError::Policy(error)))
+    .map_err(|error| ServerError::from(AuthorizeError::Policy(error)))
 }
 
 fn share_error(error: ShareError) -> ServerError {

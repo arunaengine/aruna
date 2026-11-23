@@ -43,7 +43,6 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, ensure_permission, require_realm_auth};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::lookup::map_guard_error;
 use crate::metadata::forwarded_auth_token;
 use crate::routes::identifiers::IdentifierView;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
@@ -462,7 +461,7 @@ async fn origin_answer(
         if params.version_id.is_none() {
             let path = origin_path(&bucket, &params);
             let coordinator = drive(read_coordinator(binding, &params.key), context.as_ref()).await;
-            let asked = match coordinator.map_err(map_guard_error) {
+            let asked = match coordinator.map_err(ServerError::from) {
                 Ok(None) => None,
                 Ok(Some((range_id, node_id))) => {
                     let target = (binding.set_id, range_id, node_id);
@@ -474,7 +473,7 @@ async fn origin_answer(
             match asked {
                 Some(Err(error)) if error.status_code().is_server_error() => {
                     let readers = drive(copy_readers(binding, &params.key), context.as_ref()).await;
-                    let (range_id, here, copies) = readers.map_err(map_guard_error)?;
+                    let (range_id, here, copies) = readers.map_err(ServerError::from)?;
                     if !here && copies.is_empty() {
                         return Err(error);
                     }
@@ -489,7 +488,7 @@ async fn origin_answer(
             }
         }
         let route = drive(route_read(binding, &params.key, false), context.as_ref()).await;
-        if let ReadRoute::Holder { range_id, node_id } = route.map_err(map_guard_error)? {
+        if let ReadRoute::Holder { range_id, node_id } = route.map_err(ServerError::from)? {
             let mut holders = drive(key_holders(binding.set_id, &params.key), context.as_ref())
                 .await
                 .unwrap_or_default();
@@ -511,8 +510,8 @@ async fn origin_answer(
             state.get_ctx().as_ref(),
         )
         .await;
-        if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)? {
-            return Err(map_guard_error(GuardError::NotCoordinator {
+        if let Some((range_id, node_id)) = coordinator.map_err(ServerError::from)? {
+            return Err(ServerError::from(GuardError::NotCoordinator {
                 set_id: binding.set_id,
                 range_id,
                 node_id,
@@ -539,7 +538,7 @@ async fn origin_answer(
             state.get_ctx().as_ref(),
         )
         .await;
-        if let Some((range_id, node_id)) = coordinator.map_err(map_guard_error)?
+        if let Some((range_id, node_id)) = coordinator.map_err(ServerError::from)?
             && !headers.contains_key(RELAY_HOP_HEADER)
         {
             let path = origin_path(&bucket, &params);

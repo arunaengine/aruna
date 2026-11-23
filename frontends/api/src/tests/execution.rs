@@ -9,7 +9,7 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_runner::testing::test_context;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -43,7 +43,7 @@ pub(crate) async fn management_state() -> (TempDir, Arc<ServerState>) {
 
 async fn node_state(capabilities: NodeCapabilities) -> (TempDir, Arc<ServerState>) {
     let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let ctx = Arc::new(test_context(storage));
     let state = ServerState::new(
         ctx,

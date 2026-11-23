@@ -29,7 +29,6 @@ use ulid::Ulid;
 
 use crate::auth::ValidatedBearer;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
-use crate::lookup::map_guard_error;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::server::state::ServerState;
 
@@ -86,11 +85,13 @@ pub(crate) async fn rest_target(
     let relayed = headers.contains_key(RELAY_HOP_HEADER);
     let target = WriteTargetOperation::new(binding, key, false, relayed);
     let target = drive(target, state.get_ctx().as_ref()).await;
-    Ok(target.map_err(map_guard_error)?.map(|target| RestForward {
-        set_id: target.set_id,
-        range_id: target.range_id,
-        node_id: target.node_id,
-    }))
+    Ok(target
+        .map_err(ServerError::from)?
+        .map(|target| RestForward {
+            set_id: target.set_id,
+            range_id: target.range_id,
+            node_id: target.node_id,
+        }))
 }
 
 /// `route` with the query `pairs`, for a holder.
@@ -140,7 +141,7 @@ fn read_failure(failure: MemberFailure) -> ServerError {
         MemberRefusal::NoHolder { set_id, range_id } => ServerError::ServiceUnavailableReason(
             format!("no holder of range {range_id} of distributed bucket {set_id} answered"),
         ),
-        MemberRefusal::Route(error) => map_guard_error(error),
+        MemberRefusal::Route(error) => ServerError::from(error),
         other => ServerError::InternalError(format!("{other:?}").into()),
     }
 }

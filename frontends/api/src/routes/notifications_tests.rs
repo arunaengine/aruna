@@ -29,7 +29,7 @@ use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::driver::drive;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -54,8 +54,7 @@ fn realm_id(seed: u8) -> RealmId {
 
 async fn build_state(realm_id: RealmId, node_id: NodeId) -> (TempDir, Arc<ServerState>) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let ctx = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,
@@ -83,8 +82,7 @@ async fn build_network_state(
     secret: [u8; 32],
 ) -> (TempDir, Arc<ServerState>, NetHandle) {
     let dir = tempfile::tempdir().expect("temp dir");
-    let storage =
-        FjallStorage::open(dir.path().to_str().expect("temp path")).expect("storage opens");
+    let storage = MemoryStorage::open();
     let net = NetHandle::new(
         NetConfig {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr"),

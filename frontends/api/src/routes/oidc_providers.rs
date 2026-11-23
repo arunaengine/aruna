@@ -167,7 +167,7 @@ async fn change_provider(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_provider_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(provider_list(stored)))
 }
 
@@ -184,21 +184,23 @@ fn provider_list(config: RealmConfigDocument) -> Vec<RealmProviderResponse> {
         .collect()
 }
 
-fn map_provider_error(error: SetProviderError) -> ServerError {
-    match error {
-        SetProviderError::ConfigMissing | SetProviderError::UnknownProvider => {
-            ServerError::NotFound
+impl From<SetProviderError> for ServerError {
+    fn from(error: SetProviderError) -> Self {
+        match error {
+            SetProviderError::ConfigMissing | SetProviderError::UnknownProvider => {
+                ServerError::NotFound
+            }
+            SetProviderError::Unauthorized | SetProviderError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetProviderError::InvalidProvider { reason } => ServerError::BadRequestReason(reason),
+            SetProviderError::LastProvider => ServerError::Conflict(error.to_string()),
+            SetProviderError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::config_conflict()
+            }
+            SetProviderError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        SetProviderError::Unauthorized | SetProviderError::NotManagementNode => {
-            ServerError::Forbidden
-        }
-        SetProviderError::InvalidProvider { reason } => ServerError::BadRequestReason(reason),
-        SetProviderError::LastProvider => ServerError::Conflict(error.to_string()),
-        SetProviderError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::config_conflict()
-        }
-        SetProviderError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }
 

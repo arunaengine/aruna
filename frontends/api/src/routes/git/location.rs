@@ -2,7 +2,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::map_error;
 use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
@@ -72,7 +71,7 @@ pub async fn get_location(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(StorageLocation::new(effective)))
 }
 
@@ -101,7 +100,7 @@ pub async fn put_location(
     .await
     .map_err(|error| match error {
         GitError::Invalid => ServerError::BadRequest,
-        error => map_error(error),
+        error => ServerError::from(error),
     })?;
     Ok(Json(StorageLocation::new((chosen, false))))
 }

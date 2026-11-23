@@ -8,6 +8,7 @@ use super::{
     JsonPayload, McpServer, authorize_tool, bad_request, empty_extras, explained, internal_error,
     parse_ulid, request_auth, server_error, tool_extras,
 };
+use crate::error::ServerError;
 use crate::lookup::actor;
 use aruna_core::metadata::api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
@@ -284,7 +285,7 @@ impl McpServer {
             self.state.get_ctx().as_ref(),
         )
         .await
-        .map_err(crate::metadata::map_api_error)
+        .map_err(ServerError::from)
         .map_err(search_error)?;
         let response = crate::metadata::model::SearchResultsResponse {
             hits: result
@@ -358,7 +359,7 @@ impl McpServer {
         let preview = ProfileAssessOperation::preview(local_node, group_id, jsonld);
         let preview = drive(preview, &context)
             .await
-            .map_err(crate::metadata::map_metadata_error)
+            .map_err(ServerError::from)
             .map_err(server_error)?;
         let response = crate::metadata::model::ProfilePreviewResponse::from(preview);
         Ok(Json(JsonPayload(
@@ -467,7 +468,7 @@ impl McpServer {
             &self.state.get_ctx(),
         )
         .await
-        .map_err(crate::metadata::map_write_error)
+        .map_err(ServerError::from)
         .map_err(update_error)?;
         let summary = crate::metadata::model::MetadataDocumentSummary::from(&updated);
         Ok(Json(JsonPayload(
@@ -537,7 +538,7 @@ impl McpServer {
             )
             .await
         }
-        .map_err(crate::metadata::map_api_error)
+        .map_err(ServerError::from)
         .map_err(|error| query_error(error, document_scoped))?;
         let response =
             crate::metadata::map_query_results(execution.results, execution.fanout_stats)
@@ -583,7 +584,7 @@ impl McpServer {
             self.state.get_ctx().as_ref(),
         )
         .await
-        .map_err(crate::metadata::map_api_error)
+        .map_err(ServerError::from)
         .map_err(references_error)?;
         let response = crate::metadata::map_references_response(execution);
         Ok(Json(JsonPayload(
@@ -792,7 +793,7 @@ async fn authorize_document(
         &context,
     )
     .await
-    .map_err(crate::auth::map_authorize_error)
+    .map_err(ServerError::from)
 }
 
 pub(crate) async fn load_raw(
@@ -840,7 +841,7 @@ pub(crate) async fn load_raw(
         &server.state.get_ctx(),
     )
     .await
-    .map_err(crate::metadata::map_api_error)
+    .map_err(ServerError::from)
     .map_err(server_error)?;
     let response = crate::metadata::map_export_response(
         export,

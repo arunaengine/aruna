@@ -37,7 +37,7 @@ use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::Extension;
 use axum::body::Body;
 use axum::http::HeaderValue;
@@ -85,7 +85,7 @@ async fn write(state: &ServerState, key_space: &str, key: Vec<u8>, value: Vec<u8
 /// Destination realm 21 with federation settings, a group the user owns and its bucket `lab`.
 async fn fixture(with_blob: bool) -> Fixture {
     let (storage_dir, blob_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-    let storage = FjallStorage::open(storage_dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = realm(21);
     let (mut node_id, mut net_handle, mut blob_handle) =
         (iroh::SecretKey::from_bytes(&[7; 32]).public(), None, None);

@@ -232,7 +232,7 @@ async fn set_name(
     };
     let shown = drive(NodeNameOperation::new(config), &state.get_ctx())
         .await
-        .map_err(map_name_error)?;
+        .map_err(ServerError::from)?;
     let place = shown.place.unwrap_or_default();
     Ok((
         StatusCode::OK,
@@ -245,17 +245,23 @@ async fn set_name(
     ))
 }
 
-fn map_name_error(error: NodeNameError) -> ServerError {
-    match error {
-        error @ (NodeNameError::InvalidName
-        | NodeNameError::InvalidCoordinates
-        | NodeNameError::EmptyChange) => ServerError::BadRequestReason(error.to_string()),
-        NodeNameError::UnknownNode { .. } | NodeNameError::ConfigMissing => ServerError::NotFound,
-        NodeNameError::Unauthorized | NodeNameError::NotManagementNode => ServerError::Forbidden,
-        NodeNameError::StorageError(StorageError::TransactionConflict) => {
-            ServerError::Conflict("concurrent realm configuration update; retry".to_string())
+impl From<NodeNameError> for ServerError {
+    fn from(error: NodeNameError) -> Self {
+        match error {
+            error @ (NodeNameError::InvalidName
+            | NodeNameError::InvalidCoordinates
+            | NodeNameError::EmptyChange) => ServerError::BadRequestReason(error.to_string()),
+            NodeNameError::UnknownNode { .. } | NodeNameError::ConfigMissing => {
+                ServerError::NotFound
+            }
+            NodeNameError::Unauthorized | NodeNameError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            NodeNameError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::Conflict("concurrent realm configuration update; retry".to_string())
+            }
+            NodeNameError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
         }
-        NodeNameError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
     }
 }

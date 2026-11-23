@@ -93,19 +93,21 @@ pub struct ChatTurnsQuery {
     pub after: Option<u32>,
 }
 
-fn map_chat_error(error: ChatStoreError) -> ServerError {
-    match error {
-        ChatStoreError::NotFound => ServerError::NotFound,
-        ChatStoreError::Deleted => ServerError::Gone("the chat was deleted".to_string()),
-        ChatStoreError::Stale => {
-            ServerError::Conflict("the chat changed in another browser".to_string())
+impl From<ChatStoreError> for ServerError {
+    fn from(error: ChatStoreError) -> Self {
+        match error {
+            ChatStoreError::NotFound => ServerError::NotFound,
+            ChatStoreError::Deleted => ServerError::Gone("the chat was deleted".to_string()),
+            ChatStoreError::Stale => {
+                ServerError::Conflict("the chat changed in another browser".to_string())
+            }
+            ChatStoreError::StaleTurn { .. } => ServerError::Conflict(error.to_string()),
+            ChatStoreError::Storage(StorageError::TransactionConflict) => {
+                ServerError::Conflict("the chat is being written concurrently; retry".to_string())
+            }
+            ChatStoreError::TooLarge(cap) => ServerError::PayloadTooLarge(cap.to_string()),
+            error => ServerError::InternalError(error.into()),
         }
-        ChatStoreError::StaleTurn { .. } => ServerError::Conflict(error.to_string()),
-        ChatStoreError::Storage(StorageError::TransactionConflict) => {
-            ServerError::Conflict("the chat is being written concurrently; retry".to_string())
-        }
-        ChatStoreError::TooLarge(cap) => ServerError::PayloadTooLarge(cap.to_string()),
-        error => ServerError::InternalError(error.into()),
     }
 }
 
@@ -208,7 +210,7 @@ pub async fn list_chats(
 ) -> ServerResult<(StatusCode, Json<ChatListResponse>)> {
     let chats = drive(ListChatOperation::new(auth.user_id), &state.get_ctx())
         .await
-        .map_err(map_chat_error)?
+        .map_err(ServerError::from)?
         .into_iter()
         .map(head_response)
         .collect();
@@ -287,7 +289,7 @@ pub async fn put_chat(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_chat_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(head_response(head))))
 }
 
@@ -337,7 +339,7 @@ pub async fn get_turns(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_chat_error)?
+    .map_err(ServerError::from)?
     .into_iter()
     .map(turn_response)
     .collect();
@@ -423,7 +425,7 @@ pub async fn put_turn(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_chat_error)?;
+    .map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(head_response(head))))
 }
 
@@ -460,7 +462,7 @@ pub async fn delete_chat(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_chat_error)?;
+    .map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

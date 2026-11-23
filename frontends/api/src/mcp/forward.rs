@@ -7,7 +7,6 @@ use super::compute::request_bearer;
 use super::data::map_bucket_error;
 use super::{McpServer, explained, internal_error, server_error};
 use crate::error::ServerError;
-use crate::lookup::map_guard_error;
 use crate::routes::storage::relay::node_directed;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::id::NodeId;
@@ -160,7 +159,7 @@ fn route_failure(error: ToolRouteError, bucket: &str) -> CallToolResult {
     match error {
         ToolRouteError::Bucket(error) => map_bucket_error(error),
         ToolRouteError::Guard(error) => guard_error(error),
-        ToolRouteError::Search(error) => server_error(crate::metadata::map_api_error(error)),
+        ToolRouteError::Search(error) => server_error(ServerError::from(error)),
         ToolRouteError::SearchLate => explained(
             ServerError::ServiceUnavailable,
             format!(
@@ -174,7 +173,7 @@ fn route_failure(error: ToolRouteError, bucket: &str) -> CallToolResult {
 }
 
 fn guard_error(error: GuardError) -> CallToolResult {
-    server_error(map_guard_error(error))
+    server_error(ServerError::from(error))
 }
 
 fn parse_node(value: &str) -> Result<NodeId, CallToolResult> {

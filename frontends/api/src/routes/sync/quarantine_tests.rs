@@ -22,7 +22,7 @@ use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOper
 use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::http::StatusCode;
 use ulid::Ulid;
 
@@ -35,7 +35,7 @@ struct Fixture {
 
 async fn setup() -> Fixture {
     let dir = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(dir.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let context = Arc::new(DriverContext {
         storage_handle: storage,
         net_handle: None,

@@ -12,8 +12,8 @@ use crate::metadata::model::{
 };
 use crate::metadata::{
     commit_message, crate_entities, ensure_readable_files, forwarded_auth_token,
-    local_write_record, map_api_error, map_write_error, parse_document_id, run_create_metadata,
-    run_document_list, serialize_jsonld_object, with_global_ids,
+    local_write_record, parse_document_id, run_create_metadata, run_document_list,
+    serialize_jsonld_object, with_global_ids,
 };
 use crate::server::state::ServerState;
 use aruna_core::metadata::api::CreateDocumentPayload;
@@ -225,7 +225,7 @@ pub(crate) fn map_location_error(error: GitError) -> ServerError {
     match error {
         GitError::NotFound => ServerError::NotFound,
         GitError::Refused(reason) => ServerError::Conflict(reason),
-        GitError::Authorization(error) => crate::auth::map_authorize_error(error),
+        GitError::Authorization(error) => ServerError::from(error),
         _ => ServerError::ServiceUnavailable,
     }
 }
@@ -457,7 +457,9 @@ pub async fn get_metadata_path(
     let local_node = ctx.net_handle.as_ref().map(|net| net.node_id());
     let auth_token = forwarded_auth_token(bearer_token)?;
     let lookup = LookupPathOperation::new(state.get_realm_id(), request, auth_token, local_node);
-    let result = drive(lookup, ctx.as_ref()).await.map_err(map_api_error)?;
+    let result = drive(lookup, ctx.as_ref())
+        .await
+        .map_err(ServerError::from)?;
     Ok((
         StatusCode::OK,
         Json(MetadataPathResponse {
@@ -526,7 +528,7 @@ pub async fn get_metadata_document(
     let request = GetVisibleRequest { document_id, auth };
     let token = forwarded_auth_token(bearer_token)?;
     let read = RoutedReadOperation::new(local_node, state.get_realm_id(), request, token);
-    let record = drive(read, ctx.as_ref()).await.map_err(map_api_error)?;
+    let record = drive(read, ctx.as_ref()).await.map_err(ServerError::from)?;
     Ok((StatusCode::OK, Json(MetadataDocumentSummary::from(&record))))
 }
 
@@ -575,7 +577,9 @@ pub async fn delete_metadata_document(
         document_id,
         token,
     );
-    drive(delete, ctx.as_ref()).await.map_err(map_write_error)?;
+    drive(delete, ctx.as_ref())
+        .await
+        .map_err(ServerError::from)?;
 
     Ok(StatusCode::NO_CONTENT)
 }

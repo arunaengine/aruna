@@ -78,14 +78,16 @@ impl From<ReplicaRecord> for DeviceDocument {
     }
 }
 
-fn map_selection_error(error: SelectionError) -> ServerError {
-    match error {
-        SelectionError::NotFound => ServerError::NotFound,
-        SelectionError::PendingEdits => ServerError::Conflict(error.to_string()),
-        SelectionError::Refused(reason) => ServerError::BadRequestReason(reason),
-        SelectionError::Unavailable => ServerError::ServiceUnavailableReason(
-            "the realm has not served this document to this device yet".to_string(),
-        ),
+impl From<SelectionError> for ServerError {
+    fn from(error: SelectionError) -> Self {
+        match error {
+            SelectionError::NotFound => ServerError::NotFound,
+            SelectionError::PendingEdits => ServerError::Conflict(error.to_string()),
+            SelectionError::Refused(reason) => ServerError::BadRequestReason(reason),
+            SelectionError::Unavailable => ServerError::ServiceUnavailableReason(
+                "the realm has not served this document to this device yet".to_string(),
+            ),
+        }
     }
 }
 
@@ -214,7 +216,7 @@ async fn set_selection(
         }
         false => drive(deselect_document(document_id), &context).await,
     }
-    .map_err(map_selection_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(replica.into()))
 }
 

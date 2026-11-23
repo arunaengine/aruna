@@ -10,7 +10,6 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::job_service::{list_owned_jobs, read_staging_routed, submit_staging_job};
 use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
 use crate::lookup::bucket_info;
-use crate::routes::execution::jobs::map_submit_error;
 use crate::routes::management_relay::RELAY_HOP_HEADER;
 use crate::routes::storage::connectors::{
     ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
@@ -546,7 +545,7 @@ pub async fn stage_batch(
                 items.extend(expanded);
             }
             Err(error) => {
-                let error = map_list_error(error);
+                let error = ServerError::from(error);
                 expansion_errors.push(StageBatchResult {
                     source_path: prefix.source_prefix,
                     target_key: prefix.target_prefix,
@@ -950,7 +949,7 @@ pub async fn submit_staging(
         state.rocrate_limits().artifact_retention_ms,
     )
     .await
-    .map_err(map_submit_error)?;
+    .map_err(ServerError::from)?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -1560,7 +1559,7 @@ async fn snapshot_blob(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_snapshot_error)?;
+    .map_err(ServerError::from)?;
 
     queue_live_replication(
         &state,
@@ -1629,7 +1628,7 @@ async fn reference_blob(
     );
     let result = drive(materialize, &state.get_ctx())
         .await
-        .map_err(map_reference_error)?;
+        .map_err(ServerError::from)?;
 
     queue_live_replication(
         &state,
@@ -1715,7 +1714,7 @@ async fn coordinator_jobs(
 ) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
     let view = drive(bound_view(binding), state.get_ctx().as_ref())
         .await
-        .map_err(crate::lookup::map_guard_error)?;
+        .map_err(ServerError::from)?;
     let snapshot = view.snapshot();
     // Refused before any relay, as the local job would be while a range moves away from here.
     let moving = (snapshot.lifecycle.transfers.iter()).any(|open| open.from == binding.member_id);
@@ -1884,73 +1883,89 @@ fn validate_source_path(source_path: &str) -> ServerResult<()> {
         .ok_or(ServerError::BadRequest)
 }
 
-fn map_snapshot_error(error: MaterializeSnapshotError) -> ServerError {
-    match error {
-        MaterializeSnapshotError::Read(error) => map_read_error(error),
-        MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
-            ServerError::Forbidden
+impl From<MaterializeSnapshotError> for ServerError {
+    fn from(error: MaterializeSnapshotError) -> Self {
+        match error {
+            MaterializeSnapshotError::Read(error) => ServerError::from(error),
+            MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
+                ServerError::Forbidden
+            }
+            MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.into()),
+            MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.into()),
+            MaterializeSnapshotError::Conversion(error) => ServerError::InternalError(error.into()),
+            MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.into()),
+            // A node revalidating its inventory admits nothing governed; the client
+            // learns only that this node is busy, never which rule applies.
+            MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
         }
-        MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.into()),
-        MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.into()),
-        MaterializeSnapshotError::Conversion(error) => ServerError::InternalError(error.into()),
-        MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.into()),
-        // A node revalidating its inventory admits nothing governed; the client
-        // learns only that this node is busy, never which rule applies.
-        MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
     }
 }
 
-fn map_reference_error(error: MaterializeReferenceError) -> ServerError {
-    match error {
-        MaterializeReferenceError::Head(error) => map_head_error(error),
-        MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.into()),
-        MaterializeReferenceError::Conversion(error) => ServerError::InternalError(error.into()),
-        MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.into()),
-        // A policy error names the ids it conflicts on, which a client must
-        // never learn: the refusal is reported without them.
-        MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
-        MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
-        MaterializeReferenceError::Distribution(error) => crate::lookup::map_guard_error(error),
+impl From<MaterializeReferenceError> for ServerError {
+    fn from(error: MaterializeReferenceError) -> Self {
+        match error {
+            MaterializeReferenceError::Head(error) => ServerError::from(error),
+            MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.into()),
+            MaterializeReferenceError::Conversion(error) => {
+                ServerError::InternalError(error.into())
+            }
+            MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.into()),
+            // A policy error names the ids it conflicts on, which a client must
+            // never learn: the refusal is reported without them.
+            MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
+            MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
+            MaterializeReferenceError::Distribution(error) => ServerError::from(error),
+        }
     }
 }
 
-fn map_head_error(error: HeadSourceError) -> ServerError {
-    match error {
-        HeadSourceError::Resolve(error) => map_resolution_error(error),
-        HeadSourceError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.into()),
+impl From<HeadSourceError> for ServerError {
+    fn from(error: HeadSourceError) -> Self {
+        match error {
+            HeadSourceError::Resolve(error) => ServerError::from(error),
+            HeadSourceError::Staging(error) => ServerError::from(error),
+            _ => ServerError::InternalError(error.into()),
+        }
     }
 }
 
-fn map_read_error(error: ReadSourceError) -> ServerError {
-    match error {
-        ReadSourceError::Resolve(error) => map_resolution_error(error),
-        ReadSourceError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.into()),
+impl From<ReadSourceError> for ServerError {
+    fn from(error: ReadSourceError) -> Self {
+        match error {
+            ReadSourceError::Resolve(error) => ServerError::from(error),
+            ReadSourceError::Staging(error) => ServerError::from(error),
+            _ => ServerError::InternalError(error.into()),
+        }
     }
 }
 
-pub(crate) fn map_resolution_error(error: SourceResolutionError) -> ServerError {
-    match error {
-        SourceResolutionError::NotFound => ServerError::NotFound,
-        SourceResolutionError::InvalidSourcePath
-        | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
-        _ => ServerError::InternalError(error.into()),
+impl From<SourceResolutionError> for ServerError {
+    fn from(error: SourceResolutionError) -> Self {
+        match error {
+            SourceResolutionError::NotFound => ServerError::NotFound,
+            SourceResolutionError::InvalidSourcePath
+            | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+            _ => ServerError::InternalError(error.into()),
+        }
     }
 }
 
-fn map_source_error(error: StagingSourceError) -> ServerError {
-    match error {
-        StagingSourceError::NotFound => ServerError::NotFound,
-        _ => ServerError::BadGateway,
+impl From<StagingSourceError> for ServerError {
+    fn from(error: StagingSourceError) -> Self {
+        match error {
+            StagingSourceError::NotFound => ServerError::NotFound,
+            _ => ServerError::BadGateway,
+        }
     }
 }
 
-fn map_list_error(error: ListStagingError) -> ServerError {
-    match error {
-        ListStagingError::Resolve(error) => map_resolution_error(error),
-        ListStagingError::Staging(error) => map_source_error(error),
-        _ => ServerError::InternalError(error.into()),
+impl From<ListStagingError> for ServerError {
+    fn from(error: ListStagingError) -> Self {
+        match error {
+            ListStagingError::Resolve(error) => ServerError::from(error),
+            ListStagingError::Staging(error) => ServerError::from(error),
+            _ => ServerError::InternalError(error.into()),
+        }
     }
 }
 

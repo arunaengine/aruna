@@ -131,7 +131,7 @@ async fn change_admin(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_admin_error)?;
+    .map_err(ServerError::from)?;
     Ok(Json(sorted_ids(admins)))
 }
 
@@ -141,17 +141,23 @@ fn sorted_ids(admins: HashSet<UserId>) -> Vec<String> {
     ids
 }
 
-fn map_admin_error(error: SetAdminError) -> ServerError {
-    match error {
-        SetAdminError::InvalidUser => ServerError::BadRequest,
-        SetAdminError::Unauthorized | SetAdminError::NotManagementNode => ServerError::Forbidden,
-        SetAdminError::DocumentMissing | SetAdminError::RoleMissing => ServerError::NotFound,
-        SetAdminError::LastAdmin => ServerError::Conflict(error.to_string()),
-        SetAdminError::StorageError(StorageError::TransactionConflict) => ServerError::Conflict(
-            "concurrent realm authorization update conflict; retry".to_string(),
-        ),
-        SetAdminError::StorageError(error) => error.into(),
-        other => ServerError::InternalError(other.into()),
+impl From<SetAdminError> for ServerError {
+    fn from(error: SetAdminError) -> Self {
+        match error {
+            SetAdminError::InvalidUser => ServerError::BadRequest,
+            SetAdminError::Unauthorized | SetAdminError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetAdminError::DocumentMissing | SetAdminError::RoleMissing => ServerError::NotFound,
+            SetAdminError::LastAdmin => ServerError::Conflict(error.to_string()),
+            SetAdminError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::Conflict(
+                    "concurrent realm authorization update conflict; retry".to_string(),
+                )
+            }
+            SetAdminError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 

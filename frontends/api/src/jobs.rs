@@ -1176,7 +1176,7 @@ pub(crate) fn forwarded_job_auth(
     aruna_ops_data::metadata::api::fanout_types::forwarded_bearer(
         bearer.as_ref().map(ValidatedBearer::as_str),
     )
-    .map_err(crate::metadata::map_api_error)
+    .map_err(ServerError::from)
 }
 
 pub(crate) fn map_job_route(error: JobRouteError) -> ServerError {

@@ -161,14 +161,16 @@ fn millis(time: SystemTime) -> u64 {
         .map_or(0, |since| since.as_millis() as u64)
 }
 
-pub(super) fn map_error(error: ImportRuleError) -> ServerError {
-    match error {
-        ImportRuleError::Invalid(message) => ServerError::BadRequestMessage(message),
-        ImportRuleError::Conflict(message) => ServerError::Conflict(message),
-        ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
-        ImportRuleError::NotFound => ServerError::NotFound,
-        ImportRuleError::Forbidden => ServerError::Forbidden,
-        other => ServerError::InternalError(other.into()),
+impl From<ImportRuleError> for ServerError {
+    fn from(error: ImportRuleError) -> Self {
+        match error {
+            ImportRuleError::Invalid(message) => ServerError::BadRequestMessage(message),
+            ImportRuleError::Conflict(message) => ServerError::Conflict(message),
+            ImportRuleError::GroupWrite(error) => ServerError::Conflict(error.to_string()),
+            ImportRuleError::NotFound => ServerError::NotFound,
+            ImportRuleError::Forbidden => ServerError::Forbidden,
+            other => ServerError::InternalError(other.into()),
+        }
     }
 }
 
@@ -193,14 +195,14 @@ pub(super) async fn existing_rule(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?
+    .map_err(ServerError::from)?
     .ok_or(ServerError::NotFound)
 }
 
 async fn describe(state: &ServerState, rule: BackendImport) -> ServerResult<ImportResponse> {
     let run = drive(LastRunOperation::new(&rule), &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     let since = rule.last_started_ms.unwrap_or(millis(rule.created_at));
     let now = unix_timestamp_millis();
     let next_run_at = rule
@@ -376,7 +378,7 @@ pub async fn create_import(
         &state.get_ctx(),
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     if scheduled {
         drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
@@ -433,7 +435,7 @@ pub async fn list_group_imports(
     let (group_id, _) = admin_of_group(&state, auth, &group_id).await?;
     let rules = drive(ListImportsOperation::new(group_id), &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     let mut imports = Vec::with_capacity(rules.len());
     for rule in rules {
         imports.push(describe(&state, rule).await?);
@@ -574,7 +576,7 @@ pub async fn update_import(
     let operation = ChangeImportOperation::new(group_id, import_id, change, SystemTime::now());
     let rule = drive(operation, &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     if scheduled {
         drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
@@ -627,7 +629,7 @@ pub async fn delete_import(
         // A removal that stopped after deleting the rule is finished by the schedule.
         drive(WakeScheduleOperation, &state.get_ctx()).await.ok();
     }
-    removed.map_err(map_error)?;
+    removed.map_err(ServerError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -692,7 +694,7 @@ pub async fn run_import(
     };
     let started = drive(StartRunOperation::new(&rule, input), &context)
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     let Some(job_id) = started else {
         return Err(ServerError::Conflict(
             "the last run of this import has not finished".to_string(),
@@ -858,7 +860,7 @@ pub async fn get_renames(
         &context,
     )
     .await
-    .map_err(map_error)?;
+    .map_err(ServerError::from)?;
     let access = Arc::new(access);
     let rules = (
         AccessRule::new(access.clone(), Permission::READ),
@@ -985,11 +987,11 @@ pub async fn start_renames(
     // The move starts only while the rule and its patterns are as they were when checked.
     let guards = drive(RenameGuardsOperation::new(&rule), &state.get_ctx())
         .await
-        .map_err(map_error)?;
+        .map_err(ServerError::from)?;
     let context = state.get_ctx();
     let plan =
         AuthorizedRenamesOperation::new(node_routing(&context), caller, &rule, Permission::WRITE);
-    let checked = drive(plan, &context).await.map_err(map_error)?;
+    let checked = drive(plan, &context).await.map_err(ServerError::from)?;
     if checked.withheld_files > 0 {
         return Err(ServerError::Forbidden);
     }

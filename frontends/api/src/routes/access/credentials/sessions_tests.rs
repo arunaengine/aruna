@@ -12,13 +12,13 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use axum::response::IntoResponse;
 use tempfile::TempDir;
 
 async fn setup_node() -> (TempDir, Arc<ServerState>, AuthContext) {
     let directory = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let state = Arc::new(
         ServerState::new(
@@ -108,8 +108,7 @@ fn expiry_caps_bearer() {
 
 #[tokio::test]
 async fn mint_checks_member() {
-    let directory = tempfile::tempdir().unwrap();
-    let storage = FjallStorage::open(directory.path().to_str().unwrap()).unwrap();
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes([1u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
     let state = ServerState::new(

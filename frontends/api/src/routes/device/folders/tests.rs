@@ -2,9 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use super::{
-    FolderError, ServerError, folder_name, map_action_error, map_folder_error, parse_hash,
-};
+use super::{FolderError, ServerError, folder_name, parse_hash};
 use crate::routes::device::dto::hex_hash;
 use aruna_core::id::NodeId;
 use aruna_ops_data::device::sync::actions::ActionError;
@@ -42,24 +40,24 @@ fn names_folder_root() {
 fn maps_folder_errors() {
     // A nested root is the owner's problem, never an internal fault.
     assert!(matches!(
-        map_folder_error(FolderError::RootOverlaps("/home/ada".to_string())),
+        ServerError::from(FolderError::RootOverlaps("/home/ada".to_string())),
         ServerError::Conflict(_)
     ));
     assert!(matches!(
-        map_folder_error(FolderError::NotFound),
+        ServerError::from(FolderError::NotFound),
         ServerError::NotFound
     ));
     assert!(matches!(
-        map_action_error(ActionError::ExpectedMissing),
+        ServerError::from(ActionError::ExpectedMissing),
         ServerError::BadRequestReason(_)
     ));
     assert!(matches!(
-        map_action_error(ActionError::RemoteUnavailable),
+        ServerError::from(ActionError::RemoteUnavailable),
         ServerError::ServiceUnavailableReason(_)
     ));
 
     let node = NodeId::from_bytes(&[3u8; 32]).expect("node id");
-    let missing = map_folder_error(FolderError::RemoteBucketMissing {
+    let missing = ServerError::from(FolderError::RemoteBucketMissing {
         node,
         bucket: "test".to_string(),
     });
@@ -68,7 +66,7 @@ fn maps_folder_errors() {
         missing.to_string(),
         format!("the bucket \"test\" does not exist on node {node}")
     );
-    let exists = map_folder_error(FolderError::BucketExists {
+    let exists = ServerError::from(FolderError::BucketExists {
         node,
         bucket: "test".to_string(),
     });
@@ -81,12 +79,12 @@ fn maps_folder_errors() {
         exists.to_string(),
         format!("the bucket \"test\" already exists on node {node}")
     );
-    let conflict = map_folder_error(FolderError::RemoteBucketConflict {
+    let conflict = ServerError::from(FolderError::RemoteBucketConflict {
         bucket: "test".to_string(),
         reason: "bucket \"test\" belongs to another group".to_string(),
     });
     assert_eq!(conflict.status_code(), StatusCode::CONFLICT);
-    let target = map_folder_error(FolderError::NotRealmNode(node));
+    let target = ServerError::from(FolderError::NotRealmNode(node));
     assert_eq!(target.status_code(), StatusCode::BAD_REQUEST);
     assert_eq!(
         target.to_string(),

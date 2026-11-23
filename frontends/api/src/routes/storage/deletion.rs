@@ -39,7 +39,7 @@ use crate::auth::RealmAuth;
 use crate::auth::{ValidatedBearer, permission_granted};
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
-use crate::metadata::{bearer_token_string, map_api_error};
+use crate::metadata::bearer_token_string;
 use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
 use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
@@ -435,7 +435,7 @@ async fn set_coverage(
     );
     let preview = drive(preview, state.get_ctx().as_ref())
         .await
-        .map_err(map_api_error)?;
+        .map_err(ServerError::from)?;
     let freshness = match (
         preview.pending_materializations,
         preview.failed_materializations,
@@ -564,7 +564,7 @@ pub async fn submit_purge(
         JOB_RETENTION_MS,
     )
     .await
-    .map_err(crate::routes::execution::jobs::map_submit_error)?;
+    .map_err(ServerError::from)?;
     let urls = crate::jobs::job_urls(&state, result.job_id).await?;
     Ok((
         if result.created {
