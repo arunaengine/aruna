@@ -78,8 +78,8 @@ use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
 use aruna_runner::testing::read_value;
-use aruna_storage::storage;
 use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
@@ -96,7 +96,7 @@ struct TestContext {
 async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let temp_root = temp_dir.path().to_str().unwrap();
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = MemoryStorage::open();
     // Creating an upload asks the blob adapter whether the backend has a provider upload.
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();

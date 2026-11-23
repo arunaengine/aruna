@@ -10,7 +10,9 @@ use aruna_api::routes::access::groups::{
 };
 use aruna_core::user::id::UserId;
 use reqwest::StatusCode;
-use shared::{TestResult, create_bearer_token, create_group_http, spawn_seed_node};
+use shared::{
+    SeedNode, TestResult, create_bearer_token, create_group_http, run_step, spawn_seed_node,
+};
 use std::collections::HashMap;
 use ulid::Ulid;
 
@@ -31,9 +33,22 @@ fn role_by_name<'a>(roles: &'a [RoleResponse], name: &str) -> &'a RoleResponse {
         .unwrap_or_else(|| panic!("role {name} missing"))
 }
 
+/// Runs the group steps on one minimal seed; each step owns its group.
 #[tokio::test]
-async fn membership_invite_leave() -> TestResult<()> {
+async fn shared_node_scenario() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
+    let result = async {
+        run_step("membership_invite_leave", membership_invite_leave(&seed)).await?;
+        run_step("roles_reject_foreign", roles_reject_foreign(&seed)).await?;
+        run_step("open_hides_members", open_hides_members(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn membership_invite_leave(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -127,14 +142,10 @@ async fn membership_invite_leave() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-
-    seed.shutdown().await;
     Ok(())
 }
 
-#[tokio::test]
-async fn roles_reject_foreign() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn roles_reject_foreign(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -246,14 +257,10 @@ async fn roles_reject_foreign() -> TestResult<()> {
         .send()
         .await?;
     assert_eq!(response.status(), StatusCode::CONFLICT);
-
-    seed.shutdown().await;
     Ok(())
 }
 
-#[tokio::test]
-async fn open_hides_members() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn open_hides_members(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -298,7 +305,5 @@ async fn open_hides_members() -> TestResult<()> {
         info.roles.iter().any(|role| role.assigned_users.is_some()
             && !role.assigned_users.as_ref().unwrap().is_empty())
     );
-
-    seed.shutdown().await;
     Ok(())
 }

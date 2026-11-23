@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Lints overflow the default query depth on the nested async writer tasks, as in tests/operations/main.rs.
+// Lints overflow the default query depth on the nested async writer tasks, as in the regime roots.
 #![recursion_limit = "512"]
 
 #[path = "../tests/operations/convergence/mod.rs"]

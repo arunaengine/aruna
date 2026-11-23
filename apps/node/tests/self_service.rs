@@ -7,7 +7,7 @@ use crate::shared;
 use aruna_api::routes::access::groups::CreateGroupRequest;
 use aruna_core::user::id::UserId;
 use reqwest::StatusCode;
-use shared::{TestResult, create_bearer_token, spawn_seed_node};
+use shared::{SeedNode, TestResult, create_bearer_token, run_step, spawn_seed_node};
 use ulid::Ulid;
 
 async fn post_group(base_url: &str, token: &str, name: &str) -> TestResult<reqwest::Response> {
@@ -21,9 +21,21 @@ async fn post_group(base_url: &str, token: &str, name: &str) -> TestResult<reqwe
         .await?)
 }
 
+/// Runs the group cap steps on one minimal seed; each step uses its own fresh user.
 #[tokio::test]
-async fn fresh_user_cap() -> TestResult<()> {
+async fn shared_node_scenario() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
+    let result = async {
+        run_step("fresh_user_cap", fresh_user_cap(&seed)).await?;
+        run_step("concurrent_group_cap", concurrent_group_cap(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn fresh_user_cap(seed: &SeedNode) -> TestResult<()> {
     let member_token = create_bearer_token(
         seed.context.as_ref(),
         UserId::local(Ulid::generate(), seed.realm_id),
@@ -52,14 +64,10 @@ async fn fresh_user_cap() -> TestResult<()> {
         let response = post_group(&seed.base_url, &admin_token, &format!("admin-{i}")).await?;
         assert_eq!(response.status(), StatusCode::CREATED, "admin create {i}");
     }
-
-    seed.shutdown().await;
     Ok(())
 }
 
-#[tokio::test]
-async fn concurrent_group_cap() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn concurrent_group_cap(seed: &SeedNode) -> TestResult<()> {
     let member_token = create_bearer_token(
         seed.context.as_ref(),
         UserId::local(Ulid::generate(), seed.realm_id),
@@ -110,7 +118,5 @@ async fn concurrent_group_cap() -> TestResult<()> {
         statuses.len() - created,
         "failed concurrent attempts return conflict: {statuses:?}"
     );
-
-    seed.shutdown().await;
     Ok(())
 }

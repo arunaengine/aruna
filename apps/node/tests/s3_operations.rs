@@ -17,8 +17,9 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use shared::{
-    AWS_REGION, TestResult, create_bearer_token, create_group_http, create_restricted_credentials,
-    create_s3_credentials, s3_client, s3_setup, sign_token, spawn_complete_seed,
+    AWS_REGION, SeedNode, TestResult, create_bearer_token, create_group_http,
+    create_restricted_credentials, create_s3_credentials, run_step, s3_client, s3_group,
+    sign_token, spawn_complete_seed,
 };
 use std::time::Duration;
 use ulid::Ulid;
@@ -34,11 +35,45 @@ where
         .map(ToOwned::to_owned)
 }
 
+/// Runs the S3 route steps on one complete seed; each step owns its group and bucket.
 #[tokio::test]
-async fn head_bucket_state() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-head-bucket").await?;
-
+async fn shared_node_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let result = async {
+        run_step("head_bucket_state", head_bucket_state(&seed)).await?;
+        run_step(
+            "versioning_rejects_suspend",
+            versioning_rejects_suspend(&seed),
+        )
+        .await?;
+        run_step("delete_marks_keys", delete_marks_keys(&seed)).await?;
+        run_step("quiet_delete_omits", quiet_delete_omits(&seed)).await?;
+        run_step(
+            "delete_authorizes_entries",
+            delete_authorizes_entries(&seed),
+        )
+        .await?;
+        run_step("delete_bad_version", delete_bad_version(&seed)).await?;
+        run_step("versions_order_markers", versions_order_markers(&seed)).await?;
+        run_step("versions_honor_prefix", versions_honor_prefix(&seed)).await?;
+        run_step("versions_paginate_keys", versions_paginate_keys(&seed)).await?;
+        run_step("refresh_keeps_presigned", refresh_keeps_presigned(&seed)).await?;
+        run_step(
+            "multipart_listing_updates",
+            multipart_listing_updates(&seed),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn head_bucket_state(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-head-bucket").await?;
+
+    async {
         let bucket = "s3-ops-head-bucket";
         client.create_bucket().bucket(bucket).send().await?;
 
@@ -55,17 +90,13 @@ async fn head_bucket_state() -> TestResult<()> {
         assert!(error.is_not_found(), "expected NotFound, got {error:?}");
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn versioning_rejects_suspend() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-versioning").await?;
+async fn versioning_rejects_suspend(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-versioning").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-versioning";
         client.create_bucket().bucket(bucket).send().await?;
 
@@ -99,17 +130,13 @@ async fn versioning_rejects_suspend() -> TestResult<()> {
         );
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn delete_marks_keys() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-delete-batch").await?;
+async fn delete_marks_keys(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-delete-batch").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-delete-batch";
         client.create_bucket().bucket(bucket).send().await?;
 
@@ -157,17 +184,13 @@ async fn delete_marks_keys() -> TestResult<()> {
         assert!(head.is_err());
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn quiet_delete_omits() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-delete-quiet").await?;
+async fn quiet_delete_omits(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-delete-quiet").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-delete-quiet";
         client.create_bucket().bucket(bucket).send().await?;
         client
@@ -193,15 +216,10 @@ async fn quiet_delete_omits() -> TestResult<()> {
         assert!(output.errors().is_empty());
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn delete_authorizes_entries() -> TestResult<()> {
-    let seed = spawn_complete_seed().await?;
+async fn delete_authorizes_entries(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -218,7 +236,7 @@ async fn delete_authorizes_entries() -> TestResult<()> {
         .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
     let full_client = s3_client(endpoint, &full_credentials);
 
-    let result = async {
+    async {
         let bucket = "s3-ops-delete-scoped";
         full_client.create_bucket().bucket(bucket).send().await?;
         for key in ["scoped/in.txt", "other/out.txt"] {
@@ -285,17 +303,13 @@ async fn delete_authorizes_entries() -> TestResult<()> {
         );
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn delete_bad_version() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-delete-badversion").await?;
+async fn delete_bad_version(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-delete-badversion").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-delete-badversion";
         client.create_bucket().bucket(bucket).send().await?;
         client
@@ -332,17 +346,13 @@ async fn delete_bad_version() -> TestResult<()> {
         assert_eq!(error.code(), Some("NoSuchVersion"));
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn versions_order_markers() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-versions-order").await?;
+async fn versions_order_markers(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-versions-order").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-versions-order";
         let key = "versioned.txt";
         let first_body = b"first version body".to_vec();
@@ -419,17 +429,13 @@ async fn versions_order_markers() -> TestResult<()> {
         assert!(marker_version > second_version);
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn versions_honor_prefix() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-versions-prefix").await?;
+async fn versions_honor_prefix(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-versions-prefix").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-versions-prefix";
         client.create_bucket().bucket(bucket).send().await?;
         for key in ["a/1.txt", "a/2.txt", "b/1.txt"] {
@@ -474,17 +480,13 @@ async fn versions_honor_prefix() -> TestResult<()> {
         assert_eq!(keys, vec!["a/1.txt", "a/2.txt"]);
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn versions_paginate_keys() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-versions-page").await?;
+async fn versions_paginate_keys(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-versions-page").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-versions-page";
         client.create_bucket().bucket(bucket).send().await?;
         for key in ["obj-1", "obj-2", "obj-3"] {
@@ -532,17 +534,12 @@ async fn versions_paginate_keys() -> TestResult<()> {
         assert_eq!(page_two_keys, vec!["obj-3"]);
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn refresh_keeps_presigned() -> TestResult<()> {
+async fn refresh_keeps_presigned(seed: &SeedNode) -> TestResult<()> {
     // A part signed before its session is refreshed must still upload after the refresh.
-    let seed = spawn_complete_seed().await?;
-    let result = async {
+    async {
         let bucket = "s3-ops-refresh-presigned";
         let admin_token = create_bearer_token(
             seed.context.as_ref(),
@@ -565,7 +562,7 @@ async fn refresh_keeps_presigned() -> TestResult<()> {
             .await?;
 
         // The session expiry follows this short bearer token, so it starts inside the refresh window.
-        let bearer = sign_token(&seed, seed.user_id, None, 240)?;
+        let bearer = sign_token(seed, seed.user_id, None, 240)?;
         let http = reqwest::Client::new();
         let sessions = format!("{}/api/v1/access/s3/sessions", seed.base_url);
         let session: serde_json::Value = http
@@ -619,7 +616,7 @@ async fn refresh_keeps_presigned() -> TestResult<()> {
             .await?;
 
         // Only a renewed bearer token lets the refresh move the expiry later.
-        let renewed = sign_token(&seed, seed.user_id, None, 3600)?;
+        let renewed = sign_token(seed, seed.user_id, None, 3600)?;
         http.post(format!("{sessions}/{access_key}/refresh"))
             .bearer_auth(&renewed)
             .send()
@@ -636,16 +633,13 @@ async fn refresh_keeps_presigned() -> TestResult<()> {
         assert_eq!(status, reqwest::StatusCode::OK, "{body}");
         Ok(())
     }
-    .await;
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn multipart_listing_updates() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-ops-multipart-listing").await?;
+async fn multipart_listing_updates(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-ops-multipart-listing").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-ops-multipart-listing";
         let key = "assembled.bin";
         let part_one = vec![b'a'; 5 * 1024 * 1024];
@@ -761,8 +755,5 @@ async fn multipart_listing_updates() -> TestResult<()> {
         );
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }

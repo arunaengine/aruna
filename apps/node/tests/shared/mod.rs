@@ -503,6 +503,61 @@ pub(crate) async fn create_restricted_credentials(
     request_credentials(base_url, bearer_token, group_id, path_restrictions).await
 }
 
+/// Creates a service account of the group and makes it a member with the group's `user` role.
+pub(crate) async fn create_account(
+    base_url: &str,
+    token: &str,
+    group_id: &str,
+) -> TestResult<String> {
+    let client = reqwest::Client::new();
+    let created: serde_json::Value = client
+        .post(format!(
+            "{base_url}/api/v1/access/groups/{group_id}/service-accounts"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "name": "eLabFTW" }))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    let account = created["id"].as_str().ok_or("no account id")?.to_string();
+    client
+        .post(format!(
+            "{base_url}/api/v1/access/groups/{group_id}/members"
+        ))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "user_id": account }))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(account)
+}
+
+pub(crate) async fn issue(
+    base_url: &str,
+    token: &str,
+    group_id: &str,
+    account: &str,
+    body: &serde_json::Value,
+) -> TestResult<reqwest::Response> {
+    Ok(reqwest::Client::new()
+        .post(format!(
+            "{base_url}/api/v1/access/groups/{group_id}/service-accounts/{account}/credentials"
+        ))
+        .bearer_auth(token)
+        .json(body)
+        .send()
+        .await?)
+}
+
+pub(crate) fn as_credentials(created: CreateS3Response) -> S3Credentials {
+    S3Credentials {
+        access_key_id: created.access_key_id,
+        access_secret: created.access_secret,
+    }
+}
+
 /// Requests credentials without the group wait, for path-restricted tokens the group route refuses.
 pub(crate) async fn request_credentials(
     base_url: &str,
@@ -1345,9 +1400,8 @@ async fn load_env_config(
     Ok(resolve_settings(settings).await?)
 }
 
-/// A seed node with S3, a group named `group_name` and a client with that group's credentials.
-pub(crate) async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client)> {
-    let seed = spawn_complete_seed().await?;
+/// Creates the group `group_name` on a running seed and an S3 client with its admin credentials.
+pub(crate) async fn s3_group(seed: &SeedNode, group_name: &str) -> TestResult<S3Client> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -1361,8 +1415,16 @@ pub(crate) async fn s3_setup(group_name: &str) -> TestResult<(SeedNode, S3Client
         .s3
         .as_ref()
         .ok_or_else(|| std::io::Error::other("seed node did not start S3 server"))?;
-    let client = s3_client(endpoint, &credentials);
-    Ok((seed, client))
+    Ok(s3_client(endpoint, &credentials))
+}
+
+/// Runs one step of a scenario on a shared node and names the step in its error.
+pub(crate) async fn run_step(
+    name: &str,
+    step: impl Future<Output = TestResult<()>>,
+) -> TestResult<()> {
+    step.await
+        .map_err(|error| format!("step {name} failed: {error}").into())
 }
 
 /// A healthy Docker daemon with its own state root, so tests that run at once never contend for

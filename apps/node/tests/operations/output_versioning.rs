@@ -61,7 +61,7 @@ use aruna_p2p::NetHandle;
 use aruna_p2p::config::NetConfig;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_scheduler::{InboundTaskHandler, TaskHandle};
-use aruna_storage::storage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::jobs::record_attempt_intent;
 use futures_util::StreamExt;
 use tempfile::TempDir;
@@ -94,7 +94,7 @@ async fn setup() -> Harness {
     let blob_root = format!("{temp_root}/blobstore");
     std::fs::create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = MemoryStorage::open();
     let realm_id = RealmId::from_bytes([7u8; 32]);
     let config = NetConfig {
         realm_id,

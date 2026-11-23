@@ -9,7 +9,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
+# Integration tests build as seven regime binaries; declare each new tests/ file in its regime root.
 autotests = false
 
 [features]
@@ -111,12 +111,32 @@ rmcp = { workspace = true, features = [
 tempfile = { workspace = true }
 
 [[test]]
-name = "integration"
-path = "tests/main.rs"
+name = "identity_regime"
+path = "tests/identity_regime.rs"
 
 [[test]]
-name = "operations"
-path = "tests/operations/main.rs"
+name = "storage_regime"
+path = "tests/storage_regime.rs"
+
+[[test]]
+name = "federation_regime"
+path = "tests/federation_regime.rs"
+
+[[test]]
+name = "metadata_regime"
+path = "tests/metadata_regime.rs"
+
+[[test]]
+name = "restart_regime"
+path = "tests/restart_regime.rs"
+
+[[test]]
+name = "compute_regime"
+path = "tests/compute_regime.rs"
+
+[[test]]
+name = "ops_regime"
+path = "tests/ops_regime.rs"
 
 # Prints workload rates on request (cargo run --release --example measure); never a test.
 [[example]]

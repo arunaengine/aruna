@@ -46,7 +46,7 @@ use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::context::JobContext;
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::metadata::process_materialization_batch;
 use aruna_test_harness::projection::replay_event_log;
 use axum::Router;
@@ -103,13 +103,11 @@ impl Fixture {
 
 async fn build_fixture() -> Result<Fixture, BoxError> {
     let root = tempfile::tempdir()?;
-    let storage_path = root.path().join("storage");
     let metadata_path = root.path().join("metadata");
     let blob_path = root.path().join("blob");
-    std::fs::create_dir_all(&storage_path)?;
     std::fs::create_dir_all(&metadata_path)?;
     std::fs::create_dir_all(&blob_path)?;
-    let storage = FjallStorage::open(storage_path.to_str().ok_or("invalid storage path")?)?;
+    let storage = MemoryStorage::open();
     let realm_id = RealmId::from_bytes([41; 32]);
     let net = NetHandle::new(
         NetConfig {

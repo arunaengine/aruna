@@ -7,7 +7,7 @@ use crate::shared;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart, MetadataDirective};
-use shared::{TestResult, s3_setup};
+use shared::{SeedNode, TestResult, run_step, s3_group, spawn_complete_seed};
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
 where
@@ -20,11 +20,28 @@ where
         .map(ToOwned::to_owned)
 }
 
+/// Runs the copy steps on one complete seed; each step owns its group and bucket.
 #[tokio::test]
-async fn same_bucket_etag() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-copy-same-bucket").await?;
-
+async fn shared_node_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let result = async {
+        run_step("same_bucket_etag", same_bucket_etag(&seed)).await?;
+        run_step("version_copy_old", version_copy_old(&seed)).await?;
+        run_step("metadata_roundtrip", metadata_roundtrip(&seed)).await?;
+        run_step("matching_etag_rejected", matching_etag_rejected(&seed)).await?;
+        run_step("range_copy_assembles", range_copy_assembles(&seed)).await?;
+        run_step("self_copy_rejected", self_copy_rejected(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn same_bucket_etag(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-copy-same-bucket").await?;
+
+    async {
         let bucket = "s3-copy-same-bucket";
         let body = b"copy object identical bytes".to_vec();
         client.create_bucket().bucket(bucket).send().await?;
@@ -64,17 +81,13 @@ async fn same_bucket_etag() -> TestResult<()> {
         assert_eq!(dest_bytes, body);
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn version_copy_old() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-copy-version-source").await?;
+async fn version_copy_old(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-copy-version-source").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-copy-version-source";
         let old_body = b"copy the old version bytes".to_vec();
         let new_body = b"the current version has different bytes".to_vec();
@@ -119,17 +132,13 @@ async fn version_copy_old() -> TestResult<()> {
         assert_eq!(dest_bytes, old_body);
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn metadata_roundtrip() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-copy-metadata-replace").await?;
+async fn metadata_roundtrip(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-copy-metadata-replace").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-copy-metadata-replace";
         let mtime = "1753272000.123456789";
         let md5 = "XUFAKrxLKna5cZ2REBfFkg==";
@@ -293,17 +302,13 @@ async fn metadata_roundtrip() -> TestResult<()> {
 
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn matching_etag_rejected() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-copy-precondition").await?;
+async fn matching_etag_rejected(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-copy-precondition").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-copy-precondition";
         client.create_bucket().bucket(bucket).send().await?;
 
@@ -342,17 +347,13 @@ async fn matching_etag_rejected() -> TestResult<()> {
         assert_eq!(service_error_code(&dest).as_deref(), Some("NoSuchKey"));
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn range_copy_assembles() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-copy-upload-part").await?;
+async fn range_copy_assembles(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-copy-upload-part").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-copy-upload-part";
         let source_body = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".to_vec();
         let first_part = vec![b'f'; 5 * 1024 * 1024];
@@ -438,17 +439,13 @@ async fn range_copy_assembles() -> TestResult<()> {
         assert_eq!(assembled_bytes, expected);
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn self_copy_rejected() -> TestResult<()> {
-    let (seed, client) = s3_setup("s3-copy-self").await?;
+async fn self_copy_rejected(seed: &SeedNode) -> TestResult<()> {
+    let client = s3_group(seed, "s3-copy-self").await?;
 
-    let result = async {
+    async {
         let bucket = "s3-copy-self";
         client.create_bucket().bucket(bucket).send().await?;
         client
@@ -469,8 +466,5 @@ async fn self_copy_rejected() -> TestResult<()> {
         assert_eq!(service_error_code(&copy).as_deref(), Some("InvalidRequest"));
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }

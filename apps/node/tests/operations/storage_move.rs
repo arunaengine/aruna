@@ -21,7 +21,7 @@ use aruna_ops_data::blob::migration::misplaced::CountMisplacedOperation;
 use aruna_ops_data::s3::bucket::storage_move::StartMoveOperation;
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{drive, node_routing};
-use aruna_storage::storage;
+use aruna_storage::storage::memory::MemoryStorage;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use ulid::Ulid;
@@ -43,7 +43,7 @@ fn filesystem(root: String, prefix: &str) -> BackendConfig {
 async fn setup_context() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
     let root = temp_dir.path().to_str().unwrap().to_string();
-    let storage_handle = storage::worker::FjallStorage::open(&root).unwrap();
+    let storage_handle = MemoryStorage::open();
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

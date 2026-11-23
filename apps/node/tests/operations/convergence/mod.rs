@@ -18,6 +18,11 @@ use ulid::Ulid;
 
 pub type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// A document id mint as a create run gets one, with fresh entropy.
+pub fn fresh_ids() -> aruna_core::id_mint::IdMint {
+    aruna_core::id_mint::IdMint::new(rand::random())
+}
+
 /// A single poll that never returns is a deadlock, not slowness: no honest check
 /// against local state takes minutes. Elapsing panics and names the culprit.
 pub const HANG_CAP: Duration = Duration::from_secs(300);

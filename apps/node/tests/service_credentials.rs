@@ -12,69 +12,14 @@ use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use shared::{
-    S3Credentials, TestResult, WAIT_CAP, create_bearer_token, create_group_http,
-    create_onboarding_secret, create_s3_credentials, get_group_http, get_user_access, s3_client,
-    s3_client_once, shutdown_pair, sign_token, spawn_complete_joiner, spawn_complete_seed,
-    wait_group_member, wait_realm_nodes, wait_until,
+    TestResult, WAIT_CAP, as_credentials, create_account, create_bearer_token, create_group_http,
+    create_onboarding_secret, create_s3_credentials, get_group_http, get_user_access, issue,
+    s3_client, s3_client_once, shutdown_pair, sign_token, spawn_complete_joiner,
+    spawn_complete_seed, wait_group_member, wait_realm_nodes, wait_until,
 };
 use std::time::{Duration, SystemTime};
 
 const YEAR_SECS: u64 = 365 * 24 * 60 * 60;
-
-/// Creates a service account of the group and makes it a member with the group's `user` role.
-pub(crate) async fn create_account(
-    base_url: &str,
-    token: &str,
-    group_id: &str,
-) -> TestResult<String> {
-    let client = reqwest::Client::new();
-    let created: Value = client
-        .post(format!(
-            "{base_url}/api/v1/access/groups/{group_id}/service-accounts"
-        ))
-        .bearer_auth(token)
-        .json(&json!({ "name": "eLabFTW" }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let account = created["id"].as_str().ok_or("no account id")?.to_string();
-    client
-        .post(format!(
-            "{base_url}/api/v1/access/groups/{group_id}/members"
-        ))
-        .bearer_auth(token)
-        .json(&json!({ "user_id": account }))
-        .send()
-        .await?
-        .error_for_status()?;
-    Ok(account)
-}
-
-pub(crate) async fn issue(
-    base_url: &str,
-    token: &str,
-    group_id: &str,
-    account: &str,
-    body: &Value,
-) -> TestResult<reqwest::Response> {
-    Ok(reqwest::Client::new()
-        .post(format!(
-            "{base_url}/api/v1/access/groups/{group_id}/service-accounts/{account}/credentials"
-        ))
-        .bearer_auth(token)
-        .json(body)
-        .send()
-        .await?)
-}
-
-pub(crate) fn as_credentials(created: CreateS3Response) -> S3Credentials {
-    S3Credentials {
-        access_key_id: created.access_key_id,
-        access_secret: created.access_secret,
-    }
-}
 
 async fn put(client: &S3Client, bucket: &str, key: &str) -> Result<(), String> {
     client

@@ -15,9 +15,10 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use base64::engine::general_purpose::STANDARD;
 use reqwest::StatusCode;
 use shared::{
-    S3Credentials, TestResult, WAIT_CAP, create_group_http, create_s3_credentials, get_user_access,
-    request_credentials, revoke_s3_credentials, s3_client, s3_client_once, sign_scoped_token,
-    sign_token, spawn_complete_seed, spawn_seed_node, wait_group_http, wait_until,
+    S3Credentials, SeedNode, TestResult, WAIT_CAP, create_group_http, create_s3_credentials,
+    get_user_access, request_credentials, revoke_s3_credentials, run_step, s3_client,
+    s3_client_once, sign_scoped_token, sign_token, spawn_complete_seed, spawn_seed_node,
+    wait_group_http, wait_until,
 };
 use std::time::{Duration, SystemTime};
 
@@ -71,9 +72,24 @@ where
         .map(ToOwned::to_owned)
 }
 
+/// Runs the path scope steps on one minimal seed; each step owns its groups.
 #[tokio::test]
-async fn scoped_auth_inherits() -> TestResult<()> {
+async fn minimal_node_scenario() -> TestResult<()> {
     let seed = spawn_seed_node().await?;
+    let result = async {
+        run_step("scoped_auth_inherits", scoped_auth_inherits(&seed)).await?;
+        run_step("narrower_scope_stored", narrower_scope_stored(&seed)).await?;
+        run_step("broader_scope_rejected", broader_scope_rejected(&seed)).await?;
+        run_step("readonly_scope_stored", readonly_scope_stored(&seed)).await?;
+        run_step("foreign_group_rejected", foreign_group_rejected(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn scoped_auth_inherits(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -86,7 +102,7 @@ async fn scoped_auth_inherits() -> TestResult<()> {
         group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
     let delegated_path = format!("{group_root}/folder/**");
     let scoped_token = sign_scoped_token(
-        &seed,
+        seed,
         seed.user_id,
         vec![PathRestriction {
             pattern: delegated_path.clone(),
@@ -107,14 +123,10 @@ async fn scoped_auth_inherits() -> TestResult<()> {
             permission: Permission::WRITE,
         }])
     );
-
-    seed.shutdown().await;
     Ok(())
 }
 
-#[tokio::test]
-async fn narrower_scope_stored() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn narrower_scope_stored(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -128,7 +140,7 @@ async fn narrower_scope_stored() -> TestResult<()> {
     let auth_scope = format!("{group_root}/folder/**");
     let request_scope = format!("{group_root}/folder/narrow/**");
     let scoped_token = sign_scoped_token(
-        &seed,
+        seed,
         seed.user_id,
         vec![PathRestriction {
             pattern: auth_scope,
@@ -157,14 +169,10 @@ async fn narrower_scope_stored() -> TestResult<()> {
             permission: Permission::WRITE,
         }])
     );
-
-    seed.shutdown().await;
     Ok(())
 }
 
-#[tokio::test]
-async fn broader_scope_rejected() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn broader_scope_rejected(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -178,7 +186,7 @@ async fn broader_scope_rejected() -> TestResult<()> {
     let auth_scope = format!("{group_root}/folder/narrow/**");
     let requested_scope = format!("{group_root}/folder/**");
     let scoped_token = sign_scoped_token(
-        &seed,
+        seed,
         seed.user_id,
         vec![PathRestriction {
             pattern: auth_scope,
@@ -198,15 +206,11 @@ async fn broader_scope_rejected() -> TestResult<()> {
     .await?;
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    seed.shutdown().await;
     Ok(())
 }
 
 // A read-only request narrows a write scope: the credential is issued as READ.
-#[tokio::test]
-async fn readonly_scope_stored() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn readonly_scope_stored(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -219,7 +223,7 @@ async fn readonly_scope_stored() -> TestResult<()> {
         group_permission_path(seed.realm_id, group.group_id.parse()?, seed.net.node_id());
     let auth_scope = format!("{group_root}/folder/**");
     let scoped_token = sign_scoped_token(
-        &seed,
+        seed,
         seed.user_id,
         vec![PathRestriction {
             pattern: auth_scope.clone(),
@@ -248,14 +252,10 @@ async fn readonly_scope_stored() -> TestResult<()> {
             permission: Permission::READ,
         }])
     );
-
-    seed.shutdown().await;
     Ok(())
 }
 
-#[tokio::test]
-async fn foreign_group_rejected() -> TestResult<()> {
-    let seed = spawn_seed_node().await?;
+async fn foreign_group_rejected(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -268,7 +268,7 @@ async fn foreign_group_rejected() -> TestResult<()> {
     let group_a_root =
         group_permission_path(seed.realm_id, group_a.group_id.parse()?, seed.net.node_id());
     let scoped_token = sign_scoped_token(
-        &seed,
+        seed,
         seed.user_id,
         vec![PathRestriction {
             pattern: format!("{group_a_root}/folder/**"),
@@ -279,14 +279,27 @@ async fn foreign_group_rejected() -> TestResult<()> {
     let response = post_credentials(&seed.base_url, &scoped_token, &group_b.group_id, None).await?;
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
-
-    seed.shutdown().await;
     Ok(())
 }
 
+/// Runs the scope and token credential steps on one complete seed; each step owns its bucket.
 #[tokio::test]
-async fn scoped_list_denies() -> TestResult<()> {
+async fn complete_node_scenario() -> TestResult<()> {
     let seed = spawn_complete_seed().await?;
+    let result = async {
+        run_step("scoped_list_denies", scoped_list_denies(&seed)).await?;
+        run_step("token_reads_locked", token_reads_locked(&seed)).await?;
+        run_step("token_reads_old", token_reads_old(&seed)).await?;
+        run_step("token_opens_scope", token_opens_scope(&seed)).await?;
+        run_step("token_needs_credential", token_needs_credential(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn scoped_list_denies(seed: &SeedNode) -> TestResult<()> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -317,7 +330,7 @@ async fn scoped_list_denies() -> TestResult<()> {
         .await?;
 
     let scoped_token = sign_scoped_token(
-        &seed,
+        seed,
         seed.user_id,
         vec![PathRestriction {
             pattern: format!("{group_root}/allowed/**"),
@@ -335,8 +348,6 @@ async fn scoped_list_denies() -> TestResult<()> {
         service_error_code(&blocked_list).as_deref(),
         Some("AccessDenied")
     );
-
-    seed.shutdown().await;
     Ok(())
 }
 
@@ -545,13 +556,11 @@ fn token_client(
     aws_sdk_s3::Client::from_conf(config)
 }
 
-#[tokio::test]
-async fn token_reads_locked() -> TestResult<()> {
+async fn token_reads_locked(seed: &SeedNode) -> TestResult<()> {
     const BUCKET: &str = "token-reads";
     const DATA: &[u8] = b"content of a locked bucket";
-    let seed = spawn_complete_seed().await?;
 
-    let result = async {
+    async {
         let admin = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -652,18 +661,13 @@ async fn token_reads_locked() -> TestResult<()> {
         );
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn token_reads_old() -> TestResult<()> {
+async fn token_reads_old(seed: &SeedNode) -> TestResult<()> {
     const BUCKET: &str = "token-old-epochs";
-    let seed = spawn_complete_seed().await?;
 
-    let result = async {
+    async {
         let admin = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -740,7 +744,7 @@ async fn token_reads_old() -> TestResult<()> {
         assert_eq!(created.status(), StatusCode::CREATED);
         let created: aruna_api::routes::access::credentials::CreateS3Response =
             created.json().await?;
-        let grants = token_grants(&seed, &created.access_key_id).await?;
+        let grants = token_grants(seed, &created.access_key_id).await?;
         assert_eq!(grants.len(), 2);
         let epochs = grants.iter().flat_map(|g| g.context.request.epochs.clone());
         assert_eq!(epochs.max(), Some(19));
@@ -766,10 +770,7 @@ async fn token_reads_old() -> TestResult<()> {
         }
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
 /// The grants of credential `access_key`, read from the node's storage.
@@ -801,13 +802,11 @@ async fn token_grants(
     Ok(grants)
 }
 
-#[tokio::test]
-async fn token_opens_scope() -> TestResult<()> {
+async fn token_opens_scope(seed: &SeedNode) -> TestResult<()> {
     use aruna_core::structs::storage::abe_access::KeyScope;
     const BUCKET: &str = "token-scope";
-    let seed = spawn_complete_seed().await?;
 
-    let result = async {
+    async {
         let admin = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -875,7 +874,7 @@ async fn token_opens_scope() -> TestResult<()> {
         let created: aruna_api::routes::access::credentials::CreateS3Response =
             created.json().await?;
         let access_key = created.access_key_id.clone();
-        let grants = token_grants(&seed, &access_key).await?;
+        let grants = token_grants(seed, &access_key).await?;
         let scopes: Vec<_> = grants.iter().map(|g| &g.context.request.scope).collect();
         assert_eq!(scopes, [&KeyScope::Subtree("allowed/".to_string())]);
         let locked = http
@@ -1015,13 +1014,10 @@ async fn token_opens_scope() -> TestResult<()> {
             .send()
             .await?;
         assert!(revoked.status().is_success(), "{}", revoked.status());
-        assert!(token_grants(&seed, &access_key).await?.is_empty());
+        assert!(token_grants(seed, &access_key).await?.is_empty());
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
 /// The open key requests of credential `access_key`, read from the node's storage.
@@ -1053,8 +1049,7 @@ async fn token_requests(
     Ok(requests)
 }
 
-#[tokio::test]
-async fn token_needs_credential() -> TestResult<()> {
+async fn token_needs_credential(seed: &SeedNode) -> TestResult<()> {
     use aruna_core::calls::CallRun;
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::abe::AbeError;
@@ -1062,9 +1057,8 @@ async fn token_needs_credential() -> TestResult<()> {
     use aruna_ops_identity::abe::{KeyAction, KeyError, KeyOperation};
     use aruna_runner::driver::drive;
     const BUCKET: &str = "token-live";
-    let seed = spawn_complete_seed().await?;
 
-    let result = async {
+    async {
         let admin = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -1123,7 +1117,7 @@ async fn token_needs_credential() -> TestResult<()> {
             created.json().await?;
         assert_eq!(created.key_requests.len(), 1);
         let access_key = created.access_key_id;
-        let mut requests = token_requests(&seed, &access_key).await?;
+        let mut requests = token_requests(seed, &access_key).await?;
         let request = requests
             .pop()
             .ok_or_else(|| std::io::Error::other("no open token request"))?;
@@ -1179,7 +1173,7 @@ async fn token_needs_credential() -> TestResult<()> {
             }
         }
         assert!(operation.finalize().is_ok());
-        assert_eq!(token_grants(&seed, &access_key).await?.len(), 1);
+        assert_eq!(token_grants(seed, &access_key).await?.len(), 1);
 
         // A request after revocation recreates no request or grant for the credential.
         let revoked = http
@@ -1201,14 +1195,11 @@ async fn token_needs_credential() -> TestResult<()> {
             drive(request, &seed.context).await,
             Err(KeyError::Abe(AbeError::Stale))
         );
-        assert!(token_requests(&seed, &access_key).await?.is_empty());
-        assert!(token_grants(&seed, &access_key).await?.is_empty());
+        assert!(token_requests(seed, &access_key).await?.is_empty());
+        assert!(token_grants(seed, &access_key).await?.is_empty());
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
 #[tokio::test]

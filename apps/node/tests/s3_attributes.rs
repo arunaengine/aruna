@@ -13,19 +13,34 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
-    spawn_complete_seed,
+    SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, run_step,
+    s3_client, spawn_complete_seed,
 };
 
 fn sha256_base64(bytes: &[u8]) -> String {
     STANDARD.encode(Sha256::digest(bytes))
 }
 
+/// Runs the attribute steps on one complete seed; each step owns its group and bucket.
 #[tokio::test]
-async fn attributes_report_simple() -> TestResult<()> {
+async fn shared_node_scenario() -> TestResult<()> {
     let seed = spawn_complete_seed().await?;
-
     let result = async {
+        run_step("attributes_report_simple", attributes_report_simple(&seed)).await?;
+        run_step(
+            "attributes_report_multipart",
+            attributes_report_multipart(&seed),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn attributes_report_simple(seed: &SeedNode) -> TestResult<()> {
+    async {
         let bearer = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -79,17 +94,11 @@ async fn attributes_report_simple() -> TestResult<()> {
 
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn attributes_report_multipart() -> TestResult<()> {
-    let seed = spawn_complete_seed().await?;
-
-    let result = async {
+async fn attributes_report_multipart(seed: &SeedNode) -> TestResult<()> {
+    async {
         let bearer = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -220,8 +229,5 @@ async fn attributes_report_multipart() -> TestResult<()> {
 
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }

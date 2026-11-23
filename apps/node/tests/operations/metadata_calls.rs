@@ -2,6 +2,8 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use aruna_core::id::NodeId;

@@ -42,7 +42,7 @@ use aruna_ops_data::metadata::update_document::{
 use aruna_ops_data::metadata::update_entry::UpdateEntryOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::metadata::process_materialization_batch;
 use aruna_test_harness::projection::drain_projection_queue;
 use byteview::ByteView;
@@ -100,7 +100,6 @@ static PROFILE_TEST_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
 
 struct TestContext {
     _test_lock: tokio::sync::OwnedMutexGuard<()>,
-    _storage_dir: TempDir,
     _metadata_dir: TempDir,
     actor: Actor,
     config: RealmConfigDocument,
@@ -1702,9 +1701,8 @@ async fn build_context(
     validator_disabled: bool,
 ) -> Result<TestContext, Box<dyn std::error::Error>> {
     let test_lock = PROFILE_TEST_LOCK.clone().lock_owned().await;
-    let storage_dir = tempfile::tempdir()?;
     let metadata_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
+    let storage = MemoryStorage::open();
     let realm_id = RealmId([77u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[77u8; 32]).public();
     let graph = aruna_rdf_graph::GraphHandle::open(
@@ -1747,7 +1745,6 @@ async fn build_context(
     });
     Ok(TestContext {
         _test_lock: test_lock,
-        _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,
         config,

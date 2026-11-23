@@ -13,7 +13,8 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, ServerSideEncryption};
 use shared::{
     S3Credentials, SeedNode, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, revoke_s3_credentials, s3_client, s3_client_once, spawn_complete_seed,
+    create_s3_credentials, revoke_s3_credentials, run_step, s3_client, s3_client_once,
+    spawn_complete_seed,
 };
 
 fn service_error_code<T, E>(result: &Result<T, aws_sdk_s3::error::SdkError<E>>) -> Option<String>
@@ -27,8 +28,7 @@ where
         .map(ToOwned::to_owned)
 }
 
-async fn security_setup(group_name: &str) -> TestResult<(SeedNode, String, S3Credentials)> {
-    let seed = spawn_complete_seed().await?;
+async fn security_setup(seed: &SeedNode, group_name: &str) -> TestResult<(String, S3Credentials)> {
     let admin_token = create_bearer_token(
         seed.context.as_ref(),
         seed.user_id,
@@ -38,7 +38,7 @@ async fn security_setup(group_name: &str) -> TestResult<(SeedNode, String, S3Cre
     .await?;
     let group = create_group_http(&seed.base_url, &admin_token, group_name).await?;
     let credentials = create_s3_credentials(&seed.base_url, &admin_token, &group.group_id).await?;
-    Ok((seed, admin_token, credentials))
+    Ok((admin_token, credentials))
 }
 
 fn client(seed: &SeedNode, credentials: &S3Credentials) -> TestResult<S3Client> {
@@ -57,17 +57,46 @@ fn no_retry_client(seed: &SeedNode, credentials: &S3Credentials) -> TestResult<S
     Ok(s3_client_once(endpoint, credentials))
 }
 
+/// Runs the security steps on one complete seed; each step owns its group and credentials.
 #[tokio::test]
-async fn forged_credentials_rejected() -> TestResult<()> {
-    let (seed, _admin_token, credentials) = security_setup("s3-sec-forged").await?;
-
+async fn shared_node_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
     let result = async {
+        run_step(
+            "forged_credentials_rejected",
+            forged_credentials_rejected(&seed),
+        )
+        .await?;
+        run_step("dropped_expect_accepted", dropped_expect_accepted(&seed)).await?;
+        run_step(
+            "revoked_credentials_rejected",
+            revoked_credentials_rejected(&seed),
+        )
+        .await?;
+        run_step("sse_headers_rejected", sse_headers_rejected(&seed)).await?;
+        run_step("protocol_errors_mapped", protocol_errors_mapped(&seed)).await?;
+        run_step(
+            "workspace_credential_writes",
+            workspace_credential_writes(&seed),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+async fn forged_credentials_rejected(seed: &SeedNode) -> TestResult<()> {
+    let (_admin_token, credentials) = security_setup(seed, "s3-sec-forged").await?;
+
+    async {
         // Correct access key, tampered secret -> signature verification fails.
         let tampered = S3Credentials {
             access_key_id: credentials.access_key_id.clone(),
             access_secret: format!("{}tampered", credentials.access_secret),
         };
-        let bad_secret = client(&seed, &tampered)?.list_buckets().send().await;
+        let bad_secret = client(seed, &tampered)?.list_buckets().send().await;
         assert_eq!(
             service_error_code(&bad_secret).as_deref(),
             Some("SignatureDoesNotMatch"),
@@ -79,7 +108,7 @@ async fn forged_credentials_rejected() -> TestResult<()> {
             access_key_id: "unknown-access-key".into(),
             access_secret: "irrelevant".into(),
         };
-        let bad_key = client(&seed, &unknown)?.list_buckets().send().await;
+        let bad_key = client(seed, &unknown)?.list_buckets().send().await;
         assert_eq!(
             service_error_code(&bad_key).as_deref(),
             Some("InvalidAccessKeyId"),
@@ -87,10 +116,7 @@ async fn forged_credentials_rejected() -> TestResult<()> {
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
 /// Signs `Expect` as aws-sdk-go v1 does on a retry, then drops it as Envoy does.
@@ -126,12 +152,11 @@ impl Intercept for DroppedExpect {
     }
 }
 
-#[tokio::test]
-async fn dropped_expect_accepted() -> TestResult<()> {
-    let (seed, _admin_token, credentials) = security_setup("s3-sec-expect").await?;
+async fn dropped_expect_accepted(seed: &SeedNode) -> TestResult<()> {
+    let (_admin_token, credentials) = security_setup(seed, "s3-sec-expect").await?;
 
-    let result = async {
-        let listed = no_retry_client(&seed, &credentials)?
+    async {
+        let listed = no_retry_client(seed, &credentials)?
             .list_buckets()
             .customize()
             .interceptor(DroppedExpect)
@@ -144,23 +169,19 @@ async fn dropped_expect_accepted() -> TestResult<()> {
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn revoked_credentials_rejected() -> TestResult<()> {
-    let (seed, admin_token, credentials) = security_setup("s3-sec-revoked").await?;
+async fn revoked_credentials_rejected(seed: &SeedNode) -> TestResult<()> {
+    let (admin_token, credentials) = security_setup(seed, "s3-sec-revoked").await?;
 
-    let result = async {
+    async {
         // The credential works before revocation.
-        client(&seed, &credentials)?.list_buckets().send().await?;
+        client(seed, &credentials)?.list_buckets().send().await?;
 
         revoke_s3_credentials(&seed.base_url, &admin_token, &credentials.access_key_id).await?;
 
-        let revoked = client(&seed, &credentials)?.list_buckets().send().await;
+        let revoked = client(seed, &credentials)?.list_buckets().send().await;
         assert_eq!(
             service_error_code(&revoked).as_deref(),
             Some("InvalidAccessKeyId"),
@@ -168,19 +189,15 @@ async fn revoked_credentials_rejected() -> TestResult<()> {
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn sse_headers_rejected() -> TestResult<()> {
-    let (seed, _admin_token, credentials) = security_setup("s3-sec-sse").await?;
+async fn sse_headers_rejected(seed: &SeedNode) -> TestResult<()> {
+    let (_admin_token, credentials) = security_setup(seed, "s3-sec-sse").await?;
     let bucket = "s3-sec-sse";
 
-    let result = async {
-        let sse_client = no_retry_client(&seed, &credentials)?;
+    async {
+        let sse_client = no_retry_client(seed, &credentials)?;
         sse_client.create_bucket().bucket(bucket).send().await?;
         sse_client
             .put_object()
@@ -262,19 +279,15 @@ async fn sse_headers_rejected() -> TestResult<()> {
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
-#[tokio::test]
-async fn protocol_errors_mapped() -> TestResult<()> {
-    let (seed, _admin_token, credentials) = security_setup("s3-sec-protocol").await?;
+async fn protocol_errors_mapped(seed: &SeedNode) -> TestResult<()> {
+    let (_admin_token, credentials) = security_setup(seed, "s3-sec-protocol").await?;
     let bucket = "s3-sec-protocol";
 
-    let result = async {
-        let client = no_retry_client(&seed, &credentials)?;
+    async {
+        let client = no_retry_client(seed, &credentials)?;
         client.create_bucket().bucket(bucket).send().await?;
 
         // Completing a multipart upload with no parts must be a client error.
@@ -319,24 +332,19 @@ async fn protocol_errors_mapped() -> TestResult<()> {
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
 // The credential a batch run inside its bucket gets reads and writes that bucket through the
 // gateway's own S3 auth path, and nothing else.
-#[tokio::test]
-async fn workspace_credential_writes() -> TestResult<()> {
+async fn workspace_credential_writes(seed: &SeedNode) -> TestResult<()> {
     use aruna_core::structs::execution::job::identity::JobId;
     use aruna_core::structs::execution::job::input::{ComputeResources, ExecutionSpec, JobPayload};
     use aruna_core::structs::execution::job::local::{JobRecord, WorkspaceMode};
     use aruna_ops_work::jobs::workflow::credential::{MintCredentialOperation, RunIdentity};
     use aruna_runner::driver::drive;
 
-    let seed = spawn_complete_seed().await?;
-    let result = async {
+    async {
         let bearer = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -346,7 +354,7 @@ async fn workspace_credential_writes() -> TestResult<()> {
         .await?;
         let group = create_group_http(&seed.base_url, &bearer, "workspace-credential").await?;
         let owner = create_s3_credentials(&seed.base_url, &bearer, &group.group_id).await?;
-        let owner = client(&seed, &owner)?;
+        let owner = client(seed, &owner)?;
         for bucket in ["ws-run", "ws-other"] {
             owner.create_bucket().bucket(bucket).send().await?;
         }
@@ -392,7 +400,7 @@ async fn workspace_credential_writes() -> TestResult<()> {
             .await
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
         let run = client(
-            &seed,
+            seed,
             &S3Credentials {
                 access_key_id: minted.access_key,
                 access_secret: minted.secret,
@@ -426,7 +434,5 @@ async fn workspace_credential_writes() -> TestResult<()> {
         assert_eq!(service_error_code(&other).as_deref(), Some("AccessDenied"));
         Ok(())
     }
-    .await;
-    seed.shutdown().await;
-    result
+    .await
 }

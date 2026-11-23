@@ -11,21 +11,32 @@ use aws_sdk_s3::primitives::ByteStream;
 use reqwest::StatusCode;
 use serde_json::json;
 use shared::{
-    TestResult, create_bearer_token, create_group_http, create_s3_credentials, s3_client,
-    spawn_complete_seed,
+    SeedNode, TestResult, create_bearer_token, create_group_http, create_s3_credentials, run_step,
+    s3_client, spawn_complete_seed,
 };
 use ulid::Ulid;
 
 const PUBLIC_BODY: &[u8] = b"public profile artifact bytes";
 const PRIVATE_BODY: &[u8] = b"private bytes";
 
+/// Runs the public access steps on one complete seed; each step owns its groups and buckets.
+#[tokio::test]
+async fn shared_node_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
+        run_step("public_grants_read", public_grants_read(&seed)).await?;
+        run_step("public_folder_index", public_folder_index(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
 /// A public role grants anonymous reads on its exact paths through S3 and DRS.
 /// Writes and access outside those paths remain denied.
-#[tokio::test]
-async fn public_grants_read() -> TestResult<()> {
-    let seed = spawn_complete_seed().await?;
-
-    let result = async {
+async fn public_grants_read(seed: &SeedNode) -> TestResult<()> {
+    async {
         let bearer_token = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -286,20 +297,14 @@ async fn public_grants_read() -> TestResult<()> {
 
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }
 
 /// An unsigned browser request for a public folder key gets an HTML index of
 /// the readable entries. Clients without `Accept: text/html`, signed requests,
 /// and private folders keep their S3 answers.
-#[tokio::test]
-async fn public_folder_index() -> TestResult<()> {
-    let seed = spawn_complete_seed().await?;
-
-    let result = async {
+async fn public_folder_index(seed: &SeedNode) -> TestResult<()> {
+    async {
         let bearer_token = create_bearer_token(
             seed.context.as_ref(),
             seed.user_id,
@@ -402,8 +407,5 @@ async fn public_folder_index() -> TestResult<()> {
 
         Ok(())
     }
-    .await;
-
-    seed.shutdown().await;
-    result
+    .await
 }

@@ -26,7 +26,7 @@ use aruna_rdf_graph::GraphHandle;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::testing::send_metadata_effect;
 use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::metadata::process_materialization_batch;
 use craqle::{
     CraqleIrokleOptions, CraqleNode, CraqleOptions, CraqleRequestDurability, CreateEntityRequest,
@@ -36,7 +36,6 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 struct TestContext {
-    _storage_dir: TempDir,
     _metadata_dir: Option<TempDir>,
     actor: Actor,
     context: Arc<DriverContext>,
@@ -599,8 +598,7 @@ async fn job_count(storage: &StorageHandle) -> Result<usize, Box<dyn std::error:
 }
 
 async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::error::Error>> {
-    let storage_dir = tempfile::tempdir()?;
-    let storage_handle = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid path")?)?;
+    let storage_handle = MemoryStorage::open();
     let realm_id = RealmId::from_bytes([8u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[8u8; 32]).public();
     let actor = Actor {
@@ -636,7 +634,6 @@ async fn build_context(with_metadata: bool) -> Result<TestContext, Box<dyn std::
         outbound_handle: None,
     });
     Ok(TestContext {
-        _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,
         context,

@@ -42,7 +42,7 @@ use aruna_ops_data::metadata::update_document::{UpdateDocumentConfig, UpdateDocu
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use aruna_test_harness::metadata::process_materialization_batch;
 use aruna_test_harness::projection::{drain_projection_queue, project_create_events};
 use aruna_test_harness::projection::{
@@ -53,7 +53,6 @@ use tempfile::TempDir;
 use ulid::Ulid;
 
 struct TestContext {
-    _storage_dir: TempDir,
     _metadata_dir: TempDir,
     actor: Actor,
     config: RealmConfigDocument,
@@ -993,10 +992,8 @@ async fn read_create_events(
 }
 
 async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
-    let storage_dir = tempfile::tempdir()?;
     let metadata_dir = tempfile::tempdir()?;
-    let storage_handle =
-        FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
+    let storage_handle = MemoryStorage::open();
     let net_handle =
         NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone()).await?;
     let node_id = net_handle.node_id();
@@ -1024,7 +1021,6 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
         outbound_handle: None,
     });
     Ok(TestContext {
-        _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,
         config,
@@ -1033,10 +1029,8 @@ async fn build_context() -> Result<TestContext, Box<dyn std::error::Error>> {
 }
 
 async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Error>> {
-    let storage_dir = tempfile::tempdir()?;
     let metadata_dir = tempfile::tempdir()?;
-    let storage_handle =
-        FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
+    let storage_handle = MemoryStorage::open();
     let realm_id = RealmId([6u8; 32]);
     let node_id = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
     let graph_handle = aruna_rdf_graph::GraphHandle::open(
@@ -1063,7 +1057,6 @@ async fn build_offline_context() -> Result<TestContext, Box<dyn std::error::Erro
         outbound_handle: None,
     });
     Ok(TestContext {
-        _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         actor,
         config,

@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::blob_node::{
-    BUCKET, TestContext, blob_files, content, progress, put, read, run, setup_context, version,
+    BUCKET, TestContext, blob_files, content, progress, put, read, run, setup_durable, version,
     write,
 };
 use aruna::tasks::incoming::restore::start_task_queues;
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn migrates_bucket_copies() {
-    let context = setup_context().await;
+    let context = setup_durable().await;
     let shared: Vec<u8> = b"compressible research data ".repeat(80_000);
     let first = put(&context, "a.txt", &shared).await;
     let second = put(&context, "b.txt", &shared).await;
@@ -128,7 +128,7 @@ async fn clear_timers(context: &TestContext) {
 async fn restart_resumes_migration() {
     // The setting change committed but no timer survived, as after a crash between the
     // two: the restart alone must finish the migration.
-    let context = setup_context().await;
+    let context = setup_durable().await;
     let version_id = put(&context, "a.txt", &b"research data ".repeat(10_000)).await;
     let zstd = Compression::Zstd { level: 3 };
     let operation = PutCompressionOperation::new(BUCKET.to_string(), context.group_id, zstd, 1);
@@ -167,7 +167,7 @@ async fn restart_resumes_migration() {
 async fn failed_version_retries() {
     // A backend fault fails the only version; once it recovers, the waiting retry pass
     // moves it without anyone sending the setting again.
-    let context = setup_context().await;
+    let context = setup_durable().await;
     let data = b"research data ".repeat(10_000);
     let version_id = put(&context, "a.txt", &data).await;
     let [file] = blob_files(&context.temp_dir.path().join("blobstore"))

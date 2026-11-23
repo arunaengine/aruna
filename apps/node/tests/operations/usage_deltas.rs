@@ -62,6 +62,7 @@ use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_storage::storage;
 use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::memory::MemoryStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -74,10 +75,7 @@ struct Harness {
 }
 
 async fn setup() -> Harness {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let storage_handle =
-        storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
-    setup_on(temp_dir, storage_handle).await
+    setup_on(tempfile::tempdir().unwrap(), MemoryStorage::open()).await
 }
 
 async fn setup_on(temp_dir: TempDir, storage_handle: StorageHandle) -> Harness {

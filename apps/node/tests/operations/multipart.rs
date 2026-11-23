@@ -43,6 +43,7 @@ use aruna_p2p::dht::storage::decode_entries;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_runner::testing::read_value;
 use aruna_storage::storage;
+use aruna_storage::storage::memory::MemoryStorage;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{create_dir_all, exists, read_dir};
 use std::path::Path;
@@ -63,7 +64,7 @@ async fn setup_context() -> TestContext {
     let blob_root = format!("{temp_root}/blobstore");
     create_dir_all(&blob_root).unwrap();
 
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
+    let storage_handle = MemoryStorage::open();
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

@@ -14,7 +14,7 @@ use aruna_core::user::id::UserId;
 use aruna_ops_data::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
 use aruna_ops_data::metadata::create_entry::CreateEntryOperation;
 use aruna_runner::driver::DriverContext;
-use aruna_storage::storage::worker::FjallStorage;
+use aruna_storage::storage::memory::MemoryStorage;
 use ulid::Ulid;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -35,13 +35,7 @@ async fn concurrent_creates_succeed() -> Result<(), BoxError> {
     // Parallel creates in one realm must not raise transaction conflicts now
     // that the unchanged realm-config write-back is gone.
     let temp_dir = tempfile::tempdir()?;
-    let storage = FjallStorage::open(
-        temp_dir
-            .path()
-            .join("fjall")
-            .to_str()
-            .ok_or("invalid storage path")?,
-    )?;
+    let storage = MemoryStorage::open();
     let node_id = iroh::SecretKey::generate().public();
     let graph_handle = aruna_rdf_graph::GraphHandle::open(
         temp_dir.path().join("metadata"),

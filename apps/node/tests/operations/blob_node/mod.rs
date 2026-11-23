@@ -34,6 +34,7 @@ use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_storage::storage;
 use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::memory::MemoryStorage;
 use futures_util::TryStreamExt;
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -51,13 +52,22 @@ pub fn realm_id() -> RealmId {
     RealmId::from_bytes([7u8; 32])
 }
 
-/// A node whose only blob backend is a file system under `blobstore`.
+/// A node over memory storage whose only blob backend is a file system under `blobstore`.
 pub async fn setup_context() -> TestContext {
+    setup_store(tempfile::tempdir().unwrap(), MemoryStorage::open()).await
+}
+
+/// The same node over fjall storage in its temporary directory, for restart tests.
+pub async fn setup_durable() -> TestContext {
     let temp_dir = tempfile::tempdir().unwrap();
-    let temp_root = temp_dir.path().to_str().unwrap();
-    let blob_root = format!("{temp_root}/blobstore");
+    let storage_handle =
+        storage::worker::FjallStorage::open(temp_dir.path().to_str().unwrap()).unwrap();
+    setup_store(temp_dir, storage_handle).await
+}
+
+async fn setup_store(temp_dir: TempDir, storage_handle: StorageHandle) -> TestContext {
+    let blob_root = format!("{}/blobstore", temp_dir.path().to_str().unwrap());
     std::fs::create_dir_all(&blob_root).unwrap();
-    let storage_handle = storage::worker::FjallStorage::open(temp_root).unwrap();
     let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
         .await
         .unwrap();

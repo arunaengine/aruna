@@ -3,7 +3,6 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::service_credentials::{as_credentials, create_account, issue};
 use crate::shared;
 
 use aws_sdk_s3::Client as S3Client;
@@ -16,8 +15,8 @@ use aws_sdk_s3::types::{
 use reqwest::StatusCode;
 use serde_json::json;
 use shared::{
-    S3Credentials, S3Endpoint, TestResult, create_bearer_token, create_group_http,
-    create_s3_credentials, s3_client, spawn_complete_seed,
+    S3Credentials, S3Endpoint, TestResult, as_credentials, create_account, create_bearer_token,
+    create_group_http, create_s3_credentials, issue, s3_client, spawn_complete_seed,
 };
 
 const BUCKET: &str = "shared-bucket";
