@@ -24,16 +24,16 @@ use aruna_core::document_apply::cursor::AppliedCursor;
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::StoragePort;
 use aruna_core::id::{DhtKeyId, NodeId, short_display_id};
 use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
+use aruna_core::persistence::FjallPersistPolicy;
 use aruna_core::reducer::overlay::reduced_admin_target;
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
 use aruna_core::telemetry::duration_ms;
 use aruna_core::types::Value;
-use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::persistence::FjallPersistPolicy;
 use byteview::ByteView;
 use parking_lot::{Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -81,6 +81,14 @@ const REPLAY_BATCH_LIMIT: usize = 1_024;
 /// Bounds concurrent co-holder genesis probes so a large holder set cannot open
 /// an unbounded number of simultaneous sync streams.
 const SHARD_PROBE_CONCURRENCY: usize = 8;
+
+/// Maps the persist policy to the fjall persist mode of the sync store.
+fn persist_mode(policy: FjallPersistPolicy) -> fjall::PersistMode {
+    match policy {
+        FjallPersistPolicy::Buffer => fjall::PersistMode::Buffer,
+        FjallPersistPolicy::SyncAll => fjall::PersistMode::SyncAll,
+    }
+}
 
 struct DocumentEventBatch {
     cursor: ::irokle::ActorClock,
@@ -307,7 +315,7 @@ pub struct DocumentSyncService {
     published: fjall::OptimisticTxKeyspace,
     publish_locks: Arc<Vec<Mutex<()>>>,
     persist_policy: FjallPersistPolicy,
-    pub(crate) storage: StorageHandle,
+    pub(crate) storage: Arc<dyn StoragePort>,
     default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
     shard_publishers: Arc<RwLock<BTreeMap<::irokle::TopicId, ShardPublisherPolicy>>>,
     storage_path: PathBuf,
@@ -354,7 +362,7 @@ impl DocumentSyncService {
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         endpoint: iroh::Endpoint,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         storage_path: impl AsRef<Path>,
         peer_nodes: &[NodeId],
         alpns: Vec<Vec<u8>>,
@@ -376,7 +384,7 @@ impl DocumentSyncService {
     #[allow(clippy::too_many_arguments)]
     pub fn open_with_policy(
         endpoint: iroh::Endpoint,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         storage_path: impl AsRef<Path>,
         peer_nodes: &[NodeId],
         alpns: Vec<Vec<u8>>,
@@ -384,6 +392,7 @@ impl DocumentSyncService {
         persist_policy: FjallPersistPolicy,
         realm_id: RealmId,
     ) -> Result<Self> {
+        let storage: Arc<dyn StoragePort> = storage.into();
         let storage_path = storage_path.as_ref().to_path_buf();
         let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_to_peer).collect();
         let db = fjall::OptimisticTxDatabase::builder(&storage_path)
@@ -400,7 +409,7 @@ impl DocumentSyncService {
         let node = ::irokle::Irokle::builder()
             .with_iroh_secret_key(endpoint.secret_key())
             .with_peer_whitelist(default_peers.clone())
-            .with_fjall_database_and_persist_mode(db.clone(), persist_policy.as_fjall())
+            .with_fjall_database_and_persist_mode(db.clone(), persist_mode(persist_policy))
             .map_err(|error| NetError::Bootstrap(error.to_string()))?
             .build()
             .map_err(|error| NetError::Bootstrap(error.to_string()))?;

@@ -11,6 +11,7 @@ use std::time::Duration;
 use aruna_core::calls::HangLimits;
 use aruna_core::federation::valid_federation_url;
 use aruna_core::listener::{HostRoutes, MAX_BODY_SIZE, S3ServerTimeouts, cors_allows};
+use aruna_core::persistence::{CACHE_BYTES, FjallPersistPolicy};
 use aruna_core::search::MetadataSearchStorage;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::realm::OidcProviderConfig;
@@ -19,10 +20,7 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig, BlobTimeoutConf
 use aruna_core::structs::storage::node_info::{
     CLASS_LABEL_PREFIX, KIND_LABEL_KEY, LOCATION_LABEL_KEY,
 };
-use aruna_storage::storage::lifecycle::CACHE_BYTES;
-use aruna_storage::storage::persistence::FjallPersistPolicy;
 use aruna_wire::portal::{LegalDocument, LegalSource, PortalLogin};
-use irokle::net::IrohRuntimeConfig;
 
 use crate::{PortalArtifactConfig, PortalConfig, RateLimitSettings, SetupError};
 
@@ -99,7 +97,7 @@ pub struct Settings {
     pub additional_relay_urls: Vec<String>,
     pub max_uni_streams: Option<u64>,
     pub max_bidi_streams: Option<u64>,
-    pub document_sync_runtime: IrohRuntimeConfig,
+    pub document_sync_runtime: DocumentSyncSettings,
     pub metadata_replication_factor: u32,
     /// `None` when `S3_HOST`/`S3_ADDRESS` are unset or empty: no S3 listener.
     pub s3_host: Option<String>,
@@ -126,6 +124,19 @@ pub struct Settings {
 }
 
 /// Native HTTPS: the listener, the certificate files and the routed public origins.
+/// Document sync timings from the `DOCUMENT_SYNC_*_SECS` keys; `None` keeps the sync default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DocumentSyncSettings {
+    pub connect_timeout: Option<Duration>,
+    pub sync_io_timeout: Option<Duration>,
+    pub resync_interval: Option<Duration>,
+    pub resync_initial_backoff: Option<Duration>,
+    pub resync_max_backoff: Option<Duration>,
+    pub full_sweep_interval: Option<Duration>,
+    /// Seconds after midnight of the full sweep.
+    pub full_sweep_time: Option<Duration>,
+}
+
 #[derive(Clone, Debug)]
 pub struct HttpsSettings {
     pub address: SocketAddr,
@@ -1029,59 +1040,32 @@ fn parse_node_labels(env: &dyn SettingsEnv) -> Result<BTreeMap<String, String>, 
     Ok(labels)
 }
 
-fn load_sync_config(env: &dyn SettingsEnv) -> Result<IrohRuntimeConfig, SetupError> {
-    let default = IrohRuntimeConfig::default();
-    Ok(IrohRuntimeConfig {
-        connect_timeout: duration_secs_env(
-            env,
-            "DOCUMENT_SYNC_CONNECT_TIMEOUT_SECS",
-            default.connect_timeout,
-        )?,
-        sync_io_timeout: duration_secs_env(
-            env,
-            "DOCUMENT_SYNC_IO_TIMEOUT_SECS",
-            default.sync_io_timeout,
-        )?,
-        resync_interval: duration_secs_env(
-            env,
-            "DOCUMENT_SYNC_RESYNC_INTERVAL_SECS",
-            default.resync_interval,
-        )?,
+fn load_sync_config(env: &dyn SettingsEnv) -> Result<DocumentSyncSettings, SetupError> {
+    Ok(DocumentSyncSettings {
+        connect_timeout: duration_secs_env(env, "DOCUMENT_SYNC_CONNECT_TIMEOUT_SECS")?,
+        sync_io_timeout: duration_secs_env(env, "DOCUMENT_SYNC_IO_TIMEOUT_SECS")?,
+        resync_interval: duration_secs_env(env, "DOCUMENT_SYNC_RESYNC_INTERVAL_SECS")?,
         resync_initial_backoff: duration_secs_env(
             env,
             "DOCUMENT_SYNC_RESYNC_INITIAL_BACKOFF_SECS",
-            default.resync_initial_backoff,
         )?,
-        resync_max_backoff: duration_secs_env(
-            env,
-            "DOCUMENT_SYNC_RESYNC_MAX_BACKOFF_SECS",
-            default.resync_max_backoff,
-        )?,
-        full_sweep_interval: duration_secs_env(
-            env,
-            "DOCUMENT_SYNC_FULL_SWEEP_INTERVAL_SECS",
-            default.full_sweep_interval,
-        )?,
-        full_sweep_time_of_day: duration_secs_env(
-            env,
-            "DOCUMENT_SYNC_FULL_SWEEP_TIME_OF_DAY_SECS",
-            default.full_sweep_time_of_day,
-        )?,
+        resync_max_backoff: duration_secs_env(env, "DOCUMENT_SYNC_RESYNC_MAX_BACKOFF_SECS")?,
+        full_sweep_interval: duration_secs_env(env, "DOCUMENT_SYNC_FULL_SWEEP_INTERVAL_SECS")?,
+        full_sweep_time: duration_secs_env(env, "DOCUMENT_SYNC_FULL_SWEEP_TIME_OF_DAY_SECS")?,
     })
 }
 
 fn duration_secs_env(
     env: &dyn SettingsEnv,
     key: &'static str,
-    default: Duration,
-) -> Result<Duration, SetupError> {
+) -> Result<Option<Duration>, SetupError> {
     let Some(value) = env.var(key) else {
-        return Ok(default);
+        return Ok(None);
     };
     let seconds = value
         .parse::<u64>()
         .map_err(|error| invalid_config_value(key, value, error))?;
-    Ok(Duration::from_secs(seconds))
+    Ok(Some(Duration::from_secs(seconds)))
 }
 
 fn load_oidc_providers(env: &dyn SettingsEnv) -> Result<Vec<OidcProviderConfig>, SetupError> {

@@ -9,6 +9,7 @@ use crate::s3::{self, check_keys};
 use aruna_core::effects::{BlobEffect, StorageEffect};
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::handle::StoragePort;
 use aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE;
 use aruna_core::structs::storage::backends::ImportRoot;
 use aruna_core::structs::storage::blob::{Backend, BackendConfig, BackendRef};

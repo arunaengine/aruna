@@ -14,7 +14,7 @@ use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffe
 use aruna_core::egress::EgressPolicy;
 use aruna_core::errors::{BlobError, StagingSourceError};
 use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
-use aruna_core::handle::Handle;
+use aruna_core::handle::{Handle, StoragePort};
 use aruna_core::id::NodeId;
 use aruna_core::native_reference::is_native;
 use aruna_core::stream::{BackendStream, StreamError};
@@ -25,7 +25,6 @@ use aruna_core::structs::storage::encryption::{BucketKeyError, generate_key, sea
 use aruna_core::structs::storage::multipart::MultipartPartKey;
 use aruna_p2p::NetHandle;
 use aruna_p2p::streams::BiStream;
-use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::Stream;
@@ -616,7 +615,7 @@ impl BlobHandler {
     #[allow(clippy::new_ret_no_self)]
     pub async fn new(
         config: BackendConfig,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         net: NetHandle,
     ) -> Result<BlobHandle, BlobLibError> {
         Self::with_egress(config, storage, net, EgressPolicy::strict()).await
@@ -627,7 +626,7 @@ impl BlobHandler {
     #[allow(clippy::new_ret_no_self)]
     pub async fn with_egress(
         config: BackendConfig,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         net: NetHandle,
         policy: EgressPolicy,
     ) -> Result<BlobHandle, BlobLibError> {
@@ -639,7 +638,7 @@ impl BlobHandler {
     #[allow(clippy::new_ret_no_self)]
     pub async fn with_registry(
         registry: BackendRegistry,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         net: NetHandle,
         policy: EgressPolicy,
         spool_dir: Option<std::path::PathBuf>,
@@ -650,7 +649,7 @@ impl BlobHandler {
         let blob_handler = BlobHandler {
             registry,
             egress: EgressGuard::new(policy)?,
-            storage,
+            storage: storage.into(),
             net,
             connections: Arc::new(Mutex::new(HashMap::new())),
             connection_slots: Arc::new(Semaphore::new(CONNECTION_SLOTS)),

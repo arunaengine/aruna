@@ -17,6 +17,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::BlobError;
 use aruna_core::events::{BlobEvent, Event, StorageEvent};
+use aruna_core::handle::StoragePort;
 use aruna_core::keyspaces::BLOB_QUARANTINE_KEYSPACE;
 use aruna_core::stream::{BackendStream, StreamError};
 use aruna_core::structs::execution::source_access::ResolvedSourceAccess;

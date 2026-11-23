@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::egress::EgressGuard;
+use aruna_core::handle::StoragePort;
 use aruna_core::id::NodeId;
 use aruna_p2p::NetHandle;
 use aruna_p2p::streams::BiStream;
-use aruna_storage::storage::handle::StorageHandle;
 use bao_tree::BlockSize;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
@@ -65,7 +65,7 @@ enum ControlPlaneKind {
 pub struct BlobHandler {
     registry: BackendRegistry,
     egress: EgressGuard,
-    storage: StorageHandle,
+    storage: Arc<dyn StoragePort>,
     net: NetHandle,
     connections: Arc<Mutex<HashMap<Ulid, Connection>>>,
     connection_slots: Arc<Semaphore>,

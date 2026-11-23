@@ -8,7 +8,7 @@ use crate::s3::make_bucket;
 use aruna_core::effects::{Effect, IterStart, StorageEffect};
 use aruna_core::errors::{BlobError, ConversionError, StorageError};
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::handle::{Handle, StoragePort, TransactionOwner};
 use aruna_core::keyspaces::{
     BLOB_CLEANUP_KEYSPACE, BUCKET_FREE_INDEX, BUCKET_STATS_DB, HIDDEN_RESERVATION_KEYSPACE,
 };
@@ -18,7 +18,6 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::group_backend::{DEFAULT_BUCKET, MAX_KEY_LEN, PARTS_PREFIX};
 use aruna_core::types::TxnId;
-use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use opendal::Operator;
 use std::path::PathBuf;

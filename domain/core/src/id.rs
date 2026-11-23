@@ -9,6 +9,8 @@ use std::fmt;
 use ulid::Ulid;
 
 pub type NodeId = iroh::PublicKey;
+/// An Ed25519 signature by a node key.
+pub type Signature = iroh::Signature;
 
 pub const DISPLAY_ID_CHARS: usize = 8;
 pub const HEX_PREFIX_BYTES: usize = 8;

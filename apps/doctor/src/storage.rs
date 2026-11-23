@@ -1,10 +1,14 @@
-//! Writes a database snapshot file and imports such a snapshot into a new database.
+//! Opens the node store with its configuration, and writes and imports database snapshots.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
+use aruna_config::settings::read_settings;
+use aruna_config::{Config, resolve_config};
 use aruna_storage::snapshot::{SnapshotError, SnapshotStats};
 use aruna_storage::snapshot::{SnapshotReader, SnapshotRecord, SnapshotWriter};
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_storage::storage::worker::FjallStorage;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace, PersistMode};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
@@ -22,6 +26,22 @@ pub struct ImportStats {
     pub keyspace_count: u64,
     pub entry_count: u64,
     pub target_path: PathBuf,
+}
+
+/// Parses the operator settings, opens the node store they name and resolves the configuration.
+pub async fn load() -> Result<(Config, StorageHandle), CliError> {
+    let settings = read_settings().map_err(Box::new)?;
+    let storage = FjallStorage::open_with_cache(
+        &settings.storage_path,
+        settings.fjall_persist_policy,
+        settings.fjall_cache_bytes,
+    )?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    match resolve_config(settings, storage.clone(), &stop).await {
+        Ok(Some(config)) => Ok((config, storage)),
+        Ok(None) => Err(std::io::Error::other("configuration resolution stopped").into()),
+        Err(error) => Err(Box::new(error).into()),
+    }
 }
 
 pub async fn snapshot(database_path: String, target_path: String) -> Result<(), CliError> {
@@ -297,6 +317,7 @@ pub(crate) fn ensure_target_path(target_db_path: &Path) -> Result<(), SnapshotEr
 
 #[cfg(test)]
 mod tests {
+    use super::load;
     use super::{
         ImportKeyspaceState, KeyspaceCreateOptions, OptimisticTxDatabase, TXN_BYTE_LIMIT,
         import_new_database, snapshot_database,
@@ -304,7 +325,6 @@ mod tests {
     use crate::tests::fixtures::env_lock;
     use aruna_api::server::state::ServerState;
     use aruna_blob::blob::BlobHandler;
-    use aruna_config::load;
     use aruna_core::keyspaces::{
         API_STATE_KEYSPACE, AUTH_KEYSPACE, GROUP_KEYSPACE, NODE_STATE_KEYSPACE,
         REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, USER_ACCESS_KEYSPACE,

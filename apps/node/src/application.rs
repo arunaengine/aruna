@@ -1062,7 +1062,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let settings = startup_settings(&path);
-        let storage = aruna_config::open_storage(&settings).expect("storage opens");
+        let storage = crate::startup::resources::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_scheduler::TaskHandle::new();
 
         // The tracked handler blocks the real tasks-phase join that cleanup
@@ -1148,7 +1148,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let path = temp.path().to_str().expect("utf8 path").to_string();
         let settings = startup_settings(&path);
-        let storage = aruna_config::open_storage(&settings).expect("storage opens");
+        let storage = crate::startup::resources::open_storage(&settings).expect("storage opens");
         let task_handle = aruna_scheduler::TaskHandle::new();
 
         let mut checkpoint = |stage: StartupStage| -> Result<(), Box<dyn std::error::Error>> {

@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
+use aruna_core::dht_protocol::StoredEntry;
 use aruna_core::document::{PendingShardPlacement, shard_topic_id};
 use aruna_core::onboarding::OnboardingSecretRecord;
 use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordEnvelope, JobRecordKey};
@@ -26,7 +27,6 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_ops_work::jobs::lifecycle::witness::arm::WitnessDeadline;
 use aruna_ops_work::placement::policy::cache::PolicyCacheEntry;
-use aruna_p2p::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::ser::{SerializeStruct, Serializer};

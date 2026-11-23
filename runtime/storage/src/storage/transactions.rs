@@ -23,6 +23,7 @@ use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 use super::rebuild::{shadow_copies, shadow_row};
 
 use super::handle::{CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP};
+use super::persistence::persist_mode;
 use super::worker::{FjallStorage, Txn};
 
 /// A transaction's pending counter changes, keyed by key space and key in sorted order.
@@ -145,7 +146,7 @@ impl FjallStorage {
         } else {
             match self.store.db.write_tx() {
                 Ok(txn) => Txn::Write(Arc::new(
-                    txn.durability(Some(self.persist_policy.as_fjall())),
+                    txn.durability(Some(persist_mode(self.persist_policy))),
                 )),
                 Err(_) => {
                     self.transaction_cleanup

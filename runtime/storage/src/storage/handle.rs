@@ -14,7 +14,7 @@ use aruna_core::credential_encryption::CredentialEncryptionKey;
 use aruna_core::effects::{Effect, StorageEffect, StoragePriority};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::handle::{Handle, StoragePort};
 use aruna_core::node::vault::NodeVaultKey;
 use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
 use aruna_core::telemetry::record_stage;
@@ -420,7 +420,7 @@ impl StorageHandle {
             .await
         {
             StorageEvent::TransactionStarted { txn_id } => {
-                Ok(TransactionOwner::new(self.clone(), txn_id))
+                Ok(TransactionOwner::new(Arc::new(self.clone()), txn_id))
             }
             StorageEvent::Error { error } => Err(error),
             _ => Err(StorageError::InvalidEffect),
@@ -1356,6 +1356,27 @@ pub(super) fn response_channel(
     let (sender, receiver) = oneshot::channel();
     (ResponseSender::new(sender, token), receiver)
 }
+impl From<StorageHandle> for Arc<dyn StoragePort> {
+    fn from(handle: StorageHandle) -> Self {
+        Arc::new(handle)
+    }
+}
+
+#[async_trait]
+impl StoragePort for StorageHandle {
+    async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
+        StorageHandle::send_storage_effect(self, effect).await
+    }
+
+    async fn start_transaction(&self, read: bool) -> Result<TransactionOwner, StorageError> {
+        StorageHandle::start_transaction(self, read).await
+    }
+
+    fn config_changes(&self) -> u64 {
+        StorageHandle::config_changes(self)
+    }
+}
+
 #[async_trait]
 impl Handle for StorageHandle {
     #[tracing::instrument(

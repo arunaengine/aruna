@@ -80,6 +80,7 @@ use aruna_core::sync_checks::{
     validate_watch_upsert,
 };
 use aruna_core::user::id::UserId;
+use aruna_storage::storage::handle::StorageHandle;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use tempfile::TempDir;

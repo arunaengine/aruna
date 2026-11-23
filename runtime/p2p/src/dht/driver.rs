@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aruna_core::alpn::Alpn;
@@ -10,14 +11,12 @@ use aruna_core::effects::DhtGetOptions;
 use aruna_core::effects::{Effect, StorageEffect};
 use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::handle::{StoragePort, TransactionOwner};
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::keyspaces::DHT_KEYSPACE;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::trace_context::DistributedTraceContext;
 use aruna_core::types::TxnId;
-use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::owner::TransactionOwner;
 use byteview::ByteView;
 use crossfire::{AsyncRx, MAsyncTx, MTx, mpsc};
 use iroh::Endpoint;
@@ -233,7 +232,7 @@ pub struct DhtDriver {
     clock_diverged: bool,
     endpoint: Endpoint,
     connection_pool: ConnectionPool,
-    storage: StorageHandle,
+    storage: Arc<dyn StoragePort>,
     cmd_rx: DriverCmdReceiver,
     inbound_rx: InboundReceiver,
     io_tx: IoSender,
@@ -348,7 +347,7 @@ impl DhtDriver {
     pub fn new(
         state: DhtStateMachine,
         endpoint: Endpoint,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         connection_pool: ConnectionPool,
         cmd_rx: DriverCmdReceiver,
         inbound_rx: InboundReceiver,
@@ -372,12 +371,13 @@ impl DhtDriver {
         state: DhtStateMachine,
         clock: DhtClock,
         endpoint: Endpoint,
-        storage: StorageHandle,
+        storage: impl Into<Arc<dyn StoragePort>>,
         connection_pool: ConnectionPool,
         cmd_rx: DriverCmdReceiver,
         inbound_rx: InboundReceiver,
         shutdown: CancellationToken,
     ) -> Self {
+        let storage: Arc<dyn StoragePort> = storage.into();
         let (io_tx, io_rx) = mpsc::bounded_async(IO_EVENT_CAPACITY);
         let (revision_tx, revision_rx) = tokio::sync::mpsc::channel(CMD_CHANNEL_CAPACITY);
         let revision_task = tokio::spawn(run_revision_allocator(
@@ -1498,7 +1498,7 @@ struct ReclaimRow {
 }
 
 async fn start_storage_txn(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
 ) -> Result<TransactionOwner, TransactionFailure> {
@@ -1523,11 +1523,12 @@ async fn start_storage_txn(
 }
 
 async fn run_revision_allocator(
-    storage: StorageHandle,
+    storage: impl Into<Arc<dyn StoragePort>>,
     io_tx: IoSender,
     mut revision_rx: tokio::sync::mpsc::Receiver<RevisionRequest>,
     shutdown: CancellationToken,
 ) {
+    let storage: Arc<dyn StoragePort> = storage.into();
     let mut revisions = None;
     loop {
         let request = tokio::select! {
@@ -1547,7 +1548,7 @@ async fn run_revision_allocator(
 }
 
 async fn handle_revision_request(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     io_tx: &IoSender,
     revisions: &mut Option<std::ops::RangeInclusive<u64>>,
     op_id: OpId,
@@ -1581,7 +1582,7 @@ async fn handle_revision_request(
 }
 
 async fn reserve_revision_block(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
 ) -> Result<std::ops::RangeInclusive<u64>, DhtIoError> {
@@ -1603,7 +1604,7 @@ async fn reserve_revision_block(
 }
 
 async fn reserve_revision_txn(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     owner: &mut TransactionOwner,
@@ -1668,7 +1669,7 @@ async fn reserve_revision_txn(
 
 #[cfg(test)]
 async fn mutate_storage_entries(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     key: DhtKeyId,
@@ -1678,7 +1679,7 @@ async fn mutate_storage_entries(
 }
 
 async fn mutate_storage_checked(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     key: DhtKeyId,
@@ -1689,7 +1690,7 @@ async fn mutate_storage_checked(
 }
 
 async fn mutate_storage_with(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     key: DhtKeyId,
@@ -1725,7 +1726,7 @@ async fn mutate_storage_with(
 }
 
 async fn iter_deadlines(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     index: DeadlineIndex,
@@ -1795,7 +1796,7 @@ async fn iter_deadlines(
 }
 
 async fn delete_deadline(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -1816,7 +1817,7 @@ async fn delete_deadline(
 }
 
 async fn find_reclaimable(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -1909,7 +1910,7 @@ async fn find_reclaimable(
 }
 
 async fn reserve_key_slot(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -1942,7 +1943,7 @@ async fn reserve_key_slot(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_storage_txn(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     key: DhtKeyId,
@@ -2164,7 +2165,7 @@ async fn run_storage_txn(
 }
 
 async fn apply_batch_delete(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -2188,7 +2189,7 @@ async fn apply_batch_delete(
 }
 
 async fn apply_batch_write(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -2242,7 +2243,7 @@ fn merge_fresh_entries(
 }
 
 async fn read_key_count(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -2263,7 +2264,7 @@ async fn read_key_count(
 }
 
 async fn decrement_key_count(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -2295,7 +2296,7 @@ fn decode_counter(value: Option<ByteView>) -> Result<u64, TransactionFailure> {
 }
 
 async fn write_counter(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     txn_id: TxnId,
@@ -2320,7 +2321,7 @@ async fn write_counter(
 }
 
 async fn commit_storage_txn(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     owner: &mut TransactionOwner,
@@ -2375,7 +2376,7 @@ async fn commit_storage_txn(
 }
 
 async fn abort_storage_txn(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     op_id: OpId,
     stage: StorageStage,
     owner: &mut TransactionOwner,
@@ -2406,14 +2407,19 @@ fn storage_transaction_error(error: StorageError) -> TransactionFailure {
 }
 
 async fn send_storage_effect(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     effect: Effect,
     op_id: OpId,
     stage: StorageStage,
     operation: &'static str,
 ) -> Result<Event, DhtIoError> {
+    let Effect::Storage(effect) = effect else {
+        return Ok(Event::Storage(StorageEvent::Error {
+            error: StorageError::InvalidEffect,
+        }));
+    };
     let started = Instant::now();
-    match tokio::time::timeout(STORAGE_TIMEOUT, storage.send_effect(effect)).await {
+    match tokio::time::timeout(STORAGE_TIMEOUT, storage.send_storage_effect(effect)).await {
         Ok(event) => Ok(event),
         Err(error) => {
             warn!(
@@ -2913,7 +2919,9 @@ async fn write_stream_response(
 mod tests {
     use super::*;
     use crate::test_support::make_node;
+    use aruna_core::handle::Handle;
     use aruna_core::structs::identity::realm::RealmId;
+    use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::worker::FjallStorage;
     use tempfile::{TempDir, tempdir};
 

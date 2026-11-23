@@ -11,6 +11,7 @@ use aruna::bootstrap::{
     wait_for_placement,
 };
 use aruna::inbound::{IncomingFixture, initialize_incoming_fixture};
+use aruna::startup::resources::{resolve_settings, sync_runtime};
 use aruna::tasks::incoming::restore::start_task_queues;
 use aruna_api::cors::CorsConfig;
 use aruna_api::monitoring::{MonitoringState, Readiness, serve_ops};
@@ -27,9 +28,9 @@ use aruna_blob::blob::BlobHandler;
 use aruna_blob::blob::registry::BackendRegistry;
 use aruna_clock::testing::poll_until;
 use aruna_compute::registry::ExecutorRegistry;
+use aruna_config::Config;
 use aruna_config::identity::{mark_onboarding_phase, mark_state_complete};
 use aruna_config::settings::read_settings_from;
-use aruna_config::{Config, resolve_settings};
 use aruna_core::egress::EgressPolicy;
 use aruna_core::keys::generate_signing_key;
 use aruna_core::listener::S3ServerTimeouts;
@@ -966,7 +967,7 @@ async fn spawn_joiner_mode(
             max_uni_streams: config.max_uni_streams,
             max_bidi_streams: config.max_bidi_streams,
             sync_storage_path: Some(config.sync_storage_path.clone()),
-            document_sync_runtime: Some(config.document_sync_runtime),
+            document_sync_runtime: Some(sync_runtime(config.document_sync_runtime)),
             fjall_persist_policy: config.fjall_persist_policy,
         },
         storage_handle.clone(),

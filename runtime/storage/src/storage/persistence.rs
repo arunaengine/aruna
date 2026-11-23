@@ -3,50 +3,24 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum FjallPersistPolicy {
-    #[default]
-    Buffer,
-    SyncAll,
-}
-
-impl FjallPersistPolicy {
-    pub fn as_fjall(self) -> PersistMode {
-        match self {
-            Self::Buffer => PersistMode::Buffer,
-            Self::SyncAll => PersistMode::SyncAll,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Buffer => "buffer",
-            Self::SyncAll => "sync_all",
-        }
-    }
-}
-
-impl std::str::FromStr for FjallPersistPolicy {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "buffer" => Ok(Self::Buffer),
-            "sync_all" => Ok(Self::SyncAll),
-            other => Err(format!("unsupported fjall persist policy `{other}`")),
-        }
-    }
-}
-
 use std::time::Instant;
 
 use aruna_core::errors::StorageError;
 use aruna_core::events::StorageEvent;
+pub use aruna_core::persistence::FjallPersistPolicy;
 use aruna_core::telemetry::duration_ms;
 use fjall::PersistMode;
 use tracing::Span;
 
 use super::worker::FjallStorage;
+
+/// Maps the persist policy to the fjall persist mode.
+pub fn persist_mode(policy: FjallPersistPolicy) -> PersistMode {
+    match policy {
+        FjallPersistPolicy::Buffer => PersistMode::Buffer,
+        FjallPersistPolicy::SyncAll => PersistMode::SyncAll,
+    }
+}
 
 impl FjallStorage {
     pub(super) fn sync_all(&self) -> StorageEvent {
@@ -57,7 +31,7 @@ impl FjallStorage {
     }
 
     pub(super) fn persist_journal(&self) -> Result<(), StorageError> {
-        self.persist_with_mode(self.persist_policy.as_fjall())
+        self.persist_with_mode(persist_mode(self.persist_policy))
     }
 
     fn persist_with_mode(&self, mode: PersistMode) -> Result<(), StorageError> {
@@ -74,7 +48,7 @@ impl FjallStorage {
         self.store
             .db
             .write_tx()
-            .map(|tx| tx.durability(Some(self.persist_policy.as_fjall())))
+            .map(|tx| tx.durability(Some(persist_mode(self.persist_policy))))
             .map_err(|error| StorageError::WriteError(error.to_string()))
     }
 

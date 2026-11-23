@@ -19,7 +19,6 @@ test-hooks = []
 [dependencies]
 aruna-clock = { workspace = true }
 aruna-core = { workspace = true }
-aruna-storage = { workspace = true }
 blake3 = { workspace = true }
 iroh = { workspace = true }
 irokle = { workspace = true }
@@ -45,6 +44,7 @@ tempfile = { workspace = true }
 [dev-dependencies]
 aruna-clock = { workspace = true, features = ["test-hooks"] }
 aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [[test]]

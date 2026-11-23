@@ -30,14 +30,18 @@ use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
 use aruna_scheduler::shutdown::Shutdown;
+use aruna_storage::errors::StorageLibError;
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::persistence::FjallPersistPolicy;
+use aruna_storage::storage::worker::FjallStorage;
+use irokle::net::IrohRuntimeConfig;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
 use crate::compute_setup::build_registry;
 use crate::shutdown::{NodeShutdown, ShutdownOutcome, shutdown_grace_env};
-use aruna_config::settings::Settings;
-use aruna_config::{Config, open_storage, resolve_config};
+use aruna_config::settings::{DocumentSyncSettings, Settings};
+use aruna_config::{Config, SetupError, resolve_config};
 
 /// How much event recording keeps in memory when `EVENT_RECORDING` is enabled.
 const RECORD_LIMITS: aruna_runner::recorder::RecordLimits = aruna_runner::recorder::RecordLimits {
@@ -243,6 +247,59 @@ fn cleanup_stop_outcome(
     }
 }
 
+/// A failure while opening the store or resolving the node configuration.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error(transparent)]
+    Storage(#[from] StorageLibError),
+    #[error(transparent)]
+    Setup(#[from] SetupError),
+}
+
+/// Opens the local store for parsed settings. The caller owns the handle from
+/// here on, before any identity or enrollment I/O needs it.
+pub fn open_storage(settings: &Settings) -> Result<StorageHandle, StorageLibError> {
+    FjallStorage::open_with_cache(
+        &settings.storage_path,
+        settings.fjall_persist_policy,
+        settings.fjall_cache_bytes,
+    )
+}
+
+/// Convenience for callers that want the store and the resolved configuration
+/// together. Startup uses [`open_storage`] and [`resolve_config`] directly so
+/// the resource owner exists before the identity I/O.
+pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHandle), ResolveError> {
+    let storage_handle = open_storage(&settings)?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let config = resolve_config(settings, storage_handle.clone(), &stop)
+        .await?
+        .expect("a resolution with a fresh stop token always resolves");
+    Ok((config, storage_handle))
+}
+
+/// The document sync timings of the net adapter; an unset timing keeps the Irokle default.
+pub fn sync_runtime(settings: DocumentSyncSettings) -> IrohRuntimeConfig {
+    let default = IrohRuntimeConfig::default();
+    IrohRuntimeConfig {
+        connect_timeout: settings.connect_timeout.unwrap_or(default.connect_timeout),
+        sync_io_timeout: settings.sync_io_timeout.unwrap_or(default.sync_io_timeout),
+        resync_interval: settings.resync_interval.unwrap_or(default.resync_interval),
+        resync_initial_backoff: settings
+            .resync_initial_backoff
+            .unwrap_or(default.resync_initial_backoff),
+        resync_max_backoff: settings
+            .resync_max_backoff
+            .unwrap_or(default.resync_max_backoff),
+        full_sweep_interval: settings
+            .full_sweep_interval
+            .unwrap_or(default.full_sweep_interval),
+        full_sweep_time_of_day: settings
+            .full_sweep_time
+            .unwrap_or(default.full_sweep_time_of_day),
+    }
+}
+
 pub(crate) async fn acquire(
     stop: &tokio_util::sync::CancellationToken,
     on_drain: &mut impl FnMut(),
@@ -428,7 +485,7 @@ async fn fill(
             max_uni_streams: config.max_uni_streams,
             max_bidi_streams: config.max_bidi_streams,
             sync_storage_path: Some(config.sync_storage_path.clone()),
-            document_sync_runtime: Some(config.document_sync_runtime),
+            document_sync_runtime: Some(sync_runtime(config.document_sync_runtime)),
             fjall_persist_policy: config.fjall_persist_policy,
         },
         acquired.storage_handle.clone(),
@@ -986,7 +1043,6 @@ mod tests {
     // subset: every later stage is absent and the store lock is given back.
     #[tokio::test]
     async fn stage_failure_releases() {
-        use aruna_config::resolve_settings;
         use aruna_config::settings::read_settings_from;
 
         let stages = [
@@ -1064,7 +1120,7 @@ mod tests {
         .into_iter()
         .collect();
         let settings = read_settings_from(&map).expect("settings parse");
-        let storage = aruna_config::open_storage(&settings).expect("storage opens");
+        let storage = super::open_storage(&settings).expect("storage opens");
         let task_handle = TaskHandle::new();
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
@@ -1088,5 +1144,84 @@ mod tests {
             identity.load().await.unwrap().is_none(),
             "a pre-cancelled startup must not generate or persist an identity"
         );
+    }
+
+    /// Settings of a store under `path` that resolve without a network.
+    fn reopen_settings(path: &str) -> Settings {
+        let map: std::collections::BTreeMap<String, String> = [
+            ("DATABASE_DIR", path),
+            ("SOCKET_ADDRESS", "127.0.0.1:0"),
+            ("S3_HOST", "127.0.0.1:0"),
+            ("S3_ADDRESS", "127.0.0.1:0"),
+            ("PORTAL_MODE", "disabled"),
+            ("ARUNA_FJALL_PERSIST_MODE", "buffer"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+        aruna_config::settings::read_settings_from(&map).expect("settings parse")
+    }
+
+    // A persisted identity loads unchanged from a reopened store on the repeat boot.
+    #[tokio::test]
+    async fn boot_reuses_identity() {
+        use aruna_config::identity::IdentityStore;
+        use aruna_config::identity::enrollment::{EnrollmentPlan, plan_enrollment};
+        use aruna_core::structs::identity::auth::NodeCapabilities;
+
+        let dir = tempdir().expect("temp dir");
+        let storage = open_storage(&dir);
+        let store = IdentityStore::from_storage(storage.clone());
+        assert!(store.load().await.unwrap().is_none());
+        let generated = store.generate().unwrap();
+        store.persist(&generated).await.unwrap();
+        let (derived_realm, capabilities) = store.capabilities(&generated).unwrap();
+        assert_eq!(derived_realm, generated.realm_id);
+        assert!(matches!(capabilities, NodeCapabilities::Management { .. }));
+        drop(store);
+        storage.close().await;
+
+        let store = IdentityStore::from_storage(open_storage(&dir));
+        let loaded = store
+            .load()
+            .await
+            .unwrap()
+            .expect("a persisted identity must load on the repeat boot");
+        assert_eq!(loaded, generated);
+        assert_eq!(
+            plan_enrollment(Some(&loaded), false).unwrap(),
+            EnrollmentPlan::Ready
+        );
+    }
+
+    // An incomplete first startup must resume realm initialization after a
+    // reopen rather than mint a second identity.
+    #[tokio::test]
+    async fn incomplete_boot_resumes() {
+        use aruna_config::StartupMode;
+        use aruna_config::identity::IdentityStore;
+        use aruna_core::structs::identity::node_state::PersistedNodeStatus;
+
+        let dir = tempdir().expect("temp dir");
+        let storage = open_storage(&dir);
+        let store = IdentityStore::from_storage(storage.clone());
+        let generated = store.generate().unwrap();
+        assert!(matches!(
+            generated.status,
+            PersistedNodeStatus::PendingInitialization
+        ));
+        store.persist(&generated).await.unwrap();
+        drop(store);
+        storage.close().await;
+
+        let path = dir.path().to_str().expect("utf8 path");
+        let (config, _storage) = resolve_settings(reopen_settings(path))
+            .await
+            .expect("settings resolve");
+        assert!(matches!(
+            config.startup_mode,
+            StartupMode::InitializeRealm { .. }
+        ));
+        assert_eq!(config.node_state, generated);
     }
 }

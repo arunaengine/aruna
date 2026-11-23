@@ -45,7 +45,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
 use aruna_core::effects::{Effect, NetEffect, StorageEffect};
 use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
-use aruna_core::handle::Handle;
+use aruna_core::handle::{Handle, StoragePort};
 use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
@@ -54,7 +54,6 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::info::{NetState, NetworkDiagnosticsState};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
-use aruna_storage::storage::handle::StorageHandle;
 use async_trait::async_trait;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::{Endpoint, EndpointAddr};
@@ -115,7 +114,7 @@ pub struct NetHandle {
 
 struct NetInner {
     effect_tx: mpsc::Sender<EffectHandle>,
-    storage: StorageHandle,
+    storage: Arc<dyn StoragePort>,
     node_id: NodeId,
     realm_id: RealmId,
     endpoint: Endpoint,

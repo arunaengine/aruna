@@ -1,4 +1,4 @@
-//! Builds the node config from operator settings, opening storage and reading realm config.
+//! Builds the node config from operator settings and the realm config in an open store.
 //! The node and the doctor share it, with the settings and the node identity it reads.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
@@ -15,6 +15,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::listener::S3ServerTimeouts;
+use aruna_core::network_config::{DiscoveryMethod, RelayMethod, parse_endpoint_config};
 use aruna_core::onboarding::OnboardingPhase;
 use aruna_core::structs::execution::job::input::RoCrateLimits;
 use aruna_core::structs::identity::auth::NodeCapabilities;
@@ -25,23 +26,20 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::backends::NodeBackendsConfig;
 use aruna_core::structs::storage::blob::BlobTimeoutConfig;
 use aruna_core::user::id::UserId;
-use aruna_p2p::config::{DiscoveryMethod, RelayMethod, parse_endpoint_config};
-use irokle::net::IrohRuntimeConfig;
 
 use crate::identity::enrollment::{
     EnrollmentPlan, bootstrap_node_state, onboarding_realm_endpoints, plan_enrollment,
     refresh_onboarding_bootstrap,
 };
 use crate::identity::{IdentityError, IdentityStore};
-use crate::settings::{Settings, invalid_config_value, normalize_env_value, validate_relay_urls};
+use crate::settings::{
+    DocumentSyncSettings, Settings, invalid_config_value, normalize_env_value, validate_relay_urls,
+};
+use aruna_core::persistence::FjallPersistPolicy;
 use aruna_core::search::MetadataSearchStorage;
 use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeState, PersistedNodeStatus,
 };
-use aruna_storage::errors::StorageLibError;
-use aruna_storage::storage::handle::StorageHandle;
-use aruna_storage::storage::persistence::FjallPersistPolicy;
-use aruna_storage::storage::worker::FjallStorage;
 use byteview::ByteView;
 use iroh::EndpointAddr;
 use iroh::KeyParsingError;
@@ -89,7 +87,7 @@ pub struct Config {
     pub net_secret_key: iroh::SecretKey,
     pub peer_nodes: Vec<iroh::PublicKey>,
     pub peer_endpoints: Vec<EndpointAddr>,
-    pub document_sync_runtime: IrohRuntimeConfig,
+    pub document_sync_runtime: DocumentSyncSettings,
     pub temporary_bootstrap_active: bool,
     pub discovery_method: DiscoveryMethod,
     pub relay_method: RelayMethod,
@@ -185,8 +183,6 @@ pub enum SetupError {
     ParseIntError(#[from] ParseIntError),
     #[error(transparent)]
     StorageError(#[from] StorageError),
-    #[error(transparent)]
-    StorageLibError(#[from] StorageLibError),
     #[error("persisted node state does not match derived realm id")]
     NodeStateMismatch,
     #[error(transparent)]
@@ -238,34 +234,12 @@ impl Config {
     }
 }
 
-/// Opens the local store for parsed settings. The caller owns the handle from
-/// here on, before any identity or enrollment I/O needs it.
-pub fn open_storage(settings: &Settings) -> Result<StorageHandle, SetupError> {
-    Ok(FjallStorage::open_with_cache(
-        &settings.storage_path,
-        settings.fjall_persist_policy,
-        settings.fjall_cache_bytes,
-    )?)
-}
-
-/// Convenience for callers that want the store and the resolved configuration
-/// together. Startup uses [`open_storage`] and [`resolve_config`] directly so
-/// the resource owner exists before the identity I/O.
-pub async fn resolve_settings(settings: Settings) -> Result<(Config, StorageHandle), SetupError> {
-    let storage_handle = open_storage(&settings)?;
-    let stop = tokio_util::sync::CancellationToken::new();
-    let config = resolve_config(settings, storage_handle.clone(), &stop)
-        .await?
-        .expect("a resolution with a fresh stop token always resolves");
-    Ok((config, storage_handle))
-}
-
 /// Resolves or bootstraps the persisted node state on an already-open store and
 /// derives the realm network configuration from it. `Ok(None)` means a stop was
 /// accepted before an identity mutation or enrollment request.
-pub async fn resolve_config(
+pub async fn resolve_config<H: Handle>(
     settings: Settings,
-    storage_handle: StorageHandle,
+    storage_handle: H,
     stop: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<Config>, SetupError> {
     let Settings {
@@ -489,12 +463,6 @@ pub async fn resolve_config(
     }))
 }
 
-/// Convenience for callers outside the node startup path, such as the
-/// operator doctor: parse settings, open storage, resolve the configuration.
-pub async fn load() -> Result<(Config, StorageHandle), SetupError> {
-    resolve_settings(crate::settings::read_settings()?).await
-}
-
 /// Only a device may run without an S3 listener. An infrastructure node whose
 /// `S3_HOST`/`S3_ADDRESS` pair is accidentally absent must fail its start
 /// instead of coming up silently serving no S3 endpoint at all.
@@ -593,7 +561,7 @@ fn fold_components(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 async fn load_realm_config(
-    storage: &StorageHandle,
+    storage: &impl Handle,
     realm_id: &RealmId,
 ) -> Result<Option<RealmConfigDocument>, SetupError> {
     match storage
@@ -767,13 +735,14 @@ fn policy_relay_method(policy: &RelayPolicy) -> Result<RelayMethod, SetupError> 
 #[cfg(test)]
 mod tests {
     use super::{
-        SetupError, normalize_root, outermost_roots, resolve_settings, validate_s3_profile,
+        Config, SetupError, normalize_root, outermost_roots, validate_s3_profile,
         validate_wipe_roots,
     };
     use crate::identity::enrollment::onboarding_realm_endpoints;
     use crate::identity::persist_node_state;
     use crate::settings::read_settings_from;
     use aruna_core::keys::generate_signing_key;
+    use aruna_core::network_config::{RelayMethod, format_endpoint_config};
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::node_state::{
         BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
@@ -782,10 +751,9 @@ mod tests {
         DynamicDiscoveryMethod, RealmConfigDocument, RealmDiscoveryConfig, RealmId, RelayPolicy,
         StaticRealmEndpoint,
     };
-    use aruna_p2p::config::{RelayMethod, format_endpoint_config};
-    use aruna_storage::storage::worker::FjallStorage;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::memory::MemoryStorage;
     use std::collections::BTreeMap;
-    use tempfile::tempdir;
 
     /// Operator inputs for resolution tests: a minimal valid environment plus
     /// the case's overrides.
@@ -802,6 +770,15 @@ mod tests {
             env.insert((*key).to_string(), (*value).to_string());
         }
         env
+    }
+
+    /// Resolves the configuration from `env` on an already-open store.
+    async fn resolve(env: &BTreeMap<String, String>, storage: StorageHandle) -> Config {
+        let stop = tokio_util::sync::CancellationToken::new();
+        super::resolve_config(read_settings_from(env).unwrap(), storage, &stop)
+            .await
+            .unwrap()
+            .expect("a fresh stop token always resolves")
     }
 
     // Wipe roots cannot contain the owner's home, another root, or the filesystem.
@@ -964,9 +941,7 @@ mod tests {
             "https://relay-a.example, https://relay-b.example",
         )]);
 
-        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
-            .await
-            .unwrap();
+        let config = resolve(&env, MemoryStorage::open()).await;
 
         assert_eq!(
             config.relay_method,
@@ -979,8 +954,7 @@ mod tests {
 
     #[tokio::test]
     async fn existing_ignores_secret() {
-        let tempdir = tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
 
         let realm_signing_key = generate_signing_key();
         let net_signing_key = generate_signing_key();
@@ -997,16 +971,10 @@ mod tests {
             },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
-        storage.close().await;
 
-        let env = settings_env(&[
-            ("DATABASE_DIR", tempdir.path().to_str().unwrap()),
-            ("ONBOARDING_SECRET", "definitely-not-a-valid-secret"),
-        ]);
+        let env = settings_env(&[("ONBOARDING_SECRET", "definitely-not-a-valid-secret")]);
 
-        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
-            .await
-            .unwrap();
+        let config = resolve(&env, storage).await;
         assert!(!config.is_initial_node());
         assert!(matches!(
             config.startup_mode,
@@ -1016,8 +984,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_ignores_secret() {
-        let tempdir = tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
+        let storage = MemoryStorage::open();
 
         let realm_signing_key = generate_signing_key();
         let net_signing_key = generate_signing_key();
@@ -1034,15 +1001,10 @@ mod tests {
             },
         };
         persist_node_state(&storage, &node_state).await.unwrap();
-        storage.close().await;
 
         // No ONBOARDING_SECRET: a phase past the bootstrap refresh must not
         // require one.
-        let env = settings_env(&[("DATABASE_DIR", tempdir.path().to_str().unwrap())]);
-
-        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
-            .await
-            .unwrap();
+        let config = resolve(&settings_env(&[]), storage).await;
         assert!(matches!(
             config.startup_mode,
             super::StartupMode::JoinRealm {
@@ -1051,40 +1013,13 @@ mod tests {
         ));
         assert!(!config.temporary_bootstrap_active);
     }
-    #[tokio::test]
-    async fn incomplete_boot_resumes() {
-        // An incomplete first startup must resume realm initialization rather
-        // than mint a second identity.
-        let tempdir = tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let store = crate::identity::IdentityStore::from_storage(storage.clone());
-        let generated = store.generate().unwrap();
-        assert!(matches!(
-            generated.status,
-            PersistedNodeStatus::PendingInitialization
-        ));
-        store.persist(&generated).await.unwrap();
-        drop(store);
-        storage.close().await;
-
-        let env = settings_env(&[("DATABASE_DIR", tempdir.path().to_str().unwrap())]);
-        let (config, _storage) = resolve_settings(read_settings_from(&env).unwrap())
-            .await
-            .unwrap();
-        assert!(matches!(
-            config.startup_mode,
-            super::StartupMode::InitializeRealm { .. }
-        ));
-        assert_eq!(config.node_state, generated);
-    }
 
     // A stop accepted before the identity decision resolves no configuration
     // and leaves the store without a generated identity.
     #[tokio::test]
     async fn cancel_skips_identity() {
-        let tempdir = tempdir().unwrap();
-        let storage = FjallStorage::open(tempdir.path().to_str().unwrap()).unwrap();
-        let env = settings_env(&[("DATABASE_DIR", tempdir.path().to_str().unwrap())]);
+        let storage = MemoryStorage::open();
+        let env = settings_env(&[]);
         let stop = tokio_util::sync::CancellationToken::new();
         stop.cancel();
 

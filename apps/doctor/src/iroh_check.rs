@@ -5,8 +5,8 @@
 use crate::error::CliError;
 use crate::info::{default_info_url, fetch_info_url, resolve_token};
 use aruna_core::alpn::Alpn;
+use aruna_core::dht_protocol::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_core::telemetry::duration_ms;
-use aruna_p2p::dht::rpc::{DhtRequest, DhtResponse, decode_response, encode_request};
 use aruna_wire::info::{InfoResponse, NetworkServiceStatus, PeerConnectionInfo, ServiceStatus};
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, RelayMap, RelayMode, TransportAddr};

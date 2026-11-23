@@ -605,7 +605,7 @@ impl DocumentSyncService {
 
     pub(in crate::document_sync) fn flush_database(&self) -> Result<()> {
         self.db
-            .persist(self.persist_policy.as_fjall())
+            .persist(persist_mode(self.persist_policy))
             .map_err(|error| NetError::Bootstrap(error.to_string()))
     }
 

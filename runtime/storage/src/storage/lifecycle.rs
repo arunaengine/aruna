@@ -19,8 +19,7 @@ use super::preimage::flush_empty;
 use super::rebuild::running_rebuild;
 use super::worker::{BULK_POOL_THREADS, FjallStorage, READ_POOL_THREADS, Store, spawn_read_pool};
 
-/// Block cache of the node database; Fjall's 32 MiB default rereads blocks on large scans.
-pub const CACHE_BYTES: u64 = 256 << 20;
+pub use aruna_core::persistence::CACHE_BYTES;
 
 impl FjallStorage {
     #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]

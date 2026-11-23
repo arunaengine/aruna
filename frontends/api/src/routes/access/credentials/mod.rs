@@ -666,7 +666,7 @@ fn format_system_time(value: SystemTime) -> String {
 }
 
 fn format_node_id(bytes: [u8; 32]) -> String {
-    iroh::PublicKey::from_bytes(&bytes)
+    aruna_core::id::NodeId::from_bytes(&bytes)
         .map(|node_id| node_id.to_string())
         .unwrap_or_else(|_| bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }

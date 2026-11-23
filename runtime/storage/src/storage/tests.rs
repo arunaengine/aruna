@@ -1087,7 +1087,7 @@ fn unknown_open_keeps() {
             queued: false,
         },
     );
-    let mut owner = super::owner::TransactionOwner::new(handle, txn_id);
+    let mut owner = super::owner::TransactionOwner::new(std::sync::Arc::new(handle), txn_id);
 
     owner.unknown();
     assert_eq!(owner.id(), Some(txn_id));

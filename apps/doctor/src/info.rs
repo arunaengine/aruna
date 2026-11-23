@@ -284,12 +284,12 @@ fn env_key(id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{ConfigView, fetch_info, http_base_url};
+    use crate::storage::load;
     use crate::tests::fixtures::env_lock;
     use aruna::inbound::initialize_net_holder;
     use aruna::tasks::incoming::restore::start_task_queues;
     use aruna_api::server::state::ServerState;
     use aruna_api::server::{Server, ServerConfig};
-    use aruna_config::load;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;

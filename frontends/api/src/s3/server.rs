@@ -1854,4 +1854,117 @@ mod tests {
             "the connection child must have released the client, got {closed:?}"
         );
     }
+
+    /// Bytes of one chunk of the slow body and the number of chunks it sends.
+    const CHUNK_BYTES: usize = 64 * 1024;
+    const CHUNK_COUNT: usize = 12;
+
+    /// Accepts any object and reads its whole body before it answers.
+    struct SlowS3;
+
+    #[async_trait::async_trait]
+    impl s3s::S3 for SlowS3 {
+        async fn put_object(
+            &self,
+            request: s3s::S3Request<s3s::dto::PutObjectInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
+            use futures_util::StreamExt;
+            let mut body = request.input.body.unwrap();
+            let mut received = 0;
+            while let Some(chunk) = body.next().await {
+                received += chunk.unwrap().len();
+            }
+            assert_eq!(received, CHUNK_BYTES * CHUNK_COUNT);
+            Ok(s3s::S3Response::new(Default::default()))
+        }
+    }
+
+    /// A request body whose chunks a test feeds over a channel, so it arrives over time.
+    struct ChannelChunks(tokio::sync::mpsc::Receiver<bytes::Bytes>);
+
+    impl futures_core::Stream for ChannelChunks {
+        type Item = Result<bytes::Bytes, s3s::StdError>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            self.0.poll_recv(context).map(|chunk| chunk.map(Ok))
+        }
+    }
+
+    impl s3s::stream::ByteStream for ChannelChunks {}
+
+    // A part still sending its body when the initial request timer fires keeps its connection.
+    #[tokio::test(start_paused = true)]
+    async fn slow_part_survives() {
+        let initial = Duration::from_secs(1);
+        let timeouts = S3ServerTimeouts {
+            initial_request: initial,
+            connection_idle: Duration::from_secs(300),
+            stream_lifetime: Duration::from_secs(60 * 60),
+        };
+        let driver_ctx = Arc::new(DriverContext::storage_only(
+            aruna_storage::storage::memory::MemoryStorage::open(),
+        ));
+        let watch = Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle));
+        let service = WrappingService {
+            shared: S3ServiceBuilder::new(SlowS3).build(),
+            cors: CorsConfig::default(),
+            domain: "localhost".to_string(),
+            driver_ctx,
+            metrics: Arc::new(NodeMetrics::new()),
+            peer_ip: None,
+            rate_limits: Arc::new(crate::rate_limit::ApiRateLimits::default()),
+            control_limit: Arc::new(Semaphore::new(1)),
+            bulk_limit: Arc::new(Semaphore::new(1)),
+            read_limit: Arc::new(Semaphore::new(1)),
+            mutation_limit: Arc::new(Semaphore::new(1)),
+            capture_limit: Arc::new(Semaphore::new(1)),
+            activity: Some(watch.clone()),
+            trusted_proxies: Arc::new(Vec::new()),
+            timeouts,
+            host_check: None,
+        };
+        let (client_io, server_io) = tokio::io::duplex(CHUNK_BYTES);
+        let mut builder = ConnBuilder::new(TokioExecutor::new()).http1_only();
+        builder
+            .http1()
+            .timer(hyper_util::rt::TokioTimer::new())
+            .header_read_timeout(initial);
+        let server = tokio::spawn(async move {
+            let conn = builder.serve_connection(TokioIo::new(server_io), service);
+            activity::run_connection(watch, conn, initial).await;
+        });
+        let (mut sender, client_conn) =
+            hyper::client::conn::http1::handshake::<_, s3s::Body>(TokioIo::new(client_io))
+                .await
+                .expect("client handshake");
+        let client = tokio::spawn(client_conn);
+
+        // The body keeps arriving for about three times the initial request timeout.
+        let (feed, chunks) = tokio::sync::mpsc::channel(1);
+        let feeder = tokio::spawn(async move {
+            for _ in 0..CHUNK_COUNT {
+                let chunk = bytes::Bytes::from(vec![b's'; CHUNK_BYTES]);
+                feed.send(chunk).await.expect("body chunk sent");
+                tokio::time::sleep(initial / 4).await;
+            }
+        });
+        let body: s3s::stream::DynByteStream = Box::pin(ChannelChunks(chunks));
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/slow-part/slow.bin")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, CHUNK_BYTES * CHUNK_COUNT)
+            .body(s3s::Body::from(body))
+            .unwrap();
+        let response = sender.send_request(request).await.expect("put answered");
+
+        assert_eq!(response.status(), http::StatusCode::OK);
+        feeder.await.expect("feeder finishes");
+        drop(sender);
+        client.abort();
+        server.abort();
+    }
 }

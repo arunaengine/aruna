@@ -4375,6 +4375,7 @@ mod reserve;
 async fn s3_copies_plain() {
     // A rename copy inside the provider keeps the bytes and hashes and leaves no recorded
     // upload; without a version the copied part's ETag must match the source MD5.
+    use aruna_core::handle::StoragePort;
     use aruna_core::keyspaces::{BACKEND_VERSION_KEYSPACE, BLOB_CLEANUP_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{PlainPath, version_key};
     use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};

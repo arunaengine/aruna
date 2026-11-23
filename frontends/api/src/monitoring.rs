@@ -8,9 +8,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use aruna_clock::unix_timestamp_millis;
-use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
-use aruna_core::keyspaces::{NODE_STATE_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
 use aruna_ops_work::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
@@ -22,7 +20,6 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use byteview::ByteView;
 use prometheus_client::collector::Collector;
 use prometheus_client::encoding::{DescriptorEncoder, EncodeLabelSet, EncodeMetric};
 use prometheus_client::metrics::counter::{ConstCounter, Counter};
@@ -39,7 +36,6 @@ use tower_http::timeout::TimeoutLayer;
 /// readiness quickly instead of blocking on the much longer request timeout.
 const STORAGE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const SYNC_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
-const STATE_PROBE_KEY: &[u8] = b"node_state";
 
 /// Whole-request timeout for the monitoring listener so a slow or stalled probe caller
 /// cannot hold a connection open indefinitely.
@@ -313,11 +309,7 @@ async fn check_storage(ctx: &DriverContext) -> CheckOutcome {
     if ctx.storage_handle.channel_closed() {
         return CheckOutcome::failed("storage effect channel closed");
     }
-    let probe = ctx.storage_handle.send_storage_effect(StorageEffect::Read {
-        key_space: NODE_STATE_KEYSPACE.to_string(),
-        key: ByteView::from(STATE_PROBE_KEY),
-        txn_id: None,
-    });
+    let probe = ctx.probe_storage();
     match tokio::time::timeout(STORAGE_PROBE_TIMEOUT, probe).await {
         Ok(Event::Storage(StorageEvent::ReadResult { .. })) => {
             let writes =
@@ -350,13 +342,7 @@ async fn check_sync(ctx: &DriverContext) -> CheckOutcome {
     if ctx.net_handle.is_none() {
         return CheckOutcome::failed("document sync node not attached");
     }
-    let probe = ctx.storage_handle.send_storage_effect(StorageEffect::Iter {
-        key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
-        prefix: None,
-        start: None,
-        limit: 1,
-        txn_id: None,
-    });
+    let probe = ctx.probe_outbox();
     match tokio::time::timeout(SYNC_PROBE_TIMEOUT, probe).await {
         Ok(Event::Storage(StorageEvent::IterResult { .. })) => {
             CheckOutcome::ok_with("ok: document sync attached; outbox readable")
@@ -668,10 +654,13 @@ fn register_queue_metrics(metrics: &NodeMetrics) -> Arc<QueueMetrics> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
     use aruna_ops_work::shard::recovery::RecoveryError;
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::worker::FjallStorage;
     use axum::body::{Body, to_bytes};
+    use byteview::ByteView;
     use http::Request;
     use tower::ServiceExt;
 
@@ -762,7 +751,7 @@ mod tests {
         let _ = storage
             .send_storage_effect(StorageEffect::Read {
                 key_space: NODE_STATE_KEYSPACE.to_string(),
-                key: ByteView::from(STATE_PROBE_KEY),
+                key: ByteView::from(NODE_STATE_KEY),
                 txn_id: None,
             })
             .await;

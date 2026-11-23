@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::error::CliError;
+use crate::storage::load;
 use aruna_clock::unix_timestamp_millis;
-use aruna_config::load;
 use aruna_core::auth::{REALMS_LIST_KEY, bearer_token_hash};
 use aruna_core::calls::Next;
 use aruna_core::onboarding::{
@@ -29,7 +29,6 @@ use aruna_ops_work::realm::claim_admin::{
 };
 use aruna_ops_work::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_runner::driver::{DriverContext, drive};
-use aruna_scheduler::TaskHandle;
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use jsonwebtoken::dangerous::insecure_decode;
 use rand::Rng;
@@ -98,16 +97,8 @@ pub async fn create_bootstrap_token(
 }
 
 async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliError> {
-    let (config, storage_handle) = load().await.map_err(Box::new)?;
-    let driver_ctx = DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: Some(TaskHandle::new()),
-        compute_handle: None,
-        outbound_handle: None,
-    };
+    let (config, storage_handle) = load().await?;
+    let driver_ctx = DriverContext::storage_and_tasks(storage_handle);
 
     let onboarding_secret = OnboardingSecret::decode(&bootstrap_secret)?;
     if onboarding_secret.realm_id != config.realm_id {
@@ -207,16 +198,8 @@ async fn create_direct_token(bootstrap_secret: String) -> Result<String, CliErro
 /// Mint a fresh initial-administrator onboarding secret on this node's storage
 /// so an operator can recover admin access when the original secret is lost.
 pub async fn recover_initial_admin() -> Result<String, CliError> {
-    let (config, storage_handle) = load().await.map_err(Box::new)?;
-    let driver_ctx = DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: Some(TaskHandle::new()),
-        compute_handle: None,
-        outbound_handle: None,
-    };
+    let (config, storage_handle) = load().await?;
+    let driver_ctx = DriverContext::storage_and_tasks(storage_handle);
 
     let mut secret_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut secret_bytes);
@@ -479,17 +462,9 @@ impl DoctorValidationState {
 }
 
 pub async fn view_token(token: String) -> Result<String, CliError> {
-    let (_, storage_handle) = load().await.map_err(Box::new)?;
+    let (_, storage_handle) = load().await?;
 
-    let driver_ctx = Arc::new(DriverContext {
-        storage_handle,
-        net_handle: None,
-        blob_handle: None,
-        graph_handle: None,
-        task_handle: None,
-        compute_handle: None,
-        outbound_handle: None,
-    });
+    let driver_ctx = Arc::new(DriverContext::storage_only(storage_handle));
     let validation_state = DoctorValidationState::load(driver_ctx.as_ref()).await;
     let token_view = build_token_view(&token, &validation_state).await?;
 

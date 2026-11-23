@@ -7,11 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use aruna_clock::SystemEnvironment;
-use aruna_core::id::{DhtKeyId, NodeId};
-use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::id::DhtKeyId;
 use aruna_core::structured_id::clock_health::IdEnvironment;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::constants::{
@@ -19,6 +17,7 @@ use super::constants::{
     MAX_TTL_SECS, MAX_VALUE_SIZE,
 };
 use super::rpc::verify_record;
+pub use aruna_core::dht_protocol::StoredEntry;
 
 pub(super) const CLEANUP_PAGE_SIZE: usize = 256;
 const SAMPLE_WINDOW_MS: u64 = 1;
@@ -153,17 +152,6 @@ fn clock_drift_ms(anchor: &ClockAnchor, sample: &ClockAnchor) -> Option<u64> {
     let elapsed_ms = sample.monotonic_ms.checked_sub(anchor.monotonic_ms)?;
     let expected_ms = anchor.wall_ms.saturating_add(elapsed_ms);
     Some(sample.wall_ms.abs_diff(expected_ms))
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StoredEntry {
-    pub publisher: NodeId,
-    pub realm_id: RealmId,
-    pub value: Vec<u8>,
-    pub expires_at: u64,
-    pub revision: u64,
-    pub signature: iroh::Signature,
-    pub retain_until: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +383,8 @@ pub fn entry_is_fresh(expires_at: u64, now: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+
+    use aruna_core::structs::identity::realm::RealmId;
 
     use super::*;
 

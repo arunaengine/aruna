@@ -22,7 +22,7 @@ impl DocumentSyncService {
 }
 
 pub(super) async fn storage_read_from(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     key_space: String,
     key: ByteView,
 ) -> Result<Option<Value>> {
@@ -43,7 +43,7 @@ pub(super) async fn storage_read_from(
 }
 
 pub(crate) async fn batch_write_to(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     writes: Vec<(String, ByteView, Value)>,
 ) -> Result<()> {
     match storage

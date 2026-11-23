@@ -21,6 +21,7 @@ use aruna_core::placement::transition::transition_health;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{GroupQuotaOverride, QuotaConfig, UserCapOverride};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind, ReplicaQuota};
+use aruna_core::structs::info::{format_transport_addr, side_name};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::placement::record::PlacementScope;
 use aruna_core::structs::storage::blob::BackendRef;
@@ -2737,21 +2738,6 @@ fn protocol_name(alpn: Option<Alpn>) -> Option<String> {
         Alpn::JobControl => "job_control".to_string(),
         Alpn::Heartbeat => "heartbeat".to_string(),
     })
-}
-
-fn side_name(side: iroh::endpoint::Side) -> String {
-    match side {
-        iroh::endpoint::Side::Client => "client".to_string(),
-        iroh::endpoint::Side::Server => "server".to_string(),
-    }
-}
-
-fn format_transport_addr(addr: &iroh::TransportAddr) -> String {
-    match addr {
-        iroh::TransportAddr::Ip(addr) => addr.to_string(),
-        iroh::TransportAddr::Relay(url) => url.to_string(),
-        _ => format!("{addr:?}"),
-    }
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ pub mod purge_fence;
 pub mod realm_usage;
 pub mod restart_notice;
 mod row_fence;
+pub mod row_reads;
 pub mod session;
 pub mod unlock_limit;
 pub mod usage;

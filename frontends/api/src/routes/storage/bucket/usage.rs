@@ -11,7 +11,8 @@ use aruna_core::structs::storage::distribution::DistributionBinding;
 use aruna_core::structs::storage::distribution::accounting::RangeCounters;
 use aruna_core::structs::storage::distribution::capacity::RangeSize;
 use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
-use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
+use aruna_core::structs::storage::usage::BucketCounters;
+use aruna_ops_work::s3::row_reads::BucketCountersOperation;
 use aruna_ops_work::s3::usage::UsageCompleteOperation;
 use aruna_ops_work::transfer::charged_ranges::{HeldRange, RangeUsage, sum_held};
 use aruna_ops_work::transfer::status::read_view;
@@ -552,30 +553,15 @@ pub async fn get_bucket_usage(
 
 /// The bucket's counter row; a bucket without one holds nothing yet.
 async fn bucket_counters(state: &ServerState, bucket: &str) -> ServerResult<BucketCounters> {
-    use aruna_core::effects::StorageEffect;
-    use aruna_core::events::{Event, StorageEvent};
-    use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
-
-    let read = StorageEffect::Read {
-        key_space: USAGE_STATS_KEYSPACE.to_string(),
-        key: usage_bucket_key(bucket).into(),
-        txn_id: None,
-    };
-    let value = match state
-        .get_ctx()
-        .storage_handle
-        .send_storage_effect(read)
-        .await
-    {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => value,
-        other => {
-            let error = format!("could not read the bucket counter: {other:?}");
-            return Err(ServerError::InternalError(error.into()));
-        }
-    };
-    let counters = value.as_deref().map(BucketCounters::from_bytes).transpose();
-    let counters = counters.map_err(|error| ServerError::InternalError(error.into()))?;
-    Ok(counters.unwrap_or_default())
+    drive(
+        BucketCountersOperation::new(bucket),
+        state.get_ctx().as_ref(),
+    )
+    .await
+    .map_err(|error| {
+        let error = format!("could not read the bucket counter: {error}");
+        ServerError::InternalError(error.into())
+    })
 }
 
 #[cfg(test)]

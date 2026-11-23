@@ -140,3 +140,20 @@ impl std::fmt::Display for Status {
         )
     }
 }
+
+/// The connection side as the info route reports it.
+pub fn side_name(side: iroh::endpoint::Side) -> String {
+    match side {
+        iroh::endpoint::Side::Client => "client".to_string(),
+        iroh::endpoint::Side::Server => "server".to_string(),
+    }
+}
+
+/// A transport address as the info route reports it: a socket address or a relay URL.
+pub fn format_transport_addr(addr: &iroh::TransportAddr) -> String {
+    match addr {
+        iroh::TransportAddr::Ip(addr) => addr.to_string(),
+        iroh::TransportAddr::Relay(url) => url.to_string(),
+        _ => format!("{addr:?}"),
+    }
+}

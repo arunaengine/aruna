@@ -131,7 +131,9 @@ async fn rejoin_peer(
         max_uni_streams: joiner.config.max_uni_streams,
         max_bidi_streams: joiner.config.max_bidi_streams,
         sync_storage_path: Some(directory.path().join("document-sync")),
-        document_sync_runtime: Some(joiner.config.document_sync_runtime),
+        document_sync_runtime: Some(aruna::startup::resources::sync_runtime(
+            joiner.config.document_sync_runtime,
+        )),
         fjall_persist_policy: joiner.config.fjall_persist_policy,
     };
     let peer = NetHandle::new(config, context_storage.clone()).await?;

@@ -19,6 +19,7 @@ use aruna_core::document_apply::cursor::AppliedCursor;
 use aruna_core::document_apply::topic_cursor_key;
 use aruna_core::effects::StorageEffect;
 use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::StoragePort;
 use aruna_core::id::NodeId;
 use aruna_core::keyspaces::{
     APPLIED_OPS_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_LIFECYCLE_KEYSPACE,

@@ -48,7 +48,7 @@ impl From<ApplyError> for NetError {
 /// What effects reach: storage always, the service when the operation reads topics.
 #[derive(Clone, Copy)]
 struct Backends<'a> {
-    storage: &'a StorageHandle,
+    storage: &'a dyn StoragePort,
     service: Option<&'a DocumentSyncService>,
 }
 
@@ -119,7 +119,7 @@ impl<'a> Backends<'a> {
 }
 
 /// Runs `plan` once in its transaction.
-pub(crate) async fn run_plan<P>(storage: &StorageHandle, plan: P) -> Result<P::Output>
+pub(crate) async fn run_plan<P>(storage: &dyn StoragePort, plan: P) -> Result<P::Output>
 where
     P: RowPlan<Error = ApplyError> + 'static,
     P::Output: PartialEq,
@@ -133,7 +133,7 @@ where
 
 /// Runs `plan` and lets `during` finish right before its first change reaches storage.
 pub(crate) async fn run_plan_around<P>(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     plan: P,
     during: impl Future<Output = ()>,
 ) -> Result<P::Output>
@@ -164,7 +164,7 @@ where
     machine.finalize().map_err(NetError::from)
 }
 
-pub(crate) async fn start_storage_transaction(storage: &StorageHandle) -> Result<TxnId> {
+pub(crate) async fn start_storage_transaction(storage: &dyn StoragePort) -> Result<TxnId> {
     match storage
         .send_storage_effect(StorageEffect::StartTransaction { read: false })
         .await
@@ -175,7 +175,7 @@ pub(crate) async fn start_storage_transaction(storage: &StorageHandle) -> Result
 }
 
 pub(crate) async fn transaction_read(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     key_space: String,
     key: ByteView,
     txn_id: Option<TxnId>,
@@ -196,7 +196,7 @@ pub(crate) async fn transaction_read(
 
 /// Writes `writes` in the transaction and commits it.
 pub(crate) async fn replace_batch_in(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     txn_id: TxnId,
     deletes: Vec<(String, ByteView)>,
     writes: Vec<(String, ByteView, Value)>,
@@ -223,7 +223,7 @@ pub(crate) async fn replace_batch_in(
 }
 
 pub(crate) async fn batch_delete_to(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     deletes: Vec<(String, ByteView)>,
 ) -> Result<()> {
     match storage
@@ -264,7 +264,7 @@ impl RowPlan for CheckPlan {
 }
 
 pub(crate) async fn check_group_authority(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     event: &AdminDocumentEvent,
     state: Option<&AdminDocumentState>,
 ) -> Result<AdminEventValidation> {
@@ -272,7 +272,7 @@ pub(crate) async fn check_group_authority(
 }
 
 pub(crate) async fn check_user_authority(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     event: &AdminDocumentEvent,
     state: Option<&AdminDocumentState>,
 ) -> Result<AdminEventValidation> {
@@ -296,7 +296,7 @@ impl RowPlan for StatePlan {
 }
 
 pub(crate) async fn read_reducer_state(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     target: &AdminDocumentTarget,
 ) -> Result<Option<AdminDocumentState>> {
     run_plan(storage, StatePlan(target.clone())).await
@@ -319,14 +319,14 @@ impl RowPlan for DependencyPlan {
 }
 
 pub(crate) async fn dependency_available(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     dependency: DocumentSyncDependency,
 ) -> Result<bool> {
     run_plan(storage, DependencyPlan(dependency)).await
 }
 
 /// Runs the plan `build` makes, again after each lost transaction conflict it allows.
-async fn retry_plan<P>(storage: &StorageHandle, build: impl Fn() -> P) -> Result<P::Output>
+async fn retry_plan<P>(storage: &dyn StoragePort, build: impl Fn() -> P) -> Result<P::Output>
 where
     P: RowPlan<Error = ApplyError> + 'static,
     P::Output: PartialEq,
@@ -353,7 +353,7 @@ pub(crate) fn target_write_entry(
 }
 
 pub(crate) async fn apply_admin_operation(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<()> {
@@ -380,7 +380,7 @@ pub(crate) async fn apply_admin_operation(
 }
 
 pub(crate) async fn apply_distribution_operation(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     target: DocumentTarget,
     event: AdminDocumentEvent,
 ) -> Result<Handled> {
@@ -399,7 +399,7 @@ pub(crate) struct ConfigValidationCache {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn validate_admin_event(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     topic_id: ::irokle::TopicId,
     actor_id: ::irokle::ActorId,
     target: &DocumentTarget,
@@ -425,7 +425,7 @@ pub(crate) async fn validate_admin_event(
 }
 
 pub(crate) async fn store_registry_upsert(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     record: MetadataRegistryRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<PlacementOutcome<()>> {
@@ -437,7 +437,7 @@ pub(crate) async fn store_registry_upsert(
 }
 
 pub(crate) async fn store_graph_lifecycle(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     record: &GraphLifecycleRecord,
     primary_bytes: Vec<u8>,
 ) -> Result<bool> {
@@ -449,7 +449,7 @@ pub(crate) async fn store_graph_lifecycle(
 }
 
 pub(crate) async fn store_document_lifecycle(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     record: &MetadataLifecycleRecord,
     change: DocumentChange,
 ) -> Result<bool> {
@@ -461,7 +461,7 @@ pub(crate) async fn store_document_lifecycle(
 }
 
 pub(crate) async fn delete_registry_record(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     group_id: Ulid,
     document_id: Ulid,
 ) -> Result<()> {
@@ -473,7 +473,7 @@ pub(crate) async fn delete_registry_record(
 }
 
 pub(crate) async fn store_watch_change(
-    storage: &StorageHandle,
+    storage: &dyn StoragePort,
     target: DocumentTarget,
     bytes: Option<Vec<u8>>,
     change: DocumentChange,

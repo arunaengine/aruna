@@ -18,7 +18,6 @@ use aruna_core::structs::identity::node_state::{
     BootOrigin, PersistedNodeIdentity, PersistedNodeState, PersistedNodeStatus,
 };
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-use aruna_storage::storage::handle::StorageHandle;
 use byteview::ByteView;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
@@ -61,12 +60,12 @@ pub enum IdentityError {
 }
 
 /// The persisted identity boundary.
-pub struct IdentityStore {
-    storage: StorageHandle,
+pub struct IdentityStore<H: Handle> {
+    storage: H,
 }
 
-impl IdentityStore {
-    pub fn from_storage(storage: StorageHandle) -> Self {
+impl<H: Handle> IdentityStore<H> {
+    pub fn from_storage(storage: H) -> Self {
         Self { storage }
     }
 
@@ -145,7 +144,7 @@ impl IdentityStore {
 }
 
 async fn read_row(
-    storage: &StorageHandle,
+    storage: &impl Handle,
     key_space: &str,
     key: &[u8],
 ) -> Result<Option<ByteView>, IdentityError> {
@@ -163,7 +162,7 @@ async fn read_row(
 
 /// Whether the realm config this node holds lists it as a management node.
 async fn listed_management(
-    storage: &StorageHandle,
+    storage: &impl Handle,
     realm_id: RealmId,
     node_id: NodeId,
 ) -> Result<bool, IdentityError> {
@@ -251,7 +250,7 @@ pub(crate) fn generate_node_state() -> Result<PersistedNodeState, IdentityError>
 }
 
 pub(crate) async fn load_node_state(
-    storage: &StorageHandle,
+    storage: &impl Handle,
 ) -> Result<Option<PersistedNodeState>, IdentityError> {
     match storage
         .send_effect(Effect::Storage(StorageEffect::Read {
@@ -273,7 +272,7 @@ pub(crate) async fn load_node_state(
 }
 
 pub(crate) async fn persist_node_state(
-    storage: &StorageHandle,
+    storage: &impl Handle,
     node_state: &PersistedNodeState,
 ) -> Result<(), IdentityError> {
     let value = postcard::to_allocvec(node_state).map_err(ConversionError::from)?;
@@ -294,7 +293,7 @@ pub(crate) async fn persist_node_state(
 /// Marks a persisted state complete. The transition lives with the record it
 /// writes, not with the configuration that reads it.
 pub async fn mark_state_complete(
-    storage: &StorageHandle,
+    storage: &impl Handle,
     node_state: &PersistedNodeState,
 ) -> Result<(), IdentityError> {
     if matches!(node_state.status, PersistedNodeStatus::Complete) {
@@ -310,7 +309,7 @@ pub async fn mark_state_complete(
 
 /// Records the onboarding phase a pending joiner reached.
 pub async fn mark_onboarding_phase(
-    storage: &StorageHandle,
+    storage: &impl Handle,
     node_state: &PersistedNodeState,
     phase: OnboardingPhase,
 ) -> Result<(), IdentityError> {
@@ -321,10 +320,11 @@ pub async fn mark_onboarding_phase(
 
 #[cfg(test)]
 mod tests {
-    use super::enrollment::{EnrollmentPlan, plan_enrollment};
     use super::*;
     use aruna_core::keys::generate_signing_key;
     use aruna_core::user::id::UserId;
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::memory::MemoryStorage;
 
     /// The persisted record keeps its byte layout across the ownership move:
     /// the stored encoding is part of the deployed compatibility surface.
@@ -416,49 +416,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boot_reuses_identity() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
-        let store = IdentityStore::from_storage(storage.clone());
-
-        assert!(store.load().await.unwrap().is_none());
-        let generated = store.generate().unwrap();
-        store.persist(&generated).await.unwrap();
-
-        let (derived_realm, capabilities) = store.capabilities(&generated).unwrap();
-        assert_eq!(derived_realm, generated.realm_id);
-        assert!(matches!(capabilities, NodeCapabilities::Management { .. }));
-
-        drop(store);
-        storage.close().await;
-        let reopened =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
-        let store = IdentityStore::from_storage(reopened);
-        let loaded = store
-            .load()
-            .await
-            .unwrap()
-            .expect("a persisted identity must load on the repeat boot");
-        assert_eq!(loaded, generated);
-        assert_eq!(
-            plan_enrollment(Some(&loaded), false).unwrap(),
-            EnrollmentPlan::Ready
-        );
-    }
-
-    #[tokio::test]
     async fn corrupt_identity_rejected() {
         use aruna_core::effects::Effect;
         use aruna_core::handle::Handle;
         use aruna_core::keyspaces::NODE_STATE_KEYSPACE;
 
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = MemoryStorage::open();
         storage
             .send_effect(Effect::Storage(aruna_core::effects::StorageEffect::Write {
                 key_space: NODE_STATE_KEYSPACE.to_string(),
@@ -476,8 +439,7 @@ mod tests {
     fn realm_mismatch_detected() {
         // Only a management identity derives its realm from key material; a
         // corrupted realm field must be detectable against the derived one.
-        let (storage, _receivers) = aruna_storage::storage::handle::StorageHandle::new();
-        let store = IdentityStore::from_storage(storage);
+        let store = IdentityStore::from_storage(MemoryStorage::open());
         let mut management = store.generate().unwrap();
         let (derived, capabilities) = store.capabilities(&management).unwrap();
         assert_eq!(derived, management.realm_id);
@@ -533,14 +495,10 @@ mod tests {
     ) -> (
         PersistedNodeState,
         NodeId,
-        IdentityStore,
+        IdentityStore<StorageHandle>,
         StorageHandle,
-        tempfile::TempDir,
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let storage =
-            aruna_storage::storage::worker::FjallStorage::open(dir.path().to_str().unwrap())
-                .unwrap();
+        let storage = MemoryStorage::open();
         let state = PersistedNodeState {
             boot_origin: BootOrigin::Onboarded,
             status: PersistedNodeStatus::Complete,
@@ -555,13 +513,13 @@ mod tests {
         };
         let node_id = iroh::SecretKey::from_bytes(&state.net_secret_key).public();
         let store = IdentityStore::from_storage(storage.clone());
-        (state, node_id, store, storage, dir)
+        (state, node_id, store, storage)
     }
 
     #[tokio::test]
     async fn promotion_needs_config() {
         let realm_key = generate_signing_key();
-        let (state, node_id, store, storage, _dir) = server_node(&realm_key);
+        let (state, node_id, store, storage) = server_node(&realm_key);
         write_row(
             &storage,
             NODE_STATE_KEYSPACE,
@@ -599,7 +557,7 @@ mod tests {
     #[tokio::test]
     async fn foreign_key_dropped() {
         let realm_key = generate_signing_key();
-        let (state, node_id, store, storage, _dir) = server_node(&realm_key);
+        let (state, node_id, store, storage) = server_node(&realm_key);
         write_config(&storage, state.realm_id, node_id, RealmNodeKind::Management).await;
         for row in [pem(&generate_signing_key()), b"not a key".to_vec()] {
             write_row(&storage, NODE_STATE_KEYSPACE, PROMOTED_KEY_ROW, row).await;
@@ -615,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn leftover_row_dropped() {
         let realm_key = generate_signing_key();
-        let (state, node_id, store, storage, _dir) = server_node(&realm_key);
+        let (state, node_id, store, storage) = server_node(&realm_key);
         let management = PersistedNodeState {
             identity: PersistedNodeIdentity::Management {
                 realm_private_pem: String::from_utf8(pem(&realm_key)).unwrap(),

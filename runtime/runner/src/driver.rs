@@ -14,7 +14,9 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, GroupEvent, GroupResult, StorageEvent};
 use aruna_core::heartbeat::{Heard, HeldHeartbeat, Here, MAX_HEARTBEAT_AGE};
 use aruna_core::id::NodeId;
-use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
+use aruna_core::keyspaces::{
+    NODE_STATE_KEY, NODE_STATE_KEYSPACE, REALM_CONFIG_KEYSPACE, SYNC_OUTBOX_KEYSPACE,
+};
 use aruna_core::node::facts::{NodeFacts, class_labels, permille_of};
 use aruna_core::operation::SubOperation;
 use aruna_core::operation::{AfterConflict, HoldScope, Operation};
@@ -114,6 +116,38 @@ impl DriverContext {
             task_handle: None,
             compute_handle: None,
             outbound_handle: None,
+        }
+    }
+
+    /// Reads the node state row, so a readiness check sees whether storage answers reads.
+    pub async fn probe_storage(&self) -> Event {
+        self.storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: NODE_STATE_KEYSPACE.to_string(),
+                key: NODE_STATE_KEY.into(),
+                txn_id: None,
+            })
+            .await
+    }
+
+    /// Reads one row of the document sync outbox, so a readiness check sees it is readable.
+    pub async fn probe_outbox(&self) -> Event {
+        self.storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: SYNC_OUTBOX_KEYSPACE.to_string(),
+                prefix: None,
+                start: None,
+                limit: 1,
+                txn_id: None,
+            })
+            .await
+    }
+
+    /// A context with storage and a fresh task handle, for operator tools that schedule tasks.
+    pub fn storage_and_tasks(storage_handle: storage::handle::StorageHandle) -> Self {
+        Self {
+            task_handle: Some(TaskHandle::new()),
+            ..Self::storage_only(storage_handle)
         }
     }
 

@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use aruna_core::effects::DhtGetOptions;
 use aruna_core::events::DhtEntry;
+use aruna_core::handle::StoragePort;
 use aruna_core::id::{DhtKeyId, NodeId};
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_storage::storage::handle::StorageHandle;
 use crossfire::{TrySendError, mpsc};
 use iroh::Endpoint;
 use tokio::sync::oneshot;
@@ -55,7 +55,7 @@ impl DhtHandle {
     )]
     pub(crate) fn spawn(
         endpoint: Endpoint,
-        storage: StorageHandle,
+        storage: std::sync::Arc<dyn StoragePort>,
         connection_pool: ConnectionPool,
         peer_kinds: PeerKinds,
         shutdown: CancellationToken,

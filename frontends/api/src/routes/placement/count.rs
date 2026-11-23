@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aruna_core::id::NodeId;
+use aruna_core::id::{NodeId, Signature};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::coverage::{CountRelay, CoverageCount};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
@@ -329,7 +329,7 @@ fn relay_signed(relay: &CountRelay, headers: &HeaderMap, members: &[NodeId]) -> 
     let signature = (headers.get(COUNT_SIGNATURE_HEADER))
         .and_then(|value| hex::decode(value.as_bytes()).ok())
         .and_then(|bytes| <[u8; 64]>::try_from(bytes).ok())
-        .map(|bytes| iroh::Signature::from_bytes(&bytes));
+        .map(|bytes| Signature::from_bytes(&bytes));
     match (signer, signature) {
         (Some(signer), Some(signature)) => {
             members.contains(&signer) && relay.signed_by(&signer, &signature)

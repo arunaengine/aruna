@@ -166,7 +166,7 @@ async fn is_public(url: &Url, policy: &EgressPolicy) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_config::resolve_settings;
+    use crate::startup::resources::resolve_settings;
     use aruna_config::settings::read_settings_from;
     use aruna_core::federation::FederationSettings;
     use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};

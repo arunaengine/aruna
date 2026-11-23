@@ -6,12 +6,12 @@
 use std::sync::Arc;
 
 use aruna_core::alpn::Alpn;
+use aruna_core::handle::StoragePort;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NotificationWatchMetrics;
 use aruna_core::structs::execution::notification_watch::WatchInterestTable;
 use aruna_core::structs::info::NetworkDiagnosticsState;
 use aruna_core::user::id::UserId;
-use aruna_storage::storage::handle::StorageHandle;
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::address_lookup::{DnsAddressLookup, PkarrPublisher};
 use iroh::endpoint::{QuicTransportConfig, VarInt, presets};
@@ -45,7 +45,8 @@ use crate::{
 };
 
 impl NetHandle {
-    pub async fn new(config: NetConfig, storage: StorageHandle) -> Result<Self> {
+    pub async fn new(config: NetConfig, storage: impl Into<Arc<dyn StoragePort>>) -> Result<Self> {
+        let storage: Arc<dyn StoragePort> = storage.into();
         // 1. Configuration and the bound endpoint.
         let runtime = NetworkEndpoint::bind(&config).await?;
         // 2. Persisted peer and admission state.
@@ -256,7 +257,7 @@ impl PeerAdmissionState {
     async fn load(
         runtime: &NetworkEndpoint,
         config: &NetConfig,
-        storage: &StorageHandle,
+        storage: &Arc<dyn StoragePort>,
     ) -> Result<(Self, HandleState)> {
         let persisted_realm_peers =
             read_persisted_peers(storage, config.realm_id, runtime.node_id).await?;
@@ -342,7 +343,7 @@ impl NetworkServices {
         config: &NetConfig,
         runtime: &NetworkEndpoint,
         peers: &PeerAdmissionState,
-        storage: &StorageHandle,
+        storage: &Arc<dyn StoragePort>,
     ) -> Result<(Self, DhtSpawnResources)> {
         let connection_pool =
             ConnectionPool::new(runtime.endpoint.clone(), ConnectionPoolOptions::default());

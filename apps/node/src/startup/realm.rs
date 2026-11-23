@@ -397,7 +397,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (config, storage) = aruna_config::resolve_settings(
+        let (config, storage) = crate::startup::resources::resolve_settings(
             aruna_config::settings::read_settings_from(&map).expect("settings parse"),
         )
         .await

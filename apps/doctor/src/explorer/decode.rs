@@ -5,6 +5,7 @@
 
 use aruna_core::auth::{ADMIN_CLAIMED_KEY, REALMS_LIST_KEY};
 use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
+use aruna_core::dht_protocol::StoredEntry;
 use aruna_core::id::DhtKeyId;
 use aruna_core::keyspaces::{
     API_STATE_KEYSPACE, APPLIED_OPS_KEYSPACE, AUTH_KEYSPACE, BLOB_HEAD_KEYSPACE,
@@ -45,7 +46,6 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_ops_work::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
 use aruna_ops_work::placement::policy::cache::PolicyCacheEntry;
-use aruna_p2p::dht::storage::StoredEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -962,6 +962,7 @@ mod tests {
         DOT_ENCODING_TAG, GRAPH_META_PREFIX, LOG_BATCH_PREFIX, decode_entry, raw_field,
     };
     use aruna_core::compute::quota::{ComputeDepartureReport, JobReservationRecord};
+    use aruna_core::dht_protocol::StoredEntry;
     use aruna_core::id::DhtKeyId;
     use aruna_core::keyspaces::{
         BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE,
@@ -1007,7 +1008,6 @@ mod tests {
     };
     use aruna_ops_work::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
     use aruna_ops_work::placement::policy::cache::PolicyCacheEntry;
-    use aruna_p2p::dht::storage::StoredEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1657,7 +1657,7 @@ mod tests {
         let publisher_secret = iroh::SecretKey::from_bytes(&[5_u8; 32]);
         let publisher = publisher_secret.public();
         let revision = 1;
-        let signed = aruna_p2p::dht::rpc::signed_record_bytes(
+        let signed = aruna_core::dht_protocol::signed_record_bytes(
             &key,
             &publisher,
             &realm_id,

@@ -24,6 +24,7 @@ use aruna_ops_work::s3::bucket::remap::{
     self, CountSelectedOperation, RemapPreviewOperation, RemapScope,
 };
 use aruna_ops_work::s3::imports::LastRunOperation;
+use aruna_ops_work::s3::row_reads::ImportedRowOperation;
 use aruna_ops_work::transfer::discovery::RuleAccessOperation;
 use aruna_runner::driver::{drive, node_routing};
 use axum::extract::{Path, State};
@@ -849,22 +850,10 @@ async fn file_keys(
     ),
     path: &str,
 ) -> ServerResult<Vec<String>> {
-    use aruna_core::structs::storage::backend_import::{ImportedObject, object_key};
     use aruna_core::structs::storage::discovery::file_identity;
-    let read = aruna_core::effects::StorageEffect::Read {
-        key_space: aruna_core::keyspaces::IMPORTED_OBJECT_KEYSPACE.to_string(),
-        key: object_key(rule.import_id, path),
-        txn_id: None,
-    };
-    let row = match context.storage_handle.send_storage_effect(read).await {
-        aruna_core::events::Event::Storage(aruna_core::events::StorageEvent::ReadResult {
-            value,
-            ..
-        }) => value,
-        other => return Err(ServerError::InternalError(format!("{other:?}").into())),
-    };
-    let row = row.as_deref().map(ImportedObject::from_bytes).transpose();
-    let row = row.map_err(|error| ServerError::InternalError(error.into()))?;
+    let row = drive(ImportedRowOperation::new(rule.import_id, path), context)
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
     let mut keys: Vec<String> = row.and_then(|row| row.key).into_iter().collect();
     keys.extend(rule.aruna_key(path));
     // A pending write to the path names its key too.
