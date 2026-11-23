@@ -44,7 +44,7 @@ impl ReplicationTimerOperation {
             catch_up: drained.catch_up,
             ..self.memory.clone()
         };
-        TimerPlan { after, memory }
+        TimerPlan::keep(after, memory)
     }
 }
 
@@ -64,10 +64,10 @@ impl Operation for ReplicationTimerOperation {
             Ok(drained) => Ok(Next::Done(self.plan(drained))),
             Err(error) => {
                 warn!(%error, "Failed to drain blob replication queue");
-                Ok(Next::Done(TimerPlan {
-                    after: Some(REPLICATION_RETRY_AFTER),
-                    memory: self.memory.clone(),
-                }))
+                Ok(Next::Done(TimerPlan::keep(
+                    Some(REPLICATION_RETRY_AFTER),
+                    self.memory.clone(),
+                )))
             }
         }
     }

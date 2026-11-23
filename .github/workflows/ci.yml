@@ -696,7 +696,7 @@ jobs:
     timeout-minutes: 60
     env:
       # Startup checks need no aggressive O3 passes; opt-level 1 keeps async
-      # frames compact for the 2 MiB Tokio stack while cutting LLVM time.
+      # frames compact while cutting LLVM time (apps/node uses an 8 MiB stack).
       CARGO_PROFILE_RELEASE_OPT_LEVEL: 1
 
     steps:

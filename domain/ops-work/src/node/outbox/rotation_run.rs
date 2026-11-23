@@ -79,7 +79,7 @@ impl RotationRunOperation {
             published: std::mem::take(&mut self.published),
             ..TimerMemory::default()
         };
-        Ok(Next::Done(TimerPlan { after, memory }))
+        Ok(Next::Done(TimerPlan::keep(after, memory)))
     }
 
     /// Waits on the rotation's retry ladder.

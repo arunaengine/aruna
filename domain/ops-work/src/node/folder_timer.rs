@@ -200,10 +200,10 @@ impl FolderTimerOperation {
 
     fn finish(&self) -> Result<Next<TimerPlan>, IoError> {
         let left = self.deadline_ms.saturating_sub(self.now_ms);
-        Ok(Next::Done(TimerPlan {
-            after: Some(Duration::from_millis(left)),
-            memory: self.memory.clone(),
-        }))
+        Ok(Next::Done(TimerPlan::keep(
+            Some(Duration::from_millis(left)),
+            self.memory.clone(),
+        )))
     }
 }
 

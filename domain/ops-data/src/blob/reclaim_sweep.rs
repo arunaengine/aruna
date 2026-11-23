@@ -38,10 +38,7 @@ const RECLAIM_PAGE_SIZE: usize = 128;
 /// key it keeps, and whether it reached the end of the queue. A failing candidate climbs the
 /// retry ladder, so it cannot hold a one-minute rescan of the whole queue forever.
 pub fn reclaim_plan(outcome: Option<&ReclaimOutcome>, memory: &TimerMemory) -> (TimerPlan, bool) {
-    let plan = |after, memory| TimerPlan {
-        after: Some(after),
-        memory,
-    };
+    let plan = |after, memory| TimerPlan::keep(Some(after), memory);
     let Some(outcome) = outcome else {
         let (after, memory) = memory.next_retry(RECLAIM_SWEEP_RETRY, RECLAIM_SWEEP_AFTER);
         return (plan(after, memory), false);
@@ -101,7 +98,7 @@ impl Operation for ReclaimTimerOperation {
         // Removal walks whole keyspaces too, so it only rides a sweep that reached the end of
         // the queue, never the fast retries behind a backlog.
         if drained {
-            plan.memory.handoff = TimerHandoff::RemoveBackends;
+            plan.handoff = TimerHandoff::RemoveBackends;
         }
         Ok(Next::Done(plan))
     }
@@ -155,7 +152,6 @@ type SweepTurn = Result<Next<ReclaimOutcome>, ReclaimSweepError>;
 
 /// Pages the queue from `start_after` so a failing candidate cannot starve rows
 /// behind it: the cap moves the cursor past it either way.
-// Deferred (#359): recount and candidate-persistence hardening.
 #[derive(Debug, PartialEq)]
 pub struct ReclaimSweepOperation {
     catalog: BackendCatalog,
@@ -618,10 +614,10 @@ mod tests {
             }
         };
         let clean = swept(Ok(ReclaimOutcome::default()));
-        assert_eq!(clean.memory.handoff, TimerHandoff::RemoveBackends);
+        assert_eq!(clean.handoff, TimerHandoff::RemoveBackends);
         assert_eq!(clean.after, Some(RECLAIM_SWEEP_AFTER));
         let failed = swept(Err(ReclaimSweepError::Io(IoError::Unfinished)));
-        assert_eq!(failed.memory.handoff, TimerHandoff::Nothing);
+        assert_eq!(failed.handoff, TimerHandoff::Nothing);
         assert_eq!(failed.memory.cursor.as_deref(), Some(&b"kept"[..]));
         assert_eq!(failed.after, Some(RECLAIM_SWEEP_RETRY));
     }

@@ -178,7 +178,7 @@ There are no release binaries yet. Install it with Rust 1.97.1 or newer, from a 
 repository or straight from Git:
 
 ```bash
-cargo install --locked --path cli
+cargo install --locked --path apps/cli
 cargo install --locked --git https://github.com/arunaengine/aruna aruna-cli
 ```
 

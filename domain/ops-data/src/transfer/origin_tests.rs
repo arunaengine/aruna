@@ -13,12 +13,24 @@ use aruna_core::structs::identity::identifier::{
 use aruna_core::structs::storage::blob::{BackendRef, BucketInfo};
 use aruna_core::structs::storage::bucket_metadata::StoredMetadata;
 use aruna_core::structs::storage::format::{Compression, EncodingClass};
+use aruna_runner::driver::DriverContext;
 
 const BUCKET: &str = "bakrep";
 const KEY: &str = "genes/SAMN15803895.faa.gz";
 
 async fn put(context: &DriverContext, key_space: &str, key: Vec<u8>, value: Vec<u8>) {
     aruna_runner::testing::write_value(&context.storage_handle, key_space, key, value).await;
+}
+
+async fn read_origin(
+    context: &DriverContext,
+    realm_id: RealmId,
+    bucket: &str,
+    key: &str,
+    version_id: Option<Ulid>,
+) -> Result<OriginView, OriginError> {
+    let operation = ReadOriginOperation::new(realm_id, bucket, key, version_id);
+    aruna_runner::driver::drive(operation, context).await
 }
 
 /// A bucket with one version and database metadata whose rules find BioSample ids.
@@ -174,8 +186,7 @@ async fn connector_name_read() {
     )
     .await;
 
-    let scope = (actor.realm_id, actor.node_id);
-    let view = read_origin(&context, scope, BUCKET, "b.faa", Some(version_id))
+    let view = read_origin(&context, actor.realm_id, BUCKET, "b.faa", Some(version_id))
         .await
         .unwrap();
     assert_eq!(view.origin, Some(origin.clone()));
@@ -197,8 +208,7 @@ async fn database_identifiers_read() {
         let actor = actor();
         let realm_id = actor.realm_id;
         let version_id = seed(&context, &actor, listed).await;
-        let scope = (realm_id, actor.node_id);
-        let view = read_origin(&context, scope, BUCKET, KEY, Some(version_id))
+        let view = read_origin(&context, realm_id, BUCKET, KEY, Some(version_id))
             .await
             .unwrap();
         if !listed {

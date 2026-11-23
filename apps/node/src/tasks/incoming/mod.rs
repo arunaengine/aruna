@@ -260,19 +260,15 @@ impl OperationsTaskHandler {
         let build = || operation.clone();
         let bulk = operation.bulk_lane().then(|| self.context.bulk());
         let context = bulk.as_ref().unwrap_or(self.context.as_ref());
-        let mut plan = match drive_retry(build, context, &seed).await {
+        let plan = match drive_retry(build, context, &seed).await {
             Ok(plan) => plan,
             Err(failure) => {
                 warn!(task_id = ?key, error = %failure, "Timer run failed");
-                TimerPlan {
-                    after: Some(failure.retry_after),
-                    memory,
-                }
+                TimerPlan::keep(Some(failure.retry_after), memory)
             }
         };
-        let handoff = std::mem::take(&mut plan.memory.handoff);
         self.keep_memory(&key, plan.memory);
-        self.hand_off(handoff).await;
+        self.hand_off(plan.handoff).await;
         drop(gate);
         let Some(after) = plan.after else {
             return;
@@ -363,31 +359,6 @@ impl OperationsTaskHandler {
 
     fn timer_work(&self, key: TaskKey) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         match key {
-            TaskKey::RealmPresence { .. } => Box::pin(self.run_trigger(key)),
-            TaskKey::SyncPlacements { .. } => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainSyncOutbox => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishUsageSnapshots => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishNodeInfo => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainProjectionQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainMaterializationQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainPruneQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainReplicationQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainRefreshQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainNotificationOutbox => Box::pin(self.run_trigger(key)),
-            TaskKey::PruneNotifications => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishWatchInterest => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainWatchEvents => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainAppliedSync => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainJobQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::PruneJobs => Box::pin(self.run_trigger(key)),
-            TaskKey::PruneFamilies => Box::pin(self.run_trigger(key)),
-            TaskKey::ConfigCatchUp => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainMirrorRepair => Box::pin(self.run_trigger(key)),
-            TaskKey::SweepHiddenBlobs => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainCleanupQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainReclaimQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::MigrateCompression => Box::pin(self.run_trigger(key)),
-            TaskKey::RefreshBlobHolders => Box::pin(self.run_trigger(key)),
             TaskKey::LockBucket {
                 bucket_id,
                 generation,
@@ -425,21 +396,45 @@ impl OperationsTaskHandler {
                     warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
                 }
             }),
-            // The key change already applies; only its record waits for storage.
-            TaskKey::RecordAudit { .. } => Box::pin(self.run_trigger(key)),
-            TaskKey::DeliverKeyWakes => Box::pin(self.run_trigger(key)),
-            TaskKey::PublishRegistration => Box::pin(self.run_trigger(key)),
-            TaskKey::PruneConnectorReferences => Box::pin(self.run_trigger(key)),
-            TaskKey::MaintainRanges => Box::pin(self.run_trigger(key)),
-            TaskKey::RunBackendImports => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainFamilyOutbox => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainWitnessQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::SettleJobTerminals => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainLinkQueue => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainCaptures => Box::pin(self.run_trigger(key)),
-            TaskKey::ReconcileSyncedFolders => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainUploadOutbox => Box::pin(self.run_trigger(key)),
-            TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),
+            TaskKey::RealmPresence { .. }
+            | TaskKey::SyncPlacements { .. }
+            | TaskKey::DrainSyncOutbox
+            | TaskKey::PublishUsageSnapshots
+            | TaskKey::PublishNodeInfo
+            | TaskKey::DrainProjectionQueue
+            | TaskKey::DrainMaterializationQueue
+            | TaskKey::DrainPruneQueue
+            | TaskKey::DrainReplicationQueue
+            | TaskKey::DrainRefreshQueue
+            | TaskKey::DrainNotificationOutbox
+            | TaskKey::PruneNotifications
+            | TaskKey::PublishWatchInterest
+            | TaskKey::DrainWatchEvents
+            | TaskKey::DrainAppliedSync
+            | TaskKey::DrainJobQueue
+            | TaskKey::PruneJobs
+            | TaskKey::PruneFamilies
+            | TaskKey::ConfigCatchUp
+            | TaskKey::DrainMirrorRepair
+            | TaskKey::SweepHiddenBlobs
+            | TaskKey::DrainCleanupQueue
+            | TaskKey::DrainReclaimQueue
+            | TaskKey::MigrateCompression
+            | TaskKey::RefreshBlobHolders
+            | TaskKey::RecordAudit { .. }
+            | TaskKey::DeliverKeyWakes
+            | TaskKey::PublishRegistration
+            | TaskKey::PruneConnectorReferences
+            | TaskKey::MaintainRanges
+            | TaskKey::RunBackendImports
+            | TaskKey::DrainFamilyOutbox
+            | TaskKey::DrainWitnessQueue
+            | TaskKey::SettleJobTerminals
+            | TaskKey::DrainLinkQueue
+            | TaskKey::DrainCaptures
+            | TaskKey::ReconcileSyncedFolders
+            | TaskKey::DrainUploadOutbox
+            | TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),
         }
     }
 }

@@ -118,7 +118,10 @@ reason in the pull request. A change that lowers a count lowers the baseline in
 the same change.
 
 The guard also enforces the layer order derived from each crate's top-level folder
-(`LAYERS` in the script), so a new crate needs no extra rule. The current state:
+(`LAYERS` in the script), so a new crate needs no extra rule. For domain crates,
+the rule applies to production and build dependencies; tests may still use the
+runner, backends and test harness as dev-dependencies, while higher operations
+crates remain forbidden even as dev-dependencies. The current state:
 
 - `StoragePort` in `domain/core/src/handle.rs` lets `runtime/blob` and `runtime/p2p`
   use storage without a production dependency on `runtime/storage`; only their tests

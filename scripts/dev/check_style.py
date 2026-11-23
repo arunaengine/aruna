@@ -794,6 +794,119 @@ def attrs_before(attrs, offset, masked):
     return chain
 
 
+PATH_ATTR_RE = re.compile(r'\bpath\s*=\s*"([^"]+)"')
+INCLUDE_RE = re.compile(r'\binclude!\s*\(\s*"([^"]+)"\s*\)')
+
+
+def crate_roots(src):
+    roots = []
+    for name in ("lib.rs", "main.rs"):
+        candidate = os.path.join(src, name)
+        if os.path.isfile(candidate):
+            roots.append(candidate)
+    bin_dir = os.path.join(src, "bin")
+    if os.path.isdir(bin_dir):
+        for entry in sorted(os.listdir(bin_dir)):
+            full = os.path.join(bin_dir, entry)
+            if entry.endswith(".rs") and os.path.isfile(full):
+                roots.append(full)
+            elif os.path.isdir(full) and os.path.isfile(os.path.join(full, "main.rs")):
+                roots.append(os.path.join(full, "main.rs"))
+    pkg = os.path.dirname(src)
+    manifest = os.path.join(pkg, "Cargo.toml")
+    if os.path.isfile(manifest):
+        for hit in PATH_ATTR_RE.finditer(read_source(manifest)):
+            candidate = os.path.normpath(os.path.join(pkg, hit.group(1)))
+            if os.path.isfile(candidate):
+                roots.append(candidate)
+    return roots
+
+
+def mod_offset(tokens, index):
+    start = tokens[index][2]
+    prev = index - 1
+    if prev >= 0 and tokens[prev][0] == "punct" and tokens[prev][1] == ")":
+        depth = 0
+        while prev >= 0:
+            if tokens[prev][0] == "punct":
+                depth += 1 if tokens[prev][1] == ")" else -1 if tokens[prev][1] == "(" else 0
+                if depth == 0:
+                    prev -= 1
+                    break
+            prev -= 1
+    if prev >= 0 and tokens[prev][0] == "ident" and tokens[prev][1] == "pub":
+        return tokens[prev][2]
+    return start
+
+
+def attr_path(attrs, offset, masked):
+    for attr in attrs_before(attrs, offset, masked):
+        hit = PATH_ATTR_RE.search(attr["body"])
+        if hit:
+            return hit.group(1)
+    return None
+
+
+def mod_targets(path, text):
+    masked, _comments, attrs, tokens = mask_source(text)
+    file_dir = os.path.dirname(path)
+    stem = os.path.basename(path)[:-3]
+    base_dir = file_dir if stem in ("lib", "main", "mod") else os.path.join(file_dir, stem)
+    stack = [(len(tokens), base_dir, file_dir)]
+    found = []
+    for index, (kind, word, _start, _end) in enumerate(tokens):
+        while len(stack) > 1 and index > stack[-1][0]:
+            stack.pop()
+        if kind != "ident" or word != "mod" or index + 2 >= len(tokens):
+            continue
+        nxt, after = tokens[index + 1], tokens[index + 2]
+        if nxt[0] != "ident" or after[0] != "punct" or after[1] not in (";", "{"):
+            continue
+        explicit = attr_path(attrs, mod_offset(tokens, index), masked)
+        mod_dir, rel_dir = stack[-1][1], stack[-1][2]
+        if after[1] == "{":
+            close = matching_punct(tokens, index + 2)
+            inner = os.path.normpath(os.path.join(rel_dir, explicit)) if explicit else os.path.join(mod_dir, nxt[1])
+            stack.append((close, inner, inner))
+            continue
+        if explicit:
+            for base in (rel_dir, mod_dir):
+                candidate = os.path.normpath(os.path.join(base, explicit))
+                if os.path.isfile(candidate):
+                    found.append(candidate)
+            continue
+        for candidate in (os.path.join(mod_dir, f"{nxt[1]}.rs"), os.path.join(mod_dir, nxt[1], "mod.rs")):
+            if os.path.isfile(candidate):
+                found.append(candidate)
+    for hit in INCLUDE_RE.finditer(text):
+        candidate = os.path.normpath(os.path.join(file_dir, hit.group(1)))
+        if os.path.isfile(candidate):
+            found.append(candidate)
+    return found
+
+
+def check_orphans(root):
+    for src in src_roots(root):
+        queue = [os.path.normpath(path) for path in crate_roots(src)]
+        seen = set(queue)
+        while queue:
+            current = queue.pop()
+            for target in mod_targets(current, read_source(current)):
+                norm = os.path.normpath(target)
+                if norm not in seen:
+                    seen.add(norm)
+                    queue.append(norm)
+        for dirpath, dirs, files in os.walk(src):
+            dirs[:] = [d for d in dirs if d not in SKIP_PARTS and d not in ASSET_PARTS]
+            for name in sorted(files):
+                if not name.endswith(".rs"):
+                    continue
+                full = os.path.normpath(os.path.join(dirpath, name))
+                if full not in seen:
+                    rel = os.path.relpath(full, root)
+                    yield ("file", rel, 0, "unreferenced Rust source file under src/")
+
+
 def check_sources(root):
     for path in iter_rust_files(root):
         rel = os.path.relpath(path, root)
@@ -1463,6 +1576,7 @@ def main(argv):
         return 2
     findings = []
     findings.extend(check_folders(root))
+    findings.extend(check_orphans(root))
     findings.extend(check_sources(root))
     findings.extend(check_headers(root))
     findings.extend(python_findings(root))

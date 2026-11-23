@@ -741,3 +741,7 @@ mod tests {
         assert_eq!(runs.next(page), Ok(Next::Done(expected)));
     }
 }
+
+#[cfg(test)]
+#[path = "origin_tests.rs"]
+mod origin_tests;

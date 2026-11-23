@@ -45,8 +45,6 @@ pub struct TimerMemory {
     pub published: Arc<BTreeMap<Vec<u8>, Publication>>,
     /// Earliest timestamp in milliseconds when a throttled pass may run again.
     pub due_ms: u64,
-    /// Work this run hands to the shell; the shell takes it out before it keeps the memory.
-    pub handoff: TimerHandoff,
 }
 
 /// Work only the shell can start after a timer run, such as a spawned job or a backend claim.
@@ -79,18 +77,31 @@ impl TimerMemory {
     }
 }
 
-/// When a timer runs again, `None` while it waits for work, and what it keeps until then.
+/// When a timer runs again, `None` while it waits for work, what it keeps until then, and any
+/// shell work it hands off once the run completes.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimerPlan {
     pub after: Option<Duration>,
     pub memory: TimerMemory,
+    pub handoff: TimerHandoff,
+}
+
+impl TimerPlan {
+    /// Plans the next run with kept `memory` and no shell handoff.
+    pub fn keep(after: Option<Duration>, memory: TimerMemory) -> Self {
+        Self {
+            after,
+            memory,
+            handoff: TimerHandoff::Nothing,
+        }
+    }
 }
 
 impl From<Option<Duration>> for TimerPlan {
     fn from(after: Option<Duration>) -> Self {
         Self {
             after,
-            memory: TimerMemory::default(),
+            ..Self::default()
         }
     }
 }

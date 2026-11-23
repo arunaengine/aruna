@@ -594,11 +594,11 @@ impl TimerRun for DrainJobsOperation {
             claimed: drained.claimed,
             lost_attempts: drained.lost_attempts,
         };
-        let memory = TimerMemory {
+        Ok(TimerPlan {
+            after,
+            memory: TimerMemory::default(),
             handoff,
-            ..TimerMemory::default()
-        };
-        Ok(TimerPlan { after, memory })
+        })
     }
 }
 
@@ -627,10 +627,7 @@ impl TimerRun for ProcessMigrationsOperation {
             cursor: run.cursor.map(|key| key.to_vec()),
             ..TimerMemory::default()
         };
-        Ok(TimerPlan {
-            after: run.next,
-            memory,
-        })
+        Ok(TimerPlan::keep(run.next, memory))
     }
 }
 
@@ -676,7 +673,7 @@ impl TimerRun for DeliverWakesOperation {
             cursor: delivery.next.map(|key| key.to_vec()),
             ..TimerMemory::default()
         };
-        Ok(TimerPlan { after, memory })
+        Ok(TimerPlan::keep(after, memory))
     }
 }
 
@@ -1432,7 +1429,7 @@ mod tests {
             claimed: Vec::new(),
             lost_attempts: Vec::new(),
         };
-        assert_eq!(plan.memory.handoff, handed);
+        assert_eq!(plan.handoff, handed);
         let failed = DrainJobsOperation::rearm(Err(DrainError("boom".to_string())));
         assert_eq!(failed.unwrap_err().retry_after, DRAIN_RETRY_AFTER);
     }

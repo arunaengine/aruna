@@ -53,20 +53,14 @@ impl PlacementTimerOperation {
 
     /// When the timer runs again after `outcome`, and the ladder it keeps until then.
     fn plan(&self, outcome: PlacementReconcileOutcome) -> TimerPlan {
-        let kept = TimerPlan {
-            after: None,
-            memory: self.memory.clone(),
-        };
+        let kept = TimerPlan::keep(None, self.memory.clone());
         match outcome.status {
             PlacementReconcileStatus::Clean => TimerPlan::default(),
             // New holders only need their co-holders to apply the same config, so the ladder
             // starts prompt and never jumps to the placement interval.
             PlacementReconcileStatus::RetryScheduled if outcome.pull_pending => {
                 let (after, memory) = self.memory.next_retry(PULL_RETRY_AFTER, PULL_RETRY_MAX);
-                TimerPlan {
-                    after: Some(after),
-                    memory,
-                }
+                TimerPlan::keep(Some(after), memory)
             }
             // The reconciler armed its own retry.
             PlacementReconcileStatus::RetryScheduled => kept,

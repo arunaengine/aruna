@@ -42,10 +42,7 @@ impl InfoTimerOperation {
             sequence: self.sequence,
             ..TimerMemory::default()
         };
-        TimerPlan {
-            after: Some(INFO_PUBLISH_INTERVAL),
-            memory,
-        }
+        TimerPlan::keep(Some(INFO_PUBLISH_INTERVAL), memory)
     }
 }
 

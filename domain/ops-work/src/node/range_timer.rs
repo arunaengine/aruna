@@ -110,10 +110,7 @@ impl Operation for RangeTimerOperation {
                     Err(error) => warn!(%error, "Unverified data links could not be retried"),
                 }
                 let memory = self.memory.clone();
-                Ok(Next::Done(TimerPlan {
-                    after: Some(self.after),
-                    memory,
-                }))
+                Ok(Next::Done(TimerPlan::keep(Some(self.after), memory)))
             }
         }
     }
