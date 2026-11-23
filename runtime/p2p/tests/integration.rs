@@ -1,0 +1,885 @@
+//! Integration tests for two net handles: DHT lookups, streams, loopback and realm fan-out.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aruna_clock::testing::poll_until;
+use aruna_core::alpn::Alpn;
+use aruna_core::effects::{DhtEffect, DhtGetOptions, Effect, IterStart, NetEffect, StorageEffect};
+use aruna_core::events::{DhtEvent, Event, NetEvent, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::id::{DhtKeyId, NodeId, TopicId};
+use aruna_core::keys::realm_presence_key;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::info::{ConnectionAddressStatus, NetState, PeerConnectionStatus};
+use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_p2p::error::NetError;
+use aruna_p2p::streams::BiStream;
+use aruna_p2p::{InboundEventHandler, NetHandle};
+use aruna_storage::storage::memory::MemoryStorage;
+use async_trait::async_trait;
+use byteview::ByteView;
+use iroh::endpoint::ReadToEndError;
+use tempfile::tempdir;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Semaphore, mpsc, oneshot};
+use ulid::Ulid;
+
+const NETWORK_HANG_CAP: Duration = Duration::from_secs(45);
+
+fn peer_connected(status: &NetState, node_id: NodeId) -> bool {
+    status.connections.iter().any(|peer| {
+        peer.node_id == node_id
+            && peer.status == PeerConnectionStatus::Connected
+            && peer.active_addresses.iter().any(|address| {
+                address.status == ConnectionAddressStatus::Active
+                    && !address.address.is_empty()
+                    && !address.protocol_connections.is_empty()
+            })
+    })
+}
+
+async fn wait_for_connection(
+    handle: &NetHandle,
+    node_id: NodeId,
+) -> Result<NetState, Box<dyn std::error::Error>> {
+    let connected = poll_until(NETWORK_HANG_CAP, async || {
+        let status = handle.get_status().await;
+        peer_connected(&status, node_id).then_some(status)
+    })
+    .await;
+    Ok(connected.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("connection to {node_id} did not become active"),
+        )
+    })?)
+}
+
+async fn wait_for_dht(handle: &NetHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let found = poll_until(NETWORK_HANG_CAP, async || {
+        (handle.get_status().await.routing_table_size.unwrap_or(0) > 0).then_some(())
+    })
+    .await;
+    found.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "DHT peer never appeared")
+    })?;
+    Ok(())
+}
+
+#[derive(Clone, Default)]
+struct TestInboundHandler {
+    stream_tx: Option<mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>>,
+}
+
+#[async_trait]
+impl InboundEventHandler for TestInboundHandler {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.send((alpn, stream, node_id));
+        }
+    }
+}
+
+/// A single-node handle for the in-process loopback tests.
+async fn local_handle() -> Result<(NetHandle, tempfile::TempDir), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let storage = MemoryStorage::open();
+    let handle = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage,
+    )
+    .await?;
+    Ok((handle, dir))
+}
+
+/// Forwards every inbound stream and returns, so the inbound tracker drains
+/// as soon as the stream was handed over.
+fn forwarding_handler() -> (
+    Arc<TestInboundHandler>,
+    mpsc::UnboundedReceiver<(Alpn, BiStream, NodeId)>,
+) {
+    let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+    (
+        Arc::new(TestInboundHandler {
+            stream_tx: Some(stream_tx),
+        }),
+        stream_rx,
+    )
+}
+
+/// Hands the inbound stream over, then holds the handler until released, so
+/// a test controls whether the drain deadline is met.
+struct HoldingInboundHandler {
+    arrivals: mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>,
+    release: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl InboundEventHandler for HoldingInboundHandler {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+        let _ = self.arrivals.send((alpn, stream, node_id));
+        let _ = self.release.acquire().await;
+    }
+}
+
+#[tokio::test]
+async fn storage_iter_pagination() -> Result<(), Box<dyn std::error::Error>> {
+    let storage = MemoryStorage::open();
+
+    for (k, v) in [
+        (b"a1", b"v1"),
+        (b"a2", b"v2"),
+        (b"a3", b"v3"),
+        (b"b1", b"v4"),
+    ] {
+        let _ = storage
+            .send_effect(Effect::Storage(StorageEffect::Write {
+                key_space: "iter_test".to_string(),
+                key: ByteView::from(*k),
+                value: ByteView::from(*v),
+                txn_id: None,
+            }))
+            .await;
+    }
+
+    let first = storage
+        .send_effect(Effect::Storage(StorageEffect::Iter {
+            key_space: "iter_test".to_string(),
+            prefix: Some(ByteView::from(*b"a")),
+            start: None,
+            limit: 2,
+            txn_id: None,
+        }))
+        .await;
+
+    let (values, next_start_after) = match first {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => (values, next_start_after),
+        other => panic!("unexpected first iter result: {other:?}"),
+    };
+
+    assert_eq!(values.len(), 2);
+    assert_eq!(values[0].0, ByteView::from(*b"a1"));
+    assert_eq!(values[1].0, ByteView::from(*b"a2"));
+    assert_eq!(next_start_after, Some(ByteView::from(*b"a2")));
+
+    let second = storage
+        .send_effect(Effect::Storage(StorageEffect::Iter {
+            key_space: "iter_test".to_string(),
+            prefix: Some(ByteView::from(*b"a")),
+            start: next_start_after.map(IterStart::After),
+            limit: 2,
+            txn_id: None,
+        }))
+        .await;
+
+    match second {
+        Event::Storage(StorageEvent::IterResult {
+            values,
+            next_start_after,
+        }) => {
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].0, ByteView::from(*b"a3"));
+            assert!(next_start_after.is_none());
+        }
+        other => panic!("unexpected second iter result: {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dht_put_get() -> Result<(), Box<dyn std::error::Error>> {
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    wait_for_dht(&handle_a).await?;
+    wait_for_dht(&handle_b).await?;
+
+    let key = aruna_core::id::DhtKeyId::from_bytes([42u8; 32]);
+    let value = b"replicated-value".to_vec();
+
+    let put = handle_a
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
+            key,
+            realm_id: RealmId::from_bytes([1u8; 32]),
+            value: value.clone(),
+            ttl: Duration::from_secs(3600),
+        }))))
+        .await;
+    assert!(
+        matches!(
+            put,
+            Event::Net(NetEvent::Dht(DhtEvent::PutComplete {
+                remote_store_count: 1..,
+                ..
+            }))
+        ),
+        "expected strict PUT to receive a remote acknowledgement, event: {put:?}"
+    );
+
+    let get = handle_b
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
+            key,
+            realm_filter: None,
+            options: DhtGetOptions::default(),
+        }))))
+        .await;
+    let found = match &get {
+        Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, .. })) => {
+            values.iter().any(|entry| entry.value == value)
+        }
+        _ => false,
+    };
+    assert!(
+        found,
+        "expected replicated DHT value on second node, event: {get:?}"
+    );
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn dht_fallback() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(45), dht_fallback_inner())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "DHT fallback test exceeded 45 seconds",
+            )
+        })?
+}
+
+async fn dht_fallback_inner() -> Result<(), Box<dyn std::error::Error>> {
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+    let storage_c = MemoryStorage::open();
+
+    let secret_a = iroh::SecretKey::from_bytes(&[61u8; 32]);
+    let secret_b = iroh::SecretKey::from_bytes(&[62u8; 32]);
+    let secret_c = iroh::SecretKey::from_bytes(&[63u8; 32]);
+    let node_a = secret_a.public();
+    let node_b = secret_b.public();
+    let node_c = secret_c.public();
+    let realm_id = RealmId::from_bytes([31u8; 32]);
+    let discovery_method = DiscoveryMethod::ordered(vec![DiscoveryMethod::DhtSigned {
+        ttl: Duration::from_secs(30),
+        refresh_after: Duration::from_secs(1),
+    }]);
+
+    let cfg = |secret_key: iroh::SecretKey, peer_nodes: Vec<NodeId>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key: Some(secret_key),
+        realm_id,
+        peer_nodes,
+        discovery_method: discovery_method.clone(),
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(secret_a, vec![node_b, node_c]), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(secret_b, vec![node_a, node_c]), storage_b).await?;
+    let handle_c = NetHandle::new(cfg(secret_c, vec![node_a, node_b]), storage_c).await?;
+
+    let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    realm_config.ensure_node(node_a, RealmNodeKind::Management);
+    realm_config.ensure_node(node_b, RealmNodeKind::Management);
+    realm_config.ensure_node(node_c, RealmNodeKind::Management);
+    handle_a.refresh_document_peers(&realm_config).await?;
+    handle_b.refresh_document_peers(&realm_config).await?;
+    handle_c.refresh_document_peers(&realm_config).await?;
+
+    let (stream_tx, stream_rx) = mpsc::unbounded_channel();
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
+        stream_tx: Some(stream_tx),
+    }));
+
+    handle_a.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_c.add_peer_addr(handle_b.endpoint_addr()).await;
+
+    let opened_stream = poll_until(NETWORK_HANG_CAP, async || {
+        handle_a.open_stream(node_b, Alpn::Bao).await.ok()
+    })
+    .await
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "DHT-signed fallback did not resolve node_b",
+        )
+    })?;
+
+    let status = wait_for_connection(&handle_a, node_b).await?;
+    assert!(status.discovery_methods.contains(&"dht_signed".to_string()));
+    assert!(status.requests.total > 0);
+    assert!(peer_connected(&status, node_b));
+
+    drop(opened_stream);
+    drop(stream_rx);
+    tokio::join!(
+        handle_a.shutdown(),
+        handle_b.shutdown(),
+        handle_c.shutdown()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn stream_send_receive() -> Result<(), Box<dyn std::error::Error>> {
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler {
+        stream_tx: Some(stream_tx),
+    }));
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let mut stream = handle_a.open_stream(handle_b.node_id(), Alpn::Bao).await?;
+    stream
+        .0
+        .write_all(b"hello stream")
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to write outbound stream data: {e}")))?;
+
+    let (incoming_alpn, mut incoming_stream, _node_id) =
+        tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+            .await?
+            .ok_or("expected inbound stream")?;
+    assert_eq!(incoming_alpn, Alpn::Bao);
+
+    let mut chunk = vec![0u8; b"hello stream".len()];
+    incoming_stream
+        .1
+        .read_exact(&mut chunk)
+        .await
+        .map_err(|e| std::io::Error::other(format!("failed to read inbound stream data: {e}")))?;
+    assert_eq!(chunk, b"hello stream".to_vec());
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+    Ok(())
+}
+
+// A same-node stream must still reach the handler after admission closes
+// (the writer-drain window), and the final closure rejects it.
+#[tokio::test]
+async fn loopback_survives_admission() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let (handler, mut stream_rx) = forwarding_handler();
+    handle.set_inbound_handler(handler);
+
+    let mut first = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut first_inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    first.0.write_all(b"before").await?;
+    let mut seen = [0u8; 6];
+    first_inbound.1.read_exact(&mut seen).await?;
+    assert_eq!(&seen, b"before");
+
+    handle.close_admission();
+
+    // Writer-drain window: same-node work still reaches the handler.
+    let mut second = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut second_inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback must stay open while writers drain")?;
+    second.0.write_all(b"during").await?;
+    let mut seen = [0u8; 6];
+    second_inbound.1.read_exact(&mut seen).await?;
+    assert_eq!(&seen, b"during");
+
+    let outcome = handle.shutdown_with_drain(Duration::from_millis(100)).await;
+    assert!(outcome.complete(), "handlers drained: {outcome:?}");
+
+    let rejected = handle.open_stream(handle.node_id(), Alpn::Bao).await;
+    assert!(
+        rejected.is_err(),
+        "loopback must be closed after final shutdown"
+    );
+    Ok(())
+}
+
+// A parked local read and a blocked local write both wake with an error when
+// the final shutdown closes the loopback.
+#[tokio::test]
+async fn loopback_io_wakes() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let (handler, mut stream_rx) = forwarding_handler();
+    handle.set_inbound_handler(handler);
+
+    let dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    let send = dialed.0;
+    let recv = dialed.1;
+
+    // A write larger than the 64 KiB pipe blocks; the read has no writer.
+    let (write_done, mut write_result) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut send = send;
+        let payload = vec![0u8; 128 * 1024];
+        let _ = write_done.send(send.write_all(&payload).await);
+    });
+    let (read_done, mut read_result) = oneshot::channel();
+    tokio::spawn(async move {
+        let mut recv = recv;
+        let mut buf = [0u8; 8];
+        let _ = read_done.send(recv.read(&mut buf).await);
+    });
+
+    // Bounded check: neither can finish while its peer half stays idle here.
+    let parked = tokio::time::timeout(Duration::from_millis(200), async {
+        tokio::join!(&mut read_result, &mut write_result)
+    })
+    .await;
+    assert!(
+        parked.is_err(),
+        "local IO must park while its peer half is idle"
+    );
+
+    let outcome = handle.shutdown_with_drain(Duration::from_millis(100)).await;
+    assert!(outcome.complete(), "no handler is pending: {outcome:?}");
+
+    let read = tokio::time::timeout(Duration::from_secs(5), read_result).await?;
+    assert!(
+        read.map_err(|error| std::io::Error::other(error.to_string()))?
+            .is_err(),
+        "a parked local read must fail at final shutdown"
+    );
+    let write = tokio::time::timeout(Duration::from_secs(5), write_result).await?;
+    assert!(
+        write
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .is_err(),
+        "a blocked local write must fail at final shutdown"
+    );
+
+    drop(inbound);
+    Ok(())
+}
+
+// A handler that outlives its drain deadline keeps the first attempt
+// incomplete; releasing it lets a resumed shutdown join and complete.
+#[tokio::test]
+async fn loopback_shutdown_resumes() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let release = Arc::new(Semaphore::new(0));
+    let (arrivals, mut stream_rx) = mpsc::unbounded_channel();
+    handle.set_inbound_handler(Arc::new(HoldingInboundHandler {
+        arrivals,
+        release: release.clone(),
+    }));
+
+    let dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, held, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("held handler must receive the loopback stream")?;
+
+    let interrupted = handle.shutdown_with_drain(Duration::from_millis(50)).await;
+    assert!(
+        !interrupted.complete(),
+        "held handler must keep the shutdown incomplete: {interrupted:?}"
+    );
+    assert_eq!(interrupted.inbound_pending, 1);
+
+    release.add_permits(1);
+    let resumed = tokio::time::timeout(
+        Duration::from_secs(30),
+        handle.shutdown_with_drain(Duration::from_millis(500)),
+    )
+    .await?;
+    assert!(
+        resumed.complete(),
+        "the resumed shutdown joins the released handler: {resumed:?}"
+    );
+
+    drop((dialed, held));
+    Ok(())
+}
+
+// Normal loopback stream semantics: half-close, reset, and the read limit.
+#[tokio::test]
+async fn loopback_stream_bounds() -> Result<(), Box<dyn std::error::Error>> {
+    let (handle, _dir) = local_handle().await?;
+    let (handler, mut stream_rx) = forwarding_handler();
+    handle.set_inbound_handler(handler);
+
+    // Half-close: finish ends the write direction, the reader sees EOF.
+    let mut dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    dialed.0.write_all(b"payload").await?;
+    dialed
+        .0
+        .finish()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let body = inbound
+        .1
+        .read_to_end(64)
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    assert_eq!(body, b"payload".to_vec());
+
+    // Reset: stop drops the read direction; the writer then sees a broken pipe.
+    let mut dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    dialed.0.write_all(b"early").await?;
+    inbound
+        .1
+        .stop(0u32.into())
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let payload = vec![0u8; 128 * 1024];
+    let reset = dialed
+        .0
+        .write_all(&payload)
+        .await
+        .expect_err("a stopped local read must break the writer");
+    assert_eq!(reset.kind(), std::io::ErrorKind::BrokenPipe);
+
+    // Size limit: one byte over the limit fails with TooLong.
+    let mut dialed = handle.open_stream(handle.node_id(), Alpn::Bao).await?;
+    let (_, mut inbound, _) = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
+        .await?
+        .ok_or("loopback stream must reach the handler")?;
+    dialed.0.write_all(b"x").await?;
+    dialed
+        .0
+        .finish()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let limited = inbound.1.read_to_end(0).await;
+    assert!(matches!(limited, Err(ReadToEndError::TooLong)));
+
+    handle.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rejects_internal_alpn() -> Result<(), Box<dyn std::error::Error>> {
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+
+    let cfg = || NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(), storage_b).await?;
+
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+
+    let error = handle_a
+        .open_stream(handle_b.node_id(), Alpn::Dht)
+        .await
+        .expect_err("DHT streams are internal to the DHT service");
+    assert!(matches!(error, NetError::Stream(_)));
+
+    handle_a.shutdown().await;
+    handle_b.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn offline_peer_bounded() -> Result<(), Box<dyn std::error::Error>> {
+    // Repeated requests to a peer that went away must not repay a dial each
+    // time, and the peer must become reachable again once its address returns.
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+    let storage_c = MemoryStorage::open();
+
+    let secret_b = iroh::SecretKey::from_bytes(&[71u8; 32]);
+    let node_b = secret_b.public();
+    let cfg = |secret_key: Option<iroh::SecretKey>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+
+    let handle_a = NetHandle::new(cfg(None), storage_a).await?;
+    let handle_b = NetHandle::new(cfg(Some(secret_b.clone())), storage_b).await?;
+    handle_a.add_peer_addr(handle_b.endpoint_addr()).await;
+    handle_b.add_peer_addr(handle_a.endpoint_addr()).await;
+    handle_b.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+
+    handle_a
+        .open_stream(node_b, Alpn::Bao)
+        .await
+        .expect("reachable peer accepts a stream");
+
+    handle_b.shutdown().await;
+    let before = handle_a.pool_counts();
+    let after = poll_until(NETWORK_HANG_CAP, async || {
+        assert!(handle_a.open_stream(node_b, Alpn::Bao).await.is_err());
+        let counts = handle_a.pool_counts();
+        (counts.cooldown_hits > before.cooldown_hits).then_some(counts)
+    })
+    .await
+    .ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "offline peer never entered dial cooldown",
+        )
+    })?;
+
+    assert!(
+        after.dials - before.dials < 5,
+        "expected the cooldown to suppress dials, saw {}",
+        after.dials - before.dials
+    );
+    assert!(after.cooldown_hits > before.cooldown_hits);
+
+    let handle_c = NetHandle::new(cfg(Some(secret_b)), storage_c).await?;
+    handle_c.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    handle_a.add_peer_addr(handle_c.endpoint_addr()).await;
+    handle_a
+        .open_stream(node_b, Alpn::Bao)
+        .await
+        .expect("returned peer is reachable again");
+
+    handle_a.shutdown().await;
+    handle_c.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn realm_fanout_recovers() -> Result<(), Box<dyn std::error::Error>> {
+    tokio::time::timeout(Duration::from_secs(120), realm_fanout_inner())
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "realm fan-out test exceeded 120 seconds",
+            )
+        })?
+}
+
+struct RealmFixture {
+    a: NetHandle,
+    b: NetHandle,
+    c: NetHandle,
+    b_storage: aruna_storage::storage::handle::StorageHandle,
+    b_secret: iroh::SecretKey,
+    node_b: NodeId,
+    node_c: NodeId,
+    realm_id: RealmId,
+    _dirs: (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir),
+}
+
+async fn setup_realm() -> Result<RealmFixture, Box<dyn std::error::Error>> {
+    let realm_id = RealmId::from_bytes([72u8; 32]);
+    let temp_a = tempdir()?;
+    let temp_b = tempdir()?;
+    let temp_c = tempdir()?;
+    let storage_a = MemoryStorage::open();
+    let storage_b = MemoryStorage::open();
+    let b_storage = storage_b.clone();
+    let storage_c = MemoryStorage::open();
+    let secret_a = iroh::SecretKey::from_bytes(&[72u8; 32]);
+    let b_secret = iroh::SecretKey::from_bytes(&[73u8; 32]);
+    let secret_c = iroh::SecretKey::from_bytes(&[74u8; 32]);
+    let node_b = b_secret.public();
+    let node_c = secret_c.public();
+    let cfg = |secret_key: iroh::SecretKey, peers: Vec<NodeId>| NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key: Some(secret_key),
+        realm_id,
+        peer_nodes: peers,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    };
+    let a = NetHandle::new(cfg(secret_a, vec![node_b, node_c]), storage_a).await?;
+    let b = NetHandle::new(cfg(b_secret.clone(), vec![a.node_id(), node_c]), storage_b).await?;
+    let c = NetHandle::new(cfg(secret_c, vec![a.node_id(), node_b]), storage_c).await?;
+    a.add_peer_addr(b.endpoint_addr()).await;
+    a.add_peer_addr(c.endpoint_addr()).await;
+    b.add_peer_addr(a.endpoint_addr()).await;
+    c.add_peer_addr(a.endpoint_addr()).await;
+    c.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    Ok(RealmFixture {
+        a,
+        b,
+        c,
+        b_storage,
+        b_secret,
+        node_b,
+        node_c,
+        realm_id,
+        _dirs: (temp_a, temp_b, temp_c),
+    })
+}
+
+async fn seed_presence(
+    handle: &NetHandle,
+    key: DhtKeyId,
+    realm_id: RealmId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let published = handle
+        .send_effect(Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Put {
+            key,
+            realm_id,
+            value: Vec::new(),
+            ttl: Duration::from_secs(300),
+        }))))
+        .await;
+    assert!(matches!(
+        published,
+        Event::Net(NetEvent::Dht(DhtEvent::PutComplete { .. }))
+    ));
+    Ok(())
+}
+
+async fn realm_fanout_inner() -> Result<(), Box<dyn std::error::Error>> {
+    // Exercise the same DHT and metadata stream paths used by process routes
+    // while one configured peer is unavailable and then returns.
+    let fixture = setup_realm().await?;
+    let realm_id = fixture.realm_id;
+    let key = realm_presence_key(&realm_id);
+    seed_presence(&fixture.b, key, realm_id).await?;
+
+    fixture.b.shutdown().await;
+    let first = fixture.a.pool_counts();
+    let request = || {
+        Effect::Net(NetEffect::Dht(Box::new(DhtEffect::Get {
+            key,
+            realm_filter: Some(realm_id),
+            options: DhtGetOptions::presence(Duration::from_secs(4), realm_id),
+        })))
+    };
+    let _ = fixture.a.send_effect(request()).await;
+    let after_first = fixture.a.pool_counts();
+    assert!(after_first.dials > first.dials);
+    let _ = fixture.a.send_effect(request()).await;
+    let after_retry = fixture.a.pool_counts();
+    assert_eq!(after_retry.dials, after_first.dials);
+
+    let failed_metadata = fixture.a.open_stream(fixture.node_b, Alpn::Metadata).await;
+    assert!(failed_metadata.is_err());
+    let partial = fixture
+        .a
+        .open_stream(fixture.node_c, Alpn::Metadata)
+        .await?;
+    drop(partial);
+
+    let restarted = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+            secret_key: Some(fixture.b_secret.clone()),
+            realm_id,
+            peer_nodes: vec![fixture.a.node_id(), fixture.node_c],
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        fixture.b_storage,
+    )
+    .await?;
+    restarted.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    fixture.a.add_peer_addr(restarted.endpoint_addr()).await;
+    let before_return = fixture.a.pool_counts();
+    let recovered = fixture.a.send_effect(request()).await;
+    assert!(matches!(
+        recovered,
+        Event::Net(NetEvent::Dht(DhtEvent::GetResult { values, stale: false, .. }))
+            if values.iter().any(|entry| entry.node_id == fixture.node_b)
+    ));
+    let after_return = fixture.a.pool_counts();
+    assert_eq!(after_return.dials - before_return.dials, 1);
+
+    let metadata = fixture
+        .a
+        .open_stream(fixture.node_b, Alpn::Metadata)
+        .await?;
+    drop(metadata);
+    tokio::join!(
+        fixture.a.shutdown(),
+        fixture.c.shutdown(),
+        restarted.shutdown()
+    );
+    Ok(())
+}
+
+#[test]
+fn dht_key_hashing() {
+    let key1 = DhtKeyId::from_data(b"test-key");
+    let key2 = DhtKeyId::from_data(b"test-key");
+    let key3 = DhtKeyId::from_data(b"different-key");
+
+    assert_eq!(key1, key2);
+    assert_eq!(key1.as_bytes(), key2.as_bytes());
+    assert_ne!(key1, key3);
+    assert!(key1.as_bytes().iter().any(|&b| b != 0));
+
+    let bytes = *key1.as_bytes();
+    let key4 = DhtKeyId::from_bytes(bytes);
+    assert_eq!(key1, key4);
+}
+
+#[test]
+fn topic_id_creation() {
+    let realm_id = RealmId::from_bytes([3u8; 32]);
+    let topic1 = TopicId::realm(realm_id);
+
+    let bytes = topic1.to_bytes();
+    let topic2 = TopicId::from_bytes(&bytes).expect("topic roundtrip");
+    assert_eq!(topic1, topic2);
+
+    let group_id = Ulid::generate();
+    let topic3 = TopicId::group(group_id);
+    let topic4 = TopicId::group(group_id);
+    let topic5 = TopicId::group(Ulid::generate());
+
+    assert_eq!(topic3, topic4);
+    assert_ne!(topic3, topic5);
+}

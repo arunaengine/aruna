@@ -1,0 +1,413 @@
+//! Declares the shared error enums for authorization, blob, staging, storage, DHT and streams.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::structs::execution::source_connector::SourceConnectorKind;
+use crate::structs::storage::blob::BackendLocation;
+use std::array::TryFromSliceError;
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum AuthorizationError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    GlobError(#[from] globset::Error),
+    #[error(transparent)]
+    RestrictionLimit(#[from] crate::permission_path::RestrictionLimitError),
+    #[error("No transaction found")]
+    NoTransactionFound,
+    #[error("Invalid realm id")]
+    InvalidRealmId,
+    #[error("Invalid group id")]
+    InvalidGroupId,
+    #[error("No group found")]
+    GroupNotFound,
+    #[error("Authorization document not found")]
+    DocNotFound,
+    #[error("Authorization did not finish")]
+    NotFinished,
+    #[error("Unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: String,
+    },
+}
+
+#[derive(Debug, Error, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum BlobError {
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error("Cleanup is unsupported by the backend")]
+    CleanupUnsupported,
+    #[error("The storage cannot create a file only while its name is free")]
+    ConditionalUnsupported,
+    #[error("The storage cannot copy a file inside itself")]
+    CopyUnsupported,
+    #[error("Failed to send message")]
+    SendError,
+    #[error("Invalid effect type")]
+    InvalidEffect,
+    #[error("Blob handle missing")]
+    HandleMissing,
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("failed to create bucket: {0}")]
+    MakeBucketError(String),
+    #[error("Operator creation failed: {0}")]
+    OperatorCreationFailed(String),
+    /// A stored record names a backend this node does not have registered.
+    #[error("unknown storage backend {0}")]
+    UnknownBackend(String),
+    #[error("Outboard creation failed: {0}")]
+    OutboardCreationFailed(String),
+    #[error("Failed to open connection: {0}")]
+    ConnectionFailed(String),
+    /// Server-side write fault: backend writer, close, or operator failure.
+    #[error("Write error: {0}")]
+    WriteError(String),
+    /// Client-sourced body stream fault; the request, not the node, is at fault.
+    #[error("Stream failed: {0}")]
+    StreamFailed(String),
+    /// The output location must be handed to durable cleanup before releasing capacity.
+    #[error("Write cleanup failed for {location:?}: {message}")]
+    WriteCleanup {
+        location: BackendLocation,
+        message: String,
+    },
+    #[error("Blob exceeds the {limit} byte limit")]
+    SizeLimitExceeded { limit: u64 },
+    #[error("Read error: {0}")]
+    ReadError(String),
+    #[error("List error: {0}")]
+    ListError(String),
+    #[error("Delete error: {0}")]
+    DeleteError(String),
+    #[error("Integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
+    #[error("Replication rejected: {0}")]
+    ReplicationRejected(String),
+    #[error("Replication failed: {0}")]
+    ReplicationFailed(String),
+    #[error("Blob storage is closed for shutdown")]
+    Closed,
+    #[error(transparent)]
+    BucketKey(#[from] crate::structs::storage::encryption::BucketKeyError),
+    #[error(transparent)]
+    Abe(#[from] crate::structs::storage::abe::AbeError),
+    /// A conditional write found a file already at the path.
+    #[error("Another file took the path first")]
+    PathTaken,
+    /// This one object cannot be read: it is gone, or its key cannot be read exactly.
+    #[error("Object cannot be read: {0}")]
+    Unreadable(String),
+    /// The backend key would be longer than group storages accept.
+    #[error("The path is too long for this storage: keys are at most 1024 bytes")]
+    KeyTooLong,
+    /// Local spools together would exceed their disk budget or file count; a retry may fit.
+    #[error("Local spools would exceed their {limit} byte budget or their file count")]
+    SpoolBudgetExhausted { limit: u64 },
+    /// One local spool would need more than the whole spool budget; no retry can fit it.
+    #[error("A local spool cannot hold more than {limit} bytes")]
+    SpoolTooLarge { limit: u64 },
+}
+
+impl BlobError {
+    /// The message without the error kind in front, for short reasons shown to users.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::WriteError(message)
+            | Self::DeleteError(message)
+            | Self::ReadError(message)
+            | Self::ListError(message)
+            | Self::MakeBucketError(message)
+            | Self::OperatorCreationFailed(message)
+            | Self::UnknownBackend(message) => message.clone(),
+            other => other.to_string(),
+        }
+    }
+}
+
+impl From<crate::calls::IoError> for BlobError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum StagingSourceError {
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error("Invalid effect type")]
+    InvalidEffect,
+    #[error("Staging source handle missing")]
+    HandleMissing,
+    #[error("Staging source not found")]
+    NotFound,
+    #[error("Access denied")]
+    AccessDenied,
+    #[error("Unsupported staging source kind `{0}`")]
+    UnsupportedKind(String),
+    #[error("Operator creation failed: {0}")]
+    OperatorCreationFailed(String),
+    /// A required connector setting is absent; names the setting, never a value.
+    #[error("the connector configuration names no {0}")]
+    MissingSetting(&'static str),
+    #[error("Check error: {0}")]
+    CheckError(String),
+    #[error("Stat error: {0}")]
+    StatError(String),
+    #[error("List error: {0}")]
+    ListError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+    /// The source changed while it was being read, so the bytes are not one
+    /// representation. Retryable, and never an identity.
+    #[error("Source changed during the read")]
+    SourceUnstable,
+    #[error("Invalid listing request: {0}")]
+    InvalidListing(String),
+    /// The source no longer holds the representation the read was bound to.
+    #[error("Source changed since its observation was recorded")]
+    ConditionFailed,
+    #[error(transparent)]
+    EgressDenied(#[from] crate::egress::EgressError),
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum SourceResolutionError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error("Connector not found")]
+    NotFound,
+    #[error("Connector kind `{0}` is not supported in Phase 3")]
+    UnsupportedConnectorKind(SourceConnectorKind),
+    #[error("Source path must be relative to connector root")]
+    InvalidSourcePath,
+    #[error("Source connector resolution failed")]
+    ResolveFailed,
+}
+
+/// A runner failure as a read error of the source.
+impl From<crate::calls::IoError> for StagingSourceError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::ReadError(error.to_string())
+    }
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for SourceResolutionError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::StorageError(StorageError::from(error))
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq, Clone)]
+pub enum StorageError {
+    #[error("Key not found")]
+    KeyNotFound,
+    #[error("Transaction conflict")]
+    TransactionConflict,
+    /// A commit that neither succeeded nor was refused. Its writes may still
+    /// become durable, so a caller must not undo what the commit would own.
+    #[error("Commit failed")]
+    CommitFailed,
+    #[error("Transaction not found")]
+    TransactionNotFound,
+    /// Transaction-cleanup tracking is full, so the effect was never enqueued.
+    /// Distinct from a conflict: re-running the same effect only spins.
+    #[error("Transaction cleanup capacity exhausted")]
+    CleanupCapacity,
+    #[error("Keyspace error: {0}")]
+    KeyspaceError(String),
+    #[error("Read error: {0}")]
+    ReadError(String),
+    #[error("Write error: {0}")]
+    WriteError(String),
+    #[error("Delete error")]
+    DeleteError,
+    #[error("Persist error: {0}")]
+    PersistError(String),
+    #[error("Channel closed")]
+    ChannelClosed,
+    #[error("Queue full")]
+    QueueFull,
+    #[error("Timeout")]
+    Timeout,
+    #[error("Invalid effect type")]
+    InvalidEffect,
+    #[error("Storage is closed for shutdown")]
+    Closed,
+    /// A commit storage refused before applying it, for the cause given: its writes are gone.
+    #[error("Transaction rolled back: {0}")]
+    RolledBack(Box<StorageError>),
+}
+
+impl StorageError {
+    /// Whether a failed `CommitTransaction` proves the transaction's writes were discarded: refused by the
+    /// conflict check, or never handed to the storage actor at all. Every other failure leaves the commit
+    /// either already applied or unknown, so its records may exist.
+    pub fn proves_no_commit(&self) -> bool {
+        matches!(
+            self,
+            Self::TransactionConflict
+                | Self::QueueFull
+                | Self::CleanupCapacity
+                | Self::RolledBack(_)
+        )
+    }
+
+    /// Whether the same work may succeed later: a missing key or a malformed effect never does.
+    pub fn is_transient(&self) -> bool {
+        !matches!(self, Self::KeyNotFound | Self::InvalidEffect)
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum DhtError {
+    #[error("Key not found")]
+    KeyNotFound,
+    #[error("Store failed: {0}")]
+    StoreFailed(String),
+    #[error("Storage full")]
+    StorageFull,
+    #[error("Other: {0}")]
+    Other(String),
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum StreamError {
+    #[error("Connection failed: {0}")]
+    ConnectionFailed(String),
+    #[error("Stream closed")]
+    StreamClosed,
+    #[error("Other: {0}")]
+    Other(String),
+}
+
+/// Why a stored row could not be read or decoded.
+#[derive(Debug, Error, PartialEq)]
+pub enum StorageReadError {
+    #[error(transparent)]
+    Storage(StorageError),
+    #[error(transparent)]
+    Conversion(ConversionError),
+}
+
+impl From<StorageReadError> for SourceResolutionError {
+    fn from(value: StorageReadError) -> Self {
+        match value {
+            StorageReadError::Storage(error) => Self::StorageError(error),
+            StorageReadError::Conversion(error) => Self::ConversionError(error),
+        }
+    }
+}
+
+/// A runner failure as a storage failure; one that is none reads as a read error.
+impl From<crate::calls::IoError> for StorageReadError {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::Storage(StorageError::from(error))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum ConversionError {
+    #[error(transparent)]
+    UlidDecodeError(#[from] ulid::DecodeError),
+    #[error(transparent)]
+    Base64DecodeError(#[from] base64::DecodeError),
+    #[error("`{0}`")]
+    InvalidLength(String),
+    #[error("Invalid UserId")]
+    InvalidUserId,
+    #[error("Invalid session claim")]
+    InvalidSessionClaim,
+    #[error(transparent)]
+    PostcardError(#[from] postcard::Error),
+    #[error(transparent)]
+    FromUtf8Error(#[from] std::string::FromUtf8Error),
+    #[error("Failed to convert from str: {0}")]
+    FromStrError(String),
+    #[error("Failed to convert OsString to String")]
+    OsStringError,
+    #[error("Unsafe path: {0}")]
+    UnsafePath(String),
+    #[error(transparent)]
+    ParseIntError(#[from] std::num::ParseIntError),
+    #[error(transparent)]
+    SerdeJsonError(#[from] serde_json::Error),
+    #[error(transparent)]
+    PublicKeyError(#[from] ed25519_dalek::ed25519::Error),
+    #[error(transparent)]
+    FromSliceError(#[from] TryFromSliceError),
+    #[error(transparent)]
+    PublicConversionError(#[from] ed25519_dalek::pkcs8::spki::Error),
+    #[error(transparent)]
+    PrivateConversionError(#[from] ed25519_dalek::pkcs8::Error),
+    #[error("Invalid string `{0}` for Operation")]
+    InvalidOperationConversion(String),
+    #[error("RO-Crate conversion error: {0}")]
+    RoCrateError(String),
+    #[error(transparent)]
+    PlacementPolicyError(#[from] crate::structs::placement::policy::PlacementPolicyError),
+    #[error(transparent)]
+    AdvertisementError(#[from] crate::compute::AdvertisementError),
+    #[error("policy refs must be sorted and deduplicated")]
+    NonCanonicalRefs,
+    /// A monotonic head generation must never wrap: a wrapped pointer would
+    /// compare equal to an older one and silently win the convergent order.
+    #[error("object head generation is exhausted")]
+    HeadGenerationExhausted,
+    #[error(transparent)]
+    BucketKey(#[from] crate::structs::storage::encryption::BucketKeyError),
+}
+
+impl PartialEq for ConversionError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::UlidDecodeError(left), Self::UlidDecodeError(right)) => left == right,
+            (Self::Base64DecodeError(left), Self::Base64DecodeError(right)) => left == right,
+            (Self::InvalidLength(left), Self::InvalidLength(right)) => left == right,
+            (Self::InvalidUserId, Self::InvalidUserId) => true,
+            (Self::InvalidSessionClaim, Self::InvalidSessionClaim) => true,
+            (Self::PostcardError(left), Self::PostcardError(right)) => left == right,
+            (Self::FromUtf8Error(left), Self::FromUtf8Error(right)) => left == right,
+            (Self::FromStrError(left), Self::FromStrError(right)) => left == right,
+            (Self::OsStringError, Self::OsStringError) => true,
+            (Self::UnsafePath(left), Self::UnsafePath(right)) => left == right,
+            (Self::ParseIntError(left), Self::ParseIntError(right)) => left == right,
+            // serde_json, signature and slice errors lack PartialEq, so compare renderings.
+            (Self::SerdeJsonError(left), Self::SerdeJsonError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::PublicKeyError(left), Self::PublicKeyError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::FromSliceError(left), Self::FromSliceError(right)) => {
+                left.to_string() == right.to_string()
+            }
+            (Self::PublicConversionError(left), Self::PublicConversionError(right)) => {
+                left == right
+            }
+            (Self::PrivateConversionError(left), Self::PrivateConversionError(right)) => {
+                left == right
+            }
+            (Self::InvalidOperationConversion(left), Self::InvalidOperationConversion(right)) => {
+                left == right
+            }
+            (Self::RoCrateError(left), Self::RoCrateError(right)) => left == right,
+            (Self::PlacementPolicyError(left), Self::PlacementPolicyError(right)) => left == right,
+            (Self::AdvertisementError(left), Self::AdvertisementError(right)) => left == right,
+            (Self::NonCanonicalRefs, Self::NonCanonicalRefs) => true,
+            (Self::HeadGenerationExhausted, Self::HeadGenerationExhausted) => true,
+            (Self::BucketKey(left), Self::BucketKey(right)) => left == right,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}

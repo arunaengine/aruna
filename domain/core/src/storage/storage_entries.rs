@@ -1,0 +1,1492 @@
+//! Builds the keys and values that records use in each keyspace, and parses them back.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use byteview::ByteView;
+use ulid::Ulid;
+
+use crate::admin_documents::AdminDocumentTarget;
+use crate::document::{
+    DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision, DocumentTarget,
+    ShardManifestEntry,
+};
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::keyspaces::{
+    COMMIT_MESSAGE_KEYSPACE, CREATE_ACCEPTANCE_KEYSPACE, DEAD_LETTER_KEYSPACE,
+    DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_JOB_KEYSPACE,
+    DOCUMENT_LIFECYCLE_KEYSPACE, DOCUMENT_STATE_KEYSPACE, EVENT_LOG_KEYSPACE, EVENT_SIZE_KEYSPACE,
+    GRAPH_LIFECYCLE_KEYSPACE, IRI_INDEX_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+    NOTIFICATION_INBOX_KEYSPACE, NOTIFICATION_OUTBOX_KEYSPACE, PENDING_PROJECTION_KEYSPACE,
+    PRUNE_INDEX_KEYSPACE, PRUNE_JOB_KEYSPACE, RAW_BUDGET_KEYSPACE, SHARD_MANIFEST_KEYSPACE,
+    SUBJECT_INDEX_KEYSPACE, SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE, UPDATED_INDEX_KEYSPACE,
+    VALIDATION_STATUS_KEYSPACE, WATCH_SUBSCRIPTIONS_KEYSPACE,
+};
+use crate::metadata::{
+    DeadLetterRecord, EventSize, GraphLifecycleRecord, GraphPruneRecord, IriIndexRecord,
+    MaterializationStatusRecord, MetadataEventRecord, MetadataLifecycleRecord,
+    MetadataMaterializationRecord, ProfileValidationStatus, RawOriginBudget,
+};
+use crate::reducer::{AdminConflict, AdminDocumentState};
+use crate::structs::execution::notification::{
+    NotificationOutboxRecord, NotificationRecord, notification_inbox_key, notification_outbox_key,
+    notification_prune_key,
+};
+use crate::structs::execution::notification_watch::{WatchSubscription, watch_subscription_key};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::user::User;
+use crate::structs::placement::record::{PLACEMENT_EPOCH_PAD, PlacementRef};
+use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+use crate::types::{GroupId, Key, KeySpace, Value};
+use crate::user::id::UserId;
+
+pub fn subject_index_key(subject_id: &str) -> Key {
+    ByteView::from(subject_id.as_bytes().to_vec())
+}
+
+pub fn subject_index_value(user_id: UserId) -> Value {
+    ByteView::from(user_id.to_storage_key())
+}
+
+pub fn subject_index_writes(user: &User) -> Vec<(KeySpace, Key, Value)> {
+    user.subject_ids
+        .iter()
+        .map(|subject_id| {
+            (
+                SUBJECT_INDEX_KEYSPACE.to_string(),
+                subject_index_key(subject_id),
+                subject_index_value(user.user_id),
+            )
+        })
+        .collect()
+}
+
+pub fn stale_subject_deletes(
+    previous: Option<&User>,
+    current: Option<&User>,
+) -> Vec<(KeySpace, Key)> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    previous
+        .subject_ids
+        .iter()
+        .filter(|subject_id| {
+            current
+                .map(|user| !user.subject_ids.contains(*subject_id))
+                .unwrap_or(true)
+        })
+        .map(|subject_id| {
+            (
+                SUBJECT_INDEX_KEYSPACE.to_string(),
+                subject_index_key(subject_id),
+            )
+        })
+        .collect()
+}
+
+pub fn metadata_registry_key(group_id: GroupId, document_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&group_id.to_bytes());
+    bytes.extend_from_slice(&document_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// Registry index key: `updated_at_ms (big-endian) || document_id`. It omits a realm prefix while
+/// nodes are single-realm and registry-complete; multi-realm support must add one.
+pub fn updated_index_key(updated_at_ms: u64, document_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&updated_at_ms.to_be_bytes());
+    bytes.extend_from_slice(&document_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn parse_updated_key(key: &[u8]) -> Result<(u64, Ulid), ConversionError> {
+    if key.len() != 24 {
+        return Err(ConversionError::InvalidLength(format!(
+            "expected 24-byte metadata updated index key, got {}",
+            key.len()
+        )));
+    }
+    let updated_at_ms = u64::from_be_bytes(key[..8].try_into()?);
+    let document_id = Ulid::from_bytes(key[8..24].try_into()?);
+    Ok((updated_at_ms, document_id))
+}
+
+/// The timestamp-index entry for a registry record. Written in the same batch as
+/// the record so the new key is atomic; the prior key (at the old timestamp) is
+/// left for lazy cleanup, which only ever over-lists and never under-lists.
+pub fn updated_index_entry(record: &MetadataRegistryRecord) -> (KeySpace, Key, Value) {
+    (
+        UPDATED_INDEX_KEYSPACE.to_string(),
+        updated_index_key(record.updated_at_ms, record.document_id),
+        ByteView::from(Vec::new()),
+    )
+}
+
+pub fn metadata_registry_prefix(group_id: GroupId) -> Key {
+    ByteView::from(group_id.to_bytes().to_vec())
+}
+
+pub fn metadata_document_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+/// Prefix of the IRI index rows that name `object_iri`, under any predicate.
+pub fn iri_object_prefix(object_iri: &str) -> Key {
+    ByteView::from(blake3::hash(object_iri.as_bytes()).as_bytes().to_vec())
+}
+
+/// Prefix of the IRI index rows that name `object_iri` under `predicate_iri`: object first.
+pub fn iri_reference_prefix(predicate_iri: &str, object_iri: &str) -> Key {
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(blake3::hash(object_iri.as_bytes()).as_bytes());
+    bytes.extend_from_slice(blake3::hash(predicate_iri.as_bytes()).as_bytes());
+    ByteView::from(bytes)
+}
+
+/// One row per object, predicate and document; the document cursor lives in the value.
+pub fn iri_reference_key(predicate_iri: &str, object_iri: &str, document_id: Ulid) -> Key {
+    let mut bytes = iri_reference_prefix(predicate_iri, object_iri)
+        .as_ref()
+        .to_vec();
+    bytes.extend_from_slice(&document_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// Document id at the end of an IRI index key, or `None` when the key is not the expected
+/// 80-byte layout.
+pub fn iri_reference_document(key: &[u8]) -> Option<Ulid> {
+    let bytes: [u8; 16] = key.get(64..)?.try_into().ok()?;
+    Some(Ulid::from_bytes(bytes))
+}
+
+pub fn create_acceptance_key(document_id: Ulid) -> Key {
+    metadata_document_key(document_id)
+}
+
+pub fn graph_lifecycle_key(graph_iri: &str) -> Key {
+    ByteView::from(blake3::hash(graph_iri.as_bytes()).as_bytes().to_vec())
+}
+
+pub fn document_lifecycle_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn event_log_prefix(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn event_log_key(document_id: Ulid, event_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn pending_projection_key(document_id: Ulid, event_id: Ulid) -> Key {
+    event_log_key(document_id, event_id)
+}
+
+pub fn pending_projection_target(key: &[u8]) -> Option<(Ulid, Ulid)> {
+    if key.len() != 32 {
+        return None;
+    }
+    let mut document_id = [0u8; 16];
+    document_id.copy_from_slice(&key[..16]);
+    let mut event_id = [0u8; 16];
+    event_id.copy_from_slice(&key[16..]);
+    Some((Ulid::from_bytes(document_id), Ulid::from_bytes(event_id)))
+}
+
+pub fn sync_revision_key(target: &DocumentTarget) -> Key {
+    sync_sidecar_key(target)
+}
+
+pub fn sync_conflict_key(target: &DocumentTarget) -> Key {
+    sync_sidecar_key(target)
+}
+
+fn sync_sidecar_key(target: &DocumentTarget) -> Key {
+    let storage_key = target.storage_key();
+    let keyspace = target.storage_keyspace().as_bytes();
+    let mut bytes = Vec::with_capacity(keyspace.len() + 1 + storage_key.as_ref().len());
+    bytes.extend_from_slice(keyspace);
+    bytes.push(0);
+    bytes.extend_from_slice(storage_key.as_ref());
+    ByteView::from(bytes)
+}
+
+pub fn materialization_status_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn profile_validation_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn raw_revision_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn raw_budget_key(document_id: Ulid, node_id: NodeId) -> Key {
+    let mut bytes = Vec::with_capacity(48);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(node_id.as_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn document_job_prefix(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn document_job_key(document_id: Ulid, event_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(32);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// The key of a document's ready Git capture mark: the document, then its capture sequence.
+pub fn capture_key(document_id: Ulid, sequence: u64) -> Key {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&document_id.to_bytes());
+    bytes.extend_from_slice(&sequence.to_be_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn dead_letter_key(document_id: Ulid, event_id: Ulid) -> Key {
+    document_job_key(document_id, event_id)
+}
+
+pub fn materialization_job_key(record: &MetadataMaterializationRecord) -> Key {
+    let mut bytes = Vec::with_capacity(40);
+    bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
+    bytes.extend_from_slice(&record.document_id.to_bytes());
+    bytes.extend_from_slice(&record.event_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn admin_target_key(target: &AdminDocumentTarget) -> Key {
+    ByteView::from(admin_target_bytes(target))
+}
+
+pub fn reducer_state_key(target: &AdminDocumentTarget) -> Key {
+    admin_target_key(target)
+}
+
+pub type GroupDeleteEntries = (Vec<(KeySpace, Key)>, Vec<(KeySpace, Key, Value)>);
+
+pub fn group_deletion_entries(
+    record: &crate::structs::identity::group_delete::GroupDeleteRecord,
+    state: &AdminDocumentState,
+) -> Result<GroupDeleteEntries, ConversionError> {
+    let group_id = record.plan.group_id;
+    let deletes = vec![
+        (
+            crate::keyspaces::GROUP_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+        ),
+        (
+            crate::keyspaces::AUTH_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+        ),
+        (
+            crate::keyspaces::OWNER_INDEX_KEYSPACE.to_string(),
+            crate::structs::identity::group::owner_group_key(record.plan.owner, group_id).into(),
+        ),
+    ];
+    let writes = vec![
+        reducer_state_entry(state)?,
+        (
+            crate::keyspaces::GROUP_DELETE_KEYSPACE.to_string(),
+            group_id.to_bytes().into(),
+            record.to_bytes()?.into(),
+        ),
+    ];
+    Ok((deletes, writes))
+}
+
+pub fn reducer_conflict_prefix(target: &AdminDocumentTarget) -> Key {
+    admin_target_key(target)
+}
+
+pub fn reducer_conflict_key(target: &AdminDocumentTarget, path: &str) -> Key {
+    let mut bytes = admin_target_bytes(target);
+    bytes.extend_from_slice(path.as_bytes());
+    ByteView::from(bytes)
+}
+
+fn admin_target_bytes(target: &AdminDocumentTarget) -> Vec<u8> {
+    match target {
+        AdminDocumentTarget::Group { group_id } => {
+            let mut bytes = Vec::with_capacity(17);
+            bytes.push(b'g');
+            bytes.extend_from_slice(&group_id.to_bytes());
+            bytes
+        }
+        AdminDocumentTarget::Realm { realm_id } => {
+            let mut bytes = Vec::with_capacity(33);
+            bytes.push(b'r');
+            bytes.extend_from_slice(realm_id.as_bytes());
+            bytes
+        }
+        AdminDocumentTarget::User { user_id } => {
+            let mut bytes = Vec::with_capacity(49);
+            bytes.push(b'u');
+            bytes.extend_from_slice(&user_id.to_storage_key());
+            bytes
+        }
+        AdminDocumentTarget::RealmConfig { realm_id } => {
+            let mut bytes = Vec::with_capacity(33);
+            bytes.push(b'c');
+            bytes.extend_from_slice(realm_id.as_bytes());
+            bytes
+        }
+        AdminDocumentTarget::Distribution { realm_id, set_id } => {
+            let mut bytes = Vec::with_capacity(49);
+            bytes.push(b'd');
+            bytes.extend_from_slice(realm_id.as_bytes());
+            bytes.extend_from_slice(&set_id.to_bytes());
+            bytes
+        }
+    }
+}
+
+pub fn graph_prune_key(record: &GraphPruneRecord) -> Key {
+    let mut bytes = Vec::with_capacity(40);
+    bytes.extend_from_slice(&record.due_at_ms.to_be_bytes());
+    bytes.extend_from_slice(blake3::hash(record.graph_iri.as_bytes()).as_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn metadata_actor_key(document_id: Ulid) -> Key {
+    ByteView::from(document_id.to_bytes().to_vec())
+}
+
+pub fn metadata_actor_entry(
+    actor: &crate::metadata::MetadataActor,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        crate::keyspaces::METADATA_ACTOR_KEYSPACE.to_string(),
+        metadata_actor_key(actor.document_id),
+        postcard::to_allocvec(actor)?.into(),
+    ))
+}
+
+pub fn create_event_entry(
+    event: &MetadataEventRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        EVENT_LOG_KEYSPACE.to_string(),
+        event_log_key(event.record.document_id, event.event_id),
+        postcard::to_allocvec(event)?.into(),
+    ))
+}
+
+/// The event log row of `event` and its size row, which are always written together.
+pub fn logged_event_entries(
+    event: &MetadataEventRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    let log = create_event_entry(event)?;
+    let size = EventSize {
+        node_id: event.node_id,
+        bytes: log.2.len() as u64,
+    };
+    let size = (
+        EVENT_SIZE_KEYSPACE.to_string(),
+        log.1.clone(),
+        postcard::to_allocvec(&size)?.into(),
+    );
+    Ok(vec![log, size])
+}
+
+/// The commit message the author of `event` gave for its ARC snapshot.
+pub fn commit_message_entry(
+    event: &MetadataEventRecord,
+    message: &str,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        COMMIT_MESSAGE_KEYSPACE.to_string(),
+        event_log_key(event.record.document_id, event.event_id),
+        postcard::to_allocvec(message)?.into(),
+    ))
+}
+
+pub fn raw_budget_entry(
+    budget: &RawOriginBudget,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        RAW_BUDGET_KEYSPACE.to_string(),
+        raw_budget_key(budget.document_id, budget.node_id),
+        postcard::to_allocvec(budget)?.into(),
+    ))
+}
+
+pub fn profile_validation_entry(
+    status: &ProfileValidationStatus,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        VALIDATION_STATUS_KEYSPACE.to_string(),
+        profile_validation_key(status.document_id),
+        postcard::to_allocvec(status)?.into(),
+    ))
+}
+
+pub fn create_acceptance_entry(
+    event: &MetadataEventRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        CREATE_ACCEPTANCE_KEYSPACE.to_string(),
+        create_acceptance_key(event.record.document_id),
+        postcard::to_allocvec(event)?.into(),
+    ))
+}
+
+pub fn pending_projection_entry(event: &MetadataEventRecord) -> (KeySpace, Key, Value) {
+    (
+        PENDING_PROJECTION_KEYSPACE.to_string(),
+        pending_projection_key(event.record.document_id, event.event_id),
+        ByteView::from(Vec::new()),
+    )
+}
+
+pub fn delete_projection_entry(document_id: Ulid, event_id: Ulid) -> (KeySpace, Key) {
+    (
+        PENDING_PROJECTION_KEYSPACE.to_string(),
+        pending_projection_key(document_id, event_id),
+    )
+}
+
+pub fn create_projection_entries(
+    event: &MetadataEventRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    let mut entries = logged_event_entries(event)?;
+    entries.push(pending_projection_entry(event));
+    entries.extend(checkpoint_entry(event));
+    Ok(entries)
+}
+
+/// The window marker of a checkpoint event, written wherever the event is logged.
+pub fn checkpoint_entry(event: &MetadataEventRecord) -> Option<(KeySpace, Key, Value)> {
+    matches!(
+        event.payload,
+        crate::metadata::MetadataEventPayload::Checkpoint { .. }
+    )
+    .then(|| {
+        (
+            crate::keyspaces::METADATA_CHECKPOINT_KEYSPACE.to_string(),
+            event_log_key(event.record.document_id, event.event_id),
+            ByteView::from(Vec::new()),
+        )
+    })
+}
+
+pub fn graph_lifecycle_entry(
+    record: &GraphLifecycleRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        GRAPH_LIFECYCLE_KEYSPACE.to_string(),
+        graph_lifecycle_key(&record.graph_iri),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn document_lifecycle_entry(
+    record: &MetadataLifecycleRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DOCUMENT_LIFECYCLE_KEYSPACE.to_string(),
+        document_lifecycle_key(record.document_id()),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn sync_revision_entry(
+    target: &DocumentTarget,
+    change: &DocumentChange,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        SYNC_REVISION_KEYSPACE.to_string(),
+        sync_revision_key(target),
+        postcard::to_allocvec(change)?.into(),
+    ))
+}
+
+/// Manifest-row key: `strategy(16) ‖ pad(8) ‖ shard(4, be) ‖ per-target sidecar key`. The 28-byte shard
+/// prefix isolates one shard's rows on a scan; the sidecar tail (keyspace-discriminated, see
+/// [`sync_revision_key`]) keeps two targets sharing a storage key from colliding.
+pub fn shard_manifest_key(placement: &PlacementRef, target: &DocumentTarget) -> Key {
+    let tail = sync_sidecar_key(target);
+    let mut bytes = Vec::with_capacity(28 + tail.as_ref().len());
+    bytes.extend_from_slice(&shard_manifest_prefix(placement));
+    bytes.extend_from_slice(tail.as_ref());
+    ByteView::from(bytes)
+}
+
+/// Key of a bucket's write-admission fence: `realm ‖ strategy ‖ shard`. The
+/// fence is local state: it admits this node's own writes against its own
+/// observation of the bucket's cutover.
+pub fn placement_fence_key(realm_id: &RealmId, placement: &PlacementRef) -> Key {
+    let mut bytes = Vec::with_capacity(52);
+    bytes.extend_from_slice(realm_id.as_bytes());
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
+    ByteView::from(bytes)
+}
+
+/// The 28-byte shard prefix (`strategy ‖ pad ‖ shard`) a manifest assembly
+/// scan iterates.
+pub fn shard_manifest_prefix(placement: &PlacementRef) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(28);
+    bytes.extend_from_slice(&placement.strategy_id.to_bytes());
+    bytes.extend_from_slice(&PLACEMENT_EPOCH_PAD);
+    bytes.extend_from_slice(&placement.shard.to_be_bytes());
+    bytes
+}
+
+/// Manifest row for a shard-classed change: upsert or delete both write the row
+/// at `change.current` (a delete leaves a tombstone). `Ok(None)` for shared
+/// realm-scoped targets or a NIL placement (no shard governs the change yet).
+pub fn shard_manifest_entry(
+    target: &DocumentTarget,
+    change: &DocumentChange,
+) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+    if !target.uses_shard_topic() || change.placement == PlacementRef::NIL {
+        return Ok(None);
+    }
+    let entry = ShardManifestEntry {
+        target: target.clone(),
+        revision: change.current,
+    };
+    Ok(Some((
+        SHARD_MANIFEST_KEYSPACE.to_string(),
+        shard_manifest_key(&change.placement, target),
+        postcard::to_allocvec(&entry)?.into(),
+    )))
+}
+
+/// Manifest row for a metadata document lifecycle record, built from the same
+/// revision change its sidecar carries so the manifest and the sidecar agree.
+pub fn lifecycle_manifest_entry(
+    record: &MetadataLifecycleRecord,
+    delete_actor: NodeId,
+    placement: PlacementRef,
+) -> Result<Option<(KeySpace, Key, Value)>, ConversionError> {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
+        document_id: record.document_id(),
+    };
+    let change = lifecycle_revision_change(record, delete_actor, placement);
+    shard_manifest_entry(&target, &change)
+}
+
+pub fn sync_conflict_entry(
+    target: &DocumentTarget,
+    conflict: &DocumentSyncConflict,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        SYNC_CONFLICT_KEYSPACE.to_string(),
+        sync_conflict_key(target),
+        postcard::to_allocvec(conflict)?.into(),
+    ))
+}
+
+pub fn lifecycle_revision_change(
+    record: &MetadataLifecycleRecord,
+    delete_actor: NodeId,
+    placement: PlacementRef,
+) -> DocumentChange {
+    match record {
+        MetadataLifecycleRecord::Upsert { event }
+        | MetadataLifecycleRecord::UpsertWithMessage { event, .. } => DocumentChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: event.record.updated_at_ms,
+                event_id: event.event_id,
+                actor: event.node_id,
+                updated_at_ms: event.occurred_at_ms,
+            },
+            kind: DocumentChangeKind::Upsert,
+            placement,
+        },
+        MetadataLifecycleRecord::Delete { event } => DocumentChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: event.tombstone.updated_at_ms,
+                event_id: event.event_id,
+                actor: delete_actor,
+                updated_at_ms: event.tombstone.updated_at_ms,
+            },
+            kind: DocumentChangeKind::Delete,
+            placement,
+        },
+    }
+}
+
+/// Build the revision carried by a graph lifecycle outbox event. Graph
+/// lifecycle records do not own an event id, so the sync event id is supplied
+/// by the outbox publisher and becomes the deterministic tie-breaker.
+pub fn graph_revision_change(
+    record: &GraphLifecycleRecord,
+    event_id: Ulid,
+    actor: NodeId,
+    placement: PlacementRef,
+) -> DocumentChange {
+    DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: record.updated_at_ms,
+            event_id,
+            actor,
+            updated_at_ms: record.updated_at_ms,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement,
+    }
+}
+
+pub fn lifecycle_revision_entry(
+    record: &MetadataLifecycleRecord,
+    delete_actor: NodeId,
+    placement: PlacementRef,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    let target = DocumentTarget::MetadataDocumentLifecycle {
+        document_id: record.document_id(),
+    };
+    let change = lifecycle_revision_change(record, delete_actor, placement);
+    sync_revision_entry(&target, &change)
+}
+
+pub fn materialization_status_entry(
+    record: &MaterializationStatusRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        MATERIALIZATION_STATUS_KEYSPACE.to_string(),
+        materialization_status_key(record.document_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn iri_reference_entry(
+    record: &IriIndexRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        IRI_INDEX_KEYSPACE.to_string(),
+        iri_reference_key(
+            &record.predicate_iri,
+            &record.object_iri,
+            record.document_id,
+        ),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+/// Due-index row for the materialization queue. The value is empty: the sidecar
+/// row is authoritative. Both rows MUST be written and deleted in one batch/txn
+/// so the index never references a document job that does not exist.
+pub fn materialization_job_entry(
+    record: &MetadataMaterializationRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        MATERIALIZATION_JOB_KEYSPACE.to_string(),
+        materialization_job_key(record),
+        ByteView::from(Vec::new()),
+    ))
+}
+
+/// Authoritative sidecar row for the materialization queue, paired with the due
+/// index row above; the two MUST be written and deleted together.
+pub fn document_job_entry(
+    record: &MetadataMaterializationRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DOCUMENT_JOB_KEYSPACE.to_string(),
+        document_job_key(record.document_id, record.event_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+/// Parked job kept for later requeue; the drain rearm loop retries these so a
+/// node converges without an operator or a restart.
+pub fn dead_letter_entry(
+    record: &DeadLetterRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DEAD_LETTER_KEYSPACE.to_string(),
+        dead_letter_key(record.job.document_id, record.job.event_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn graph_prune_entry(
+    record: &GraphPruneRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        PRUNE_JOB_KEYSPACE.to_string(),
+        graph_prune_key(record),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn inbox_write_entries(
+    record: &NotificationRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    Ok(vec![
+        (
+            NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            notification_inbox_key(
+                record.recipient,
+                record.created_at_ms,
+                record.notification_id,
+            ),
+            record.to_bytes()?.into(),
+        ),
+        (
+            PRUNE_INDEX_KEYSPACE.to_string(),
+            notification_prune_key(record),
+            ByteView::from(Vec::new()),
+        ),
+    ])
+}
+
+pub fn inbox_delete_entries(record: &NotificationRecord) -> Vec<(KeySpace, Key)> {
+    vec![
+        (
+            NOTIFICATION_INBOX_KEYSPACE.to_string(),
+            notification_inbox_key(
+                record.recipient,
+                record.created_at_ms,
+                record.notification_id,
+            ),
+        ),
+        (
+            PRUNE_INDEX_KEYSPACE.to_string(),
+            notification_prune_key(record),
+        ),
+    ]
+}
+
+pub fn inbox_update_entry(
+    record: &NotificationRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        NOTIFICATION_INBOX_KEYSPACE.to_string(),
+        notification_inbox_key(
+            record.recipient,
+            record.created_at_ms,
+            record.notification_id,
+        ),
+        record.to_bytes()?.into(),
+    ))
+}
+
+pub fn outbox_write_entry(
+    record: &NotificationOutboxRecord,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        NOTIFICATION_OUTBOX_KEYSPACE.to_string(),
+        notification_outbox_key(record.outbox_id),
+        postcard::to_allocvec(record)?.into(),
+    ))
+}
+
+pub fn watch_write_entry(
+    subscription: &WatchSubscription,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+        watch_subscription_key(subscription.owner, subscription.watch_id),
+        subscription.to_bytes()?.into(),
+    ))
+}
+
+pub fn watch_delete_entry(owner: UserId, watch_id: Ulid) -> (KeySpace, Key) {
+    (
+        WATCH_SUBSCRIPTIONS_KEYSPACE.to_string(),
+        watch_subscription_key(owner, watch_id),
+    )
+}
+
+pub fn reducer_state_entry(
+    state: &AdminDocumentState,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DOCUMENT_STATE_KEYSPACE.to_string(),
+        reducer_state_key(&state.target),
+        postcard::to_allocvec(state)?.into(),
+    ))
+}
+
+pub fn conflict_write_entry(
+    target: &AdminDocumentTarget,
+    conflict: &AdminConflict,
+) -> Result<(KeySpace, Key, Value), ConversionError> {
+    Ok((
+        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+        reducer_conflict_key(target, &conflict.path),
+        postcard::to_allocvec(conflict)?.into(),
+    ))
+}
+
+pub fn conflict_write_entries(
+    state: &AdminDocumentState,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    state
+        .conflicts
+        .values()
+        .map(|conflict| conflict_write_entry(&state.target, conflict))
+        .collect()
+}
+
+pub fn conflict_delete_entry(target: &AdminDocumentTarget, path: &str) -> (KeySpace, Key) {
+    (
+        DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+        reducer_conflict_key(target, path),
+    )
+}
+
+pub fn stale_conflict_deletes(
+    previous: Option<&AdminDocumentState>,
+    current: Option<&AdminDocumentState>,
+) -> Vec<(KeySpace, Key)> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    let current_conflicts = current
+        .filter(|state| state.target == previous.target)
+        .map(|state| &state.conflicts);
+
+    previous
+        .conflicts
+        .keys()
+        .filter(|path| {
+            current_conflicts
+                .map(|conflicts| !conflicts.contains_key(*path))
+                .unwrap_or(true)
+        })
+        .map(|path| conflict_delete_entry(&previous.target, path))
+        .collect()
+}
+
+pub fn registry_write_entries(
+    record: &MetadataRegistryRecord,
+) -> Result<Vec<(KeySpace, Key, Value)>, ConversionError> {
+    let record_bytes: ByteView = postcard::to_allocvec(record)?.into();
+    Ok(vec![
+        (
+            METADATA_INDEX_KEYSPACE.to_string(),
+            metadata_registry_key(record.group_id, record.document_id),
+            record_bytes.clone(),
+        ),
+        (
+            DOCUMENT_INDEX_KEYSPACE.to_string(),
+            metadata_document_key(record.document_id),
+            record_bytes,
+        ),
+        (
+            METADATA_HOLDERS_KEYSPACE.to_string(),
+            metadata_registry_key(record.group_id, record.document_id),
+            postcard::to_allocvec(&record.holder_node_ids)?.into(),
+        ),
+        updated_index_entry(record),
+    ])
+}
+
+/// The timestamp-index key of a record being removed. Only the record itself
+/// carries the `updated_at_ms` half of the key, so the row must be read before
+/// the delete batch is built or the key leaks with no later write to supersede it.
+pub fn updated_index_delete(record: &MetadataRegistryRecord) -> (KeySpace, Key) {
+    (
+        UPDATED_INDEX_KEYSPACE.to_string(),
+        updated_index_key(record.updated_at_ms, record.document_id),
+    )
+}
+
+pub fn registry_delete_entries(record: &MetadataRegistryRecord) -> Vec<(KeySpace, Key)> {
+    let group_id = record.group_id;
+    let document_id = record.document_id;
+    vec![
+        (
+            METADATA_INDEX_KEYSPACE.to_string(),
+            metadata_registry_key(group_id, document_id),
+        ),
+        (
+            DOCUMENT_INDEX_KEYSPACE.to_string(),
+            metadata_document_key(document_id),
+        ),
+        (
+            METADATA_HOLDERS_KEYSPACE.to_string(),
+            metadata_registry_key(group_id, document_id),
+        ),
+        updated_index_delete(record),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use ulid::Ulid;
+
+    use super::{
+        conflict_write_entries, graph_revision_change, iri_object_prefix, iri_reference_document,
+        iri_reference_entry, iri_reference_key, iri_reference_prefix, metadata_document_key,
+        metadata_registry_key, reducer_conflict_key, reducer_conflict_prefix, reducer_state_entry,
+        reducer_state_key, registry_write_entries, shard_manifest_entry, shard_manifest_key,
+        shard_manifest_prefix, stale_conflict_deletes, sync_conflict_entry, sync_conflict_key,
+        sync_revision_entry, sync_revision_key, updated_index_key,
+    };
+    use crate::admin_documents::{AdminDocumentClock, AdminDocumentDot, AdminDocumentTarget};
+    use crate::document::ShardManifestEntry;
+    use crate::document::{
+        DocumentChange, DocumentChangeKind, DocumentSyncConflict, DocumentSyncRevision,
+        DocumentTarget,
+    };
+    use crate::id::NodeId;
+    use crate::keyspaces::{
+        DOCUMENT_CONFLICT_KEYSPACE, DOCUMENT_INDEX_KEYSPACE, DOCUMENT_STATE_KEYSPACE,
+        IRI_INDEX_KEYSPACE, METADATA_HOLDERS_KEYSPACE, METADATA_INDEX_KEYSPACE,
+        SHARD_MANIFEST_KEYSPACE, SYNC_CONFLICT_KEYSPACE, SYNC_REVISION_KEYSPACE,
+        UPDATED_INDEX_KEYSPACE,
+    };
+    use crate::metadata::{GraphLifecycleRecord, IriIndexRecord};
+    use crate::reducer::{AdminAttributeVersion, AdminConflict, AdminDocumentState};
+    use crate::structs::identity::realm::RealmId;
+    use crate::structs::placement::record::PlacementRef;
+    use crate::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use crate::user::id::UserId;
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm_id(seed: u8) -> RealmId {
+        RealmId::from_bytes([seed; 32])
+    }
+
+    fn user_id(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), realm_id(seed + 1))
+    }
+
+    fn user_target(seed: u8) -> AdminDocumentTarget {
+        AdminDocumentTarget::User {
+            user_id: user_id(seed),
+        }
+    }
+
+    #[test]
+    fn metadata_iri_iris() {
+        let document_id = Ulid::from_bytes([7; 16]);
+        let record = IriIndexRecord {
+            document_id,
+            document_cursor: Ulid::from_bytes([8; 16]),
+            predicate_iri: "http://schema.org/conformsTo".to_string(),
+            object_iri: "https://example.test/profiles/one".to_string(),
+            subject_iris: vec!["https://example.test/dataset".to_string()],
+        };
+
+        let (keyspace, key, value) = iri_reference_entry(&record).unwrap();
+        let prefix = iri_reference_prefix(&record.predicate_iri, &record.object_iri);
+        let decoded: IriIndexRecord = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, IRI_INDEX_KEYSPACE);
+        assert_eq!(prefix.as_ref().len(), 64);
+        assert_eq!(key.as_ref().len(), 80);
+        assert!(key.as_ref().starts_with(prefix.as_ref()));
+        assert!(
+            key.as_ref()
+                .starts_with(iri_object_prefix(&record.object_iri).as_ref())
+        );
+        assert_eq!(iri_reference_document(key.as_ref()), Some(document_id));
+        assert_eq!(
+            key,
+            iri_reference_key(&record.predicate_iri, &record.object_iri, document_id)
+        );
+        assert_eq!(decoded, record);
+    }
+
+    fn realm_target(seed: u8) -> AdminDocumentTarget {
+        AdminDocumentTarget::Realm {
+            realm_id: realm_id(seed),
+        }
+    }
+
+    fn realm_config_target(seed: u8) -> AdminDocumentTarget {
+        AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(seed),
+        }
+    }
+
+    fn dot(seed: u8) -> AdminDocumentDot {
+        AdminDocumentDot {
+            event_id: Ulid::from_bytes([seed; 16]),
+            origin_node_id: node(seed),
+            origin_seq: u64::from(seed),
+        }
+    }
+
+    fn revision(seed: u8, generation: u64) -> DocumentSyncRevision {
+        DocumentSyncRevision {
+            generation,
+            event_id: Ulid::from_bytes([seed; 16]),
+            actor: node(seed),
+            updated_at_ms: u64::from(seed),
+        }
+    }
+
+    fn conflict(path: &str, first_seed: u8, second_seed: u8) -> AdminConflict {
+        crate::testing::admin_conflict(path, first_seed, second_seed)
+    }
+
+    #[test]
+    fn admin_document_roundtrips() {
+        let target = user_target(8);
+        let attr_dot = dot(1);
+        let state = AdminDocumentState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default().with_observed(attr_dot.origin_node_id, 1),
+            applied_event_ids: BTreeSet::from([attr_dot.event_id]),
+            user_attributes: BTreeMap::from([(
+                "department".to_string(),
+                AdminAttributeVersion {
+                    value: Some("biology".to_string()),
+                    dot: attr_dot,
+                },
+            )]),
+            conflicts: BTreeMap::from([(
+                "user.attributes.title".to_string(),
+                conflict("user.attributes.title", 2, 3),
+            )]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
+        };
+
+        let (keyspace, key, value) = reducer_state_entry(&state).unwrap();
+        let decoded: AdminDocumentState = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(key, reducer_state_key(&target));
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn realm_config_roundtrips() {
+        let target = realm_config_target(8);
+        let attr_dot = dot(1);
+        let path = format!("realm_config.nodes.{}", node(4));
+        let state = AdminDocumentState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default().with_observed(attr_dot.origin_node_id, 1),
+            applied_event_ids: BTreeSet::from([attr_dot.event_id]),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::new(),
+            user_name: None,
+            user_subject_ids: BTreeMap::from([(
+                path,
+                AdminAttributeVersion {
+                    value: Some("server".to_string()),
+                    dot: attr_dot,
+                },
+            )]),
+            equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
+        };
+
+        let (keyspace, key, value) = reducer_state_entry(&state).unwrap();
+        let decoded: AdminDocumentState = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, DOCUMENT_STATE_KEYSPACE);
+        assert_eq!(key, reducer_state_key(&target));
+        assert_eq!(decoded, state);
+    }
+
+    #[test]
+    fn document_sync_roundtrips() {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let base = revision(1, 1);
+        let change = DocumentChange {
+            base: Some(base),
+            current: revision(2, 2),
+            kind: DocumentChangeKind::Upsert,
+            placement: PlacementRef::NIL,
+        };
+
+        let (keyspace, key, value) = sync_revision_entry(&target, &change).unwrap();
+        let decoded: DocumentChange = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, SYNC_REVISION_KEYSPACE);
+        assert_eq!(key, sync_revision_key(&target));
+        assert_eq!(decoded, change);
+    }
+
+    #[test]
+    fn graph_revision_order() {
+        let graph_iri = "urn:graph:revision".to_string();
+        let target = DocumentTarget::MetadataGraphLifecycle {
+            graph_iri: graph_iri.clone(),
+        };
+        let record = GraphLifecycleRecord::deleted(
+            graph_iri,
+            realm_id(2),
+            Ulid::from_bytes([3; 16]),
+            Ulid::from_bytes([4; 16]),
+            7,
+        );
+        let placement = shard_placement(3);
+        let older = graph_revision_change(&record, Ulid::from_bytes([5; 16]), node(5), placement);
+        let newer = graph_revision_change(&record, Ulid::from_bytes([6; 16]), node(6), placement);
+
+        assert!(older.current < newer.current);
+        let (keyspace, key, value) = sync_revision_entry(&target, &newer).unwrap();
+        let decoded: DocumentChange = postcard::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(keyspace, SYNC_REVISION_KEYSPACE);
+        assert_eq!(key, sync_revision_key(&target));
+        assert_eq!(decoded, newer);
+
+        let (_, manifest_key, manifest_value) =
+            shard_manifest_entry(&target, &newer).unwrap().unwrap();
+        let manifest: ShardManifestEntry = postcard::from_bytes(manifest_value.as_ref()).unwrap();
+        assert_eq!(manifest_key, shard_manifest_key(&placement, &target));
+        assert_eq!(manifest.revision, newer.current);
+    }
+
+    fn shard_placement(shard: u32) -> PlacementRef {
+        PlacementRef {
+            strategy_id: Ulid::from_bytes([9; 16]),
+            shard,
+        }
+    }
+
+    #[test]
+    fn shard_manifest_revision() {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let placement = shard_placement(3);
+        let change = DocumentChange {
+            base: None,
+            current: revision(2, 5),
+            kind: DocumentChangeKind::Upsert,
+            placement,
+        };
+
+        let (keyspace, key, value) = shard_manifest_entry(&target, &change).unwrap().unwrap();
+        assert_eq!(keyspace, SHARD_MANIFEST_KEYSPACE);
+        assert_eq!(key, shard_manifest_key(&placement, &target));
+        let decoded: ShardManifestEntry = postcard::from_bytes(value.as_ref()).unwrap();
+        assert_eq!(decoded.target, target);
+        assert_eq!(decoded.revision, change.current);
+    }
+
+    #[test]
+    fn shard_delete_key() {
+        let target = DocumentTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let placement = shard_placement(3);
+        let upsert = DocumentChange {
+            base: None,
+            current: revision(2, 5),
+            kind: DocumentChangeKind::Upsert,
+            placement,
+        };
+        let delete = DocumentChange {
+            base: Some(upsert.current),
+            current: revision(3, 6),
+            kind: DocumentChangeKind::Delete,
+            placement,
+        };
+
+        let (_, upsert_key, _) = shard_manifest_entry(&target, &upsert).unwrap().unwrap();
+        let (_, delete_key, delete_value) =
+            shard_manifest_entry(&target, &delete).unwrap().unwrap();
+
+        // A delete overwrites the same row with the delete revision (a tombstone),
+        // it never removes it.
+        assert_eq!(upsert_key, delete_key);
+        let decoded: ShardManifestEntry = postcard::from_bytes(delete_value.as_ref()).unwrap();
+        assert_eq!(decoded.revision, delete.current);
+    }
+
+    #[test]
+    fn shard_manifest_placements() {
+        let shared = DocumentTarget::RealmConfig {
+            realm_id: realm_id(2),
+        };
+        let change = DocumentChange {
+            base: None,
+            current: revision(1, 1),
+            kind: DocumentChangeKind::Upsert,
+            placement: shard_placement(3),
+        };
+        // Shared realm-scoped targets never ride a shard, so they get no row.
+        assert!(shard_manifest_entry(&shared, &change).unwrap().is_none());
+
+        // A shard-classed target with a NIL placement has no governing shard yet.
+        let shard_target = DocumentTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let nil_change = DocumentChange {
+            placement: PlacementRef::NIL,
+            ..change
+        };
+        assert!(
+            shard_manifest_entry(&shard_target, &nil_change)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn shard_manifest_targets() {
+        let a = DocumentTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([7; 16]),
+        };
+        let b = DocumentTarget::MetadataDocumentLifecycle {
+            document_id: Ulid::from_bytes([8; 16]),
+        };
+        let shard3 = shard_placement(3);
+        let shard4 = shard_placement(4);
+
+        // Every row for one shard shares the 28-byte shard prefix; a different
+        // shard does not.
+        let prefix3 = shard_manifest_prefix(&shard3);
+        assert!(
+            shard_manifest_key(&shard3, &a)
+                .as_ref()
+                .starts_with(&prefix3)
+        );
+        assert!(
+            shard_manifest_key(&shard3, &b)
+                .as_ref()
+                .starts_with(&prefix3)
+        );
+        assert!(
+            !shard_manifest_key(&shard4, &a)
+                .as_ref()
+                .starts_with(&prefix3)
+        );
+        // Distinct documents in one shard get distinct rows.
+        assert_ne!(
+            shard_manifest_key(&shard3, &a),
+            shard_manifest_key(&shard3, &b)
+        );
+    }
+
+    #[test]
+    fn document_conflict_roundtrips() {
+        let target = DocumentTarget::User {
+            user_id: user_id(8),
+        };
+        let local_change = DocumentChange {
+            base: None,
+            current: revision(1, 1),
+            kind: DocumentChangeKind::Upsert,
+            placement: PlacementRef::NIL,
+        };
+        let incoming_change = DocumentChange {
+            base: None,
+            current: revision(2, 2),
+            kind: DocumentChangeKind::Upsert,
+            placement: PlacementRef::NIL,
+        };
+        let conflict = DocumentSyncConflict {
+            target: target.clone(),
+            local_change: Some(local_change),
+            local_bytes: Some(vec![1, 2]),
+            incoming_change,
+            incoming_bytes: vec![3, 4],
+        };
+
+        let (keyspace, key, value) = sync_conflict_entry(&target, &conflict).unwrap();
+        let decoded: DocumentSyncConflict = postcard::from_bytes(value.as_ref()).unwrap();
+
+        assert_eq!(keyspace, SYNC_CONFLICT_KEYSPACE);
+        assert_eq!(key, sync_conflict_key(&target));
+        assert_eq!(decoded, conflict);
+    }
+
+    #[test]
+    fn document_sync_keyspace() {
+        let group_id = Ulid::from_bytes([4; 16]);
+        let group = DocumentTarget::Group { group_id };
+        let auth = DocumentTarget::GroupAuthorization { group_id };
+
+        assert_ne!(sync_revision_key(&group), sync_revision_key(&auth));
+    }
+
+    #[test]
+    fn admin_document_prefix() {
+        let target = user_target(8);
+        let other_target = user_target(9);
+        let state = AdminDocumentState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default(),
+            applied_event_ids: BTreeSet::new(),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::from([
+                (
+                    "user.attributes.department".to_string(),
+                    conflict("user.attributes.department", 1, 2),
+                ),
+                (
+                    "user.attributes.title".to_string(),
+                    conflict("user.attributes.title", 3, 4),
+                ),
+            ]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
+        };
+
+        let entries = conflict_write_entries(&state).unwrap();
+        let prefix = reducer_conflict_prefix(&target);
+        let other_prefix = reducer_conflict_prefix(&other_target);
+
+        assert_eq!(entries.len(), 2);
+        for (keyspace, key, value) in entries {
+            let decoded: AdminConflict = postcard::from_bytes(value.as_ref()).unwrap();
+
+            assert_eq!(keyspace, DOCUMENT_CONFLICT_KEYSPACE);
+            assert!(key.as_ref().starts_with(prefix.as_ref()));
+            assert!(!key.as_ref().starts_with(other_prefix.as_ref()));
+            assert_eq!(
+                &key.as_ref()[prefix.as_ref().len()..],
+                decoded.path.as_bytes()
+            );
+            assert_eq!(key, reducer_conflict_key(&target, &decoded.path));
+        }
+    }
+
+    #[test]
+    fn realm_config_auth() {
+        let target = realm_config_target(8);
+        let realm_auth_target = realm_target(8);
+        let path = format!("realm_config.nodes.{}", node(4));
+        let state_key = reducer_state_key(&target);
+        let conflict_prefix = reducer_conflict_prefix(&target);
+        let conflict_key = reducer_conflict_key(&target, &path);
+
+        assert_ne!(state_key, reducer_state_key(&realm_auth_target));
+        assert_eq!(conflict_prefix, state_key);
+        assert!(conflict_key.as_ref().starts_with(conflict_prefix.as_ref()));
+        assert_eq!(
+            &conflict_key.as_ref()[conflict_prefix.as_ref().len()..],
+            path.as_bytes()
+        );
+    }
+
+    #[test]
+    fn stale_admin_paths() {
+        let target = user_target(8);
+        let previous = AdminDocumentState {
+            target: target.clone(),
+            clock: AdminDocumentClock::default(),
+            applied_event_ids: BTreeSet::new(),
+            user_attributes: BTreeMap::new(),
+            conflicts: BTreeMap::from([
+                (
+                    "user.attributes.department".to_string(),
+                    conflict("user.attributes.department", 1, 2),
+                ),
+                (
+                    "user.attributes.title".to_string(),
+                    conflict("user.attributes.title", 3, 4),
+                ),
+            ]),
+            user_name: None,
+            user_subject_ids: BTreeMap::new(),
+            equivalent_value_dots: BTreeMap::new(),
+            revocation_floor: 0,
+            revocation_next_expiry: None,
+        };
+        let current = AdminDocumentState {
+            conflicts: BTreeMap::from([(
+                "user.attributes.title".to_string(),
+                conflict("user.attributes.title", 3, 4),
+            )]),
+            ..previous.clone()
+        };
+
+        let deletes = stale_conflict_deletes(Some(&previous), Some(&current));
+
+        assert_eq!(
+            deletes,
+            vec![(
+                DOCUMENT_CONFLICT_KEYSPACE.to_string(),
+                reducer_conflict_key(&target, "user.attributes.department"),
+            )]
+        );
+        assert!(stale_conflict_deletes(None, Some(&current)).is_empty());
+    }
+
+    fn registry_record() -> MetadataRegistryRecord {
+        let realm_id = realm_id(1);
+        let group_id = Ulid::from_bytes([2; 16]);
+        let document_id = Ulid::from_bytes([3; 16]);
+        MetadataRegistryRecord {
+            realm_id,
+            group_id,
+            document_id,
+            document_path: "datasets/registry".to_string(),
+            graph_iri: MetadataRegistryRecord::graph_iri_for(document_id),
+            public: true,
+            permission_path: MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/registry",
+                document_id,
+            ),
+            placement: PlacementRef::NIL,
+            holder_node_ids: vec![node(4), node(5)],
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            establishing_event_id: Ulid::from_bytes([6; 16]),
+            last_event_id: Ulid::from_bytes([7; 16]),
+        }
+    }
+
+    #[test]
+    fn registry_bytes_reused() {
+        let record = registry_record();
+        let entries = registry_write_entries(&record).unwrap();
+        let encoded = postcard::to_allocvec(&record).unwrap();
+
+        let keyspaces: Vec<&str> = entries
+            .iter()
+            .map(|(key_space, _, _)| key_space.as_str())
+            .collect();
+        assert_eq!(
+            keyspaces,
+            vec![
+                METADATA_INDEX_KEYSPACE,
+                DOCUMENT_INDEX_KEYSPACE,
+                METADATA_HOLDERS_KEYSPACE,
+                UPDATED_INDEX_KEYSPACE,
+            ]
+        );
+        let registry_key = metadata_registry_key(record.group_id, record.document_id);
+        assert_eq!(entries[0].1, registry_key);
+        assert_eq!(entries[1].1, metadata_document_key(record.document_id));
+        assert_eq!(entries[2].1, registry_key);
+        assert_eq!(
+            entries[3].1,
+            updated_index_key(record.updated_at_ms, record.document_id)
+        );
+        assert_eq!(entries[0].2.as_ref(), encoded.as_slice());
+        assert_eq!(entries[1].2, entries[0].2);
+        assert_eq!(entries[0].2.as_ref(), entries[1].2.as_ref());
+        let holders: Vec<NodeId> = postcard::from_bytes(entries[2].2.as_ref()).unwrap();
+        assert_eq!(holders, record.holder_node_ids);
+        assert!(entries[3].2.is_empty());
+    }
+}

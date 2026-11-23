@@ -162,7 +162,7 @@ working ARC can still lack the contacts, assays, workflows or evidence required 
 
 ## Runtime requirements
 
-Native hosting requires Unix, Git and Python 3.13 with `blob/arc-requirements.txt`. The image
+Native hosting requires Unix, Git and Python 3.13 with `runtime/blob/arc-requirements.txt`. The image
 includes Git, Python, ARCtrl and the CWL validator. Generated commits are not signed yet; they
 have the service author `Aruna <git@aruna.local>` and matching author/committer timestamps.
 Missing runtime or storage infrastructure leaves work pending for retry.
@@ -205,7 +205,7 @@ CARGO_BUILD_JOBS=2 RUST_TEST_THREADS=2 CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEB
   uv run --no-project --with-requirements scripts/arc-native/requirements.txt \
   sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)"; \
     exec nice -n 19 ionice -c3 cargo test --locked -p aruna --no-default-features \
-    --test integration -- --ignored --nocapture git_native::'
+    --test regimes -- --ignored --nocapture metadata_regime::git_native::'
 ```
 
 The Python code in this test generates a fixture and drives clients; it does not serve

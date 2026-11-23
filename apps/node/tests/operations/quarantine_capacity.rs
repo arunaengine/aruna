@@ -1,0 +1,289 @@
+//! Tests that a full quarantine store refuses new rows until releases free space (#338).
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::document::{
+    DocumentChange, DocumentChangeKind, DocumentEffect, DocumentEvent, DocumentNetEvent,
+    DocumentSyncPublish, DocumentSyncRevision, DocumentTarget,
+};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetEvent, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::keyspaces::{APPLIED_OPS_KEYSPACE, SYNC_QUARANTINE_KEYSPACE};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::storage::node_info::{NodeInfoDocument, NodeUrls, NodeUtilization};
+use aruna_core::structs::sync_quarantine::{
+    QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
+    SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
+};
+use aruna_ops_identity::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::{QuarantinePage, QuarantinePageRequest};
+use aruna_p2p::NetHandle;
+use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_runner::driver::{DriverContext, drive};
+use aruna_runner::testing::test_context;
+use aruna_runner::testing::write_entries;
+use aruna_storage::storage::handle::StorageHandle;
+use aruna_test_harness::documents::reconcile_topics;
+use byteview::ByteView;
+use ulid::Ulid;
+
+/// Mirrors the applied-ops cursor key of the sync path: publishing marks its
+/// own ops applied, so a fresh peer's delivery has to be simulated.
+async fn reset_cursor(storage: &StorageHandle, topic: &[u8]) {
+    let mut key = b"topic-cursor/".to_vec();
+    key.extend_from_slice(topic);
+    write_entries(
+        storage,
+        vec![(
+            APPLIED_OPS_KEYSPACE.to_string(),
+            ByteView::from(key),
+            ByteView::from(
+                postcard::to_allocvec(&irokle::ActorClock::default()).expect("clock serializes"),
+            ),
+        )],
+    )
+    .await;
+}
+
+fn seed_event(index: u64) -> DocumentEvent {
+    DocumentEvent::Upsert {
+        event_id: Ulid::from_parts(index, 1),
+        target: DocumentTarget::RealmConfig {
+            realm_id: RealmId::from_bytes([9; 32]),
+        },
+        bytes: vec![7; 16],
+        change: DocumentChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(index, 1),
+                actor: iroh::SecretKey::from_bytes(&[1; 32]).public(),
+                updated_at_ms: 1,
+            },
+            kind: DocumentChangeKind::Upsert,
+            placement: PlacementRef::NIL,
+        },
+    }
+}
+
+/// Fill the store to its record capacity with unacknowledged evidence.
+async fn fill_store(storage: &StorageHandle) -> SyncQuarantineUsage {
+    let mut usage = SyncQuarantineUsage::default();
+    let mut writes = Vec::new();
+    for index in 0..QUARANTINE_MAX_RECORDS {
+        let record = SyncQuarantineRecord::new(
+            SyncQuarantineIdentity::from_parts([7; 32], [8; 32], index + 1),
+            SyncQuarantineEvidence::from_event(&seed_event(index)),
+            "seeded evidence",
+            index,
+        );
+        let entry = quarantine_row_entry(&record).expect("row entry");
+        usage.records += 1;
+        usage.bytes += entry.2.len() as u64;
+        writes.push(entry);
+        if writes.len() == 512 {
+            write_entries(storage, std::mem::take(&mut writes)).await;
+        }
+    }
+    writes.push(quarantine_usage_entry(usage).expect("usage entry"));
+    write_entries(storage, writes).await;
+    usage
+}
+
+fn node_info_bytes(node_id: aruna_core::id::NodeId) -> Vec<u8> {
+    NodeInfoDocument {
+        node_id,
+        executors: Vec::new(),
+        labels: std::collections::BTreeMap::new(),
+        urls: NodeUrls {
+            api: None,
+            s3: None,
+        },
+        utilization: NodeUtilization {
+            storage_bytes_used: 1,
+            documents_held: None,
+            load_permille: None,
+            heartbeat_at_ms: 5,
+            download_slots: None,
+            storage_capacity_bytes: None,
+        },
+        updated_at_ms: 5,
+        epoch: aruna_core::structs::storage::node_info::AdvertisementEpoch {
+            membership_generation: 1,
+            publisher_generation: 1,
+            observed_at_ms: 5,
+        },
+        compute_draining: false,
+        leaving: false,
+        demand: Default::default(),
+        reservation: Default::default(),
+    }
+    .to_bytes()
+    .expect("node info serializes")
+}
+
+async fn list(ctx: &DriverContext, request: QuarantinePageRequest) -> QuarantinePage {
+    drive(ListQuarantineOperation::new(request), ctx)
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capacity_blocks_releases() {
+    let storage = aruna_storage::storage::memory::MemoryStorage::open();
+    let realm_id = RealmId::from_bytes([31; 32]);
+    let net = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("bind address"),
+            realm_id,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        storage.clone(),
+    )
+    .await
+    .expect("net handle");
+    let mut ctx = test_context(storage.clone());
+    ctx.net_handle = Some(net.clone());
+    let local_node = net.node_id();
+
+    let seeded = fill_store(&storage).await;
+    assert_eq!(
+        list(&ctx, QuarantinePageRequest::default()).await.usage,
+        seeded
+    );
+
+    // A node info document that claims another node is a permanent reject.
+    let target = DocumentTarget::NodeInfo {
+        realm_id,
+        node_id: local_node,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let event_id = Ulid::from_parts(9_001, 1);
+    let published = net
+        .send_effect(Effect::Net(NetEffect::DocumentSync(
+            DocumentEffect::PublishDocuments {
+                documents: vec![DocumentSyncPublish::Upsert {
+                    event_id,
+                    target: target.clone(),
+                    bytes: node_info_bytes(iroh::SecretKey::from_bytes(&[5; 32]).public()),
+                    change: DocumentChange {
+                        base: None,
+                        current: DocumentSyncRevision {
+                            generation: 1,
+                            event_id,
+                            actor: local_node,
+                            updated_at_ms: 1,
+                        },
+                        kind: DocumentChangeKind::Upsert,
+                        placement: PlacementRef::NIL,
+                    },
+                    allow_genesis: true,
+                }],
+                peers: Vec::new(),
+                expected: Vec::new(),
+            },
+        )))
+        .await;
+    assert!(
+        matches!(
+            published,
+            Event::Net(NetEvent::DocumentSync(
+                DocumentNetEvent::DocumentsPublished { .. }
+            ))
+        ),
+        "publish failed: {published:?}"
+    );
+
+    // Evidence rows are keyed by transport identity, so the tested topic's
+    // rows are exactly the ones under its own key prefix.
+    let topic_page = || QuarantinePageRequest {
+        start_after: None,
+        topic: Some(topic_id.as_bytes().to_vec()),
+        limit: Some(4),
+    };
+    reset_cursor(&storage, topic_id.as_bytes()).await;
+    reconcile_topics(&ctx, vec![topic_id])
+        .await
+        .expect("reconcile runs");
+    assert!(
+        list(&ctx, topic_page()).await.records.is_empty(),
+        "a full store must not write evidence"
+    );
+    assert_eq!(
+        list(&ctx, QuarantinePageRequest::default()).await.usage,
+        seeded
+    );
+
+    // Reclaim one slot: only acknowledged rows are prunable.
+    let seeded_page = || QuarantinePageRequest {
+        start_after: None,
+        topic: Some(vec![7u8; 32]),
+        limit: Some(1),
+    };
+    let page = list(&ctx, seeded_page()).await;
+    let oldest = page.records.first().expect("seeded evidence").storage_key();
+    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(pruned.pruned, 0, "unacknowledged evidence is never pruned");
+    drive(AcknowledgeQuarantineOperation::new(oldest.clone()), &ctx)
+        .await
+        .unwrap()
+        .expect("row is acknowledged");
+    let pruned = drive(PruneQuarantineOperation::new(seeded_page()), &ctx)
+        .await
+        .unwrap();
+    assert_eq!(pruned.pruned, 1);
+    assert_eq!(pruned.usage.records, QUARANTINE_MAX_RECORDS - 1);
+
+    // The event was never applied and its cursor never advanced, so the next
+    // reconcile redelivers it and the reclaimed slot takes the evidence.
+    reconcile_topics(&ctx, vec![topic_id])
+        .await
+        .expect("reconcile runs");
+    let redelivered = list(&ctx, topic_page()).await;
+    let record = redelivered
+        .records
+        .first()
+        .expect("redelivered evidence persists");
+    assert_eq!(redelivered.records.len(), 1);
+    assert_eq!(record.event_id(), Some(event_id));
+    assert!(record.reason.starts_with("invalid node info document:"));
+    assert_eq!(record.target(), Some(&target));
+    assert_eq!(
+        drive(ReadQuarantineOperation::new(record.storage_key()), &ctx)
+            .await
+            .unwrap()
+            .as_ref(),
+        Some(record)
+    );
+    assert_eq!(
+        list(&ctx, QuarantinePageRequest::default())
+            .await
+            .usage
+            .records,
+        QUARANTINE_MAX_RECORDS
+    );
+    assert!(
+        matches!(
+            storage
+                .send_storage_effect(StorageEffect::Read {
+                    key_space: SYNC_QUARANTINE_KEYSPACE.to_string(),
+                    key: ByteView::from(oldest.clone()),
+                    txn_id: None,
+                })
+                .await,
+            Event::Storage(StorageEvent::ReadResult { value: None, .. })
+        ),
+        "the pruned row stays gone"
+    );
+
+    net.shutdown().await;
+}

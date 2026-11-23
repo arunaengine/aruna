@@ -1,0 +1,111 @@
+//! Hashes bearer credentials and checks token lifetime and revocation retention bounds.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::time::Duration;
+
+pub const REALMS_LIST_KEY: &[u8] = b"trusted_realms_list";
+pub const ADMIN_CLAIMED_KEY: &[u8] = b"initial_realm_admin_claimed";
+pub const ONBOARDING_SECRET_KEY: &[u8] = b"initial_local_onboarding_secret";
+
+/// Maximum bearer-token lifetime accepted by replicated revocation admission.
+/// 366 days covers every 12-calendar-month token, including leap years.
+pub const MAX_TOKEN_LIFETIME: u64 = 366 * 24 * 60 * 60;
+
+/// Bounded grace for revocation retention across pairwise clock skew. Also the
+/// only skew a replicated timestamp may be ahead of the local clock before it
+/// is treated as a rollback rather than as skew.
+pub const REVOCATION_GRACE_SECS: u64 = 5 * 60;
+
+/// Maximum number of issuer keys a process cache retains.
+pub const KEY_CACHE_CAPACITY: usize = 1024;
+/// Time a cached issuer key is retained before it is checked again.
+pub const KEY_CACHE_TTL: Duration = Duration::from_secs(3600);
+
+pub fn credential_hash(value: impl AsRef<[u8]>) -> String {
+    blake3::hash(value.as_ref()).to_string()
+}
+
+pub fn bearer_token_hash(token: &str) -> String {
+    credential_hash(token)
+}
+
+/// Revocation hash that stands for every credential of one user issued before a cutoff.
+pub fn user_cutoff_hash(user_id: &crate::user::id::UserId) -> String {
+    credential_hash(format!("aruna user cutoff {user_id}"))
+}
+
+/// Revocation expiry that keeps a user cutoff until every older token has expired.
+pub fn user_cutoff_expiry(cutoff: u64) -> u64 {
+    cutoff.saturating_add(MAX_TOKEN_LIFETIME)
+}
+
+/// Shape check for a replicated revocation entry, so a realm-wide revocation
+/// set can never be filled with arbitrary strings.
+pub fn valid_token_hash(hash: &str) -> bool {
+    hash.len() == blake3::OUT_LEN * 2
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn revocation_live(expires_at: u64, now: u64) -> bool {
+    expires_at >= now
+}
+
+pub fn revocation_retained(expires_at: u64, now: u64) -> bool {
+    expires_at.saturating_add(REVOCATION_GRACE_SECS) >= now
+}
+
+pub fn valid_revocation_expiry(expires_at: u64, now: u64) -> bool {
+    expires_at.saturating_sub(now) <= MAX_TOKEN_LIFETIME.saturating_add(REVOCATION_GRACE_SECS)
+}
+
+/// Whether the signed lifetime of a token stays revocable. Issuance and
+/// validation share it so a minted token can never outlive what the replicated
+/// revocation set is able to hold.
+pub fn valid_token_lifetime(iat: u64, exp: u64) -> bool {
+    exp.checked_sub(iat)
+        .is_some_and(|lifetime| lifetime <= MAX_TOKEN_LIFETIME)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        REALMS_LIST_KEY, REVOCATION_GRACE_SECS, bearer_token_hash, credential_hash,
+        revocation_live, revocation_retained, valid_revocation_expiry,
+    };
+
+    #[test]
+    fn bearer_token_hex() {
+        let token = "bearer-token";
+        let expected = blake3::hash(b"bearer-token").to_string();
+
+        assert_eq!(bearer_token_hash(token), expected);
+    }
+
+    #[test]
+    fn credential_hash_hex() {
+        let secret = b"credential-secret";
+
+        assert_eq!(credential_hash(secret), blake3::hash(secret).to_string());
+    }
+
+    #[test]
+    fn auth_state_names() {
+        assert_eq!(REALMS_LIST_KEY, b"trusted_realms_list");
+    }
+
+    #[test]
+    fn bounded_revocation_window() {
+        let now = 1_000;
+        assert!(revocation_live(now, now));
+        assert!(!revocation_live(now - 1, now));
+        assert!(revocation_retained(now - REVOCATION_GRACE_SECS, now));
+        assert!(!revocation_retained(now - REVOCATION_GRACE_SECS - 1, now));
+        assert!(valid_revocation_expiry(
+            now + super::MAX_TOKEN_LIFETIME,
+            now
+        ));
+    }
+}

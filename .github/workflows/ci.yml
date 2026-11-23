@@ -23,9 +23,10 @@ env:
   CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
-  # Compiles every test binary once; the jobs below run parts of this archive.
-  test-build:
-    name: Build tests
+  # Compiles every crate test binary except the node's; the jobs below run parts of it.
+  # Examples and benches are left to clippy, which compiles all targets.
+  test-build-crates:
+    name: Build crate tests
     runs-on: ubuntu-latest
     # Hang cap for one workspace test build, not a performance budget.
     timeout-minutes: 60
@@ -34,10 +35,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
+      # The workspace test build stopped the runner without either; its logs never said which.
+      - name: Add swap space
+        uses: ./.github/actions/add-swap
+
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: tests
+          shared-key: tests-crates
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -46,26 +54,113 @@ jobs:
 
       - name: Build the test archive
         run: >-
-          cargo nextest archive --workspace --all-targets --all-features --locked
-          --archive-file nextest-archive.tar.zst
+          cargo nextest archive --workspace --exclude aruna --exclude aruna-api --exclude aruna-doctor
+          --lib --bins --tests --all-features --locked --archive-file nextest-crates.tar.zst
 
       # nextest never runs doctests; this keeps them in the gate.
       - name: Run doctests
-        run: cargo test --workspace --all-features --locked --doc
+        run: >-
+          cargo test --workspace --exclude aruna --exclude aruna-api --exclude aruna-doctor
+          --all-features --locked --doc
 
       - name: Upload the test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: nextest-archive
-          path: nextest-archive.tar.zst
+          name: nextest-crates
+          path: nextest-crates.tar.zst
           if-no-files-found: error
           # The archive is already zstd compressed.
           compression-level: 0
           retention-days: 1
 
-  tests:
-    name: tests (${{ matrix.shard }}/4)
-    needs: test-build
+  # Compiles the node, API and doctor test binaries beside the crate build.
+  test-build-node:
+    name: Build node tests
+    runs-on: ubuntu-latest
+    # Hang cap for one node test build, not a performance budget.
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
+      - name: Add swap space
+        uses: ./.github/actions/add-swap
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: tests-node
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Build the test archive
+        run: >-
+          cargo nextest archive -p aruna-api -p aruna -p aruna-doctor
+          --lib --bins --tests --all-features --locked --archive-file nextest-node.tar.zst
+
+      - name: Run doctests
+        run: cargo test -p aruna-api -p aruna -p aruna-doctor --all-features --locked --doc
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nextest-node
+          path: nextest-node.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  tests-crates:
+    name: crate tests (${{ matrix.shard }}/2)
+    needs: test-build-crates
+    runs-on: ubuntu-latest
+    # Job-level hang cap, not a performance budget. Per-test concurrency and the
+    # 15 minute per-test hang cap live in .config/nextest.toml.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-crates
+
+      # The archive unpacks at the build job's path, so compile-time paths in tests stay valid.
+      - name: Run the test shard
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-crates.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --partition hash:${{ matrix.shard }}/2
+
+      - name: Upload JUnit report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-crates-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  tests-node:
+    name: node tests (${{ matrix.shard }}/4)
+    needs: test-build-node
     runs-on: ubuntu-latest
     # Job-level hang cap, not a performance budget. Per-test concurrency and the
     # 15 minute per-test hang cap live in .config/nextest.toml.
@@ -87,19 +182,29 @@ jobs:
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: nextest-archive
+          name: nextest-node
 
-      # The archive unpacks at the build job's path, so compile-time paths in tests stay valid.
       - name: Run the test shard
         run: >-
-          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --partition hash:${{ matrix.shard }}/4
+
+      # The node's Docker cases are ignored by default; this runner has a daemon.
+      # Reuse the extracted archive metadata from the shard run above.
+      - name: Run the node Docker cases
+        run: >-
+          cargo-nextest nextest run
+          --cargo-metadata target/nextest/cargo-metadata.json
+          --binaries-metadata target/nextest/binaries-metadata.json
+          --target-dir-remap target --workspace-remap .
+          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
+          -E 'package(aruna) & binary(regimes) & test(/^compute_regime::(compute_execution|mcp_artifacts)::/)'
 
       - name: Upload JUnit report
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: junit-tests-${{ matrix.shard }}
+          name: junit-node-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
           retention-days: 7
@@ -122,22 +227,52 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # Real-time scanning of every build file slows Windows compiles.
+      - name: Exclude workspace from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE", "$env:USERPROFILE\.cargo" -ErrorAction SilentlyContinue
+
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
           shared-key: platform-tests
 
-      - name: Run the local folder service tests
-        run: cargo test -p aruna-blob --lib --locked local_fs
+      # One invocation compiles the crates both test sets share only once.
+      - name: Run the local folder and portal install tests
+        run: >-
+          cargo test -p aruna-blob -p aruna-config --profile ci-platform --lib --locked
+          -- local_fs fs_write::tests portal::tests
 
-      # The node itself must build on Windows; the other platform jobs never compile it there.
+  # The node itself must build on Windows; the other platform jobs never compile it there.
+  windows-node-check:
+    name: Windows node check
+    runs-on: windows-latest
+    # Hang cap for one node check, not a performance budget.
+    timeout-minutes: 60
+    env:
+      # Windows runners have no NASM; aws-lc-sys then uses its prebuilt NASM objects.
+      AWS_LC_SYS_PREBUILT_NASM: 1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Exclude workspace from Windows Defender
+        shell: pwsh
+        run: Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE", "$env:USERPROFILE\.cargo" -ErrorAction SilentlyContinue
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: windows-node-check
+
       - name: Check the node build
-        if: runner.os == 'Windows'
-        run: cargo check -p aruna --locked
+        run: cargo check -p aruna --profile ci-platform --locked
 
   native-git:
     name: Native Git tests
-    needs: test-build
+    needs: test-build-node
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -145,20 +280,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Install cargo-nextest
+      - name: Install cargo-nextest and uv
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Install uv
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: uv@0.11.28
+          tool: cargo-nextest@0.9.140,uv@0.11.28
 
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: nextest-archive
+          name: nextest-node
 
       # Real Git, Git LFS and ARC clients; the node itself converts ARCs with arctrl.
       - name: Run native Git tests
@@ -166,9 +296,9 @@ jobs:
           uv run --no-project --python 3.13
           --with-requirements scripts/arc-native/requirements.txt
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
-          exec cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          exec cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --run-ignored only --no-tests fail
-          -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
+          -E "package(aruna) & binary(regimes) & test(/^metadata_regime::git_native::/)"'
 
   # The example's own Python tests; the plugin examples job runs it in the plugin runtime.
   elabftw-python:
@@ -193,7 +323,7 @@ jobs:
   # Builds every plugin example with its toolchain and runs it in the plugin runtime against fakes.
   plugin-examples:
     name: Plugin examples
-    needs: test-build
+    needs: test-build-crates
     runs-on: ubuntu-latest
     # Hang cap for the example builds and runs, as for the eLabFTW job.
     timeout-minutes: 45
@@ -211,20 +341,15 @@ jobs:
       - name: Add the WASM target
         run: rustup target add wasm32-unknown-unknown
 
-      - name: Install cargo-nextest
+      - name: Install cargo-nextest and uv
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Install uv
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: uv@0.11.28
+          tool: cargo-nextest@0.9.140,uv@0.11.28
 
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: nextest-archive
+          name: nextest-crates
 
       - name: Run the Python library tests
         working-directory: plugins/sdk/python
@@ -236,15 +361,14 @@ jobs:
         run: node --test tests/*.test.js
 
       - name: Run the examples in the plugin runtime
-        env:
-          ARUNA_PLUGIN_LANGUAGES: "1"
         run: >-
-          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --no-tests fail -E "package(aruna-plugins) & (binary(examples) | binary(elabftw_python))"
+          cargo-nextest nextest run --archive-file nextest-crates.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored all --no-tests fail
+          -E "package(aruna-wasm-host) & binary(integration) & test(/^(examples|elabftw_python)::/)"
 
   restart-stress:
     name: Restart scale stress
-    needs: test-build
+    needs: test-build-node
     runs-on: ubuntu-latest
     # A functional stress lane, not a timing assertion; bounded so a deadlock fails promptly.
     timeout-minutes: 45
@@ -261,16 +385,16 @@ jobs:
       - name: Download the test archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: nextest-archive
+          name: nextest-node
 
       - name: Run restart scale tests
         run: >-
-          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored only --no-tests fail
-          -E 'package(aruna-operations) & binary(integration) & test(/^restart_traffic::offline_scale_/)'
+          -E 'package(aruna) & binary(regimes) & test(/^restart_regime::restart_traffic::offline_scale_/)'
 
   s3-backend:
-    needs: test-build
+    needs: [test-build-crates, test-build-node]
     runs-on: ubuntu-latest
     # Hang cap for the MinIO-backed suite, not a performance budget.
     timeout-minutes: 30
@@ -284,6 +408,7 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      # Start MinIO detached before downloading the archive so container boot overlaps setup.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
@@ -291,6 +416,24 @@ jobs:
             -e MINIO_ROOT_PASSWORD=aruna-test-secret \
             cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
             server /data
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Download the crate test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-crates
+
+      - name: Download the node test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: nextest-node
+
+      - name: Wait for MinIO
+        run: |
           for _ in $(seq 1 60); do
             if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
               exit 0
@@ -301,19 +444,9 @@ jobs:
           docker logs minio >&2 || true
           exit 1
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Download the test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: nextest-archive
-
-      - name: Run the s3 backend cases
+      - name: Run the blob s3 backend cases
         run: >-
-          cargo-nextest nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          cargo-nextest nextest run --archive-file nextest-crates.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored all --no-tests fail
           -E 'package(aruna-blob) & kind(lib) & (test(=blob::tests::s3_roundtrip_range)
           | test(=blob::tests::s3_multipart_compose) | test(=blob::tests::s3_group_backend)
@@ -327,17 +460,20 @@ jobs:
           | test(=blob::tests::framed::s3_framed_table) | test(=blob::tests::framed::s3_decoded_compose)
           | test(=blob::tests::framed::s3_framed_fallback) | test(=blob::tests::framed::s3_omitted_part)
           | test(=blob::tests::framed::s3_completion_budget)
-          | test(=blob::tests::framed::s3_bucketless_framed))
-          | (package(aruna-operations) & binary(integration)
-          & (test(=multipart::s3_provider_flow) | test(=multipart::s3_framed_completion)))
-          | (package(aruna-operations) & binary(integration) & test(/^linked_import::/))'
+          | test(=blob::tests::framed::s3_bucketless_framed))'
+
+      - name: Run the node s3 backend cases
+        run: >-
+          cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --run-ignored all --no-tests fail
+          -E '(package(aruna) & binary(regimes)
+          & (test(=storage_regime::multipart::s3_provider_flow) | test(=storage_regime::multipart::s3_framed_completion)))
+          | (package(aruna) & binary(regimes) & test(/^storage_regime::linked_import::/))'
 
   docker-backend:
     runs-on: ubuntu-latest
     # Hang cap for the daemon-backed compute suite, not a performance budget.
     timeout-minutes: 60
-    env:
-      ARUNA_COMPUTE_REQUIRE_DOCKER: "1"
 
     steps:
       - name: Check out repository
@@ -346,8 +482,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
 
-      # A required daemon job must fail when Docker is unavailable instead of
-      # letting the ignored cases skip past a broken environment.
+      # Fails early with a clear message when Docker is unavailable; the cases fail without it too.
       - name: Require the Docker daemon
         run: docker info >/dev/null
 
@@ -375,6 +510,7 @@ jobs:
       matrix:
         include:
           - name: default and compute
+            cache-key: default-compute
             run: |
               cargo check --workspace --locked
               cargo check -p aruna-compute --all-targets --no-default-features --locked
@@ -382,14 +518,16 @@ jobs:
                 cargo check -p aruna-compute --all-targets --no-default-features --features "$features" --locked
               done
           # The node compiles its own configuration under each feature, so it is checked apart.
-          - name: node
-            run: cargo check -p aruna --all-targets --no-default-features --locked
-          - name: node docker
-            run: cargo check -p aruna --all-targets --no-default-features --features docker --locked
-          - name: node apptainer
-            run: cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
-          - name: node kubernetes
-            run: cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
+          - name: node and docker
+            cache-key: node-docker
+            run: |
+              cargo check -p aruna --all-targets --no-default-features --locked
+              cargo check -p aruna --all-targets --no-default-features --features docker --locked
+          - name: node apptainer and kubernetes
+            cache-key: node-apptainer-k8s
+            run: |
+              cargo check -p aruna --all-targets --no-default-features --features apptainer --locked
+              cargo check -p aruna --all-targets --no-default-features --features kubernetes --locked
 
     steps:
       - name: Check out repository
@@ -398,7 +536,8 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: feature-checks
+          # Separate cache per leg so parallel runs on main do not overwrite each other's crates.
+          shared-key: feature-checks-${{ matrix.cache-key }}
 
       - name: Check the feature selection
         run: |
@@ -430,7 +569,7 @@ jobs:
       - name: Run the example's tests with the built module
         env:
           ELABFTW_MODULE: ${{ github.workspace }}/target/wasm32-unknown-unknown/release/elabftw_sync.wasm
-        run: cargo test -p elabftw-sync --locked
+        run: cargo test -p elabftw-sync --locked -- --include-ignored
 
   # Quick checks share one runner, so one push does not occupy a slot per check.
   static-checks:
@@ -461,13 +600,22 @@ jobs:
         if: ${{ !cancelled() }}
         run: python3 scripts/dev/check_style.py
 
+      - name: Run the layer guard self-tests
+        if: ${{ !cancelled() }}
+        run: python3 scripts/dev/check_layers_tests.py
+
+      # Structural counts may not rise above scripts/dev/layers_baseline.json.
+      - name: Run the layer guard
+        if: ${{ !cancelled() }}
+        run: python3 scripts/dev/check_layers.py
+
       # The official action builds a container from Docker Hub, whose rate
-      # limited pulls time out on hosted runners; install the binary instead.
-      - name: Install cargo-deny
+      # limited pulls time out on hosted runners; install the binaries instead.
+      - name: Install cargo-deny and just
         if: ${{ !cancelled() }}
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: cargo-deny@0.20.2
+          tool: cargo-deny@0.20.2,just@1.58.0
 
       - name: Run cargo-deny
         if: ${{ !cancelled() }}
@@ -479,8 +627,9 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           shellcheck scripts/*.sh scripts/tests/*.sh
-          shellcheck --shell=sh scripts/compute-helper/build.sh scripts/session-deno/build.sh \
-            scripts/session-python/build.sh scripts/session-helper/session-start
+          shellcheck --shell=sh apps/compute-helper/build.sh scripts/dev/rustc_coverage.sh \
+            scripts/session-deno/build.sh scripts/session-python/build.sh \
+            scripts/session-helper/session-start
 
       - name: Run Python helper tests
         if: ${{ !cancelled() }}
@@ -513,12 +662,6 @@ jobs:
           promtool check rules /rules/alerts.yml
           promtool test rules /rules/alerts.test.yml
 
-      - name: Install just
-        if: ${{ !cancelled() }}
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: just@1.58.0
-
       - name: Run recipe contract tests
         if: ${{ !cancelled() }}
         run: bash scripts/tests/just_recipes.sh
@@ -532,9 +675,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Free disk space
-        uses: ./.github/actions/free-disk
 
       - name: Install nightly clippy
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
@@ -554,6 +694,10 @@ jobs:
     runs-on: ubuntu-latest
     # Hang cap for one release build, not a performance budget.
     timeout-minutes: 60
+    env:
+      # Startup checks need no aggressive O3 passes; opt-level 1 keeps async
+      # frames compact while cutting LLVM time (apps/node uses an 8 MiB stack).
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: 1
 
     steps:
       - name: Check out repository
@@ -562,7 +706,7 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: release
+          shared-key: release-smoke
 
       - name: Build the deployment binaries
         run: |
@@ -576,6 +720,7 @@ jobs:
           name: release-binaries
           path: release-binaries.tar
           if-no-files-found: error
+          compression-level: 1
           retention-days: 1
 
   cluster-start:
@@ -842,11 +987,27 @@ jobs:
         with:
           name: release-binaries
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # The gha cache backend reads the Actions runtime token, which run steps lack by default.
+      - name: Expose the Actions runtime
+        uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
+
       # The Dockerfile copies binaries from .prebuilt/ instead of compiling them again.
+      # Only main writes the Docker cache, matching rust-setup so PRs never evict main's caches.
       - name: Build the compose image once
+        env:
+          CACHE_WRITE: ${{ github.ref == 'refs/heads/main' }}
         run: |
+          set -euo pipefail
           mkdir -p .prebuilt && tar -xf release-binaries.tar -C .prebuilt
-          docker compose --file scripts/compose.yaml build aruna
+          cache_to=()
+          if [ "$CACHE_WRITE" = "true" ]; then
+            cache_to=(--cache-to "type=gha,scope=compose-image,mode=max,ignore-error=true")
+          fi
+          docker buildx build --load -t aruna:latest \
+            --cache-from type=gha,scope=compose-image "${cache_to[@]}" .
 
       - name: Start the compose recipes
         run: |

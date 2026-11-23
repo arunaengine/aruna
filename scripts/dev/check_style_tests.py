@@ -977,6 +977,30 @@ class HeaderTest(TreeTest):
         self.assertEqual(check_style.without_reason(check_style.HEADER_EXCEPTIONS), ["fixtures/sample.md"])
 
 
+class OrphanTest(unittest.TestCase):
+    def orphans(self, files):
+        with tempfile.TemporaryDirectory() as tmp:
+            for relpath, text in files:
+                full = os.path.join(tmp, relpath)
+                os.makedirs(os.path.dirname(full), exist_ok=True)
+                with open(full, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            return sorted(check_style.check_orphans(tmp))
+
+    def test_orphan_detected(self):
+        tree = [
+            ("pkg/Cargo.toml", '[package]\nname = "pkg"\n'),
+            ("pkg/src/lib.rs", 'mod used;\n#[cfg(test)]\n#[path = "used_tests.rs"]\nmod tests;\n'),
+            ("pkg/src/used.rs", "pub fn ok() {}\n"),
+            ("pkg/src/used_tests.rs", "fn runs() {}\n"),
+            ("pkg/src/orphan.rs", "fn never() {}\n"),
+        ]
+        self.assertEqual(
+            self.orphans(tree),
+            [("file", "pkg/src/orphan.rs", 0, "unreferenced Rust source file under src/")],
+        )
+
+
 class OwnFilesTest(unittest.TestCase):
     def test_own_clean(self):
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

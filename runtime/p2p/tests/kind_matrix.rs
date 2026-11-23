@@ -1,0 +1,228 @@
+//! Tests the accept-time ALPN and node kind boundary between realm nodes and user devices.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use aruna_core::alpn::Alpn;
+use aruna_core::document::DocumentTarget;
+use aruna_core::id::NodeId;
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
+use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use aruna_p2p::streams::BiStream;
+use aruna_p2p::{InboundEventHandler, NetHandle};
+use aruna_storage::storage::memory::MemoryStorage;
+use async_trait::async_trait;
+use irokle::Storage as _;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
+
+const NETWORK_HANG_CAP: Duration = Duration::from_secs(45);
+
+#[derive(Clone, Default)]
+struct TestInboundHandler {
+    stream_tx: Option<mpsc::UnboundedSender<(Alpn, BiStream, NodeId)>>,
+}
+
+#[async_trait]
+impl InboundEventHandler for TestInboundHandler {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: BiStream, node_id: NodeId) {
+        if let Some(tx) = &self.stream_tx {
+            let _ = tx.send((alpn, stream, node_id));
+        }
+    }
+}
+
+fn user_kind(realm_id: RealmId) -> RealmNodeKind {
+    RealmNodeKind::User {
+        owner: UserId::nil(realm_id),
+    }
+}
+
+fn config(realm_id: RealmId, secret_key: iroh::SecretKey) -> NetConfig {
+    NetConfig {
+        bind_addr: "127.0.0.1:0".parse().expect("valid bind addr"),
+        secret_key: Some(secret_key),
+        realm_id,
+        discovery_method: DiscoveryMethod::None,
+        relay_method: RelayMethod::None,
+        ..NetConfig::default()
+    }
+}
+
+#[tokio::test]
+async fn refuses_user_sync() -> Result<(), Box<dyn std::error::Error>> {
+    // The realm node knows the dialer as a User device, so document sync is refused
+    // while the metadata read surface stays open: only the accept side can refuse.
+    let realm_id = RealmId::from_bytes([91u8; 32]);
+    let storage_device = MemoryStorage::open();
+    let storage_realm = MemoryStorage::open();
+
+    let device = NetHandle::new(
+        config(realm_id, iroh::SecretKey::from_bytes(&[91u8; 32])),
+        storage_device,
+    )
+    .await?;
+    let realm = NetHandle::new(
+        config(realm_id, iroh::SecretKey::from_bytes(&[92u8; 32])),
+        storage_realm,
+    )
+    .await?;
+
+    let mut realm_view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    realm_view.ensure_node(realm.node_id(), RealmNodeKind::Management);
+    realm_view.ensure_node(device.node_id(), user_kind(realm_id));
+    realm.refresh_document_peers(&realm_view).await?;
+
+    let mut device_view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    device_view.ensure_node(realm.node_id(), RealmNodeKind::Management);
+    device_view.ensure_node(device.node_id(), RealmNodeKind::Management);
+    device.refresh_document_peers(&device_view).await?;
+
+    let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
+    realm.set_inbound_handler(Arc::new(TestInboundHandler {
+        stream_tx: Some(stream_tx),
+    }));
+    device.add_peer_addr(realm.endpoint_addr()).await;
+    realm.add_peer_addr(device.endpoint_addr()).await;
+
+    let mut allowed = device.open_stream(realm.node_id(), Alpn::Metadata).await?;
+    allowed.0.write_all(b"metadata probe").await?;
+    let (accepted_alpn, _stream, dialer) = tokio::time::timeout(NETWORK_HANG_CAP, stream_rx.recv())
+        .await?
+        .ok_or("expected an inbound metadata stream")?;
+    assert_eq!(accepted_alpn, Alpn::Metadata);
+    assert_eq!(dialer, device.node_id());
+
+    let refused = tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let Ok(mut stream) = device
+            .open_stream(realm.node_id(), Alpn::DocumentSync)
+            .await
+        else {
+            return true;
+        };
+        if stream.0.write_all(b"sync probe").await.is_err() {
+            return true;
+        }
+        let _ = stream.0.finish();
+        stream.1.read_to_end(1024).await.is_err()
+    })
+    .await?;
+    assert!(refused, "a user-kind key must not reach document sync");
+
+    device.shutdown().await;
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sync_skips_devices() -> Result<(), Box<dyn std::error::Error>> {
+    // Dial-side mirror of the accept matrix: a realm node never writes a device
+    // into a topic's membership and never picks one as a sync target.
+    let realm_id = RealmId::from_bytes([95u8; 32]);
+    let storage_realm = MemoryStorage::open();
+    let realm = NetHandle::new(
+        config(realm_id, iroh::SecretKey::from_bytes(&[95u8; 32])),
+        storage_realm,
+    )
+    .await?;
+    let device = iroh::SecretKey::from_bytes(&[96u8; 32]).public();
+    let server = iroh::SecretKey::from_bytes(&[97u8; 32]).public();
+
+    let mut view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    view.ensure_node(realm.node_id(), RealmNodeKind::Management);
+    view.ensure_node(server, RealmNodeKind::Server);
+    view.ensure_node(device, user_kind(realm_id));
+    realm.refresh_document_peers(&view).await?;
+
+    let topic =
+        DocumentTarget::RealmConfig { realm_id }.sync_topic_id(realm_id, &PlacementRef::NIL);
+    realm
+        .ensure_sync_topics(&[topic], vec![device, server])
+        .await?;
+    realm.allow_topic_peers(&[topic], vec![device]).await?;
+
+    let members = realm
+        .document_sync_node()
+        .storage()
+        .topic_state(&topic)?
+        .ok_or("expected the shared topic")?
+        .members;
+    assert!(
+        !members.contains(&irokle::PeerId::from_bytes(*device.as_bytes())),
+        "a device must never be added to a sync topic"
+    );
+    assert!(members.contains(&irokle::PeerId::from_bytes(*server.as_bytes())));
+
+    // The device has no known address, so a selection that kept it as a target
+    // would fail this sync instead of finishing with nothing to dial.
+    tokio::time::timeout(
+        NETWORK_HANG_CAP,
+        realm.sync_topic_peers(topic, vec![device]),
+    )
+    .await??;
+
+    realm.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn device_refuses_sync() -> Result<(), Box<dyn std::error::Error>> {
+    // Direction matters: a device never dials sync or shard exchange, dials job
+    // control for its owner's submissions, and never serves job control.
+    let realm_id = RealmId::from_bytes([93u8; 32]);
+    let storage_device = MemoryStorage::open();
+    let storage_realm = MemoryStorage::open();
+
+    let device = NetHandle::new(
+        config(realm_id, iroh::SecretKey::from_bytes(&[93u8; 32])),
+        storage_device,
+    )
+    .await?;
+    let realm = NetHandle::new(
+        config(realm_id, iroh::SecretKey::from_bytes(&[94u8; 32])),
+        storage_realm,
+    )
+    .await?;
+
+    let mut view = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+    view.ensure_node(realm.node_id(), RealmNodeKind::Management);
+    view.ensure_node(device.node_id(), user_kind(realm_id));
+    device.refresh_document_peers(&view).await?;
+    realm.refresh_document_peers(&view).await?;
+
+    realm.set_inbound_handler(Arc::new(TestInboundHandler::default()));
+    device.add_peer_addr(realm.endpoint_addr()).await;
+    realm.add_peer_addr(device.endpoint_addr()).await;
+
+    for alpn in [Alpn::DocumentSync, Alpn::Shard] {
+        device
+            .open_stream(realm.node_id(), alpn)
+            .await
+            .expect_err("a user device must not dial realm infrastructure protocols");
+    }
+    device.open_stream(realm.node_id(), Alpn::Metadata).await?;
+    device
+        .open_stream(realm.node_id(), Alpn::JobControl)
+        .await?;
+
+    let refused = tokio::time::timeout(NETWORK_HANG_CAP, async {
+        let Ok(mut stream) = realm.open_stream(device.node_id(), Alpn::JobControl).await else {
+            return true;
+        };
+        if stream.0.write_all(b"job probe").await.is_err() {
+            return true;
+        }
+        let _ = stream.0.finish();
+        stream.1.read_to_end(1024).await.is_err()
+    })
+    .await?;
+    assert!(refused, "a user device must not serve job control");
+
+    device.shutdown().await;
+    realm.shutdown().await;
+    Ok(())
+}

@@ -28,9 +28,15 @@ revision. The same commands are available locally: `just check` compiles every
 supported feature selection, and `just test` runs the nextest and doctest
 commands (it requires `cargo-nextest`).
 
-Each crate builds its `tests/` files as modules of one `integration` test binary.
-Run them with nextest, which starts every test in its own process; select one file
-with `-E 'test(/^<file>::/)'`.
+Most crates with several `tests/` files consolidate them into one test binary,
+named `integration` in library crates and `regimes` (grouped under seven regime
+modules) in `apps/node`. Run them with nextest, which starts every test in its
+own process. For consolidated binaries, select one file by module prefix with
+`-E 'test(/^<file>::/)'`, and in `apps/node` add the regime prefix, for example
+`cargo nextest run -p aruna --test regimes -E 'test(/^storage_regime::s3_operations::/)'`.
+Crates that use Cargo's separate integration test targets (such as
+`elabftw-sync`) select a file by target name instead, for example
+`cargo nextest run -p elabftw-sync --test bodies`.
 
 All required PR checks must pass before merge. A failed, partial, or earlier
 run is not a pass; rerun affected checks after corrections. Use the pinned
@@ -48,10 +54,10 @@ keeping a local copy. The root policy is the single owner of the folder
 threshold, the shared-prefix exception, term limits, and hoisting.
 
 - **Behavior homes.** Bucket, object, multipart, and access operations belong
-  under `operations/src/s3/<family>/`; routes under
-  `api/src/routes/{execution,access,storage}/`; records under
-  `core/src/structs/{placement,identity,storage,execution}/`; effect adapters
-  under `operations/src/effect_adapters/`. See
+  under `domain/ops-data/src/s3/<family>/`; routes under
+  `frontends/api/src/routes/{execution,access,storage}/`; records under
+  `domain/core/src/structs/{placement,identity,storage,execution}/`; effect adapters
+  under `runtime/runner/src/effect_adapters/`. See
   [REPO_STRUCTURE.md](REPO_STRUCTURE.md) for the full map.
 
 ### Workflow

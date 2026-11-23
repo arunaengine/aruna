@@ -1,0 +1,289 @@
+//! Begins and finishes usage rebuilds and copies committed usage deltas onto rebuild rows.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::{BTreeSet, HashSet};
+
+use aruna_core::effects::IterStart;
+use aruna_core::errors::StorageError;
+use aruna_core::events::StorageEvent;
+use aruna_core::keyspaces::{NODE_STATS_KEYSPACE, USAGE_STATS_KEYSPACE};
+use aruna_core::structs::storage::usage::{
+    RebuildProgress, ShadowCounters, USAGE_COMPLETE_KEY, USAGE_PROGRESS_KEY, USAGE_REBUILD_KEY,
+    USAGE_SHADOW_PREFIX, UsageDelta, dirty_share_key, global_shard_keys, usage_shadow_key,
+};
+use byteview::ByteView;
+use fjall::Readable;
+use tracing::warn;
+use ulid::Ulid;
+
+use super::transactions::{CounterChange, PendingChanges, warn_clamped};
+use super::worker::{FjallStorage, Store, iterate_page};
+
+/// Rows read per page while a rebuild clears or replaces counter rows.
+const REBUILD_PAGE: usize = 1024;
+
+/// The usage keyspace whose rebuild was begun before the last stop and saved its progress.
+pub(super) fn running_rebuild(store: &Store) -> HashSet<String> {
+    let marker = store
+        .existing_keyspace(USAGE_STATS_KEYSPACE)
+        .ok()
+        .flatten()
+        .and_then(|keyspace| store.db.read_tx().get(&keyspace, USAGE_PROGRESS_KEY).ok())
+        .flatten();
+    marker
+        .filter(|value| RebuildProgress::from_bytes(value.as_ref()).is_ok())
+        .map(|_| USAGE_STATS_KEYSPACE.to_string())
+        .into_iter()
+        .collect()
+}
+
+/// True for the rebuild marker and the rebuild rows, which are never copied themselves.
+pub(super) fn is_rebuild_row(key: &[u8]) -> bool {
+    key == USAGE_REBUILD_KEY || key == USAGE_PROGRESS_KEY || key.starts_with(USAGE_SHADOW_PREFIX)
+}
+
+/// The new value of a rebuild row after `change`; rebuild rows hold signed sums.
+pub(super) fn shadow_row(
+    stored: Option<&[u8]>,
+    change: CounterChange,
+) -> Result<Vec<u8>, StorageError> {
+    let failed = |message: String| StorageError::WriteError(message);
+    let change = match change {
+        CounterChange::Usage(delta) => ShadowCounters::Usage(delta),
+        CounterChange::Bucket(delta) => ShadowCounters::Bucket(delta),
+        CounterChange::Range(_) => return Err(failed("range change on a rebuild row".into())),
+    };
+    let row = match stored {
+        Some(bytes) => ShadowCounters::from_bytes(bytes)
+            .map_err(|error| failed(error.to_string()))?
+            .merge(change)
+            .ok_or_else(|| failed("rebuild row kinds differ".into()))?,
+        None => change,
+    };
+    row.to_bytes().map_err(|error| failed(error.to_string()))
+}
+
+/// Adds each usage change of a rebuilding keyspace in `shadow` to its rebuild row, so both
+/// land in the same commit.
+pub(super) fn shadow_copies(
+    shadow: &HashSet<String>,
+    pending: &mut PendingChanges,
+) -> Result<(), StorageError> {
+    if shadow.is_empty() {
+        return Ok(());
+    }
+    let copies: Vec<_> = pending
+        .iter()
+        .filter(|((key_space, key), change)| {
+            shadow.contains(key_space)
+                && !is_rebuild_row(key)
+                && !matches!(change, CounterChange::Range(_))
+        })
+        .map(|((key_space, key), change)| {
+            let shadow = ByteView::from(usage_shadow_key(key));
+            ((key_space.clone(), shadow), *change)
+        })
+        .collect();
+    for (row, change) in copies {
+        let merged = match pending.get(&row) {
+            Some(existing) => existing.merge(change)?,
+            None => change,
+        };
+        pending.insert(row, merged);
+    }
+    Ok(())
+}
+
+/// The rows a new rebuild generation starts with: every global shard row at zero, then the
+/// progress and the marker.
+pub(super) fn rebuild_seed() -> Result<Vec<(ByteView, ByteView)>, StorageError> {
+    let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
+    let seed = ShadowCounters::Usage(UsageDelta::default()).to_bytes();
+    let seed = seed.map_err(|error| failed(&error))?;
+    let mut rows: Vec<_> = (global_shard_keys().into_iter())
+        .map(|shard| {
+            let row = ByteView::from(usage_shadow_key(&shard));
+            (row, ByteView::from(seed.as_slice()))
+        })
+        .collect();
+    let progress = RebuildProgress::new(Ulid::generate()).to_bytes();
+    let progress = progress.map_err(|error| failed(&error))?;
+    rows.push((ByteView::from(USAGE_PROGRESS_KEY), ByteView::from(progress)));
+    rows.push((ByteView::from(USAGE_REBUILD_KEY), ByteView::from(&[][..])));
+    Ok(rows)
+}
+
+/// What finishing a rebuild does with one row of the usage keyspace.
+pub(super) struct Swap {
+    /// The live counter row a rebuild row becomes, with its value.
+    pub(super) live: Option<(ByteView, ByteView)>,
+    pub(super) remove: bool,
+    /// The group whose counter row changed.
+    pub(super) group: Option<Ulid>,
+}
+
+/// Decides the fate of row `key`; `kept` tells whether a live row has its rebuild row.
+pub(super) fn swap_row(
+    key: &ByteView,
+    value: &[u8],
+    kept: impl FnOnce() -> Result<bool, StorageError>,
+) -> Result<Swap, StorageError> {
+    let failed = |message: String| StorageError::WriteError(message);
+    let mut swap = Swap {
+        live: None,
+        remove: false,
+        group: None,
+    };
+    let key = key.as_ref();
+    if key == USAGE_COMPLETE_KEY {
+        return Ok(swap);
+    }
+    if key == USAGE_REBUILD_KEY || key == USAGE_PROGRESS_KEY {
+        swap.remove = true;
+    } else if let Some(live) = key.strip_prefix(USAGE_SHADOW_PREFIX) {
+        let row = ShadowCounters::from_bytes(value).map_err(|error| failed(error.to_string()))?;
+        let (live_value, shortfalls) = row.live_row().map_err(|error| failed(error.to_string()))?;
+        warn_clamped(live, shortfalls);
+        swap.group = counter_group(live);
+        swap.live = Some((ByteView::from(live), ByteView::from(live_value)));
+        swap.remove = true;
+    } else if !kept()? {
+        // A counter row the rebuild did not produce is stale.
+        swap.group = counter_group(key);
+        swap.remove = true;
+    }
+    Ok(swap)
+}
+
+impl FjallStorage {
+    /// Answers a view that reads source rows as the rebuild began. A rebuild already running,
+    /// also one begun before a restart, resumes with its rows and kept values.
+    #[tracing::instrument(name = "storage.begin_usage_rebuild", level = "debug", skip(self))]
+    pub(super) fn begin_usage_rebuild(&mut self, key_space: String) -> StorageEvent {
+        if !self.usage_shadow.contains(&key_space) {
+            let cleared = self.clear_preimages();
+            if let Err(error) = cleared.and_then(|()| self.clear_rebuild_rows(&key_space)) {
+                return StorageEvent::Error { error };
+            }
+            // No commit can land between turning shadowing on and taking the snapshot.
+            self.usage_shadow.insert(key_space.clone());
+        }
+        let started = self.start_transaction(true);
+        if let StorageEvent::TransactionStarted { txn_id } = &started {
+            self.usage_views.insert(*txn_id);
+        }
+        started
+    }
+
+    /// Deletes old rebuild rows, seeds every global shard row, and writes the marker and the
+    /// progress of a new generation in one commit.
+    fn clear_rebuild_rows(&mut self, key_space: &str) -> Result<(), StorageError> {
+        let keyspace = self.store.resolve_keyspace(key_space)?;
+        let snapshot = self.store.db.read_tx();
+        let mut tx = self.buffered_write_tx()?;
+        let prefix = ByteView::from(USAGE_SHADOW_PREFIX);
+        let mut start = None;
+        loop {
+            let (values, next) = iterate_page(
+                &snapshot,
+                &keyspace,
+                Some(&prefix),
+                start.as_ref(),
+                REBUILD_PAGE,
+            )?;
+            for (key, _) in values {
+                tx.remove(keyspace.clone(), key);
+            }
+            match next {
+                Some(key) => start = Some(IterStart::After(key)),
+                None => break,
+            }
+        }
+        for (row, value) in rebuild_seed()? {
+            tx.insert(keyspace.clone(), row, value);
+        }
+        self.commit_buffered(tx)?;
+        self.persist_journal()
+    }
+
+    #[tracing::instrument(name = "storage.finish_usage_rebuild", level = "debug", skip(self))]
+    pub(super) fn finish_usage_rebuild(&mut self, key_space: String) -> StorageEvent {
+        if !self.usage_shadow.contains(&key_space) {
+            return StorageEvent::Error {
+                error: StorageError::WriteError("no usage rebuild is running".to_string()),
+            };
+        }
+        match self.replace_counter_rows(&key_space) {
+            Ok(entries) => {
+                self.usage_shadow.remove(&key_space);
+                // A fresh rebuild clears what is left.
+                if let Err(error) = self.clear_preimages() {
+                    warn!(%error, "Kept rebuild values stay until the next usage rebuild");
+                }
+                StorageEvent::BatchWriteResult { entries }
+            }
+            Err(error) => StorageEvent::Error { error },
+        }
+    }
+
+    /// Replaces every live counter row by its rebuild row in one commit.
+    fn replace_counter_rows(
+        &mut self,
+        key_space: &str,
+    ) -> Result<Vec<(String, ByteView)>, StorageError> {
+        let keyspace = self.store.resolve_keyspace(key_space)?;
+        let snapshot = self.store.db.read_tx();
+        let mut tx = self.buffered_write_tx()?;
+        let mut entries = Vec::new();
+        let mut groups = BTreeSet::new();
+        let mut start = None;
+        loop {
+            let (values, next) =
+                iterate_page(&snapshot, &keyspace, None, start.as_ref(), REBUILD_PAGE)?;
+            for (key, value) in values {
+                let kept = || {
+                    let shadow = usage_shadow_key(key.as_ref());
+                    let kept = snapshot.get(&keyspace, &shadow);
+                    let kept = kept.map_err(|error| StorageError::ReadError(error.to_string()));
+                    Ok(kept?.is_some())
+                };
+                let swap = swap_row(&key, value.as_ref(), kept)?;
+                groups.extend(swap.group);
+                if let Some((live, live_value)) = swap.live {
+                    tx.insert(keyspace.clone(), live.clone(), live_value);
+                    entries.push((key_space.to_string(), live));
+                }
+                if swap.remove {
+                    tx.remove(keyspace.clone(), key);
+                }
+            }
+            match next {
+                Some(key) => start = Some(IterStart::After(key)),
+                None => break,
+            }
+        }
+        // Corrected group counters may undercut replica shares published from the old ones, so
+        // each group's quota gate stops deducting its own share until the next publish.
+        let stats = self.store.resolve_keyspace(NODE_STATS_KEYSPACE)?;
+        let generation = ByteView::from(Ulid::generate().to_bytes().to_vec());
+        for group in groups {
+            tx.insert(
+                stats.clone(),
+                ByteView::from(dirty_share_key(group)),
+                generation.clone(),
+            );
+        }
+        let complete = ByteView::from(USAGE_COMPLETE_KEY);
+        tx.insert(keyspace, complete, ByteView::from(&[][..]));
+        self.commit_buffered(tx)?;
+        self.persist_journal()?;
+        Ok(entries)
+    }
+}
+
+/// The group of a `group/<id>` counter row.
+pub(super) fn counter_group(key: &[u8]) -> Option<Ulid> {
+    let id = key.strip_prefix(b"group/")?;
+    Some(Ulid::from_bytes(id.try_into().ok()?))
+}

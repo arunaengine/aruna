@@ -1,0 +1,133 @@
+//! Owns the decentralized submission lifecycle: no leader, no quorum, no global scheduler.
+//! One family holder admits a submission, every witness plans it, and its target receipts it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::compute::quota::QuotaDenied;
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::structs::execution::job::family::{JobFamilyId, JobRecordError};
+use aruna_core::structs::execution::job::identity::JobId;
+use aruna_core::structs::identity::realm::{JobFamilyError, RealmConfigDocument, RealmId};
+use aruna_core::types::Value;
+use thiserror::Error;
+
+use super::records::RecordStoreError;
+use super::records::verify::FamilyView;
+
+pub mod admit;
+pub(crate) mod advertised;
+pub mod alias;
+pub mod cancel;
+pub mod chain;
+pub mod closure;
+pub mod deferred;
+pub mod family_reads;
+pub(crate) mod fetch;
+mod forward;
+pub mod held;
+#[cfg(test)]
+mod ingress;
+mod input_capture;
+mod input_walk;
+pub mod launch_admit;
+pub(crate) mod launch_checks;
+pub mod membership;
+pub mod offer;
+pub mod outbox;
+mod output_policies;
+pub mod plan;
+pub mod remote_inputs;
+pub mod report;
+pub mod reservation;
+mod resolve_inputs;
+pub mod routing;
+pub mod screen;
+pub mod serve_inputs;
+pub mod stage;
+mod submission_rules;
+pub mod submit_external;
+pub mod task_job;
+pub mod updates;
+pub mod witness;
+
+/// Why one lifecycle round did not complete. An availability failure is never
+/// reported as a refusal of the request itself.
+#[derive(Debug, PartialEq, Error)]
+pub enum LifecycleError {
+    #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
+    #[error(transparent)]
+    Record(#[from] JobRecordError),
+    #[error(transparent)]
+    Family(#[from] JobFamilyError),
+    #[error(transparent)]
+    Store(#[from] RecordStoreError),
+    #[error("realm config document missing")]
+    RealmConfigMissing,
+    /// This node does not hold the submission family, so it may not admit it.
+    #[error("this node does not hold the submission family placement")]
+    NotHolder,
+    /// Exact local admission found no capacity for the stored resources.
+    #[error("no local capacity for the stored execution resources")]
+    Capacity,
+    /// The same idempotency key is already bound to a different request.
+    #[error("idempotency key already bound to job {existing_job_id}")]
+    IdempotencyConflict { existing_job_id: JobId },
+    /// Standing quota refused this NEW admission; replays are never refused.
+    #[error("standing compute quota refused the admission: {0}")]
+    QuotaDenied(#[from] QuotaDenied),
+    /// A plugin task's request reached a holder after its admission deadline, or without one.
+    #[error("the request is past its admission deadline")]
+    AdmissionClosed,
+    /// A plugin task's work row on the receiver is no longer dispatched.
+    #[error("the plugin task's work has ended")]
+    TaskEnded,
+    /// The keyed family is still being deleted on this node; the submission is retried later.
+    #[error("the job family is still being pruned; retry later")]
+    Pruning,
+    #[error("operation did not finish")]
+    NotFinished,
+    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: &'static str,
+    },
+}
+
+crate::jobs::io_failure!(LifecycleError);
+
+impl LifecycleError {
+    /// An event the operation's current state does not accept.
+    pub(crate) fn unexpected(
+        state: &impl std::fmt::Debug,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Self {
+        Self::UnexpectedEvent {
+            state: format!("{state:?}"),
+            expected,
+            got,
+        }
+    }
+}
+
+/// The family view a realm config row gives; a missing row is `RealmConfigMissing`.
+fn stored_view(
+    value: Option<Value>,
+    realm_id: RealmId,
+    family: JobFamilyId,
+) -> Result<Option<FamilyView>, LifecycleError> {
+    let value = value.ok_or(LifecycleError::RealmConfigMissing)?;
+    let config = RealmConfigDocument::from_bytes(&value)?;
+    Ok(FamilyView::resolve(&config, realm_id, family))
+}
+
+#[cfg(test)]
+mod tests;

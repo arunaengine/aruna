@@ -1,0 +1,127 @@
+//! Tests global version resolution: probe targets and the bounded content page.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::{probe_targets, range_holders};
+use crate::distribution::test_record::{member, replicated, secret};
+use aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot;
+use aruna_core::structs::storage::distribution::{DataStrategy, MemberState, MetadataCoverage};
+use aruna_runner::driver::drive;
+
+/// The two shards split at "m", each replicated on the other member, every member ready.
+fn ready_set() -> DistributionSnapshot {
+    let (mut snapshot, _) = replicated(true, 1);
+    for member in &mut snapshot.config.members {
+        member.state = MemberState::Ready;
+    }
+    snapshot
+}
+
+#[test]
+fn holders_are_copies() {
+    let mut snapshot = ready_set();
+    // Member 1 coordinates "a", member 2 keeps a copy of it.
+    assert_eq!(
+        range_holders(&snapshot, "a"),
+        vec![secret(1).public(), secret(2).public()]
+    );
+    // A replica that keeps copies on use may serve one, after the coordinator.
+    snapshot.config.members[1].strategy = DataStrategy::CacheOnUse;
+    assert_eq!(
+        range_holders(&snapshot, "a"),
+        vec![secret(1).public(), secret(2).public()]
+    );
+    // A streaming replica keeps no bytes to serve from.
+    snapshot.config.members[1].strategy = DataStrategy::Stream;
+    assert_eq!(range_holders(&snapshot, "a"), vec![secret(1).public()]);
+    // A member that is not ready serves nothing.
+    snapshot.config.members[0].state = MemberState::CatchingUp;
+    assert!(range_holders(&snapshot, "a").is_empty());
+}
+
+#[test]
+fn probes_full_member() {
+    let mut snapshot = ready_set();
+    // Assigned coverage: the holders of each range are asked, never this node.
+    assert_eq!(
+        probe_targets(&snapshot, secret(1).public()),
+        vec![vec![secret(2).public()]]
+    );
+    // Each range's coordinator first, then its replica answers when the coordinator is down.
+    assert_eq!(
+        probe_targets(&snapshot, secret(3).public()),
+        vec![
+            vec![secret(1).public(), secret(2).public()],
+            vec![secret(2).public(), secret(1).public()],
+        ]
+    );
+    // A catching-up member proves nothing, so it is never asked.
+    snapshot.config.members[1].state = MemberState::CatchingUp;
+    assert_eq!(
+        probe_targets(&snapshot, secret(3).public()),
+        vec![vec![secret(1).public()]]
+    );
+    snapshot.config.members[1].state = MemberState::Ready;
+    // One ready member with all coverage covers the whole set.
+    let full = snapshot
+        .config
+        .members
+        .iter_mut()
+        .find(|candidate| candidate.member_id == member(2))
+        .unwrap();
+    full.coverage = MetadataCoverage::All;
+    assert_eq!(
+        probe_targets(&snapshot, secret(3).public()),
+        vec![vec![secret(2).public()]]
+    );
+}
+
+#[tokio::test]
+async fn content_page_bounded() {
+    use super::content_versions;
+    use crate::distribution::test_store::{apply, context, install, open, range, write};
+    use ulid::Ulid;
+
+    let (_dir, handle) = open();
+    let set = Ulid::from_bytes([9; 16]);
+    install(&handle, set, &[range(1, "", None)]).await;
+    assert!(apply(&handle, write(set, "a", 3, 10)).await.unwrap());
+    let context = context(&handle);
+    let found = drive(content_versions(set, &[3; 32], 4), &context)
+        .await
+        .unwrap();
+    assert_eq!(
+        found,
+        (vec![(Ulid::from_bytes([3; 16]), "a".to_string())], false)
+    );
+    let cut = drive(content_versions(set, &[3; 32], 0), &context)
+        .await
+        .unwrap();
+    assert_eq!(cut, (Vec::new(), true), "a cut page says more exist");
+    let other = drive(content_versions(set, &[4; 32], 4), &context)
+        .await
+        .unwrap();
+    assert_eq!(other, (Vec::new(), false));
+}
+
+#[test]
+fn spent_deadline_stops() {
+    // Members are asked only while the runner clock is before the deadline.
+    use super::{AskSetOperation, SetAnswer};
+    use aruna_core::bucket_read::GetBucketError;
+    use aruna_core::calls::{ChildOutcome, IoCall, IoResult, Next};
+    use aruna_core::operation::Operation;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::storage::blob::BucketInfo;
+    let ask = |now_ms| {
+        let ids = Some((secret(3).public(), RealmId::from_bytes([1; 32])));
+        let version_id = ulid::Ulid::from_bytes([5; 16]);
+        let mut ask = AskSetOperation::new(ids, ready_set(), version_id, (0, Some(10)));
+        ask.stamp(now_ms);
+        ask.first().unwrap();
+        let missing = Err::<BucketInfo, _>(GetBucketError::NotFound);
+        ask.next(IoResult::Child(ChildOutcome::new(missing)))
+    };
+    assert!(matches!(ask(9), Ok(Next::Call(IoCall::Child(_)))));
+    assert_eq!(ask(10), Ok(Next::Done((SetAnswer::Unknown, 0))));
+}

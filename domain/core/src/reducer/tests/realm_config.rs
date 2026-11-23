@@ -1,0 +1,1224 @@
+//! Tests realm config node, OIDC provider and settings updates and their conflict handling.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+
+#[test]
+fn realm_config_deterministically() {
+    let mut state = realm_config_state();
+    let first_node = node(11);
+    let second_node = node(12);
+
+    state
+        .apply(&ensure_realm_node(
+            1,
+            1,
+            first_node,
+            RealmNodeKind::Management,
+        ))
+        .unwrap();
+    state
+        .apply(&ensure_realm_node(2, 2, second_node, RealmNodeKind::Server))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_config_nodes(),
+        BTreeMap::from([
+            (first_node, RealmNodeKind::Management),
+            (second_node, RealmNodeKind::Server),
+        ])
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn concurrent_realm_closed() {
+    let mut state = realm_config_state();
+    let config_node = node(11);
+
+    state
+        .apply(&ensure_realm_node(
+            1,
+            1,
+            config_node,
+            RealmNodeKind::Management,
+        ))
+        .unwrap();
+    state
+        .apply(&ensure_realm_node(2, 2, config_node, RealmNodeKind::Server))
+        .unwrap();
+
+    assert!(!state.materialized_config_nodes().contains_key(&config_node));
+    let conflict = state
+        .conflicts
+        .get(&format!("realm_config.nodes.{config_node}"))
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    for kind in [RealmNodeKind::Management, RealmNodeKind::Server] {
+        let encoded = node_kind_value(&kind);
+        assert!(
+            conflict
+                .values
+                .iter()
+                .any(|value| value.value.as_deref() == Some(encoded.as_str()))
+        );
+    }
+}
+
+#[test]
+fn removes_config_node() {
+    // Ensured then removed: the node leaves the materialization and is
+    // reported as removed, which is what the overlays subtract.
+    let mut state = realm_config_state();
+    let config_node = node(11);
+    let origin = node(1);
+    let ensured = ensure_realm_node(
+        1,
+        1,
+        config_node,
+        RealmNodeKind::User {
+            owner: UserId::nil(realm_id()),
+        },
+    );
+    let removed = realm_config_event(
+        2,
+        origin,
+        2,
+        AdminDocumentClock::default().with_observed(origin, 1),
+        AdminDocumentOperation::ConfigNodeRemoved {
+            node_id: config_node,
+            cutoffs: Vec::new(),
+        },
+    );
+
+    state.apply(&ensured).unwrap();
+    state.apply(&removed).unwrap();
+
+    assert!(state.materialized_config_nodes().is_empty());
+    assert_eq!(state.removed_config_nodes(), BTreeSet::from([config_node]));
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn removal_keeps_cutoffs() {
+    use crate::structs::storage::distribution::{DistributionRevision, PublisherCutoff};
+    let cutoff = |seed: u8| PublisherCutoff {
+        set_id: Ulid::from_bytes([seed; 16]),
+        revision: DistributionRevision {
+            number: u64::from(seed),
+            digest: [seed; 32],
+        },
+    };
+    let origin = node(1);
+    let removal = |cutoffs: Vec<PublisherCutoff>| {
+        realm_config_event(
+            2,
+            origin,
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::ConfigNodeRemoved {
+                node_id: node(12),
+                cutoffs,
+            },
+        )
+    };
+    let mut state = realm_config_state();
+    state.apply(&removal(vec![cutoff(5), cutoff(3)])).unwrap();
+    assert_eq!(
+        state.publisher_cutoffs(&node(12)),
+        Some(vec![cutoff(3), cutoff(5)])
+    );
+    assert_eq!(state.publisher_cutoffs(&node(13)), None);
+    let mut repeated = cutoff(3);
+    repeated.revision.number = 9;
+    assert_eq!(
+        realm_config_state().apply(&removal(vec![cutoff(3), repeated])),
+        Err(AdminDocumentError::InvalidCutoffs)
+    );
+}
+
+#[test]
+fn observed_realm_conflict() {
+    let mut state = realm_config_state();
+    let config_node = node(11);
+    let first_origin = node(1);
+    let second_origin = node(2);
+    let first = realm_config_event(
+        1,
+        first_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: config_node,
+            kind: RealmNodeKind::Management,
+        },
+    );
+    let second = realm_config_event(
+        2,
+        second_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: config_node,
+            kind: RealmNodeKind::Server,
+        },
+    );
+    let replacement = realm_config_event(
+        3,
+        node(3),
+        1,
+        AdminDocumentClock::default()
+            .with_observed(first_origin, 1)
+            .with_observed(second_origin, 1),
+        AdminDocumentOperation::ConfigNodeEnsured {
+            node_id: config_node,
+            kind: RealmNodeKind::User {
+                owner: UserId::nil(realm_id()),
+            },
+        },
+    );
+
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+    state.apply(&replacement).unwrap();
+
+    assert_eq!(
+        state.materialized_config_nodes(),
+        BTreeMap::from([(
+            config_node,
+            RealmNodeKind::User {
+                owner: UserId::nil(realm_id()),
+            }
+        )])
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn node_kinds_roundtrip() {
+    // The materialized attribute value is the only carrier of the owner a
+    // User node is bound to, so decode must return it unchanged.
+    let owner = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id());
+    for kind in [
+        RealmNodeKind::Management,
+        RealmNodeKind::Server,
+        RealmNodeKind::User { owner },
+        RealmNodeKind::User {
+            owner: UserId::nil(realm_id()),
+        },
+    ] {
+        let encoded = node_kind_value(&kind);
+        assert_eq!(decode_node_kind(&encoded), Some(kind));
+    }
+    assert_eq!(decode_node_kind("not-a-kind"), None);
+}
+
+#[test]
+fn realm_disjoint_deterministically() {
+    let mut state = realm_config_state();
+    let first = oidc_provider("default", "one");
+    let second = oidc_provider("partner", "two");
+
+    state
+        .apply(&upsert_oidc_provider(1, 1, first.clone()))
+        .unwrap();
+    state
+        .apply(&upsert_oidc_provider(2, 2, second.clone()))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_oidc_providers(),
+        BTreeMap::from([
+            ("default".to_string(), first),
+            ("partner".to_string(), second),
+        ])
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn concurrent_realm_order() {
+    let config_node = node(11);
+    let provider = oidc_provider("default", "one");
+    let metadata_replication = MetadataReplicationConfig::new(5);
+    let discovery = RealmDiscoveryConfig::Static {
+        endpoints: Vec::new(),
+    };
+    let node_event = ensure_realm_node(1, 1, config_node, RealmNodeKind::Management);
+    let provider_event = upsert_oidc_provider(2, 2, provider.clone());
+    let settings_event = set_realm_settings(3, 3, metadata_replication.clone(), discovery.clone());
+
+    let mut left = realm_config_state();
+    left.apply(&node_event).unwrap();
+    left.apply(&provider_event).unwrap();
+    left.apply(&settings_event).unwrap();
+
+    let mut right = realm_config_state();
+    right.apply(&settings_event).unwrap();
+    right.apply(&provider_event).unwrap();
+    right.apply(&node_event).unwrap();
+
+    assert_eq!(left.user_subject_ids, right.user_subject_ids);
+    assert_eq!(
+        left.materialized_config_nodes(),
+        BTreeMap::from([(config_node, RealmNodeKind::Management)])
+    );
+    assert_eq!(
+        left.materialized_oidc_providers(),
+        BTreeMap::from([("default".to_string(), provider)])
+    );
+    assert_eq!(
+        left.materialized_metadata_replication(),
+        Some(metadata_replication)
+    );
+    assert_eq!(left.materialized_realm_discovery(), Some(discovery));
+    assert!(left.conflicts.is_empty());
+    assert!(right.conflicts.is_empty());
+}
+
+#[test]
+fn concurrent_realm_independent() {
+    let first_metadata = MetadataReplicationConfig::new(3);
+    let second_metadata = MetadataReplicationConfig::new(5);
+    let discovery = RealmDiscoveryConfig::Dynamic {
+        methods: Vec::new(),
+    };
+    let first = set_realm_settings(1, 1, first_metadata, discovery.clone());
+    let second = set_realm_settings(2, 2, second_metadata, discovery.clone());
+
+    let mut left = realm_config_state();
+    left.apply(&first).unwrap();
+    left.apply(&second).unwrap();
+
+    let mut right = realm_config_state();
+    right.apply(&second).unwrap();
+    right.apply(&first).unwrap();
+
+    assert_eq!(left.conflicts, right.conflicts);
+    assert_eq!(left.materialized_metadata_replication(), None);
+    assert_eq!(right.materialized_metadata_replication(), None);
+    assert_eq!(left.materialized_realm_discovery(), Some(discovery.clone()));
+    assert_eq!(right.materialized_realm_discovery(), Some(discovery));
+}
+
+#[test]
+fn concurrent_config_closed() {
+    let mut state = realm_config_state();
+    let first = oidc_provider("default", "one");
+    let second = oidc_provider("default", "two");
+    let first_value = oidc_provider_value(&first);
+    let second_value = oidc_provider_value(&second);
+
+    state.apply(&upsert_oidc_provider(1, 1, first)).unwrap();
+    state.apply(&upsert_oidc_provider(2, 2, second)).unwrap();
+
+    assert!(!state.materialized_oidc_providers().contains_key("default"));
+    let conflict = state
+        .conflicts
+        .get("realm_config.oidc_providers.default")
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+    );
+}
+
+#[test]
+fn observed_realm_provider() {
+    let mut state = realm_config_state();
+    let provider = oidc_provider("default", "one");
+    let upsert_origin = node(1);
+    let upsert = realm_config_event(
+        1,
+        upsert_origin,
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::OidcProviderUpserted { provider },
+    );
+    let removal = realm_config_event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default().with_observed(upsert_origin, 1),
+        AdminDocumentOperation::OidcProviderRemoved {
+            provider_id: "default".to_string(),
+        },
+    );
+
+    state.apply(&upsert).unwrap();
+    state.apply(&removal).unwrap();
+
+    assert!(state.materialized_oidc_providers().is_empty());
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn realm_config_discovery() {
+    let mut state = realm_config_state();
+    let metadata_replication = MetadataReplicationConfig::new(5);
+    let discovery = RealmDiscoveryConfig::Static {
+        endpoints: Vec::new(),
+    };
+
+    state
+        .apply(&set_realm_settings(
+            1,
+            1,
+            metadata_replication.clone(),
+            discovery.clone(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_metadata_replication(),
+        Some(metadata_replication)
+    );
+    assert_eq!(state.materialized_realm_discovery(), Some(discovery));
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn realm_config_materializes() {
+    let mut state = realm_config_state();
+
+    state
+        .apply(&set_realm_description(1, 1, "Demo Realm"))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_realm_description().as_deref(),
+        Some("Demo Realm")
+    );
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn keeps_device_cap() {
+    // The device cap and the per-device limits materialize like any other
+    // quota field.
+    let mut state = realm_config_state();
+    let quota = QuotaConfig {
+        default_quota_bytes: Some(1_000),
+        devices_per_user: Some(6),
+        device_request_rate: Some(120),
+        device_concurrent_pulls: Some(4),
+        ..QuotaConfig::default()
+    };
+    let expected = quota.clone();
+
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::ConfigQuotaSet {
+                quota: quota.clone(),
+            },
+        ))
+        .unwrap();
+
+    assert_eq!(state.materialized_realm_quota(), Some(expected.clone()));
+
+    let stored_value = state
+        .user_subject_ids
+        .get(CONFIG_QUOTA_PATH)
+        .and_then(|version| version.value.as_deref())
+        .expect("quota reducer value exists")
+        .to_string();
+    let stored_quota: QuotaConfig = serde_json::from_str(&stored_value).unwrap();
+    assert_eq!(stored_quota, expected);
+
+    state
+        .user_subject_ids
+        .get_mut(CONFIG_QUOTA_PATH)
+        .expect("quota reducer value exists")
+        .value = Some(serde_json::to_string(&quota).unwrap());
+    assert_eq!(state.materialized_realm_quota(), Some(expected));
+}
+
+#[test]
+fn realm_config_detection() {
+    let group_a = Ulid::from_bytes([1; 16]);
+    let group_b = Ulid::from_bytes([2; 16]);
+    let user_a = user_id_seed(3);
+    let user_b = user_id_seed(4);
+    let expected = QuotaConfig {
+        default_quota_bytes: Some(1_000),
+        grace_factor_percent: 125,
+        warn_threshold_percent: 80,
+        group_overrides: vec![
+            GroupQuotaOverride {
+                group_id: group_a,
+                quota_bytes: Some(500),
+                grace_factor_percent: None,
+            },
+            GroupQuotaOverride {
+                group_id: group_b,
+                quota_bytes: Some(750),
+                grace_factor_percent: Some(150),
+            },
+        ],
+        groups_per_user: Some(4),
+        group_cap_overrides: vec![
+            UserCapOverride {
+                user_id: user_a,
+                max_groups: Some(2),
+            },
+            UserCapOverride {
+                user_id: user_b,
+                max_groups: Some(3),
+            },
+        ],
+        devices_per_user: Some(6),
+        ..QuotaConfig::default()
+    };
+    let reordered = QuotaConfig {
+        group_overrides: expected.group_overrides.iter().cloned().rev().collect(),
+        group_cap_overrides: expected.group_cap_overrides.iter().cloned().rev().collect(),
+        devices_per_user: Some(6),
+        ..expected.clone()
+    };
+
+    let first = realm_config_event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::ConfigQuotaSet {
+            quota: expected.clone(),
+        },
+    );
+    let second = realm_config_event(
+        2,
+        node(2),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::ConfigQuotaSet { quota: reordered },
+    );
+
+    let mut state = realm_config_state();
+    state.apply(&first).unwrap();
+    state.apply(&second).unwrap();
+
+    assert!(state.conflicts.is_empty());
+    assert_eq!(state.materialized_realm_quota(), Some(expected.clone()));
+
+    let stored_value = state
+        .user_subject_ids
+        .get(CONFIG_QUOTA_PATH)
+        .and_then(|version| version.value.as_deref())
+        .expect("quota reducer value exists");
+    let stored_quota: QuotaConfig = serde_json::from_str(stored_value).unwrap();
+    assert_eq!(stored_quota, expected);
+}
+
+#[test]
+fn realm_config_replication() {
+    let mut state = realm_config_state();
+    let first_metadata = MetadataReplicationConfig::new(3);
+    let second_metadata = MetadataReplicationConfig::new(5);
+    let discovery = RealmDiscoveryConfig::Dynamic {
+        methods: Vec::new(),
+    };
+    let first_value = metadata_replication_value(&first_metadata);
+    let second_value = metadata_replication_value(&second_metadata);
+
+    state
+        .apply(&set_realm_settings(1, 1, first_metadata, discovery.clone()))
+        .unwrap();
+    state
+        .apply(&set_realm_settings(
+            2,
+            2,
+            second_metadata,
+            discovery.clone(),
+        ))
+        .unwrap();
+
+    assert_eq!(state.materialized_metadata_replication(), None);
+    assert_eq!(state.materialized_realm_discovery(), Some(discovery));
+    assert!(!state.conflicts.contains_key(CONFIG_DISCOVERY_PATH));
+    let conflict = state
+        .conflicts
+        .get(METADATA_REPLICATION_PATH)
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+    );
+}
+
+#[test]
+fn realm_settings_discovery() {
+    let mut state = realm_config_state();
+    let metadata_replication = MetadataReplicationConfig::new(3);
+    let first_discovery = RealmDiscoveryConfig::Static {
+        endpoints: Vec::new(),
+    };
+    let second_discovery = RealmDiscoveryConfig::Dynamic {
+        methods: Vec::new(),
+    };
+    let first_value = realm_discovery_value(&first_discovery);
+    let second_value = realm_discovery_value(&second_discovery);
+
+    state
+        .apply(&set_realm_settings(
+            1,
+            1,
+            metadata_replication.clone(),
+            first_discovery,
+        ))
+        .unwrap();
+    state
+        .apply(&set_realm_settings(
+            2,
+            2,
+            metadata_replication.clone(),
+            second_discovery,
+        ))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_metadata_replication(),
+        Some(metadata_replication)
+    );
+    assert_eq!(state.materialized_realm_discovery(), None);
+    assert!(!state.conflicts.contains_key(METADATA_REPLICATION_PATH));
+    let conflict = state
+        .conflicts
+        .get(CONFIG_DISCOVERY_PATH)
+        .expect("conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(first_value.as_str()))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(second_value.as_str()))
+    );
+}
+
+#[test]
+fn user_operation_change() {
+    let mut state = group_state();
+    let before = state.clone();
+    let event = group_event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::UserNameSet {
+            name: "Alice".to_string(),
+        },
+    );
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentError::UnsupportedTarget)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn oidc_provider_change() {
+    let mut state = user_state();
+    let before = state.clone();
+    let event = event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::OidcProviderUpserted {
+            provider: oidc_provider("default", "one"),
+        },
+    );
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentError::UnsupportedTarget)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn realm_config_target() {
+    let mut state = user_state();
+    let before = state.clone();
+    let event = event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::ConfigSettingsSet {
+            metadata_replication: MetadataReplicationConfig::new(3),
+            discovery: RealmDiscoveryConfig::Static {
+                endpoints: Vec::new(),
+            },
+        },
+    );
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentError::UnsupportedTarget)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn federation_settings_materialize() {
+    use crate::federation::{
+        AcceptedRealms, FederationSettings, RealmDescriptor, RegistrationMode, Signed,
+    };
+    use crate::structs::identity::realm::RealmId;
+    let key = ed25519_dalek::SigningKey::from_bytes(&[3; 32]);
+    let capabilities =
+        crate::structs::identity::auth::NodeCapabilities::management_node(key.clone()).unwrap();
+    let url = |value: &str| url::Url::parse(value).unwrap();
+    let descriptor = RealmDescriptor {
+        realm_id: RealmId::from_bytes(key.verifying_key().to_bytes()),
+        name: "Realm".to_string(),
+        description: String::new(),
+        api_url: url("https://api.example.org"),
+        portal_url: url("https://portal.example.org"),
+        contact: None,
+        login_providers: Vec::new(),
+        issued_at: 1,
+    };
+    let settings = FederationSettings {
+        name: descriptor.name.clone(),
+        description: String::new(),
+        contact: None,
+        login_providers: Vec::new(),
+        api_url: descriptor.api_url.clone(),
+        portal_url: descriptor.portal_url.clone(),
+        registry_url: None,
+        registration: RegistrationMode::Disabled,
+        accepted_realms: AcceptedRealms::Only(vec![RealmId::from_bytes([8; 32])]),
+        descriptor: Signed::sign(descriptor, &capabilities).unwrap(),
+    };
+    let mut state = realm_config_state();
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            AdminDocumentOperation::ConfigFederationSet {
+                settings: Box::new(settings.clone()),
+            },
+        ))
+        .unwrap();
+    assert_eq!(state.materialized_realm_federation(), Some(settings));
+}
+
+#[test]
+fn quota_event_replays() {
+    // A quota event signed before the replica setting keeps its bytes, so a fresh node replays
+    // the realm's quota history; the setting travels as its own operation.
+    const SIGNED: &str =
+        "1401e8076e55011a303130343047323038313034304732303831303430473230383101f40300010300000000";
+    let quota = QuotaConfig {
+        default_quota_bytes: Some(1_000),
+        group_overrides: vec![GroupQuotaOverride {
+            group_id: Ulid::from_bytes([1; 16]),
+            quota_bytes: Some(500),
+            grace_factor_percent: None,
+        }],
+        ..QuotaConfig::default()
+    };
+    let op = AdminDocumentOperation::ConfigQuotaSet {
+        quota: quota.clone(),
+    };
+    assert_eq!(hex::encode(postcard::to_allocvec(&op).unwrap()), SIGNED);
+    let signed = postcard::from_bytes(&hex::decode(SIGNED).unwrap()).unwrap();
+    let event = realm_config_event(1, node(1), 1, AdminDocumentClock::default(), signed);
+    let mut fresh = realm_config_state();
+    fresh.apply(&event).unwrap();
+    assert_eq!(fresh.materialized_realm_quota(), Some(quota));
+
+    let replicas = crate::structs::identity::realm::ReplicaQuota {
+        count: true,
+        groups: [(Ulid::from_bytes([1; 16]), false)].into(),
+    };
+    let set = AdminDocumentOperation::ConfigReplicasSet {
+        replicas: replicas.clone(),
+    };
+    let observed = fresh.clock.clone();
+    fresh
+        .apply(&realm_config_event(2, node(1), 2, observed, set))
+        .unwrap();
+    assert_eq!(fresh.materialized_realm_replicas(), Some(replicas));
+    assert!(
+        fresh.materialized_realm_quota().is_some(),
+        "the quota stays"
+    );
+}
+
+#[test]
+fn name_clear_wins() {
+    // A later clear must win, or a removed name would keep showing on every node.
+    let mut state = realm_config_state();
+    let named = AdminDocumentOperation::NodeNameSet {
+        node_id: node(12),
+        display_name: Some("Giessen storage 1".to_string()),
+    };
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            named,
+        ))
+        .unwrap();
+    assert_eq!(
+        state.materialized_node_names(),
+        BTreeMap::from([(node(12), "Giessen storage 1".to_string())])
+    );
+    // The name rides in the existing path map, so the stored state keeps its layout.
+    let bytes = postcard::to_allocvec(&state).unwrap();
+    assert_eq!(crate::reducer::decode_reducer_state(&bytes).unwrap(), state);
+
+    let cleared = AdminDocumentOperation::NodeNameSet {
+        node_id: node(12),
+        display_name: None,
+    };
+    let observed = state.clock.clone();
+    state
+        .apply(&realm_config_event(2, node(1), 2, observed, cleared))
+        .unwrap();
+    assert!(state.materialized_node_names().is_empty());
+    assert!(state.materialized_config_nodes().is_empty());
+}
+
+#[test]
+fn place_clear_wins() {
+    use crate::structs::identity::realm::{NodeCoordinates, NodePlace};
+    let mut state = realm_config_state();
+    let place = NodePlace {
+        name: Some("Giessen".to_string()),
+        coordinates: NodeCoordinates::from_degrees(50.58, 8.68),
+    };
+    let placed = AdminDocumentOperation::NodePlaceSet {
+        node_id: node(12),
+        place: Some(place.clone()),
+    };
+    state
+        .apply(&realm_config_event(
+            1,
+            node(1),
+            1,
+            AdminDocumentClock::default(),
+            placed,
+        ))
+        .unwrap();
+    assert_eq!(
+        state.materialized_node_places(),
+        BTreeMap::from([(node(12), place)])
+    );
+    assert!(
+        state.materialized_node_names().is_empty(),
+        "names keep their own path"
+    );
+
+    // A place nobody could store is refused before it reaches the state.
+    let invalid = AdminDocumentOperation::NodePlaceSet {
+        node_id: node(12),
+        place: Some(NodePlace::default()),
+    };
+    let observed = state.clock.clone();
+    let refused = state.apply(&realm_config_event(2, node(1), 2, observed, invalid));
+    assert_eq!(refused, Err(AdminDocumentError::InvalidNodePlace));
+
+    let cleared = AdminDocumentOperation::NodePlaceSet {
+        node_id: node(12),
+        place: None,
+    };
+    let observed = state.clock.clone();
+    state
+        .apply(&realm_config_event(3, node(1), 3, observed, cleared))
+        .unwrap();
+    assert!(state.materialized_node_places().is_empty());
+}
+
+#[test]
+fn merge_coordinator_pins() {
+    // A handoff that saw the pin replaces it; two concurrent pins name no coordinator at all.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let pin = |node_id| AdminDocumentOperation::MergeCoordinatorSet { node_id };
+    let mut first = base.clone();
+    first
+        .apply_operation(&actor(node(1)), pin(node(1)), ulid::Ulid::generate())
+        .unwrap();
+    assert_eq!(first.materialized_merge_coordinator(), Some(node(1)));
+    let mut handed = first.clone();
+    handed
+        .apply_operation(&actor(node(1)), pin(node(2)), ulid::Ulid::generate())
+        .unwrap();
+    assert_eq!(handed.materialized_merge_coordinator(), Some(node(2)));
+
+    let mut second = base.clone();
+    let rival = second
+        .apply_operation(&actor(node(3)), pin(node(3)), ulid::Ulid::generate())
+        .unwrap();
+    first.apply(&rival).unwrap();
+    assert_eq!(first.materialized_merge_coordinator(), None);
+}
+
+fn vault_set(id: u8, revision: Option<u8>) -> AdminDocumentOperation {
+    use crate::realm_vault::{RealmVaultEntry, RealmVaultPurpose, RealmVaultRecord};
+    let entry = RealmVaultEntry::new(RealmVaultPurpose::SmtpPassword, Ulid::from_bytes([id; 16]));
+    let record = revision.map(|revision| RealmVaultRecord {
+        entry,
+        revision: Ulid::from_bytes([revision; 16]),
+        sealed: vec![revision; 40],
+        changed_by: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
+        changed_at_ms: u64::from(revision),
+    });
+    AdminDocumentOperation::ConfigVaultSet { entry, record }
+}
+
+fn vault_revisions(state: &AdminDocumentState) -> Vec<(Ulid, Ulid)> {
+    (state.materialized_realm_vault().iter())
+        .map(|record| (record.entry.id, record.revision))
+        .collect()
+}
+
+#[test]
+fn vault_entry_writes() {
+    // Different entries never conflict; a write that saw the record replaces or deletes it.
+    let mut state =
+        AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        });
+    state
+        .apply_operation(
+            &actor(node(1)),
+            vault_set(2, Some(1)),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    let mut other = state.clone();
+    other
+        .apply_operation(
+            &actor(node(2)),
+            vault_set(1, Some(1)),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    let rival = state
+        .apply_operation(
+            &actor(node(1)),
+            vault_set(2, Some(2)),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    other.apply(&rival).unwrap();
+    let ids = |id: u8, revision: u8| (Ulid::from_bytes([id; 16]), Ulid::from_bytes([revision; 16]));
+    assert_eq!(vault_revisions(&other), vec![ids(1, 1), ids(2, 2)]);
+    assert!(other.conflicts.is_empty());
+
+    other
+        .apply_operation(&actor(node(2)), vault_set(2, None), ulid::Ulid::generate())
+        .unwrap();
+    assert_eq!(vault_revisions(&other), vec![ids(1, 1)]);
+    let path = crate::reducer::paths::vault_entry_path(&crate::realm_vault::RealmVaultEntry::new(
+        crate::realm_vault::RealmVaultPurpose::SmtpPassword,
+        Ulid::from_bytes([2; 16]),
+    ));
+    assert_eq!(other.user_subject_ids[&path].value, None);
+
+    let mismatched = match vault_set(3, Some(1)) {
+        AdminDocumentOperation::ConfigVaultSet { record, .. } => {
+            AdminDocumentOperation::ConfigVaultSet {
+                entry: crate::realm_vault::RealmVaultEntry::new(
+                    crate::realm_vault::RealmVaultPurpose::SmtpPassword,
+                    Ulid::from_bytes([4; 16]),
+                ),
+                record,
+            }
+        }
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        other.apply_operation(&actor(node(2)), mismatched, ulid::Ulid::generate()),
+        Err(AdminDocumentError::InvalidVaultRecord)
+    );
+}
+
+#[test]
+fn vault_conflict_absent() {
+    // Two unseen writes of one entry leave it absent on every node, whatever the event order.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let mut first = base.clone();
+    let one = first
+        .apply_operation(
+            &actor(node(1)),
+            vault_set(5, Some(1)),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    let mut second = base.clone();
+    let two = second
+        .apply_operation(
+            &actor(node(2)),
+            vault_set(5, Some(2)),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    first.apply(&two).unwrap();
+    second.apply(&one).unwrap();
+    for state in [&first, &second] {
+        assert!(state.materialized_realm_vault().is_empty());
+        assert_eq!(state.conflicts.len(), 1);
+    }
+    let mut deleted = base.clone();
+    let tombstone = deleted
+        .apply_operation(&actor(node(3)), vault_set(5, None), ulid::Ulid::generate())
+        .unwrap();
+    first.apply(&tombstone).unwrap();
+    assert!(first.materialized_realm_vault().is_empty());
+}
+
+fn email_set(host: Option<&str>) -> AdminDocumentOperation {
+    use crate::structs::execution::email::{RealmEmailProfile, SmtpTls};
+    let profile = host.map(|host| RealmEmailProfile {
+        revision: Ulid::from_bytes([1; 16]),
+        host: host.to_string(),
+        port: Some(587),
+        tls: SmtpTls::Starttls,
+        username: None,
+        from: "aruna@example.org".to_string(),
+        password: None,
+        changed_by: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
+        changed_at_ms: 1,
+    });
+    AdminDocumentOperation::ConfigEmailSet { profile }
+}
+
+#[test]
+fn email_conflict_off() {
+    // A profile conflict means no email on every node, whatever the order; a later write resolves it.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let mut first = base.clone();
+    let one = first
+        .apply_operation(
+            &actor(node(1)),
+            email_set(Some("one.example.org")),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    assert_eq!(
+        first.materialized_realm_email().map(|profile| profile.host),
+        Some("one.example.org".to_string())
+    );
+    let mut second = base.clone();
+    let two = second
+        .apply_operation(
+            &actor(node(2)),
+            email_set(Some("two.example.org")),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    first.apply(&two).unwrap();
+    second.apply(&one).unwrap();
+    for state in [&first, &second] {
+        assert_eq!(state.materialized_realm_email(), None);
+        assert_eq!(state.realm_email_candidates().len(), 2);
+    }
+    first
+        .apply_operation(
+            &actor(node(1)),
+            email_set(Some("three.example.org")),
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    assert_eq!(first.realm_email_candidates().len(), 1);
+    first
+        .apply_operation(&actor(node(1)), email_set(None), ulid::Ulid::generate())
+        .unwrap();
+    assert_eq!(first.materialized_realm_email(), None);
+    assert!(first.realm_email_candidates().is_empty());
+    assert_eq!(
+        first.apply_operation(
+            &actor(node(1)),
+            email_set(Some(" ")),
+            ulid::Ulid::generate()
+        ),
+        Err(AdminDocumentError::InvalidEmailProfile)
+    );
+}
+
+fn named_secret(value: u8) -> Vec<AdminDocumentOperation> {
+    use crate::realm_vault::{RealmSecretRef, RealmVaultRecord};
+    use crate::secrets::{SecretKind, SecretName, SecretRecord};
+    let user = UserId::local(Ulid::from_bytes([9; 16]), realm_id());
+    let name = SecretName::try_from("catalog-key".to_string()).unwrap();
+    let reference = RealmSecretRef::named(Ulid::from_bytes([value; 16]));
+    let info = SecretRecord {
+        name: name.clone(),
+        kind: SecretKind::parse("bearer").unwrap(),
+        description: String::new(),
+        settings: Default::default(),
+        uses: Vec::new(),
+        fields: vec!["token".to_string()],
+        revision: reference.revision,
+        value_id: reference.revision,
+        created_by: user,
+        created_at_ms: 1,
+        updated_by: user,
+        updated_at_ms: 1,
+    };
+    let record = RealmVaultRecord {
+        entry: reference.entry,
+        revision: reference.revision,
+        sealed: vec![value; 40],
+        changed_by: user,
+        changed_at_ms: 1,
+    };
+    vec![
+        AdminDocumentOperation::ConfigVaultSet {
+            entry: reference.entry,
+            record: Some(record),
+        },
+        AdminDocumentOperation::ConfigSecretSet {
+            name,
+            info: Some(info),
+        },
+    ]
+}
+
+#[test]
+fn secret_conflict_absent() {
+    // Two unseen writes of one name leave it absent everywhere, and neither value is served.
+    let base = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+        realm_id: realm_id(),
+    });
+    let mut first = base.clone();
+    let mut second = base.clone();
+    let mut one = Vec::new();
+    for operation in named_secret(1) {
+        one.push(
+            first
+                .apply_operation(&actor(node(1)), operation, ulid::Ulid::generate())
+                .unwrap(),
+        );
+    }
+    assert_eq!(first.materialized_realm_secrets().len(), 1);
+    assert_eq!(first.materialized_realm_vault().len(), 1);
+    let mut two = Vec::new();
+    for operation in named_secret(2) {
+        two.push(
+            second
+                .apply_operation(&actor(node(2)), operation, ulid::Ulid::generate())
+                .unwrap(),
+        );
+    }
+    for event in &two {
+        first.apply(event).unwrap();
+    }
+    for event in &one {
+        second.apply(event).unwrap();
+    }
+    for state in [&first, &second] {
+        assert!(state.materialized_realm_secrets().is_empty());
+        // Both values stay held but hidden; the next write of the name supersedes both.
+        assert!(state.materialized_realm_vault().is_empty());
+        let name = crate::secrets::SecretName::try_from("catalog-key".to_string()).unwrap();
+        assert_eq!(state.realm_secret_candidates(&name).len(), 2);
+    }
+}
+
+#[test]
+fn node_history_kept() {
+    // Removal and re-addition keep both intervals; a clock in the gap is inside neither.
+    use crate::structs::identity::realm::RealmNodeKind;
+    let mut state =
+        AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::RealmConfig {
+            realm_id: realm_id(),
+        });
+    let before = state.clock.clone();
+    let ensure = || AdminDocumentOperation::ConfigNodeEnsured {
+        node_id: node(5),
+        kind: RealmNodeKind::Server,
+    };
+    let remove = || AdminDocumentOperation::ConfigNodeRemoved {
+        node_id: node(5),
+        cutoffs: Vec::new(),
+    };
+    state
+        .apply_operation(&actor(node(1)), ensure(), ulid::Ulid::generate())
+        .unwrap();
+    let member = state.clock.clone();
+    state
+        .apply_operation(&actor(node(1)), remove(), ulid::Ulid::generate())
+        .unwrap();
+    let gap = state.clock.clone();
+    state
+        .apply_operation(&actor(node(2)), ensure(), ulid::Ulid::generate())
+        .unwrap();
+    let again = state.clock.clone();
+    let device = AdminDocumentOperation::ConfigNodeEnsured {
+        node_id: node(6),
+        kind: RealmNodeKind::User {
+            owner: UserId::local(Ulid::from_bytes([9; 16]), realm_id()),
+        },
+    };
+    state
+        .apply_operation(&actor(node(1)), device, ulid::Ulid::generate())
+        .unwrap();
+
+    let intervals = state.node_intervals();
+    assert_eq!(
+        intervals.len(),
+        2,
+        "a user device has no infrastructure interval"
+    );
+    let open = |clock| intervals.iter().any(|interval| interval.open_at(clock));
+    assert!(!open(&before), "a clock before the addition");
+    assert!(open(&member) && !open(&gap) && open(&again));
+    assert!(again.covers(&member) && !member.covers(&again));
+}
+
+#[test]
+fn clocks_compare_componentwise() {
+    use crate::admin_documents::AdminDocumentClock;
+    let one = AdminDocumentClock::default().with_observed(node(1), 2);
+    let two = AdminDocumentClock::default().with_observed(node(2), 1);
+    let both = one.clone().with_observed(node(2), 1);
+    assert!(both.covers(&one) && both.covers(&two));
+    // Concurrent clocks: neither covers the other.
+    assert!(!one.covers(&two) && !two.covers(&one));
+    assert!(one.covers(&AdminDocumentClock::default()));
+}

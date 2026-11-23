@@ -1,0 +1,351 @@
+//! Describes a plugin version published to the realm: its artifact digest, size and manifest.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use serde::{Deserialize, Serialize};
+
+use ulid::Ulid;
+
+use crate::compute::SecretBytes;
+use crate::secrets::{Delivery, ResponseExposure, SecretKind, SecretSettings};
+use crate::user::id::UserId;
+
+/// Largest artifact a realm admin may publish; nodes copy and fetch it in chunks.
+pub const MAX_ARTIFACT: usize = 64 << 20;
+pub const MAX_MANIFEST: usize = 64 * 1024;
+const MAX_NAME: usize = 64;
+
+/// One published plugin version. Management nodes keep its artifact; every other
+/// node fetches the artifact by digest and checks it against this entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedPlugin {
+    pub name: String,
+    pub version: String,
+    /// `sha256:<64 lowercase hex>` of the exact artifact bytes.
+    pub digest: String,
+    pub size: u64,
+    /// The artifact's checked manifest as JSON, so nodes can read it without the artifact.
+    pub manifest: String,
+    pub published_by: UserId,
+    pub published_at_ms: u64,
+}
+
+impl PublishedPlugin {
+    /// Whether the entry is well formed. The publishing management node checked the artifact.
+    pub fn valid(&self) -> bool {
+        let digest = valid_digest(&self.digest);
+        let size = usize::try_from(self.size).is_ok_and(|size| (1..=MAX_ARTIFACT).contains(&size));
+        let manifest = (1..=MAX_MANIFEST).contains(&self.manifest.len())
+            && serde_json::from_str::<serde_json::Value>(&self.manifest)
+                .is_ok_and(|value| value.is_object());
+        valid_name(&self.name) && valid_version(&self.version) && digest && size && manifest
+    }
+}
+
+/// The one entry concurrent publications of a version agree on: every competing value is an
+/// entry of the same artifact. The earliest publication is kept, so every node picks the same.
+pub fn same_artifact(values: &[crate::reducer::AdminConflictValue]) -> Option<PublishedPlugin> {
+    let entries = (values.iter())
+        .map(|value| serde_json::from_str::<PublishedPlugin>(value.value.as_deref()?).ok())
+        .collect::<Option<Vec<PublishedPlugin>>>()?;
+    let first = entries.first()?;
+    fn artifact(entry: &PublishedPlugin) -> (&str, &str, &str, u64, &str) {
+        (
+            &entry.name,
+            &entry.version,
+            &entry.digest,
+            entry.size,
+            &entry.manifest,
+        )
+    }
+    if !entries
+        .iter()
+        .all(|entry| artifact(entry) == artifact(first))
+    {
+        return None;
+    }
+    let order = |entry: &PublishedPlugin| (entry.published_at_ms, entry.published_by.to_string());
+    entries.into_iter().min_by_key(order)
+}
+
+/// A digest in the form `sha256:<64 lowercase hex>`.
+pub fn valid_digest(digest: &str) -> bool {
+    let lower = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+    (digest.strip_prefix("sha256:")).is_some_and(|hex| hex.len() == 64 && hex.bytes().all(lower))
+}
+
+/// A plugin name: 1 to 64 of `a-z`, `0-9` or `-`, starting with a letter, no `-` at the end.
+pub fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    (1..=MAX_NAME).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && !name.ends_with('-')
+        && (bytes.iter()).all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+/// A version: 1 to 64 of ASCII letters, digits, `.`, `-` or `+`; the manifest checked its form.
+pub fn valid_version(version: &str) -> bool {
+    (1..=MAX_NAME).contains(&version.len())
+        && (version.bytes()).all(|b| b.is_ascii_alphanumeric() || b"-+.".contains(&b))
+}
+
+/// Artifact bytes in a node message; Debug prints only their length.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ArtifactBytes(pub Vec<u8>);
+
+impl std::fmt::Debug for ArtifactBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArtifactBytes({} bytes)", self.0.len())
+    }
+}
+
+/// One piece of an artifact in a node message; chunk `index` covers bytes from `index * CHUNK`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chunk {
+    pub digest: String,
+    pub index: u32,
+    pub total: u64,
+    pub bytes: ArtifactBytes,
+}
+
+/// The step of the use check that refused a release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Refusal {
+    Peer,
+    Binding,
+    Entry,
+    Rule,
+    Authority,
+    Policy,
+}
+
+impl Refusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Peer => "peer",
+            Self::Binding => "binding",
+            Self::Entry => "entry",
+            Self::Rule => "rule",
+            Self::Authority => "authority",
+            Self::Policy => "policy",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum ReleaseError {
+    #[error("the use of the secret was refused at the {} check", .0.as_str())]
+    Refused(Refusal),
+    #[error("the secret cannot be released now: {0}")]
+    Unavailable(String),
+}
+
+/// Why a node binding does not fit its slot on the install's receiver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+pub enum NodeCheckError {
+    #[error("the receiver has no node secret of this name")]
+    Missing,
+    #[error("the node secret has another kind than the slot")]
+    OtherKind,
+    #[error("only a server node of the realm may ask")]
+    Forbidden,
+    #[error("the receiver did not answer")]
+    Unavailable,
+}
+
+/// What a run asks of the secret bound to one slot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    pub install_id: Ulid,
+    pub slot: String,
+    pub delivery: Delivery,
+    /// The method and URL of the outgoing request, for `inject`.
+    pub target: Option<(String, String)>,
+    /// The value write id the receiver holds already; its fields are not sent again.
+    pub held: Option<Ulid>,
+    pub run_id: Option<Ulid>,
+}
+
+/// A released secret; `fields` is absent when the receiver holds this value already.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Released {
+    pub kind: SecretKind,
+    pub settings: SecretSettings,
+    pub exposure: ResponseExposure,
+    pub value_id: Ulid,
+    pub fields: Option<SecretBytes>,
+}
+
+/// A call to the plugin host's node-wide state, which lives as long as the node process.
+#[derive(Debug, PartialEq)]
+pub enum PluginEffect {
+    /// Takes one host call of the install at `now_ms` from its rate; answers `Taken`.
+    TakeCall { install_id: Ulid, now_ms: u64 },
+    /// Takes one webhook request of the install at `now_ms` from its rate; answers `Taken`.
+    TakeHook { install_id: Ulid, now_ms: u64 },
+    /// Reserves memory for an artifact of `bytes` from the node's budget; answers `Reserved`.
+    Reserve { bytes: u64 },
+    /// Forgets the `named` accounts and answers when each `unnamed` one was first seen, at
+    /// `now_ms` for one seen now; answers `Seen`.
+    FirstSeen {
+        named: Vec<UserId>,
+        unnamed: Vec<UserId>,
+        now_ms: u64,
+    },
+    /// The newest value write id whose fields `holder`, one broker of run `run_id`, holds for
+    /// `slot`; answers `Held`.
+    HeldValue {
+        run_id: Ulid,
+        holder: Ulid,
+        slot: String,
+    },
+    /// Keeps `fields` as value `value_id` of the holder's `slot` when given; answers `Fields` with
+    /// the fields the holder keeps for that value.
+    HoldValue {
+        run_id: Ulid,
+        holder: Ulid,
+        slot: String,
+        value_id: Ulid,
+        fields: Option<SecretBytes>,
+    },
+}
+
+/// The answer of a [`PluginEffect`].
+#[derive(Debug, PartialEq)]
+pub enum PluginEvent {
+    /// Whether the call or request was within the install's rate.
+    Taken(bool),
+    /// The reservation, or `None` while the node spends its budget elsewhere.
+    Reserved(Option<MemoryPermit>),
+    /// When each asked unnamed account was first seen, in the asked order.
+    Seen(Vec<u64>),
+    Held(Option<Ulid>),
+    Fields(Option<SecretBytes>),
+}
+
+/// Memory reserved for one artifact upload or assembly, given back when dropped.
+pub struct MemoryPermit {
+    mib: u32,
+    release: Option<Box<dyn FnOnce() + Send + Sync>>,
+}
+
+impl MemoryPermit {
+    /// A reservation of `mib` that `release` gives back.
+    pub fn new(mib: u32, release: impl FnOnce() + Send + Sync + 'static) -> Self {
+        Self {
+            mib,
+            release: Some(Box::new(release)),
+        }
+    }
+
+    /// MiB this reservation holds of the node's budget.
+    pub fn mib(&self) -> u32 {
+        self.mib
+    }
+}
+
+impl Drop for MemoryPermit {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            release();
+        }
+    }
+}
+
+impl std::fmt::Debug for MemoryPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MemoryPermit({} MiB)", self.mib)
+    }
+}
+
+impl PartialEq for MemoryPermit {
+    fn eq(&self, other: &Self) -> bool {
+        self.mib == other.mib
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::identity::realm::RealmId;
+
+    fn entry() -> PublishedPlugin {
+        PublishedPlugin {
+            name: "dataset-announcer".into(),
+            version: "0.1.0".into(),
+            digest: format!("sha256:{}", "ab".repeat(32)),
+            size: 1024,
+            manifest: r#"{"name":"dataset-announcer"}"#.into(),
+            published_by: UserId::nil(RealmId::from_bytes([1u8; 32])),
+            published_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn entry_shape() {
+        assert!(entry().valid());
+        let cases: [fn(&mut PublishedPlugin); 7] = [
+            |e| e.name = "Announcer".into(),
+            |e| e.version = "1.0 beta".into(),
+            |e| e.digest = format!("sha256:{}", "AB".repeat(32)),
+            |e| e.size = 0,
+            |e| e.size = MAX_ARTIFACT as u64 + 1,
+            |e| e.manifest = "[]".into(),
+            |e| e.manifest = "{".into(),
+        ];
+        for edit in cases {
+            let mut invalid = entry();
+            edit(&mut invalid);
+            assert!(!invalid.valid(), "{invalid:?}");
+        }
+    }
+
+    /// Two managers publish `left` and `right` concurrently, then each applies the other's event.
+    fn concurrent(left: PublishedPlugin, right: PublishedPlugin) -> [Vec<PublishedPlugin>; 2] {
+        use crate::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+        use crate::reducer::AdminDocumentState;
+        use crate::structs::identity::auth::Actor;
+
+        let realm_id = RealmId::from_bytes([1u8; 32]);
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        let manager = |seed: u8| Actor {
+            node_id: iroh::SecretKey::from_bytes(&[seed; 32]).public(),
+            user_id: UserId::nil(realm_id),
+            realm_id,
+        };
+        let set = |plugin: PublishedPlugin| AdminDocumentOperation::ConfigPluginSet {
+            name: plugin.name.clone(),
+            version: plugin.version.clone(),
+            plugin: Some(plugin),
+        };
+        let (mut a, mut b) = (
+            AdminDocumentState::new(target.clone()),
+            AdminDocumentState::new(target),
+        );
+        let from_a = a
+            .apply_operation(&manager(3), set(left), ulid::Ulid::generate())
+            .unwrap();
+        let from_b = b
+            .apply_operation(&manager(4), set(right), ulid::Ulid::generate())
+            .unwrap();
+        a.apply(&from_b).unwrap();
+        b.apply(&from_a).unwrap();
+        [a.materialized_plugins(), b.materialized_plugins()]
+    }
+
+    #[test]
+    fn coalesces_retries() {
+        // A retry of the same bytes through another manager stays published, the earliest kept.
+        let mut retry = entry();
+        retry.published_at_ms = 9;
+        for seen in concurrent(entry(), retry.clone()) {
+            assert_eq!(seen, vec![entry()]);
+        }
+        // Two different artifacts of one version keep the conflict rule: the version is hidden.
+        retry.digest = format!("sha256:{}", "cd".repeat(32));
+        for seen in concurrent(entry(), retry.clone()) {
+            assert!(seen.is_empty(), "{seen:?}");
+        }
+    }
+}

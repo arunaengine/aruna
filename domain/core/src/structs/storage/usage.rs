@@ -1,0 +1,803 @@
+//! Defines usage counters and the keys node and group usage snapshots are stored under.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::keyspaces::{
+    ABE_ARCHIVE_KEYSPACE, ABE_COPY_KEYSPACE, ABE_ENVELOPE_KEYSPACE, ABE_VERSION_KEYSPACE,
+    BLOB_HEAD_KEYSPACE, BLOB_LOCATIONS_KEYSPACE, BLOB_VERSIONS_KEYSPACE, PENDING_LOCATION_KEYSPACE,
+    REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE, UPLOAD_KEYSPACE,
+};
+use crate::structs::storage::blob::BackendRef;
+use crate::types::GroupId;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use thiserror::Error;
+use ulid::Ulid;
+
+pub const USAGE_GLOBAL_KEY: &[u8] = b"global";
+pub const GLOBAL_SHARD_COUNT: usize = 64;
+pub const USAGE_BACKEND_PREFIX: &str = "backend/";
+/// Node-local [`BucketCounters`] rows, one per bucket.
+pub const USAGE_BUCKET_PREFIX: &str = "bucket/";
+
+/// Usage keys group fixed binary node snapshots by node or group for prefix scans.
+/// Local `dirty/` and `summary/` text keys cannot collide with snapshot prefixes.
+pub const USAGE_GLOBAL_PREFIX: &[u8] = b"n/";
+pub const USAGE_GROUP_PREFIX: &[u8] = b"g/";
+pub const DIRTY_PREFIX: &[u8] = b"dirty/";
+pub const DIRTY_GLOBAL_KEY: &[u8] = b"dirty/global";
+pub const DIRTY_GROUP_PREFIX: &[u8] = b"dirty/group/";
+/// Marks a group whose replica share on this node may have shrunk since its last publish.
+pub const DIRTY_SHARE_PREFIX: &[u8] = b"dirty/share/";
+pub const SUMMARY_GLOBAL_KEY: &[u8] = b"summary/global";
+pub const SUMMARY_GROUP_PREFIX: &[u8] = b"summary/group/";
+/// Marker row of a running usage rebuild; while it exists the live counters are incomplete.
+pub const USAGE_REBUILD_KEY: &[u8] = b"rebuild";
+/// The [`RebuildProgress`] of a begun usage rebuild; writes read the marker, never this row.
+pub const USAGE_PROGRESS_KEY: &[u8] = b"rebuild_progress";
+/// Prefix of the signed rows a usage rebuild fills before they replace the live counter rows.
+pub const USAGE_SHADOW_PREFIX: &[u8] = b"shadow/";
+/// Marker row of live counters a rebuild once completed: every later delta applies to them,
+/// so quota decisions keep using them while another rebuild runs.
+pub const USAGE_COMPLETE_KEY: &[u8] = b"complete";
+
+/// The keyspaces a usage rebuild reads. While one runs, storage keeps the value each changed
+/// row had when it began, so a resumed rebuild reads the same rows as the one that began.
+pub const USAGE_SOURCE_KEYSPACES: [&str; 11] = [
+    S3_BUCKET_KEYSPACE,
+    BLOB_VERSIONS_KEYSPACE,
+    ABE_VERSION_KEYSPACE,
+    ABE_COPY_KEYSPACE,
+    BLOB_LOCATIONS_KEYSPACE,
+    PENDING_LOCATION_KEYSPACE,
+    UPLOAD_KEYSPACE,
+    BLOB_HEAD_KEYSPACE,
+    ABE_ENVELOPE_KEYSPACE,
+    ABE_ARCHIVE_KEYSPACE,
+    REALM_CONFIG_KEYSPACE,
+];
+
+/// Where a usage rebuild stands, advanced in the commit of each page's counts, so a restarted
+/// rebuild resumes after the last committed page.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RebuildProgress {
+    /// Names one rebuild; a resumed rebuild keeps it, so a stale walker cannot commit.
+    pub generation: Ulid,
+    /// Index of the walk the next page reads; past the last walk once every walk ended.
+    pub walk: u8,
+    /// Quota bucket a scoped walk is in.
+    pub scope: u32,
+    /// Start of the next page and whether it is inclusive; `None` starts the walk.
+    pub start: Option<(Vec<u8>, bool)>,
+    pub total: UsageCounters,
+    pub orphan_versions: u64,
+}
+
+impl RebuildProgress {
+    pub fn new(generation: Ulid) -> Self {
+        Self {
+            generation,
+            ..Default::default()
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// A single node's usage total distributed over the sync layer. Single writer
+/// per key (each node writes only its own snapshots), so ingest is last-write-wins.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NodeUsageSnapshot {
+    pub node_id: NodeId,
+    pub counters: UsageCounters,
+    /// The part of `counters` from distributed ranges this node holds but does not coordinate.
+    pub replicas: UsageCounters,
+    /// The record number of each distributed set `replicas` was computed under.
+    pub revisions: BTreeMap<Ulid, u64>,
+}
+
+impl NodeUsageSnapshot {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+pub fn usage_global_key(node_id: NodeId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(USAGE_GLOBAL_PREFIX.len() + 32);
+    key.extend_from_slice(USAGE_GLOBAL_PREFIX);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+pub fn usage_group_prefix(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(USAGE_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(USAGE_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+pub fn usage_snapshot_key(group_id: GroupId, node_id: NodeId) -> Vec<u8> {
+    let mut key = usage_group_prefix(group_id);
+    key.extend_from_slice(node_id.as_bytes());
+    key
+}
+
+/// Recovers the owning node id from a snapshot key produced by
+/// [`usage_global_key`] or [`usage_snapshot_key`].
+pub fn usage_node_id(key: &[u8]) -> Option<NodeId> {
+    let tail = match key.strip_prefix(USAGE_GLOBAL_PREFIX) {
+        Some(rest) => rest,
+        None => key.strip_prefix(USAGE_GROUP_PREFIX)?.get(16..)?,
+    };
+    let bytes: [u8; 32] = tail.try_into().ok()?;
+    NodeId::from_bytes(&bytes).ok()
+}
+
+pub fn dirty_group_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DIRTY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(DIRTY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+pub fn dirty_share_key(group_id: GroupId) -> Vec<u8> {
+    [DIRTY_SHARE_PREFIX, &group_id.to_bytes()].concat()
+}
+
+/// Recovers the group id from a `dirty/share/<ulid>` marker key.
+pub fn dirty_share_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(DIRTY_SHARE_PREFIX)?;
+    Some(GroupId::from_bytes(tail.try_into().ok()?))
+}
+
+/// Recovers the group id from a `dirty/group/<ulid>` marker key.
+pub fn dirty_group_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(DIRTY_GROUP_PREFIX)?;
+    let bytes: [u8; 16] = tail.try_into().ok()?;
+    Some(GroupId::from_bytes(bytes))
+}
+
+/// Recovers the group id from a `g/<group><node>` per-group snapshot key.
+pub fn usage_group_id(key: &[u8]) -> Option<GroupId> {
+    let tail = key.strip_prefix(USAGE_GROUP_PREFIX)?;
+    let bytes: [u8; 16] = tail.get(..16)?.try_into().ok()?;
+    Some(GroupId::from_bytes(bytes))
+}
+
+pub fn usage_summary_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SUMMARY_GROUP_PREFIX.len() + 16);
+    key.extend_from_slice(SUMMARY_GROUP_PREFIX);
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+pub fn global_shard_index(group_id: GroupId) -> usize {
+    group_id
+        .to_bytes()
+        .iter()
+        .fold(0u8, |shard, byte| shard ^ byte) as usize
+        % GLOBAL_SHARD_COUNT
+}
+
+pub fn global_shard_key(shard: usize) -> Vec<u8> {
+    format!("global/{shard:02}").into_bytes()
+}
+
+pub fn global_group_key(group_id: GroupId) -> Vec<u8> {
+    global_shard_key(global_shard_index(group_id))
+}
+
+pub fn global_shard_keys() -> Vec<Vec<u8>> {
+    (0..GLOBAL_SHARD_COUNT).map(global_shard_key).collect()
+}
+
+/// Shard of the physical `stored_*` counters. Keyed by content hash so a
+/// reclaim debits exactly the shard its write credited, which makes underflow
+/// structurally impossible.
+pub fn shard_for_hash(blake3: &[u8; 32]) -> usize {
+    blake3.iter().fold(0u8, |shard, byte| shard ^ byte) as usize % GLOBAL_SHARD_COUNT
+}
+
+/// Shard of the `stored_*` counters of a Pithos archive. Keyed by its archive id, so the charge
+/// never moves when a pending content hash becomes known.
+pub fn shard_for_archive(archive_id: Ulid) -> usize {
+    shard_for_hash(blake3::hash(&archive_id.to_bytes()).as_bytes())
+}
+
+pub fn usage_hash_key(blake3: &[u8; 32]) -> Vec<u8> {
+    global_shard_key(shard_for_hash(blake3))
+}
+
+/// Stored bytes on one backend. The trailing fixed-width shard keeps two
+/// backend names from ever producing the same key.
+pub fn usage_backend_key(backend: &BackendRef, shard: usize) -> Vec<u8> {
+    let mut key = USAGE_BACKEND_PREFIX.as_bytes().to_vec();
+    key.extend_from_slice(&backend.key_bytes());
+    key.extend_from_slice(format!("/{shard:02}").as_bytes());
+    key
+}
+
+pub fn usage_backend_keys(backend: &BackendRef) -> Vec<Vec<u8>> {
+    (0..GLOBAL_SHARD_COUNT)
+        .map(|shard| usage_backend_key(backend, shard))
+        .collect()
+}
+
+pub fn usage_bucket_key(bucket: &str) -> Vec<u8> {
+    [USAGE_BUCKET_PREFIX.as_bytes(), bucket.as_bytes()].concat()
+}
+
+/// The rebuild row of the live counter row `key`.
+pub fn usage_shadow_key(key: &[u8]) -> Vec<u8> {
+    [USAGE_SHADOW_PREFIX, key].concat()
+}
+
+pub fn usage_group_key(group_id: GroupId) -> Vec<u8> {
+    let mut key = Vec::with_capacity(6 + 16);
+    key.extend_from_slice(b"group/");
+    key.extend_from_slice(&group_id.to_bytes());
+    key
+}
+
+/// Maintained usage aggregates. The `stored_*` fields track physical
+/// content-addressed blobs and are only meaningful on the global and
+/// per-backend rows.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UsageCounters {
+    pub buckets: u64,
+    pub objects: u64,
+    pub stored_blobs: u64,
+    pub stored_bytes: u64,
+    /// Materialized version sizes, and the per-group quota basis.
+    pub logical_bytes: u64,
+    /// Bytes reachable only through an external reference.
+    pub referenced_bytes: u64,
+}
+
+impl UsageCounters {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Applies `delta`, saturating every decrement at zero. Growth stays strict
+    /// because quota admission reads these counters; the returned shortfalls
+    /// name the counters that were already below what the caller removed.
+    pub fn apply(
+        &mut self,
+        delta: &UsageDelta,
+    ) -> Result<Vec<CounterShortfall>, UsageCounterError> {
+        let buckets = apply_delta("buckets", self.buckets, delta.buckets)?;
+        let objects = apply_delta("objects", self.objects, delta.objects)?;
+        let stored_blobs = apply_delta("stored_blobs", self.stored_blobs, delta.stored_blobs)?;
+        let stored_bytes = apply_delta("stored_bytes", self.stored_bytes, delta.stored_bytes)?;
+        let logical_bytes = apply_delta("logical_bytes", self.logical_bytes, delta.logical_bytes)?;
+        let referenced_bytes = apply_delta(
+            "referenced_bytes",
+            self.referenced_bytes,
+            delta.referenced_bytes,
+        )?;
+
+        self.buckets = buckets.0;
+        self.objects = objects.0;
+        self.stored_blobs = stored_blobs.0;
+        self.stored_bytes = stored_bytes.0;
+        self.logical_bytes = logical_bytes.0;
+        self.referenced_bytes = referenced_bytes.0;
+        Ok([
+            buckets.1,
+            objects.1,
+            stored_blobs.1,
+            stored_bytes.1,
+            logical_bytes.1,
+            referenced_bytes.1,
+        ]
+        .into_iter()
+        .flatten()
+        .collect())
+    }
+
+    pub fn add(&mut self, other: &Self) -> Result<(), UsageCounterError> {
+        let buckets = add_counter("buckets", self.buckets, other.buckets)?;
+        let objects = add_counter("objects", self.objects, other.objects)?;
+        let stored_blobs = add_counter("stored_blobs", self.stored_blobs, other.stored_blobs)?;
+        let stored_bytes = add_counter("stored_bytes", self.stored_bytes, other.stored_bytes)?;
+        let logical_bytes = add_counter("logical_bytes", self.logical_bytes, other.logical_bytes)?;
+        let referenced_bytes = add_counter(
+            "referenced_bytes",
+            self.referenced_bytes,
+            other.referenced_bytes,
+        )?;
+
+        self.buckets = buckets;
+        self.objects = objects;
+        self.stored_blobs = stored_blobs;
+        self.stored_bytes = stored_bytes;
+        self.logical_bytes = logical_bytes;
+        self.referenced_bytes = referenced_bytes;
+        Ok(())
+    }
+
+    /// Counts each object once: removes the `replicas` share from the object and data
+    /// counters, saturating; the physical `stored_*` and `buckets` stay.
+    pub fn without_replicas(mut self, replicas: &Self) -> Self {
+        self.objects = self.objects.saturating_sub(replicas.objects);
+        self.logical_bytes = self.logical_bytes.saturating_sub(replicas.logical_bytes);
+        self.referenced_bytes = (self.referenced_bytes).saturating_sub(replicas.referenced_bytes);
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct UsageDelta {
+    pub buckets: i128,
+    pub objects: i128,
+    pub stored_blobs: i128,
+    pub stored_bytes: i128,
+    pub logical_bytes: i128,
+    pub referenced_bytes: i128,
+}
+
+impl UsageDelta {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Folds two deltas aimed at one key, so a hash shard that happens to equal
+    /// a group shard still applies both halves instead of losing one.
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            buckets: self.buckets.saturating_add(other.buckets),
+            objects: self.objects.saturating_add(other.objects),
+            stored_blobs: self.stored_blobs.saturating_add(other.stored_blobs),
+            stored_bytes: self.stored_bytes.saturating_add(other.stored_bytes),
+            logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
+            referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
+        }
+    }
+}
+
+/// One bucket's maintained counters, stored node-local under [`usage_bucket_key`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BucketCounters {
+    /// Current heads that are not delete markers.
+    pub objects: u64,
+    /// Stored version rows that are not delete markers, noncurrent ones included.
+    pub versions: u64,
+    pub delete_markers: u64,
+    /// As [`UsageCounters::logical_bytes`], for this bucket's versions.
+    pub logical_bytes: u64,
+    pub referenced_bytes: u64,
+    /// Multipart upload records not yet removed by a completion or an abort.
+    pub open_uploads: u64,
+}
+
+impl BucketCounters {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Applies `delta` like [`UsageCounters::apply`]: decrements saturate at zero and are
+    /// reported as shortfalls.
+    pub fn apply(
+        &mut self,
+        delta: &BucketDelta,
+    ) -> Result<Vec<CounterShortfall>, UsageCounterError> {
+        let objects = apply_delta("objects", self.objects, delta.objects)?;
+        let versions = apply_delta("versions", self.versions, delta.versions)?;
+        let markers = apply_delta("delete_markers", self.delete_markers, delta.delete_markers)?;
+        let logical_bytes = apply_delta("logical_bytes", self.logical_bytes, delta.logical_bytes)?;
+        let referenced_bytes = apply_delta(
+            "referenced_bytes",
+            self.referenced_bytes,
+            delta.referenced_bytes,
+        )?;
+        let uploads = apply_delta("open_uploads", self.open_uploads, delta.open_uploads)?;
+        self.objects = objects.0;
+        self.versions = versions.0;
+        self.delete_markers = markers.0;
+        self.logical_bytes = logical_bytes.0;
+        self.referenced_bytes = referenced_bytes.0;
+        self.open_uploads = uploads.0;
+        Ok([
+            objects.1,
+            versions.1,
+            markers.1,
+            logical_bytes.1,
+            referenced_bytes.1,
+            uploads.1,
+        ]
+        .into_iter()
+        .flatten()
+        .collect())
+    }
+}
+
+/// A change of [`BucketCounters`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BucketDelta {
+    pub objects: i128,
+    pub versions: i128,
+    pub delete_markers: i128,
+    pub logical_bytes: i128,
+    pub referenced_bytes: i128,
+    pub open_uploads: i128,
+}
+
+impl BucketDelta {
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            objects: self.objects.saturating_add(other.objects),
+            versions: self.versions.saturating_add(other.versions),
+            delete_markers: self.delete_markers.saturating_add(other.delete_markers),
+            logical_bytes: self.logical_bytes.saturating_add(other.logical_bytes),
+            referenced_bytes: self.referenced_bytes.saturating_add(other.referenced_bytes),
+            open_uploads: self.open_uploads.saturating_add(other.open_uploads),
+        }
+    }
+}
+
+/// The share of a group delta that belongs to the bucket it concerns.
+impl From<UsageDelta> for BucketDelta {
+    fn from(delta: UsageDelta) -> Self {
+        Self {
+            objects: delta.objects,
+            logical_bytes: delta.logical_bytes,
+            referenced_bytes: delta.referenced_bytes,
+            ..Default::default()
+        }
+    }
+}
+
+/// A rebuild row under [`USAGE_SHADOW_PREFIX`]: signed sums of the walked snapshot and of every
+/// delta committed after the rebuild began, so a removal walked later never clamps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ShadowCounters {
+    Usage(UsageDelta),
+    Bucket(BucketDelta),
+}
+
+impl ShadowCounters {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    /// Adds two rows of one kind; `None` when the kinds differ.
+    pub fn merge(self, other: Self) -> Option<Self> {
+        match (self, other) {
+            (Self::Usage(left), Self::Usage(right)) => Some(Self::Usage(left.merge(right))),
+            (Self::Bucket(left), Self::Bucket(right)) => Some(Self::Bucket(left.merge(right))),
+            _ => None,
+        }
+    }
+
+    /// The live row this rebuild row becomes; a negative sum is clamped and reported.
+    pub fn live_row(&self) -> Result<(Vec<u8>, Vec<CounterShortfall>), ShadowRowError> {
+        Ok(match self {
+            Self::Usage(delta) => {
+                let mut counters = UsageCounters::default();
+                let shortfalls = counters.apply(delta)?;
+                (counters.to_bytes()?, shortfalls)
+            }
+            Self::Bucket(delta) => {
+                let mut counters = BucketCounters::default();
+                let shortfalls = counters.apply(delta)?;
+                (counters.to_bytes()?, shortfalls)
+            }
+        })
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum ShadowRowError {
+    #[error(transparent)]
+    Counter(#[from] UsageCounterError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum UsageCounterError {
+    #[error("usage counter {field} would overflow: {value} + {delta}")]
+    Overflow {
+        field: &'static str,
+        value: u64,
+        delta: u128,
+    },
+}
+
+/// A decrement that would have gone below zero. The counter is clamped to zero
+/// and `missing` reports what the stored value was short of, so a drifted
+/// counter is a reported repair item and never a refused deletion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CounterShortfall {
+    pub field: &'static str,
+    pub missing: u64,
+}
+
+fn apply_delta(
+    field: &'static str,
+    value: u64,
+    delta: i128,
+) -> Result<(u64, Option<CounterShortfall>), UsageCounterError> {
+    if delta >= 0 {
+        let amount = u64::try_from(delta).map_err(|_| UsageCounterError::Overflow {
+            field,
+            value,
+            delta: delta as u128,
+        })?;
+        return Ok((add_counter(field, value, amount)?, None));
+    }
+    let amount = u64::try_from(delta.unsigned_abs()).unwrap_or(u64::MAX);
+    Ok(match value.checked_sub(amount) {
+        Some(result) => (result, None),
+        None => (
+            0,
+            Some(CounterShortfall {
+                field,
+                missing: amount - value,
+            }),
+        ),
+    })
+}
+
+fn add_counter(field: &'static str, value: u64, delta: u64) -> Result<u64, UsageCounterError> {
+    value.checked_add(delta).ok_or(UsageCounterError::Overflow {
+        field,
+        value,
+        delta: u128::from(delta),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_clamps_decrement() {
+        // A drifted counter must not refuse the deletion that discovered it.
+        let mut counters = UsageCounters {
+            objects: 1,
+            logical_bytes: 100,
+            ..Default::default()
+        };
+        let shortfalls = counters
+            .apply(&UsageDelta {
+                objects: -5,
+                logical_bytes: -400,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(counters.objects, 0);
+        assert_eq!(counters.logical_bytes, 0);
+        assert_eq!(
+            shortfalls,
+            vec![
+                CounterShortfall {
+                    field: "objects",
+                    missing: 4,
+                },
+                CounterShortfall {
+                    field: "logical_bytes",
+                    missing: 300,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_rejects_overflow() {
+        // Growth stays strict: quota admission reads these counters.
+        let mut counters = UsageCounters {
+            logical_bytes: u64::MAX,
+            ..Default::default()
+        };
+        let error = counters.apply(&UsageDelta {
+            logical_bytes: 1,
+            ..Default::default()
+        });
+
+        assert!(matches!(
+            error,
+            Err(UsageCounterError::Overflow {
+                field: "logical_bytes",
+                ..
+            })
+        ));
+        assert_eq!(counters.logical_bytes, u64::MAX);
+    }
+
+    #[test]
+    fn decrement_within_range() {
+        let mut counters = UsageCounters {
+            objects: 3,
+            logical_bytes: 900,
+            ..Default::default()
+        };
+        let shortfalls = counters
+            .apply(&UsageDelta {
+                objects: -1,
+                logical_bytes: -400,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(shortfalls.is_empty());
+        assert_eq!(counters.objects, 2);
+        assert_eq!(counters.logical_bytes, 500);
+    }
+
+    #[test]
+    fn apply_updates_counters() {
+        let mut counters = UsageCounters::default();
+        counters
+            .apply(&UsageDelta {
+                buckets: 1,
+                objects: 2,
+                stored_blobs: 3,
+                stored_bytes: 4,
+                logical_bytes: 5,
+                referenced_bytes: 6,
+            })
+            .unwrap();
+
+        assert_eq!(counters.buckets, 1);
+        assert_eq!(counters.objects, 2);
+        assert_eq!(counters.stored_blobs, 3);
+        assert_eq!(counters.stored_bytes, 4);
+        assert_eq!(counters.logical_bytes, 5);
+        assert_eq!(counters.referenced_bytes, 6);
+    }
+
+    #[test]
+    fn apply_accepts_max() {
+        let mut counters = UsageCounters::default();
+        let large = i128::from(i64::MAX) + 1;
+
+        counters
+            .apply(&UsageDelta {
+                logical_bytes: large,
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(counters.logical_bytes, i64::MAX as u64 + 1);
+    }
+
+    #[test]
+    fn counters_round_trip() {
+        let counters = UsageCounters {
+            buckets: 1,
+            objects: 2,
+            stored_blobs: 3,
+            stored_bytes: 4,
+            logical_bytes: 5,
+            referenced_bytes: 6,
+        };
+        let bytes = counters.to_bytes().unwrap();
+        assert_eq!(UsageCounters::from_bytes(&bytes).unwrap(), counters);
+    }
+
+    #[test]
+    fn keys_stay_distinct() {
+        // A name ending in a shard-shaped suffix must not alias another backend.
+        let plain = BackendRef::Node("cold".to_string());
+        let tricky = BackendRef::Node("cold/07".to_string());
+
+        assert_eq!(usage_backend_keys(&plain).len(), GLOBAL_SHARD_COUNT);
+        assert_ne!(usage_backend_key(&plain, 7), usage_backend_key(&tricky, 7));
+        assert!(
+            !usage_backend_keys(&plain)
+                .iter()
+                .any(|key| usage_backend_keys(&tricky).contains(key))
+        );
+    }
+
+    #[test]
+    fn shard_is_stable() {
+        let hash = [7u8; 32];
+        assert_eq!(
+            usage_hash_key(&hash),
+            global_shard_key(shard_for_hash(&hash))
+        );
+        assert!(shard_for_hash(&hash) < GLOBAL_SHARD_COUNT);
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    #[test]
+    fn node_usage_trips() {
+        let snapshot = NodeUsageSnapshot {
+            node_id: node(7),
+            counters: UsageCounters {
+                buckets: 2,
+                logical_bytes: 9,
+                ..Default::default()
+            },
+            replicas: UsageCounters {
+                logical_bytes: 4,
+                ..Default::default()
+            },
+            revisions: Default::default(),
+        };
+        let bytes = snapshot.to_bytes().unwrap();
+        assert_eq!(NodeUsageSnapshot::from_bytes(&bytes).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn replicas_leave_physical() {
+        let counters = UsageCounters {
+            buckets: 2,
+            objects: 5,
+            stored_blobs: 4,
+            stored_bytes: 40,
+            logical_bytes: 30,
+            referenced_bytes: 10,
+        };
+        let replicas = UsageCounters {
+            objects: 2,
+            logical_bytes: 12,
+            referenced_bytes: 20,
+            ..Default::default()
+        };
+        let once = counters.without_replicas(&replicas);
+        assert_eq!((once.objects, once.logical_bytes), (3, 18));
+        assert_eq!(
+            once.referenced_bytes, 0,
+            "a lagging share never goes below zero"
+        );
+        assert_eq!(
+            (once.buckets, once.stored_blobs, once.stored_bytes),
+            (2, 4, 40)
+        );
+    }
+
+    #[test]
+    fn node_usage_ids() {
+        let node_id = node(3);
+        let group_id = ulid::Ulid::from_bytes([5u8; 16]);
+
+        let global_key = usage_global_key(node_id);
+        assert!(global_key.starts_with(USAGE_GLOBAL_PREFIX));
+        assert_eq!(usage_node_id(&global_key), Some(node_id));
+
+        let group_key = usage_snapshot_key(group_id, node_id);
+        assert!(group_key.starts_with(&usage_group_prefix(group_id)));
+        assert_eq!(usage_node_id(&group_key), Some(node_id));
+        assert_eq!(usage_group_id(&group_key), Some(group_id));
+        assert_eq!(usage_group_id(&global_key), None);
+
+        // Group snapshots for one group form a contiguous scan range.
+        assert!(group_key.starts_with(USAGE_GROUP_PREFIX));
+
+        let dirty_key = dirty_group_key(group_id);
+        assert_eq!(dirty_group_id(&dirty_key), Some(group_id));
+        assert_eq!(dirty_group_id(DIRTY_GLOBAL_KEY), None);
+    }
+}

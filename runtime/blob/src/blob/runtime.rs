@@ -1,0 +1,1445 @@
+//! Runs the blob handle: dispatches effects, limits concurrency and drains writes on shutdown.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::group::{BackendClaim, GroupHold};
+use super::registry::BackendRegistry;
+use super::{BlobHandle, BlobHandler, CONNECTION_SLOTS, PEER_CONNECTIONS};
+use crate::egress::EgressGuard;
+use crate::error::BlobLibError;
+use crate::native;
+use crate::opendal::init_operator;
+use aruna_core::alpn::Alpn;
+use aruna_core::effects::{BlobEffect, Effect, LocalFileEffect, StagingSourceEffect};
+use aruna_core::egress::EgressPolicy;
+use aruna_core::errors::{BlobError, StagingSourceError};
+use aruna_core::events::{BlobEvent, Event, StagingSourceEvent};
+use aruna_core::handle::{Handle, StoragePort};
+use aruna_core::id::NodeId;
+use aruna_core::native_reference::is_native;
+use aruna_core::stream::{BackendStream, StreamError};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_core::structs::info::{BackendState, BlobState, Status};
+use aruna_core::structs::storage::blob::BackendConfig;
+use aruna_core::structs::storage::encryption::{BucketKeyError, generate_key, seal_copies};
+use aruna_core::structs::storage::multipart::MultipartPartKey;
+use aruna_p2p::NetHandle;
+use aruna_p2p::streams::BiStream;
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Duration, Instant, interval, timeout};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
+use ulid::Ulid;
+
+// Bounds concurrent transfers so overload queues instead of exhausting fds.
+pub(super) const TRANSFER_SLOTS: usize = 256;
+// Reads hold a backend connection for as long as the returned stream lives.
+pub(super) const READ_SLOTS: usize = 256;
+// Spools take their own pool because their input stream may issue nested
+// transfer and read effects; sharing a pool with those would deadlock.
+pub(super) const SPOOL_SLOTS: usize = 64;
+// Disk that local spools may hold together, in MiB permits.
+pub(super) const SPOOL_BUDGET_MIB: usize = 32 * 1024;
+const QUEUE_WAIT_WARN: Duration = Duration::from_millis(100);
+const SLOW_LOCAL_EFFECT: Duration = Duration::from_secs(1);
+const SLOW_CONTROL_EFFECT: Duration = Duration::from_secs(120);
+const SLOW_TRANSFER_EFFECT: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EffectClass {
+    Local,
+    Control,
+    Transfer,
+    Read,
+    Spool,
+}
+
+impl EffectClass {
+    fn slow_threshold(self) -> Duration {
+        match self {
+            EffectClass::Local | EffectClass::Read => SLOW_LOCAL_EFFECT,
+            EffectClass::Control => SLOW_CONTROL_EFFECT,
+            EffectClass::Transfer | EffectClass::Spool => SLOW_TRANSFER_EFFECT,
+        }
+    }
+}
+
+fn classify_effect(effect: &BlobEffect) -> (EffectClass, &'static str) {
+    match effect {
+        BlobEffect::Abe(effect) => match effect.as_ref() {
+            aruna_core::structs::storage::abe::AbeEffect::Write { .. } => {
+                (EffectClass::Transfer, "write_object")
+            }
+            _ => (EffectClass::Local, "abe"),
+        },
+        BlobEffect::Write { .. } => (EffectClass::Transfer, "write"),
+        BlobEffect::WritePart { .. } => (EffectClass::Transfer, "write_part"),
+        BlobEffect::Compose { .. } => (EffectClass::Transfer, "compose"),
+        BlobEffect::OpenUpload { .. } => (EffectClass::Control, "open_upload"),
+        BlobEffect::CompleteUpload { .. } => (EffectClass::Transfer, "complete_upload"),
+        BlobEffect::AbortUpload { .. } => (EffectClass::Control, "abort_upload"),
+        BlobEffect::SpoolHidden { .. } => (EffectClass::Spool, "spool_hidden"),
+        // Its streams and spool take their own slots through nested effects.
+        BlobEffect::Remote(_) => (EffectClass::Control, "remote"),
+        BlobEffect::SpoolLocal { .. } => (EffectClass::Spool, "spool_local"),
+        BlobEffect::Replicate { .. } => (EffectClass::Transfer, "replicate"),
+        BlobEffect::HandleReplication { .. } => (EffectClass::Transfer, "handle_replication"),
+        BlobEffect::ServeRead { .. } => (EffectClass::Transfer, "serve_read"),
+        BlobEffect::ServeSourceRead { .. } => (EffectClass::Transfer, "serve_source_read"),
+        BlobEffect::ReceiveRead { .. } => (EffectClass::Transfer, "receive_read"),
+        BlobEffect::OpenConnection { .. } => (EffectClass::Control, "open_connection"),
+        BlobEffect::SendMessage { .. } => (EffectClass::Control, "send_message"),
+        BlobEffect::ReadMessage { .. } => (EffectClass::Control, "read_message"),
+        BlobEffect::CloseConnection { .. } => (EffectClass::Control, "close_connection"),
+        BlobEffect::Read { .. } => (EffectClass::Read, "read"),
+        BlobEffect::CollectStream { .. } => (EffectClass::Read, "collect_stream"),
+        BlobEffect::ReadRange { .. } => (EffectClass::Read, "read_range"),
+        BlobEffect::ReadHiddenRange { .. } => (EffectClass::Read, "read_hidden_range"),
+        BlobEffect::Delete { .. } => (EffectClass::Local, "delete"),
+        BlobEffect::ReleaseReservation { .. } => (EffectClass::Local, "release_reservation"),
+        BlobEffect::ReconcileReservation { .. } => (EffectClass::Local, "reconcile_reservation"),
+        BlobEffect::DiscardTarget { .. } => (EffectClass::Local, "discard_target"),
+        BlobEffect::AbortTarget { .. } => (EffectClass::Local, "abort_target"),
+        BlobEffect::DeleteHidden { .. } => (EffectClass::Local, "delete_hidden"),
+        BlobEffect::ListHidden { .. } => (EffectClass::Local, "list_hidden"),
+        BlobEffect::CheckGroupBackend { .. } => (EffectClass::Control, "check_group_backend"),
+        BlobEffect::GenerateBucketKey => (EffectClass::Local, "generate_bucket_key"),
+        BlobEffect::SealHolderCopies { .. } => (EffectClass::Local, "seal_holder_copies"),
+        BlobEffect::SealUnlocked { .. } => (EffectClass::Local, "seal_unlocked"),
+        BlobEffect::PrepareKey { .. } => (EffectClass::Local, "prepare_key"),
+        BlobEffect::ActivateKey { .. } => (EffectClass::Local, "activate_key"),
+        BlobEffect::DiscardKey { .. } => (EffectClass::Local, "discard_key"),
+        BlobEffect::ReadKeyStatus { .. } => (EffectClass::Local, "read_key_status"),
+        BlobEffect::ExtendKey { .. } => (EffectClass::Local, "extend_key"),
+        BlobEffect::LockKey { .. } => (EffectClass::Local, "lock_key"),
+        BlobEffect::AdmitRead { .. } => (EffectClass::Local, "admit_read"),
+        BlobEffect::RewriteCopy { .. } => (EffectClass::Transfer, "rewrite_copy"),
+        BlobEffect::ReadUnlockedKey { .. } => (EffectClass::Local, "read_unlocked_key"),
+        BlobEffect::WritePiece { .. } => (EffectClass::Transfer, "write_piece"),
+        BlobEffect::ComposePieces { .. } => (EffectClass::Transfer, "compose_pieces"),
+        BlobEffect::HashArchive { .. } => (EffectClass::Transfer, "hash_archive"),
+        BlobEffect::ReadSealed { .. } => (EffectClass::Read, "read_sealed"),
+        BlobEffect::ServeSealedRead { .. } => (EffectClass::Transfer, "serve_sealed_read"),
+        BlobEffect::ReserveCompose { .. } => (EffectClass::Local, "reserve_compose"),
+        BlobEffect::ReplicateLeased { .. } => (EffectClass::Transfer, "replicate_leased"),
+        BlobEffect::ListExternal { .. } => (EffectClass::Control, "list_external"),
+        BlobEffect::HashExternal { .. } => (EffectClass::Transfer, "hash_external"),
+        BlobEffect::WritePlain { .. } => (EffectClass::Transfer, "write_plain"),
+        BlobEffect::CopyPlain { .. } => (EffectClass::Transfer, "copy_plain"),
+        BlobEffect::StatPlain { .. } => (EffectClass::Control, "stat_plain"),
+        BlobEffect::StatExternal { .. } => (EffectClass::Control, "stat_external"),
+        BlobEffect::DropReservation { .. } => (EffectClass::Control, "drop_reservation"),
+        BlobEffect::DeletePlain { .. } => (EffectClass::Local, "delete_plain"),
+        BlobEffect::StatCopy { .. } => (EffectClass::Control, "stat_copy"),
+        BlobEffect::SettleCopy { .. } => (EffectClass::Control, "settle_copy"),
+        BlobEffect::EnsureBucket { .. } => (EffectClass::Control, "ensure_bucket"),
+        BlobEffect::HeadBucket { .. } => (EffectClass::Control, "head_bucket"),
+        BlobEffect::DeleteEmptyBucket { .. } => (EffectClass::Control, "delete_empty_bucket"),
+        BlobEffect::PinRead { .. } => (EffectClass::Control, "pin_read"),
+        BlobEffect::ReadHeld { .. } => (EffectClass::Control, "read_held"),
+    }
+}
+
+/// Effects that write bytes to a backend or remove them. Reads, serves, listings
+/// and connection control stay open after the close.
+fn blob_effect_mutates(effect: &BlobEffect) -> bool {
+    matches!(
+        effect,
+        BlobEffect::Abe(_)
+            | BlobEffect::Write { .. }
+            | BlobEffect::WritePart { .. }
+            | BlobEffect::Compose { .. }
+            | BlobEffect::OpenUpload { .. }
+            | BlobEffect::CompleteUpload { .. }
+            | BlobEffect::AbortUpload { .. }
+            | BlobEffect::SpoolHidden { .. }
+            | BlobEffect::EnsureBucket { .. }
+            | BlobEffect::DeleteEmptyBucket { .. }
+            | BlobEffect::Replicate { .. }
+            | BlobEffect::HandleReplication { .. }
+            | BlobEffect::ReceiveRead { .. }
+            | BlobEffect::Delete { .. }
+            | BlobEffect::ReconcileReservation { .. }
+            | BlobEffect::DiscardTarget { .. }
+            | BlobEffect::AbortTarget { .. }
+            | BlobEffect::DeleteHidden { .. }
+            | BlobEffect::RewriteCopy { .. }
+            | BlobEffect::WritePiece { .. }
+            | BlobEffect::ComposePieces { .. }
+            | BlobEffect::ReplicateLeased { .. }
+            | BlobEffect::WritePlain { .. }
+            | BlobEffect::CopyPlain { .. }
+            | BlobEffect::SettleCopy { .. }
+            | BlobEffect::DeletePlain { .. }
+            | BlobEffect::DropReservation { .. }
+    )
+}
+
+/// The bytes of `blob`, read to its end. A chunk past `limit` is refused before it is copied.
+async fn collect_stream(
+    mut blob: BackendStream<Result<Bytes, StreamError>>,
+    limit: Option<u64>,
+) -> BlobEvent {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = futures::StreamExt::next(&mut blob).await {
+        match chunk {
+            Ok(chunk) => {
+                let size = bytes.len().saturating_add(chunk.len()) as u64;
+                if let Some(limit) = limit.filter(|limit| size > *limit) {
+                    return BlobEvent::StreamTooLarge { limit };
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Err(error) => {
+                let bytes = Err(error.to_string());
+                return BlobEvent::StreamCollected { bytes };
+            }
+        }
+    }
+    BlobEvent::StreamCollected { bytes: Ok(bytes) }
+}
+
+/// Tracks one in-flight blob mutation so `drain_writes` can wait for it.
+struct BlobWriteGuard {
+    in_flight: Arc<AtomicUsize>,
+    drained: Arc<tokio::sync::Notify>,
+}
+
+impl BlobWriteGuard {
+    fn new(handler: &BlobHandler) -> Self {
+        handler.writes_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self {
+            in_flight: handler.writes_in_flight.clone(),
+            drained: handler.writes_drained.clone(),
+        }
+    }
+}
+
+impl Drop for BlobWriteGuard {
+    fn drop(&mut self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
+// Holds a read slot until the lazily consumed stream is dropped.
+struct PermitStream {
+    inner: BackendStream<Result<Bytes, StreamError>>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Stream for PermitStream {
+    type Item = Result<Bytes, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut().inner.0.as_mut().poll_next(cx)
+    }
+}
+
+fn hold_permit(
+    blob: BackendStream<Result<Bytes, StreamError>>,
+    permit: OwnedSemaphorePermit,
+) -> BackendStream<Result<Bytes, StreamError>> {
+    BackendStream(Box::pin(PermitStream {
+        inner: blob,
+        _permit: permit,
+    }))
+}
+
+// Error events drop the permit here; only a live stream keeps a slot.
+fn attach_permit(event: BlobEvent, permit: Option<OwnedSemaphorePermit>) -> BlobEvent {
+    let Some(permit) = permit else {
+        return event;
+    };
+    match event {
+        BlobEvent::ReadFinished { blob, stream_size } => BlobEvent::ReadFinished {
+            blob: hold_permit(blob, permit),
+            stream_size,
+        },
+        BlobEvent::HiddenRead { blob, stream_size } => BlobEvent::HiddenRead {
+            blob: hold_permit(blob, permit),
+            stream_size,
+        },
+        other => other,
+    }
+}
+
+#[async_trait]
+impl Handle for BlobHandle {
+    async fn send_effect(&self, effect: Effect) -> Event {
+        match effect {
+            Effect::Blob(blob_effect) => self.send_blob_effect(*blob_effect).await,
+            Effect::StagingSource(staging_source_effect) => {
+                self.send_staging_effect(*staging_source_effect).await
+            }
+            Effect::LocalFile(file_effect) => self.send_file_effect(file_effect).await,
+            _ => Event::blob(BlobEvent::Error(BlobError::InvalidEffect)),
+        }
+    }
+}
+
+impl BlobHandle {
+    pub fn new(handler: BlobHandler) -> Self {
+        BlobHandle { handler }
+    }
+
+    /// Installs the Git store on first call; later calls get the installed one.
+    pub fn install_git(&self, store: Arc<crate::git::GitStore>) -> Arc<crate::git::GitStore> {
+        self.handler.git.get_or_init(|| store).clone()
+    }
+
+    pub fn git(&self) -> Option<&crate::git::GitStore> {
+        self.handler.git.get().map(Arc::as_ref)
+    }
+
+    /// The installed Git store, shared with holders that outlive this handle.
+    pub fn git_store(&self) -> Option<Arc<crate::git::GitStore>> {
+        self.handler.git.get().cloned()
+    }
+
+    /// Closes the blob write path before storage is closed. Mutations that
+    /// arrive afterwards are rejected and counted.
+    pub fn close_writes(&self) {
+        self.handler.close_writes();
+    }
+
+    pub fn writes_closed(&self) -> bool {
+        self.handler.writes_closed()
+    }
+
+    pub fn rejected_writes(&self) -> u64 {
+        self.handler.rejected_writes.load(Ordering::Relaxed)
+    }
+
+    /// Waits until blob mutations registered before the close complete, bounded
+    /// by `timeout`. Returns `true` when none remain.
+    pub async fn drain_writes(&self, timeout: Duration) -> bool {
+        self.handler.drain_writes(timeout).await
+    }
+
+    pub async fn send_blob_effect(&self, effect: BlobEffect) -> Event {
+        let (class, kind) = classify_effect(&effect);
+        // Register a mutation before any await so a concurrent close either
+        // rejects it or drains it; the guard lives for the whole effect.
+        let write = if blob_effect_mutates(&effect) {
+            let _close_guard = self
+                .handler
+                .close_lock
+                .read()
+                .expect("blob close lock poisoned");
+            if self.handler.writes_closed() {
+                self.handler.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    event = "blob.write.after_close",
+                    effect = kind,
+                    "Rejected a blob write issued after the shutdown close"
+                );
+                return Event::blob(BlobEvent::Error(BlobError::Closed));
+            }
+            Some(BlobWriteGuard::new(&self.handler))
+        } else {
+            None
+        };
+        let deadline = match &effect {
+            BlobEffect::SpoolHidden { deadline, .. } | BlobEffect::SpoolLocal { deadline, .. } => {
+                *deadline
+            }
+            _ => None,
+        };
+        // A composition runs on the transfer slot its reservation already holds.
+        let reserved = matches!(effect, BlobEffect::ComposePieces { .. });
+        let slots = match class {
+            EffectClass::Transfer if reserved => None,
+            EffectClass::Transfer => Some(self.handler.transfer_slots.clone()),
+            EffectClass::Read => Some(self.handler.read_slots.clone()),
+            EffectClass::Spool => Some(self.handler.spool_slots.clone()),
+            EffectClass::Local | EffectClass::Control => None,
+        };
+        let permit = match slots {
+            Some(slots) => {
+                let queued = Instant::now();
+                let permit = match deadline {
+                    Some(deadline) => match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(deadline),
+                        slots.acquire_owned(),
+                    )
+                    .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return Event::blob(BlobEvent::Error(BlobError::WriteError(
+                                "blob effect deadline expired".to_string(),
+                            )));
+                        }
+                    },
+                    None => slots.acquire_owned().await,
+                };
+                let queue_wait = queued.elapsed();
+                if queue_wait >= QUEUE_WAIT_WARN {
+                    tracing::warn!(
+                        event = "blob.queue.lag",
+                        effect = kind,
+                        queue_wait_ms = queue_wait.as_millis() as u64,
+                        in_flight = self.handler.inflight.load(Ordering::Relaxed),
+                        "Blob slots saturated"
+                    );
+                }
+                permit.ok()
+            }
+            None => None,
+        };
+
+        struct InflightGuard<'a>(&'a AtomicUsize);
+        impl Drop for InflightGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let in_flight = self.handler.inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        let _inflight = InflightGuard(&self.handler.inflight);
+        let started = Instant::now();
+        // Its own task, so the effect starts on a fresh stack instead of under the caller's frames.
+        let handler = self.handler.clone();
+        let task = AbortOnDropHandle::new(tokio::spawn(async move {
+            let _write = write;
+            handler.execute_effect(effect).await
+        }));
+        let blob_event = match task.await {
+            Ok(event) => event,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => BlobEvent::Error(BlobError::Closed),
+        };
+        drop(_inflight);
+        // Read events carry a lazy stream, so the slot follows the stream.
+        let blob_event = if class == EffectClass::Read {
+            attach_permit(blob_event, permit)
+        } else {
+            blob_event
+        };
+        let service = started.elapsed();
+        if service >= class.slow_threshold() {
+            tracing::warn!(
+                event = "blob.effect.slow",
+                effect = kind,
+                service_ms = service.as_millis() as u64,
+                in_flight,
+                "Slow blob effect"
+            );
+        }
+        Event::blob(blob_event)
+    }
+
+    /// Executes one write into a folder the owner bound on this machine. The
+    /// adapter enforces the jail and the guard; the policy is the operation's.
+    pub async fn send_file_effect(&self, effect: LocalFileEffect) -> Event {
+        Event::LocalFile(match effect {
+            LocalFileEffect::Write {
+                root,
+                relative,
+                guard,
+                blob,
+            } => crate::fs_write::write_guarded(&root, &relative, &guard, blob).await,
+            LocalFileEffect::WriteConflicted {
+                root,
+                relative,
+                at_ms,
+                blob,
+            } => crate::fs_write::write_conflicted(&root, &relative, at_ms, blob).await,
+            LocalFileEffect::MoveAside {
+                root,
+                relative,
+                guard,
+            } => crate::fs_write::move_aside(&root, &relative, &guard).await,
+            LocalFileEffect::Hash { root, relative } => {
+                crate::fs_write::hash_local(&root, &relative).await
+            }
+        })
+    }
+
+    pub async fn send_staging_effect(&self, effect: StagingSourceEffect) -> Event {
+        let staging_source_event = match effect {
+            // A native source is another node's object, read through the reference protocol.
+            StagingSourceEffect::Head { access } if is_native(&access) => {
+                native::head(&self.handler.net, access)
+                    .await
+                    .unwrap_or_else(source_error)
+            }
+            StagingSourceEffect::Read { access, range, .. } if is_native(&access) => {
+                native::read(&self.handler.net, access, range)
+                    .await
+                    .unwrap_or_else(source_error)
+            }
+            StagingSourceEffect::Check { access } | StagingSourceEffect::List { access, .. }
+                if is_native(&access) =>
+            {
+                source_error(StagingSourceError::UnsupportedKind(
+                    SourceConnectorKind::ArunaNative.to_string(),
+                ))
+            }
+            StagingSourceEffect::PrepareFolder { root } => {
+                match crate::fs_source::check_root(&root, true).await {
+                    Ok(()) => StagingSourceEvent::CheckResult,
+                    Err(error) => source_error(error),
+                }
+            }
+            StagingSourceEffect::Check { access } => {
+                self.handler.check_staging_source(access).await
+            }
+            StagingSourceEffect::Head { access } => self.handler.head_staging_source(access).await,
+            StagingSourceEffect::List { access, request } => {
+                self.handler.list_staging_source(access, request).await
+            }
+            StagingSourceEffect::Read {
+                access,
+                range,
+                expected,
+            } => {
+                self.handler
+                    .read_staging_source(access, range, expected)
+                    .await
+            }
+            StagingSourceEffect::Health { accesses } => self.handler.source_health(&accesses),
+        };
+
+        Event::staging(staging_source_event)
+    }
+
+    /// Node-local routing inputs for callers assembling an operation config.
+    pub fn routing(&self) -> aruna_core::structs::storage::routing::NodeRouting {
+        self.handler.registry.routing()
+    }
+
+    /// SSRF-screened plain-HTTP GET builder for non-opendal fetches, such as an
+    /// OAI-PMH verb request against an attacker-influenceable repository URL.
+    pub fn egress_request(
+        &self,
+        url: reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, aruna_core::egress::EgressError> {
+        self.handler.egress.request(url)
+    }
+
+    pub(crate) fn egress(&self) -> &crate::egress::EgressGuard {
+        &self.handler.egress
+    }
+
+    pub fn repository_request(
+        &self,
+        method: reqwest::Method,
+        url: reqwest::Url,
+    ) -> Result<reqwest::RequestBuilder, aruna_core::egress::EgressError> {
+        self.handler.egress.repository_request(method, url)
+    }
+
+    /// The screened repository client and its egress policy, for the outbound backend.
+    pub fn repository_client(&self) -> (reqwest::Client, EgressPolicy) {
+        self.handler.egress.repository_client()
+    }
+
+    /// Holds every tenant backend an effect names for as long as the guard
+    /// lives. The driver keeps it for the whole operation, so the metadata
+    /// transaction behind the bytes and its rollback are both covered.
+    pub fn hold_backends(&self, effect: &BlobEffect) -> Result<Option<GroupHold>, BlobError> {
+        self.handler.hold_backends(effect)
+    }
+
+    /// The backend's hold generation while nothing holds or claims it.
+    pub fn idle_generation(&self, backend_id: Ulid) -> Option<u64> {
+        self.handler.idle_generation(backend_id)
+    }
+
+    /// Reserves one tenant backend for removal, or refuses when it has been
+    /// held at any point since `generation`.
+    pub fn claim_backend(&self, backend_id: Ulid, generation: u64) -> Option<BackendClaim> {
+        self.handler.claim_backend(backend_id, generation)
+    }
+
+    /// Per-backend health for `/info`.
+    pub async fn backend_states(&self) -> Vec<BackendState> {
+        let mut states = Vec::new();
+        for (name, backend) in self.handler.registry.entries() {
+            states.push(BackendState {
+                name: name.clone(),
+                backend_type: backend.config.backend_type.clone(),
+                class: backend.class.clone(),
+                allow_tenants: backend.allow_tenants,
+                quota_bytes: backend.quota_bytes,
+                default: name == self.handler.registry.default_name(),
+                status: *backend.status.read().await,
+            });
+        }
+        states
+    }
+
+    pub async fn store_connection(
+        &self,
+        peer: NodeId,
+        stream: BiStream,
+    ) -> Result<Ulid, BlobError> {
+        self.handler.add_connection(None, peer, stream).await
+    }
+
+    /// The headline signal stays the default backend's, so existing consumers
+    /// keep one status while the registry tracks each backend separately.
+    pub async fn get_status(&self) -> BlobState {
+        let registry = &self.handler.registry;
+        let config = registry.default_config().clone();
+        let status = registry
+            .backend(&registry.default_ref())
+            .map(|backend| backend.status.clone());
+        let status = match status {
+            Ok(status) => *status.read().await,
+            Err(_) => Status::NotConfigured,
+        };
+
+        BlobState {
+            backend_type: config.backend_type,
+            max_bucket_size: config.max_bucket_size,
+            multipart_bucket: config.multipart_bucket,
+            timeouts: config.timeouts,
+            status,
+            backends: self.backend_states().await,
+        }
+    }
+}
+
+impl BlobHandler {
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn new(
+        config: BackendConfig,
+        storage: impl Into<Arc<dyn StoragePort>>,
+        net: NetHandle,
+    ) -> Result<BlobHandle, BlobLibError> {
+        Self::with_egress(config, storage, net, EgressPolicy::strict()).await
+    }
+
+    /// Constructor seam for the egress policy. Production wiring calls `new`,
+    /// which pins the strict policy; fixtures pass a loopback-permitting one.
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn with_egress(
+        config: BackendConfig,
+        storage: impl Into<Arc<dyn StoragePort>>,
+        net: NetHandle,
+        policy: EgressPolicy,
+    ) -> Result<BlobHandle, BlobLibError> {
+        Self::with_registry(BackendRegistry::single(config), storage, net, policy, None).await
+    }
+
+    /// Builds the handler; `spool_dir` must be a writable disk directory, created when missing.
+    /// Without one, every local spool fails.
+    #[allow(clippy::new_ret_no_self)]
+    pub async fn with_registry(
+        registry: BackendRegistry,
+        storage: impl Into<Arc<dyn StoragePort>>,
+        net: NetHandle,
+        policy: EgressPolicy,
+        spool_dir: Option<std::path::PathBuf>,
+    ) -> Result<BlobHandle, BlobLibError> {
+        if let Some(dir) = spool_dir.as_deref() {
+            super::local_spool::prepare_dir(dir)?;
+        }
+        let blob_handler = BlobHandler {
+            registry,
+            egress: EgressGuard::new(policy)?,
+            storage: storage.into(),
+            net,
+            connections: Arc::new(Mutex::new(HashMap::new())),
+            connection_slots: Arc::new(Semaphore::new(CONNECTION_SLOTS)),
+            transfer_slots: Arc::new(Semaphore::new(TRANSFER_SLOTS)),
+            read_slots: Arc::new(Semaphore::new(READ_SLOTS)),
+            spool_slots: Arc::new(Semaphore::new(SPOOL_SLOTS)),
+            inflight: Arc::new(AtomicUsize::new(0)),
+            group_effects: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            frame_indexes: Arc::new(std::sync::Mutex::new(super::frames::IndexCache::new())),
+            source_stats: Default::default(),
+            read_pins: Default::default(),
+            reservation_active: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            part_chains: Arc::default(),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close_lock: Arc::new(std::sync::RwLock::new(())),
+            rejected_writes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            writes_in_flight: Arc::new(AtomicUsize::new(0)),
+            writes_drained: Arc::new(tokio::sync::Notify::new()),
+            monitor_cancel: CancellationToken::new(),
+            monitor_task: Arc::new(StdMutex::new(None)),
+            unlocks: Arc::new(StdMutex::new(super::unlock::UnlockRegistry::new(
+                super::unlock::UNLOCKED_BUCKETS,
+            ))),
+            pithos_budget: Arc::new(Semaphore::new(super::pithos::budget_permits())),
+            spool_dir: spool_dir.map(Arc::new),
+            spool_files: Arc::new(Semaphore::new(super::local_spool::SPOOL_FILES)),
+            spool_budget: Arc::new(Semaphore::new(SPOOL_BUDGET_MIB)),
+            git: Arc::default(),
+        };
+        blob_handler.ensure_multipart_bucket().await?;
+        if let Err(error) = blob_handler.backfill_free_index().await {
+            tracing::warn!(%error, "Could not add provider buckets to the free index");
+        }
+        blob_handler.probe_all_backends().await;
+        let status_handler = blob_handler.clone();
+        let monitor_cancel = blob_handler.monitor_cancel.clone();
+        let monitor_task = tokio::spawn(async move {
+            tokio::select! {
+                _ = status_handler.monitor_backend_status() => {}
+                _ = monitor_cancel.cancelled() => {}
+            }
+        });
+        *blob_handler
+            .monitor_task
+            .lock()
+            .expect("blob monitor task lock poisoned") = Some(monitor_task);
+
+        Ok(BlobHandle::new(blob_handler))
+    }
+
+    pub(super) fn close_writes(&self) {
+        let _guard = self.close_lock.write().expect("blob close lock poisoned");
+        self.closed.store(true, Ordering::SeqCst);
+        // The monitor holds a handler clone; stop it so cleanup can release the
+        // storage handle instead of leaving a detached task behind.
+        self.monitor_cancel.cancel();
+    }
+
+    pub(super) fn writes_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn drain_writes(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        self.monitor_cancel.cancel();
+        let monitor_task = self
+            .monitor_task
+            .lock()
+            .expect("blob monitor task lock poisoned")
+            .take();
+        if let Some(task) = monitor_task {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let _ = tokio::time::timeout(remaining, task).await;
+        }
+        loop {
+            if self.writes_in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let notified = self.writes_drained.notified();
+            // Re-check after arming the wait so a wake between the two is not lost.
+            if self.writes_in_flight.load(Ordering::Acquire) == 0 {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            if tokio::time::timeout(remaining, notified).await.is_err() {
+                return self.writes_in_flight.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+
+    // Effects run on their own spawned task; per-operation ordering
+    // is preserved by the driver awaiting each effect before the next.
+    pub(super) async fn execute_effect(&self, effect: BlobEffect) -> BlobEvent {
+        // A settlement of a recorded upload names its backend only in the record.
+        let effect = match effect {
+            BlobEffect::SettleCopy {
+                attempt,
+                upload: None,
+            } => match self.copy_upload(attempt).await {
+                Ok(Some((location, upload_id))) => BlobEffect::SettleCopy {
+                    attempt,
+                    upload: Some((Box::new(location), upload_id)),
+                },
+                Ok(None) => return BlobEvent::UploadAborted,
+                Err(error) => return BlobEvent::Error(error),
+            },
+            effect => effect,
+        };
+        let _hold = match self.hold_backends(&effect) {
+            Ok(hold) => hold,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        let handler = match self.with_group_backends(&effect).await {
+            Ok(handler) => handler,
+            Err(error) => return BlobEvent::Error(error),
+        };
+        handler.dispatch_effect(effect).await
+    }
+
+    async fn dispatch_effect(&self, effect: BlobEffect) -> BlobEvent {
+        match effect {
+            BlobEffect::Abe(effect) => self.abe_effect(*effect).await,
+            BlobEffect::Write {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                blob,
+                size,
+            } => {
+                let write = self.write_sized_blob(&bucket, &key, resolved, created_by, blob, size);
+                Box::pin(write).await
+            }
+            BlobEffect::WritePart {
+                upload_id,
+                part_number,
+                resolved,
+                created_by,
+                backend_upload: Some(upload),
+                size,
+                blob,
+            } => {
+                Box::pin(self.write_part(
+                    *upload,
+                    MultipartPartKey::new(upload_id, part_number),
+                    resolved,
+                    created_by,
+                    size,
+                    blob,
+                ))
+                .await
+            }
+            BlobEffect::WritePart {
+                upload_id,
+                part_number,
+                resolved,
+                created_by,
+                blob,
+                ..
+            } => {
+                Box::pin(self.write_blob_part(
+                    MultipartPartKey::new(upload_id, part_number),
+                    resolved,
+                    created_by,
+                    blob,
+                ))
+                .await
+            }
+            BlobEffect::Compose {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                parts,
+                plain: Some(plain),
+            } => {
+                let _ = (bucket, key);
+                Box::pin(self.compose_plain(resolved, plain, created_by, parts)).await
+            }
+            BlobEffect::Compose {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                parts,
+                plain: None,
+            } => Box::pin(self.compose_blob(&bucket, &key, resolved, created_by, parts)).await,
+            BlobEffect::OpenUpload {
+                record_id,
+                bucket,
+                key,
+                resolved,
+                created_by,
+                plain,
+            } => {
+                let open = self.open_upload(record_id, &bucket, &key, resolved, created_by, plain);
+                Box::pin(open).await
+            }
+            BlobEffect::CompleteUpload {
+                backend_upload,
+                parts,
+                streamed,
+                compression,
+                if_not_exists,
+            } => {
+                let upload = *backend_upload;
+                let complete =
+                    self.complete_upload(upload, parts, &streamed, compression, if_not_exists);
+                Box::pin(complete).await
+            }
+            BlobEffect::AbortUpload { backend_upload } => {
+                Box::pin(self.abort_upload(*backend_upload)).await
+            }
+            BlobEffect::Read { location } => Box::pin(self.read_blob(location)).await,
+            BlobEffect::ReadRange { location, range } => {
+                Box::pin(self.read_blob_range(location, range)).await
+            }
+            BlobEffect::Remote(request) => {
+                let handle = BlobHandle {
+                    handler: self.clone(),
+                };
+                BlobEvent::Remote(Box::pin(handle.run_remote(*request)).await)
+            }
+            BlobEffect::Delete { location } => Box::pin(self.delete_blob(location)).await,
+            BlobEffect::ReleaseReservation { id } => {
+                self.clear_active(id);
+                BlobEvent::ReservationReleased { id }
+            }
+            BlobEffect::PinRead { backend_path, blob } => BlobEvent::PinnedRead {
+                blob: self.read_pins.pin(backend_path, blob),
+            },
+            BlobEffect::ReadHeld { backend_path } => BlobEvent::ReadHeld {
+                held: self.read_pins.held(&backend_path),
+            },
+            BlobEffect::CollectStream { blob, limit } => collect_stream(blob, limit).await,
+            BlobEffect::ReconcileReservation { location } => {
+                match Box::pin(self.reconcile_reservation(location)).await {
+                    Ok(done) => BlobEvent::ReservationReconciled { done },
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::DiscardTarget { location } => {
+                match Box::pin(self.discard_target(&location)).await {
+                    Ok(()) => BlobEvent::DeleteFinished,
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::AbortTarget { location } => {
+                match Box::pin(self.abort_target(&location)).await {
+                    Ok(()) => BlobEvent::UploadAborted,
+                    Err(error) => BlobEvent::Error(error),
+                }
+            }
+            BlobEffect::SpoolHidden {
+                namespace,
+                name,
+                created_by,
+                max_bytes,
+                deadline,
+                blob,
+            } => {
+                let spool =
+                    self.spool_hidden_blob(namespace, &name, created_by, max_bytes, deadline, blob);
+                Box::pin(spool).await
+            }
+            BlobEffect::SpoolLocal {
+                size,
+                deadline,
+                range,
+                blob,
+            } => Box::pin(self.spool_local(size, deadline, range, blob)).await,
+            BlobEffect::ReadHiddenRange { location, range } => {
+                Box::pin(self.read_hidden_range(location, range)).await
+            }
+            BlobEffect::DeleteHidden { key } => Box::pin(self.delete_hidden_blob(key)).await,
+            BlobEffect::ListHidden { namespace, cursor } => {
+                Box::pin(self.list_hidden_blobs(namespace, cursor)).await
+            }
+            BlobEffect::CheckGroupBackend { record, secret } => {
+                Box::pin(self.check_group_backend(record, secret)).await
+            }
+            BlobEffect::GenerateBucketKey => match (super::abe::fresh_rng())
+                .ok_or(BucketKeyError::Seal)
+                .and_then(|mut rng| generate_key(&mut rng))
+            {
+                Ok((public_key, private_key)) => BlobEvent::BucketKeyGenerated {
+                    public_key,
+                    private_key,
+                },
+                Err(error) => BlobEvent::Error(error.into()),
+            },
+            BlobEffect::SealHolderCopies {
+                key,
+                public_key,
+                private_key,
+                realm_id,
+                node_id,
+                holders,
+            } => {
+                let now_ms = aruna_clock::unix_timestamp_millis();
+                let origin = (realm_id, node_id);
+                let sealed =
+                    (super::abe::fresh_rng().ok_or(BucketKeyError::Seal)).and_then(|mut rng| {
+                        seal_copies(
+                            key,
+                            &public_key,
+                            private_key.bytes(),
+                            origin,
+                            &holders,
+                            now_ms,
+                            &mut rng,
+                        )
+                    });
+                match sealed {
+                    Ok(copies) => BlobEvent::CopiesSealed { copies },
+                    Err(error) => BlobEvent::Error(error.into()),
+                }
+            }
+            BlobEffect::SealUnlocked {
+                key,
+                realm_id,
+                node_id,
+                holders,
+            } => self.seal_unlocked(key, (realm_id, node_id), &holders),
+            effect @ (BlobEffect::PrepareKey { .. }
+            | BlobEffect::ActivateKey { .. }
+            | BlobEffect::DiscardKey { .. }
+            | BlobEffect::ReadKeyStatus { .. }
+            | BlobEffect::ExtendKey { .. }
+            | BlobEffect::LockKey { .. }) => self.unlock_effect(effect),
+            BlobEffect::AdmitRead { key, archive } => self.admit_read(key, archive).await,
+            BlobEffect::RewriteCopy {
+                bucket,
+                key,
+                source,
+                lease,
+                target,
+                grants_only,
+                object,
+            } => {
+                let (lease, target) = (lease.map(|lease| *lease), *target);
+                let rewrite = self.rewrite_copy(
+                    &bucket,
+                    &key,
+                    source,
+                    lease,
+                    target,
+                    (grants_only, object.map(|key| *key)),
+                );
+                Box::pin(rewrite).await
+            }
+            BlobEffect::ReadUnlockedKey { key } => self.read_unlocked(key),
+            BlobEffect::WritePiece {
+                upload_id,
+                part_number,
+                resolved,
+                created_by,
+                content_offset,
+                object,
+                blob,
+            } => {
+                let part = MultipartPartKey::new(upload_id, part_number);
+                let piece =
+                    self.seal_piece(part, resolved, created_by, (content_offset, object), blob);
+                Box::pin(piece).await
+            }
+            BlobEffect::ComposePieces {
+                bucket,
+                key,
+                resolved,
+                created_by,
+                parts,
+                share,
+            } => {
+                let composed =
+                    self.compose_pieces(&bucket, &key, resolved, created_by, parts, share);
+                Box::pin(composed).await
+            }
+            BlobEffect::ReserveCompose { content } => self.reserve_compose(content).await,
+            BlobEffect::ListExternal {
+                backend,
+                prefix,
+                start_after,
+                limit,
+            } => {
+                let list = self.list_external(&backend, &prefix, start_after, limit);
+                Box::pin(list).await
+            }
+            BlobEffect::HashExternal {
+                resolved,
+                path,
+                created_by,
+            } => Box::pin(self.hash_external(resolved, path, created_by)).await,
+            BlobEffect::WritePlain {
+                resolved,
+                plain,
+                created_by,
+                blob,
+            } => Box::pin(self.write_plain(resolved, plain, created_by, blob)).await,
+            BlobEffect::CopyPlain {
+                resolved,
+                plain,
+                source,
+                etag,
+            } => Box::pin(self.copy_plain(resolved, plain, *source, etag)).await,
+            BlobEffect::StatCopy { location } => Box::pin(self.stat_copy(location)).await,
+            BlobEffect::SettleCopy { attempt, upload } => {
+                let upload = upload.map(|(location, id)| (*location, id));
+                Box::pin(self.settle_copy(attempt, upload)).await
+            }
+            BlobEffect::StatPlain { backend, path } => {
+                Box::pin(self.stat_plain(backend, path)).await
+            }
+            BlobEffect::StatExternal {
+                resolved,
+                path,
+                created_by,
+            } => Box::pin(self.stat_external(resolved, path, created_by)).await,
+            BlobEffect::DropReservation {
+                backend,
+                path,
+                version_id,
+            } => Box::pin(self.drop_reservation(backend, path, version_id)).await,
+            BlobEffect::DeletePlain {
+                location,
+                version,
+                etag,
+            } => Box::pin(self.delete_plain(location, version, etag)).await,
+            BlobEffect::EnsureBucket { backend, bucket } => {
+                Box::pin(self.ensure_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::HeadBucket { backend, bucket } => {
+                Box::pin(self.head_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::DeleteEmptyBucket { backend, bucket } => {
+                Box::pin(self.delete_bucket(&backend, &bucket)).await
+            }
+            BlobEffect::HashArchive { location, lease } => {
+                Box::pin(self.hash_archive(location, *lease)).await
+            }
+            BlobEffect::ReadSealed {
+                location,
+                range,
+                lease,
+            } => Box::pin(self.read_sealed(location, range, *lease)).await,
+            BlobEffect::ServeSealedRead {
+                stream_id,
+                location,
+                expected_blake3,
+                lease,
+                range,
+            } => {
+                let target = (location, expected_blake3, range);
+                Box::pin(self.serve_sealed_read(stream_id, target, *lease)).await
+            }
+            BlobEffect::OpenConnection { node_id } => Box::pin(self.open_connection(node_id)).await,
+            BlobEffect::SendMessage { stream_id, payload } => {
+                self.send_message(stream_id, payload).await
+            }
+            BlobEffect::ReadMessage { stream_id } => self.read_message(stream_id).await,
+            BlobEffect::CloseConnection { stream_id } => self.close_connection(stream_id).await,
+            BlobEffect::Replicate {
+                replication_id,
+                stream_id,
+                location,
+                keep_alive,
+            } => {
+                Box::pin(self.replicate_blob(replication_id, stream_id, location, keep_alive)).await
+            }
+            BlobEffect::HandleReplication {
+                replication_id,
+                stream_id,
+                resolved,
+                keep_alive,
+                object,
+            } => {
+                Box::pin(self.handle_incoming_replication(
+                    replication_id,
+                    stream_id,
+                    (resolved, object),
+                    keep_alive,
+                ))
+                .await
+            }
+            BlobEffect::ServeRead {
+                stream_id,
+                location,
+                expected_blake3,
+                range,
+            } => Box::pin(self.serve_read(stream_id, (location, expected_blake3, range))).await,
+            BlobEffect::ServeSourceRead {
+                stream_id,
+                access,
+                size,
+                expected_blake3,
+                fingerprint,
+            } => {
+                Box::pin(self.serve_source_read(
+                    stream_id,
+                    access,
+                    size,
+                    expected_blake3,
+                    fingerprint,
+                ))
+                .await
+            }
+            BlobEffect::ReceiveRead {
+                stream_id,
+                size,
+                expected_blake3,
+                range,
+            } => Box::pin(self.receive_read(stream_id, size, expected_blake3, range)).await,
+            BlobEffect::ReplicateLeased {
+                replication_id,
+                stream_id,
+                location,
+                lease,
+                regrant,
+                object,
+            } => {
+                let ids = (replication_id, stream_id);
+                let regrant = regrant.map(|plan| (*plan, object));
+                Box::pin(self.replicate_leased(ids, location, *lease, regrant)).await
+            }
+        }
+    }
+
+    pub async fn open_connection(&self, node_id: NodeId) -> BlobEvent {
+        match super::control_plane::with_timeout(
+            self.net.open_stream(node_id, Alpn::Bao),
+            self.connect_timeout(),
+            super::ControlPlaneKind::Connection,
+            "opening bao replication stream",
+        )
+        .await
+        {
+            Ok(Ok(stream)) => match self.add_connection(None, node_id, stream).await {
+                Ok(stream_id) => BlobEvent::ConnectionEstablished { stream_id },
+                Err(err) => BlobEvent::Error(err),
+            },
+            Ok(Err(err)) => BlobEvent::Error(BlobError::ConnectionFailed(err.to_string())),
+            Err(event) => event,
+        }
+    }
+
+    pub async fn send_message(&self, stream_id: Ulid, payload: Vec<u8>) -> BlobEvent {
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
+        };
+        let mut stream = stream.lock().await;
+        let sx = &mut stream.0;
+
+        if let Err(event) = super::control_plane::send_framed_message(
+            sx,
+            &payload,
+            self.io_timeout(),
+            "sending control-plane message",
+        )
+        .await
+        {
+            return event;
+        }
+
+        BlobEvent::MessageSent { stream_id }
+    }
+
+    pub async fn read_message(&self, stream_id: Ulid) -> BlobEvent {
+        let stream = match self.connection_handle(stream_id).await {
+            Ok(stream) => stream,
+            Err(event) => return event,
+        };
+        let mut stream = stream.lock().await;
+        let rx = &mut stream.1;
+
+        let buf = match super::control_plane::read_framed_message(
+            rx,
+            self.io_timeout(),
+            "reading control-plane message",
+        )
+        .await
+        {
+            Ok(payload) => payload,
+            Err(event) => return event,
+        };
+
+        BlobEvent::MessageReceived {
+            stream_id,
+            payload: buf,
+        }
+    }
+
+    pub async fn add_connection(
+        &self,
+        stream_id: Option<Ulid>,
+        peer: NodeId,
+        stream: BiStream,
+    ) -> Result<Ulid, BlobError> {
+        let slot = self
+            .connection_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                BlobError::ConnectionFailed("blob connection limit reached".to_string())
+            })?;
+        let mut connections = self.connections.lock().await;
+        if connections
+            .values()
+            .filter(|connection| connection.peer == peer)
+            .count()
+            >= PEER_CONNECTIONS
+        {
+            return Err(BlobError::ConnectionFailed(
+                "peer blob connection limit reached".to_string(),
+            ));
+        }
+        let stream_id = match stream_id {
+            Some(stream_id) => {
+                if stream_id.is_nil() {
+                    return Err(BlobError::ConnectionFailed(
+                        "refusing to register a nil stream id".to_string(),
+                    ));
+                }
+                if connections.contains_key(&stream_id) {
+                    return Err(BlobError::ConnectionFailed(format!(
+                        "stream id already registered: {stream_id}"
+                    )));
+                }
+                stream_id
+            }
+            None => {
+                let mut candidate = Ulid::generate();
+                while candidate.is_nil() || connections.contains_key(&candidate) {
+                    candidate = Ulid::generate();
+                }
+                candidate
+            }
+        };
+        connections.insert(
+            stream_id,
+            super::Connection {
+                peer,
+                stream: Arc::new(Mutex::new(stream)),
+                _slot: slot,
+            },
+        );
+        Ok(stream_id)
+    }
+
+    pub async fn close_connection(&self, stream_id: Ulid) -> BlobEvent {
+        let connection = self.connections.lock().await.remove(&stream_id);
+        let Some(connection) = connection else {
+            return BlobEvent::ConnectionClosed { stream_id };
+        };
+        tracing::debug!(stream_id = %stream_id, peer = %connection.peer, "closing blob connection");
+        let mut stream = connection.stream.lock().await;
+
+        _ = stream.0.finish();
+        _ = stream.1.stop(0u32.into());
+        BlobEvent::ConnectionClosed { stream_id }
+    }
+
+    pub(super) async fn connection_handle(
+        &self,
+        stream_id: Ulid,
+    ) -> Result<Arc<Mutex<BiStream>>, BlobEvent> {
+        self.connections
+            .lock()
+            .await
+            .get(&stream_id)
+            .map(|connection| connection.stream.clone())
+            .ok_or_else(|| {
+                BlobEvent::Error(BlobError::ReplicationRejected(
+                    "Stream not available".to_string(),
+                ))
+            })
+    }
+
+    async fn monitor_backend_status(&self) {
+        let mut interval = interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            self.probe_all_backends().await;
+            self.report_pressure();
+        }
+    }
+
+    async fn probe_all_backends(&self) {
+        for (_, backend) in self.registry.entries() {
+            let status = self.probe_backend_status(&backend.config).await;
+            *backend.status.write().await = status;
+        }
+    }
+
+    fn report_pressure(&self) {
+        let in_flight = self.inflight.load(Ordering::Relaxed);
+        let free_slots = self.transfer_slots.available_permits();
+        let free_reads = self.read_slots.available_permits();
+        let free_spools = self.spool_slots.available_permits();
+        if free_slots == 0 || free_reads == 0 || free_spools == 0 {
+            tracing::warn!(
+                event = "blob.slots.exhausted",
+                in_flight,
+                free_slots,
+                free_reads,
+                free_spools,
+                "A blob slot pool is fully busy"
+            );
+        } else if in_flight > 0 {
+            tracing::debug!(
+                event = "blob.pressure",
+                in_flight,
+                free_slots,
+                free_reads,
+                free_spools,
+                "Blob effects in flight"
+            );
+        }
+    }
+
+    async fn probe_backend_status(&self, backend: &BackendConfig) -> Status {
+        let backend_type = backend.backend_type.clone();
+        let mut config = backend.service_config.clone();
+        if !backend.root.trim().is_empty() {
+            config.insert("root".to_string(), backend.root.clone());
+        }
+        // S3 operators need a bucket; without a pinned one, probe the multipart
+        // bucket that startup guarantees.
+        if backend_type == aruna_core::structs::storage::blob::Backend::S3
+            && !config.contains_key("bucket")
+        {
+            match backend.multipart_bucket.as_deref() {
+                Some(bucket) => {
+                    config.insert("bucket".to_string(), bucket.to_string());
+                }
+                None => return Status::NotConfigured,
+            }
+        }
+
+        match init_operator(backend_type, config, &self.egress) {
+            Ok(operator) => {
+                let probe_timeout = self.handler_probe_timeout();
+                match timeout(probe_timeout, operator.check()).await {
+                    Ok(Ok(_)) => Status::Available,
+                    Ok(Err(_)) | Err(_) => Status::Unavailable,
+                }
+            }
+            Err(BlobError::OperatorCreationFailed(_)) => Status::NotConfigured,
+            Err(_) => Status::Unavailable,
+        }
+    }
+
+    fn handler_probe_timeout(&self) -> Duration {
+        self.registry
+            .timeouts()
+            .control_io_timeout
+            .min(Duration::from_secs(5))
+    }
+}
+
+fn source_error(error: StagingSourceError) -> StagingSourceEvent {
+    StagingSourceEvent::Error { error }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunks(sizes: &[usize]) -> BackendStream<Result<Bytes, StreamError>> {
+        let parts: Vec<Result<Bytes, std::io::Error>> = (sizes.iter())
+            .map(|size| Ok(Bytes::from(vec![7u8; *size])))
+            .collect();
+        BackendStream::new(futures::stream::iter(parts))
+    }
+
+    #[tokio::test]
+    async fn collect_stops_early() {
+        let whole = collect_stream(chunks(&[3, 3]), Some(6)).await;
+        let bytes = Ok(vec![7u8; 6]);
+        assert_eq!(whole, BlobEvent::StreamCollected { bytes });
+        let cut = collect_stream(chunks(&[3, 3, 3]), Some(5)).await;
+        assert_eq!(cut, BlobEvent::StreamTooLarge { limit: 5 });
+        let open = collect_stream(chunks(&[4, 4]), None).await;
+        let bytes = Ok(vec![7u8; 8]);
+        assert_eq!(open, BlobEvent::StreamCollected { bytes });
+        // One chunk far past the limit is refused as it arrives.
+        let large = collect_stream(chunks(&[2, 1 << 20]), Some(5)).await;
+        assert_eq!(large, BlobEvent::StreamTooLarge { limit: 5 });
+    }
+}

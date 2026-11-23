@@ -1,0 +1,168 @@
+//! Applies realm config events for nodes, OIDC providers, settings and token revocations.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use crate::reducer::paths::{
+    CONFIG_COMPUTE_PATH, CONFIG_DESCRIPTION_PATH, CONFIG_EMAIL_PATH, CONFIG_FEDERATION_PATH,
+    CONFIG_MERGE_PATH, CONFIG_POLICIES_PATH, CONFIG_PORTAL_PATH, CONFIG_QUOTA_PATH,
+    CONFIG_REPLICAS_PATH, compute_value, federation_value, node_kind_value, node_name_path,
+    node_place_path, oidc_provider_value, plugin_entry_path, plugin_install_path, policies_value,
+    portal_value, publisher_cutoffs_path, quota_value, replicas_value, secret_info_path,
+    vault_entry_path,
+};
+
+impl AdminDocumentState {
+    pub(super) fn apply_config(
+        &mut self,
+        event: &AdminDocumentEvent,
+        realm_id: &RealmId,
+    ) -> Result<AdminApplyStatus, AdminDocumentError> {
+        match &event.op {
+            AdminDocumentOperation::ConfigNodeEnsured { node_id, kind } => {
+                self.apply_config_node(event, node_id, Some(node_kind_value(kind)));
+                if matches!(kind, RealmNodeKind::Server | RealmNodeKind::Management) {
+                    self.record_membership(event, node_id, false);
+                }
+            }
+            AdminDocumentOperation::ConfigNodeRemoved { node_id, cutoffs } => {
+                let mut sorted = cutoffs.clone();
+                sorted.sort();
+                sorted.dedup_by_key(|cutoff| cutoff.set_id);
+                if sorted.len() != cutoffs.len() || sorted.len() > MAX_CUTOFFS {
+                    return Err(AdminDocumentError::InvalidCutoffs);
+                }
+                self.apply_config_node(event, node_id, None);
+                self.record_membership(event, node_id, true);
+                let value = serde_json::to_string(&sorted)
+                    .map_err(|_| AdminDocumentError::InvalidCutoffs)?;
+                self.apply_config_setting(event, &publisher_cutoffs_path(node_id), value);
+            }
+            AdminDocumentOperation::OidcProviderUpserted { provider } => {
+                self.apply_oidc_provider(event, &provider.id, Some(oidc_provider_value(provider)));
+            }
+            AdminDocumentOperation::OidcProviderRemoved { provider_id } => {
+                self.apply_oidc_provider(event, provider_id, None);
+            }
+            AdminDocumentOperation::ConfigSettingsSet {
+                metadata_replication,
+                discovery,
+            } => self.apply_config_settings(event, metadata_replication, discovery),
+            AdminDocumentOperation::ConfigDescriptionSet { description } => {
+                self.apply_config_setting(event, CONFIG_DESCRIPTION_PATH, description.clone());
+            }
+            AdminDocumentOperation::ConfigQuotaSet { quota } => {
+                self.apply_config_setting(event, CONFIG_QUOTA_PATH, quota_value(quota));
+            }
+            AdminDocumentOperation::ConfigComputeSet { compute } => {
+                self.apply_config_setting(event, CONFIG_COMPUTE_PATH, compute_value(compute));
+            }
+            AdminDocumentOperation::ConfigFederationSet { settings } => {
+                self.apply_config_setting(
+                    event,
+                    CONFIG_FEDERATION_PATH,
+                    federation_value(settings),
+                );
+            }
+            AdminDocumentOperation::ConfigPortalSet { features } => {
+                self.apply_config_setting(event, CONFIG_PORTAL_PATH, portal_value(features));
+            }
+            AdminDocumentOperation::MergeCoordinatorSet { node_id } => {
+                self.apply_config_setting(event, CONFIG_MERGE_PATH, node_id.to_string());
+            }
+            AdminDocumentOperation::ConfigVaultSet { entry, record } => {
+                if record.as_ref().is_some_and(|record| record.entry != *entry) {
+                    return Err(AdminDocumentError::InvalidVaultRecord);
+                }
+                let value = (record.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
+                self.apply_value(event, vault_entry_path(entry), value);
+            }
+            AdminDocumentOperation::ConfigSecretSet { name, info } => {
+                if info.as_ref().is_some_and(|info| info.name != *name) {
+                    return Err(AdminDocumentError::InvalidVaultRecord);
+                }
+                let value = (info.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidVaultRecord)?;
+                self.apply_value(event, secret_info_path(name), value);
+            }
+            AdminDocumentOperation::ConfigPluginSet {
+                name,
+                version,
+                plugin,
+            } => {
+                let matching = |plugin: &crate::plugins::PublishedPlugin| {
+                    plugin.valid() && plugin.name == *name && plugin.version == *version
+                };
+                if plugin.as_ref().is_some_and(|plugin| !matching(plugin)) {
+                    return Err(AdminDocumentError::InvalidPlugin);
+                }
+                let value = (plugin.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidPlugin)?;
+                self.apply_value(event, plugin_entry_path(name, version), value);
+            }
+            AdminDocumentOperation::ConfigInstallSet {
+                install_id,
+                install,
+            } => {
+                let matching = |install: &crate::plugin_installs::PluginInstall| {
+                    install.valid() && install.install_id == *install_id
+                };
+                if install.as_ref().is_some_and(|install| !matching(install)) {
+                    return Err(AdminDocumentError::InvalidInstall);
+                }
+                let value = (install.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidInstall)?;
+                self.apply_value(event, plugin_install_path(install_id), value);
+            }
+            AdminDocumentOperation::ConfigEmailSet { profile } => {
+                if profile.as_ref().is_some_and(|profile| !profile.valid()) {
+                    return Err(AdminDocumentError::InvalidEmailProfile);
+                }
+                let value = (profile.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidEmailProfile)?;
+                self.apply_value(event, CONFIG_EMAIL_PATH.to_string(), value);
+            }
+            AdminDocumentOperation::ConfigReplicasSet { replicas } => {
+                let value = replicas_value(replicas);
+                self.apply_config_setting(event, CONFIG_REPLICAS_PATH, value);
+            }
+            AdminDocumentOperation::NodeNameSet {
+                node_id,
+                display_name,
+            } => self.apply_value(event, node_name_path(node_id), display_name.clone()),
+            AdminDocumentOperation::NodePlaceSet { node_id, place } => {
+                if place.as_ref().is_some_and(|place| !place.valid()) {
+                    return Err(AdminDocumentError::InvalidNodePlace);
+                }
+                let value = (place.as_ref().map(serde_json::to_string))
+                    .transpose()
+                    .map_err(|_| AdminDocumentError::InvalidNodePlace)?;
+                self.apply_value(event, node_place_path(node_id), value);
+            }
+            AdminDocumentOperation::ConfigPoliciesSet { policies } => {
+                self.apply_config_setting(event, CONFIG_POLICIES_PATH, policies_value(policies));
+            }
+            AdminDocumentOperation::ConfigTokenRevoked {
+                token_hash,
+                expires_at,
+                token_owner,
+            } => {
+                if !valid_token_hash(token_hash) {
+                    return Err(AdminDocumentError::InvalidTokenHash);
+                }
+                let status =
+                    self.apply_revocation_full(event, token_hash, *expires_at, *token_owner);
+                self.refresh_revocation_expiry();
+                return Ok(status);
+            }
+            _ => return self.apply_placement(event, realm_id),
+        }
+        Ok(AdminApplyStatus::Applied)
+    }
+}

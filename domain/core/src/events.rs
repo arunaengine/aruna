@@ -1,0 +1,1368 @@
+//! Declares the events adapters return for each effect, one variant group per domain.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::compute::{SecretBytes, SharedSecret};
+use crate::effects::{
+    FrameBoundsError, JOB_PAGE_BYTES, JobRecordFrame, MAX_RECORD_PAGE, encoded_len,
+};
+use crate::errors::{BlobError, SourceResolutionError, StagingSourceError};
+use crate::key_index::IndexEvent;
+use crate::metadata::MetadataEvent;
+use crate::node::vault::VaultEntry;
+use crate::outbound::OutboundEvent;
+use crate::stream::{BackendStream, StreamError as BackendStreamError};
+use crate::structs::execution::source_access::{
+    ListCursor, ResolvedSourceAccess, ResolvedSourceConnector, SourceEntry, SourceMetadata,
+    SourceStats,
+};
+use crate::structs::identity::realm::RealmId;
+use crate::structs::identity::user::vault::VaultRecords;
+use crate::structs::placement::policy::document::{PlacementPolicyDocument, PolicyPublication};
+use crate::structs::placement::policy::{MAX_REF_INPUT, PlacementDecision};
+use crate::structs::storage::blob::{BackendLocation, HiddenBlobEntry};
+use crate::structs::storage::encryption::{
+    BucketKeyRef, KeyTicket, ReadLease, SealedCopy, UnlockStatus,
+};
+use crate::structs::storage::multipart::{BackendUpload, PartPiece, WorkingShare};
+use crate::structs::storage::routing::GroupRoutingInputs;
+use crate::{
+    document::DocumentNetEvent,
+    errors::{AuthorizationError, DhtError, StorageError, StreamError},
+    id::{DhtKeyId, NodeId},
+    jobs::JobResponse,
+    task::TaskEvent,
+    types::{Key, KeySpace, TxnId, Value},
+};
+use bytes::Bytes;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use ulid::Ulid;
+
+#[derive(Debug, PartialEq)]
+pub enum Event {
+    Blob(Box<BlobEvent>),
+    StagingSource(Box<StagingSourceEvent>),
+    LocalFile(LocalFileEvent),
+    Storage(StorageEvent),
+    Net(NetEvent),
+    Metadata(MetadataEvent),
+    SubOperation(SubOperationEvent),
+    Task(TaskEvent),
+    Index(IndexEvent),
+    Group(GroupEvent),
+    Session(Box<crate::compute::session::SessionAnswer>),
+    Outbound(OutboundEvent),
+    Plugin(crate::plugins::PluginEvent),
+    /// Answers `Effect::Delay` once its time passed.
+    Delayed,
+    /// The adapter of this effect kind did not answer within the runner's hang limit.
+    Hung {
+        effect: &'static str,
+    },
+    /// The typed outcome of a child made with `IoCall::child`; never persisted.
+    Child(crate::calls::ChildOutcome),
+    /// Answers `Effect::Compute`; never persisted.
+    Compute(Box<crate::compute::effect::ComputeAnswer>),
+    /// The answer of a running job's host; never persisted.
+    Job(crate::jobs::JobEvent),
+    /// Answers `Effect::Git`; never persisted.
+    Git(Box<crate::git::GitAnswer>),
+}
+
+impl Event {
+    /// Boxes a blob event so `Event` stays compact on non-blob paths.
+    pub fn blob(event: BlobEvent) -> Self {
+        Self::Blob(Box::new(event))
+    }
+
+    /// Boxes a staging-source event so `Event` stays compact on other paths.
+    pub fn staging(event: StagingSourceEvent) -> Self {
+        Self::StagingSource(Box::new(event))
+    }
+
+    /// Borrows a blob event when this event is one.
+    pub fn as_blob(&self) -> Option<&BlobEvent> {
+        match self {
+            Self::Blob(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    /// Borrows a staging-source event when this event is one.
+    pub fn as_staging(&self) -> Option<&StagingSourceEvent> {
+        match self {
+            Self::StagingSource(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    /// Unboxes a blob event, or returns the event unchanged.
+    pub fn into_blob(self) -> Result<BlobEvent, Self> {
+        match self {
+            Self::Blob(event) => Ok(*event),
+            other => Err(other),
+        }
+    }
+
+    /// Unboxes a staging-source event, or returns the event unchanged.
+    pub fn into_staging(self) -> Result<StagingSourceEvent, Self> {
+        match self {
+            Self::StagingSource(event) => Ok(*event),
+            other => Err(other),
+        }
+    }
+}
+
+impl From<BlobEvent> for Event {
+    fn from(event: BlobEvent) -> Self {
+        Self::blob(event)
+    }
+}
+
+impl From<StagingSourceEvent> for Event {
+    fn from(event: StagingSourceEvent) -> Self {
+        Self::staging(event)
+    }
+}
+
+/// Results of a [`crate::effects::EffectGroup`]; never persisted.
+#[derive(Debug, PartialEq)]
+pub enum GroupEvent {
+    /// Every member result of an all-at-once group, in emission order.
+    Finished { results: Vec<GroupResult> },
+    /// One finished window member; `index` counts the window's members in emission order.
+    Member { index: usize, result: GroupResult },
+    /// The window has no running or waiting member left.
+    Closed,
+}
+
+/// What one group member returned.
+#[derive(Debug, PartialEq)]
+pub enum GroupResult {
+    Done(Box<Event>),
+    /// The group deadline passed before the member finished.
+    Unfinished,
+    /// The member is a storage transaction effect or a group, which a group cannot run.
+    Refused,
+}
+
+impl GroupResult {
+    /// The result of a finished child member, or `None` for any other member or result type.
+    pub fn child_outcome<T: 'static, E: 'static>(self) -> Option<Result<T, E>> {
+        let GroupResult::Done(event) = self else {
+            return None;
+        };
+        match *event {
+            Event::Child(outcome) => outcome.take(),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SubOperationEvent {
+    GroupWritten {
+        result: Result<(), crate::structs::identity::group_delete::GroupWriteError>,
+    },
+    DepthLimitExceeded {
+        max_depth: usize,
+    },
+    AuthorizationResult {
+        allowed: Result<bool, AuthorizationError>,
+    },
+    DocumentSyncResult {
+        result: Result<(), String>,
+    },
+    SourceConnectorResolved {
+        result: Box<Result<ResolvedSourceConnector, SourceResolutionError>>,
+    },
+    VersionAccessResolved {
+        result: Box<Result<ResolvedSourceAccess, SourceResolutionError>>,
+    },
+    LiveReplicationQueued {
+        result: Result<(), String>,
+    },
+    RefreshQueued {
+        result: Result<(), String>,
+    },
+    BucketCreated {
+        result: Result<(), String>,
+    },
+    GroupRoutingLoaded {
+        result: Box<Result<GroupRoutingInputs, String>>,
+    },
+    NotificationsEmitted,
+    /// A share link's access log entry and use counters were written.
+    ShareLogged {
+        result: Result<(), String>,
+    },
+    TokenRevoked {
+        result: Result<(), String>,
+    },
+    UserUpdated {
+        result: Result<(), String>,
+    },
+    /// BLAKE3 digests of the saved payloads of a user's vault heads; empty without a vault.
+    VaultHeld {
+        result: Result<Vec<[u8; 32]>, String>,
+    },
+    /// The emission stored no notification; its failure as text.
+    NotificationsFailed {
+        reason: String,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum BlobEvent {
+    WriteFinished {
+        location: BackendLocation,
+    },
+    ReadFinished {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+        stream_size: u64,
+    },
+    DeleteFinished,
+    ReservationReleased {
+        id: Ulid,
+    },
+    /// The bytes of a collected stream, or why it broke off.
+    StreamCollected {
+        bytes: Result<Vec<u8>, String>,
+    },
+    /// Whether the reservation is settled; `false` keeps it for a later pass.
+    ReservationReconciled {
+        done: bool,
+    },
+    HiddenSpooled {
+        location: BackendLocation,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    HiddenRead {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+        stream_size: u64,
+    },
+    /// The hashes of all spooled bytes and a stream of the requested range of them.
+    LocalSpooled {
+        hashes: std::collections::HashMap<String, Vec<u8>>,
+        size: u64,
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    HiddenDeleted,
+    /// The stream of a `BlobEffect::PinRead`, which holds the copy until it ends or drops.
+    PinnedRead {
+        blob: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    ReadHeld {
+        held: bool,
+    },
+    HiddenListed {
+        entries: Vec<HiddenBlobEntry>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    ConnectionEstablished {
+        stream_id: Ulid,
+    },
+    ConnectionClosed {
+        stream_id: Ulid,
+    },
+    MessageReceived {
+        stream_id: Ulid,
+        payload: Vec<u8>,
+    },
+    MessageSent {
+        stream_id: Ulid,
+    },
+    ReplicationFinished {
+        location: BackendLocation,
+    },
+    ReadServed {
+        stream_id: Ulid,
+    },
+    GroupBackendChecked,
+    UploadOpened {
+        backend_upload: Option<BackendUpload>,
+    },
+    /// An in-place part: its location is partial and names the provider upload's target.
+    PartWritten {
+        location: BackendLocation,
+        backend_etag: String,
+    },
+    UploadAborted,
+    BucketKeyGenerated {
+        public_key: [u8; 32],
+        private_key: SharedSecret,
+    },
+    CopiesSealed {
+        copies: Vec<SealedCopy>,
+    },
+    KeyPrepared {
+        ticket: KeyTicket,
+    },
+    KeyActivated {
+        status: UnlockStatus,
+    },
+    KeyDiscarded {
+        ticket: KeyTicket,
+    },
+    KeyStatus {
+        generations: Vec<UnlockStatus>,
+    },
+    KeyExtended {
+        status: UnlockStatus,
+    },
+    /// The generations whose keys were removed; already locked buckets report none.
+    KeyLocked {
+        locked: Vec<KeyTicket>,
+        sequence: Ulid,
+        live: Option<Box<UnlockStatus>>,
+    },
+    ReadAdmitted {
+        lease: ReadLease,
+    },
+    Error(BlobError),
+    /// The new copy of a rewrite; its reservation is held until released.
+    CopyRewritten {
+        location: BackendLocation,
+    },
+    /// A part sealed as a Pithos piece; the location holds the original size and checksums.
+    PieceWritten {
+        location: BackendLocation,
+        piece: PartPiece,
+    },
+    UnlockedKeyRead {
+        key: BucketKeyRef,
+        private_key: SharedSecret,
+    },
+    /// The raw hashes and size of the verified plaintext of a sealed copy.
+    ArchiveHashed {
+        hashes: std::collections::HashMap<String, Vec<u8>>,
+        size: u64,
+    },
+    /// The working set of one composition; the completion keeps it until composition ends.
+    ComposeReserved {
+        share: WorkingShare,
+    },
+    Abe(Box<crate::structs::storage::abe::AbeEvent>),
+    /// One listing page; `next` is the `start_after` of the following page.
+    ExternalListed {
+        objects: Vec<crate::structs::storage::backend_import::ExternalObject>,
+        next: Option<String>,
+    },
+    /// `version` names the bytes read on a backend that keeps versions; `etag` is the
+    /// backend's ETag of the bytes read, when it reports one.
+    ExternalHashed {
+        location: BackendLocation,
+        version: Option<String>,
+        etag: Option<String>,
+    },
+    /// Whether a file is at the path, and its version id on a backend that keeps versions.
+    PlainStat {
+        exists: bool,
+        version: Option<String>,
+    },
+    /// The metadata of an external file; its location has no hashes, and is `None` without a
+    /// file at the path.
+    ExternalStat {
+        location: Option<BackendLocation>,
+        version: Option<String>,
+        etag: Option<String>,
+    },
+    CopyStat {
+        exists: bool,
+    },
+    /// `version` is the backend's id of the bytes written, on a backend that keeps versions;
+    /// `etag` is the backend's ETag of them, when it reports one.
+    PlainWritten {
+        location: BackendLocation,
+        version: Option<String>,
+        etag: Option<String>,
+    },
+    /// The bucket is ready; `created` when Aruna created it.
+    BucketReady {
+        created: bool,
+    },
+    /// `writable` says whether a test write and delete worked; `None` for a missing bucket.
+    BucketExists {
+        exists: bool,
+        writable: Option<bool>,
+    },
+    /// `deleted` is false when the bucket still held objects and stays.
+    BucketDeleted {
+        deleted: bool,
+    },
+    /// The answer to a repository, provider or stored artifact call.
+    Remote(
+        Result<crate::repository::remote::RemoteAnswer, crate::repository::remote::RemoteFailure>,
+    ),
+    /// A collected stream went past the byte limit its read set; the rest was not read.
+    StreamTooLarge {
+        limit: u64,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StagingSourceEvent {
+    CheckResult,
+    HeadResult {
+        metadata: SourceMetadata,
+    },
+    ListResult {
+        entries: Vec<SourceEntry>,
+        /// `None` once the listing is exhausted or reached its stop key.
+        next_cursor: Option<ListCursor>,
+    },
+    ReadResult {
+        metadata: SourceMetadata,
+        stream: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    HealthResult {
+        stats: Vec<SourceStats>,
+        /// Uniformly random, so the operation can pick among sources deterministically.
+        draw: u64,
+    },
+    Error {
+        error: StagingSourceError,
+    },
+}
+
+/// Why the adapter refused to touch a file on the owner's disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalFileRefusal {
+    /// The target no longer carries the bytes the guard named.
+    Drifted,
+    /// The target exists and the guard forbids replacing anything.
+    Exists,
+    Missing,
+    /// The path resolved outside the folder root.
+    Escaped,
+    /// The target is not a regular file, so no guard can vouch for its bytes.
+    NotRegular,
+}
+
+/// Reply to a [`crate::effects::LocalFileEffect`]. A refusal is an outcome, not
+/// a fault: the operation records it and reports the entry to the owner.
+#[derive(Debug, PartialEq)]
+pub enum LocalFileEvent {
+    Written {
+        fingerprint: String,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    /// The incoming bytes landed beside the file under this relative path.
+    Copied {
+        relative: String,
+        fingerprint: String,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    Moved {
+        to: String,
+    },
+    Hashed {
+        fingerprint: String,
+        blake3: [u8; 32],
+        size: u64,
+    },
+    Refused {
+        reason: LocalFileRefusal,
+    },
+    Error {
+        message: String,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StorageEvent {
+    TransactionStarted {
+        txn_id: TxnId,
+    },
+    /// `sequence` orders this store's commits: a write commit takes the next number, and a
+    /// read-only one answers the number of the last write commit before it.
+    TransactionCommitted {
+        txn_id: TxnId,
+        sequence: u64,
+    },
+    TransactionAborted {
+        txn_id: TxnId,
+    },
+    ReadResult {
+        key: Key,
+        value: Option<Value>,
+    },
+    /// Values in the same order as the requested reads.
+    BatchReadResult {
+        values: Vec<(Key, Option<Value>)>,
+    },
+    WriteResult {
+        key: Key,
+    },
+    BatchWriteResult {
+        entries: Vec<(KeySpace, Key)>,
+    },
+    DeleteResult {
+        key: Key,
+    },
+    BatchDeleteResult {
+        entries: Vec<(KeySpace, Key)>,
+    },
+    SyncAllFinished,
+    /// Result of an iteration request with optional pagination cursor.
+    IterResult {
+        values: Vec<(Key, Value)>,
+        next_start_after: Option<Key>,
+    },
+    /// The opened node vault record of `entry`, if it exists.
+    VaultResult {
+        entry: VaultEntry,
+        secret: Option<SecretBytes>,
+    },
+    Error {
+        error: StorageError,
+    },
+    /// The opened realm secret, or why this node could not open it.
+    RealmOpened {
+        result: Result<SecretBytes, crate::realm_vault::RealmVaultError>,
+    },
+    /// The compiled policy sets, in the order the effect named them.
+    PoliciesCompiled(crate::request_policy::CompiledSets),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NetEvent {
+    Dht(DhtEvent),
+    DocumentSync(DocumentNetEvent),
+    Stream(StreamEvent),
+    JobControl(JobControlEvent),
+    /// Milliseconds since each asked node's last heartbeat, or since this node started.
+    HeartbeatSilence(std::collections::BTreeMap<NodeId, u64>),
+    PolicyFetch(PolicyFetchEvent),
+    PolicySign(PolicySignEvent),
+    VaultFetch(VaultFetchEvent),
+    VaultSign(VaultSignEvent),
+    SnapshotSign(SnapshotSignEvent),
+    StatementSign(StatementSignEvent),
+    ExecutionSign(ExecutionSignEvent),
+    Error(NetError),
+    /// The holder's answer frame, or why none came.
+    Notification(
+        Result<Box<crate::structs::execution::notification::NotificationTransportMessage>, String>,
+    ),
+    InboxWoken,
+    /// The last contact of each asked peer this node saw, in unix milliseconds.
+    PeerContacts(std::collections::BTreeMap<NodeId, u64>),
+    /// This node's id, or `None` on a node without a net handle.
+    LocalNode(Option<crate::id::NodeId>),
+    /// The realm this node serves, `None` without a network.
+    LocalRealm(Option<crate::structs::identity::realm::RealmId>),
+    /// Whether the issuer key is a valid public key; `false` also when it went unchecked.
+    IssuerKey(bool),
+    /// This node's id and the holders its watch interest matches; `None` without a net handle.
+    WatchHolders(Option<(crate::id::NodeId, Vec<crate::id::NodeId>)>),
+    Heartbeat(crate::heartbeat::HeartbeatEvent),
+    MetadataAnswer(Box<MetadataAnswer>),
+    /// Whether the peer set follows the configuration, or why it does not.
+    DocumentPeers(Result<(), String>),
+    /// The version a granted read reached, or why it did not.
+    GrantedRead(
+        Result<Box<crate::native_reference::GrantedBody>, crate::errors::StagingSourceError>,
+    ),
+    /// The version a delegated read reached, or why it did not.
+    DelegatedRead(
+        Result<Box<crate::native_reference::DelegatedBody>, crate::errors::StagingSourceError>,
+    ),
+    /// The signed read grant, or `None` when this node cannot sign it.
+    GrantSign(Option<Box<crate::structs::storage::read_grant::SignedGrant>>),
+    /// The signed delegation, or `None` when this node cannot sign it.
+    DelegationSign(
+        Option<Box<crate::structs::storage::distribution::delegation::SignedDelegation>>,
+    ),
+    /// The holder is skipped in holder choices for a while.
+    HolderAvoided,
+    /// The cursor signature, or `None` when this node cannot sign the cursor.
+    CursorSigned(Option<iroh::Signature>),
+    /// The federation signature, or why this node cannot make it.
+    FederationSigned(Result<crate::federation::FederationSignature, String>),
+    /// The opened token, why it does not open, or `None` when this node holds no credential key.
+    CredentialOpened(Option<Result<crate::compute::Secret, String>>),
+    /// The relay signature of an admin event, or why this node does not sign it.
+    AdminSigned(Result<iroh::Signature, String>),
+    /// The sealed position, or `None` when it could not be sealed.
+    PositionSealed(Option<Vec<u8>>),
+    /// The opened position, or `None` when this process did not seal it.
+    PositionOpened(Option<Vec<u8>>),
+    /// The drawn secret; its `Debug` print never shows it.
+    SecretDrawn(crate::compute::Secret),
+    /// The peer's last-contact time is refreshed.
+    PeerContact,
+    Shard(Box<ShardNetEvent>),
+    /// Whether sync topics took the requested peers.
+    TopicPeers(Result<(), TopicPeerError>),
+    /// The asked peers a topic lacks, `None` without the topic's state here, or why it is
+    /// unreadable.
+    MissingTopicPeers(Result<Option<Vec<crate::id::NodeId>>, String>),
+    ConfigCatchUp(CatchUpEvent),
+    /// This node's signature over a group deletion plan.
+    DeletePlanSigned(Result<crate::structs::identity::group_delete::GroupDeleteProof, String>),
+    /// This node's signature over a count relay.
+    CountRelaySigned(Result<iroh::Signature, String>),
+    /// A local signal or change was taken; nothing is read back.
+    Recorded,
+}
+
+/// What peers said about topics this node lacks.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GenesisProbe {
+    /// Topics at least one reached peer holds.
+    pub known_co_holder: std::collections::BTreeSet<irokle::TopicId>,
+    /// Topics a reached peer may hold; creating them could fork the topic.
+    pub unconfirmed: std::collections::BTreeSet<irokle::TopicId>,
+    pub unreachable: Vec<NodeId>,
+}
+
+/// The answer to a [`crate::effects::ShardNetEffect`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum ShardNetEvent {
+    /// This node has no net transport.
+    NoNetwork,
+    Existing(std::collections::BTreeSet<irokle::TopicId>),
+    /// How many topics could not be reopened.
+    Reopened {
+        failed: usize,
+    },
+    Closed(Result<bool, String>),
+    Outcome(Result<(), String>),
+    Probed(GenesisProbe),
+    /// How the fetch of a pull ended, for this node and realm to reconcile and apply.
+    Pulled {
+        node_id: NodeId,
+        realm_id: RealmId,
+        sync: Box<DocumentNetEvent>,
+    },
+    Flag(bool),
+    Facts {
+        holder: NodeId,
+        digest: [u8; 32],
+        cursor: Vec<u8>,
+    },
+    Root(Result<[u8; 32], String>),
+    Proof(crate::structs::placement::transition::CompletionProof),
+    Manifest(Result<Box<crate::document::ShardManifest>, String>),
+}
+
+/// The answer to one realm config catch-up step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatchUpEvent {
+    /// The round ran to its end; the topic's stored clock after it is the round target.
+    Counted { target: irokle::ActorClock },
+    /// The round stopped at its page budget (`WouldBlock`), so it counts for nothing.
+    Partial,
+    /// The management node did not answer, or the round failed.
+    Failed(String),
+    /// Whether the applied cursor covers every round target.
+    Applied { covered: bool },
+}
+
+/// Why sync topics did not take the requested peers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopicPeerError {
+    NoNetwork,
+    Failed(String),
+}
+
+/// Reply to a [`crate::effects::MetadataRequestEffect`]: the encoded answer or why there is none,
+/// and how long the request took, so one deadline can span the requests to several peers.
+#[derive(PartialEq)]
+pub struct MetadataAnswer {
+    pub peer: NodeId,
+    pub elapsed: Duration,
+    pub result: Result<Vec<u8>, PeerRequestError>,
+}
+
+/// Shows the reply size only: a reply frame can carry an opened secret.
+impl std::fmt::Debug for MetadataAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut shown = f.debug_struct("MetadataAnswer");
+        shown
+            .field("peer", &self.peer)
+            .field("elapsed", &self.elapsed);
+        match &self.result {
+            Ok(frame) => shown.field("frame_bytes", &frame.len()),
+            Err(error) => shown.field("error", error),
+        };
+        shown.finish()
+    }
+}
+
+/// Why a forwarded token gives a peer no caller.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PeerAuthRefusal {
+    #[error("the forwarded token is not accepted")]
+    Unauthorized,
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+impl From<crate::calls::IoError> for PeerAuthRefusal {
+    fn from(error: crate::calls::IoError) -> Self {
+        Self::Unavailable(error.to_string())
+    }
+}
+
+/// Why a peer request has no answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRequestError {
+    /// The request failed before an answer arrived; the peer may have acted on it.
+    Failed(crate::metadata::MetadataError),
+    /// The request never left this node, so asking again or elsewhere replays nothing.
+    NotSent(crate::metadata::MetadataError),
+    /// No answer arrived within the request's timeout.
+    TimedOut,
+}
+
+/// Reply to a [`crate::effects::NetEffect::PolicySign`]. The adapter signs only
+/// a claim naming this node, so no operation can mint foreign provenance.
+#[derive(Debug, PartialEq)]
+pub enum PolicySignEvent {
+    Signed(Box<PolicyPublication>),
+    Unavailable(String),
+}
+
+/// Result of a policy fetch from the holders of a [`crate::effects::PolicyFetchEffect`]. A
+/// fetched document is a candidate only; the operation verifies its definition and publication
+/// authority before it may be cached or matched against a subject.
+#[derive(Debug, PartialEq)]
+pub enum PolicyFetchEvent {
+    Fetched {
+        publisher: NodeId,
+        document: Box<PlacementPolicyDocument>,
+    },
+    /// Every reached holder answered without the document.
+    NotFound,
+    /// No holder answered, so the miss is an availability hint, never a denial.
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::VaultSign`]: the same records, signed. The
+/// adapter signs only records naming this node, so no operation can mint another origin.
+#[derive(Debug, PartialEq)]
+pub enum VaultSignEvent {
+    Signed(Box<VaultRecords>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::SnapshotSign`]. The adapter signs only a snapshot
+/// whose set names this node as publisher.
+#[derive(Debug, PartialEq)]
+pub enum SnapshotSignEvent {
+    Signed(Box<crate::structs::storage::distribution::snapshot::SignedSnapshot>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::StatementSign`]. The adapter signs only a claim
+/// that names this node as signer.
+#[derive(Debug, PartialEq)]
+pub enum StatementSignEvent {
+    Signed(Box<crate::structs::storage::distribution::statement::SignedStatement>),
+    Unavailable(String),
+}
+
+/// Reply to a [`crate::effects::NetEffect::ExecutionSign`]. The adapter signs only a claim
+/// that names this node as publisher.
+#[derive(Debug, PartialEq)]
+pub enum ExecutionSignEvent {
+    Signed(Box<crate::structs::execution::job::family::JobRecordEnvelope>),
+    Unavailable(String),
+}
+
+/// Result of a vault fetch from the holders of a [`crate::effects::VaultFetchEffect`].
+#[derive(Debug, PartialEq)]
+pub enum VaultFetchEvent {
+    Fetched {
+        holder: NodeId,
+        records: Box<VaultRecords>,
+    },
+    /// Every reached holder answered without records.
+    NotFound,
+    /// A holder refused the forwarded caller.
+    Denied,
+    /// No holder answered, so the miss is an availability hint, never a denial.
+    Unavailable(String),
+}
+
+/// Bounded page of immutable job-family records, oldest key first. Its bounds
+/// hold for a decoded page too, so a holder cannot answer with an unbounded one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<JobRecordFrame>")]
+pub struct JobRecordPage(Vec<JobRecordFrame>);
+
+impl JobRecordPage {
+    pub fn new(records: Vec<JobRecordFrame>) -> Result<Self, FrameBoundsError> {
+        if records.len() > MAX_RECORD_PAGE {
+            return Err(FrameBoundsError::RecordCount);
+        }
+        if encoded_len(&records)? > JOB_PAGE_BYTES {
+            return Err(FrameBoundsError::PageBytes);
+        }
+        Ok(Self(records))
+    }
+
+    /// Rejects an oversized frame before it is decoded, so a peer cannot force
+    /// the allocation of a page it is not allowed to send.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, FrameBoundsError> {
+        if bytes.len() > JOB_PAGE_BYTES {
+            return Err(FrameBoundsError::PageBytes);
+        }
+        Self::new(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameBoundsError> {
+        Ok(postcard::to_allocvec(&self.0)?)
+    }
+
+    pub fn records(&self) -> &[JobRecordFrame] {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> Vec<JobRecordFrame> {
+        self.0
+    }
+}
+
+impl TryFrom<Vec<JobRecordFrame>> for JobRecordPage {
+    type Error = FrameBoundsError;
+
+    fn try_from(records: Vec<JobRecordFrame>) -> Result<Self, Self::Error> {
+        Self::new(records)
+    }
+}
+
+/// Why a holder refused an append-only job record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobRecordRejection {
+    /// The responder does not hold that family placement; resolve holders again.
+    NotHolder,
+    /// A record with the same key and different bytes is already retained.
+    Conflict,
+    /// The publisher signature or the kind's exact author rule failed.
+    Unauthorized,
+    /// The record failed contract validation, such as budget or chain rules.
+    Invalid,
+    /// The responder holds no accepted spec of the family; offer the record again with its spec.
+    SpecNeeded,
+    /// The record's spec is older than the horizon, so the family can never start here.
+    StaleFamily,
+    /// The record's spec belongs to a family the responder pruned.
+    FamilyPruned,
+}
+
+/// The placement detail one decline may carry. Decoding rejects an oversized
+/// ref or id list and an `Allowed` decision, so a peer can neither force an
+/// unbounded allocation nor answer a refusal with a grant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "PlacementDecision")]
+pub struct DeclinedPolicy(PlacementDecision);
+
+impl DeclinedPolicy {
+    pub fn new(decision: PlacementDecision) -> Result<Self, FrameBoundsError> {
+        let listed = match &decision {
+            PlacementDecision::Allowed => return Err(FrameBoundsError::RecordKind),
+            PlacementDecision::Required { refs } | PlacementDecision::DigestMismatch { refs } => {
+                refs.len()
+            }
+            PlacementDecision::Unavailable { policy_ids }
+            | PlacementDecision::Invalid { policy_ids }
+            | PlacementDecision::Denied { policy_ids } => policy_ids.len(),
+            PlacementDecision::InvalidInput { .. } => 0,
+        };
+        match listed <= MAX_REF_INPUT {
+            true => Ok(Self(decision)),
+            false => Err(FrameBoundsError::RecordCount),
+        }
+    }
+
+    pub fn decision(&self) -> &PlacementDecision {
+        &self.0
+    }
+}
+
+impl TryFrom<PlacementDecision> for DeclinedPolicy {
+    type Error = FrameBoundsError;
+
+    fn try_from(decision: PlacementDecision) -> Result<Self, Self::Error> {
+        Self::new(decision)
+    }
+}
+
+/// Why an execution target refused a launch offer. The policy detail travels
+/// with the decline in its own bounded wrapper.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LaunchDecline {
+    /// The offering scheduler is not a holder in the target's current view.
+    NotHolder,
+    /// Realm or group authorization denied the stored submitter.
+    Unauthorized,
+    /// Placement evaluation blocked the execution subject; never `Allowed`.
+    Policy(DeclinedPolicy),
+    /// Exact local admission found no capacity for the stored resources.
+    Capacity,
+    /// The target is draining or leaving and accepts no new work.
+    Draining,
+    /// That launch id is already bound to a different launch digest.
+    LaunchConflict,
+    /// The request family was cancelled before the offer arrived.
+    Cancelled,
+    /// This node already runs, or already ran successfully, an execution of the
+    /// same family. Retryable: another target may still take the launch.
+    AlreadyRunning,
+    /// The launch window passed on the target's clock, so no target accepts this launch any
+    /// more. A new launch may still be accepted.
+    Expired,
+    /// None of the target's membership intervals the launch cites is still open, so the launch
+    /// belongs to an interval that ended.
+    WrongInterval,
+}
+
+/// Reply to a [`crate::effects::JobControlEffect`]: the owner's response, or an
+/// unreachable-owner failure the routing operation maps to `Unavailable` (503).
+#[derive(Debug, PartialEq)]
+pub enum JobControlEvent {
+    Response(Box<JobResponse>),
+    /// The owner's response and the artifact bytes that follow it on the stream.
+    Streamed {
+        response: Box<JobResponse>,
+        body: BackendStream<Result<Bytes, BackendStreamError>>,
+    },
+    Unavailable(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DhtEvent {
+    PutComplete {
+        key: DhtKeyId,
+        remote_attempt_count: usize,
+        remote_store_count: usize,
+    },
+    GetResult {
+        key: DhtKeyId,
+        values: Vec<DhtEntry>,
+        /// Answered from a bounded-stale snapshot instead of a completed lookup.
+        /// Stale values are candidates, never proof that a peer is reachable.
+        stale: bool,
+    },
+    Error {
+        error: DhtError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DhtEntry {
+    pub node_id: NodeId,
+    pub realm_id: RealmId,
+    pub value: Vec<u8>,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum StreamEvent {
+    Opened { stream_id: u64, node_id: NodeId },
+    Closed { stream_id: u64 },
+    Error { stream_id: u64, error: StreamError },
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NetError {
+    InvalidEffect,
+    ChannelClosed,
+}
+
+/// Expands to the `Kind::Variant` name of a value, matched exhaustively over the listed variants.
+macro_rules! variant_label {
+    ($value:expr, $kind:ident { $($variant:ident),* $(,)? }) => {
+        match $value {
+            $($kind::$variant { .. } => concat!(stringify!($kind), "::", stringify!($variant)),)*
+        }
+    };
+}
+
+impl MetadataEvent {
+    /// Names the metadata event variant without its values.
+    pub fn label(&self) -> &'static str {
+        variant_label!(
+            self,
+            MetadataEvent {
+                ValidationResult,
+                CreateCrateResult,
+                ApplyRoCrateResult,
+                EntityUpsertResult,
+                GraphPolicySet,
+                GraphPeerAdded,
+                GraphTopic,
+                TopicChanged,
+                GraphPolicyResult,
+                RoCrateExportResult,
+                RoCrateSummaryResult,
+                RoCratePageResult,
+                SearchResult,
+                QueryResult,
+                GraphDeleted,
+                GraphListResult,
+                IndexesReady,
+                ContainsGraphResult,
+                ContainsDotResult,
+                VersionedExport,
+                GraphSnapshotResult,
+                SnapshotInstalled,
+                BatchPlanned,
+                BatchMerged,
+                CacheGeneration,
+                CachedGroup,
+                QueryCacheEntry,
+                DocumentTitle,
+                IriReferences,
+                RowsMerged,
+                GraphFlushed,
+                ProfileShapes,
+                ProfileChecked,
+                RegistrySnapshot,
+                RegistryStored,
+                QueryCacheStored,
+                DeletionMark,
+                DeletionMarked,
+                Error,
+            }
+        )
+    }
+}
+
+impl BlobEvent {
+    /// Names the blob event variant without its values.
+    pub fn label(&self) -> &'static str {
+        variant_label!(
+            self,
+            BlobEvent {
+                WriteFinished,
+                ReadFinished,
+                DeleteFinished,
+                ReservationReleased,
+                StreamCollected,
+                ReservationReconciled,
+                HiddenSpooled,
+                HiddenRead,
+                LocalSpooled,
+                HiddenDeleted,
+                PinnedRead,
+                ReadHeld,
+                HiddenListed,
+                ConnectionEstablished,
+                ConnectionClosed,
+                MessageReceived,
+                MessageSent,
+                ReplicationFinished,
+                ReadServed,
+                GroupBackendChecked,
+                UploadOpened,
+                PartWritten,
+                UploadAborted,
+                BucketKeyGenerated,
+                CopiesSealed,
+                KeyPrepared,
+                KeyActivated,
+                KeyDiscarded,
+                KeyStatus,
+                KeyExtended,
+                KeyLocked,
+                ReadAdmitted,
+                Error,
+                CopyRewritten,
+                PieceWritten,
+                UnlockedKeyRead,
+                ArchiveHashed,
+                ComposeReserved,
+                Abe,
+                ExternalListed,
+                ExternalHashed,
+                PlainStat,
+                ExternalStat,
+                CopyStat,
+                PlainWritten,
+                BucketReady,
+                BucketExists,
+                BucketDeleted,
+                Remote,
+                StreamTooLarge,
+            }
+        )
+    }
+}
+
+impl StagingSourceEvent {
+    /// Names the staging-source event variant without its values.
+    pub fn label(&self) -> &'static str {
+        variant_label!(
+            self,
+            StagingSourceEvent {
+                CheckResult,
+                HeadResult,
+                ListResult,
+                ReadResult,
+                HealthResult,
+                Error,
+            }
+        )
+    }
+}
+
+impl Event {
+    /// Names the event variant without its values, for logs and unexpected-event errors.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Event::Blob(event) => event.label(),
+            Event::StagingSource(event) => event.label(),
+            Event::LocalFile(event) => variant_label!(
+                event,
+                LocalFileEvent {
+                    Written,
+                    Copied,
+                    Moved,
+                    Hashed,
+                    Refused,
+                    Error,
+                }
+            ),
+            Event::Storage(event) => variant_label!(
+                event,
+                StorageEvent {
+                    TransactionStarted,
+                    TransactionCommitted,
+                    TransactionAborted,
+                    ReadResult,
+                    BatchReadResult,
+                    WriteResult,
+                    BatchWriteResult,
+                    DeleteResult,
+                    BatchDeleteResult,
+                    SyncAllFinished,
+                    IterResult,
+                    VaultResult,
+                    Error,
+                    RealmOpened,
+                    PoliciesCompiled,
+                }
+            ),
+            Event::Net(event) => variant_label!(
+                event,
+                NetEvent {
+                    Dht,
+                    DocumentSync,
+                    Stream,
+                    JobControl,
+                    PolicyFetch,
+                    PolicySign,
+                    VaultFetch,
+                    VaultSign,
+                    SnapshotSign,
+                    StatementSign,
+                    ExecutionSign,
+                    Error,
+                    MetadataAnswer,
+                    DocumentPeers,
+                    GrantedRead,
+                    DelegatedRead,
+                    PeerContact,
+                    GrantSign,
+                    DelegationSign,
+                    HolderAvoided,
+                    CursorSigned,
+                    FederationSigned,
+                    CredentialOpened,
+                    AdminSigned,
+                    PositionSealed,
+                    PositionOpened,
+                    SecretDrawn,
+                    Shard,
+                    TopicPeers,
+                    MissingTopicPeers,
+                    ConfigCatchUp,
+                    DeletePlanSigned,
+                    CountRelaySigned,
+                    Notification,
+                    InboxWoken,
+                    PeerContacts,
+                    LocalNode,
+                    LocalRealm,
+                    IssuerKey,
+                    WatchHolders,
+                    Heartbeat,
+                    HeartbeatSilence,
+                    Recorded,
+                }
+            ),
+            Event::Metadata(event) => event.label(),
+            Event::SubOperation(event) => variant_label!(
+                event,
+                SubOperationEvent {
+                    GroupWritten,
+                    DepthLimitExceeded,
+                    AuthorizationResult,
+                    DocumentSyncResult,
+                    SourceConnectorResolved,
+                    VersionAccessResolved,
+                    LiveReplicationQueued,
+                    RefreshQueued,
+                    BucketCreated,
+                    GroupRoutingLoaded,
+                    NotificationsEmitted,
+                    ShareLogged,
+                    TokenRevoked,
+                    UserUpdated,
+                    VaultHeld,
+                    NotificationsFailed,
+                }
+            ),
+            Event::Task(event) => variant_label!(
+                event,
+                TaskEvent {
+                    TimerScheduled,
+                    TimerCancelled,
+                    BackgroundStarted,
+                    RunningHandlersAborted,
+                    Pull,
+                    Error,
+                }
+            ),
+            Event::Group(event) => variant_label!(
+                event,
+                GroupEvent {
+                    Finished,
+                    Member,
+                    Closed
+                }
+            ),
+            Event::Delayed => "Event::Delayed",
+            Event::Hung { .. } => "Event::Hung",
+            Event::Child(_) => "Event::Child",
+            Event::Job(_) => "Event::Job",
+            Event::Git(_) => "Event::Git",
+            Event::Plugin(_) => "Event::Plugin",
+            Event::Index(event) => variant_label!(
+                event,
+                IndexEvent {
+                    Applied,
+                    Searched,
+                    Exists,
+                    Outdated,
+                    Counted,
+                    Pruned,
+                    Error,
+                }
+            ),
+            Event::Session(_) => "Event::Session",
+            Event::Compute(_) => "Event::Compute",
+            Event::Outbound(event) => variant_label!(
+                event,
+                OutboundEvent {
+                    Posted,
+                    MailSent,
+                    Backoff,
+                    Answered,
+                    MailRefreshed,
+                    RangeListed,
+                    MemberAnswered,
+                    ConnectionAnswered,
+                    SmtpChecked,
+                    AddressChecked
+                }
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::effects::sized_envelope;
+
+    fn frame(objects: usize, key_bytes: usize) -> JobRecordFrame {
+        JobRecordFrame::new(sized_envelope(objects, key_bytes)).expect("bounded record")
+    }
+
+    #[test]
+    fn answer_debug_hidden() {
+        let answer = MetadataAnswer {
+            peer: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            elapsed: Duration::from_secs(1),
+            result: Ok(vec![201; 32]),
+        };
+        assert!(!format!("{answer:?}").contains("201, 201"));
+    }
+
+    #[test]
+    fn label_omits_values() {
+        let event = Event::Task(TaskEvent::Error {
+            key: None,
+            message: "private detail".to_string(),
+        });
+        assert_eq!(event.label(), "TaskEvent::Error");
+        assert_eq!(Event::Delayed.label(), "Event::Delayed");
+    }
+
+    #[test]
+    fn rejects_wide_page() {
+        let records = vec![frame(1, 8); MAX_RECORD_PAGE + 1];
+        assert_eq!(
+            JobRecordPage::new(records.clone()),
+            Err(FrameBoundsError::RecordCount)
+        );
+        let encoded = postcard::to_allocvec(&records).expect("records encode");
+        assert_eq!(
+            JobRecordPage::from_bytes(&encoded),
+            Err(FrameBoundsError::RecordCount)
+        );
+        assert!(postcard::from_bytes::<JobRecordPage>(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_decoded_record() {
+        // A page frame may not smuggle a record past the per-record byte bound.
+        let encoded =
+            postcard::to_allocvec(&vec![sized_envelope(1024, 1200)]).expect("records encode");
+        assert!(JobRecordPage::from_bytes(&encoded).is_err());
+    }
+
+    #[test]
+    fn rejects_heavy_page() {
+        // A record count within the page bound still cannot exceed the byte bound.
+        let records = vec![frame(1024, 800); 5];
+        assert_eq!(
+            JobRecordPage::new(records),
+            Err(FrameBoundsError::PageBytes)
+        );
+        let frame = vec![0u8; JOB_PAGE_BYTES + 1];
+        assert_eq!(
+            JobRecordPage::from_bytes(&frame),
+            Err(FrameBoundsError::PageBytes)
+        );
+    }
+
+    #[test]
+    fn page_round_trips() {
+        let page = JobRecordPage::new(vec![frame(1, 8), frame(2, 8)]).expect("bounded page");
+        let bytes = page.to_bytes().expect("page encodes");
+        assert_eq!(JobRecordPage::from_bytes(&bytes), Ok(page.clone()));
+        assert_eq!(page.records().len(), 2);
+    }
+
+    #[test]
+    fn page_keeps_publishers() {
+        // Paging is transport: every relayed record keeps its own publisher.
+        let envelope = sized_envelope(3, 8);
+        let page = JobRecordPage::new(vec![frame(3, 8)]).expect("bounded page");
+        let bytes = page.to_bytes().expect("page encodes");
+        let relayed = JobRecordPage::from_bytes(&bytes).expect("page decodes");
+        let first = relayed.records()[0].envelope();
+        assert_eq!(first.published_by, envelope.published_by);
+        assert!(first.verify_signature().is_ok());
+    }
+}

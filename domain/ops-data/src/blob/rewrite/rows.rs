@@ -1,0 +1,135 @@
+//! Publication of a rewritten copy: its rows, the old owner and the usage update.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+
+impl RewriteVersionOperation {
+    pub(super) fn handle_target(&mut self, value: Option<Value>) -> Step {
+        let writes = self.rows(value.map(|value| value.to_vec()))?;
+        self.state = RewriteState::WriteRows;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    /// An existing plain copy in the target class is adopted; otherwise the new copy owns its
+    /// row. The old copy goes to reclaim, and the transition waits for its removal.
+    fn rows(
+        &mut self,
+        existing: Option<Vec<u8>>,
+    ) -> Result<Vec<(String, Key, Value)>, RewriteError> {
+        let (Some(old), Some(version)) = (self.old.as_ref(), self.version.as_ref()) else {
+            return Err(RewriteError::NotFinished);
+        };
+        let new = self.new.clone().ok_or(RewriteError::NotFinished)?;
+        let old_key = old.location_key()?;
+        let (version, mut stored) = (version.clone(), None);
+        let mut writes = Vec::new();
+        let published = match existing {
+            Some(value) => {
+                let existing = BackendLocation::from_bytes(&value)?;
+                self.owns_row = existing.same_object(&new);
+                existing
+            }
+            None => {
+                writes.push((
+                    BLOB_LOCATIONS_KEYSPACE.to_string(),
+                    new.location_key()?.to_bytes().into(),
+                    new.to_bytes()?.into(),
+                ));
+                self.owns_row = true;
+                stored =
+                    Some(StoredDelta::for_location(&new, true).ok_or(RewriteError::NotFinished)?);
+                new
+            }
+        };
+        if published.format.bucket_key().is_some() {
+            let owner = CopyOwner::new(ArchiveKey::of(&published), self.version_key.clone());
+            writes.push((
+                COPY_OWNER_KEYSPACE.to_string(),
+                owner.key()?.into(),
+                Vec::new().into(),
+            ));
+        }
+        let (envelope, added) = self.envelope_writes(&published, &version.metadata)?;
+        writes.extend(envelope);
+        self.gate = self.quota_gate(added);
+        self.usage = self.usage_with(stored, added);
+        let mut moved = version;
+        if let BlobVersionState::Materialized { encoding, .. } = &mut moved.state {
+            *encoding = published.format.encoding();
+        }
+        if let Some(copy) = self.copy.as_ref() {
+            let copy = ManagedCopyRecord {
+                location: published,
+                ..copy.clone()
+            };
+            writes.push((
+                MANAGED_COPY_KEYSPACE.to_string(),
+                copy.key().to_bytes()?.into(),
+                copy.to_bytes()?.into(),
+            ));
+        }
+        writes.push((
+            BLOB_VERSIONS_KEYSPACE.to_string(),
+            self.version_key.to_bytes()?.into(),
+            moved.to_bytes()?.into(),
+        ));
+        // Only a transition waits for its old copies to go.
+        if !self.rekey {
+            let cleanup = cleanup_key(&self.version_key.bucket, &old_key.to_bytes());
+            writes.push((
+                TRANSITION_CLEANUP_KEYSPACE.to_string(),
+                cleanup.into(),
+                Vec::new().into(),
+            ));
+        }
+        let candidate =
+            ReclaimCandidateKey::new(old_key.backend, old_key.encoding, old_key.blake3_hash);
+        let enqueued = ReclaimCandidate {
+            enqueued_at: self.now,
+        };
+        writes.push((
+            BLOB_RECLAIM_KEYSPACE.to_string(),
+            candidate.to_bytes().into(),
+            enqueued.to_bytes()?.into(),
+        ));
+        Ok(writes)
+    }
+
+    /// The old archive loses this version as owner, so reclaim may free it once unpinned.
+    pub(super) fn handle_rows(&mut self) -> Step {
+        let sealed = self
+            .old
+            .as_ref()
+            .filter(|old| old.format.bucket_key().is_some());
+        let Some(old) = sealed else {
+            return self.drop_envelope();
+        };
+        let owner = CopyOwner::new(ArchiveKey::of(old), self.version_key.clone()).key()?;
+        self.state = RewriteState::DropOwner;
+        let delete = (COPY_OWNER_KEYSPACE.to_string(), owner.into());
+        Ok(Next::Call(IoCall::Delete(vec![delete])))
+    }
+
+    pub(super) fn update_usage(&mut self) -> Step {
+        if let Some(gate) = self.gate.as_mut() {
+            self.state = RewriteState::Quota;
+            return Ok(Next::Call(gate.start_calls()));
+        }
+        let Some(usage) = self.usage.as_mut().filter(|usage| !usage.is_noop()) else {
+            return self.end(RewriteOutcome::Moved);
+        };
+        self.state = RewriteState::UpdateUsage;
+        Ok(Next::Call(
+            usage.start_calls(self.ids.mint(self.now_ms)).into_call(),
+        ))
+    }
+
+    pub(super) fn handle_usage(&mut self, result: IoResult) -> Step {
+        let usage = self.usage.as_mut().ok_or(RewriteError::NotFinished)?;
+        match usage.step_calls(result)? {
+            Some(call) => Ok(Next::Call(call.into_call())),
+            None => self.end(RewriteOutcome::Moved),
+        }
+    }
+}

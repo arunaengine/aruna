@@ -1,0 +1,330 @@
+//! Owns the per node Prometheus registry and the counters, gauges and histograms it holds.
+//! Each node keeps its own registry, so several nodes in one process never merge counters.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use prometheus_client::collector::Collector;
+use prometheus_client::encoding::EncodeLabelSet;
+use prometheus_client::encoding::text::encode;
+use prometheus_client::metrics::counter::Counter;
+use prometheus_client::metrics::family::Family;
+use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::metrics::info::Info;
+use prometheus_client::registry::{Metric, Registry, Unit};
+use std::sync::{PoisonError, RwLock};
+
+/// Exponential request-duration buckets in seconds, spanning ~1 ms to 60 s.
+const DURATION_BUCKETS_SECONDS: [f64; 15] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+/// Labels for the request counter: which interface, HTTP method, status code.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RequestLabels {
+    pub interface: &'static str,
+    pub method: &'static str,
+    pub code: u16,
+}
+
+/// Collapses nonstandard request methods to `other` so arbitrary extension
+/// tokens cannot mint unbounded label values.
+pub fn method_label(method: &str) -> &'static str {
+    match method {
+        "GET" => "GET",
+        "HEAD" => "HEAD",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "TRACE" => "TRACE",
+        "CONNECT" => "CONNECT",
+        _ => "other",
+    }
+}
+
+/// Labels for the request-duration histogram: interface plus the logical
+/// operation (REST matched-route template or resolved S3 operation name).
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct RouteLabels {
+    pub interface: &'static str,
+    pub op: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchMetricReason {
+    InvalidResource,
+    InvalidOwner,
+    TokenRestricted,
+    TokenExpired,
+    TokenRevoked,
+    PermissionDenied,
+    AuthorizationUnavailable,
+    InvalidState,
+}
+
+impl WatchMetricReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidResource => "invalid_resource",
+            Self::InvalidOwner => "invalid_owner",
+            Self::TokenRestricted => "token_restricted",
+            Self::TokenExpired => "token_expired",
+            Self::TokenRevoked => "token_revoked",
+            Self::PermissionDenied => "permission_denied",
+            Self::AuthorizationUnavailable => "authorization_unavailable",
+            Self::InvalidState => "invalid_state",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "invalid_resource" => Self::InvalidResource,
+            "invalid_owner" => Self::InvalidOwner,
+            "token_restricted" => Self::TokenRestricted,
+            "token_expired" => Self::TokenExpired,
+            "token_revoked" => Self::TokenRevoked,
+            "permission_denied" => Self::PermissionDenied,
+            "authorization_unavailable" => Self::AuthorizationUnavailable,
+            "invalid_state" => Self::InvalidState,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct WatchAuthorizationLabels {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NotificationWatchMetrics {
+    creation_denials: Family<WatchAuthorizationLabels, Counter>,
+    delivery_suppressions: Family<WatchAuthorizationLabels, Counter>,
+}
+
+impl NotificationWatchMetrics {
+    pub fn record_creation_denial(&self, reason: WatchMetricReason) {
+        self.creation_denials
+            .get_or_create(&WatchAuthorizationLabels {
+                reason: reason.as_str(),
+            })
+            .inc();
+    }
+
+    pub fn record_delivery_suppression(&self, reason: WatchMetricReason) {
+        self.delivery_suppressions
+            .get_or_create(&WatchAuthorizationLabels {
+                reason: reason.as_str(),
+            })
+            .inc();
+    }
+
+    pub fn register(&self, metrics: &NodeMetrics) {
+        metrics.register(
+            "notification_watch_creation_denials",
+            "Notification watch creation denials",
+            self.creation_denials.clone(),
+        );
+        metrics.register(
+            "notification_watch_delivery_suppressions",
+            "Notification watch delivery suppressions",
+            self.delivery_suppressions.clone(),
+        );
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct BuildInfoLabels {
+    version: String,
+}
+
+/// Owns a node's Prometheus registry and the built-in request metrics.
+pub struct NodeMetrics {
+    registry: RwLock<Registry>,
+    pub http_requests: Family<RequestLabels, Counter>,
+    pub http_request_duration: Family<RouteLabels, Histogram>,
+    node_started: Gauge,
+}
+
+impl NodeMetrics {
+    pub fn new() -> Self {
+        let mut registry = Registry::with_prefix("aruna");
+
+        let http_requests = Family::<RequestLabels, Counter>::default();
+        registry.register(
+            "http_requests",
+            "Total number of HTTP and S3 requests served",
+            http_requests.clone(),
+        );
+
+        let http_request_duration = Family::<RouteLabels, Histogram>::new_with_constructor(|| {
+            Histogram::new(DURATION_BUCKETS_SECONDS)
+        });
+        registry.register_with_unit(
+            "http_request_duration",
+            "HTTP and S3 request duration",
+            Unit::Seconds,
+            http_request_duration.clone(),
+        );
+
+        let node_started = Gauge::default();
+        registry.register(
+            "node_started",
+            "1 once the node finished startup and is serving traffic",
+            node_started.clone(),
+        );
+
+        registry.register(
+            "build",
+            "Build information",
+            Info::new(BuildInfoLabels {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            }),
+        );
+
+        Self {
+            registry: RwLock::new(registry),
+            http_requests,
+            http_request_duration,
+            node_started,
+        }
+    }
+
+    pub fn set_node_started(&self, started: bool) {
+        self.node_started.set(i64::from(started));
+    }
+
+    /// Late-register a metric into the node registry (used by feature branches).
+    pub fn register(&self, name: &str, help: &str, metric: impl Metric) {
+        self.registry
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register(name.to_string(), help.to_string(), metric);
+    }
+
+    /// Late-register a metric carrying a unit suffix (e.g. `_seconds`).
+    pub fn register_with_unit(&self, name: &str, help: &str, unit: Unit, metric: impl Metric) {
+        self.registry
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register_with_unit(name.to_string(), help.to_string(), unit, metric);
+    }
+
+    /// Register a scrape-time [`Collector`] that emits its metrics synchronously
+    /// on each encode (used for const counters read from a live snapshot).
+    pub fn register_collector(&self, collector: impl Collector) {
+        self.registry
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register_collector(Box::new(collector));
+    }
+
+    /// Encodes the registry as Prometheus text.
+    pub fn render(&self) -> String {
+        let registry = self.registry.read().unwrap_or_else(PoisonError::into_inner);
+        let mut buffer = String::new();
+        encode(&mut buffer, &registry)
+            .expect("encoding prometheus metrics into a String is infallible");
+        buffer
+    }
+}
+
+impl Default for NodeMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for NodeMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeMetrics").finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_includes_metrics() {
+        let metrics = NodeMetrics::new();
+        metrics
+            .http_requests
+            .get_or_create(&RequestLabels {
+                interface: "rest",
+                method: method_label("GET"),
+                code: 200,
+            })
+            .inc();
+        // prometheus-client omits families without samples from the text
+        // encoding, so the histogram needs one observation to show up.
+        metrics
+            .http_request_duration
+            .get_or_create(&RouteLabels {
+                interface: "rest",
+                op: "/metrics".to_string(),
+            })
+            .observe(0.05);
+
+        let body = metrics.render();
+        assert!(
+            body.contains(
+                "aruna_http_requests_total{interface=\"rest\",method=\"GET\",code=\"200\"} 1"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("aruna_http_request_duration_seconds"),
+            "{body}"
+        );
+        assert!(body.contains("aruna_build_info{version=\""), "{body}");
+    }
+
+    #[test]
+    fn method_label_tokens() {
+        assert_eq!(method_label("GET"), "GET");
+        assert_eq!(method_label("PATCH"), "PATCH");
+        assert_eq!(method_label("BREW"), "other");
+        assert_eq!(method_label("get"), "other");
+    }
+
+    #[test]
+    fn node_started_flag() {
+        let metrics = NodeMetrics::new();
+        assert!(metrics.render().contains("aruna_node_started 0"));
+        metrics.set_node_started(true);
+        assert!(metrics.render().contains("aruna_node_started 1"));
+    }
+
+    #[test]
+    fn late_registration_rendered() {
+        let metrics = NodeMetrics::new();
+        let gauge: Gauge = Gauge::default();
+        gauge.set(7);
+        metrics.register("custom_gauge", "late", gauge.clone());
+        assert!(metrics.render().contains("aruna_custom_gauge 7"));
+    }
+
+    #[test]
+    fn notification_watch_labels() {
+        assert_eq!(
+            WatchMetricReason::parse("token_revoked"),
+            Some(WatchMetricReason::TokenRevoked)
+        );
+        let metrics = NodeMetrics::new();
+        let watch_metrics = NotificationWatchMetrics::default();
+        watch_metrics.register(&metrics);
+        watch_metrics.record_creation_denial(WatchMetricReason::PermissionDenied);
+        watch_metrics.record_delivery_suppression(WatchMetricReason::TokenRestricted);
+
+        let body = metrics.render();
+        assert!(body.contains(
+            "aruna_notification_watch_creation_denials_total{reason=\"permission_denied\"} 1"
+        ));
+        assert!(body.contains(
+            "aruna_notification_watch_delivery_suppressions_total{reason=\"token_restricted\"} 1"
+        ));
+    }
+}

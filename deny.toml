@@ -18,6 +18,7 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml quadratic parse via RDF stack (upstream craqle)
     "RUSTSEC-2026-0195", # quick-xml namespace allocation via RDF stack (upstream craqle)
     "RUSTSEC-2026-0173", # proc-macro-error2 unmaintained via rudof_rdf/tabled (upstream craqle)
+    "RUSTSEC-2026-0543", # chrono unmaintained, no fixed release; also via craqle, s3s, rmcp, schemars
 ]
 
 [licenses]

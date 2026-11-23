@@ -1,0 +1,56 @@
+# Manifest of aruna-compute, with one feature per executor backend.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
+autotests = false
+
+[features]
+default = ["docker", "apptainer", "kubernetes"]
+docker = ["dep:bollard"]
+apptainer = ["dep:nix", "dep:rustix"]
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:json-patch", "dep:serde-saphyr"]
+# Runs Apptainer containers as Slurm jobs, so it builds on the Apptainer backend.
+slurm = ["apptainer"]
+
+[dependencies]
+aruna-clock = { workspace = true }
+aruna-core = { workspace = true }
+async-trait = { workspace = true }
+bollard = { workspace = true, optional = true, features = ["ssl"] }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+futures-util = { workspace = true }
+ipnet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde-saphyr = { workspace = true, optional = true }
+tar = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+nix = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+json-patch = { workspace = true, optional = true }
+
+[dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
+http = { workspace = true }
+iroh = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"

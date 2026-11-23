@@ -1,0 +1,33 @@
+//! Declares the blob crate: storage backends, staging sources and the blob handle.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+#![allow(clippy::result_large_err)]
+#![recursion_limit = "256"]
+
+pub mod arc;
+pub mod archive;
+mod autoindex;
+pub mod bao_tree;
+pub mod blob;
+mod codec;
+pub mod egress;
+pub mod error;
+mod framing;
+mod fs_source;
+mod fs_write;
+pub mod git;
+pub mod git_cache;
+pub mod invenio;
+pub mod local_fs;
+mod messages;
+pub mod native;
+pub mod opendal;
+pub mod pace;
+mod part_chain;
+pub mod receive_hook;
+pub mod remote;
+pub mod repo;
+pub mod rocrate;
+pub mod s3;
+mod walk;

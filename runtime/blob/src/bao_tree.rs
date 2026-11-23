@@ -1,0 +1,699 @@
+//! Wraps net streams, opendal objects and local files as bao tree readers and writers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::codec::FrameEncoder;
+use crate::error::BlobLibError;
+use crate::opendal::abort_partial_writer;
+use aruna_core::errors::BlobError;
+use aruna_core::structs::checksum::Hasher;
+use aruna_core::structs::storage::format::{Compression, FrameLayout};
+use aruna_p2p::streams::{RecvStream, SendStream};
+use bytes::Bytes;
+use futures::{AsyncReadExt, AsyncSeekExt};
+use iroh_io::{AsyncSliceReader, AsyncSliceWriter, AsyncStreamReader, AsyncStreamWriter};
+use opendal::{FuturesAsyncReader, Operator};
+use std::{future::Future, io, ops::Range, time::Duration};
+use tokio::io::{
+    AsyncReadExt as TokioAsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt, DuplexStream,
+};
+use tokio::time::timeout;
+use tracing::debug;
+
+fn idle_timeout_error(action: &'static str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("data-transfer idle timeout after {timeout:?} while {action}"),
+    )
+}
+
+async fn with_idle_timeout<F, T>(
+    future: F,
+    timeout_duration: Duration,
+    action: &'static str,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    timeout(timeout_duration, future)
+        .await
+        .map_err(|_| idle_timeout_error(action, timeout_duration))?
+}
+
+// ----- SendStream/RecvStream impls for bao_tree ----------
+
+pub struct SendStreamWrapper<'a> {
+    pub stream: &'a mut SendStream,
+    pub idle_timeout: Duration,
+}
+
+impl<'a> SendStreamWrapper<'a> {
+    pub fn new(stream: &'a mut SendStream, idle_timeout: Duration) -> Self {
+        Self {
+            stream,
+            idle_timeout,
+        }
+    }
+}
+
+impl AsyncStreamWriter for SendStreamWrapper<'_> {
+    async fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        debug!("Sending chunk with len: {}", data.len());
+        with_idle_timeout(
+            async {
+                self.stream
+                    .write_all(data)
+                    .await
+                    .map_err(|err| io::Error::other(err.to_string()))
+            },
+            self.idle_timeout,
+            "writing bao chunk to network stream",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn write_bytes(&mut self, data: Bytes) -> std::io::Result<()> {
+        with_idle_timeout(
+            async {
+                self.stream
+                    .write_all(&data)
+                    .await
+                    .map_err(|err| io::Error::other(err.to_string()))
+            },
+            self.idle_timeout,
+            "writing bao chunk to network stream",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> std::io::Result<()> {
+        with_idle_timeout(
+            async {
+                self.stream
+                    .flush()
+                    .await
+                    .map_err(|err| io::Error::other(err.to_string()))
+            },
+            self.idle_timeout,
+            "flushing bao chunk stream",
+        )
+        .await?;
+        Ok(())
+    }
+}
+
+pub struct RecvStreamWrapper<'a> {
+    pub stream: &'a mut RecvStream,
+    pub idle_timeout: Duration,
+}
+
+impl<'a> RecvStreamWrapper<'a> {
+    pub fn new(stream: &'a mut RecvStream, idle_timeout: Duration) -> Self {
+        Self {
+            stream,
+            idle_timeout,
+        }
+    }
+}
+
+impl AsyncStreamReader for RecvStreamWrapper<'_> {
+    async fn read_bytes(&mut self, len: usize) -> std::io::Result<Bytes> {
+        debug!("Receiving chunk with len: {}", len);
+        // Read bytes into buffer
+        let mut bs = vec![0u8; len];
+        with_idle_timeout(
+            async {
+                self.stream
+                    .read_exact(&mut bs)
+                    .await
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+            },
+            self.idle_timeout,
+            "reading bao chunk from network stream",
+        )
+        .await?;
+
+        Ok(Bytes::from(bs))
+    }
+
+    async fn read<const L: usize>(&mut self) -> std::io::Result<[u8; L]> {
+        // Read bytes into buffer
+        let mut bs = [0u8; L];
+        with_idle_timeout(
+            async {
+                self.stream
+                    .read_exact(&mut bs)
+                    .await
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+            },
+            self.idle_timeout,
+            "reading bao chunk from network stream",
+        )
+        .await?;
+
+        Ok(bs)
+    }
+}
+
+// ----- FuturesAsyncReader/opendal Writer impls for bao_tree ----------
+pub struct OpenDalWriter {
+    writer: opendal::Writer,
+    pub hasher: Hasher,
+    idle_timeout: Duration,
+    control_timeout: Duration,
+    written: u64,
+    /// Set when this node stores the replica as frames; hashes stay on original bytes.
+    encoder: Option<FrameEncoder>,
+}
+
+pub struct BaoReadWriter {
+    writer: DuplexStream,
+    hasher: blake3::Hasher,
+    written: u64,
+}
+
+impl BaoReadWriter {
+    pub fn new(writer: DuplexStream) -> Self {
+        Self {
+            writer,
+            hasher: blake3::Hasher::new(),
+            written: 0,
+        }
+    }
+
+    pub fn finish(self, size: u64, expected_blake3: [u8; 32]) -> io::Result<()> {
+        if self.written != size {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "bao read ended after {} bytes, expected {size}",
+                    self.written
+                ),
+            ));
+        }
+        if self.hasher.finalize().as_bytes() != &expected_blake3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bao read content hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Passes on the bytes of one range from the verified chunks a ranged bao read decodes; the
+/// chunks cover the range and arrive in order.
+pub struct RangeWriter {
+    writer: DuplexStream,
+    range: Range<u64>,
+    decoded: u64,
+    written: u64,
+}
+
+impl RangeWriter {
+    pub fn new(writer: DuplexStream, range: Range<u64>) -> Self {
+        Self {
+            writer,
+            decoded: range.start,
+            range,
+            written: 0,
+        }
+    }
+
+    pub fn finish(self) -> io::Result<()> {
+        let expected = self.range.end - self.range.start;
+        if self.written != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!(
+                    "ranged bao read ended after {} of {expected} bytes",
+                    self.written
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsyncSliceWriter for RangeWriter {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        let end = offset + data.len() as u64;
+        // Chunks start at or before the range and never step back over bytes already passed on.
+        if offset > self.decoded || end < self.decoded {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ranged bao read produced non-sequential output",
+            ));
+        }
+        let from = self.decoded.max(self.range.start);
+        let to = end.min(self.range.end);
+        if from < to {
+            let slice = &data[(from - offset) as usize..(to - offset) as usize];
+            self.writer.write_all(slice).await?;
+            self.written += to - from;
+        }
+        self.decoded = self.decoded.max(end);
+        Ok(())
+    }
+
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> io::Result<()> {
+        self.write_at(offset, &data).await
+    }
+
+    async fn set_len(&mut self, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> io::Result<()> {
+        self.writer.flush().await
+    }
+}
+
+impl AsyncSliceWriter for BaoReadWriter {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> io::Result<()> {
+        if offset != self.written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bao read produced non-sequential output",
+            ));
+        }
+        self.writer.write_all(data).await?;
+        self.hasher.update(data);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> io::Result<()> {
+        self.write_at(offset, &data).await
+    }
+
+    async fn set_len(&mut self, _len: u64) -> io::Result<()> {
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> io::Result<()> {
+        self.writer.flush().await
+    }
+}
+
+impl AsyncSliceWriter for OpenDalWriter {
+    async fn write_at(&mut self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        self.write_bytes_at(offset, Bytes::copy_from_slice(data))
+            .await
+    }
+
+    async fn write_bytes_at(&mut self, offset: u64, data: Bytes) -> std::io::Result<()> {
+        self.check_offset(offset)?;
+        let pieces = match self.encoder.as_mut() {
+            Some(encoder) => encoder.push(&data).await.map_err(io::Error::other)?,
+            None => vec![data.clone()],
+        };
+        self.write_pieces(pieces).await?;
+        self.hasher.update(&data);
+        self.written += data.len() as u64;
+        Ok(())
+    }
+
+    async fn set_len(&mut self, _len: u64) -> std::io::Result<()> {
+        //Note: Nonsensical for most storage backends so just a no-op implementation
+        Ok(())
+    }
+
+    async fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl OpenDalWriter {
+    pub async fn new(
+        operator: &Operator,
+        storage_path: &str,
+        idle_timeout: Duration,
+        control_timeout: Duration,
+    ) -> Result<Self, BlobLibError> {
+        let writer = timeout(control_timeout, operator.writer(storage_path))
+            .await
+            .map_err(|_| {
+                BlobLibError::IoError(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out opening replicated blob writer",
+                ))
+            })??;
+        Ok(Self {
+            writer,
+            hasher: Hasher::new(),
+            idle_timeout,
+            control_timeout,
+            written: 0,
+            encoder: None,
+        })
+    }
+
+    /// Stores the replica as frames when `compression` enables zstd.
+    pub fn encoded(mut self, compression: Compression) -> Self {
+        self.encoder = match compression {
+            Compression::Off => None,
+            Compression::Zstd { level } => Some(FrameEncoder::new(level)),
+        };
+        self
+    }
+
+    async fn write_pieces(&mut self, pieces: Vec<Bytes>) -> io::Result<()> {
+        for piece in pieces {
+            with_idle_timeout(
+                async { self.writer.write(piece).await.map_err(io::Error::from) },
+                self.idle_timeout,
+                "writing replicated chunk to backend storage",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    // The backend writer is append-only, so a non-sequential offset would
+    // silently reorder the replicated blob.
+    fn check_offset(&self, offset: u64) -> io::Result<()> {
+        if offset != self.written {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "bao write at offset {offset}, expected {} for append-only backend",
+                    self.written
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Closes the replica; returns its frame layout when it was stored as frames.
+    pub async fn finalize(mut self) -> Result<Option<FrameLayout>, BlobError> {
+        let mut layout = None;
+        if let Some(encoder) = self.encoder.take() {
+            let (pieces, framed) = encoder.finish().await?;
+            if let Err(error) = self.write_pieces(pieces).await {
+                return match abort_partial_writer(&mut self.writer, self.control_timeout).await {
+                    Ok(()) => Err(BlobError::WriteError(error.to_string())),
+                    Err(cleanup) => Err(BlobError::DeleteError(format!("{error}; {cleanup}"))),
+                };
+            }
+            layout = Some(framed);
+        }
+        let close_result = with_idle_timeout(
+            async {
+                self.writer
+                    .close()
+                    .await
+                    .map(|_| ())
+                    .map_err(io::Error::from)
+            },
+            self.idle_timeout,
+            "finalizing replicated blob in backend storage",
+        )
+        .await;
+        if let Err(err) = close_result {
+            return match abort_partial_writer(&mut self.writer, self.control_timeout).await {
+                Ok(()) => Err(BlobError::WriteError(err.to_string())),
+                Err(cleanup) => Err(BlobError::DeleteError(format!("{err}; {cleanup}"))),
+            };
+        }
+        Ok(layout)
+    }
+
+    pub async fn abort(mut self) -> Result<(), BlobError> {
+        abort_partial_writer(&mut self.writer, self.control_timeout).await
+    }
+}
+
+pub struct OpenDalReader {
+    pub stream: FuturesAsyncReader,
+    pub blob_size: u64,
+    pub idle_timeout: Duration,
+}
+
+impl AsyncSliceReader for OpenDalReader {
+    async fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        self.read_exact_at(offset, len).await
+    }
+
+    async fn read_exact_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        // Jump to offset
+        with_idle_timeout(
+            self.stream.seek(std::io::SeekFrom::Start(offset)),
+            self.idle_timeout,
+            "seeking source blob for bao transfer",
+        )
+        .await?;
+
+        // Read bytes into buffer
+        let mut bs = vec![0u8; len];
+        with_idle_timeout(
+            self.stream.read_exact(&mut bs),
+            self.idle_timeout,
+            "reading source blob chunk for bao transfer",
+        )
+        .await?;
+
+        Ok(Bytes::from(bs))
+    }
+
+    async fn size(&mut self) -> std::io::Result<u64> {
+        Ok(self.blob_size)
+    }
+}
+
+/// Random-access reader over one regular file. A device serves its own
+/// observations from the owner's filesystem, so the bao encoder needs a reader
+/// that is not backed by the blob store at all.
+pub struct LocalFileReader {
+    file: tokio::fs::File,
+    size: u64,
+}
+
+impl LocalFileReader {
+    pub(crate) fn from_file(file: tokio::fs::File, size: u64) -> Self {
+        Self { file, size }
+    }
+
+    pub async fn open(path: &std::path::Path, size: u64) -> std::io::Result<Self> {
+        Ok(Self {
+            file: tokio::fs::File::open(path).await?,
+            size,
+        })
+    }
+}
+
+impl AsyncSliceReader for LocalFileReader {
+    /// A short read at the end of the file is allowed here, which is what
+    /// separates this from `read_exact_at`.
+    async fn read_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        let readable = usize::try_from(self.size.saturating_sub(offset))
+            .unwrap_or(usize::MAX)
+            .min(len);
+        self.read_exact_at(offset, readable).await
+    }
+
+    async fn read_exact_at(&mut self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        self.file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut bs = vec![0u8; len];
+        self.file.read_exact(&mut bs).await?;
+        Ok(Bytes::from(bs))
+    }
+
+    async fn size(&mut self) -> std::io::Result<u64> {
+        Ok(self.size)
+    }
+}
+
+impl OpenDalReader {
+    pub async fn new(
+        operator: &Operator,
+        storage_path: &str,
+        blob_size: u64,
+        idle_timeout: Duration,
+    ) -> Result<Self, BlobLibError> {
+        Ok(OpenDalReader {
+            stream: operator
+                .reader(storage_path)
+                .await?
+                .into_futures_async_read(..)
+                .await?,
+            blob_size,
+            idle_timeout,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BaoReadWriter, OpenDalWriter, RangeWriter, idle_timeout_error, with_idle_timeout};
+    use iroh_io::AsyncSliceWriter;
+    use std::io;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    // Verified chunks cover more than the range; only the range is passed on, in order.
+    #[tokio::test]
+    async fn range_writer_trims() {
+        let (writer, mut reader) = tokio::io::duplex(64);
+        let mut range = RangeWriter::new(writer, 3..9);
+        range.write_at(0, b"abcde").await.unwrap();
+        range.write_at(5, b"fghij").await.unwrap();
+        range.finish().unwrap();
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"defghi");
+    }
+
+    // A gap in the decoded chunks or a short read never passes as the whole range.
+    #[tokio::test]
+    async fn range_writer_gaps() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut range = RangeWriter::new(writer, 3..9);
+        assert!(range.write_at(4, b"efgh").await.is_err());
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut short = RangeWriter::new(writer, 3..9);
+        short.write_at(0, b"abcde").await.unwrap();
+        assert!(short.finish().is_err());
+    }
+
+    #[tokio::test]
+    async fn reports_idle_timeout() {
+        let err = with_idle_timeout(
+            std::future::pending::<io::Result<()>>(),
+            Duration::from_millis(1),
+            "reading bao chunk from network stream",
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "data-transfer idle timeout after 1ms while reading bao chunk from network stream"
+        );
+    }
+
+    #[test]
+    fn idle_timeout_kind() {
+        let err = idle_timeout_error(
+            "writing replicated chunk to backend storage",
+            Duration::from_secs(1800),
+        );
+
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            err.to_string(),
+            "data-transfer idle timeout after 1800s while writing replicated chunk to backend storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_accepts_content() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut writer = BaoReadWriter::new(writer);
+        let content = b"verified";
+
+        writer.write_at(0, content).await.unwrap();
+
+        writer
+            .finish(content.len() as u64, *blake3::hash(content).as_bytes())
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_sink_mismatch() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut writer = BaoReadWriter::new(writer);
+
+        writer.write_at(0, b"content").await.unwrap();
+
+        let error = writer.finish(7, [9u8; 32]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn rejects_sink_truncation() {
+        let (writer, _reader) = tokio::io::duplex(64);
+        let mut writer = BaoReadWriter::new(writer);
+
+        writer.write_at(0, b"short").await.unwrap();
+
+        let error = writer
+            .finish(6, *blake3::hash(b"short").as_bytes())
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_gap() {
+        // The opendal writer appends, so a skipped offset must not be accepted.
+        let dir = tempfile::tempdir().unwrap();
+        let operator = opendal::Operator::from_iter::<opendal::services::Fs>(
+            [("root".to_string(), dir.path().to_str().unwrap().to_string())].into_iter(),
+        )
+        .unwrap();
+        let mut writer = OpenDalWriter::new(
+            &operator,
+            "blob.bin",
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+
+        writer.write_at(0, b"abc").await.unwrap();
+        let error = writer.write_at(7, b"d").await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        writer.write_at(3, b"d").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_encodes_frames() {
+        // A replica is stored with this node's compression, hashed over original bytes.
+        use crate::codec::FrameEncoder;
+        use aruna_core::structs::storage::format::Compression;
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let operator = opendal::Operator::from_iter::<opendal::services::Fs>(
+            [("root".to_string(), dir.path().to_str().unwrap().to_string())].into_iter(),
+        )
+        .unwrap();
+        let mut writer = OpenDalWriter::new(
+            &operator,
+            "blob.bin",
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .encoded(Compression::Zstd { level: 3 });
+        let mut offset = 0;
+        for chunk in data.chunks(100_000) {
+            let bytes = bytes::Bytes::copy_from_slice(chunk);
+            writer.write_bytes_at(offset, bytes).await.unwrap();
+            offset += chunk.len() as u64;
+        }
+        assert_eq!(
+            writer.hasher.finalize().blake3,
+            *blake3::hash(&data).as_bytes()
+        );
+        let layout = writer
+            .finalize()
+            .await
+            .unwrap()
+            .expect("frames were written");
+
+        let mut encoder = FrameEncoder::new(3);
+        let mut expected = encoder.push(&data).await.unwrap().concat();
+        let (rest, expected_layout) = encoder.finish().await.unwrap();
+        expected.extend(rest.concat());
+        let stored = std::fs::read(dir.path().join("blob.bin")).unwrap();
+        assert_eq!(stored, expected);
+        assert_eq!(layout, expected_layout);
+        assert!(stored.len() < data.len());
+    }
+}

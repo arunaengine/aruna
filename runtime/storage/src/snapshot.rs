@@ -1,0 +1,639 @@
+//! Streams Fjall keyspaces in the database snapshot format and reads such a stream back with checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use blake3::Hasher;
+use fjall::{Database, KeyspaceCreateOptions, Readable, Snapshot};
+use std::collections::HashSet;
+use std::io::{ErrorKind, Read, Write};
+use std::path::PathBuf;
+use std::time::Duration;
+use thiserror::Error;
+
+/// File name of the backup socket in the node's storage directory.
+pub const BACKUP_SOCKET: &str = "backup.sock";
+/// Keyspace name prefixes of the node, document sync and metadata stores in a backup.
+pub const MAIN_PREFIX: &str = "main/";
+pub const SYNC_PREFIX: &str = "document-sync/";
+pub const METADATA_PREFIX: &str = "craqle/";
+/// Pseudo keyspace holding the Git repositories: relative path to file bytes, `/` ends a directory.
+pub const GIT_KEYSPACE: &str = "git";
+/// The store prefixes in stream order: node, document sync, metadata.
+pub const PREFIXES: [&str; 3] = [MAIN_PREFIX, SYNC_PREFIX, METADATA_PREFIX];
+
+const SNAPSHOT_MAGIC: &[u8] = b"ARUNA_DB_SNAPSHOT";
+const SNAPSHOT_VERSION: u16 = 1;
+const RECORD_BEGIN_KEYSPACE: u8 = 1;
+const RECORD_ENTRY: u8 = 2;
+const RECORD_END_KEYSPACE: u8 = 3;
+const RECORD_FOOTER: u8 = 4;
+/// The longest field of each kind a stream may hold: a store prefix with a Fjall keyspace name
+/// of at most 255 bytes, a Fjall key, and a value read into memory, which Fjall bounds too.
+const MAX_NAME_BYTES: u64 = SYNC_PREFIX.len() as u64 + 255;
+const MAX_KEY_BYTES: u64 = u16::MAX as u64;
+const MAX_VALUE_BYTES: u64 = u32::MAX as u64;
+/// Tries and pause between tries to open snapshots of several databases at one instant.
+const CUT_ATTEMPTS: u32 = 1_000;
+const CUT_PAUSE: Duration = Duration::from_millis(1);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotStats {
+    pub created_unix_seconds: u64,
+    pub keyspace_count: u64,
+    pub entry_count: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum SnapshotError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Fjall(#[from] fjall::Error),
+    #[error("snapshot path already exists: {0}")]
+    SnapshotPathExists(PathBuf),
+    #[error("target database path already exists: {0}")]
+    TargetPathExists(PathBuf),
+    #[error("target database parent directory does not exist: {0}")]
+    TargetParentMissing(PathBuf),
+    #[error("invalid snapshot magic")]
+    InvalidMagic,
+    #[error("unsupported snapshot version: {0}")]
+    UnsupportedVersion(u16),
+    #[error("invalid snapshot structure: {0}")]
+    InvalidStructure(&'static str),
+    #[error("duplicate keyspace in snapshot: {0}")]
+    DuplicateKeyspace(String),
+    #[error("checksum mismatch")]
+    ChecksumMismatch,
+    #[error("snapshot contains invalid UTF-8 keyspace name")]
+    InvalidKeyspaceName,
+    #[error("snapshot length does not fit in memory: {0}")]
+    LengthOverflow(u64),
+    #[error("the databases kept changing while their snapshots were opened")]
+    BusyDatabases,
+}
+
+/// One record of a snapshot stream, in stream order.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SnapshotRecord {
+    Keyspace(String),
+    Entry { key: Vec<u8>, value: Vec<u8> },
+    EndKeyspace,
+}
+
+/// Writes a snapshot stream: keyspace sections of entries, then a footer with counts and a
+/// BLAKE3 checksum over all sections.
+pub struct SnapshotWriter<W: Write> {
+    out: W,
+    hasher: Hasher,
+    created_unix_seconds: u64,
+    keyspace_count: u64,
+    entry_count: u64,
+    open_entries: Option<u64>,
+}
+
+impl<W: Write> SnapshotWriter<W> {
+    pub fn new(mut out: W, created_unix_seconds: u64) -> Result<Self, SnapshotError> {
+        out.write_all(SNAPSHOT_MAGIC)?;
+        out.write_all(&SNAPSHOT_VERSION.to_be_bytes())?;
+        out.write_all(&created_unix_seconds.to_be_bytes())?;
+        Ok(Self {
+            out,
+            hasher: Hasher::new(),
+            created_unix_seconds,
+            keyspace_count: 0,
+            entry_count: 0,
+            open_entries: None,
+        })
+    }
+
+    pub fn begin_keyspace(&mut self, name: &str) -> Result<(), SnapshotError> {
+        if self.open_entries.is_some() {
+            return Err(SnapshotError::InvalidStructure(
+                "began a keyspace before closing the previous keyspace",
+            ));
+        }
+        self.write_hashed(&[RECORD_BEGIN_KEYSPACE])?;
+        self.write_prefixed(name.as_bytes())?;
+        self.open_entries = Some(0);
+        self.keyspace_count += 1;
+        Ok(())
+    }
+
+    pub fn entry(&mut self, key: &[u8], value: &[u8]) -> Result<(), SnapshotError> {
+        self.open_entry(key)?;
+        self.write_prefixed(value)?;
+        self.count_entry();
+        Ok(())
+    }
+
+    /// Writes an entry whose `len` value bytes are copied from `value` piece by piece, so a
+    /// large value is never held whole. A source that ends early fails the entry.
+    pub fn entry_from(
+        &mut self,
+        key: &[u8],
+        len: u64,
+        value: impl Read,
+    ) -> Result<(), SnapshotError> {
+        self.open_entry(key)?;
+        self.write_hashed(&len.to_be_bytes())?;
+        let mut out = Hashed {
+            out: &mut self.out,
+            hasher: &mut self.hasher,
+        };
+        if std::io::copy(&mut value.take(len), &mut out)? != len {
+            let early = std::io::Error::new(ErrorKind::UnexpectedEof, "an entry value ended early");
+            return Err(early.into());
+        }
+        self.count_entry();
+        Ok(())
+    }
+
+    fn open_entry(&mut self, key: &[u8]) -> Result<(), SnapshotError> {
+        if self.open_entries.is_none() {
+            return Err(SnapshotError::InvalidStructure(
+                "wrote an entry outside a keyspace section",
+            ));
+        }
+        self.write_hashed(&[RECORD_ENTRY])?;
+        self.write_prefixed(key)
+    }
+
+    fn count_entry(&mut self) {
+        self.open_entries = self.open_entries.map(|count| count + 1);
+        self.entry_count += 1;
+    }
+
+    pub fn end_keyspace(&mut self) -> Result<(), SnapshotError> {
+        let Some(entry_count) = self.open_entries.take() else {
+            return Err(SnapshotError::InvalidStructure(
+                "ended a keyspace outside a keyspace section",
+            ));
+        };
+        self.write_hashed(&[RECORD_END_KEYSPACE])?;
+        self.write_hashed(&entry_count.to_be_bytes())
+    }
+
+    /// Writes every keyspace of `db` from one read snapshot, sorted by name and each name
+    /// prefixed with `prefix`. The database may keep serving writes meanwhile.
+    pub fn database(&mut self, db: &Database, prefix: &str) -> Result<(), SnapshotError> {
+        self.database_at(db, &db.snapshot(), prefix)
+    }
+
+    /// Writes every keyspace of `db` as `snapshot` shows it, like [`Self::database`].
+    pub fn database_at(
+        &mut self,
+        db: &Database,
+        snapshot: &Snapshot,
+        prefix: &str,
+    ) -> Result<(), SnapshotError> {
+        let mut names = db.list_keyspace_names();
+        names.sort();
+        for name in names {
+            let keyspace = db.keyspace(&name, KeyspaceCreateOptions::default)?;
+            self.begin_keyspace(&format!("{prefix}{}", &*name))?;
+            for entry in snapshot.iter(&keyspace) {
+                let (key, value) = entry.into_inner()?;
+                self.entry(&key, &value)?;
+            }
+            self.end_keyspace()?;
+        }
+        Ok(())
+    }
+
+    /// Writes the footer and returns the flushed output with the stream totals.
+    pub fn finish(mut self) -> Result<(W, SnapshotStats), SnapshotError> {
+        if self.open_entries.is_some() {
+            return Err(SnapshotError::InvalidStructure(
+                "finished before closing the active keyspace",
+            ));
+        }
+        let checksum = *self.hasher.finalize().as_bytes();
+        self.out.write_all(&[RECORD_FOOTER])?;
+        self.out.write_all(&self.keyspace_count.to_be_bytes())?;
+        self.out.write_all(&self.entry_count.to_be_bytes())?;
+        self.out.write_all(&checksum)?;
+        self.out.flush()?;
+        let stats = SnapshotStats {
+            created_unix_seconds: self.created_unix_seconds,
+            keyspace_count: self.keyspace_count,
+            entry_count: self.entry_count,
+        };
+        Ok((self.out, stats))
+    }
+
+    fn write_hashed(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.out.write_all(bytes)?;
+        self.hasher.update(bytes);
+        Ok(())
+    }
+
+    fn write_prefixed(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        let len =
+            u64::try_from(bytes.len()).map_err(|_| SnapshotError::LengthOverflow(u64::MAX))?;
+        self.write_hashed(&len.to_be_bytes())?;
+        self.write_hashed(bytes)
+    }
+}
+
+/// Writes to the output and the checksum together.
+struct Hashed<'a, W> {
+    out: &'a mut W,
+    hasher: &'a mut Hasher,
+}
+
+impl<W: Write> Write for Hashed<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.out.write(bytes)?;
+        self.hasher.update(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+/// Opens one read snapshot per database, all showing the same instant. Fjall cannot pause
+/// writers, so a try that a write crossed is dropped and repeated.
+pub fn consistent_snapshots(databases: &[&Database]) -> Result<Vec<Snapshot>, SnapshotError> {
+    for _ in 0..CUT_ATTEMPTS {
+        let snapshots: Vec<Snapshot> = databases.iter().map(|db| db.snapshot()).collect();
+        if same_instant(databases, &snapshots) {
+            return Ok(snapshots);
+        }
+        std::thread::sleep(CUT_PAUSE);
+    }
+    Err(SnapshotError::BusyDatabases)
+}
+
+/// Fjall takes a write's sequence number and publishes it under one journal lock, so a
+/// database whose next number is still its snapshot's has not started a write since.
+fn same_instant(databases: &[&Database], snapshots: &[Snapshot]) -> bool {
+    databases
+        .iter()
+        .zip(snapshots)
+        .all(|(db, snapshot)| db.seqno() == snapshot.seqno())
+}
+
+/// Reads a snapshot stream record by record and rejects bad structure, mismatched counts, a
+/// wrong checksum and trailing bytes.
+pub struct SnapshotReader<R: Read> {
+    input: R,
+    hasher: Hasher,
+    created_unix_seconds: u64,
+    seen_keyspaces: HashSet<String>,
+    open_entries: Option<u64>,
+    keyspace_count: u64,
+    entry_count: u64,
+    finished: bool,
+}
+
+impl<R: Read> SnapshotReader<R> {
+    pub fn new(mut input: R) -> Result<Self, SnapshotError> {
+        let mut magic = vec![0_u8; SNAPSHOT_MAGIC.len()];
+        input.read_exact(&mut magic)?;
+        if magic.as_slice() != SNAPSHOT_MAGIC {
+            return Err(SnapshotError::InvalidMagic);
+        }
+        let version = u16::from_be_bytes(read_array(&mut input)?);
+        if version != SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let created_unix_seconds = u64::from_be_bytes(read_array(&mut input)?);
+        Ok(Self {
+            input,
+            hasher: Hasher::new(),
+            created_unix_seconds,
+            seen_keyspaces: HashSet::new(),
+            open_entries: None,
+            keyspace_count: 0,
+            entry_count: 0,
+            finished: false,
+        })
+    }
+
+    pub fn stats(&self) -> SnapshotStats {
+        SnapshotStats {
+            created_unix_seconds: self.created_unix_seconds,
+            keyspace_count: self.keyspace_count,
+            entry_count: self.entry_count,
+        }
+    }
+
+    /// The next record, or `None` once the footer matched and no bytes follow it.
+    pub fn next_record(&mut self) -> Result<Option<SnapshotRecord>, SnapshotError> {
+        self.next_with(|_| Ok(None::<std::io::Sink>))
+    }
+
+    /// Like [`Self::next_record`], but when `sink` answers a writer for an entry's key, the value
+    /// streams into it piece by piece and the returned entry holds an empty value.
+    pub fn next_with<W: Write>(
+        &mut self,
+        sink: impl FnOnce(&[u8]) -> Result<Option<W>, SnapshotError>,
+    ) -> Result<Option<SnapshotRecord>, SnapshotError> {
+        if self.finished {
+            return Ok(None);
+        }
+        let tag = match read_array::<1>(&mut self.input) {
+            Ok([tag]) => tag,
+            Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                return Err(SnapshotError::InvalidStructure("missing footer record"));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match tag {
+            RECORD_BEGIN_KEYSPACE => self.read_begin(tag).map(Some),
+            RECORD_ENTRY => {
+                let Some(count) = self.open_entries else {
+                    return Err(SnapshotError::InvalidStructure(
+                        "encountered an entry outside a keyspace section",
+                    ));
+                };
+                self.hasher.update(&[tag]);
+                let key = self.read_hashed_bytes(MAX_KEY_BYTES)?;
+                let value = match sink(&key)? {
+                    Some(mut out) => {
+                        self.copy_hashed(&mut out)?;
+                        Vec::new()
+                    }
+                    None => self.read_hashed_bytes(MAX_VALUE_BYTES)?,
+                };
+                self.open_entries = Some(count + 1);
+                self.entry_count += 1;
+                Ok(Some(SnapshotRecord::Entry { key, value }))
+            }
+            RECORD_END_KEYSPACE => {
+                let Some(count) = self.open_entries.take() else {
+                    return Err(SnapshotError::InvalidStructure(
+                        "encountered end-of-keyspace outside a keyspace section",
+                    ));
+                };
+                self.hasher.update(&[tag]);
+                let expected = self.read_hashed_u64()?;
+                if count != expected {
+                    return Err(SnapshotError::InvalidStructure(
+                        "keyspace entry count did not match the section footer",
+                    ));
+                }
+                Ok(Some(SnapshotRecord::EndKeyspace))
+            }
+            RECORD_FOOTER => {
+                self.read_footer()?;
+                self.finished = true;
+                Ok(None)
+            }
+            _ => Err(SnapshotError::InvalidStructure("unknown record tag")),
+        }
+    }
+
+    fn read_begin(&mut self, tag: u8) -> Result<SnapshotRecord, SnapshotError> {
+        if self.open_entries.is_some() {
+            return Err(SnapshotError::InvalidStructure(
+                "encountered a new keyspace before closing the previous keyspace",
+            ));
+        }
+        self.hasher.update(&[tag]);
+        let name = String::from_utf8(self.read_hashed_bytes(MAX_NAME_BYTES)?)
+            .map_err(|_| SnapshotError::InvalidKeyspaceName)?;
+        if !self.seen_keyspaces.insert(name.clone()) {
+            return Err(SnapshotError::DuplicateKeyspace(name));
+        }
+        self.open_entries = Some(0);
+        self.keyspace_count += 1;
+        Ok(SnapshotRecord::Keyspace(name))
+    }
+
+    fn read_footer(&mut self) -> Result<(), SnapshotError> {
+        if self.open_entries.is_some() {
+            return Err(SnapshotError::InvalidStructure(
+                "encountered footer before closing the active keyspace",
+            ));
+        }
+        let keyspace_count = u64::from_be_bytes(read_array(&mut self.input)?);
+        let entry_count = u64::from_be_bytes(read_array(&mut self.input)?);
+        let checksum: [u8; 32] = read_array(&mut self.input)?;
+        if self.keyspace_count != keyspace_count {
+            return Err(SnapshotError::InvalidStructure(
+                "keyspace count did not match the footer",
+            ));
+        }
+        if self.entry_count != entry_count {
+            return Err(SnapshotError::InvalidStructure(
+                "entry count did not match the footer",
+            ));
+        }
+        if *self.hasher.finalize().as_bytes() != checksum {
+            return Err(SnapshotError::ChecksumMismatch);
+        }
+        let mut trailing = [0_u8; 1];
+        match self.input.read(&mut trailing)? {
+            0 => Ok(()),
+            _ => Err(SnapshotError::InvalidStructure(
+                "snapshot has trailing bytes after the footer",
+            )),
+        }
+    }
+
+    fn read_hashed_u64(&mut self) -> Result<u64, SnapshotError> {
+        let bytes = read_array(&mut self.input)?;
+        self.hasher.update(&bytes);
+        Ok(u64::from_be_bytes(bytes))
+    }
+
+    /// Reads a length-prefixed field of at most `limit` bytes, refused at its length prefix;
+    /// memory grows with the bytes that arrive, never with the length a corrupt stream claims.
+    fn read_hashed_bytes(&mut self, limit: u64) -> Result<Vec<u8>, SnapshotError> {
+        let len = self.read_hashed_u64()?;
+        if len > limit {
+            return Err(SnapshotError::InvalidStructure(
+                "a snapshot field is longer than its format allows",
+            ));
+        }
+        let mut bytes = Vec::new();
+        let read = (&mut self.input).take(len).read_to_end(&mut bytes)?;
+        if read as u64 != len {
+            return Err(cut_field());
+        }
+        self.hasher.update(&bytes);
+        Ok(bytes)
+    }
+
+    fn copy_hashed(&mut self, out: &mut impl Write) -> Result<(), SnapshotError> {
+        let len = self.read_hashed_u64()?;
+        let mut out = Hashed {
+            out,
+            hasher: &mut self.hasher,
+        };
+        if std::io::copy(&mut (&mut self.input).take(len), &mut out)? != len {
+            return Err(cut_field());
+        }
+        Ok(())
+    }
+}
+
+fn cut_field() -> SnapshotError {
+    std::io::Error::new(ErrorKind::UnexpectedEof, "a snapshot field ended early").into()
+}
+
+fn read_array<const N: usize>(input: &mut impl Read) -> Result<[u8; N], std::io::Error> {
+    let mut bytes = [0_u8; N];
+    input.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SnapshotError, SnapshotReader, SnapshotRecord, SnapshotWriter, consistent_snapshots,
+        same_instant,
+    };
+    use fjall::{Database, KeyspaceCreateOptions};
+
+    fn sample_stream() -> Vec<u8> {
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace("a").unwrap();
+        writer.entry(b"k1", b"v1").unwrap();
+        writer.entry(b"k2", b"v2").unwrap();
+        writer.end_keyspace().unwrap();
+        writer.finish().unwrap().0
+    }
+
+    fn read_all(bytes: &[u8]) -> Result<Vec<SnapshotRecord>, SnapshotError> {
+        let mut reader = SnapshotReader::new(bytes)?;
+        let mut records = Vec::new();
+        while let Some(record) = reader.next_record()? {
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    #[test]
+    fn streamed_entry_matches() {
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace("a").unwrap();
+        writer.entry_from(b"k1", 2, &b"v1"[..]).unwrap();
+        writer.entry(b"k2", b"v2").unwrap();
+        writer.end_keyspace().unwrap();
+        assert_eq!(writer.finish().unwrap().0, sample_stream());
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace("a").unwrap();
+        let Err(SnapshotError::Io(early)) = writer.entry_from(b"k1", 3, &b"v1"[..]) else {
+            panic!("a short source fails the entry");
+        };
+        assert_eq!(early.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    // A keyspace name longer than any store prefix and Fjall name is refused at its length.
+    #[test]
+    fn long_name_refused() {
+        let mut writer = SnapshotWriter::new(Vec::new(), 7).unwrap();
+        writer.begin_keyspace(&"k".repeat(1000)).unwrap();
+        writer.end_keyspace().unwrap();
+        let bytes = writer.finish().unwrap().0;
+        assert!(matches!(
+            read_all(&bytes),
+            Err(SnapshotError::InvalidStructure(_))
+        ));
+    }
+
+    #[test]
+    fn claimed_length_bounded() {
+        let mut bytes = sample_stream()[..27].to_vec();
+        bytes.push(1);
+        // A length within the name limit, with fewer bytes behind it than it claims.
+        bytes.extend_from_slice(&200_u64.to_be_bytes());
+        bytes.extend_from_slice(b"ab");
+        assert!(matches!(read_all(&bytes), Err(SnapshotError::Io(_))));
+    }
+
+    #[test]
+    fn streams_entry_value() {
+        let bytes = sample_stream();
+        let mut reader = SnapshotReader::new(&bytes[..]).unwrap();
+        let mut sunk = Vec::new();
+        let mut records = Vec::new();
+        while let Some(record) = reader
+            .next_with(|key| Ok((key == b"k2").then_some(&mut sunk)))
+            .unwrap()
+        {
+            records.push(record);
+        }
+        let streamed = SnapshotRecord::Entry {
+            key: b"k2".to_vec(),
+            value: Vec::new(),
+        };
+        assert_eq!(records[2], streamed);
+        assert_eq!(sunk, b"v2");
+    }
+
+    #[test]
+    fn rejects_truncated_stream() {
+        let bytes = sample_stream();
+        for len in [bytes.len() - 1, bytes.len() - 40, 40] {
+            assert!(
+                read_all(&bytes[..len]).is_err(),
+                "cut at {len} bytes was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_changed_byte() {
+        let mut bytes = sample_stream();
+        let position = bytes.windows(2).position(|pair| pair == b"v2").unwrap();
+        bytes[position + 1] = b'3';
+        assert!(matches!(
+            read_all(&bytes),
+            Err(SnapshotError::ChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn prefixes_database_keyspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::builder(dir.path()).open().unwrap();
+        let keyspace = db
+            .keyspace("items", KeyspaceCreateOptions::default)
+            .unwrap();
+        keyspace.insert("key", "value").unwrap();
+
+        let mut writer = SnapshotWriter::new(Vec::new(), 1).unwrap();
+        writer.database(&db, "main/").unwrap();
+        let (bytes, stats) = writer.finish().unwrap();
+
+        assert_eq!((stats.keyspace_count, stats.entry_count), (1, 1));
+        assert_eq!(
+            read_all(&bytes).unwrap(),
+            vec![
+                SnapshotRecord::Keyspace("main/items".to_string()),
+                SnapshotRecord::Entry {
+                    key: b"key".to_vec(),
+                    value: b"value".to_vec(),
+                },
+                SnapshotRecord::EndKeyspace,
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_crossed_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Database::builder(dir.path().join("first")).open().unwrap();
+        let second = Database::builder(dir.path().join("second")).open().unwrap();
+        let keyspace = second
+            .keyspace("items", KeyspaceCreateOptions::default)
+            .unwrap();
+        keyspace.insert("old", "value").unwrap();
+        let databases = [&first, &second];
+
+        let snapshots = consistent_snapshots(&databases).unwrap();
+        assert!(same_instant(&databases, &snapshots));
+        keyspace.insert("new", "value").unwrap();
+        assert!(!same_instant(&databases, &snapshots));
+
+        let mut writer = SnapshotWriter::new(Vec::new(), 1).unwrap();
+        writer.database_at(&second, &snapshots[1], "").unwrap();
+        assert_eq!(writer.finish().unwrap().1.entry_count, 1);
+    }
+}

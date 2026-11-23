@@ -1,0 +1,52 @@
+//! Parses the upload id marker and hands a finished multipart put to the queue.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::ArunaS3Service;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_ops_data::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use aruna_runner::driver::drive;
+use s3s::{S3Result, s3_error};
+
+pub(super) fn parse_upload_marker(
+    key_marker: Option<&str>,
+    upload_id_marker: Option<&str>,
+) -> S3Result<Option<ulid::Ulid>> {
+    let Some(_) = key_marker.filter(|marker| !marker.is_empty()) else {
+        return Ok(None);
+    };
+    upload_id_marker
+        .map(|marker| {
+            ulid::Ulid::from_string(marker)
+                .map_err(|_| s3_error!(InvalidArgument, "Invalid upload-id-marker"))
+        })
+        .transpose()
+}
+
+impl ArunaS3Service {
+    pub(super) async fn complete_put(
+        &self,
+        auth: AuthContext,
+        group_id: ulid::Ulid,
+        bucket: String,
+        key: String,
+        version_id: ulid::Ulid,
+        size_bytes: u64,
+    ) {
+        drive(
+            CompletePutOperation::new(CompletePutInput {
+                realm_id: self.realm_id,
+                node_id: self.node_id,
+                auth,
+                group_id,
+                bucket,
+                key,
+                version_id,
+                size_bytes,
+            }),
+            &self.state,
+        )
+        .await
+        .ok();
+    }
+}

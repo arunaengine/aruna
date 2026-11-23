@@ -128,6 +128,17 @@ class Imports:
                                      file_field, fields(form_fields))
         return self.call(jobs.upload, request)
 
+    def job_task(self, task, parameters, inputs, files, outputs):
+        jobs, field = self.imports.jobs, self.imports.types.Field
+        request = jobs.TaskRequest(
+            task,
+            [field(*pair) for pair in parameters],
+            [jobs.TaskInput(path, source, version) for path, source, version in inputs],
+            [jobs.TaskFile(path, content) for path, content in files],
+            [field(*pair) for pair in outputs],
+        )
+        return self.call(jobs.start_task, request)
+
     def job_get(self, id):
         status = self.call(self.imports.jobs.get, id)
         reply = None

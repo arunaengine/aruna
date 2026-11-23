@@ -1,0 +1,64 @@
+//! Collects the owner-only device routes a user node serves for the machine it runs on.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod buckets;
+pub mod documents;
+pub mod drafts;
+pub mod dto;
+pub mod folders;
+pub mod origins;
+pub mod sync;
+pub mod transfers;
+pub mod wipe;
+
+use std::sync::Arc;
+
+use utoipa_axum::router::OpenApiRouter;
+
+use crate::server::state::ServerState;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::new()
+        .merge(buckets::router())
+        .merge(documents::router())
+        .merge(drafts::router())
+        .merge(folders::router())
+        .merge(origins::router())
+        .merge(sync::router())
+        .merge(transfers::router())
+        .merge(wipe::router())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn lists_device_routes() {
+        let openapi = serde_json::to_value(crate::openapi::ApiDoc::openapi()).unwrap();
+        for path in [
+            "/device/buckets",
+            "/device/documents",
+            "/device/documents/{document_id}/selection",
+            "/device/sync/status",
+            "/device/sync/run",
+            "/device/drafts",
+            "/device/drafts/preview",
+            "/device/drafts/{draft_id}",
+            "/device/folders",
+            "/device/folders/{folder_id}",
+            "/device/folders/{folder_id}/entries",
+            "/device/folders/{folder_id}/entries/{path}/actions",
+            "/device/folders/{folder_id}/actions",
+            "/device/folders/{folder_id}/pause",
+            "/device/folders/{folder_id}/resume",
+            "/device/folders/{folder_id}/sync",
+            "/device/origins/{version_id}",
+            "/device/transfers",
+            "/device/wipe",
+        ] {
+            assert!(openapi["paths"][path].is_object(), "{path} is undocumented");
+        }
+        // Offered directories became upload-only synced folders.
+        assert!(openapi["paths"]["/device/offers"].is_null());
+    }
+}

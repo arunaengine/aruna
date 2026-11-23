@@ -1,0 +1,990 @@
+//! Notification records and inbox, outbox and prune keys, with the per class retention.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::time::Duration;
+
+use byteview::ByteView;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+
+use crate::effects::Effect;
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::structs::execution::notification_watch::{
+    WatchAuthorizationBinding, WatchEvent, WatchEventMask, WatchSubscription,
+};
+use crate::structs::identity::realm::RealmId;
+use crate::task::{TaskEffect, TaskKey};
+use crate::types::{GroupId, Key};
+use crate::user::id::UserId;
+
+pub const DIRECT_TTL_MS: u64 = 90 * 24 * 60 * 60 * 1000;
+pub const TRANSIENT_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+pub const TRANSIENT_USER_CAP: usize = 500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationClass {
+    Direct,
+    Transient,
+}
+
+impl NotificationClass {
+    pub fn ttl_ms(&self) -> u64 {
+        match self {
+            NotificationClass::Direct => DIRECT_TTL_MS,
+            NotificationClass::Transient => TRANSIENT_TTL_MS,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationKind {
+    AddedToGroup {
+        group_id: GroupId,
+        actor_user_id: UserId,
+    },
+    RemovedFromGroup {
+        group_id: GroupId,
+        actor_user_id: UserId,
+    },
+    GroupMemberAdded {
+        group_id: GroupId,
+        member_user_id: UserId,
+        actor_user_id: UserId,
+    },
+    NodeOnboarded {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
+    MetadataCreated {
+        path: String,
+        group_id: GroupId,
+        document_id: Ulid,
+        actor_user_id: UserId,
+    },
+    DataUploaded {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+        actor_user_id: UserId,
+    },
+    SyncCompleted {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        versions_synced: u64,
+        actor_user_id: UserId,
+    },
+    SyncFailed {
+        path: String,
+        group_id: GroupId,
+        node_id: NodeId,
+        bucket: String,
+        relationship_id: Ulid,
+        error: String,
+        actor_user_id: UserId,
+    },
+    GroupJoinRequested {
+        group_id: GroupId,
+        request_id: Ulid,
+        actor_user_id: UserId,
+    },
+    /// A node restart locked an unlocked encrypted bucket; a holder must unlock it again.
+    #[serde(rename = "BucketLockedByRestart")]
+    BucketRestartLocked {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
+    /// The holders of an encrypted bucket no longer meet the recovery rule, for example after
+    /// an admin lost the group admin role.
+    BucketRecoveryDegraded {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
+    /// A member waits for scoped bucket keys after a grant by an admin who holds no key.
+    BucketKeyPending {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+        member_user_id: UserId,
+    },
+    /// A visitor uploaded a file through one of the recipient's share links.
+    ShareUpload {
+        share_id: Ulid,
+        node_id: NodeId,
+        group_id: GroupId,
+        bucket: String,
+        key: String,
+        size_bytes: u64,
+    },
+    /// The bucket was deleted: the inbox holder drops the recipient's earlier notices about
+    /// it and never stores this record.
+    BucketDeleted {
+        bucket: String,
+        node_id: NodeId,
+        group_id: GroupId,
+    },
+    /// A manager widened who may use a named secret, or how. The group names a group secret,
+    /// the node a node secret; neither names a realm secret.
+    SecretUseWidened {
+        name: String,
+        group_id: Option<GroupId>,
+        node_id: Option<NodeId>,
+        actor_user_id: UserId,
+    },
+}
+
+impl NotificationKind {
+    /// Stable category string for per-kind preferences (#288). Never change an
+    /// existing mapping.
+    pub fn category(&self) -> &'static str {
+        match self {
+            NotificationKind::AddedToGroup { .. }
+            | NotificationKind::RemovedFromGroup { .. }
+            | NotificationKind::GroupMemberAdded { .. }
+            | NotificationKind::GroupJoinRequested { .. } => "group.membership",
+            NotificationKind::NodeOnboarded { .. } => "node.onboarding",
+            NotificationKind::MetadataCreated { .. }
+            | NotificationKind::DataUploaded { .. }
+            | NotificationKind::SyncCompleted { .. }
+            | NotificationKind::SyncFailed { .. } => "resource.watch",
+            NotificationKind::BucketRestartLocked { .. }
+            | NotificationKind::BucketRecoveryDegraded { .. }
+            | NotificationKind::BucketKeyPending { .. } => "bucket.encryption",
+            NotificationKind::ShareUpload { .. } => "share.upload",
+            NotificationKind::BucketDeleted { .. } => "bucket.deleted",
+            NotificationKind::SecretUseWidened { .. } => "secret.use",
+        }
+    }
+
+    /// Stable machine-readable variant name for API payloads.
+    pub fn name(&self) -> &'static str {
+        match self {
+            NotificationKind::AddedToGroup { .. } => "added_to_group",
+            NotificationKind::RemovedFromGroup { .. } => "removed_from_group",
+            NotificationKind::GroupMemberAdded { .. } => "group_member_added",
+            NotificationKind::GroupJoinRequested { .. } => "group_join_requested",
+            NotificationKind::NodeOnboarded { .. } => "node_onboarded",
+            NotificationKind::MetadataCreated { .. } => "metadata_created",
+            NotificationKind::DataUploaded { .. } => "data_uploaded",
+            NotificationKind::SyncCompleted { .. } => "sync_completed",
+            NotificationKind::SyncFailed { .. } => "sync_failed",
+            NotificationKind::BucketRestartLocked { .. } => "bucket_locked_by_restart",
+            NotificationKind::BucketRecoveryDegraded { .. } => "bucket_recovery_degraded",
+            NotificationKind::BucketKeyPending { .. } => "bucket_key_pending",
+            NotificationKind::ShareUpload { .. } => "share_upload",
+            NotificationKind::BucketDeleted { .. } => "bucket_deleted",
+            NotificationKind::SecretUseWidened { .. } => "secret_use_widened",
+        }
+    }
+
+    /// The node and bucket a notice is about, if it names one.
+    pub fn bucket(&self) -> Option<(NodeId, &str)> {
+        match self {
+            NotificationKind::DataUploaded {
+                node_id, bucket, ..
+            }
+            | NotificationKind::SyncCompleted {
+                node_id, bucket, ..
+            }
+            | NotificationKind::SyncFailed {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketRestartLocked {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketRecoveryDegraded {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketKeyPending {
+                node_id, bucket, ..
+            }
+            | NotificationKind::ShareUpload {
+                node_id, bucket, ..
+            }
+            | NotificationKind::BucketDeleted {
+                node_id, bucket, ..
+            } => Some((*node_id, bucket)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationRecord {
+    pub notification_id: Ulid,
+    pub recipient: UserId,
+    pub class: NotificationClass,
+    pub kind: NotificationKind,
+    pub created_at_ms: u64,
+    pub read_at_ms: Option<u64>,
+    pub watch_authorization: Option<WatchAuthorizationBinding>,
+}
+
+type LegacyNotificationRecord = (
+    Ulid,
+    UserId,
+    NotificationClass,
+    NotificationKind,
+    u64,
+    Option<u64>,
+);
+
+fn from_exact_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, postcard::Error> {
+    match postcard::take_from_bytes(bytes)? {
+        (record, []) => Ok(record),
+        _ => Err(postcard::Error::SerdeDeCustom),
+    }
+}
+
+impl NotificationRecord {
+    fn from_legacy(record: LegacyNotificationRecord) -> Self {
+        Self {
+            notification_id: record.0,
+            recipient: record.1,
+            class: record.2,
+            kind: record.3,
+            created_at_ms: record.4,
+            read_at_ms: record.5,
+            watch_authorization: None,
+        }
+    }
+
+    pub fn new(
+        notification_id: Ulid,
+        recipient: UserId,
+        class: NotificationClass,
+        kind: NotificationKind,
+        created_at_ms: u64,
+    ) -> Self {
+        Self {
+            notification_id,
+            recipient,
+            class,
+            kind,
+            created_at_ms,
+            read_at_ms: None,
+            watch_authorization: None,
+        }
+    }
+
+    /// True when this is a bucket deletion that removes `other`: a notice of the same recipient
+    /// about the deleted bucket, made no later than the deletion.
+    pub fn purges(&self, other: &NotificationRecord) -> bool {
+        let NotificationKind::BucketDeleted { .. } = &self.kind else {
+            return false;
+        };
+        self.recipient == other.recipient
+            && other.created_at_ms <= self.created_at_ms
+            && other.kind.bucket().is_some()
+            && other.kind.bucket() == self.kind.bucket()
+    }
+
+    pub fn expires_at_ms(&self) -> u64 {
+        self.created_at_ms.saturating_add(self.class.ttl_ms())
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        from_exact_bytes(bytes)
+            .or_else(|_| from_exact_bytes(bytes).map(Self::from_legacy))
+            .map_err(Into::into)
+    }
+}
+
+/// Typed post-commit event emitted by mutating operations (event plane). Never
+/// persisted raw; consumed by routing (operations crate) only.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResourceEvent {
+    GroupMemberAdded {
+        group_id: GroupId,
+        affected_user: UserId,
+        actor_user_id: UserId,
+    },
+    GroupMemberRemoved {
+        group_id: GroupId,
+        affected_user: UserId,
+        actor_user_id: UserId,
+    },
+    NodeOnboarded {
+        realm_id: RealmId,
+        node_id: NodeId,
+    },
+    GroupJoinRequested {
+        group_id: GroupId,
+        request_id: Ulid,
+        actor_user_id: UserId,
+    },
+    /// Goes to the managers of the secret, the acting one included, since a stolen session
+    /// could widen use.
+    SecretUseWidened {
+        name: String,
+        group_id: Option<GroupId>,
+        node_id: Option<NodeId>,
+        actor_user_id: UserId,
+    },
+}
+
+/// Durable origin-node outbox row (transport plane). Holder is NOT stored: it is
+/// re-resolved on every drain so deliveries re-rank when the eligible set changes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationOutboxRecord {
+    pub outbox_id: Ulid,
+    pub record: NotificationRecord,
+}
+
+impl NotificationOutboxRecord {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        from_exact_bytes(bytes)
+            .or_else(|_| {
+                from_exact_bytes::<(Ulid, LegacyNotificationRecord)>(bytes).map(|record| Self {
+                    outbox_id: record.0,
+                    record: NotificationRecord::from_legacy(record.1),
+                })
+            })
+            .map_err(Into::into)
+    }
+}
+
+pub fn invert_timestamp_ms(timestamp_ms: u64) -> u64 {
+    u64::MAX - timestamp_ms
+}
+
+pub fn notification_inbox_key(recipient: UserId, created_at_ms: u64, notification_id: Ulid) -> Key {
+    let mut bytes = Vec::with_capacity(72);
+    bytes.extend_from_slice(&recipient.to_storage_key());
+    bytes.extend_from_slice(&invert_timestamp_ms(created_at_ms).to_be_bytes());
+    bytes.extend_from_slice(&notification_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+/// The deletion cutoff row of one recipient for the bucket a notice names.
+pub fn notification_cutoff_key(recipient: UserId, node_id: NodeId, bucket: &str) -> Key {
+    let mut bytes = recipient.to_storage_key();
+    bytes.extend_from_slice(node_id.as_bytes());
+    bytes.extend_from_slice(bucket.as_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn notification_inbox_prefix(recipient: UserId) -> Key {
+    ByteView::from(recipient.to_storage_key())
+}
+
+pub fn notification_inbox_cursor(created_at_ms: u64, notification_id: Ulid) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(24);
+    bytes.extend_from_slice(&invert_timestamp_ms(created_at_ms).to_be_bytes());
+    bytes.extend_from_slice(&notification_id.to_bytes());
+    bytes
+}
+
+pub fn parse_inbox_key(key: &[u8]) -> Result<(UserId, u64, Ulid), ConversionError> {
+    if key.len() != 72 {
+        return Err(ConversionError::InvalidLength(format!(
+            "expected 72-byte notification inbox key, got {} bytes",
+            key.len()
+        )));
+    }
+    let recipient = UserId::from_storage_key(&key[..48])?;
+    let created_at_ms = invert_timestamp_ms(u64::from_be_bytes(key[48..56].try_into()?));
+    let notification_id = Ulid::from_bytes(key[56..72].try_into()?);
+    Ok((recipient, created_at_ms, notification_id))
+}
+
+pub fn notification_prune_key(record: &NotificationRecord) -> Key {
+    let mut bytes = Vec::with_capacity(72);
+    bytes.extend_from_slice(&record.expires_at_ms().to_be_bytes());
+    bytes.extend_from_slice(&record.recipient.to_storage_key());
+    bytes.extend_from_slice(&record.notification_id.to_bytes());
+    ByteView::from(bytes)
+}
+
+pub fn parse_prune_key(key: &[u8]) -> Result<(u64, UserId, Ulid), ConversionError> {
+    if key.len() != 72 {
+        return Err(ConversionError::InvalidLength(format!(
+            "expected 72-byte notification prune index key, got {} bytes",
+            key.len()
+        )));
+    }
+    let expires_at_ms = u64::from_be_bytes(key[..8].try_into()?);
+    let recipient = UserId::from_storage_key(&key[8..56])?;
+    let notification_id = Ulid::from_bytes(key[56..72].try_into()?);
+    Ok((expires_at_ms, recipient, notification_id))
+}
+
+pub fn notification_outbox_key(outbox_id: Ulid) -> Key {
+    ByteView::from(outbox_id.to_bytes())
+}
+
+/// One request to the notification holder `node`, answered by one frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotificationRequest {
+    pub node: NodeId,
+    pub message: NotificationTransportMessage,
+}
+
+/// Bytes of one request or answer frame.
+pub const MAX_NOTIFICATION_SIZE: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum NotificationTransportMessage {
+    DeliverBatch {
+        records: Vec<NotificationRecord>,
+    },
+    DeliverAck {
+        written: u32,
+    },
+    List {
+        recipient: UserId,
+        cursor: Option<Vec<u8>>,
+        limit: u32,
+    },
+    ListResult {
+        records: Vec<NotificationRecord>,
+        next_cursor: Option<Vec<u8>>,
+    },
+    UnreadCount {
+        recipient: UserId,
+    },
+    UnreadCountResult {
+        count: u32,
+        capped: bool,
+    },
+    MarkRead {
+        recipient: UserId,
+        ids: Vec<Ulid>,
+        up_to_ms: Option<u64>,
+    },
+    MarkReadResult {
+        marked: u32,
+    },
+    Reject(String),
+    CreateWatch {
+        owner: UserId,
+        path_prefix: String,
+        event_mask: WatchEventMask,
+        authorization: WatchAuthorizationBinding,
+    },
+    WatchCreated {
+        subscription: WatchSubscription,
+    },
+    DeleteWatch {
+        owner: UserId,
+        watch_id: Ulid,
+    },
+    WatchDeleted,
+    ListWatches {
+        owner: UserId,
+    },
+    WatchList {
+        subscriptions: Vec<WatchSubscription>,
+    },
+    DeliverWatchEvents {
+        events: Vec<WatchEvent>,
+    },
+    WatchEventsAck {
+        written: u32,
+    },
+    /// The holder could not take the request now and stored nothing; the sender keeps it and
+    /// tries again later, unlike after a `Reject`.
+    Unavailable(String),
+}
+
+impl NotificationTransportMessage {
+    pub fn label(&self) -> &'static str {
+        match self {
+            NotificationTransportMessage::DeliverBatch { .. } => "deliver_batch",
+            NotificationTransportMessage::DeliverAck { .. } => "deliver_ack",
+            NotificationTransportMessage::List { .. } => "list",
+            NotificationTransportMessage::ListResult { .. } => "list_result",
+            NotificationTransportMessage::UnreadCount { .. } => "unread_count",
+            NotificationTransportMessage::UnreadCountResult { .. } => "unread_count_result",
+            NotificationTransportMessage::MarkRead { .. } => "mark_read",
+            NotificationTransportMessage::MarkReadResult { .. } => "mark_read_result",
+            NotificationTransportMessage::Reject(_) => "reject",
+            NotificationTransportMessage::CreateWatch { .. } => "create_watch",
+            NotificationTransportMessage::WatchCreated { .. } => "watch_created",
+            NotificationTransportMessage::DeleteWatch { .. } => "delete_watch",
+            NotificationTransportMessage::WatchDeleted => "watch_deleted",
+            NotificationTransportMessage::ListWatches { .. } => "list_watches",
+            NotificationTransportMessage::WatchList { .. } => "watch_list",
+            NotificationTransportMessage::DeliverWatchEvents { .. } => "deliver_watch_events",
+            NotificationTransportMessage::WatchEventsAck { .. } => "watch_events_ack",
+            NotificationTransportMessage::Unavailable(_) => "unavailable",
+        }
+    }
+}
+
+/// Result of a holder-local inbox upsert: `recipients` lists, in first-seen order, those that
+/// gained or lost a record, so a caller wakes each once; a pure redelivery reports zero writes.
+/// `purged` counts records a bucket deletion removed, `cutoffs` the deletion times it stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InboxWriteOutcome {
+    pub written: usize,
+    pub recipients: Vec<UserId>,
+    pub purged: usize,
+    pub cutoffs: usize,
+    /// Batch records the inbox holds after the write, new or already present, never discarded.
+    pub held: Vec<NotificationRecord>,
+}
+
+/// The outbox row of one notification record.
+pub fn new_outbox_record(outbox_id: Ulid, record: NotificationRecord) -> NotificationOutboxRecord {
+    NotificationOutboxRecord { outbox_id, record }
+}
+
+/// Arms the notification outbox drain now.
+pub fn schedule_drain_effect() -> Effect {
+    Effect::Task(TaskEffect::ResetTimer {
+        key: TaskKey::DrainNotificationOutbox,
+        after: Duration::ZERO,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keyspaces::{NOTIFICATION_INBOX_KEYSPACE, PRUNE_INDEX_KEYSPACE};
+    use crate::storage_entries::{inbox_delete_entries, inbox_update_entry, inbox_write_entries};
+
+    fn make_node_id(seed: u8) -> NodeId {
+        let mut seed_bytes = [0u8; 32];
+        seed_bytes[0] = seed;
+        iroh::SecretKey::from_bytes(&seed_bytes).public()
+    }
+
+    fn user(realm: u8, user_byte: u8) -> UserId {
+        UserId::new(Ulid::from_bytes([user_byte; 16]), RealmId([realm; 32]))
+    }
+
+    fn added(actor: u8) -> NotificationKind {
+        NotificationKind::AddedToGroup {
+            group_id: Ulid::generate(),
+            actor_user_id: user(1, actor),
+        }
+    }
+
+    #[test]
+    fn notification_record_schema() {
+        let recipient = user(1, 2);
+        let notification_id = Ulid::generate();
+        let legacy = (
+            notification_id,
+            recipient,
+            NotificationClass::Direct,
+            added(3),
+            1234,
+            None::<u64>,
+        );
+        let legacy_bytes = postcard::to_allocvec(&legacy).unwrap();
+        let decoded = NotificationRecord::from_bytes(&legacy_bytes)
+            .expect("legacy notification record decodes");
+        assert_eq!(decoded.notification_id, notification_id);
+        assert_eq!(decoded.recipient, recipient);
+        assert_eq!(decoded.watch_authorization, None);
+        assert!(NotificationRecord::from_bytes(&[legacy_bytes, vec![2]].concat()).is_err());
+
+        let outbox_id = Ulid::generate();
+        let outbox = (outbox_id, legacy);
+        let decoded =
+            NotificationOutboxRecord::from_bytes(&postcard::to_allocvec(&outbox).unwrap())
+                .expect("legacy notification outbox record decodes");
+        assert_eq!(decoded.outbox_id, outbox_id);
+        assert_eq!(decoded.record.watch_authorization, None);
+    }
+
+    #[test]
+    fn notification_record_postcard() {
+        let recipient = user(1, 2);
+        let metadata_group_id = Ulid::generate();
+        let data_group_id = Ulid::generate();
+        let data_node_id = make_node_id(8);
+        for kind in [
+            NotificationKind::BucketRestartLocked {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+            },
+            NotificationKind::BucketRecoveryDegraded {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+            },
+            NotificationKind::BucketKeyPending {
+                bucket: "raw".to_string(),
+                node_id: make_node_id(9),
+                group_id: Ulid::generate(),
+                member_user_id: user(1, 4),
+            },
+            NotificationKind::GroupJoinRequested {
+                group_id: Ulid::generate(),
+                request_id: Ulid::generate(),
+                actor_user_id: user(1, 3),
+            },
+            NotificationKind::AddedToGroup {
+                group_id: Ulid::generate(),
+                actor_user_id: user(1, 3),
+            },
+            NotificationKind::RemovedFromGroup {
+                group_id: Ulid::generate(),
+                actor_user_id: user(1, 3),
+            },
+            NotificationKind::GroupMemberAdded {
+                group_id: Ulid::generate(),
+                member_user_id: user(1, 4),
+                actor_user_id: user(1, 3),
+            },
+            NotificationKind::NodeOnboarded {
+                realm_id: RealmId([1; 32]),
+                node_id: make_node_id(7),
+            },
+            NotificationKind::MetadataCreated {
+                path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
+                group_id: metadata_group_id,
+                document_id: Ulid::generate(),
+                actor_user_id: user(1, 5),
+            },
+            NotificationKind::DataUploaded {
+                path: crate::structs::execution::notification_watch::watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "key",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                key: "key".to_string(),
+                size_bytes: 4096,
+                actor_user_id: user(1, 6),
+            },
+            NotificationKind::SyncCompleted {
+                path: crate::structs::execution::notification_watch::watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "prefix/",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::generate(),
+                versions_synced: 3,
+                actor_user_id: user(1, 6),
+            },
+            NotificationKind::SyncFailed {
+                path: crate::structs::execution::notification_watch::watch_resource_path(
+                    data_group_id,
+                    data_node_id,
+                    "bucket",
+                    "prefix/",
+                ),
+                group_id: data_group_id,
+                node_id: data_node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::generate(),
+                error: "quota".to_string(),
+                actor_user_id: user(1, 6),
+            },
+        ] {
+            let record = NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                1234,
+            );
+            let bytes = record.to_bytes().unwrap();
+            assert_eq!(NotificationRecord::from_bytes(&bytes).unwrap(), record);
+        }
+    }
+
+    #[test]
+    fn inbox_keys_recipient() {
+        let r = user(1, 2);
+        let id = Ulid::generate();
+        assert!(notification_inbox_key(r, 2000, id) < notification_inbox_key(r, 1000, id));
+
+        let id_a = Ulid::from_bytes([0u8; 16]);
+        let id_b = Ulid::from_bytes([1u8; 16]);
+        let ka = notification_inbox_key(r, 1000, id_a);
+        let kb = notification_inbox_key(r, 1000, id_b);
+        assert_ne!(ka, kb);
+        assert!(ka < kb);
+    }
+
+    #[test]
+    fn inbox_key_prefixed() {
+        let a = user(1, 2);
+        let b = user(1, 3);
+        let id = Ulid::generate();
+        let ka = notification_inbox_key(a, 1000, id);
+        let kb = notification_inbox_key(b, 1000, id);
+        assert_ne!(&ka[..48], &kb[..48]);
+        assert_eq!(&ka[..48], notification_inbox_prefix(a).as_ref());
+        assert!(!ka.starts_with(notification_inbox_prefix(b).as_ref()));
+    }
+
+    #[test]
+    fn inbox_key_parser() {
+        let r = user(5, 9);
+        let ts = 1_700_000_000_000u64;
+        let id = Ulid::generate();
+        let key = notification_inbox_key(r, ts, id);
+        assert_eq!(parse_inbox_key(&key).unwrap(), (r, ts, id));
+        assert!(matches!(
+            parse_inbox_key(&key[..71]),
+            Err(ConversionError::InvalidLength(_))
+        ));
+        let mut long = key.to_vec();
+        long.push(0);
+        assert!(matches!(
+            parse_inbox_key(&long),
+            Err(ConversionError::InvalidLength(_))
+        ));
+    }
+
+    #[test]
+    fn prune_index_expiry() {
+        let r = user(1, 2);
+        let t = 1_000_000u64;
+        let transient = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Transient,
+            added(3),
+            t,
+        );
+        let direct = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            t,
+        );
+        let kt = notification_prune_key(&transient);
+        let kd = notification_prune_key(&direct);
+        assert!(kt < kd);
+        assert_eq!(
+            parse_prune_key(&kt).unwrap(),
+            (transient.expires_at_ms(), r, transient.notification_id)
+        );
+    }
+
+    #[test]
+    fn outbox_keys_ulid() {
+        assert!(
+            notification_outbox_key(Ulid::from_parts(1, 0))
+                < notification_outbox_key(Ulid::from_parts(2, 0))
+        );
+    }
+
+    #[test]
+    fn cursor_is_suffix() {
+        let r = user(1, 2);
+        let ts = 42u64;
+        let id = Ulid::generate();
+        let cursor = notification_inbox_cursor(ts, id);
+        assert_eq!(cursor.len(), 24);
+        assert_eq!(
+            cursor.as_slice(),
+            &notification_inbox_key(r, ts, id)[48..72]
+        );
+    }
+
+    #[test]
+    fn write_entries_index() {
+        let r = user(1, 2);
+        let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            r,
+            NotificationClass::Direct,
+            added(3),
+            1000,
+        );
+
+        let writes = inbox_write_entries(&record).unwrap();
+        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[0].0, NOTIFICATION_INBOX_KEYSPACE);
+        assert_eq!(
+            writes[0].1,
+            notification_inbox_key(r, record.created_at_ms, record.notification_id)
+        );
+        assert_eq!(writes[1].0, PRUNE_INDEX_KEYSPACE);
+        assert_eq!(writes[1].1, notification_prune_key(&record));
+        assert!(writes[1].2.is_empty());
+
+        let deletes = inbox_delete_entries(&record);
+        assert_eq!(deletes.len(), 2);
+        assert_eq!(deletes[0].0, NOTIFICATION_INBOX_KEYSPACE);
+        assert_eq!(
+            deletes[0].1,
+            notification_inbox_key(r, record.created_at_ms, record.notification_id)
+        );
+        assert_eq!(deletes[1].0, PRUNE_INDEX_KEYSPACE);
+        assert_eq!(deletes[1].1, notification_prune_key(&record));
+
+        let update = inbox_update_entry(&record).unwrap();
+        assert_eq!(update.0, NOTIFICATION_INBOX_KEYSPACE);
+        assert_eq!(
+            update.1,
+            notification_inbox_key(r, record.created_at_ms, record.notification_id)
+        );
+    }
+
+    #[test]
+    fn expires_at_saturates() {
+        let record = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            user(1, 2),
+            NotificationClass::Direct,
+            NotificationKind::NodeOnboarded {
+                realm_id: RealmId([1; 32]),
+                node_id: make_node_id(1),
+            },
+            u64::MAX,
+        );
+        assert_eq!(record.expires_at_ms(), u64::MAX);
+    }
+
+    #[test]
+    fn kind_categories_stable() {
+        let added = NotificationKind::AddedToGroup {
+            group_id: Ulid::generate(),
+            actor_user_id: user(1, 3),
+        };
+        let removed = NotificationKind::RemovedFromGroup {
+            group_id: Ulid::generate(),
+            actor_user_id: user(1, 3),
+        };
+        let member = NotificationKind::GroupMemberAdded {
+            group_id: Ulid::generate(),
+            member_user_id: user(1, 4),
+            actor_user_id: user(1, 3),
+        };
+        let onboarded = NotificationKind::NodeOnboarded {
+            realm_id: RealmId([1; 32]),
+            node_id: make_node_id(1),
+        };
+        let metadata_group_id = Ulid::generate();
+        let metadata_created = NotificationKind::MetadataCreated {
+            path: format!("meta/{metadata_group_id}/datasets/project/run-42"),
+            group_id: metadata_group_id,
+            document_id: Ulid::generate(),
+            actor_user_id: user(1, 5),
+        };
+        let data_group_id = Ulid::generate();
+        let data_node_id = make_node_id(2);
+        let data_uploaded = NotificationKind::DataUploaded {
+            path: crate::structs::execution::notification_watch::watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "key",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            size_bytes: 1,
+            actor_user_id: user(1, 6),
+        };
+        let sync_completed = NotificationKind::SyncCompleted {
+            path: crate::structs::execution::notification_watch::watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            relationship_id: Ulid::generate(),
+            versions_synced: 2,
+            actor_user_id: user(1, 6),
+        };
+        let sync_failed = NotificationKind::SyncFailed {
+            path: crate::structs::execution::notification_watch::watch_resource_path(
+                data_group_id,
+                data_node_id,
+                "bucket",
+                "",
+            ),
+            group_id: data_group_id,
+            node_id: data_node_id,
+            bucket: "bucket".to_string(),
+            relationship_id: Ulid::generate(),
+            error: "quota".to_string(),
+            actor_user_id: user(1, 6),
+        };
+        assert_eq!(added.category(), "group.membership");
+        assert_eq!(removed.category(), "group.membership");
+        assert_eq!(member.category(), "group.membership");
+        assert_eq!(onboarded.category(), "node.onboarding");
+        assert_eq!(metadata_created.category(), "resource.watch");
+        assert_eq!(data_uploaded.category(), "resource.watch");
+        assert_eq!(sync_completed.category(), "resource.watch");
+        assert_eq!(sync_failed.category(), "resource.watch");
+        assert_eq!(added.name(), "added_to_group");
+        assert_eq!(removed.name(), "removed_from_group");
+        assert_eq!(member.name(), "group_member_added");
+        assert_eq!(onboarded.name(), "node_onboarded");
+        assert_eq!(metadata_created.name(), "metadata_created");
+        assert_eq!(data_uploaded.name(), "data_uploaded");
+        assert_eq!(sync_completed.name(), "sync_completed");
+        assert_eq!(sync_failed.name(), "sync_failed");
+    }
+
+    #[test]
+    fn deletion_purges_notices() {
+        let (recipient, node_id, group_id) = (user(1, 2), make_node_id(3), Ulid::generate());
+        let upload = |bucket: &str, node_id| NotificationKind::ShareUpload {
+            share_id: Ulid::generate(),
+            node_id,
+            group_id,
+            bucket: bucket.to_string(),
+            key: "key".to_string(),
+            size_bytes: 1,
+        };
+        let deleted = NotificationRecord::new(
+            ulid::Ulid::generate(),
+            recipient,
+            NotificationClass::Direct,
+            NotificationKind::BucketDeleted {
+                bucket: "raw".to_string(),
+                node_id,
+                group_id,
+            },
+            100,
+        );
+        let notice = |recipient, kind, at| {
+            NotificationRecord::new(
+                ulid::Ulid::generate(),
+                recipient,
+                NotificationClass::Direct,
+                kind,
+                at,
+            )
+        };
+        assert!(deleted.purges(&notice(recipient, upload("raw", node_id), 100)));
+        // Later notices belong to a new bucket of the name; others name another bucket or user.
+        assert!(!deleted.purges(&notice(recipient, upload("raw", node_id), 101)));
+        assert!(!deleted.purges(&notice(recipient, upload("other", node_id), 50)));
+        assert!(!deleted.purges(&notice(recipient, upload("raw", make_node_id(4)), 50)));
+        assert!(!deleted.purges(&notice(user(1, 9), upload("raw", node_id), 50)));
+        assert!(!deleted.purges(&notice(recipient, added(3), 50)));
+        let upload = notice(recipient, upload("raw", node_id), 50);
+        assert!(!upload.purges(&upload.clone()));
+    }
+}

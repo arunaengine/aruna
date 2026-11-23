@@ -1,0 +1,219 @@
+//! REST contracts for scoped keys, per-version envelopes and pinned downloads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+mod content;
+pub(crate) mod records;
+use crate::auth::RealmAuth;
+use crate::auth::ValidatedBearer;
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::routes::storage::relay::{RestRead, holder_json, missed_json};
+use crate::server::state::ServerState;
+use aruna_core::bucket_read::GetBucketOperation;
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::abe::{AbeError, AbeParameters, EnvelopeArchive, ObjectEnvelope};
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_ops_identity::abe::envelope::EnvelopeOperation;
+use aruna_ops_identity::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
+use aruna_runner::driver::{DriverContext, drive, drive_retry};
+use axum::extract::{Query, State};
+use axum::{Extension, Json};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use http::{HeaderMap, StatusCode};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::Arc;
+use ulid::Ulid;
+use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::new()
+        .routes(routes!(envelope))
+        .routes(routes!(content::content))
+        .merge(records::router())
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct EnvelopeView {
+    pub version_id: String,
+    pub context: Value,
+    pub parameters: Value,
+    pub envelope: Value,
+}
+#[derive(Deserialize, ToSchema)]
+pub struct VersionQuery {
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+}
+
+fn abe_error(error: AbeError) -> ServerError {
+    let (status, code) = match error {
+        AbeError::WrongKey => (StatusCode::FORBIDDEN, "wrong_object_key"),
+        AbeError::Pending => (StatusCode::CONFLICT, "envelope_pending"),
+        AbeError::Required => (StatusCode::LOCKED, "object_key_required"),
+        AbeError::Parameters => (StatusCode::CONFLICT, "parameter_mismatch"),
+        AbeError::Epoch => (StatusCode::CONFLICT, "stale_epoch"),
+        AbeError::Context => (StatusCode::CONFLICT, "stale_version"),
+        AbeError::Stale => (StatusCode::CONFLICT, "stale_request"),
+        AbeError::Scope => (StatusCode::UNPROCESSABLE_ENTITY, "scope_unsupported"),
+        AbeError::Limit => (StatusCode::PAYLOAD_TOO_LARGE, "encryption_limit"),
+        AbeError::Crypto => (StatusCode::INTERNAL_SERVER_ERROR, "encryption_failed"),
+        AbeError::Missing => return ServerError::NotFound,
+        AbeError::Unavailable => return ServerError::ServiceUnavailable,
+    };
+    ServerError::Refused(status, code, error.to_string())
+}
+/// Runs a key action, rerunning it from the start after a transaction conflict.
+pub(crate) async fn drive_key(
+    bucket: String,
+    auth: AuthContext,
+    node: aruna_core::id::NodeId,
+    action: KeyAction,
+    context: &DriverContext,
+) -> Result<KeyResult, KeyError> {
+    let seed = Ulid::generate().to_bytes();
+    let build = || {
+        let now = aruna_clock::unix_timestamp_millis();
+        KeyOperation::new(bucket.clone(), auth.clone(), node, action.clone(), now)
+    };
+    drive_retry(build, context, &seed).await
+}
+pub(crate) fn key_error(error: KeyError) -> ServerError {
+    let message = error.to_string();
+    match error {
+        KeyError::Abe(e) => abe_error(e),
+        KeyError::Missing => ServerError::NotFound,
+        KeyError::Denied => ServerError::Forbidden,
+        KeyError::Storage | KeyError::Conflict | KeyError::Unprepared => {
+            ServerError::ServiceUnavailable
+        }
+        KeyError::Busy => ServerError::Refused(StatusCode::CONFLICT, "rekey_running", message),
+        KeyError::Locked => ServerError::Refused(StatusCode::CONFLICT, "bucket_locked", message),
+        KeyError::Bound(_) => {
+            ServerError::Refused(StatusCode::PAYLOAD_TOO_LARGE, "enumeration_limit", message)
+        }
+        KeyError::Unfinished => {
+            ServerError::Refused(StatusCode::CONFLICT, "rekey_pending", message)
+        }
+        KeyError::Session => ServerError::Refused(StatusCode::CONFLICT, "session_policy", message),
+    }
+}
+fn parameter_view(p: &AbeParameters, epoch: u64) -> ServerResult<Value> {
+    Ok(
+        json!({"realm_id":p.realm_id.to_string(), "node_id":p.node_id.to_string(),
+        "bucket_id":p.key.bucket_id.to_string(), "generation":p.key.generation,
+        "fingerprint":STANDARD.encode(p.fingerprint), "parameters":STANDARD.encode(&p.parameters),
+        "epoch":epoch, "context":STANDARD.encode(p.context().map_err(abe_error)?)}),
+    )
+}
+async fn authorize_version(
+    state: &ServerState,
+    auth: &AuthContext,
+    query: &VersionQuery,
+) -> ServerResult<(Ulid, BucketInfo)> {
+    let ctx = state.get_ctx();
+    let info = drive(GetBucketOperation::new(query.bucket.clone()), &ctx)
+        .await
+        .map_err(|_| ServerError::NotFound)?;
+    let path = aruna_core::structs::storage::blob::object_permission_path(
+        auth.realm_id,
+        info.group_id,
+        state.get_node_id(),
+        &query.bucket,
+        &query.key,
+    );
+    crate::auth::ensure_permission(state, auth, path, Permission::READ).await?;
+    let version = Ulid::from_string(&query.version_id).map_err(|_| ServerError::BadRequest)?;
+    Ok((version, info))
+}
+/// `route` for the same pinned version on a holder.
+fn version_path(route: &str, query: &VersionQuery) -> String {
+    let pairs = [
+        ("bucket", query.bucket.as_str()),
+        ("key", &query.key),
+        ("version_id", &query.version_id),
+    ];
+    crate::routes::storage::relay::query_path(route, &pairs)
+}
+async fn read_envelope(
+    state: &ServerState,
+    query: &VersionQuery,
+    version: Ulid,
+) -> ServerResult<(ObjectEnvelope, EnvelopeArchive)> {
+    let operation = EnvelopeOperation::new(query.bucket.clone(), query.key.clone(), version);
+    drive(operation, &state.get_ctx()).await.map_err(abe_error)
+}
+
+#[utoipa::path(get, path = "/data/blobs/envelope", tag = "data/blobs",
+    summary = "Read a version envelope",
+    description = r#"Returns the envelope of one pinned object version.
+
+**Authentication**: READ on the exact object, including realm and group request policies.
+
+**Behavior**
+- Binary fields use padded base64; version ids use ULIDs.
+- A same-bucket copy made while the bucket is locked answers 409 until the next unlock writes
+  its envelope. Copies from other buckets have no envelope and require bucket unlock.
+- A member of a distributed bucket that keeps no records of the key's range relays the call to
+  a holder with the caller's token."#,
+    params(("bucket" = String, Query, description = "Node-local S3 bucket name"), ("key" = String, Query, description = "Literal object key"), ("version_id" = String, Query, description = "Pinned version ULID")),
+    responses((status = 200, body = EnvelopeView, description = "Envelope of the exact authorized version", example = json!({"version_id":"01JABCDEF0123456789ABCDEFG","context":{},"parameters":{},"envelope":{}})),
+        (status = 400, body = ErrorResponse, description = "Malformed version"), (status = 401, body = ErrorResponse, description = "Bearer token required"),
+        (status = 403, body = ErrorResponse, description = "READ refused"), (status = 404, body = ErrorResponse, description = "Version missing"), (status = 409, body = ErrorResponse, description = "Envelope pending or stale version"),
+        (status = 503, body = ErrorResponse, description = "Storage unavailable, or no holder of the key's range answered")), security(("bearer_auth" = [])))]
+pub async fn envelope(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: HeaderMap,
+    Query(query): Query<VersionQuery>,
+) -> ServerResult<Json<EnvelopeView>> {
+    let (version, info) = authorize_version(&state, &auth, &query).await?;
+    let path = version_path("/data/blobs/envelope", &query);
+    let relayed = RestRead {
+        info: &info,
+        key: &query.key,
+        headers: &headers,
+        path: &path,
+        bearer: bearer.as_ref(),
+    };
+    if let Some(answer) = holder_json(&state, &relayed).await? {
+        return Ok(Json(answer));
+    }
+    let read = read_envelope(&state, &query, version).await;
+    if matches!(read, Err(ServerError::NotFound))
+        && let Some(answer) = missed_json(&state, &relayed).await?
+    {
+        return Ok(Json(answer));
+    }
+    let (envelope, _) = read?;
+    let c = &envelope.context;
+    let context = json!({"realm_id":c.parameters.realm_id.to_string(), "node_id":c.parameters.node_id.to_string(),
+        "bucket_id":c.parameters.key.bucket_id.to_string(), "generation":c.parameters.key.generation,
+        "fingerprint":STANDARD.encode(c.parameters.fingerprint), "epoch":c.epoch, "object_key":c.object_key,
+        "write_id":c.write_id.to_string(), "public_key":STANDARD.encode(c.public_key),
+        "bytes":STANDARD.encode(c.bytes().map_err(abe_error)?)});
+    Ok(Json(EnvelopeView {
+        version_id: query.version_id,
+        parameters: parameter_view(&c.parameters, c.epoch)?,
+        context,
+        envelope: json!({"abe":STANDARD.encode(&envelope.abe),"recovery_enc":STANDARD.encode(envelope.recovery_enc),
+            "recovery_ciphertext":STANDARD.encode(&envelope.recovery_ciphertext)}),
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aruna_core::calls::IoError;
+
+    #[test]
+    fn storage_unavailable_maps() {
+        let timeout = IoError::Storage(aruna_core::errors::StorageError::Timeout);
+        let error = AbeError::from(timeout);
+        assert_eq!(error, AbeError::Unavailable);
+        assert!(matches!(abe_error(error), ServerError::ServiceUnavailable));
+    }
+}

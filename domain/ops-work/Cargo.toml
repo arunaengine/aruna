@@ -1,0 +1,77 @@
+# Manifest of aruna-ops-work, the work-layer operations and trigger table crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-ops-work"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Pure test fixtures for the tests of other crates; only dev-dependencies enable it.
+test-hooks = [
+    "aruna-core/test-hooks",
+    "aruna-ops-identity/test-hooks",
+    "aruna-ops-data/test-hooks",
+]
+
+[dependencies]
+aruna-core = { workspace = true }
+aruna-ops-data = { workspace = true }
+aruna-ops-identity = { workspace = true }
+aruna-plugin-contract = { workspace = true }
+base64 = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+byteview = { workspace = true }
+chrono = { workspace = true }
+craqle = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+iroh = { workspace = true }
+irokle = { workspace = true }
+md5 = { workspace = true }
+oxrdf = { workspace = true }
+oxttl = { workspace = true }
+percent-encoding = { workspace = true }
+postcard = { workspace = true }
+quick-xml = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
+aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-runner = { workspace = true, features = ["test-hooks"] }
+aruna-rdf-graph = { workspace = true }
+aruna-p2p = { workspace = true, features = ["test-hooks"] }
+aruna-ops-work = { workspace = true, features = ["test-hooks"] }
+aruna-ops-data = { workspace = true, features = ["test-hooks"] }
+aruna-ops-identity = { workspace = true, features = ["test-hooks"] }
+aruna-egress = { workspace = true }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+aruna-scheduler = { workspace = true }
+aruna-test-harness = { workspace = true }
+async-trait = { workspace = true }
+async_zip = { workspace = true }
+axum = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-util = { workspace = true }
+globset = { workspace = true }
+proptest = { workspace = true }
+rand = { workspace = true }
+reqwest = { workspace = true }
+spareval = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util = { workspace = true }
+zip = { workspace = true }

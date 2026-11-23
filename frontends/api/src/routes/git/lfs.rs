@@ -1,0 +1,176 @@
+//! Native Git LFS batch negotiation and streamed object transfers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::{base_url, repository_id};
+use crate::auth::RealmAuth;
+use crate::error::{ServerError, ServerResult};
+use crate::server::state::ServerState;
+use aruna_core::git::LfsObject;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_ops_data::git::{self, GitError};
+use aruna_runner::driver::{drive, node_routing};
+use axum::Json;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde_json::{Value, json};
+use std::sync::Arc;
+
+const MEDIA: &str = "application/vnd.git-lfs+json";
+
+#[utoipa::path(post, path = "/git/{repository}/info/lfs/objects/batch", tag = "metadata/git",
+    security(("bearer_auth" = []), ("basic_auth" = [])),
+    summary = "Negotiate native LFS transfers",
+    description = "Negotiates basic Git LFS transfers using SHA-256 identities.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and object-path READ or WRITE.\n\n**Behavior**: individual failures are reported per object.",
+    params(("repository" = String, Path, description = "Document ID followed by .git")),
+    request_body(content = Value, content_type = "application/vnd.git-lfs+json",
+                 example = json!({"operation":"download","transfers":["basic"],"objects":[{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":42}]})),
+    responses((status = 200, description = "LFS batch actions", body = Value, content_type = "application/vnd.git-lfs+json",
+               example = json!({"transfer":"basic","objects":[{"oid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":42,"error":{"code":404,"message":"object not found"}}]})),
+              (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
+pub async fn batch(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Path(repository): Path<String>,
+    Json(body): Json<Value>,
+) -> ServerResult<Response> {
+    let id = repository_id(&repository)?;
+    let operation = body["operation"].as_str().ok_or(ServerError::BadRequest)?;
+    let permission = match operation {
+        "upload" => Permission::WRITE,
+        "download" => Permission::READ,
+        _ => return Err(ServerError::BadRequest),
+    };
+    if body.get("hash_algo").is_some_and(|value| value != "sha256") {
+        return Err(ServerError::BadRequest);
+    }
+    if body.get("transfers").is_some_and(|value| {
+        !value
+            .as_array()
+            .is_some_and(|values| values.iter().any(|value| value == "basic"))
+    }) {
+        return Err(ServerError::BadRequest);
+    }
+    drive(
+        git::access::repository(state.get_ctx().node_id(), &auth, id, permission.clone()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(ServerError::from)?;
+    let objects: Vec<LfsObject> =
+        serde_json::from_value(body["objects"].clone()).map_err(|_| ServerError::BadRequest)?;
+    if objects.len() > 1000 {
+        return Err(ServerError::BadRequest);
+    }
+    let base = base_url(&state, id).await?;
+    let mut output = Vec::new();
+    for object in objects {
+        if !object.valid() || object.size > state.rocrate_limits().import_source_bytes {
+            return Err(ServerError::BadRequest);
+        }
+        let mut item = json!({"oid": object.oid, "size": object.size});
+        match drive(
+            git::lfs::inspect(
+                state.get_ctx().node_id(),
+                &auth,
+                id,
+                &object,
+                permission.clone(),
+            ),
+            &state.get_ctx(),
+        )
+        .await
+        {
+            Ok(Some(_)) if operation == "upload" => {}
+            Ok(None) if operation == "download" => {
+                item["error"] = json!({"code":404,"message":"object not found"});
+            }
+            Ok(_) => {
+                item["actions"] =
+                    json!({operation: {"href": format!("{base}/info/lfs/objects/{}", object.oid)}});
+            }
+            Err(error) => {
+                let code = match error {
+                    GitError::Invalid => 422,
+                    other => ServerError::from(other).into_response().status().as_u16(),
+                };
+                item["error"] = json!({"code":code,"message":"object unavailable"});
+            }
+        }
+        output.push(item);
+    }
+    Ok((
+        [(header::CONTENT_TYPE, MEDIA)],
+        Json(json!({"transfer":"basic","objects":output})),
+    )
+        .into_response())
+}
+
+#[utoipa::path(put, path = "/git/{repository}/info/lfs/objects/{oid}", tag = "metadata/git",
+    security(("bearer_auth" = []), ("basic_auth" = [])),
+    summary = "Upload a native LFS object",
+    description = "Uploads and verifies one Git LFS object.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and destination-object WRITE.\n\n**Behavior**: the transfer uses Aruna quota, routing and checksum operations. SHA-256 and Content-Length must match before publication.",
+    params(("repository" = String, Path, description = "Document ID followed by .git"), ("oid" = String, Path, description = "Lowercase SHA-256")),
+    responses((status = 200, description = "Verified object stored"), (status = 400, description = "Invalid content"),
+              (status = 401, description = "Authentication required"), (status = 403, description = "Access denied")))]
+pub async fn upload(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Path((repository, oid)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> ServerResult<StatusCode> {
+    let size: u64 = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .ok_or(ServerError::BadRequest)?
+        .parse()
+        .map_err(|_| ServerError::BadRequest)?;
+    if size > state.rocrate_limits().import_source_bytes {
+        return Err(ServerError::PayloadTooLarge(
+            "LFS object exceeds limit".into(),
+        ));
+    }
+    drive(
+        git::lfs::upload(
+            (state.get_ctx().node_id(), node_routing(&state.get_ctx())),
+            &auth,
+            repository_id(&repository)?,
+            LfsObject { oid, size },
+            crate::routes::rocrate_import::upload_body_stream(
+                body,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3600),
+            ),
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(ServerError::from)?;
+    Ok(StatusCode::OK)
+}
+
+#[utoipa::path(get, path = "/git/{repository}/info/lfs/objects/{oid}", tag = "metadata/git",
+    security(("bearer_auth" = []), ("basic_auth" = [])),
+    summary = "Download an exact native LFS version",
+    description = "Downloads the exact Aruna version bound to an LFS identity.\n\n**Authentication**: Aruna bearer token, directly or as an HTTP Basic password, with repository and source-object READ.\n\n**Behavior**: changing the S3 key head does not change the recorded LFS payload. Content stored on another node is relayed from that node; this node keeps no copy.",
+    params(("repository" = String, Path, description = "Document ID followed by .git"), ("oid" = String, Path, description = "Lowercase SHA-256")),
+    responses((status = 200, description = "LFS bytes", content_type = "application/octet-stream"),
+              (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
+              (status = 404, description = "Object missing")))]
+pub async fn download(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Path((repository, oid)): Path<(String, String)>,
+) -> ServerResult<Response> {
+    let context = state.get_ctx();
+    let id = repository_id(&repository)?;
+    let read = git::download::download(context.node_and_realm(), &auth, id, &oid);
+    let (blob, size) = drive(read, &context).await.map_err(ServerError::from)?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, size)
+        .body(Body::from_stream(blob))
+        .map_err(|_| ServerError::ServiceUnavailable)
+}

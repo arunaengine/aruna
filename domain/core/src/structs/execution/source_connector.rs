@@ -1,0 +1,416 @@
+//! Data source connector kinds with their stored config record and secret record.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::compute::SecretBytes;
+use crate::errors::ConversionError;
+use crate::node::vault::{VaultEntry, VaultPurpose};
+use crate::structs::execution::source_access::SOURCE_WEIGHT;
+use crate::types::GroupId;
+use crate::user::id::UserId;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use std::time::SystemTime;
+use ulid::Ulid;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SourceConnectorKind {
+    Http,
+    S3,
+    Webdav,
+    Ftp,
+    ArunaNative,
+    /// A directory the owner offers from their own device. It resolves only on
+    /// that device, against a registration the device stores locally.
+    LocalDirectory,
+    /// A file of an Invenio record read through a repository connector. It is
+    /// only created by reference imports, never registered as a source connector.
+    Invenio,
+    /// A link to one exact Aruna version elsewhere. Every read is authorized at the target for
+    /// the caller; the link itself grants nothing.
+    ArunaLink,
+}
+
+impl SourceConnectorKind {
+    /// Whether a read sent with `If-Match` fails when the source no longer holds that ETag:
+    /// S3 does, while HTTP servers may ignore the condition and other sources have none.
+    pub const fn enforces_if_match(self) -> bool {
+        matches!(self, Self::S3)
+    }
+
+    /// Whether the source lists a whole prefix flat and resumes after a key, so an import walks
+    /// it with one provider cursor instead of a directory queue.
+    pub const fn lists_flat(self) -> bool {
+        matches!(self, Self::S3)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::S3 => "s3",
+            Self::Webdav => "webdav",
+            Self::Ftp => "ftp",
+            Self::ArunaNative => "aruna_native",
+            Self::LocalDirectory => "local_directory",
+            Self::Invenio => "invenio",
+            Self::ArunaLink => "aruna_link",
+        }
+    }
+}
+
+impl fmt::Display for SourceConnectorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceConnector {
+    pub connector_id: Ulid,
+    pub group_id: GroupId,
+    pub name: String,
+    pub kind: SourceConnectorKind,
+    pub public_config: HashMap<String, String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    pub created_by: UserId,
+    /// The [`source_namespace`] of the stored credentials, copied into every reference.
+    pub namespace: Option<String>,
+}
+
+const NAMESPACE_DOMAIN: &[u8] = b"aruna-source-namespace-v1";
+
+/// A portable digest of the principal a connector logs in as, for kinds where the login
+/// selects the namespace that paths resolve in. `None` without a principal.
+pub fn source_namespace(
+    kind: SourceConnectorKind,
+    secret_config: &HashMap<String, String>,
+) -> Option<String> {
+    let field = match kind {
+        SourceConnectorKind::Http | SourceConnectorKind::Webdav => "username",
+        SourceConnectorKind::Ftp => "user",
+        SourceConnectorKind::S3 => "access_key_id",
+        SourceConnectorKind::ArunaNative => "access_key",
+        SourceConnectorKind::LocalDirectory
+        | SourceConnectorKind::Invenio
+        | SourceConnectorKind::ArunaLink => return None,
+    };
+    let principal = secret_config.get(field).filter(|value| !value.is_empty())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(NAMESPACE_DOMAIN);
+    hasher.update(kind.as_str().as_bytes());
+    hasher.update(&[0]);
+    hasher.update(principal.as_bytes());
+    Some(hasher.finalize().to_hex().to_string())
+}
+
+impl SourceConnector {
+    /// The URL an HTTP or WebDAV connector's paths are below, ending with `/`.
+    pub fn base_url(&self) -> Option<String> {
+        if !matches!(
+            self.kind,
+            SourceConnectorKind::Http | SourceConnectorKind::Webdav
+        ) {
+            return None;
+        }
+        let endpoint = self.public_config.get("endpoint")?.trim_end_matches('/');
+        let root = (self.public_config.get("root")).map_or("", |root| root.trim_matches('/'));
+        Some(match root.is_empty() {
+            true => format!("{endpoint}/"),
+            false => format!("{endpoint}/{root}/"),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        connector_id: Ulid,
+        group_id: GroupId,
+        name: String,
+        kind: SourceConnectorKind,
+        public_config: HashMap<String, String>,
+        created_at: SystemTime,
+        updated_at: SystemTime,
+        created_by: UserId,
+    ) -> Self {
+        Self {
+            connector_id,
+            group_id,
+            name,
+            kind,
+            public_config,
+            created_at,
+            updated_at,
+            created_by,
+            namespace: None,
+        }
+    }
+
+    /// The public settings that name the source; the weight hint is not one, so changing it
+    /// never makes the connector another source.
+    pub fn source_config(&self) -> HashMap<String, String> {
+        let mut config = self.public_config.clone();
+        config.remove(SOURCE_WEIGHT);
+        config
+    }
+
+    /// Records the namespace the stored credentials select.
+    pub fn with_namespace(mut self, secret_config: &HashMap<String, String>) -> Self {
+        self.namespace = source_namespace(self.kind, secret_config);
+        self
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+/// Credentials of a source or repository connector, split from the public record so the public
+/// projection never carries a secret.
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SourceConnectorSecret {
+    pub connector_id: Ulid,
+    pub secret_config: HashMap<String, String>,
+    pub updated_at: SystemTime,
+}
+
+/// Shows only the secret keys; the values are live credentials.
+impl fmt::Debug for SourceConnectorSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceConnectorSecret")
+            .field("connector_id", &self.connector_id)
+            .field("keys", &self.secret_config.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl SourceConnectorSecret {
+    pub fn new(
+        connector_id: Ulid,
+        secret_config: HashMap<String, String>,
+        updated_at: SystemTime,
+    ) -> Option<Self> {
+        if secret_config.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            connector_id,
+            secret_config,
+            updated_at,
+        })
+    }
+
+    /// The node vault record that holds the secret config of `connector_id`.
+    pub fn vault_entry(connector_id: Ulid) -> VaultEntry {
+        VaultEntry::new(VaultPurpose::SourceConnector, connector_id)
+    }
+
+    pub fn to_secret(&self) -> Result<SecretBytes, ConversionError> {
+        Ok(SecretBytes::new(self.to_bytes()?))
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
+
+    fn test_user_id(seed: u8) -> UserId {
+        UserId::local(Ulid::from_bytes([seed; 16]), RealmId([seed; 32]))
+    }
+
+    #[test]
+    fn weight_names_nothing() {
+        // Sources bound through a connector stay one source whatever weight it gets later.
+        let endpoint = ("endpoint".to_string(), "https://a.example.org".to_string());
+        let weighted = HashMap::from([endpoint.clone(), (SOURCE_WEIGHT.to_string(), "5".into())]);
+        let connector = |config| {
+            let time = SystemTime::UNIX_EPOCH;
+            let kind = SourceConnectorKind::Http;
+            let name = "a".to_string();
+            SourceConnector::new(
+                Ulid::nil(),
+                Ulid::nil(),
+                name,
+                kind,
+                config,
+                time,
+                time,
+                test_user_id(1),
+            )
+        };
+        let plain = connector(HashMap::from([endpoint])).source_config();
+        assert_eq!(connector(weighted).source_config(), plain);
+    }
+
+    #[test]
+    fn debug_hides_secrets() {
+        let secret = SourceConnectorSecret::new(
+            Ulid::from_bytes([1u8; 16]),
+            HashMap::from([("token".to_string(), "canary-7f3a".to_string())]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+
+        let rendered = format!("{secret:?}");
+
+        assert!(!rendered.contains("canary-7f3a"));
+        assert!(rendered.contains("token"));
+    }
+
+    #[test]
+    fn empty_secret_none() {
+        assert!(
+            SourceConnectorSecret::new(
+                Ulid::from_bytes([4u8; 16]),
+                HashMap::new(),
+                SystemTime::UNIX_EPOCH,
+            )
+            .is_none()
+        );
+    }
+
+    // Table rows name URLs; they resolve below the endpoint and root, S3 has no base URL.
+    #[test]
+    fn base_joins_root() {
+        let config = HashMap::from([
+            (
+                "endpoint".to_string(),
+                "https://ftp.ncbi.nlm.nih.gov/".to_string(),
+            ),
+            ("root".to_string(), "/genomes/".to_string()),
+        ]);
+        let (id, user) = (Ulid::from_bytes([1u8; 16]), test_user_id(3));
+        let at = SystemTime::UNIX_EPOCH;
+        let http = SourceConnector::new(
+            id,
+            id,
+            "ncbi".into(),
+            SourceConnectorKind::Http,
+            config,
+            at,
+            at,
+            user,
+        );
+        let base = http.base_url();
+        assert_eq!(
+            base.as_deref(),
+            Some("https://ftp.ncbi.nlm.nih.gov/genomes/")
+        );
+        let s3 = SourceConnector {
+            kind: SourceConnectorKind::S3,
+            ..http
+        };
+        assert_eq!(s3.base_url(), None);
+    }
+
+    #[test]
+    fn source_connector_config() {
+        let connector = SourceConnector::new(
+            Ulid::from_bytes([1u8; 16]),
+            Ulid::from_bytes([2u8; 16]),
+            "refdata".to_string(),
+            SourceConnectorKind::S3,
+            HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.com".to_string()),
+                ("region".to_string(), "eu-central-1".to_string()),
+            ]),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            test_user_id(3),
+        );
+
+        let restored = SourceConnector::from_bytes(&connector.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(connector, restored);
+        assert_eq!(restored.kind, SourceConnectorKind::S3);
+    }
+
+    #[test]
+    fn empty_secret_record() {
+        let secret = SourceConnectorSecret::new(
+            Ulid::from_bytes([4u8; 16]),
+            HashMap::new(),
+            SystemTime::UNIX_EPOCH,
+        );
+
+        assert!(secret.is_none());
+    }
+
+    #[test]
+    fn public_record_redacted() {
+        let connector = SourceConnector::new(
+            Ulid::from_bytes([5u8; 16]),
+            Ulid::from_bytes([6u8; 16]),
+            "webdav".to_string(),
+            SourceConnectorKind::Webdav,
+            HashMap::from([(
+                "endpoint".to_string(),
+                "https://webdav.example.com".to_string(),
+            )]),
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            test_user_id(7),
+        );
+        let secret = SourceConnectorSecret::new(
+            connector.connector_id,
+            HashMap::from([
+                ("username".to_string(), "alice".to_string()),
+                ("password".to_string(), "super-secret".to_string()),
+            ]),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+
+        let public_bytes = connector.to_bytes().unwrap();
+        let secret_bytes = secret.to_bytes().unwrap();
+
+        assert!(
+            !public_bytes
+                .windows("super-secret".len())
+                .any(|window| window == b"super-secret")
+        );
+        assert!(
+            secret_bytes
+                .windows("super-secret".len())
+                .any(|window| window == b"super-secret")
+        );
+    }
+
+    #[test]
+    fn namespace_follows_principal() {
+        let login = |user: &str, password: &str| {
+            let secret = HashMap::from([
+                ("user".to_string(), user.to_string()),
+                ("password".to_string(), password.to_string()),
+            ]);
+            source_namespace(SourceConnectorKind::Ftp, &secret)
+        };
+        assert_eq!(
+            login("alice", "one"),
+            login("alice", "two"),
+            "a new password"
+        );
+        assert_ne!(login("alice", "one"), login("bob", "one"));
+        assert!(!login("alice", "one").unwrap().contains("alice"));
+        assert_eq!(
+            source_namespace(SourceConnectorKind::S3, &HashMap::new()),
+            None
+        );
+    }
+}

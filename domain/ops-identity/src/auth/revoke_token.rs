@@ -1,0 +1,1419 @@
+//! Appends a bearer token hash to the realm revocation set so every node denies it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::admin_documents::{AdminDocumentOperation, AdminDocumentTarget};
+use aruna_core::auth::{
+    revocation_live, revocation_retained, user_cutoff_expiry, user_cutoff_hash,
+    valid_revocation_expiry, valid_token_hash,
+};
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord, DocumentTarget};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::id_mint::IdMint;
+use aruna_core::keyspaces::{DOCUMENT_STATE_KEYSPACE, OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
+use aruna_core::operation::{Operation, TransactionMode};
+use aruna_core::reducer::revocation::REVOCATIONS_PER_ORIGIN;
+use aruna_core::reducer::{AdminDocumentError, AdminDocumentState, RevocationIndex};
+use aruna_core::rows::PrefixPages;
+use aruna_core::storage_entries::{
+    conflict_write_entries, reducer_state_entry, reducer_state_key, stale_conflict_deletes,
+};
+use aruna_core::structs::identity::auth::Actor;
+use aruna_core::structs::identity::realm::RealmConfigDocument;
+use aruna_core::types::{Key, KeySpace, Value};
+use aruna_core::user::id::UserId;
+use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
+use ulid::Ulid;
+
+use crate::auth::epoch_due::DueMarks;
+use crate::sync::outbox::record::{admin_outbox_prefix, revocation_index_entry};
+use crate::sync::outbox::record::{
+    new_identified_record, outbox_write_entry, schedule_drain_effect,
+};
+use aruna_core::placement::target_placement_ref;
+
+const PRIVILEGED_REVOCATION_RESERVE: usize = 128;
+const REVOCATION_CAP: usize = REVOCATIONS_PER_ORIGIN - PRIVILEGED_REVOCATION_RESERVE;
+const OWNER_CAP: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeTokenAdmission {
+    SelfService,
+    Privileged,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevokeTokenConfig {
+    pub actor: Actor,
+    /// Hash of the revoked bearer token; the token never enters replicated state.
+    pub token_hash: String,
+    /// The revoked token's own expiry, which bounds how long the entry is kept.
+    pub expires_at: u64,
+    /// Verified subject of the revoked bearer token.
+    pub token_owner: UserId,
+    /// Immutable request class derived from the authenticated actor and owner.
+    pub admission: RevokeTokenAdmission,
+    /// Current unix seconds, used to prune revocations that expired.
+    pub now: u64,
+}
+
+/// Moves `owner`'s token cutoff past `issued_at` on behalf of `actor`.
+pub fn owner_cutoff(actor: Actor, owner: UserId, issued_at: u64, now: u64) -> RevokeTokenConfig {
+    RevokeTokenConfig {
+        token_hash: user_cutoff_hash(&owner),
+        expires_at: user_cutoff_expiry(issued_at.saturating_add(1)),
+        token_owner: owner,
+        admission: RevokeTokenAdmission::Privileged,
+        actor,
+        now,
+    }
+}
+
+/// Appends one bearer token hash to the realm's revocation set. Rides the admin document
+/// machinery of the other realm config settings, so the revocation replicates realm-wide instead
+/// of denying the token on this node only. The write runs in a transaction of its own.
+#[derive(Debug, PartialEq)]
+pub struct RevokeTokenOperation {
+    config: RevokeTokenConfig,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum RevokeTokenError {
+    #[error(transparent)]
+    StorageError(#[from] StorageError),
+    #[error(transparent)]
+    ConversionError(#[from] ConversionError),
+    #[error(transparent)]
+    AdminDocumentError(#[from] AdminDocumentError),
+    #[error("realm config document missing")]
+    ConfigMissing,
+    #[error("revoked bearer token hash is malformed")]
+    InvalidTokenHash,
+    #[error("revoked bearer token expiry is outside the supported window")]
+    InvalidTokenExpiry,
+    #[error("token revocation capacity reached")]
+    CapacityReached,
+    #[error("operation did not finish")]
+    NotFinished,
+    #[error("unexpected event in state {state:?}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: &'static str,
+    },
+}
+
+impl From<IoError> for RevokeTokenError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::StorageError(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::StorageError(error),
+            IoError::Unexpected { expected, got } => Self::UnexpectedEvent {
+                state: "RevokeToken".to_string(),
+                expected,
+                got,
+            },
+            IoError::Aborted | IoError::Hung { .. } | IoError::Unfinished | IoError::Codec(_) => {
+                Self::NotFinished
+            }
+        }
+    }
+}
+
+impl RevokeTokenOperation {
+    pub fn new(config: RevokeTokenConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl Operation for RevokeTokenOperation {
+    type Output = RealmConfigDocument;
+    type Error = RevokeTokenError;
+
+    fn first(&mut self) -> Result<Next<RealmConfigDocument>, RevokeTokenError> {
+        let write = RevocationWrite::new(self.config.clone());
+        Ok(Next::Call(IoCall::child(write)))
+    }
+
+    /// A capacity refusal still committed the canonical set, so it ends the run only now.
+    fn next(&mut self, result: IoResult) -> Result<Next<RealmConfigDocument>, RevokeTokenError> {
+        let revoked = result.child::<Revoked, RevokeTokenError>()??;
+        revoked.result().map(Next::Done)
+    }
+}
+
+/// What a revocation wrote: the realm config, whether an admin event reached the outbox, whether
+/// the user's cutoff moved, and whether capacity refused the revocation.
+#[derive(Debug, PartialEq)]
+pub struct Revoked {
+    pub document: RealmConfigDocument,
+    pub outbox: bool,
+    pub cutoff_raised: bool,
+    pub refused: bool,
+}
+
+impl Revoked {
+    /// The realm config, or the capacity refusal.
+    pub fn result(self) -> Result<RealmConfigDocument, RevokeTokenError> {
+        match self.refused {
+            true => Err(RevokeTokenError::CapacityReached),
+            false => Ok(self.document),
+        }
+    }
+}
+
+/// Runs a [`Revocation`] in its own write transaction, marks key epochs due when the user's
+/// cutoff moved, and wakes the outbox drain after the commit.
+#[derive(Debug, PartialEq)]
+struct RevocationWrite {
+    revocation: Revocation,
+    marks: Option<DueMarks>,
+    revoked: Option<Revoked>,
+    now_ms: u64,
+    ids: IdMint,
+}
+
+impl RevocationWrite {
+    fn new(config: RevokeTokenConfig) -> Self {
+        Self {
+            revocation: Revocation::new(config),
+            marks: None,
+            revoked: None,
+            now_ms: 0,
+            ids: IdMint::default(),
+        }
+    }
+
+    /// A failed drain timer leaves the durable outbox retryable.
+    fn finish(&mut self) -> Result<Next<Revoked>, RevokeTokenError> {
+        let output = self.revoked.take().ok_or(RevokeTokenError::NotFinished)?;
+        if !output.outbox {
+            return Ok(Next::Done(output));
+        }
+        let calls = vec![IoCall::Effect(Box::new(schedule_drain_effect()))];
+        Ok(Next::Then { output, calls })
+    }
+}
+
+impl Operation for RevocationWrite {
+    type Output = Revoked;
+    type Error = RevokeTokenError;
+
+    fn seed(&mut self, entropy: u128) {
+        self.ids = IdMint::new(entropy);
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn first(&mut self) -> Result<Next<Revoked>, RevokeTokenError> {
+        self.revocation.set_event(self.ids.mint(self.now_ms));
+        Ok(Next::Call(self.revocation.first()))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Revoked>, RevokeTokenError> {
+        if let Some(marks) = &mut self.marks {
+            return match marks.next(result, true) {
+                Ok(Some(call)) => Ok(Next::Call(call)),
+                Ok(None) => self.finish(),
+                Err(error) => Err(StorageError::WriteError(error.to_string()).into()),
+            };
+        }
+        if let Some(call) = self.revocation.next(result)? {
+            return Ok(Next::Call(call));
+        }
+        let revoked = self.revocation.outcome()?;
+        // A new or later user cutoff ends READ for the account, so its buckets need new epochs.
+        if revoked.outbox && revoked.cutoff_raised {
+            let marks = DueMarks::new(None, self.now_ms);
+            let first = marks.first();
+            self.marks = Some(marks);
+            self.revoked = Some(revoked);
+            return Ok(Next::Call(first));
+        }
+        self.revoked = Some(revoked);
+        self.finish()
+    }
+}
+
+/// What a revocation waits for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Stage {
+    Read,
+    Capacity,
+    Records,
+    PendingDelete,
+    Write,
+    StaleDelete,
+    Done,
+}
+
+/// The reads and writes of one revocation, run in the transaction of whoever folds them in: the
+/// realm config and its admin state, this node's pending outbox revocations for the capacity, then
+/// the revocation and the canonical set. A merge folds it into its own transaction.
+#[derive(Debug, PartialEq)]
+pub struct Revocation {
+    config: RevokeTokenConfig,
+    stage: Stage,
+    pages: PrefixPages,
+    document: Option<RealmConfigDocument>,
+    reducer_state: Option<AdminDocumentState>,
+    revocation_index: Option<RevocationIndex>,
+    apply_event: bool,
+    write_canonical: bool,
+    index_keys: Vec<Key>,
+    pending_deletes: Vec<(KeySpace, Key)>,
+    pending_live: BTreeMap<String, BTreeSet<UserId>>,
+    deletes: Vec<(KeySpace, Key)>,
+    outbox: bool,
+    cutoff_raised: bool,
+    refused: bool,
+    /// The id of the revocation event, which the run that folds this in mints.
+    event_id: Ulid,
+}
+
+impl Revocation {
+    pub fn new(config: RevokeTokenConfig) -> Self {
+        let prefix = admin_outbox_prefix(config.actor.node_id);
+        Self {
+            pages: PrefixPages::new(OUTBOX_INDEX_KEYSPACE, prefix, REVOCATIONS_PER_ORIGIN),
+            config,
+            stage: Stage::Read,
+            document: None,
+            reducer_state: None,
+            revocation_index: None,
+            apply_event: false,
+            write_canonical: false,
+            index_keys: Vec::new(),
+            pending_deletes: Vec::new(),
+            pending_live: BTreeMap::new(),
+            deletes: Vec::new(),
+            outbox: false,
+            cutoff_raised: false,
+            refused: false,
+            event_id: Ulid::nil(),
+        }
+    }
+
+    /// Takes the id of the revocation event from the run that folds this in.
+    pub fn set_event(&mut self, event_id: Ulid) {
+        self.event_id = event_id;
+    }
+
+    fn document_ref(&self) -> DocumentTarget {
+        DocumentTarget::RealmConfig {
+            realm_id: self.config.actor.realm_id,
+        }
+    }
+
+    fn admin_target(&self) -> AdminDocumentTarget {
+        AdminDocumentTarget::RealmConfig {
+            realm_id: self.config.actor.realm_id,
+        }
+    }
+
+    /// The read of the realm config and its admin state.
+    pub fn first(&self) -> IoCall {
+        let document = self.document_ref();
+        let target = self.admin_target();
+        IoCall::Read(vec![
+            (
+                document.storage_keyspace().to_string(),
+                document.storage_key(),
+            ),
+            (
+                DOCUMENT_STATE_KEYSPACE.to_string(),
+                reducer_state_key(&target),
+            ),
+        ])
+    }
+
+    /// The call after `result`, or `None` once the revocation is written; then read [`Self::outcome`].
+    pub fn next(&mut self, result: IoResult) -> Result<Option<IoCall>, RevokeTokenError> {
+        match self.stage {
+            Stage::Read => {
+                let [document, reducer] = aruna_core::rows::values::<2>(result)?;
+                self.emit_read_result(document, reducer).map(Some)
+            }
+            Stage::Capacity => {
+                let rows = self.pages.take(result)?;
+                if rows.is_empty() {
+                    return match self.pages.done() {
+                        true => self.finish_capacity(),
+                        false => Ok(Some(self.pages.call())),
+                    };
+                }
+                self.index_keys = rows.into_iter().map(|(key, _)| key).collect();
+                let reads = (self.index_keys.iter())
+                    .map(|key| (SYNC_OUTBOX_KEYSPACE.to_string(), key.clone()))
+                    .collect();
+                self.stage = Stage::Records;
+                Ok(Some(IoCall::Read(reads)))
+            }
+            Stage::Records => {
+                let IoResult::Values(values) = result else {
+                    return Err(RevokeTokenError::NotFinished);
+                };
+                self.collect_pending(values)?;
+                if !self.pages.done() {
+                    self.stage = Stage::Capacity;
+                    return Ok(Some(self.pages.call()));
+                }
+                self.finish_capacity()
+            }
+            Stage::PendingDelete => {
+                result.done()?;
+                self.after_capacity()
+            }
+            Stage::Write if !self.deletes.is_empty() => {
+                result.done()?;
+                self.stage = Stage::StaleDelete;
+                Ok(Some(IoCall::Delete(std::mem::take(&mut self.deletes))))
+            }
+            Stage::Write | Stage::StaleDelete => {
+                result.done()?;
+                self.stage = Stage::Done;
+                Ok(None)
+            }
+            Stage::Done => Err(RevokeTokenError::NotFinished),
+        }
+    }
+
+    /// What the finished revocation wrote.
+    pub fn outcome(&mut self) -> Result<Revoked, RevokeTokenError> {
+        if self.stage != Stage::Done {
+            return Err(RevokeTokenError::NotFinished);
+        }
+        Ok(Revoked {
+            document: self.document.take().ok_or(RevokeTokenError::NotFinished)?,
+            outbox: self.outbox,
+            cutoff_raised: self.cutoff_raised,
+            refused: self.refused,
+        })
+    }
+
+    fn emit_read_result(
+        &mut self,
+        document_value: Option<Value>,
+        reducer_state_value: Option<Value>,
+    ) -> Result<IoCall, RevokeTokenError> {
+        if !valid_token_hash(&self.config.token_hash) {
+            return Err(RevokeTokenError::InvalidTokenHash);
+        }
+        if !valid_revocation_expiry(self.config.expires_at, self.config.now) {
+            return Err(RevokeTokenError::InvalidTokenExpiry);
+        }
+
+        let Some(document_value) = document_value else {
+            return Err(RevokeTokenError::ConfigMissing);
+        };
+        let document = RealmConfigDocument::from_bytes(&document_value)?;
+        let target = self.admin_target();
+        let previous_reducer_state = reducer_state_value
+            .as_ref()
+            .map(|value| {
+                aruna_core::reducer::decode_reducer_state(value.as_ref())
+                    .map_err(ConversionError::from)
+            })
+            .transpose()?;
+        if previous_reducer_state
+            .as_ref()
+            .is_some_and(|state| state.target != target)
+        {
+            return Err(AdminDocumentError::TargetMismatch.into());
+        }
+
+        let reducer_state = previous_reducer_state
+            .clone()
+            .unwrap_or_else(|| AdminDocumentState::new(target));
+        let effective_now = reducer_state.revocation_floor.max(self.config.now);
+        let revocation_index = reducer_state.revocation_index(effective_now);
+        let materialized = revocation_index.materialized();
+        let document_materialized = document
+            .revoked_tokens
+            .iter()
+            .filter(|entry| revocation_live(entry.expires_at, self.config.now))
+            .map(|entry| (entry.token_hash.clone(), entry.expires_at))
+            .collect::<BTreeMap<_, _>>();
+        let canonical_changed = previous_reducer_state.is_none()
+            || reducer_state.revocation_floor < self.config.now
+            || document_materialized != materialized;
+        let existing_expiry = materialized.get(&self.config.token_hash).copied();
+        let apply_event =
+            !existing_expiry.is_some_and(|expires_at| expires_at >= self.config.expires_at);
+        self.document = Some(document);
+        self.reducer_state = Some(reducer_state);
+        self.revocation_index = Some(revocation_index);
+        self.apply_event = apply_event;
+        self.write_canonical = canonical_changed;
+        self.stage = Stage::Capacity;
+        Ok(self.pages.call())
+    }
+
+    fn pending_revocation(&self, record: &DocumentOutboxRecord) -> Option<(String, u64, UserId)> {
+        if record.node_id != self.config.actor.node_id || record.target != self.document_ref() {
+            return None;
+        }
+        let DocumentOutboxEvent::AdminOperation { event, .. } = &record.event else {
+            return None;
+        };
+        if event.origin_node_id != self.config.actor.node_id
+            || event.actor.node_id != self.config.actor.node_id
+            || event.target != self.admin_target()
+        {
+            return None;
+        }
+        let AdminDocumentOperation::ConfigTokenRevoked {
+            token_hash,
+            expires_at,
+            token_owner,
+        } = &event.op
+        else {
+            return None;
+        };
+        (valid_token_hash(token_hash) && valid_revocation_expiry(*expires_at, self.config.now))
+            .then_some((token_hash.clone(), *expires_at, *token_owner))
+    }
+
+    /// Sorts the outbox records of one index page into pending revocations and stale rows.
+    fn collect_pending(&mut self, values: Vec<Option<Value>>) -> Result<(), RevokeTokenError> {
+        let index_keys = std::mem::take(&mut self.index_keys);
+        if index_keys.len() != values.len() {
+            return Err(RevokeTokenError::UnexpectedEvent {
+                state: "ReadOutboxRecords".to_string(),
+                expected: "one outbox value for every revocation index key",
+                got: "a different number of outbox values",
+            });
+        }
+        let (mut pending_deletes, mut pending_live) = (
+            std::mem::take(&mut self.pending_deletes),
+            std::mem::take(&mut self.pending_live),
+        );
+        for (index_key, value) in index_keys.into_iter().zip(values) {
+            // The outbox record shares the key of its index row.
+            let outbox_key = index_key.clone();
+            let Some(value) = value else {
+                pending_deletes.push((OUTBOX_INDEX_KEYSPACE.to_string(), index_key));
+                continue;
+            };
+            let Ok(record) = postcard::from_bytes::<DocumentOutboxRecord>(&value) else {
+                pending_deletes.extend([
+                    (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (OUTBOX_INDEX_KEYSPACE.to_string(), index_key),
+                ]);
+                continue;
+            };
+            let Some((token_hash, expires_at, token_owner)) = self.pending_revocation(&record)
+            else {
+                pending_deletes.extend([
+                    (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (OUTBOX_INDEX_KEYSPACE.to_string(), index_key),
+                ]);
+                continue;
+            };
+            if !revocation_retained(expires_at, self.config.now) {
+                pending_deletes.extend([
+                    (SYNC_OUTBOX_KEYSPACE.to_string(), outbox_key),
+                    (OUTBOX_INDEX_KEYSPACE.to_string(), index_key),
+                ]);
+            } else {
+                pending_live
+                    .entry(token_hash)
+                    .or_default()
+                    .insert(token_owner);
+            }
+        }
+        self.pending_deletes = pending_deletes;
+        self.pending_live = pending_live;
+        Ok(())
+    }
+
+    /// Decides the capacity once every pending revocation is known; a refusal still stores the
+    /// canonical set and its cleanup.
+    fn finish_capacity(&mut self) -> Result<Option<IoCall>, RevokeTokenError> {
+        let mut pending_deletes = std::mem::take(&mut self.pending_deletes);
+        pending_deletes.sort();
+        pending_deletes.dedup();
+        let pending_live = &self.pending_live;
+        let revocation_index = self
+            .revocation_index
+            .as_ref()
+            .ok_or(RevokeTokenError::NotFinished)?;
+
+        let origin = self.config.actor.node_id;
+        let existing_origin = revocation_index.origin(&self.config.token_hash);
+        let same_origin =
+            existing_origin == Some(origin) || pending_live.contains_key(&self.config.token_hash);
+        let pending_count = pending_live
+            .keys()
+            .filter(|hash| revocation_index.origin(hash) != Some(origin))
+            .count();
+        let live_count = revocation_index.count(&origin);
+        let origin_cap = match self.config.admission {
+            RevokeTokenAdmission::SelfService => REVOCATION_CAP,
+            RevokeTokenAdmission::Privileged => REVOCATIONS_PER_ORIGIN,
+        };
+        let owner_count = revocation_index.owner_count(&origin, &self.config.token_owner)
+            + pending_live
+                .iter()
+                .filter(|(hash, owners)| {
+                    owners.contains(&self.config.token_owner)
+                        && revocation_index.origin(hash) != Some(origin)
+                })
+                .count();
+        let capacity_reached = self.apply_event
+            && !same_origin
+            && (live_count.saturating_add(pending_count) >= origin_cap
+                || (self.config.admission == RevokeTokenAdmission::SelfService
+                    && owner_count >= OWNER_CAP));
+        if capacity_reached {
+            self.refused = true;
+            self.apply_event = false;
+            self.write_canonical = true;
+        }
+        if pending_deletes.is_empty() {
+            return self.after_capacity();
+        }
+        self.stage = Stage::PendingDelete;
+        Ok(Some(IoCall::Delete(pending_deletes)))
+    }
+
+    fn after_capacity(&mut self) -> Result<Option<IoCall>, RevokeTokenError> {
+        if self.apply_event || self.write_canonical {
+            return self.emit_write();
+        }
+        self.stage = Stage::Done;
+        Ok(None)
+    }
+
+    fn emit_write(&mut self) -> Result<Option<IoCall>, RevokeTokenError> {
+        let apply_event = self.apply_event;
+        let (Some(mut document), Some(mut reducer_state), Some(mut revocation_index)) = (
+            self.document.take(),
+            self.reducer_state.take(),
+            self.revocation_index.take(),
+        ) else {
+            return Err(RevokeTokenError::NotFinished);
+        };
+        let previous_reducer_state = reducer_state.clone();
+        let admin_event = apply_event.then(|| {
+            reducer_state.apply_revocation_operation(
+                &self.config.actor,
+                AdminDocumentOperation::ConfigTokenRevoked {
+                    token_hash: self.config.token_hash.clone(),
+                    expires_at: self.config.expires_at,
+                    token_owner: self.config.token_owner,
+                },
+                &mut revocation_index,
+                self.event_id,
+            )
+        });
+        let admin_event = admin_event.transpose()?;
+        revocation_index.compact(&mut reducer_state);
+        let owner = self.config.token_owner;
+        let cutoff_before = document.user_cutoff(&owner, self.config.now);
+        document.merge_revocation_index(&revocation_index, self.config.now);
+        // A new or later user cutoff ends READ for a deactivated account.
+        self.cutoff_raised =
+            apply_event && document.user_cutoff(&owner, self.config.now) > cutoff_before;
+        let stale_conflict_deletes =
+            stale_conflict_deletes(Some(&previous_reducer_state), Some(&reducer_state));
+
+        let document_target = self.document_ref();
+        let placement = target_placement_ref(&document, &document_target, Default::default());
+        let mut writes = vec![
+            (
+                document_target.storage_keyspace().to_string(),
+                document_target.storage_key(),
+                document.to_bytes(&self.config.actor)?.into(),
+            ),
+            reducer_state_entry(&reducer_state)?,
+        ];
+        if let Some(admin_event) = admin_event {
+            let record = new_identified_record(
+                admin_event.event_id,
+                self.config.actor.node_id,
+                document_target,
+                Vec::new(),
+                DocumentOutboxEvent::admin(admin_event),
+                placement,
+                false,
+            );
+            writes.push(outbox_write_entry(&record).map_err(ConversionError::from)?);
+            writes.push(revocation_index_entry(&record));
+        }
+        writes.extend(conflict_write_entries(&reducer_state)?);
+
+        self.document = Some(document);
+        self.deletes = stale_conflict_deletes;
+        self.outbox = apply_event;
+        self.stage = Stage::Write;
+        Ok(Some(IoCall::Write(writes)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AdminDocumentState, AdminDocumentTarget, DOCUMENT_STATE_KEYSPACE, REVOCATIONS_PER_ORIGIN,
+        Revocation, RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError,
+        RevokeTokenOperation, reducer_state_key,
+    };
+    use crate::document_repository::GetConfigOperation;
+    use crate::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use crate::sync::outbox::record::admin_outbox_prefix;
+    use aruna_core::admin_documents::AdminDocumentOperation;
+    use aruna_core::auth::MAX_TOKEN_LIFETIME;
+    use aruna_core::auth::bearer_token_hash;
+    use aruna_core::calls::{IoResult, Next};
+    use aruna_core::document::{DocumentOutboxEvent, DocumentOutboxRecord};
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{OUTBOX_INDEX_KEYSPACE, SYNC_OUTBOX_KEYSPACE};
+    use aruna_core::operation::{Operation, TransactionMode};
+    use aruna_core::storage_entries::reducer_state_entry;
+    use aruna_core::structs::identity::auth::Actor;
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::types::{Key, Value};
+    use aruna_core::user::id::UserId;
+    use aruna_runner::driver::{DriverContext, drive};
+    use aruna_scheduler::TaskHandle;
+    use aruna_storage::storage::memory::MemoryStorage;
+    use tempfile::tempdir;
+    use ulid::Ulid;
+
+    async fn setup_realm() -> (tempfile::TempDir, DriverContext, Actor) {
+        let dir = tempdir().unwrap();
+        let storage = MemoryStorage::open();
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: None,
+            task_handle: Some(TaskHandle::new()),
+            compute_handle: None,
+            outbound_handle: None,
+        };
+        let realm_id = RealmId([31u8; 32]);
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            user_id: UserId::local(Ulid::from_bytes([6u8; 16]), realm_id),
+            realm_id,
+        };
+        drive(
+            CreateRealmOperation::new(CreateRealmConfig {
+                actor: actor.clone(),
+                realm_description: "revocation realm".to_string(),
+                oidc_providers: Vec::new(),
+                node_location: None,
+                node_weight: None,
+                node_labels: Default::default(),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        (dir, context, actor)
+    }
+
+    fn revocation(actor: &Actor, token_hash: &str, expires_at: u64, now: u64) -> RevokeTokenConfig {
+        RevokeTokenConfig {
+            actor: actor.clone(),
+            token_hash: token_hash.to_string(),
+            expires_at,
+            token_owner: actor.user_id,
+            admission: RevokeTokenAdmission::SelfService,
+            now,
+        }
+    }
+
+    fn admin_request(
+        actor: &Actor,
+        token_hash: &str,
+        token_owner: UserId,
+        expires_at: u64,
+        now: u64,
+    ) -> RevokeTokenConfig {
+        RevokeTokenConfig {
+            actor: actor.clone(),
+            token_hash: token_hash.to_string(),
+            expires_at,
+            token_owner,
+            admission: RevokeTokenAdmission::Privileged,
+            now,
+        }
+    }
+
+    fn seed_state(actor: &Actor, count: usize) -> AdminDocumentState {
+        seed_state_for(actor, actor.user_id, count)
+    }
+
+    fn seed_state_for(actor: &Actor, token_owner: UserId, count: usize) -> AdminDocumentState {
+        let target = AdminDocumentTarget::RealmConfig {
+            realm_id: actor.realm_id,
+        };
+        let mut state = AdminDocumentState::new(target);
+        for index in 0..count {
+            state
+                .apply_operation(
+                    actor,
+                    AdminDocumentOperation::ConfigTokenRevoked {
+                        token_hash: bearer_token_hash(&format!("seed-token-{index}")),
+                        expires_at: 2_000,
+                        token_owner,
+                    },
+                    ulid::Ulid::generate(),
+                )
+                .unwrap();
+        }
+        state
+    }
+
+    async fn write_state(context: &DriverContext, state: &AdminDocumentState) {
+        let (key_space, key, value) = reducer_state_entry(state).unwrap();
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Write {
+                key_space,
+                key,
+                value,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::WriteResult { .. }) => {}
+            other => panic!("unexpected reducer state write event: {other:?}"),
+        }
+    }
+
+    async fn write_index(context: &DriverContext, actor: &Actor, count: usize) {
+        let prefix = admin_outbox_prefix(actor.node_id);
+        let writes = (0..count)
+            .map(|index| {
+                let mut key = prefix.to_vec();
+                key.extend_from_slice(&(index as u64).to_be_bytes());
+                (
+                    OUTBOX_INDEX_KEYSPACE.to_string(),
+                    key.into(),
+                    vec![1u8].into(),
+                )
+            })
+            .collect();
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::BatchWriteResult { .. }) => {}
+            other => panic!("unexpected index write event: {other:?}"),
+        }
+    }
+
+    async fn iter_values(
+        context: &DriverContext,
+        key_space: &str,
+        prefix: Option<Key>,
+    ) -> Vec<(Key, Value)> {
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Iter {
+                key_space: key_space.to_string(),
+                prefix,
+                start: None,
+                limit: REVOCATIONS_PER_ORIGIN.saturating_add(1),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::IterResult { values, .. }) => values,
+            other => panic!("unexpected iteration event: {other:?}"),
+        }
+    }
+
+    async fn token_records(context: &DriverContext, actor: &Actor) -> Vec<DocumentOutboxRecord> {
+        iter_values(
+            context,
+            SYNC_OUTBOX_KEYSPACE,
+            Some(admin_outbox_prefix(actor.node_id)),
+        )
+        .await
+        .into_iter()
+        .filter_map(|(_, value)| postcard::from_bytes(&value).ok())
+        .filter(|record: &DocumentOutboxRecord| {
+            matches!(
+                &record.event,
+                DocumentOutboxEvent::AdminOperation { event, .. }
+                    if matches!(
+                        &event.op,
+                        AdminDocumentOperation::ConfigTokenRevoked { .. }
+                    )
+            )
+        })
+        .collect()
+    }
+
+    async fn index_values(context: &DriverContext, actor: &Actor) -> Vec<(Key, Value)> {
+        iter_values(
+            context,
+            OUTBOX_INDEX_KEYSPACE,
+            Some(admin_outbox_prefix(actor.node_id)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn stores_revocation() {
+        // The hash lands on the stored realm config and a later read returns it.
+        let (_dir, context, actor) = setup_realm().await;
+        let token_hash = bearer_token_hash("revoked-token");
+        let document = drive(
+            RevokeTokenOperation::new(revocation(&actor, &token_hash, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(document.token_revoked(&token_hash, 1_000));
+
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert!(read.token_revoked(&token_hash, 1_000));
+    }
+
+    /// A caller's write transaction that folds a revocation in and then commits or fails.
+    #[derive(Debug, PartialEq)]
+    struct Folded {
+        revocation: Revocation,
+        commit: bool,
+    }
+
+    impl Operation for Folded {
+        type Output = ();
+        type Error = RevokeTokenError;
+
+        fn transaction(&self) -> TransactionMode {
+            TransactionMode::Write
+        }
+
+        fn first(&mut self) -> Result<Next<()>, RevokeTokenError> {
+            Ok(Next::Call(self.revocation.first()))
+        }
+
+        fn next(&mut self, result: IoResult) -> Result<Next<()>, RevokeTokenError> {
+            if let Some(call) = self.revocation.next(result)? {
+                return Ok(Next::Call(call));
+            }
+            self.revocation.outcome()?.result()?;
+            match self.commit {
+                true => Ok(Next::Done(())),
+                false => Err(RevokeTokenError::NotFinished),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_follows_caller() {
+        // Folded into the caller's transaction, the revocation commits or aborts with the caller.
+        let (_dir, context, actor) = setup_realm().await;
+        for commit in [false, true] {
+            let token_hash = bearer_token_hash(&format!("joined-{commit}"));
+            let config = revocation(&actor, &token_hash, 2_000, 1_000);
+            let mut revocation = Revocation::new(config);
+            revocation.set_event(Ulid::from_parts(1_000, 1));
+            let folded = Folded { revocation, commit };
+            assert_eq!(drive(folded, &context).await.is_ok(), commit);
+            let read = drive(GetConfigOperation::new(actor.realm_id), &context)
+                .await
+                .unwrap();
+            assert_eq!(read.token_revoked(&token_hash, 1_000), commit);
+        }
+    }
+
+    #[tokio::test]
+    async fn repeat_revocation_accumulates() {
+        // Revoking twice is idempotent, and a second token does not evict the first.
+        let (_dir, context, actor) = setup_realm().await;
+        let first = bearer_token_hash("first-token");
+        let second = bearer_token_hash("second-token");
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &first, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &first, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index_values(&context, &actor).await.len(), 1);
+        assert_eq!(token_records(&context, &actor).await.len(), 1);
+        let state = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(
+            state
+                .user_subject_ids
+                .keys()
+                .filter(|path| path.contains(&first))
+                .count(),
+            1
+        );
+
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &second, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert_eq!(read.revoked_tokens.len(), 2);
+        assert!(read.token_revoked(&first, 1_000));
+        assert!(read.token_revoked(&second, 1_000));
+    }
+
+    #[tokio::test]
+    async fn repeat_noop_succeeds() {
+        let (_dir, context, actor) = setup_realm().await;
+        let token_hash = bearer_token_hash("repeat-noop");
+        let config = revocation(&actor, &token_hash, 2_000, 1_000);
+        drive(RevokeTokenOperation::new(config.clone()), &context)
+            .await
+            .unwrap();
+        drive(RevokeTokenOperation::new(config), &context)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn replacement_stays_bounded() {
+        let (_dir, context, actor) = setup_realm().await;
+        let token_hash = bearer_token_hash("replacement");
+        for expiry in 2_000..2_070 {
+            drive(
+                RevokeTokenOperation::new(revocation(&actor, &token_hash, expiry, 1_000)),
+                &context,
+            )
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            reducer_state(&context, actor.realm_id)
+                .await
+                .live_revocation_count(&actor.node_id, 1_000,),
+            1
+        );
+        assert_eq!(
+            reducer_state(&context, actor.realm_id)
+                .await
+                .live_owner_count(&actor.node_id, &actor.user_id, 1_000),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_live_cap() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state(&actor, REVOCATIONS_PER_ORIGIN);
+        write_state(&context, &state).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("capacity-token"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
+        let cleaned = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(cleaned.revocation_floor, 1_000);
+        assert_eq!(
+            cleaned.materialized_revoked_tokens(),
+            state.materialized_revoked_tokens()
+        );
+        assert!(index_values(&context, &actor).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_self_reserve() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state(&actor, 896);
+        write_state(&context, &state).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("self-reserve"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
+        let cleaned = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(cleaned.revocation_floor, 1_000);
+        assert_eq!(
+            cleaned.materialized_revoked_tokens(),
+            state.materialized_revoked_tokens()
+        );
+    }
+
+    #[tokio::test]
+    async fn enforces_owner_cap() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state_for(&actor, actor.user_id, 64);
+        write_state(&context, &state).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("owner-cap"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
+        let cleaned = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(cleaned.revocation_floor, 1_000);
+        assert_eq!(
+            cleaned.materialized_revoked_tokens(),
+            state.materialized_revoked_tokens()
+        );
+
+        let other = Actor {
+            user_id: UserId::local(Ulid::from_bytes([8u8; 16]), actor.realm_id),
+            ..actor
+        };
+        drive(
+            RevokeTokenOperation::new(revocation(
+                &other,
+                &bearer_token_hash("other-owner"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn admin_uses_reserve() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state(&actor, 896);
+        write_state(&context, &state).await;
+        let admin = Actor {
+            user_id: UserId::local(Ulid::from_bytes([8u8; 16]), actor.realm_id),
+            ..actor
+        };
+
+        drive(
+            RevokeTokenOperation::new(admin_request(
+                &admin,
+                &bearer_token_hash("admin-reserve"),
+                actor.user_id,
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_transfer_cap() {
+        let (_dir, context, actor) = setup_realm().await;
+        let other = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[7u8; 32]).public(),
+            user_id: actor.user_id,
+            realm_id: actor.realm_id,
+        };
+        let transferred = bearer_token_hash("transfer-token");
+        let mut state = seed_state(&actor, REVOCATIONS_PER_ORIGIN);
+        state
+            .apply_operation(
+                &other,
+                AdminDocumentOperation::ConfigTokenRevoked {
+                    token_hash: transferred.clone(),
+                    expires_at: 2_000,
+                    token_owner: actor.user_id,
+                },
+                ulid::Ulid::generate(),
+            )
+            .unwrap();
+        write_state(&context, &state).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(&actor, &transferred, 3_000, 1_000)),
+            &context,
+        )
+        .await;
+
+        assert!(matches!(result, Err(RevokeTokenError::CapacityReached)));
+        let cleaned = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(cleaned.revocation_floor, 1_000);
+        assert_eq!(
+            cleaned.materialized_revoked_tokens(),
+            state.materialized_revoked_tokens()
+        );
+        assert!(index_values(&context, &actor).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleans_orphan_index() {
+        let (_dir, context, actor) = setup_realm().await;
+        let state = seed_state(&actor, 1);
+        write_state(&context, &state).await;
+        write_index(&context, &actor, REVOCATIONS_PER_ORIGIN).await;
+
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("index-capacity-token"),
+                2_000,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_ne!(reducer_state(&context, actor.realm_id).await, state);
+        assert_eq!(index_values(&context, &actor).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prunes_expired_revocations() {
+        // Once the revoked token can no longer validate its entry is dropped,
+        // so the replicated set stays bounded and is not scanned forever.
+        let (_dir, context, actor) = setup_realm().await;
+        let stale = bearer_token_hash("stale-token");
+        let fresh = bearer_token_hash("fresh-token");
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &stale, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        let document = drive(
+            RevokeTokenOperation::new(revocation(&actor, &fresh, 4_000, 3_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(document.revoked_tokens.len(), 1);
+        assert!(!document.token_revoked(&stale, 3_000));
+        assert!(document.token_revoked(&fresh, 3_000));
+        assert_eq!(index_values(&context, &actor).await.len(), 1);
+        assert_eq!(token_records(&context, &actor).await.len(), 1);
+
+        let read = drive(GetConfigOperation::new(actor.realm_id), &context)
+            .await
+            .unwrap();
+        assert_eq!(read.revoked_tokens.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn keeps_expiry_boundary() {
+        let (_dir, context, actor) = setup_realm().await;
+        let boundary = bearer_token_hash("boundary");
+        drive(
+            RevokeTokenOperation::new(revocation(&actor, &boundary, 2_000, 1_000)),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("after-boundary"),
+                4_000,
+                2_000,
+            )),
+            &context,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(index_values(&context, &actor).await.len(), 2);
+        assert_eq!(token_records(&context, &actor).await.len(), 2);
+        let state = reducer_state(&context, actor.realm_id).await;
+        assert!(state.materialized_revoked_tokens().contains_key(&boundary));
+    }
+
+    #[tokio::test]
+    async fn compacts_reducer_state() {
+        // The reducer state behind the replicated set must shed expired entries
+        // too, so repeated revocations cannot grow the stored state for good.
+        let (_dir, context, actor) = setup_realm().await;
+        let stale = bearer_token_hash("stale-token");
+        let fresh = bearer_token_hash("fresh-token");
+        for config in [
+            revocation(&actor, &stale, 2_000, 1_000),
+            revocation(&actor, &fresh, 4_000, 3_000),
+        ] {
+            drive(RevokeTokenOperation::new(config), &context)
+                .await
+                .unwrap();
+        }
+
+        let state = reducer_state(&context, actor.realm_id).await;
+        assert_eq!(
+            state.materialized_revoked_tokens(),
+            std::collections::BTreeMap::from([(fresh, 4_000)])
+        );
+        assert!(
+            !state
+                .user_subject_ids
+                .keys()
+                .any(|path| path.contains(&stale))
+        );
+    }
+
+    async fn reducer_state(context: &DriverContext, realm_id: RealmId) -> AdminDocumentState {
+        let target = AdminDocumentTarget::RealmConfig { realm_id };
+        match context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Read {
+                key_space: DOCUMENT_STATE_KEYSPACE.to_string(),
+                key: reducer_state_key(&target),
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult {
+                value: Some(bytes), ..
+            }) => aruna_core::reducer::decode_reducer_state(&bytes).expect("reducer state decodes"),
+            other => panic!("unexpected reducer state read: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cutoff_marks_due() {
+        // A new user cutoff marks encrypted buckets due in its transaction; a repeat does not.
+        use aruna_core::keyspaces::{
+            ABE_DUE_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, GROUP_ENCRYPTED_KEYSPACE,
+        };
+        use aruna_core::structs::storage::encryption::{BucketEncryption, EncryptionMode};
+        let (_dir, context, actor) = setup_realm().await;
+        let settings = BucketEncryption {
+            mode: EncryptionMode::NodeManaged,
+            bucket_id: Some(Ulid::from_bytes([8u8; 16])),
+            key_generation: 1,
+            ..Default::default()
+        };
+        let index = [&Ulid::from_bytes([9u8; 16]).to_bytes()[..], b"bucket-a"].concat();
+        let writes = vec![
+            (
+                BUCKET_ENCRYPTION_KEYSPACE.to_string(),
+                b"bucket-a".to_vec().into(),
+                settings.to_bytes().unwrap().into(),
+            ),
+            (
+                GROUP_ENCRYPTED_KEYSPACE.to_string(),
+                index.into(),
+                Vec::new().into(),
+            ),
+        ];
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::BatchWrite {
+                writes,
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::BatchWriteResult { .. })
+        ));
+        let owner = UserId::local(Ulid::from_bytes([10u8; 16]), actor.realm_id);
+        let cutoff = || {
+            admin_request(
+                &actor,
+                &aruna_core::auth::user_cutoff_hash(&owner),
+                owner,
+                aruna_core::auth::user_cutoff_expiry(1_000),
+                1_000,
+            )
+        };
+
+        drive(RevokeTokenOperation::new(cutoff()), &context)
+            .await
+            .unwrap();
+        assert_eq!(iter_values(&context, ABE_DUE_KEYSPACE, None).await.len(), 1);
+
+        let event = context
+            .storage_handle
+            .send_storage_effect(StorageEffect::Delete {
+                key_space: ABE_DUE_KEYSPACE.to_string(),
+                key: Ulid::from_bytes([8u8; 16]).to_bytes().to_vec().into(),
+                txn_id: None,
+            })
+            .await;
+        assert!(matches!(
+            event,
+            Event::Storage(StorageEvent::DeleteResult { .. })
+        ));
+        drive(RevokeTokenOperation::new(cutoff()), &context)
+            .await
+            .unwrap();
+        assert!(
+            iter_values(&context, ABE_DUE_KEYSPACE, None)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_hash() {
+        let (_dir, context, actor) = setup_realm().await;
+        let result = drive(
+            RevokeTokenOperation::new(revocation(&actor, "not-a-hash", 2_000, 1_000)),
+            &context,
+        )
+        .await;
+        assert!(matches!(result, Err(RevokeTokenError::InvalidTokenHash)));
+    }
+
+    #[tokio::test]
+    async fn rejects_long_expiry() {
+        let (_dir, context, actor) = setup_realm().await;
+        let result = drive(
+            RevokeTokenOperation::new(revocation(
+                &actor,
+                &bearer_token_hash("long-expiry"),
+                1_000 + MAX_TOKEN_LIFETIME + 301,
+                1_000,
+            )),
+            &context,
+        )
+        .await;
+        assert!(matches!(result, Err(RevokeTokenError::InvalidTokenExpiry)));
+    }
+}

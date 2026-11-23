@@ -22,13 +22,11 @@ env:
   # Source-based coverage reads __llvm_covmap from the binary, so DWARF is dead weight.
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
-  # RUSTFLAGS replaces the rustflags of .cargo/config.toml, so the mold linker is named again.
-  RUSTFLAGS: -Cinstrument-coverage -Clink-arg=-fuse-ld=mold
 
 jobs:
-  # Compiles every instrumented test binary once; the shards below run parts of it.
-  instrumented-build:
-    name: Build instrumented tests
+  # Compiles every instrumented crate test binary except the node's; the shards below run it.
+  instrumented-build-crates:
+    name: Build instrumented crate tests
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -36,10 +34,19 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
+      # The instrumented test build stopped the runner without either; its logs never said which.
+      - name: Add swap space
+        uses: ./.github/actions/add-swap
+
+      # Third-party crates are not instrumented, so the CI test build's cache fits; CI saves it.
       - name: Set up Rust
         uses: ./.github/actions/rust-setup
         with:
-          shared-key: coverage
+          shared-key: tests-crates
+          save: "false"
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
@@ -50,18 +57,22 @@ jobs:
       - name: Sample memory use
         run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
 
-      # The measured target set matches the main tests job, so a coverage move
+      # The measured target set matches the CI test builds, so a coverage move
       # cannot come from a different target selection.
       - name: Build the instrumented test archive
+        # Instrument workspace crates only so third-party crates skip coverage
+        # codegen, shrinking compile time, archive size, and grcov memory.
+        env:
+          RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/scripts/dev/rustc_coverage.sh
         run: >-
-          cargo nextest archive --workspace --all-targets --all-features --locked
-          --archive-file coverage-archive.tar.zst
+          cargo nextest archive --workspace --exclude aruna --exclude aruna-api --exclude aruna-doctor
+          --lib --bins --tests --all-features --locked --archive-file coverage-crates.tar.zst
 
       - name: Upload the test archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-archive
-          path: coverage-archive.tar.zst
+          name: coverage-crates
+          path: coverage-crates.tar.zst
           if-no-files-found: error
           compression-level: 0
           retention-days: 1
@@ -70,14 +81,69 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-memory
+          name: coverage-memory-build-crates
           path: memory.log
           if-no-files-found: warn
           retention-days: 7
 
-  instrumented:
-    name: Instrumented tests (${{ matrix.shard }}/4)
-    needs: instrumented-build
+  # Compiles the instrumented node, API and doctor test binaries beside the crate build.
+  instrumented-build-node:
+    name: Build instrumented node tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Free disk space
+        uses: ./.github/actions/free-disk
+
+      - name: Add swap space
+        uses: ./.github/actions/add-swap
+
+      - name: Set up Rust
+        uses: ./.github/actions/rust-setup
+        with:
+          shared-key: tests-node
+          save: "false"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-nextest@0.9.140
+
+      - name: Sample memory use
+        run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
+
+      - name: Build the instrumented test archive
+        env:
+          RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/scripts/dev/rustc_coverage.sh
+        run: >-
+          cargo nextest archive -p aruna-api -p aruna -p aruna-doctor
+          --lib --bins --tests --all-features --locked --archive-file coverage-node.tar.zst
+
+      - name: Upload the test archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-node
+          path: coverage-node.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload the memory log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-memory-build-node
+          path: memory.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  instrumented-crates:
+    name: Instrumented crate tests (${{ matrix.shard }}/2)
+    needs: instrumented-build-crates
     runs-on: ubuntu-latest
     # Job-level hang cap, not a performance budget. Test concurrency and the
     # per-test hang cap live in .config/nextest.toml.
@@ -85,7 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2]
     env:
       # nextest runs one process per test, so %m merges each binary's counters
       # into one file instead of writing a profraw per test process.
@@ -102,34 +168,16 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
 
-      - name: Free disk space
-        uses: ./.github/actions/free-disk
-
       - name: Install LLVM tools
         # rust-toolchain.toml supplies the channel, so the tools match the compiler.
         run: rustup component add llvm-tools-preview
 
-      - name: Install grcov
+      - name: Install coverage tools
         uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         with:
-          tool: grcov@0.10.7
+          tool: grcov@0.10.7,cargo-nextest@0.9.140
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: cargo-nextest@0.9.140
-
-      - name: Install uv
-        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
-        with:
-          tool: uv@0.11.28
-
-      - name: Download the test archive
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: coverage-archive
-
-      # S3 multipart code only runs against a real S3 endpoint, so it is measured here too.
+      # Start MinIO detached before the main suite so it boots while tests run.
       - name: Start MinIO
         run: |
           docker run -d --name minio -p 9000:9000 \
@@ -137,52 +185,49 @@ jobs:
             -e MINIO_ROOT_PASSWORD=aruna-test-secret \
             cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
             server /data
-          for _ in $(seq 1 60); do
-            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
-              exit 0
-            fi
-            sleep 2
-          done
-          echo "MinIO did not become ready" >&2
-          docker logs minio >&2 || true
-          exit 1
 
-      # Shows whether the coverage export stays within memory at four threads.
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-crates
+
+      # Shows whether the coverage export stays within memory.
       - name: Sample memory use
         run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
 
+      # Extract once; the follow-up run reuses the extracted metadata.
       - name: Run instrumented tests
         run: >-
-          cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --partition hash:${{ matrix.shard }}/4
+          cargo-nextest nextest run --archive-file coverage-crates.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --partition hash:${{ matrix.shard }}/2
 
-      # The same native Git run as the tests workflow, split across the shards too;
-      # with two such tests, some shards get none.
-      - name: Run instrumented native Git tests
-        run: >-
-          uv run --no-project --python 3.13
-          --with-requirements scripts/arc-native/requirements.txt
-          sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
-          exec cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
-          -E "package(aruna) & binary(integration) & test(/^git_native::/)"'
-
-      # The S3 backend cases of the tests workflow, split across the shards like the Git tests.
+      # The blob S3 backend cases of the tests workflow, split across the shards.
       - name: Run instrumented S3 backend tests
-        run: >-
-          cargo-nextest nextest run --archive-file coverage-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite
-          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
-          -E '(package(aruna-blob) & kind(lib) & test(/^blob::tests::s3_/))
-          | (package(aruna-operations) & binary(integration) & test(/^multipart::s3_/))'
+        run: |
+          set -euo pipefail
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "MinIO did not become ready" >&2
+            docker logs minio >&2 || true
+            exit 1
+          fi
+          cargo-nextest nextest run \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --target-dir-remap target --workspace-remap . \
+            --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/2 \
+            -E 'package(aruna-blob) & kind(lib) & test(/^blob::tests::s3_/)'
 
       # The export's memory grows with the code size and reached the runner's 16 GB on main.
       - name: Add swap space
-        run: |
-          sudo fallocate -l 8G /mnt/coverage.swap
-          sudo chmod 600 /mnt/coverage.swap
-          sudo mkswap /mnt/coverage.swap
-          sudo swapon /mnt/coverage.swap
-          free -m
+        uses: ./.github/actions/add-swap
 
       - name: Collect coverage
         # LLVM exports use Rayon's pool, independently of grcov's parser threads;
@@ -215,7 +260,7 @@ jobs:
       - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-${{ matrix.shard }}
+          name: lcov-crates-${{ matrix.shard }}
           path: |
             coverage.lcov
             coverage-sources.txt
@@ -226,7 +271,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-memory-${{ matrix.shard }}
+          name: coverage-memory-crates-${{ matrix.shard }}
           path: memory.log
           if-no-files-found: warn
           retention-days: 7
@@ -235,7 +280,243 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: junit-instrumented-${{ matrix.shard }}
+          name: junit-instrumented-crates-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  instrumented-node:
+    name: Instrumented node tests (${{ matrix.shard }}/4)
+    needs: instrumented-build-node
+    runs-on: ubuntu-latest
+    # Job-level hang cap, not a performance budget. Test concurrency and the
+    # per-test hang cap live in .config/nextest.toml.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    env:
+      LLVM_PROFILE_FILE: cargo-test-%m.profraw
+      RUST_MIN_STACK: 8388608
+      ARUNA_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      ARUNA_TEST_S3_ACCESS_KEY: aruna-test
+      ARUNA_TEST_S3_SECRET_KEY: aruna-test-secret
+      ARUNA_TEST_S3_REGION: us-east-1
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install LLVM tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Install coverage tools
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: grcov@0.10.7,cargo-nextest@0.9.140
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=aruna-test \
+            -e MINIO_ROOT_PASSWORD=aruna-test-secret \
+            cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1 \
+            server /data
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-node
+
+      - name: Sample memory use
+        run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
+
+      # Extract once; the two follow-up runs reuse the extracted metadata.
+      - name: Run instrumented tests
+        run: >-
+          cargo-nextest nextest run --archive-file coverage-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --partition hash:${{ matrix.shard }}/4
+
+      # The node S3 backend cases of the tests workflow, split across the shards.
+      - name: Run instrumented S3 backend tests
+        run: |
+          set -euo pipefail
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "MinIO did not become ready" >&2
+            docker logs minio >&2 || true
+            exit 1
+          fi
+          cargo-nextest nextest run \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --target-dir-remap target --workspace-remap . \
+            --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4 \
+            -E 'package(aruna) & binary(regimes) & test(/^storage_regime::multipart::s3_/)'
+
+      # The node's Docker cases of the tests workflow, split across the shards.
+      - name: Run instrumented node Docker tests
+        run: >-
+          cargo-nextest nextest run
+          --cargo-metadata target/nextest/cargo-metadata.json
+          --binaries-metadata target/nextest/binaries-metadata.json
+          --target-dir-remap target --workspace-remap .
+          --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
+          -E 'package(aruna) & binary(regimes) & test(/^compute_regime::(compute_execution|mcp_artifacts)::/)'
+
+      - name: Add swap space
+        uses: ./.github/actions/add-swap
+
+      - name: Collect coverage
+        env:
+          RAYON_NUM_THREADS: 1
+        run: |
+          grcov . \
+            --threads 4 \
+            --binary-path ./target/debug/deps/ \
+            --source-dir . \
+            --output-type lcov \
+            --output-path coverage.lcov \
+            --branch \
+            --ignore-not-existing \
+            --ignore "/*" \
+            --ignore "target/*" \
+            --keep-only "*/src/*"
+          source_files="$(grep '^SF:' coverage.lcov | sed 's/^SF://' | sort -u)"
+          printf 'coverage source files: %s\n' "$(printf '%s\n' "$source_files" | wc -l)"
+          printf '%s\n' "$source_files" > coverage-sources.txt
+          records=$(grep -c '^DA:' coverage.lcov || true)
+          if [ "$records" -lt 1000 ]; then
+            echo "coverage.lcov has only $records DA records" >&2
+            exit 1
+          fi
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lcov-node-${{ matrix.shard }}
+          path: |
+            coverage.lcov
+            coverage-sources.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the memory log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-memory-node-${{ matrix.shard }}
+          path: memory.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload JUnit report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-instrumented-node-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: warn
+          retention-days: 7
+
+  # The native Git run of the tests workflow, unsharded so only this job needs Python.
+  instrumented-git:
+    name: Instrumented native Git tests
+    needs: instrumented-build-node
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      LLVM_PROFILE_FILE: cargo-test-%m.profraw
+      RUST_MIN_STACK: 8388608
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install LLVM tools
+        run: rustup component add llvm-tools-preview
+
+      - name: Install coverage tools
+        uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: grcov@0.10.7,cargo-nextest@0.9.140,uv@0.11.28
+
+      - name: Download the test archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: coverage-node
+
+      - name: Sample memory use
+        run: nohup sh -c 'while sleep 5; do printf "%s " "$(date +%T)"; free -m | sed -n 2p; done' > memory.log 2>&1 &
+
+      - name: Run instrumented native Git tests
+        run: >-
+          uv run --no-project --python 3.13
+          --with-requirements scripts/arc-native/requirements.txt
+          sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
+          exec cargo-nextest nextest run --archive-file coverage-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
+          --profile ci --run-ignored only --no-tests fail
+          -E "package(aruna) & binary(regimes) & test(/^metadata_regime::git_native::/)"'
+
+      - name: Add swap space
+        uses: ./.github/actions/add-swap
+
+      - name: Collect coverage
+        env:
+          RAYON_NUM_THREADS: 1
+        run: |
+          grcov . \
+            --threads 4 \
+            --binary-path ./target/debug/deps/ \
+            --source-dir . \
+            --output-type lcov \
+            --output-path coverage.lcov \
+            --branch \
+            --ignore-not-existing \
+            --ignore "/*" \
+            --ignore "target/*" \
+            --keep-only "*/src/*"
+          source_files="$(grep '^SF:' coverage.lcov | sed 's/^SF://' | sort -u)"
+          printf 'coverage source files: %s\n' "$(printf '%s\n' "$source_files" | wc -l)"
+          printf '%s\n' "$source_files" > coverage-sources.txt
+          records=$(grep -c '^DA:' coverage.lcov || true)
+          if [ "$records" -lt 1000 ]; then
+            echo "coverage.lcov has only $records DA records" >&2
+            exit 1
+          fi
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: lcov-git
+          path: |
+            coverage.lcov
+            coverage-sources.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload the memory log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-memory-git
+          path: memory.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload JUnit report
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-instrumented-git
           path: target/nextest/ci/junit.xml
           if-no-files-found: warn
           retention-days: 7
@@ -243,8 +524,8 @@ jobs:
   report:
     name: Generate Coverage Report
     environment: coverage
-    needs: instrumented
-    if: ${{ needs.instrumented.result == 'success' }}
+    needs: [instrumented-crates, instrumented-node, instrumented-git]
+    if: ${{ needs.instrumented-crates.result == 'success' && needs.instrumented-node.result == 'success' && needs.instrumented-git.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -255,16 +536,17 @@ jobs:
       - name: Download coverage artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: coverage-[0-9]*
+          pattern: lcov-*
           path: coverage-parts
 
       # Codecov merges the uploads of one commit, so each shard's report is sent as is.
+      # Two crate shards, four node shards and the native Git run make seven parts.
       - name: Validate coverage
         run: |
           set -euo pipefail
           files=""
           parts=0
-          for part in coverage-parts/coverage-*; do
+          for part in coverage-parts/lcov-*; do
             parts=$((parts + 1))
             records=$(grep -c '^DA:' "$part/coverage.lcov" || true)
             if [ "$records" -lt 1000 ]; then
@@ -275,7 +557,7 @@ jobs:
               | diff -u "$part/coverage-sources.txt" -
             files="$files${files:+,}$part/coverage.lcov"
           done
-          [ "$parts" = 4 ] || { echo "expected 4 coverage parts, found $parts" >&2; exit 1; }
+          [ "$parts" = 7 ] || { echo "expected 7 coverage parts, found $parts" >&2; exit 1; }
           echo "COVERAGE_FILES=$files" >> "$GITHUB_ENV"
 
       - name: Upload coverage report

@@ -1,0 +1,958 @@
+//! Tests validation of usage, watch, node and policy documents, including forged publishers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+
+#[tokio::test]
+async fn watch_origins_converge() {
+    // Independent origins must not lose a replica to arrival-order admission.
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEventKind, WatchEventMask, WatchSubscription,
+    };
+
+    let (_left_dir, left) = test_storage();
+    let (_right_dir, right) = test_storage();
+    let realm_id = RealmId::from_bytes([57u8; 32]);
+    let make = |seed: u8, event_mask: WatchEventMask| {
+        let owner = UserId::local(Ulid::from_parts(seed as u64, 1), realm_id);
+        let watch_id = Ulid::from_parts(seed as u64, 2);
+        let mut subscription = WatchSubscription::new(
+            ulid::Ulid::generate(),
+            owner,
+            format!("watch/{seed}"),
+            event_mask,
+            1,
+        );
+        subscription.watch_id = watch_id;
+        let change = DocumentChange {
+            base: None,
+            current: DocumentSyncRevision {
+                generation: 1,
+                event_id: Ulid::from_parts(seed as u64, 3),
+                actor: node(seed),
+                updated_at_ms: 1,
+            },
+            kind: DocumentChangeKind::Upsert,
+            placement: PlacementRef::NIL,
+        };
+        (
+            DocumentTarget::WatchSubscription { owner, watch_id },
+            subscription.to_bytes().expect("subscription serializes"),
+            change,
+        )
+    };
+    let first = make(
+        1,
+        WatchEventMask::from_kinds([WatchEventKind::SyncCompleted]),
+    );
+    let second = make(2, WatchEventMask::from_kinds([WatchEventKind::SyncFailed]));
+
+    assert!(validate_watch_upsert(&first.0, &first.1, &first.2).is_ok());
+    assert!(
+        store_watch_change(&left, first.0.clone(), Some(first.1.clone()), first.2,)
+            .await
+            .expect("first origin applies")
+    );
+    assert!(validate_watch_upsert(&second.0, &second.1, &second.2).is_ok());
+    assert!(
+        store_watch_change(&left, second.0.clone(), Some(second.1.clone()), second.2,)
+            .await
+            .expect("second origin applies")
+    );
+    assert!(validate_watch_upsert(&second.0, &second.1, &second.2).is_ok());
+    assert!(
+        store_watch_change(&right, second.0.clone(), Some(second.1.clone()), second.2,)
+            .await
+            .expect("second origin applies in reverse order")
+    );
+    assert!(validate_watch_upsert(&first.0, &first.1, &first.2).is_ok());
+    assert!(
+        store_watch_change(&right, first.0.clone(), Some(first.1.clone()), first.2,)
+            .await
+            .expect("first origin applies in reverse order")
+    );
+
+    for storage in [&left, &right] {
+        assert!(
+            read_storage_value(storage, first.0.storage_keyspace(), first.0.storage_key(),)
+                .await
+                .is_some()
+        );
+        assert!(
+            read_storage_value(storage, second.0.storage_keyspace(), second.0.storage_key(),)
+                .await
+                .is_some()
+        );
+    }
+    let unknown_mask: WatchEventMask =
+        postcard::from_bytes(&postcard::to_allocvec(&16u32).expect("unknown mask serializes"))
+            .expect("unknown mask decodes");
+    let (target, bytes, change) = make(3, unknown_mask);
+    assert!(validate_watch_upsert(&target, &bytes, &change).is_err());
+}
+
+#[tokio::test]
+async fn admits_authentic_policy() {
+    let realm_id = RealmId::from_bytes([21u8; 32]);
+    let (dir, storage) = test_storage();
+    let (config, auth) = policy_realm_view(realm_id);
+    write_realm_view(&storage, &config, &auth).await;
+    let service = policy_service(realm_id, storage.clone(), dir.path()).await;
+
+    let policy = policy_fixture(Ulid::from_bytes([8u8; 16]));
+    let document = signed_policy_document(realm_id, &policy, 1);
+    let placement = config
+        .policy_placement(policy.policy().policy_id)
+        .expect("policy bucket resolves");
+    assert!(matches!(
+        service
+            .apply_policy_document(&document, placement)
+            .await
+            .expect("apply runs"),
+        PlacementOutcome::Accepted(true)
+    ));
+
+    let target = placement_policy_target(policy.policy().policy_id);
+    assert!(
+        read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+            .await
+            .is_some(),
+        "an authentic publication must be stored"
+    );
+}
+
+#[tokio::test]
+async fn rejects_forged_publication() {
+    // A self-authoring ordinary node and a relay that substitutes itself as
+    // origin both lack realm-admin publication authority.
+    let realm_id = RealmId::from_bytes([22u8; 32]);
+    let (dir, storage) = test_storage();
+    let (config, auth) = policy_realm_view(realm_id);
+    write_realm_view(&storage, &config, &auth).await;
+    let service = policy_service(realm_id, storage.clone(), dir.path()).await;
+
+    let policy = policy_fixture(Ulid::from_bytes([9u8; 16]));
+    let placement = config
+        .policy_placement(policy.policy().policy_id)
+        .expect("policy bucket resolves");
+    let authentic = signed_policy_document(realm_id, &policy, 1);
+
+    let secret = iroh::SecretKey::from_bytes(&[2u8; 32]);
+    let self_authored = PlacementPolicyDocument::new(
+        realm_id,
+        &policy,
+        aruna_core::structs::placement::policy::document::PolicyPublicationClaim::new(
+            realm_id,
+            &policy,
+            secret.public(),
+            UserId::local(Ulid::from_bytes([7u8; 16]), realm_id),
+            Ulid::from_bytes([5u8; 16]),
+            9,
+            [0u8; 32],
+        )
+        .sign(&secret),
+    );
+    let mut relayed = authentic.clone();
+    relayed.publication.publisher = node(2);
+
+    for forged in [self_authored, relayed] {
+        assert!(matches!(
+            service
+                .apply_policy_document(&forged, placement)
+                .await
+                .expect("apply runs"),
+            PlacementOutcome::Rejected
+        ));
+    }
+
+    let target = placement_policy_target(policy.policy().policy_id);
+    assert!(
+        read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+            .await
+            .is_none(),
+        "a forged publication must leave no row"
+    );
+}
+
+#[tokio::test]
+async fn defers_unknown_authority() {
+    // Without the replicated authorization document the publication cannot
+    // be verified yet, so it waits instead of being accepted or dropped.
+    let realm_id = RealmId::from_bytes([23u8; 32]);
+    let (dir, storage) = test_storage();
+    let (config, _) = policy_realm_view(realm_id);
+    let actor = aruna_core::structs::identity::auth::Actor {
+        node_id: node(1),
+        user_id: policy_admin(realm_id),
+        realm_id,
+    };
+    let target = DocumentTarget::RealmConfig { realm_id };
+    batch_write_to(
+        &storage,
+        vec![(
+            target.storage_keyspace().to_string(),
+            target.storage_key(),
+            Value::from(config.to_bytes(&actor).expect("config encodes")),
+        )],
+    )
+    .await
+    .expect("config is stored");
+    let service = policy_service(realm_id, storage.clone(), dir.path()).await;
+
+    let policy = policy_fixture(Ulid::from_bytes([10u8; 16]));
+    let document = signed_policy_document(realm_id, &policy, 1);
+    let placement = config
+        .policy_placement(policy.policy().policy_id)
+        .expect("policy bucket resolves");
+    assert!(matches!(
+        service
+            .apply_policy_document(&document, placement)
+            .await
+            .expect("apply runs"),
+        PlacementOutcome::Deferred(DocumentSyncDependency::RealmAuthorization(deferred))
+            if deferred == realm_id
+    ));
+}
+
+#[test]
+fn binds_policy_target() {
+    use aruna_core::structs::placement::policy::document::placement_policy_change;
+    use aruna_core::structs::placement::policy::{
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
+    };
+
+    let realm_id = RealmId::from_bytes([2u8; 32]);
+    let policy_id = Ulid::from_bytes([8u8; 16]);
+    let selector = |location: &str| PlacementSelector {
+        node_id: None,
+        location: Some(location.to_string()),
+        labels: Vec::new(),
+        executor_kind: None,
+    };
+    let policy = VerifiedPolicy::verify(
+        PlacementPolicy::new(
+            policy_id,
+            "residency".to_string(),
+            vec![selector("eu-west")],
+        )
+        .expect("policy is valid"),
+    )
+    .expect("policy verifies");
+    let document = signed_policy_document(realm_id, &policy, 7);
+    let placement = PlacementRef {
+        strategy_id: Ulid::from_bytes([6u8; 16]),
+        shard: 3,
+    };
+    let change = placement_policy_change(&document, placement);
+    assert!(validate_policy_document(policy_id, realm_id, &document, &change).is_ok());
+
+    // Another target, another realm, or a restated revision is refused.
+    assert!(
+        validate_policy_document(Ulid::from_bytes([9u8; 16]), realm_id, &document, &change)
+            .is_err()
+    );
+    assert!(
+        validate_policy_document(
+            policy_id,
+            RealmId::from_bytes([3u8; 32]),
+            &document,
+            &change
+        )
+        .is_err()
+    );
+    let mut restated = change;
+    restated.current.actor = node(8);
+    assert!(validate_policy_document(policy_id, realm_id, &document, &restated).is_err());
+}
+
+#[tokio::test]
+async fn forged_upsert_skipped() {
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
+
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([55u8; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(55).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let forged_node = node(88);
+    assert_ne!(local_node, forged_node);
+    let target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: local_node,
+    };
+    let forged_target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: forged_node,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    assert_eq!(
+        topic_id,
+        forged_target.sync_topic_id(realm_id, &PlacementRef::NIL)
+    );
+
+    let change = || DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::generate(),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind: DocumentChangeKind::Upsert,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+    };
+    let forged_digest = WatchInterestDigest::from_subscriptions(
+        forged_node,
+        [(
+            "/forged/**".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+        )],
+    );
+    let owned_digest = WatchInterestDigest::from_subscriptions(
+        local_node,
+        [(
+            "/owned/**".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+        )],
+    );
+    let owned_bytes = owned_digest.to_bytes().expect("digest serializes");
+
+    // The forged upsert claims another node's key but is signed by this local
+    // node; the legitimate one is signed by its owner on the shared topic.
+    let published = service
+        .publish_documents(
+            vec![
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::generate(),
+                    target: forged_target.clone(),
+                    bytes: forged_digest.to_bytes().expect("digest serializes"),
+                    change: change(),
+                    allow_genesis: true,
+                },
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::generate(),
+                    target: target.clone(),
+                    bytes: owned_bytes.clone(),
+                    change: change(),
+                    allow_genesis: true,
+                },
+            ],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+
+    reset_test_cursor(&service, topic_id).await;
+
+    let result = service
+        .reconcile_document_topics([topic_id])
+        .await
+        .expect("reconcile skips forged watch-interest upsert");
+
+    assert!(result.targets.contains(&target));
+    assert!(!result.targets.contains(&forged_target));
+    let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+        .await
+        .expect("watch interest digest applied");
+    assert_eq!(
+        WatchInterestDigest::from_bytes(&stored).expect("digest decodes"),
+        owned_digest
+    );
+    assert!(
+        read_storage_value(
+            &storage,
+            forged_target.storage_keyspace(),
+            forged_target.storage_key(),
+        )
+        .await
+        .is_none()
+    );
+
+    let cursor = read_test_cursor(&storage, topic_id)
+        .await
+        .expect("cursor persisted");
+    let topic_clock = service
+        .node()
+        .storage()
+        .actor_clock(&topic_id)
+        .expect("topic clock");
+    assert!(
+        cursor.dominates(&topic_clock),
+        "cursor must advance past the forged upsert"
+    );
+
+    let records = quarantine_rows(&storage).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].reason,
+        "watch interest publisher is not the owning node"
+    );
+    assert_eq!(records[0].target(), Some(&forged_target));
+
+    service.shutdown().await;
+}
+
+#[tokio::test]
+async fn forged_watch_skipped() {
+    use aruna_core::structs::execution::notification_watch::{WatchEventKind, WatchEventMask};
+
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([56u8; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(56).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let forged_node = node(89);
+    assert_ne!(local_node, forged_node);
+    let target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: local_node,
+    };
+    let forged_target = DocumentTarget::WatchInterest {
+        realm_id,
+        node_id: forged_node,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+    assert_eq!(
+        topic_id,
+        forged_target.sync_topic_id(realm_id, &PlacementRef::NIL)
+    );
+
+    let change = |kind| DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::generate(),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+    };
+    let digest = WatchInterestDigest::from_subscriptions(
+        local_node,
+        [(
+            "/owned/**".to_string(),
+            WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+        )],
+    );
+    let digest_bytes = digest.to_bytes().expect("digest serializes");
+    // The local node originates the hostile op, so it clears the origin binding:
+    // a realm-config operation has no business on a watch-interest target.
+    let actor = Actor {
+        node_id: local_node,
+        user_id: UserId::local(Ulid::from_parts(1_560, 1), realm_id),
+        realm_id,
+    };
+    let admin_event = test_admin_event(
+        Ulid::from_parts(1_561, 1),
+        AdminDocumentTarget::RealmConfig { realm_id },
+        &actor,
+        1,
+        AdminDocumentOperation::ConfigDescriptionSet {
+            description: "forged watch-interest admin op".to_string(),
+        },
+    );
+
+    // Hostile non-upserts precede a legitimate owner-signed digest on the shared
+    // topic; reconcile must skip both and continue to the valid upsert.
+    let published = service
+        .publish_documents(
+            vec![
+                DocumentSyncPublish::Delete {
+                    event_id: Ulid::generate(),
+                    target: forged_target.clone(),
+                    change: change(DocumentChangeKind::Delete),
+                    allow_genesis: true,
+                },
+                DocumentSyncPublish::AdminOperation {
+                    target: forged_target.clone(),
+                    event: Box::new(admin_event),
+                    placement: PlacementRef::NIL,
+                    allow_genesis: true,
+                    origin_signature: None,
+                },
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::generate(),
+                    target: target.clone(),
+                    bytes: digest_bytes.clone(),
+                    change: change(DocumentChangeKind::Upsert),
+                    allow_genesis: true,
+                },
+            ],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+
+    reset_test_cursor(&service, topic_id).await;
+
+    let result = service
+        .reconcile_document_topics([topic_id])
+        .await
+        .expect("reconcile skips forged watch-interest non-upserts");
+
+    assert!(result.targets.contains(&target));
+    assert!(!result.targets.contains(&forged_target));
+    let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+        .await
+        .expect("watch interest digest applied");
+    assert_eq!(
+        WatchInterestDigest::from_bytes(&stored).expect("digest decodes"),
+        digest
+    );
+    assert!(
+        read_storage_value(
+            &storage,
+            forged_target.storage_keyspace(),
+            forged_target.storage_key(),
+        )
+        .await
+        .is_none()
+    );
+
+    let cursor = read_test_cursor(&storage, topic_id)
+        .await
+        .expect("cursor persisted");
+    let topic_clock = service
+        .node()
+        .storage()
+        .actor_clock(&topic_id)
+        .expect("topic clock");
+    assert!(
+        cursor.dominates(&topic_clock),
+        "cursor must advance past the forged non-upserts"
+    );
+
+    let records = quarantine_rows(&storage).await;
+    assert_eq!(records.len(), 2, "{records:?}");
+    for record in &records {
+        assert_eq!(
+            record.reason,
+            "unsupported non-upsert shared realm document event"
+        );
+    }
+
+    service.shutdown().await;
+}
+
+// A forged non-upsert node-usage event on the shared realm topic must be skipped,
+// not `?`-propagated, or every peer's reconcile errors at the op forever.
+#[tokio::test]
+async fn forged_usage_skipped() {
+    use aruna_core::structs::storage::usage::UsageCounters;
+
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(53).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        RealmId::from_bytes([53u8; 32]),
+    )
+    .expect("document sync service opens");
+
+    let local_node = service.local_node_id().expect("local node id");
+    let realm_id = RealmId::from_bytes([53u8; 32]);
+    let target = DocumentTarget::NodeUsage {
+        realm_id,
+        node_id: local_node,
+        group_id: None,
+    };
+    let topic_id = target.sync_topic_id(realm_id, &PlacementRef::NIL);
+
+    let change = |kind| DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation: 1,
+            event_id: Ulid::generate(),
+            actor: local_node,
+            updated_at_ms: 1,
+        },
+        kind,
+        placement: aruna_core::structs::placement::record::PlacementRef::NIL,
+    };
+
+    let snapshot = NodeUsageSnapshot {
+        node_id: local_node,
+        counters: UsageCounters {
+            buckets: 5,
+            ..Default::default()
+        },
+        replicas: Default::default(),
+        revisions: Default::default(),
+    };
+    let snapshot_bytes = snapshot.to_bytes().expect("snapshot serializes");
+
+    // Hostile Delete first, then a legitimate owner-signed Upsert on the same
+    // topic. Publishing appends both ops and advances the local cursor.
+    let published = service
+        .publish_documents(
+            vec![
+                DocumentSyncPublish::Delete {
+                    event_id: Ulid::generate(),
+                    target: target.clone(),
+                    change: change(DocumentChangeKind::Delete),
+                    allow_genesis: true,
+                },
+                DocumentSyncPublish::Upsert {
+                    event_id: Ulid::generate(),
+                    target: target.clone(),
+                    bytes: snapshot_bytes.clone(),
+                    change: change(DocumentChangeKind::Upsert),
+                    allow_genesis: true,
+                },
+            ],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+
+    // Reset the cursor so reconcile reprocesses both ops exactly as a fresh
+    // peer receiving them via sync would (its cursor has not yet advanced).
+    reset_test_cursor(&service, topic_id).await;
+
+    // (a) Reconcile completes without error despite the hostile Delete.
+    let result = service
+        .reconcile_document_topics([topic_id])
+        .await
+        .expect("reconcile skips the forged delete instead of wedging");
+
+    // (c) The legitimate upsert on the same topic still applied.
+    assert!(result.targets.contains(&target));
+    let stored = read_storage_value(&storage, target.storage_keyspace(), target.storage_key())
+        .await
+        .expect("node usage snapshot applied");
+    assert_eq!(
+        NodeUsageSnapshot::from_bytes(&stored).expect("snapshot decodes"),
+        snapshot
+    );
+
+    // (b) The cursor advanced past the hostile op.
+    let cursor = read_test_cursor(&storage, topic_id)
+        .await
+        .expect("cursor persisted");
+    let topic_clock = service
+        .node()
+        .storage()
+        .actor_clock(&topic_id)
+        .expect("topic clock");
+    assert!(
+        cursor.dominates(&topic_clock),
+        "cursor must advance past the hostile op"
+    );
+
+    let records = quarantine_rows(&storage).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].reason,
+        "unsupported non-upsert shared realm document event"
+    );
+    assert_eq!(records[0].family(), Some(SyncQuarantineFamily::Delete));
+
+    service.shutdown().await;
+}
+
+fn setting_change(actor: NodeId, generation: u64, kind: DocumentChangeKind) -> DocumentChange {
+    DocumentChange {
+        base: None,
+        current: DocumentSyncRevision {
+            generation,
+            event_id: Ulid::generate(),
+            actor,
+            updated_at_ms: 1,
+        },
+        kind,
+        placement: PlacementRef::NIL,
+    }
+}
+
+fn setting_stamp(writer: NodeId, id: Ulid) -> aruna_core::register::RegisterStamp {
+    aruna_core::register::RegisterStamp {
+        counter: 1,
+        node_id: writer,
+        write_id: id,
+    }
+}
+
+fn email_setting(owner: UserId, seed: u8, on: bool, writer: NodeId) -> (DocumentTarget, Vec<u8>) {
+    use aruna_core::structs::execution::email::EmailPreference;
+    use aruna_core::structs::execution::setting::SettingChannel;
+    let id = Ulid::from_parts(seed as u64, 1);
+    let preference = EmailPreference {
+        preference_id: id,
+        user_id: owner,
+        stamp: setting_stamp(writer, id),
+        categories: match on {
+            true => ["share.upload".to_string()].into(),
+            false => Default::default(),
+        },
+        sealed: on.then(|| vec![7; 48]),
+        created_at_ms: 1,
+    };
+    let target = SettingChannel::Email.target(owner, id);
+    (target, preference.to_bytes().expect("setting serializes"))
+}
+
+#[test]
+fn email_upsert_validated() {
+    use aruna_core::structs::execution::email::EmailPreference;
+    let owner = UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([2u8; 32]));
+    let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
+    for on in [true, false] {
+        let (target, bytes) = email_setting(owner, 1, on, node(7));
+        assert!(validate_setting_upsert(&target, &bytes, &upsert).is_ok());
+        let later = setting_change(node(7), 2, DocumentChangeKind::Upsert);
+        assert!(validate_setting_upsert(&target, &bytes, &later).is_err());
+    }
+    let (target, bytes) = email_setting(owner, 1, true, node(7));
+    let mut preference = EmailPreference::from_bytes(&bytes).expect("setting decodes");
+    let other = UserId::local(Ulid::from_parts(9, 9), owner.realm_id);
+    let mut broken = Vec::new();
+    let changes: [fn(&mut EmailPreference); 7] = [
+        |setting: &mut EmailPreference| setting.categories.clear(),
+        |setting: &mut EmailPreference| setting.sealed = None,
+        |setting: &mut EmailPreference| setting.stamp.counter = 0,
+        |setting: &mut EmailPreference| setting.stamp.write_id = Ulid::from_parts(8, 8),
+        // The stamp must name the node that published the write.
+        |setting: &mut EmailPreference| setting.stamp.node_id = node(8),
+        |setting: &mut EmailPreference| setting.categories = ["resource.watch".to_string()].into(),
+        |setting: &mut EmailPreference| setting.sealed = Some(vec![0; 4096]),
+    ];
+    for change in changes {
+        let mut changed = preference.clone();
+        change(&mut changed);
+        broken.push(changed);
+    }
+    preference.user_id = other;
+    broken.push(preference);
+    for setting in broken {
+        let bytes = setting.to_bytes().expect("setting serializes");
+        assert!(
+            validate_setting_upsert(&target, &bytes, &upsert).is_err(),
+            "{setting:?}"
+        );
+    }
+}
+
+#[test]
+fn webhook_upsert_validated() {
+    use aruna_core::structs::execution::setting::SettingChannel;
+    use aruna_core::structs::execution::webhook::WebhookSubscription;
+    let owner = UserId::local(Ulid::from_parts(1, 1), RealmId::from_bytes([2u8; 32]));
+    let id = Ulid::from_parts(3, 1);
+    let target = SettingChannel::Webhook.target(owner, id);
+    let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
+    let setting = |url: Option<&str>, sealed: Option<Vec<u8>>| {
+        let subscription = WebhookSubscription {
+            subscription_id: id,
+            user_id: owner,
+            stamp: setting_stamp(node(7), id),
+            url: url.map(str::to_string),
+            sealed,
+            created_at_ms: 1,
+        };
+        subscription.to_bytes().expect("setting serializes")
+    };
+    let url = Some("https://hooks.example.org/aruna");
+    assert!(validate_setting_upsert(&target, &setting(url, Some(vec![1; 80])), &upsert).is_ok());
+    assert!(validate_setting_upsert(&target, &setting(None, None), &upsert).is_ok());
+    for bytes in [
+        setting(url, None),
+        setting(None, Some(vec![1; 80])),
+        setting(Some("ftp://example.org/x"), Some(vec![1; 80])),
+        setting(Some("https://user:pw@example.org/x"), Some(vec![1; 80])),
+    ] {
+        assert!(validate_setting_upsert(&target, &bytes, &upsert).is_err());
+    }
+    let (email_target, _) = email_setting(owner, 3, true, node(7));
+    let mismatched = setting(url, Some(vec![1; 80]));
+    assert!(validate_setting_upsert(&email_target, &mismatched, &upsert).is_err());
+}
+
+#[tokio::test]
+async fn foreign_actor_rejected() {
+    // A setting whose revision actor is not its publisher, an invalid one, other bytes under a
+    // known target and any delete are quarantined; the valid setting applies and replays skip.
+    let (_storage_dir, storage) = test_storage();
+    let doc_dir = tempfile::tempdir().expect("doc dir");
+    let realm_id = RealmId::from_bytes([72u8; 32]);
+    let service = DocumentSyncService::open_with_policy(
+        test_endpoint(72).await,
+        storage.clone(),
+        doc_dir.path().join("document-sync"),
+        &[],
+        vec![Alpn::DocumentSync.as_bytes().to_vec()],
+        ::irokle::net::IrohRuntimeConfig::default(),
+        FjallPersistPolicy::Buffer,
+        realm_id,
+    )
+    .expect("document sync service opens");
+    let local = service.local_node_id().expect("local node id");
+    let owner = UserId::local(Ulid::from_bytes([3; 16]), realm_id);
+    let (forged, forged_bytes) = email_setting(owner, 1, true, node(71));
+    let (valid, valid_bytes) = email_setting(owner, 2, false, local);
+    let (_, conflicting) = email_setting(owner, 2, true, local);
+    let (removed, _) = email_setting(owner, 3, true, local);
+    let (invalid, _) = email_setting(owner, 4, true, local);
+    let topic = valid.sync_topic_id(realm_id, &PlacementRef::NIL);
+    let events: [Ulid; 6] = std::array::from_fn(|_| Ulid::generate());
+    let upsert =
+        |event_id, target: &DocumentTarget, bytes: &[u8], actor| DocumentSyncPublish::Upsert {
+            event_id,
+            target: target.clone(),
+            bytes: bytes.to_vec(),
+            change: setting_change(actor, 1, DocumentChangeKind::Upsert),
+            allow_genesis: true,
+        };
+    let published = service
+        .publish_documents(
+            vec![
+                upsert(events[0], &forged, &forged_bytes, node(71)),
+                upsert(events[1], &invalid, &valid_bytes, local),
+                DocumentSyncPublish::Delete {
+                    event_id: events[2],
+                    target: removed,
+                    change: setting_change(local, 2, DocumentChangeKind::Delete),
+                    allow_genesis: true,
+                },
+                upsert(events[3], &valid, &valid_bytes, local),
+                upsert(events[4], &valid, &conflicting, local),
+                upsert(events[5], &valid, &valid_bytes, local),
+            ],
+            Vec::new(),
+        )
+        .await;
+    assert!(matches!(
+        published,
+        DocumentNetEvent::DocumentsPublished { .. }
+    ));
+    reset_test_cursor(&service, topic).await;
+    service
+        .reconcile_document_topics([topic])
+        .await
+        .expect("rejected settings are quarantined");
+
+    let records = quarantine_rows(&storage).await;
+    assert_eq!(records.len(), 4, "{records:?}");
+    assert_eq!(
+        quarantined_reason(&records, events[0]),
+        "notification setting revision actor is not its publisher"
+    );
+    assert!(quarantined_reason(&records, events[1]).starts_with("invalid notification setting:"));
+    assert_eq!(
+        quarantined_reason(&records, events[2]),
+        "notification settings are never deleted"
+    );
+    assert_eq!(
+        quarantined_reason(&records, events[4]),
+        "notification setting conflicts with a stored write"
+    );
+    let applied = read_storage_value(&storage, valid.storage_keyspace(), valid.storage_key()).await;
+    assert_eq!(applied.as_deref(), Some(valid_bytes.as_slice()));
+    let skipped = read_storage_value(&storage, forged.storage_keyspace(), forged.storage_key());
+    assert!(skipped.await.is_none());
+    service.shutdown().await;
+}
+
+#[test]
+fn secret_upsert_validated() {
+    // Owner secret writes admit by structure and origin only; membership is decided later.
+    use aruna_core::admin_documents::AdminDocumentClock;
+    use aruna_core::secret_registers::{
+        SecretBody, SecretDocument, SecretLifecycle, SecretOwner, SecretValue,
+    };
+    use aruna_core::secrets::{SecretKind, SecretName};
+    let realm_id = RealmId::from_bytes([2u8; 32]);
+    let owner = SecretOwner::Group(Ulid::from_parts(5, 5));
+    let name = SecretName::try_from("catalog-key".to_string()).expect("valid name");
+    let id = Ulid::from_parts(3, 1);
+    let document = SecretDocument {
+        owner,
+        name: name.clone(),
+        stamp: setting_stamp(node(7), id),
+        incarnation: id,
+        config_clock: AdminDocumentClock::default(),
+        author: UserId::local(Ulid::from_parts(1, 1), realm_id),
+        written_at_ms: 1,
+        body: SecretBody::Lifecycle(SecretLifecycle::Created {
+            kind: SecretKind::parse("bearer").expect("built-in kind"),
+            readable: false,
+        }),
+    };
+    let target = |part| DocumentTarget::OwnerSecret {
+        realm_id,
+        owner,
+        name: name.clone(),
+        part,
+        write_id: id,
+    };
+    let lifecycle = target(aruna_core::secret_registers::SecretPart::Lifecycle);
+    let upsert = setting_change(node(7), 1, DocumentChangeKind::Upsert);
+    let bytes = document.to_bytes().expect("document serializes");
+    assert!(validate_register_upsert(&lifecycle, &bytes, &upsert).is_ok());
+    let later = setting_change(node(7), 2, DocumentChangeKind::Upsert);
+    assert!(validate_register_upsert(&lifecycle, &bytes, &later).is_err());
+    let wrong_part = target(aruna_core::secret_registers::SecretPart::Value);
+    assert!(validate_register_upsert(&wrong_part, &bytes, &upsert).is_err());
+    let mut broken = Vec::new();
+    let changes: [fn(&mut SecretDocument); 4] = [
+        |document: &mut SecretDocument| document.stamp.counter = 0,
+        // The stamp must name the node that published the write.
+        |document: &mut SecretDocument| document.stamp.node_id = node(8),
+        |document: &mut SecretDocument| document.incarnation = Ulid::from_parts(9, 9),
+        |document: &mut SecretDocument| {
+            document.body = SecretBody::Value(SecretValue {
+                fields: vec!["token".to_string()],
+                sealed: vec![0; 20_000],
+            })
+        },
+    ];
+    for change in changes {
+        let mut changed = document.clone();
+        change(&mut changed);
+        broken.push(changed);
+    }
+    for document in broken {
+        let bytes = document.to_bytes().expect("document serializes");
+        assert!(
+            validate_register_upsert(&lifecycle, &bytes, &upsert).is_err(),
+            "{document:?}"
+        );
+    }
+}

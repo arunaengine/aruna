@@ -1,0 +1,131 @@
+//! Owns the user record with its subjects, aliases and attributes, plus sessions and vault.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod session;
+pub mod vault;
+
+use crate::errors::ConversionError;
+use crate::structs::identity::auth::Actor;
+use crate::types::GroupId;
+use crate::user::id::UserId;
+use crate::user::validation::{
+    DEACTIVATED_ATTRIBUTE, INSTALL_ATTRIBUTE, MERGED_INTO_ATTRIBUTE, MERGED_PREFIX,
+    SERVICE_GROUP_ATTRIBUTE, STOPPED_BY_INSTALL,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct User {
+    pub user_id: UserId,
+    pub name: String,
+    pub subject_ids: Vec<String>,
+    pub alias_user_ids: HashSet<UserId>,
+    pub attributes: HashMap<String, String>,
+}
+
+impl User {
+    pub fn to_bytes(&self, _actor: &Actor) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn reconcile_bytes(
+        &self,
+        current: Option<&[u8]>,
+        actor: &Actor,
+    ) -> Result<Vec<u8>, ConversionError> {
+        let _ = (current, actor);
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+
+    pub fn is_deactivated(&self) -> bool {
+        self.attributes.contains_key(DEACTIVATED_ATTRIBUTE)
+    }
+
+    /// Whether the account's own plugin install deactivated it, not an administrator.
+    pub fn stopped_by_install(&self) -> bool {
+        self.attributes
+            .get(DEACTIVATED_ATTRIBUTE)
+            .map(String::as_str)
+            == Some(STOPPED_BY_INSTALL)
+    }
+
+    /// The owning group when this account is a service account.
+    pub fn service_group(&self) -> Option<GroupId> {
+        self.attributes
+            .get(SERVICE_GROUP_ATTRIBUTE)
+            .and_then(|group| group.parse().ok())
+    }
+
+    /// The plugin install this service account acts for.
+    pub fn install(&self) -> Option<ulid::Ulid> {
+        (self.attributes.get(INSTALL_ATTRIBUTE)).and_then(|install| install.parse().ok())
+    }
+
+    /// The account this one was merged into; a merged account stays deactivated.
+    pub fn merged_into(&self) -> Option<UserId> {
+        self.attributes
+            .get(MERGED_INTO_ATTRIBUTE)
+            .and_then(|user_id| UserId::from_string(user_id).ok())
+    }
+
+    /// The secondary accounts merged into this primary account, in id order.
+    pub fn merged_user_ids(&self) -> Vec<UserId> {
+        let mut merged: Vec<_> = self
+            .attributes
+            .iter()
+            .filter(|(key, _)| key.starts_with(MERGED_PREFIX))
+            .filter_map(|(_, user_id)| UserId::from_string(user_id).ok())
+            .collect();
+        merged.sort();
+        merged
+    }
+
+    /// Whether `via` opens sessions of this account: it is linked, and replication left no
+    /// second linked login of the same realm; such a conflict stays unusable until one is removed.
+    pub fn linked_login(&self, via: &UserId) -> bool {
+        self.alias_user_ids.contains(via)
+            && !self
+                .alias_user_ids
+                .iter()
+                .any(|alias| alias != via && alias.realm_id == via.realm_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::User;
+    use crate::structs::identity::auth::Actor;
+    use crate::structs::identity::realm::RealmId;
+    use crate::user::id::UserId;
+    use std::collections::HashMap;
+    use ulid::Ulid;
+
+    #[test]
+    fn user_attributes_roundtrip() {
+        let realm_id = RealmId([2u8; 32]);
+        let user_id = UserId::new(Ulid::generate(), realm_id);
+        let user = User {
+            user_id,
+            name: "alice".to_string(),
+            subject_ids: Vec::new(),
+            alias_user_ids: Default::default(),
+            attributes: HashMap::from([("orcid".to_string(), "0000-0002-1825-0097".to_string())]),
+        };
+        let actor = Actor {
+            node_id: iroh::SecretKey::from_bytes(&[2u8; 32]).public(),
+            user_id,
+            realm_id,
+        };
+
+        let bytes = user.to_bytes(&actor).unwrap();
+        let hydrated_user = User::from_bytes(&bytes).unwrap();
+
+        assert_eq!(user, hydrated_user);
+    }
+}

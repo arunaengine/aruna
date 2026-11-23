@@ -1,0 +1,531 @@
+//! Owns the document sync service: its state, peer budgets and the parts that run sync.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use ::irokle::net::{decode_sync_message, encode_frame, encode_sync_message};
+use ::irokle::oplog::Oplog;
+use ::irokle::sync::SyncMessage;
+use ::irokle::{
+    Event as _, EventEnvelope, PeerId, ReplicationPolicy, Storage as _, TopicControl,
+    TopicEviction, TopicGenesis, TopicPayload,
+};
+use aruna_core::admin_documents::AdminDocumentEvent;
+use aruna_core::document::{
+    DocumentEvent, DocumentEvictedDocument, DocumentNetEvent, DocumentOutboxEvent,
+    DocumentSyncPublish, HeldDomains,
+};
+use aruna_core::document_apply::cursor::AppliedCursor;
+use aruna_core::document_apply::topic_cursor_key;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::StoragePort;
+use aruna_core::id::{DhtKeyId, NodeId, short_display_id};
+use aruna_core::keyspaces::APPLIED_OPS_KEYSPACE;
+use aruna_core::persistence::FjallPersistPolicy;
+use aruna_core::reducer::overlay::reduced_admin_target;
+use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::structs::sync_quarantine::{SyncQuarantineIdentity, SyncRejection};
+use aruna_core::telemetry::duration_ms;
+use aruna_core::types::Value;
+use byteview::ByteView;
+use parking_lot::{Mutex, RwLock};
+use tokio::task::JoinSet;
+use tokio::time::timeout;
+use tracing::{debug, error, info, warn};
+
+use crate::error::{NetError, Result};
+use crate::streams::{BiStream, PeerKinds};
+
+pub(crate) mod cursor;
+mod eviction;
+mod inbound;
+mod peers;
+mod publish;
+mod published;
+pub(crate) mod reconcile;
+pub(crate) mod storage;
+mod sync;
+mod topics;
+
+use self::cursor::*;
+use self::published::*;
+
+const PEER_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const OUTBOUND_PEER_LIMIT: usize = 8;
+const SYNC_FANOUT_DOMAIN: &[u8] = b"aruna-document-sync-fanout-v1";
+const SYNC_FANOUT_KEYSPACE: &str = "document-sync-fanout";
+/// Block cache of the sync store; Fjall's 32 MiB default rereads blocks of long topic histories.
+const SYNC_CACHE_BYTES: u64 = 512 << 20;
+const SYNC_MESSAGE_LIMIT: usize = 4_096;
+const SYNC_STREAM_BYTES: usize = 256 * 1024 * 1024;
+// A frame is meaningful progress; a byte trickle cannot retain a permit forever.
+const INBOUND_FRAME_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const INBOUND_STREAM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+// Admission budgets: worst-case inbound cost is bounded before any stream is
+// drained, per pushing peer and for the node as a whole.
+const INBOUND_PEER_STREAMS: usize = 8;
+const INBOUND_GLOBAL_STREAMS: usize = 64;
+// Aggregate buffered-byte ceilings, well below 64 independent 256 MiB streams,
+// so concurrent streams cannot pin more memory than the node can absorb.
+const INBOUND_PEER_BYTES: usize = 512 * 1024 * 1024;
+const INBOUND_GLOBAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const FRAME_LEN_LIMIT: usize = 16 * 1024 * 1024;
+const REPLAY_BATCH_LIMIT: usize = 1_024;
+/// Bounds concurrent co-holder genesis probes so a large holder set cannot open
+/// an unbounded number of simultaneous sync streams.
+const SHARD_PROBE_CONCURRENCY: usize = 8;
+
+/// Maps the persist policy to the fjall persist mode of the sync store.
+fn persist_mode(policy: FjallPersistPolicy) -> fjall::PersistMode {
+    match policy {
+        FjallPersistPolicy::Buffer => fjall::PersistMode::Buffer,
+        FjallPersistPolicy::SyncAll => fjall::PersistMode::SyncAll,
+    }
+}
+
+struct DocumentEventBatch {
+    cursor: ::irokle::ActorClock,
+    events: Vec<(DocumentEvent, ::irokle::ActorId, u64)>,
+    /// Ops whose transport payload never decoded into an event. They are
+    /// permanent by construction: no redelivery can make the bytes valid.
+    rejections: Vec<SyncRejection>,
+}
+
+/// One journalled eviction: the payloads Irokle removed with the losing chain,
+/// plus the key that releases them once their outbox rows are committed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEviction {
+    pub key: ::irokle::EvictionKey,
+    pub documents: Vec<DocumentEvictedDocument>,
+}
+
+#[derive(Default)]
+struct PublishEventsOutcome {
+    published: BTreeMap<::irokle::TopicId, PublishedOps>,
+    published_indices: Vec<usize>,
+    retry_indices: Vec<usize>,
+    retry_error: Option<String>,
+    /// The lineage root each published event was found or appended on, by document position.
+    lineages: BTreeMap<usize, [u8; 32]>,
+}
+
+impl PublishEventsOutcome {
+    /// The lineage of each of `count` documents, `None` where it is unknown.
+    fn lineage_list(&self, count: usize) -> Vec<Option<[u8; 32]>> {
+        (0..count)
+            .map(|index| self.lineages.get(&index).copied())
+            .collect()
+    }
+}
+
+/// The ops one publish batch left on a topic: the lineage they were confirmed on and the last op
+/// of each actor, which the cursor advance checks still stand before it covers them.
+#[derive(Debug, Default)]
+struct PublishedOps {
+    lineage: [u8; 32],
+    tips: BTreeMap<::irokle::ActorId, (u64, ::irokle::OpId)>,
+}
+
+impl PublishedOps {
+    /// Takes in `op`, confirmed on `lineage`; the ops of an earlier lineage no longer stand.
+    fn observe(&mut self, op: &::irokle::Op, lineage: [u8; 32]) {
+        if self.lineage != lineage {
+            self.lineage = lineage;
+            self.tips.clear();
+        }
+        let body = &op.signed.body;
+        let tip = self
+            .tips
+            .entry(body.actor_id)
+            .or_insert((body.actor_seq, op.id));
+        if body.actor_seq > tip.0 {
+            *tip = (body.actor_seq, op.id);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PeerSelection {
+    peers: BTreeSet<PeerId>,
+    truncated: bool,
+    round: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ShardPublisherPolicy {
+    current: BTreeSet<::irokle::ActorId>,
+    // Existing history remains applicable across holder replacement. Once a
+    // topic is local, only former-holder ops above this cutover clock are stale.
+    history_cutoff: Option<::irokle::ActorClock>,
+}
+
+impl ShardPublisherPolicy {
+    fn allows(&self, actor_id: &::irokle::ActorId, actor_seq: u64) -> bool {
+        self.current.contains(actor_id)
+            || self
+                .history_cutoff
+                .as_ref()
+                .is_none_or(|cutoff| actor_seq <= cutoff.get(actor_id))
+    }
+}
+
+/// Shard genesis probe outcome. A rank-0 holder may create a genesis only when
+/// every co-holder was reached (`unreachable` empty), none advertised it, and
+/// every reached co-holder confirmed unknown; otherwise creation is withheld.
+#[derive(Clone, Debug, Default)]
+pub struct ShardGenesisProbe {
+    /// Probed topics at least one reached co-holder already has a genesis for.
+    pub known_co_holder: BTreeSet<::irokle::TopicId>,
+    /// Probed topics a reached co-holder neither advertised nor positively
+    /// confirmed unknown: it holds the topic but the prober may not open it yet,
+    /// so a fresh genesis would fork. Possibly-existing ⇒ creation withheld.
+    pub unconfirmed: BTreeSet<::irokle::TopicId>,
+    /// Co-holders that could not be reached (empty ⇒ every co-holder answered).
+    pub unreachable: Vec<NodeId>,
+}
+
+/// Concurrent inbound sync stream counters. A stream takes its permit before
+/// any byte of the payload is read, so an abusive peer costs one table entry
+/// instead of a 256 MiB drain per stream.
+#[derive(Debug, Default)]
+struct InboundSyncBudget {
+    state: Mutex<InboundSyncCounters>,
+}
+
+#[derive(Debug, Default)]
+struct InboundSyncCounters {
+    global: usize,
+    per_peer: BTreeMap<PeerId, usize>,
+    global_bytes: usize,
+    per_peer_bytes: BTreeMap<PeerId, usize>,
+}
+
+impl InboundSyncBudget {
+    fn acquire(self: &Arc<Self>, peer: PeerId) -> Option<InboundSyncPermit> {
+        let mut state = self.state.lock();
+        let held = state.per_peer.get(&peer).copied().unwrap_or(0);
+        if state.global >= INBOUND_GLOBAL_STREAMS || held >= INBOUND_PEER_STREAMS {
+            return None;
+        }
+        state.global += 1;
+        *state.per_peer.entry(peer).or_insert(0) += 1;
+        Some(InboundSyncPermit {
+            budget: self.clone(),
+            peer,
+        })
+    }
+
+    // Reserves declared frame bytes against the per-peer and global ceilings
+    // before the payload is allocated; false leaves both counters untouched.
+    fn reserve_bytes(&self, peer: PeerId, bytes: usize) -> bool {
+        let mut state = self.state.lock();
+        let held = state.per_peer_bytes.get(&peer).copied().unwrap_or(0);
+        if state.global_bytes.saturating_add(bytes) > INBOUND_GLOBAL_BYTES
+            || held.saturating_add(bytes) > INBOUND_PEER_BYTES
+        {
+            return false;
+        }
+        state.global_bytes = state.global_bytes.saturating_add(bytes);
+        *state.per_peer_bytes.entry(peer).or_insert(0) += bytes;
+        true
+    }
+
+    fn release_bytes(&self, peer: PeerId, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let mut state = self.state.lock();
+        state.global_bytes = state.global_bytes.saturating_sub(bytes);
+        if let Some(held) = state.per_peer_bytes.get_mut(&peer) {
+            *held = held.saturating_sub(bytes);
+            if *held == 0 {
+                state.per_peer_bytes.remove(&peer);
+            }
+        }
+    }
+}
+
+struct InboundSyncPermit {
+    budget: Arc<InboundSyncBudget>,
+    peer: PeerId,
+}
+
+impl Drop for InboundSyncPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.global = state.global.saturating_sub(1);
+        if let Some(held) = state.per_peer.get_mut(&self.peer) {
+            *held = held.saturating_sub(1);
+            if *held == 0 {
+                state.per_peer.remove(&self.peer);
+            }
+        }
+    }
+}
+
+/// Holds a peer's buffered-byte reservation for the lifetime of one inbound
+/// stream, releasing it on success, decode failure, cancellation, or drop.
+struct InboundByteReservation {
+    budget: Arc<InboundSyncBudget>,
+    peer: PeerId,
+    reserved: usize,
+}
+
+impl InboundByteReservation {
+    fn new(budget: Arc<InboundSyncBudget>, peer: PeerId) -> Self {
+        Self {
+            budget,
+            peer,
+            reserved: 0,
+        }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> Result<()> {
+        if !self.budget.reserve_bytes(self.peer, bytes) {
+            return Err(NetError::AdmissionRejected(format!(
+                "document sync byte budget exhausted for peer {}",
+                self.peer
+            )));
+        }
+        self.reserved = self.reserved.saturating_add(bytes);
+        Ok(())
+    }
+}
+
+impl Drop for InboundByteReservation {
+    fn drop(&mut self) {
+        self.budget.release_bytes(self.peer, self.reserved);
+    }
+}
+
+#[derive(Clone)]
+pub struct DocumentSyncService {
+    node: ::irokle::Irokle<::irokle::FjallStorage>,
+    net: Arc<::irokle::net::IrohNet<::irokle::FjallStorage>>,
+    db: fjall::OptimisticTxDatabase,
+    fanout_cursors: fjall::OptimisticTxKeyspace,
+    /// The oplog op each local publish became, so a repeated publish appends nothing.
+    published: fjall::OptimisticTxKeyspace,
+    publish_locks: Arc<Vec<Mutex<()>>>,
+    persist_policy: FjallPersistPolicy,
+    pub(crate) storage: Arc<dyn StoragePort>,
+    default_peers: Arc<RwLock<BTreeSet<PeerId>>>,
+    shard_publishers: Arc<RwLock<BTreeMap<::irokle::TopicId, ShardPublisherPolicy>>>,
+    storage_path: PathBuf,
+    reconcile_lock: Arc<tokio::sync::Mutex<()>>,
+    eviction_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<TopicEviction>>>>,
+    // Buckets each unreleased journal entry may re-emit onto, so a bucket's
+    // drain need not rescan the journal; `None` marks an undecoded recovery.
+    eviction_buckets: Arc<RwLock<BTreeMap<::irokle::EvictionKey, Option<Vec<PlacementRef>>>>>,
+    // Realm this service serves; shard-classed targets carry no realm id of
+    // their own, so their topic derivation reads it from here.
+    realm_id: RealmId,
+    inbound_budget: Arc<InboundSyncBudget>,
+    // Peers configured at open; they admit inbound sync only during bootstrap,
+    // after which only the current sync-eligible set is authoritative.
+    configured_peers: BTreeSet<PeerId>,
+    // Flips true on the first realm-config-driven peer refresh, after which
+    // `configured_peers` no longer grant admission.
+    realm_config_materialized: Arc<AtomicBool>,
+    // Realm-config kind table shared with the accept loop, so the dial side
+    // applies the same node-kind boundary. Empty until the embedder attaches it.
+    peer_kinds: PeerKinds,
+    // The temporary folder of a database opened without a configured path. Declared last and shared
+    // by clones, so the last clone removes it after its database handles above are closed.
+    fallback_dir: Option<Arc<tempfile::TempDir>>,
+}
+
+impl DocumentSyncService {
+    /// Keeps the temporary folder the database was opened in until the service is dropped.
+    pub(crate) fn keep_fallback(&mut self, dir: Option<tempfile::TempDir>) {
+        self.fallback_dir = dir.map(Arc::new);
+    }
+}
+
+impl std::fmt::Debug for DocumentSyncService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DocumentSyncService")
+            .field("peer_id", &self.node.peer_id())
+            .field("storage_path", &self.storage_path)
+            .finish()
+    }
+}
+
+impl DocumentSyncService {
+    #[allow(clippy::too_many_arguments)]
+    pub fn open(
+        endpoint: iroh::Endpoint,
+        storage: impl Into<Arc<dyn StoragePort>>,
+        storage_path: impl AsRef<Path>,
+        peer_nodes: &[NodeId],
+        alpns: Vec<Vec<u8>>,
+        runtime: ::irokle::net::IrohRuntimeConfig,
+        realm_id: RealmId,
+    ) -> Result<Self> {
+        Self::open_with_policy(
+            endpoint,
+            storage,
+            storage_path,
+            peer_nodes,
+            alpns,
+            runtime,
+            FjallPersistPolicy::default(),
+            realm_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_policy(
+        endpoint: iroh::Endpoint,
+        storage: impl Into<Arc<dyn StoragePort>>,
+        storage_path: impl AsRef<Path>,
+        peer_nodes: &[NodeId],
+        alpns: Vec<Vec<u8>>,
+        runtime: ::irokle::net::IrohRuntimeConfig,
+        persist_policy: FjallPersistPolicy,
+        realm_id: RealmId,
+    ) -> Result<Self> {
+        let storage: Arc<dyn StoragePort> = storage.into();
+        let storage_path = storage_path.as_ref().to_path_buf();
+        let default_peers: BTreeSet<PeerId> = peer_nodes.iter().map(node_to_peer).collect();
+        let db = fjall::OptimisticTxDatabase::builder(&storage_path)
+            .manual_journal_persist(true)
+            .cache_size(SYNC_CACHE_BYTES)
+            .open()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let fanout_cursors = db
+            .keyspace(SYNC_FANOUT_KEYSPACE, fjall::KeyspaceCreateOptions::default)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let published = db
+            .keyspace(PUBLISHED_KEYSPACE, fjall::KeyspaceCreateOptions::default)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let node = ::irokle::Irokle::builder()
+            .with_iroh_secret_key(endpoint.secret_key())
+            .with_peer_whitelist(default_peers.clone())
+            .with_fjall_database_and_persist_mode(db.clone(), persist_mode(persist_policy))
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .build()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let (eviction_tx, eviction_rx) = tokio::sync::mpsc::unbounded_channel();
+        let net = Arc::new(
+            ::irokle::net::IrohNet::new_with_alpns_config_and_sink(
+                endpoint,
+                node.clone(),
+                alpns,
+                runtime,
+                Some(eviction_tx),
+            )
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+        );
+        net.start_configured_resync_loop()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        // Seeded before any drain can observe the service: an entry left by an
+        // interrupted handoff must block its bucket from the first tick on.
+        let eviction_buckets: BTreeMap<::irokle::EvictionKey, Option<Vec<PlacementRef>>> = node
+            .pending_evictions()
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?
+            .iter()
+            .map(|eviction| (eviction.key(), None))
+            .collect();
+
+        Ok(Self {
+            node,
+            net,
+            db,
+            fanout_cursors,
+            published,
+            publish_locks: Arc::new((0..PUBLISH_LOCKS).map(|_| Mutex::new(())).collect()),
+            persist_policy,
+            storage,
+            default_peers: Arc::new(RwLock::new(default_peers.clone())),
+            shard_publishers: Arc::new(RwLock::new(BTreeMap::new())),
+            storage_path,
+            reconcile_lock: Arc::new(tokio::sync::Mutex::new(())),
+            eviction_rx: Arc::new(Mutex::new(Some(eviction_rx))),
+            eviction_buckets: Arc::new(RwLock::new(eviction_buckets)),
+            realm_id,
+            inbound_budget: Arc::new(InboundSyncBudget::default()),
+            configured_peers: default_peers,
+            realm_config_materialized: Arc::new(AtomicBool::new(false)),
+            peer_kinds: PeerKinds::default(),
+            fallback_dir: None,
+        })
+    }
+
+    pub fn node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
+        self.node.clone()
+    }
+
+    pub fn database(&self) -> fjall::OptimisticTxDatabase {
+        self.db.clone()
+    }
+
+    /// Waits for the reconcile lock and keeps it while the guard lives.
+    pub(crate) async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.reconcile_lock).lock_owned().await
+    }
+
+    pub async fn shutdown(&self) {
+        self.net.shutdown().await;
+        if let Err(error) = self.db.persist(fjall::PersistMode::SyncAll) {
+            warn!(error = %error, "Failed to persist document sync database on shutdown");
+        }
+    }
+}
+
+pub(crate) fn node_to_peer(node_id: &NodeId) -> PeerId {
+    PeerId::from_bytes(*node_id.as_bytes())
+}
+
+fn select_sync_peers(
+    candidates: impl IntoIterator<Item = PeerId>,
+    local_peer: PeerId,
+    subject: &[u8],
+    round: u64,
+) -> PeerSelection {
+    let mut ranked = candidates
+        .into_iter()
+        .filter(|peer| *peer != local_peer)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|peer| (peer, peer_score(subject, peer)))
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|(left_peer, left_score), (right_peer, right_score)| {
+        left_score
+            .cmp(right_score)
+            .then_with(|| left_peer.as_bytes().cmp(right_peer.as_bytes()))
+    });
+    let candidate_count = ranked.len();
+    let selected = OUTBOUND_PEER_LIMIT.min(candidate_count);
+    let start = if candidate_count == 0 {
+        0
+    } else {
+        ((round as u128 * OUTBOUND_PEER_LIMIT as u128) % candidate_count as u128) as usize
+    };
+    let peers = (0..selected)
+        .map(|offset| ranked[(start + offset) % candidate_count].0)
+        .collect();
+    PeerSelection {
+        peers,
+        truncated: candidate_count > selected,
+        round,
+    }
+}
+
+fn peer_score(subject: &[u8], peer: PeerId) -> [u8; 32] {
+    let mut input = Vec::with_capacity(SYNC_FANOUT_DOMAIN.len() + subject.len() + 32);
+    input.extend_from_slice(SYNC_FANOUT_DOMAIN);
+    input.extend_from_slice(subject);
+    input.extend_from_slice(peer.as_bytes());
+    *DhtKeyId::from_data(&input).as_bytes()
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

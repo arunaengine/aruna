@@ -1,0 +1,98 @@
+//! Owns the append-only store of signed job records, with its shared limits and errors.
+//! The mutable job row is a local execution and projection cache, not the shared truth.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::effects::FrameBoundsError;
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::structs::execution::job::family::JobRecordError;
+use aruna_core::structs::identity::realm::JobFamilyError;
+use thiserror::Error;
+
+pub mod admit;
+pub mod append;
+pub mod audit;
+pub mod family;
+pub mod pages;
+pub mod project;
+pub mod prune;
+pub mod reduce;
+pub mod transport;
+pub mod verify;
+
+/// Rows one append may read while completing its evidence scans. Reaching it
+/// with pages left is a corrupt or pathological family, never proof of absence.
+pub const MAX_EVIDENCE_ROWS: usize = 4096;
+/// Records one bounded page of the immutable log returns.
+pub const RECORD_PAGE_SIZE: usize = 64;
+/// Records one projection may reduce. A family beyond this bound is projected
+/// from its first records only, and the truncation is reported, never hidden.
+pub const MAX_PROJECTION_RECORDS: usize = 4096;
+/// Conflict rows one audit page reports.
+pub const MAX_CONFLICT_ROWS: usize = 32;
+
+/// Why an append, projection, or audit did not complete. A local availability
+/// failure is never reported as a denial of the record.
+#[derive(Debug, PartialEq, Error)]
+pub enum RecordStoreError {
+    #[error(transparent)]
+    GroupWrite(#[from] aruna_core::structs::identity::group_delete::GroupWriteError),
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error("a row did not encode or decode: {0}")]
+    Codec(String),
+    #[error(transparent)]
+    Record(#[from] JobRecordError),
+    #[error(transparent)]
+    Bounds(#[from] FrameBoundsError),
+    #[error(transparent)]
+    Family(#[from] JobFamilyError),
+    #[error("realm config document missing")]
+    RealmConfigMissing,
+    /// This node does not hold the family placement, so it is not an append or
+    /// serve authority for it.
+    #[error("this node does not hold the job family placement")]
+    NotHolder,
+    #[error("no job family is bound to that alias")]
+    UnknownAlias,
+    /// The family's evidence could not be read completely, so no candidate may
+    /// be judged from what was loaded. The caller retries.
+    #[error("job family evidence could not be read completely")]
+    EvidenceIncomplete,
+    #[error("operation did not finish")]
+    NotFinished,
+    #[error("unexpected event in state {state}: expected {expected}, got {got}")]
+    UnexpectedEvent {
+        state: String,
+        expected: &'static str,
+        got: &'static str,
+    },
+}
+
+crate::jobs::io_failure!(RecordStoreError);
+
+impl RecordStoreError {
+    /// An event the operation's current state does not accept.
+    pub(crate) fn unexpected(
+        state: &impl std::fmt::Debug,
+        expected: &'static str,
+        got: &'static str,
+    ) -> Self {
+        Self::UnexpectedEvent {
+            state: format!("{state:?}"),
+            expected,
+            got,
+        }
+    }
+
+    /// Whether the work lost its optimistic transaction and may be retried
+    /// unchanged. Every other failure needs a different answer.
+    pub fn is_conflict(&self) -> bool {
+        matches!(self, Self::Storage(StorageError::TransactionConflict))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

@@ -152,5 +152,5 @@ From this folder, with uv:
 uv run --no-project --python 3.12 python -m unittest discover -s tests -t . -p 'test_*.py'
 ```
 
-`plugins/tests/elabftw_python.rs` builds the plugin and runs it in the plugin runtime; it runs
-with `ARUNA_PLUGIN_LANGUAGES=1 cargo test -p aruna-plugins --test elabftw_python`.
+`runtime/wasm-host/tests/elabftw_python.rs` builds the plugin and runs it in the plugin runtime; it is
+ignored by default and runs with `cargo test -p aruna-wasm-host --test integration -- --ignored elabftw_python::`.

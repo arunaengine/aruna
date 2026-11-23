@@ -1,0 +1,2427 @@
+//! Decides DHT behavior in a pure state machine: lookups, routing updates and value checks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+
+use aruna_core::effects::DhtCompletion;
+use aruna_core::events::DhtEntry;
+use aruna_core::id::xor_distance_32;
+use aruna_core::id::{DhtKeyId, NodeId, NodeIdExt};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::trace_context::DistributedTraceContext;
+use smallvec::SmallVec;
+
+use super::constants::{
+    ENTRIES_PER_KEY, LOOKUP_ALPHA, LOOKUP_MAX_QUERIES, MAX_CLOCK_SKEW, MAX_TTL_SECS,
+    MAX_VALUE_SIZE, RPC_TIMEOUT_TICKS,
+};
+use super::kbucket::{InsertResult, K, PeerInfo, RoutingTable};
+use super::protocol::{
+    CLEANUP_OP_ID, DhtCmd, DhtEffect, DhtGetStats, DhtInput, DhtIo, DhtIoError, DhtIoRequest,
+    DhtOutput, DhtOutputValue, DhtPeerError, DhtPutStats, GetCompletedReason, INTERNAL_OP_START,
+    InboundId, OpId, RpcPhase, StorageStage, dht_cmd_kind, dht_input_kind, dht_io_kind,
+    io_inbound_id, io_op_id,
+};
+use super::rpc::{
+    DhtRequest, DhtResponse, ErrorCode, StoredValue, request_kind, response_kind,
+    signed_record_bytes, verify_stored_value,
+};
+use super::storage::{
+    DeadlineEntry, DeadlineIndex, MergeError, StoredEntry, entry_is_fresh, merge_validated,
+    retained_entries, retention_deadline,
+};
+use crate::streams::PeerKinds;
+
+const MIN_TTL_SECS: u64 = 1;
+
+type PendingMap = HashMap<PendingKey, PendingMeta>;
+
+const LOG_PEER_LIMIT: usize = 16;
+const LOG_ERROR_LIMIT: usize = 16;
+
+#[derive(Debug, Clone, Copy)]
+struct PendingMeta {
+    deadline_tick: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PendingKey {
+    Rpc { phase: RpcPhase, peer: NodeId },
+    Storage { stage: StorageStage },
+}
+
+pub struct DhtStateMachine {
+    local_id: NodeId,
+    secret_key: iroh::SecretKey,
+    routing_table: RoutingTable,
+    internal_op_id: OpId,
+    ops: HashMap<OpId, OpState>,
+    cleanup_active: bool,
+    cleanup_floor: bool,
+    eviction_buckets: HashSet<usize>,
+    peer_epoch: u64,
+    current_tick: u64,
+    now_secs: u64,
+    peer_kinds: PeerKinds,
+}
+
+impl std::fmt::Debug for DhtStateMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DhtStateMachine")
+            .field("local_id", &self.local_id)
+            .field("routing_table_size", &self.routing_table.len())
+            .field("ops", &self.ops.len())
+            .field("cleanup_active", &self.cleanup_active)
+            .field("cleanup_floor", &self.cleanup_floor)
+            .field("current_tick", &self.current_tick)
+            .field("now_secs", &self.now_secs)
+            .finish()
+    }
+}
+
+#[derive(Debug)]
+enum OpState {
+    Put(PutOp),
+    Get(GetOp),
+    Bootstrap(BootstrapOp),
+    EvictionPing(EvictionPingOp),
+    MaintenancePing(MaintenancePingOp),
+    InboundGet(InboundGetOp),
+    InboundPut(InboundPutOp),
+}
+
+impl OpState {
+    fn pending(&self) -> &PendingMap {
+        match self {
+            Self::Put(op) => &op.pending,
+            Self::Get(op) => &op.pending,
+            Self::Bootstrap(op) => &op.pending,
+            Self::EvictionPing(op) => &op.pending,
+            Self::MaintenancePing(op) => &op.pending,
+            Self::InboundGet(op) => &op.pending,
+            Self::InboundPut(op) => &op.pending,
+        }
+    }
+
+    fn pending_mut(&mut self) -> &mut PendingMap {
+        match self {
+            Self::Put(op) => &mut op.pending,
+            Self::Get(op) => &mut op.pending,
+            Self::Bootstrap(op) => &mut op.pending,
+            Self::EvictionPing(op) => &mut op.pending,
+            Self::MaintenancePing(op) => &mut op.pending,
+            Self::InboundGet(op) => &mut op.pending,
+            Self::InboundPut(op) => &mut op.pending,
+        }
+    }
+
+    fn trace_context(&self) -> Option<DistributedTraceContext> {
+        match self {
+            Self::Put(op) => op.trace_context.clone(),
+            Self::Get(op) => op.trace_context.clone(),
+            Self::Bootstrap(op) => op.trace_context.clone(),
+            Self::EvictionPing(_)
+            | Self::MaintenancePing(_)
+            | Self::InboundGet(_)
+            | Self::InboundPut(_) => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PutOp {
+    key: DhtKeyId,
+    realm_id: RealmId,
+    value: Vec<u8>,
+    expires_at: u64,
+    revision: Option<u64>,
+    signature: Option<iroh::Signature>,
+    frontier: LookupFrontier,
+    local_write_complete: bool,
+    lookup_finished: bool,
+    store_candidates: Vec<NodeId>,
+    store_attempt_count: usize,
+    store_count: usize,
+    trace_context: Option<DistributedTraceContext>,
+    pending: PendingMap,
+}
+
+#[derive(Debug)]
+struct GetOp {
+    key: DhtKeyId,
+    realm_filter: Option<RealmId>,
+    completion: DhtCompletion,
+    values: Vec<DhtEntry>,
+    value_indices: HashMap<(NodeId, RealmId), usize>,
+    value_versions: HashMap<(NodeId, RealmId), u64>,
+    cache_entries: Vec<StoredEntry>,
+    remote_entries: HashMap<(NodeId, RealmId), StoredEntry>,
+    remote_values: HashSet<(NodeId, RealmId)>,
+    frontier: LookupFrontier,
+    peer_error_count: usize,
+    peer_errors: Vec<DhtPeerError>,
+    successful_responses: usize,
+    trace_context: Option<DistributedTraceContext>,
+    pending: PendingMap,
+}
+
+#[derive(Debug)]
+struct BootstrapOp {
+    active_nodes: usize,
+    trace_context: Option<DistributedTraceContext>,
+    pending: PendingMap,
+}
+
+#[derive(Debug)]
+struct EvictionPingOp {
+    oldest_node: NodeId,
+    oldest_seen: u64,
+    bucket_idx: usize,
+    pending_peer: PeerInfo,
+    pending: PendingMap,
+}
+
+#[derive(Debug)]
+struct MaintenancePingOp {
+    peer: NodeId,
+    peer_seen: u64,
+    pending: PendingMap,
+}
+
+#[derive(Debug)]
+struct InboundGetOp {
+    inbound_id: InboundId,
+    key: DhtKeyId,
+    realm_filter: Option<RealmId>,
+    pending: PendingMap,
+}
+
+#[derive(Debug)]
+struct InboundPutOp {
+    inbound_id: InboundId,
+    pending: PendingMap,
+}
+
+#[derive(Debug, Default)]
+struct LookupFrontier {
+    discovered: HashSet<NodeId>,
+    queried: HashSet<NodeId>,
+    responsive: HashSet<NodeId>,
+    pending: Vec<NodeId>,
+    sent_queries: usize,
+}
+
+impl LookupFrontier {
+    fn add_candidate(&mut self, node_id: NodeId, local_id: NodeId) {
+        if node_id == local_id {
+            return;
+        }
+
+        if !self.discovered.insert(node_id) {
+            return;
+        }
+
+        if !self.queried.contains(&node_id) {
+            self.pending.push(node_id);
+        }
+    }
+
+    fn add_candidates<I: IntoIterator<Item = NodeId>>(
+        &mut self,
+        nodes: I,
+        local_id: NodeId,
+        target: &[u8; 32],
+    ) {
+        for node_id in nodes {
+            self.add_candidate(node_id, local_id);
+        }
+        self.pending
+            .sort_unstable_by(|left, right| compare_distance(target, left, right));
+        let pending_limit = LOOKUP_MAX_QUERIES.saturating_sub(self.queried.len());
+        while self.pending.len() > pending_limit {
+            if let Some(removed) = self.pending.pop() {
+                self.discovered.remove(&removed);
+            }
+        }
+    }
+
+    fn pop_next(&mut self, target: &[u8; 32]) -> Option<NodeId> {
+        if self.pending.is_empty() {
+            return None;
+        }
+
+        self.pending
+            .sort_unstable_by(|a, b| compare_distance(target, a, b));
+        if self.lookup_complete(target) {
+            return None;
+        }
+        let next = self.pending.remove(0);
+        self.queried.insert(next);
+        Some(next)
+    }
+
+    fn closest_responsive(&self, target: &[u8; 32]) -> Vec<NodeId> {
+        let mut nodes: Vec<NodeId> = self.responsive.iter().copied().collect();
+        nodes.sort_unstable_by(|a, b| compare_distance(target, a, b));
+        nodes
+    }
+
+    fn lookup_complete(&self, target: &[u8; 32]) -> bool {
+        if self.pending.is_empty() || self.sent_queries >= LOOKUP_MAX_QUERIES {
+            return true;
+        }
+        if self.responsive.len() < K {
+            return false;
+        }
+
+        let mut responsive: Vec<NodeId> = self.responsive.iter().copied().collect();
+        responsive.sort_unstable_by(|a, b| compare_distance(target, a, b));
+        let farthest = responsive[K - 1];
+        !self
+            .pending
+            .iter()
+            .any(|peer| compare_distance(target, peer, &farthest).is_lt())
+    }
+}
+
+impl DhtStateMachine {
+    pub fn new(local_id: NodeId, secret_key: iroh::SecretKey, start_unix_secs: u64) -> Self {
+        Self {
+            local_id,
+            secret_key,
+            routing_table: RoutingTable::new(local_id),
+            internal_op_id: INTERNAL_OP_START,
+            ops: HashMap::new(),
+            cleanup_active: false,
+            cleanup_floor: false,
+            eviction_buckets: HashSet::new(),
+            peer_epoch: 0,
+            current_tick: 0,
+            now_secs: start_unix_secs,
+            peer_kinds: PeerKinds::default(),
+        }
+    }
+
+    /// Shares the realm-config kind table so the DHT applies the same node-kind
+    /// boundary as the accept loop.
+    pub(crate) fn set_peer_kinds(&mut self, peer_kinds: PeerKinds) {
+        self.peer_kinds = peer_kinds;
+    }
+
+    /// Whether a peer may hold realm state: user devices read the DHT but never
+    /// enter a routing table and never store a value. An unregistered key keeps
+    /// today's behaviour; connection admission bounds it.
+    fn peer_is_eligible(&self, node_id: NodeId) -> bool {
+        self.peer_kinds
+            .read()
+            .get(&node_id)
+            .is_none_or(|kind| kind.is_sync_eligible())
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.step",
+        level = "debug",
+        skip(self, input),
+        fields(input = dht_input_kind(&input))
+    )]
+    pub fn step(&mut self, input: DhtInput) -> SmallVec<[DhtEffect; 4]> {
+        let mut out = SmallVec::<[DhtEffect; 4]>::new();
+
+        match input {
+            DhtInput::Cmd(cmd) => self.handle_cmd(cmd, &mut out),
+            DhtInput::Io(io) => self.handle_io(io, &mut out),
+            DhtInput::Clock { now_secs } => self.update_clock(now_secs),
+            DhtInput::Tick { now_tick, now_secs } => self.handle_tick(now_tick, now_secs, &mut out),
+        }
+
+        out
+    }
+
+    pub(crate) fn contains_op(&self, op_id: OpId) -> bool {
+        self.ops.contains_key(&op_id)
+    }
+
+    pub(crate) fn clock_secs(&self) -> u64 {
+        self.now_secs
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.cmd",
+        level = "debug",
+        skip(self, cmd, out),
+        fields(command = dht_cmd_kind(&cmd))
+    )]
+    fn handle_cmd(&mut self, cmd: DhtCmd, out: &mut SmallVec<[DhtEffect; 4]>) {
+        match cmd {
+            DhtCmd::Put {
+                op_id,
+                key,
+                realm_id,
+                value,
+                ttl,
+                trace_context,
+            } => self.handle_cmd_put(op_id, key, realm_id, value, ttl, trace_context, out),
+            DhtCmd::Get {
+                op_id,
+                key,
+                realm_filter,
+                completion,
+                trace_context,
+            } => self.handle_cmd_get(op_id, key, realm_filter, completion, trace_context, out),
+            DhtCmd::Cancel { op_id, error } => self.handle_cmd_cancel(op_id, error, out),
+            DhtCmd::Bootstrap {
+                op_id,
+                nodes,
+                trace_context,
+            } => self.handle_cmd_bootstrap(op_id, nodes, trace_context, out),
+            DhtCmd::RoutingTableSize { op_id } => {
+                out.push(DhtEffect::Output(DhtOutput::Completed {
+                    op_id,
+                    result: DhtOutputValue::RoutingTableSize(self.routing_table.len()),
+                }));
+            }
+            DhtCmd::AddPeer { node_id } => self.insert_peer(node_id, out),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "dht.state.cmd_put",
+        level = "debug",
+        skip(self, value, trace_context, out),
+        fields(op_id, key = %key, realm_id = %realm_id, value_len = value.len(), ttl_secs = ttl.as_secs())
+    )]
+    fn handle_cmd_put(
+        &mut self,
+        op_id: OpId,
+        key: DhtKeyId,
+        realm_id: RealmId,
+        value: Vec<u8>,
+        ttl: std::time::Duration,
+        trace_context: Option<DistributedTraceContext>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if self.ops.contains_key(&op_id) {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network("duplicate op id".to_string()),
+            }));
+            return;
+        }
+
+        if value.len() > MAX_VALUE_SIZE {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::invalid_request("DHT value exceeds the maximum size"),
+            }));
+            return;
+        }
+
+        let ttl_secs = ttl.as_secs().max(MIN_TTL_SECS);
+        if ttl_secs > MAX_TTL_SECS {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::invalid_request("DHT TTL exceeds the maximum"),
+            }));
+            return;
+        }
+
+        let Some(expires_at) = self.now_secs.checked_add(ttl_secs) else {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::invalid_request("DHT expiry overflows Unix time"),
+            }));
+            return;
+        };
+        let mut op = OpState::Put(PutOp {
+            key,
+            realm_id,
+            value,
+            expires_at,
+            revision: None,
+            signature: None,
+            frontier: LookupFrontier::default(),
+            local_write_complete: false,
+            lookup_finished: false,
+            store_candidates: Vec::new(),
+            store_attempt_count: 0,
+            store_count: 0,
+            trace_context,
+            pending: HashMap::new(),
+        });
+        self.queue_storage_revision(op_id, &mut op, out);
+        self.ops.insert(op_id, op);
+    }
+
+    /// Releases an operation the driver gave up on. Dropping its pending map is
+    /// what makes late RPC replies inert: they no longer match a live op.
+    #[tracing::instrument(
+        name = "dht.state.cmd_cancel",
+        level = "debug",
+        skip(self, out),
+        fields(op_id, error = %error)
+    )]
+    fn handle_cmd_cancel(
+        &mut self,
+        op_id: OpId,
+        error: DhtIoError,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if self.ops.remove(&op_id).is_none() {
+            return;
+        }
+        out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "dht.state.cmd_get",
+        level = "debug",
+        skip(self, trace_context, out),
+        fields(op_id, key = %key, realm_id = ?realm_filter)
+    )]
+    fn handle_cmd_get(
+        &mut self,
+        op_id: OpId,
+        key: DhtKeyId,
+        realm_filter: Option<RealmId>,
+        completion: DhtCompletion,
+        trace_context: Option<DistributedTraceContext>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if self.ops.contains_key(&op_id) {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network("duplicate op id".to_string()),
+            }));
+            return;
+        }
+
+        let mut op = OpState::Get(GetOp {
+            key,
+            realm_filter,
+            completion,
+            values: Vec::new(),
+            value_indices: HashMap::new(),
+            value_versions: HashMap::new(),
+            cache_entries: Vec::new(),
+            remote_entries: HashMap::new(),
+            remote_values: HashSet::new(),
+            frontier: LookupFrontier::default(),
+            peer_error_count: 0,
+            peer_errors: Vec::new(),
+            successful_responses: 0,
+            trace_context,
+            pending: HashMap::new(),
+        });
+        self.queue_storage_read(
+            op_id,
+            &mut op,
+            StorageStage::GetLocalRead,
+            key,
+            realm_filter,
+            out,
+        );
+        self.ops.insert(op_id, op);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.cmd_bootstrap",
+        level = "debug",
+        skip(self, nodes, trace_context, out),
+        fields(op_id, node_count = nodes.len())
+    )]
+    fn handle_cmd_bootstrap(
+        &mut self,
+        op_id: OpId,
+        nodes: Vec<NodeId>,
+        trace_context: Option<DistributedTraceContext>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if self.ops.contains_key(&op_id) {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::Network("duplicate op id".to_string()),
+            }));
+            return;
+        }
+
+        let mut unique: Vec<NodeId> = nodes
+            .into_iter()
+            .filter(|node| *node != self.local_id)
+            .collect();
+        unique.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        unique.dedup();
+
+        if unique.is_empty() {
+            out.push(DhtEffect::Output(DhtOutput::Completed {
+                op_id,
+                result: DhtOutputValue::Unit,
+            }));
+            return;
+        }
+
+        let mut op = OpState::Bootstrap(BootstrapOp {
+            active_nodes: 0,
+            trace_context,
+            pending: HashMap::new(),
+        });
+        for node in unique {
+            self.queue_rpc(
+                op_id,
+                &mut op,
+                RpcPhase::Bootstrap,
+                node,
+                DhtRequest::Ping,
+                out,
+            );
+        }
+        self.ops.insert(op_id, op);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.io",
+        level = "debug",
+        skip(self, io, out),
+        fields(io = dht_io_kind(&io), op_id = ?io_op_id(&io), inbound_id = ?io_inbound_id(&io))
+    )]
+    fn handle_io(&mut self, io: DhtIo, out: &mut SmallVec<[DhtEffect; 4]>) {
+        match io {
+            DhtIo::RpcResponse {
+                op_id,
+                phase,
+                peer,
+                response,
+            } => self.handle_rpc_response(op_id, phase, peer, response, out),
+            DhtIo::RpcError {
+                op_id,
+                phase,
+                peer,
+                error,
+            } => self.handle_rpc_error(op_id, phase, peer, error, out),
+            DhtIo::InboundRequest {
+                inbound_id,
+                peer,
+                request,
+                trace_context: _,
+            } => self.handle_inbound_request(inbound_id, peer, request, out),
+            DhtIo::InboundReadError { .. } => {}
+            DhtIo::InboundDropped { .. } => {}
+            DhtIo::StorageReadResult {
+                op_id,
+                stage,
+                entries,
+            } => self.handle_storage_read(op_id, stage, entries, out),
+            DhtIo::StorageRevisionResult {
+                op_id,
+                stage,
+                revision,
+            } => self.handle_storage_revision(op_id, stage, revision, out),
+            DhtIo::StorageWriteResult { op_id, stage } => {
+                self.handle_storage_write(op_id, stage, out)
+            }
+            DhtIo::StorageIterResult {
+                op_id,
+                stage,
+                index,
+                entries,
+            } => self.handle_storage_iter(op_id, stage, index, entries, out),
+            DhtIo::StorageError {
+                op_id,
+                stage,
+                error,
+            } => self.handle_storage_error(op_id, stage, error, out),
+            DhtIo::PeerSeen { peer } => self.insert_peer(peer, out),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.tick",
+        level = "debug",
+        skip(self, out),
+        fields(now_tick, now_secs)
+    )]
+    fn handle_tick(&mut self, now_tick: u64, now_secs: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
+        self.current_tick = now_tick;
+        self.update_clock(now_secs);
+
+        let mut timed_out = self.collect_rpc_timeouts();
+        timed_out.sort_unstable_by(|(op_a, phase_a, peer_a), (op_b, phase_b, peer_b)| {
+            op_a.cmp(op_b)
+                .then_with(|| rpc_phase_order(*phase_a).cmp(&rpc_phase_order(*phase_b)))
+                .then_with(|| peer_a.as_bytes().cmp(peer_b.as_bytes()))
+        });
+
+        for (op_id, phase, peer) in timed_out {
+            self.handle_rpc_error(op_id, phase, peer, DhtIoError::Timeout, out);
+        }
+
+        self.schedule_maintenance_ping(now_tick, out);
+        self.schedule_cleanup(out);
+    }
+
+    fn update_clock(&mut self, now_secs: u64) {
+        self.now_secs = self.now_secs.max(now_secs);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.rpc_response",
+        level = "debug",
+        skip(self, response, out),
+        fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
+    )]
+    fn handle_rpc_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_rpc(op_state.pending_mut(), phase, peer) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        self.route_rpc_response(op_id, phase, peer, response, op_state, out);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.rpc_error",
+        level = "debug",
+        skip(self, error, out),
+        fields(op_id, phase = ?phase, peer = %peer, error = %error)
+    )]
+    fn handle_rpc_error(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        error: DhtIoError,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_rpc(op_state.pending_mut(), phase, peer) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        self.route_rpc_error(op_id, phase, peer, error, op_state, out);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.rpc_response_state",
+        level = "trace",
+        skip(self, response, op_state, out),
+        fields(op_id, phase = ?phase, peer = %peer, response = response_kind(&response))
+    )]
+    fn route_rpc_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        op_state: OpState,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        match op_state {
+            OpState::Put(op) => self.handle_put_response(op_id, phase, peer, response, op, out),
+            OpState::Get(op) => self.handle_get_response(op_id, phase, peer, response, op, out),
+            OpState::Bootstrap(op) => {
+                self.handle_bootstrap_response(op_id, phase, peer, response, op, out)
+            }
+            OpState::EvictionPing(op) => {
+                self.handle_eviction_response(op_id, phase, response, op, out)
+            }
+            OpState::MaintenancePing(op) => {
+                self.handle_maintenance_response(op_id, phase, peer, response, op, out)
+            }
+            OpState::InboundGet(op) => {
+                self.ops.insert(op_id, OpState::InboundGet(op));
+            }
+            OpState::InboundPut(op) => {
+                self.ops.insert(op_id, OpState::InboundPut(op));
+            }
+        }
+    }
+
+    fn handle_put_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        mut op: PutOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        match phase {
+            RpcPhase::PutLookup => {
+                match response {
+                    DhtResponse::Nodes { nodes } => {
+                        op.frontier.responsive.insert(peer);
+                        self.insert_peer(peer, out);
+                        op.frontier
+                            .add_candidates(nodes, self.local_id, op.key.as_bytes());
+                    }
+                    DhtResponse::Pong
+                    | DhtResponse::Value { .. }
+                    | DhtResponse::Stored
+                    | DhtResponse::Error { .. } => {}
+                }
+
+                self.dispatch_put_lookups(op_id, &mut op, out);
+                if self.put_lookup_exhausted(&op) {
+                    self.begin_put_store(op_id, &mut op, out);
+                }
+            }
+            RpcPhase::PutStore => {
+                if matches!(response, DhtResponse::Stored) {
+                    op.store_count = op.store_count.saturating_add(1);
+                }
+                self.queue_put_stores(op_id, &mut op, out);
+            }
+            _ => {
+                self.ops.insert(op_id, OpState::Put(op));
+                return;
+            }
+        }
+
+        self.maybe_complete_put(op_id, op, out);
+    }
+
+    fn handle_get_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        mut op: GetOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if phase != RpcPhase::GetLookup {
+            self.ops.insert(op_id, OpState::Get(op));
+            return;
+        }
+
+        match response {
+            DhtResponse::Value {
+                entries,
+                closer_nodes,
+            } => {
+                let mut valid_response = entries.is_empty();
+                for entry in entries {
+                    if !stored_value_bounded(&op.key, &entry, self.now_secs)
+                        || !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id)
+                    {
+                        record_peer_error(&mut op, peer, "invalid_record");
+                        continue;
+                    }
+                    valid_response = true;
+                    let record_key = (entry.publisher, entry.realm_id);
+                    let stored = stored_value_entry(entry.clone(), self.now_secs);
+                    let existing = op.cache_entries.iter().find(|existing| {
+                        existing.publisher == entry.publisher && existing.realm_id == entry.realm_id
+                    });
+                    if existing.is_none() && op.cache_entries.len() >= ENTRIES_PER_KEY {
+                        out.push(DhtEffect::Output(DhtOutput::Failed {
+                            op_id,
+                            error: DhtIoError::StorageFull,
+                        }));
+                        return;
+                    }
+                    if existing.is_some_and(|existing| {
+                        existing.revision == entry.revision
+                            && !stored_value_matches(&entry, existing)
+                    }) {
+                        out.push(DhtEffect::Output(DhtOutput::Failed {
+                            op_id,
+                            error: DhtIoError::invalid_response(
+                                "publisher returned conflicting DHT records",
+                            ),
+                        }));
+                        return;
+                    }
+                    if existing.is_some_and(|existing| entry.revision <= existing.revision) {
+                        continue;
+                    }
+                    let merged = match merge_validated(
+                        &op.key,
+                        op.cache_entries.clone(),
+                        stored.clone(),
+                        self.now_secs,
+                    ) {
+                        Ok(merged) => merged,
+                        Err(MergeError::Stale) => continue,
+                        Err(MergeError::Capacity) => {
+                            out.push(DhtEffect::Output(DhtOutput::Failed {
+                                op_id,
+                                error: DhtIoError::StorageFull,
+                            }));
+                            return;
+                        }
+                        Err(MergeError::Encoding | MergeError::Invalid) => {
+                            record_peer_error(&mut op, peer, "invalid_record");
+                            continue;
+                        }
+                    };
+                    op.cache_entries = merged;
+                    if entry_is_fresh(entry.expires_at, self.now_secs) {
+                        let first_usable = first_usable_match(&op, record_key.0, record_key.1);
+                        if insert_get_value(&mut op, entry) {
+                            op.remote_values.insert(record_key);
+                            op.remote_entries.insert(record_key, stored);
+                        }
+                        if first_usable {
+                            op.frontier.responsive.insert(peer);
+                            self.insert_peer(peer, out);
+                            complete_get(op_id, op, GetCompletedReason::FirstUsable, out);
+                            return;
+                        }
+                    } else if insert_get_floor(&mut op, &entry) {
+                        op.remote_entries.insert(record_key, stored);
+                    }
+                }
+                if valid_response {
+                    op.successful_responses = op.successful_responses.saturating_add(1);
+                    op.frontier.responsive.insert(peer);
+                    self.insert_peer(peer, out);
+                }
+                op.frontier
+                    .add_candidates(closer_nodes, self.local_id, op.key.as_bytes());
+            }
+            DhtResponse::Error { code, .. } => {
+                record_peer_error(&mut op, peer, format!("remote_error:{code:?}"));
+            }
+            DhtResponse::Pong | DhtResponse::Nodes { .. } | DhtResponse::Stored => {
+                record_peer_error(&mut op, peer, "unexpected_response");
+            }
+        }
+
+        self.dispatch_get_requests(op_id, &mut op, out);
+        self.maybe_complete_get(op_id, op, out);
+    }
+
+    fn handle_bootstrap_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        mut op: BootstrapOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if phase != RpcPhase::Bootstrap {
+            self.ops.insert(op_id, OpState::Bootstrap(op));
+            return;
+        }
+
+        if matches!(response, DhtResponse::Pong) {
+            self.insert_peer(peer, out);
+            op.active_nodes = op.active_nodes.saturating_add(1);
+        }
+
+        self.finish_bootstrap(
+            op_id,
+            op,
+            DhtIoError::network("no bootstrap nodes reachable"),
+            out,
+        );
+    }
+
+    fn handle_eviction_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        response: DhtResponse,
+        op: EvictionPingOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if phase != RpcPhase::EvictionPing {
+            self.ops.insert(op_id, OpState::EvictionPing(op));
+            return;
+        }
+
+        self.eviction_buckets.remove(&op.bucket_idx);
+        let peer_alive = matches!(response, DhtResponse::Pong);
+        if peer_alive {
+            self.insert_peer(op.oldest_node, out);
+        } else if self
+            .routing_table
+            .remove_seen(&op.oldest_node, op.oldest_seen)
+            .is_some()
+        {
+            self.routing_table.insert(op.pending_peer.clone());
+        }
+
+        if pending_rpc_count(&op.pending, RpcPhase::EvictionPing) > 0 {
+            self.ops.insert(op_id, OpState::EvictionPing(op));
+        }
+    }
+
+    fn handle_maintenance_response(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        response: DhtResponse,
+        op: MaintenancePingOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if phase != RpcPhase::MaintenancePing {
+            self.ops.insert(op_id, OpState::MaintenancePing(op));
+            return;
+        }
+
+        if matches!(response, DhtResponse::Pong) {
+            self.insert_peer(peer, out);
+        } else {
+            let _ = self.routing_table.remove_seen(&op.peer, op.peer_seen);
+        }
+
+        if pending_rpc_count(&op.pending, RpcPhase::MaintenancePing) > 0 {
+            self.ops.insert(op_id, OpState::MaintenancePing(op));
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.rpc_error_state",
+        level = "trace",
+        skip(self, error, op_state, out),
+        fields(op_id, phase = ?phase, error = %error)
+    )]
+    fn route_rpc_error(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        error: DhtIoError,
+        op_state: OpState,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        match op_state {
+            OpState::Put(op) => self.handle_put_error(op_id, phase, error, op, out),
+            OpState::Get(op) => self.handle_get_error(op_id, phase, peer, error, op, out),
+            OpState::Bootstrap(op) => self.handle_bootstrap_error(op_id, phase, error, op, out),
+            OpState::EvictionPing(op) => self.handle_eviction_error(op_id, phase, op),
+            OpState::MaintenancePing(op) => self.handle_maintenance_error(op_id, phase, op),
+            OpState::InboundGet(op) => {
+                self.ops.insert(op_id, OpState::InboundGet(op));
+            }
+            OpState::InboundPut(op) => {
+                self.ops.insert(op_id, OpState::InboundPut(op));
+            }
+        }
+    }
+
+    fn handle_put_error(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        _error: DhtIoError,
+        mut op: PutOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        match phase {
+            RpcPhase::PutLookup => {
+                self.dispatch_put_lookups(op_id, &mut op, out);
+                if self.put_lookup_exhausted(&op) {
+                    self.begin_put_store(op_id, &mut op, out);
+                }
+            }
+            RpcPhase::PutStore => self.queue_put_stores(op_id, &mut op, out),
+            _ => {
+                self.ops.insert(op_id, OpState::Put(op));
+                return;
+            }
+        }
+
+        self.maybe_complete_put(op_id, op, out);
+    }
+
+    fn handle_get_error(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        peer: NodeId,
+        error: DhtIoError,
+        mut op: GetOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if phase != RpcPhase::GetLookup {
+            self.ops.insert(op_id, OpState::Get(op));
+            return;
+        }
+
+        record_peer_error(&mut op, peer, io_error_label(&error));
+        self.dispatch_get_requests(op_id, &mut op, out);
+        self.maybe_complete_get(op_id, op, out);
+    }
+
+    fn handle_bootstrap_error(
+        &mut self,
+        op_id: OpId,
+        phase: RpcPhase,
+        error: DhtIoError,
+        op: BootstrapOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if phase != RpcPhase::Bootstrap {
+            self.ops.insert(op_id, OpState::Bootstrap(op));
+            return;
+        }
+
+        self.finish_bootstrap(op_id, op, error, out);
+    }
+
+    fn handle_eviction_error(&mut self, op_id: OpId, phase: RpcPhase, op: EvictionPingOp) {
+        if phase != RpcPhase::EvictionPing {
+            self.ops.insert(op_id, OpState::EvictionPing(op));
+            return;
+        }
+
+        self.eviction_buckets.remove(&op.bucket_idx);
+        if self
+            .routing_table
+            .remove_seen(&op.oldest_node, op.oldest_seen)
+            .is_some()
+        {
+            self.routing_table.insert(op.pending_peer.clone());
+        }
+    }
+
+    fn handle_maintenance_error(&mut self, op_id: OpId, phase: RpcPhase, op: MaintenancePingOp) {
+        if phase != RpcPhase::MaintenancePing {
+            self.ops.insert(op_id, OpState::MaintenancePing(op));
+            return;
+        }
+
+        let _ = self.routing_table.remove_seen(&op.peer, op.peer_seen);
+    }
+
+    fn handle_storage_revision(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        revision: u64,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if stage != StorageStage::PutRevision
+            || !take_pending_storage(op_state.pending_mut(), stage)
+        {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+        if revision == 0 {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::storage("DHT revision must be non-zero"),
+            }));
+            return;
+        }
+
+        let OpState::Put(mut op) = op_state else {
+            self.ops.insert(op_id, op_state);
+            return;
+        };
+        let signed_data = signed_record_bytes(
+            &op.key,
+            &self.local_id,
+            &op.realm_id,
+            &op.value,
+            op.expires_at,
+            revision,
+        );
+        let signature = self.secret_key.sign(&signed_data);
+        let entry = StoredEntry {
+            publisher: self.local_id,
+            realm_id: op.realm_id,
+            value: op.value.clone(),
+            expires_at: op.expires_at,
+            revision,
+            signature,
+            retain_until: op.expires_at,
+        };
+        op.revision = Some(revision);
+        op.signature = Some(signature);
+        let key = op.key;
+        let mut op_state = OpState::Put(op);
+        self.queue_storage_merge(
+            op_id,
+            &mut op_state,
+            StorageStage::PutLocalMerge,
+            key,
+            vec![entry],
+            out,
+        );
+        self.ops.insert(op_id, op_state);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.storage_read",
+        level = "debug",
+        skip(self, entries, out),
+        fields(op_id, stage = ?stage, entry_count = entries.len())
+    )]
+    fn handle_storage_read(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        entries: Vec<StoredEntry>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if op_id == CLEANUP_OP_ID {
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_storage(op_state.pending_mut(), stage) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(op) => {
+                self.ops.insert(op_id, OpState::Put(op));
+            }
+            OpState::Get(mut op) => {
+                if stage != StorageStage::GetLocalRead {
+                    self.ops.insert(op_id, OpState::Get(op));
+                    return;
+                }
+
+                let entries = retained_entries(entries, self.now_secs);
+                op.cache_entries = entries.clone();
+                for entry in entries {
+                    if !realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id) {
+                        continue;
+                    }
+                    let value = stored_entry_value(entry);
+                    if !stored_value_bounded(&op.key, &value, self.now_secs) {
+                        continue;
+                    }
+                    if entry_is_fresh(value.expires_at, self.now_secs) {
+                        let first_usable = first_usable_match(&op, value.publisher, value.realm_id);
+                        insert_get_value(&mut op, value);
+                        if first_usable {
+                            complete_get(op_id, op, GetCompletedReason::FirstUsable, out);
+                            return;
+                        }
+                    } else {
+                        insert_get_floor(&mut op, &value);
+                    }
+                }
+
+                op.frontier.add_candidates(
+                    self.routing_table
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
+                        .into_iter()
+                        .map(|peer| peer.node_id),
+                    self.local_id,
+                    op.key.as_bytes(),
+                );
+
+                self.dispatch_get_requests(op_id, &mut op, out);
+                self.maybe_complete_get(op_id, op, out);
+            }
+            OpState::InboundGet(op) => {
+                if stage != StorageStage::InboundGetRead {
+                    self.ops.insert(op_id, OpState::InboundGet(op));
+                    return;
+                }
+
+                let now = self.now_secs;
+                let values: Vec<StoredValue> = retained_entries(entries, now)
+                    .into_iter()
+                    .map(stored_entry_value)
+                    .filter(|entry| {
+                        realm_matches_filter(op.realm_filter.as_ref(), &entry.realm_id)
+                            && stored_value_bounded(&op.key, entry, now)
+                    })
+                    .collect();
+                let closer_nodes = self
+                    .routing_table
+                    .closest(op.key.as_bytes(), K)
+                    .into_iter()
+                    .map(|peer| peer.node_id)
+                    .collect();
+
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                    inbound_id: op.inbound_id,
+                    response: DhtResponse::Value {
+                        entries: values,
+                        closer_nodes,
+                    },
+                })));
+            }
+            OpState::InboundPut(op) => {
+                self.ops.insert(op_id, OpState::InboundPut(op));
+            }
+            OpState::Bootstrap(op) => {
+                self.ops.insert(op_id, OpState::Bootstrap(op));
+            }
+            OpState::EvictionPing(op) => {
+                self.ops.insert(op_id, OpState::EvictionPing(op));
+            }
+            OpState::MaintenancePing(op) => {
+                self.ops.insert(op_id, OpState::MaintenancePing(op));
+            }
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.storage_write",
+        level = "debug",
+        skip(self, out),
+        fields(op_id, stage = ?stage)
+    )]
+    fn handle_storage_write(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if op_id == CLEANUP_OP_ID {
+            match stage {
+                StorageStage::CleanupActivePrune => {
+                    self.cleanup_active = false;
+                    self.schedule_active(out);
+                }
+                StorageStage::CleanupFloorPrune => {
+                    self.cleanup_floor = false;
+                    self.schedule_floor(out);
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_storage(op_state.pending_mut(), stage) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(mut op) => {
+                if stage != StorageStage::PutLocalMerge {
+                    self.ops.insert(op_id, OpState::Put(op));
+                    return;
+                }
+
+                op.local_write_complete = true;
+
+                op.frontier.add_candidates(
+                    self.routing_table
+                        .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
+                        .into_iter()
+                        .map(|peer| peer.node_id),
+                    self.local_id,
+                    op.key.as_bytes(),
+                );
+
+                self.dispatch_put_lookups(op_id, &mut op, out);
+                if self.put_lookup_exhausted(&op) {
+                    self.begin_put_store(op_id, &mut op, out);
+                }
+                self.maybe_complete_put(op_id, op, out);
+            }
+            OpState::InboundPut(op) => {
+                if stage != StorageStage::InboundPutMerge {
+                    self.ops.insert(op_id, OpState::InboundPut(op));
+                    return;
+                }
+
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                    inbound_id: op.inbound_id,
+                    response: DhtResponse::Stored,
+                })));
+            }
+            OpState::Get(op) => {
+                if stage == StorageStage::GetRemoteMerge {
+                    self.maybe_complete_get(op_id, op, out);
+                } else {
+                    self.ops.insert(op_id, OpState::Get(op));
+                }
+            }
+            OpState::Bootstrap(op) => {
+                self.ops.insert(op_id, OpState::Bootstrap(op));
+            }
+            OpState::EvictionPing(op) => {
+                self.ops.insert(op_id, OpState::EvictionPing(op));
+            }
+            OpState::MaintenancePing(op) => {
+                self.ops.insert(op_id, OpState::MaintenancePing(op));
+            }
+            OpState::InboundGet(op) => {
+                self.ops.insert(op_id, OpState::InboundGet(op));
+            }
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.storage_iter",
+        level = "debug",
+        skip(self, entries, out),
+        fields(op_id, stage = ?stage, index = ?index, page_len = entries.len())
+    )]
+    fn handle_storage_iter(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        index: DeadlineIndex,
+        entries: Vec<DeadlineEntry>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if op_id != CLEANUP_OP_ID {
+            return;
+        }
+
+        let prune_stage = match (stage, index) {
+            (StorageStage::CleanupActiveIter, DeadlineIndex::Active) => {
+                StorageStage::CleanupActivePrune
+            }
+            (StorageStage::CleanupFloorIter, DeadlineIndex::Floor) => {
+                StorageStage::CleanupFloorPrune
+            }
+            (StorageStage::CleanupActiveIter, _) => {
+                self.cleanup_active = false;
+                return;
+            }
+            (StorageStage::CleanupFloorIter, _) => {
+                self.cleanup_floor = false;
+                return;
+            }
+            _ => return,
+        };
+        let Some(entry) = entries.into_iter().next() else {
+            match index {
+                DeadlineIndex::Active => self.cleanup_active = false,
+                DeadlineIndex::Floor => self.cleanup_floor = false,
+            }
+            return;
+        };
+        if entry.deadline > self.now_secs {
+            match index {
+                DeadlineIndex::Active => self.cleanup_active = false,
+                DeadlineIndex::Floor => self.cleanup_floor = false,
+            }
+            return;
+        }
+
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StoragePrune {
+            op_id: CLEANUP_OP_ID,
+            stage: prune_stage,
+            index,
+            entry,
+            now_secs: self.now_secs,
+        })));
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.storage_error",
+        level = "debug",
+        skip(self, error, out),
+        fields(op_id, stage = ?stage, error = %error)
+    )]
+    fn handle_storage_error(
+        &mut self,
+        op_id: OpId,
+        stage: StorageStage,
+        error: DhtIoError,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if op_id == CLEANUP_OP_ID {
+            match stage {
+                StorageStage::CleanupActiveIter | StorageStage::CleanupActivePrune => {
+                    self.cleanup_active = false;
+                }
+                StorageStage::CleanupFloorIter | StorageStage::CleanupFloorPrune => {
+                    self.cleanup_floor = false;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let Some(mut op_state) = self.ops.remove(&op_id) else {
+            return;
+        };
+        if !take_pending_storage(op_state.pending_mut(), stage) {
+            self.ops.insert(op_id, op_state);
+            return;
+        }
+
+        match op_state {
+            OpState::Put(_) | OpState::Bootstrap(_) => {
+                out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+            }
+            OpState::Get(mut op) => match stage {
+                StorageStage::GetLocalRead => {
+                    op.frontier.add_candidates(
+                        self.routing_table
+                            .closest(op.key.as_bytes(), LOOKUP_MAX_QUERIES)
+                            .into_iter()
+                            .map(|peer| peer.node_id),
+                        self.local_id,
+                        op.key.as_bytes(),
+                    );
+                    self.dispatch_get_requests(op_id, &mut op, out);
+                    self.maybe_complete_get(op_id, op, out);
+                }
+                StorageStage::GetRemoteMerge => {
+                    // Read-repair write-back is best-effort: the values are already
+                    // signature-validated, so a losing write-back still completes the get.
+                    tracing::debug!(op_id, %error, "DHT read-repair write-back failed; completing get");
+                    self.maybe_complete_get(op_id, op, out);
+                }
+                _ => out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error })),
+            },
+            OpState::InboundGet(op) => {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                    inbound_id: op.inbound_id,
+                    response: storage_error_response(&error),
+                })));
+            }
+            OpState::InboundPut(op) => {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                    inbound_id: op.inbound_id,
+                    response: storage_error_response(&error),
+                })));
+            }
+            OpState::EvictionPing(_) | OpState::MaintenancePing(_) => {}
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.inbound_request",
+        level = "debug",
+        skip(self, request, out),
+        fields(inbound_id, request = request_kind(&request))
+    )]
+    fn handle_inbound_request(
+        &mut self,
+        inbound_id: InboundId,
+        peer: NodeId,
+        request: DhtRequest,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if !matches!(&request, DhtRequest::PutValue { .. }) {
+            self.insert_peer(peer, out);
+        }
+        match request {
+            DhtRequest::Ping => {
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                    inbound_id,
+                    response: DhtResponse::Pong,
+                })));
+            }
+            DhtRequest::FindNode { target } => {
+                let nodes = self
+                    .routing_table
+                    .closest(&target, K)
+                    .into_iter()
+                    .map(|peer| peer.node_id)
+                    .collect();
+
+                out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                    inbound_id,
+                    response: DhtResponse::Nodes { nodes },
+                })));
+            }
+            DhtRequest::GetValue { key, realm_filter } => {
+                let op_id = self.allocate_internal_id();
+                let mut op = OpState::InboundGet(InboundGetOp {
+                    inbound_id,
+                    key,
+                    realm_filter,
+                    pending: HashMap::new(),
+                });
+                self.queue_storage_read(
+                    op_id,
+                    &mut op,
+                    StorageStage::InboundGetRead,
+                    key,
+                    realm_filter,
+                    out,
+                );
+                self.ops.insert(op_id, op);
+            }
+            DhtRequest::PutValue {
+                key,
+                realm_id,
+                value,
+                expires_at,
+                revision,
+                publisher,
+                signature,
+            } => {
+                // A user device is DHT read-only: it never publishes presence
+                // and never stores realm state on anyone's behalf.
+                if !self.peer_is_eligible(peer) || !self.peer_is_eligible(publisher) {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "Node kind may not store DHT values".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
+                let Some(signature) = signature else {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidSignature,
+                            message: "Missing publisher signature".to_string(),
+                        },
+                    })));
+                    return;
+                };
+
+                if value.len() > MAX_VALUE_SIZE {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "DHT value exceeds the maximum size".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
+                if revision == 0
+                    || !entry_is_fresh(expires_at, self.now_secs)
+                    || expires_at.saturating_sub(self.now_secs)
+                        > MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW)
+                {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidRequest,
+                            message: "DHT expiry is invalid".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
+                let signed_data =
+                    signed_record_bytes(&key, &publisher, &realm_id, &value, expires_at, revision);
+
+                if publisher.verify(&signed_data, &signature).is_err() {
+                    out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcResponse {
+                        inbound_id,
+                        response: DhtResponse::Error {
+                            code: ErrorCode::InvalidSignature,
+                            message: "Invalid publisher signature".to_string(),
+                        },
+                    })));
+                    return;
+                }
+
+                self.insert_peer(peer, out);
+
+                let new_entry = StoredEntry {
+                    publisher,
+                    realm_id,
+                    value,
+                    expires_at,
+                    revision,
+                    signature,
+                    retain_until: expires_at,
+                };
+
+                let op_id = self.allocate_internal_id();
+                let mut op = OpState::InboundPut(InboundPutOp {
+                    inbound_id,
+                    pending: HashMap::new(),
+                });
+                self.queue_storage_merge(
+                    op_id,
+                    &mut op,
+                    StorageStage::InboundPutMerge,
+                    key,
+                    vec![new_entry],
+                    out,
+                );
+                self.ops.insert(op_id, op);
+            }
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.dispatch_get_requests",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
+    fn dispatch_get_requests(
+        &mut self,
+        op_id: OpId,
+        op: &mut GetOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        while pending_rpc_count(&op.pending, RpcPhase::GetLookup) < LOOKUP_ALPHA
+            && op.frontier.sent_queries < LOOKUP_MAX_QUERIES
+        {
+            let Some(peer) = op.frontier.pop_next(op.key.as_bytes()) else {
+                break;
+            };
+            self.queue_rpc_pending(
+                op_id,
+                &mut op.pending,
+                RpcPhase::GetLookup,
+                peer,
+                DhtRequest::GetValue {
+                    key: op.key,
+                    realm_filter: op.realm_filter,
+                },
+                op.trace_context.clone(),
+                out,
+            );
+            op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.dispatch_put_lookup_requests",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
+    fn dispatch_put_lookups(
+        &mut self,
+        op_id: OpId,
+        op: &mut PutOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        while pending_rpc_count(&op.pending, RpcPhase::PutLookup) < LOOKUP_ALPHA
+            && op.frontier.sent_queries < LOOKUP_MAX_QUERIES
+        {
+            let Some(peer) = op.frontier.pop_next(op.key.as_bytes()) else {
+                break;
+            };
+            self.queue_rpc_pending(
+                op_id,
+                &mut op.pending,
+                RpcPhase::PutLookup,
+                peer,
+                DhtRequest::FindNode {
+                    target: *op.key.as_bytes(),
+                },
+                op.trace_context.clone(),
+                out,
+            );
+            op.frontier.sent_queries = op.frontier.sent_queries.saturating_add(1);
+        }
+    }
+
+    fn put_lookup_exhausted(&self, op: &PutOp) -> bool {
+        !op.lookup_finished
+            && pending_rpc_count(&op.pending, RpcPhase::PutLookup) == 0
+            && op.frontier.lookup_complete(op.key.as_bytes())
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.begin_put_store",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
+    fn begin_put_store(&mut self, op_id: OpId, op: &mut PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if op.lookup_finished {
+            return;
+        }
+        op.lookup_finished = true;
+        op.store_candidates = op.frontier.closest_responsive(op.key.as_bytes());
+        self.queue_put_stores(op_id, op, out);
+    }
+
+    fn queue_put_stores(&self, op_id: OpId, op: &mut PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        let (Some(revision), Some(signature)) = (op.revision, op.signature) else {
+            return;
+        };
+        while op.store_count + pending_rpc_count(&op.pending, RpcPhase::PutStore) < K
+            && !op.store_candidates.is_empty()
+        {
+            let peer = op.store_candidates.remove(0);
+            op.store_attempt_count = op.store_attempt_count.saturating_add(1);
+            self.queue_rpc_pending(
+                op_id,
+                &mut op.pending,
+                RpcPhase::PutStore,
+                peer,
+                DhtRequest::PutValue {
+                    key: op.key,
+                    realm_id: op.realm_id,
+                    value: op.value.clone(),
+                    expires_at: op.expires_at,
+                    revision,
+                    publisher: self.local_id,
+                    signature: Some(signature),
+                },
+                op.trace_context.clone(),
+                out,
+            );
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.maybe_complete_get",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key, value_count = op.values.len())
+    )]
+    fn maybe_complete_get(
+        &mut self,
+        op_id: OpId,
+        mut op: GetOp,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if pending_rpc_count(&op.pending, RpcPhase::GetLookup) > 0
+            || !op.frontier.lookup_complete(op.key.as_bytes())
+        {
+            self.ops.insert(op_id, OpState::Get(op));
+            return;
+        }
+
+        if op.pending.contains_key(&PendingKey::Storage {
+            stage: StorageStage::GetRemoteMerge,
+        }) {
+            self.ops.insert(op_id, OpState::Get(op));
+            return;
+        }
+
+        if !op.remote_entries.is_empty() {
+            let key = op.key;
+            let mut entries = std::mem::take(&mut op.remote_entries)
+                .into_values()
+                .collect::<Vec<_>>();
+            entries.sort_unstable_by(|left, right| {
+                left.publisher
+                    .as_bytes()
+                    .cmp(right.publisher.as_bytes())
+                    .then_with(|| left.realm_id.as_bytes().cmp(right.realm_id.as_bytes()))
+            });
+            let mut op = OpState::Get(op);
+            self.queue_storage_merge(
+                op_id,
+                &mut op,
+                StorageStage::GetRemoteMerge,
+                key,
+                entries,
+                out,
+            );
+            self.ops.insert(op_id, op);
+            return;
+        }
+
+        if op.values.is_empty() && op.successful_responses == 0 {
+            out.push(DhtEffect::Output(DhtOutput::Failed {
+                op_id,
+                error: DhtIoError::network("all DHT lookup peers were unavailable"),
+            }));
+            return;
+        }
+
+        let completed_reason = if op.values.is_empty() {
+            GetCompletedReason::LookupExhausted
+        } else if !op.remote_values.is_empty() {
+            GetCompletedReason::RemoteValue
+        } else {
+            GetCompletedReason::LocalValue
+        };
+        complete_get(op_id, op, completed_reason, out);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.maybe_complete_put",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, key = %op.key)
+    )]
+    fn maybe_complete_put(&mut self, op_id: OpId, op: PutOp, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if op.local_write_complete
+            && op.lookup_finished
+            && pending_rpc_count(&op.pending, RpcPhase::PutStore) == 0
+            && (op.store_count >= K || op.store_candidates.is_empty())
+        {
+            out.push(DhtEffect::Output(DhtOutput::Completed {
+                op_id,
+                result: DhtOutputValue::PutStored {
+                    stats: DhtPutStats {
+                        remote_attempt_count: op.store_attempt_count,
+                        remote_store_count: op.store_count,
+                    },
+                },
+            }));
+        } else {
+            self.ops.insert(op_id, OpState::Put(op));
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.finish_bootstrap",
+        level = "debug",
+        skip(self, op, error, out),
+        fields(op_id, active_nodes = op.active_nodes, error = %error)
+    )]
+    fn finish_bootstrap(
+        &mut self,
+        op_id: OpId,
+        op: BootstrapOp,
+        error: DhtIoError,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        if pending_rpc_count(&op.pending, RpcPhase::Bootstrap) == 0 {
+            if op.active_nodes == 0 {
+                out.push(DhtEffect::Output(DhtOutput::Failed { op_id, error }));
+            } else {
+                out.push(DhtEffect::Output(DhtOutput::Completed {
+                    op_id,
+                    result: DhtOutputValue::Unit,
+                }));
+            }
+        } else {
+            self.ops.insert(op_id, OpState::Bootstrap(op));
+        }
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.schedule_maintenance_ping",
+        level = "trace",
+        skip(self, out),
+        fields(now_tick)
+    )]
+    fn schedule_maintenance_ping(&mut self, now_tick: u64, out: &mut SmallVec<[DhtEffect; 4]>) {
+        let mut peers = self.routing_table.all_peers();
+        if peers.is_empty() {
+            return;
+        }
+
+        peers.sort_unstable_by(|a, b| a.node_id.as_bytes().cmp(b.node_id.as_bytes()));
+        let idx = (now_tick as usize) % peers.len();
+        let peer = peers[idx].clone();
+
+        let op_id = self.allocate_internal_id();
+        let mut op = OpState::MaintenancePing(MaintenancePingOp {
+            peer: peer.node_id,
+            peer_seen: peer.last_seen,
+            pending: HashMap::new(),
+        });
+        self.queue_rpc(
+            op_id,
+            &mut op,
+            RpcPhase::MaintenancePing,
+            peer.node_id,
+            DhtRequest::Ping,
+            out,
+        );
+        self.ops.insert(op_id, op);
+    }
+
+    #[tracing::instrument(name = "dht.state.schedule_cleanup", level = "trace", skip(self, out))]
+    fn schedule_cleanup(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        self.schedule_active(out);
+        self.schedule_floor(out);
+    }
+
+    fn schedule_active(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_active {
+            return;
+        }
+
+        self.cleanup_active = true;
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupActiveIter,
+            index: DeadlineIndex::Active,
+            limit: 1,
+        })));
+    }
+
+    fn schedule_floor(&mut self, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if self.cleanup_floor {
+            return;
+        }
+
+        self.cleanup_floor = true;
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageIter {
+            op_id: CLEANUP_OP_ID,
+            stage: StorageStage::CleanupFloorIter,
+            index: DeadlineIndex::Floor,
+            limit: 1,
+        })));
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.insert_peer",
+        level = "debug",
+        skip(self, out),
+        fields(node_id = %node_id)
+    )]
+    fn insert_peer(&mut self, node_id: NodeId, out: &mut SmallVec<[DhtEffect; 4]>) {
+        if node_id == self.local_id || !self.peer_is_eligible(node_id) {
+            return;
+        }
+
+        self.peer_epoch = self.peer_epoch.saturating_add(1);
+        let result = self
+            .routing_table
+            .insert(PeerInfo::seen(node_id, self.peer_epoch));
+        let InsertResult::BucketFull { oldest, pending } = result else {
+            return;
+        };
+
+        let Some(oldest_peer) = oldest else {
+            return;
+        };
+
+        let bucket_idx = self.local_id.bucket_index(&oldest_peer.node_id);
+        if bucket_idx >= 256 || !self.eviction_buckets.insert(bucket_idx) {
+            return;
+        }
+
+        let op_id = self.allocate_internal_id();
+        let mut op = OpState::EvictionPing(EvictionPingOp {
+            oldest_node: oldest_peer.node_id,
+            oldest_seen: oldest_peer.last_seen,
+            bucket_idx,
+            pending_peer: pending,
+            pending: HashMap::new(),
+        });
+        self.queue_rpc(
+            op_id,
+            &mut op,
+            RpcPhase::EvictionPing,
+            oldest_peer.node_id,
+            DhtRequest::Ping,
+            out,
+        );
+        self.ops.insert(op_id, op);
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.queue_rpc",
+        level = "debug",
+        skip(self, op, request, out),
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
+    )]
+    fn queue_rpc(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
+        phase: RpcPhase,
+        peer: NodeId,
+        request: DhtRequest,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let trace_context = op.trace_context();
+        self.queue_rpc_pending(
+            op_id,
+            op.pending_mut(),
+            phase,
+            peer,
+            request,
+            trace_context,
+            out,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        name = "dht.state.queue_rpc_pending",
+        level = "debug",
+        skip(self, pending, request, trace_context, out),
+        fields(op_id, phase = ?phase, peer = %peer, request = request_kind(&request))
+    )]
+    fn queue_rpc_pending(
+        &self,
+        op_id: OpId,
+        pending: &mut PendingMap,
+        phase: RpcPhase,
+        peer: NodeId,
+        request: DhtRequest,
+        trace_context: Option<DistributedTraceContext>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let deadline_tick = self.current_tick.saturating_add(RPC_TIMEOUT_TICKS);
+        pending.insert(
+            PendingKey::Rpc { phase, peer },
+            PendingMeta {
+                deadline_tick: Some(deadline_tick),
+            },
+        );
+
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::RpcRequest {
+            op_id,
+            phase,
+            peer,
+            request,
+            trace_context,
+        })));
+    }
+
+    #[tracing::instrument(
+        name = "dht.state.queue_storage_read",
+        level = "debug",
+        skip(self, op, out),
+        fields(op_id, stage = ?stage, key = %key, realm_id = ?realm_filter)
+    )]
+    fn queue_storage_read(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
+        stage: StorageStage,
+        key: DhtKeyId,
+        realm_filter: Option<RealmId>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        op.pending_mut().insert(
+            PendingKey::Storage { stage },
+            PendingMeta {
+                deadline_tick: None,
+            },
+        );
+
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageRead {
+            op_id,
+            stage,
+            key,
+            realm_filter,
+            now_secs: self.now_secs,
+        })));
+    }
+
+    fn queue_storage_revision(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        let stage = StorageStage::PutRevision;
+        op.pending_mut().insert(
+            PendingKey::Storage { stage },
+            PendingMeta {
+                deadline_tick: None,
+            },
+        );
+        out.push(DhtEffect::IoRequest(Box::new(
+            DhtIoRequest::StorageRevision { op_id, stage },
+        )));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn queue_storage_merge(
+        &self,
+        op_id: OpId,
+        op: &mut OpState,
+        stage: StorageStage,
+        key: DhtKeyId,
+        entries: Vec<StoredEntry>,
+        out: &mut SmallVec<[DhtEffect; 4]>,
+    ) {
+        op.pending_mut().insert(
+            PendingKey::Storage { stage },
+            PendingMeta {
+                deadline_tick: None,
+            },
+        );
+
+        out.push(DhtEffect::IoRequest(Box::new(DhtIoRequest::StorageMerge {
+            op_id,
+            stage,
+            key,
+            entries,
+        })));
+    }
+
+    #[tracing::instrument(name = "dht.state.collect_timeouts", level = "trace", skip(self))]
+    fn collect_rpc_timeouts(&self) -> Vec<(OpId, RpcPhase, NodeId)> {
+        let mut timed_out = Vec::new();
+
+        for (op_id, op) in &self.ops {
+            for (key, meta) in op.pending() {
+                let PendingKey::Rpc { phase, peer } = key else {
+                    continue;
+                };
+                if let Some(deadline_tick) = meta.deadline_tick
+                    && deadline_tick <= self.current_tick
+                {
+                    timed_out.push((*op_id, *phase, *peer));
+                }
+            }
+        }
+
+        timed_out
+    }
+
+    #[tracing::instrument(name = "dht.state.alloc_internal_op", level = "trace", skip(self))]
+    fn allocate_internal_id(&mut self) -> OpId {
+        let op_id = self.internal_op_id;
+        self.internal_op_id = self.internal_op_id.saturating_add(1);
+        op_id
+    }
+}
+
+/// A validated entry from the expected publisher ends a `FirstUsable` read. The
+/// entry already passed signature, realm-filter and expiry checks, so no weaker
+/// record can complete the lookup, and an `Exhaustive` read never matches here.
+fn first_usable_match(op: &GetOp, publisher: NodeId, realm_id: RealmId) -> bool {
+    match op.completion {
+        DhtCompletion::Exhaustive => false,
+        DhtCompletion::FirstUsable {
+            realm_id: expected_realm,
+            publisher: expected_publisher,
+        } => expected_publisher == publisher && expected_realm == realm_id,
+    }
+}
+
+fn complete_get(
+    op_id: OpId,
+    mut op: GetOp,
+    completed_reason: GetCompletedReason,
+    out: &mut SmallVec<[DhtEffect; 4]>,
+) {
+    let stats = get_stats(&op, completed_reason);
+    op.values.sort_unstable_by(|left, right| {
+        left.node_id
+            .as_bytes()
+            .cmp(right.node_id.as_bytes())
+            .then_with(|| left.realm_id.as_bytes().cmp(right.realm_id.as_bytes()))
+    });
+    out.push(DhtEffect::Output(DhtOutput::Completed {
+        op_id,
+        result: DhtOutputValue::GetValues {
+            values: op.values,
+            stats,
+        },
+    }));
+}
+
+fn stored_entry_value(entry: StoredEntry) -> StoredValue {
+    StoredValue {
+        publisher: entry.publisher,
+        realm_id: entry.realm_id,
+        value: entry.value,
+        expires_at: entry.expires_at,
+        revision: entry.revision,
+        signature: entry.signature,
+    }
+}
+
+fn stored_value_entry(entry: StoredValue, now_secs: u64) -> StoredEntry {
+    StoredEntry {
+        publisher: entry.publisher,
+        realm_id: entry.realm_id,
+        value: entry.value,
+        expires_at: entry.expires_at,
+        revision: entry.revision,
+        signature: entry.signature,
+        retain_until: retention_deadline(entry.expires_at, now_secs),
+    }
+}
+
+fn stored_value_matches(value: &StoredValue, stored: &StoredEntry) -> bool {
+    value.publisher == stored.publisher
+        && value.realm_id == stored.realm_id
+        && value.value == stored.value
+        && value.expires_at == stored.expires_at
+        && value.revision == stored.revision
+        && value.signature == stored.signature
+}
+
+fn stored_value_bounded(key: &DhtKeyId, entry: &StoredValue, now_secs: u64) -> bool {
+    entry.value.len() <= MAX_VALUE_SIZE
+        && entry.revision > 0
+        && entry.expires_at.saturating_sub(now_secs) <= MAX_TTL_SECS.saturating_add(MAX_CLOCK_SKEW)
+        && retention_deadline(entry.expires_at, now_secs) > now_secs
+        && verify_stored_value(key, entry)
+}
+
+fn insert_get_value(op: &mut GetOp, entry: StoredValue) -> bool {
+    let record_key = (entry.publisher, entry.realm_id);
+    let revision = entry.revision;
+    let value = DhtEntry {
+        node_id: entry.publisher,
+        realm_id: entry.realm_id,
+        value: entry.value,
+        expires_at: entry.expires_at,
+    };
+
+    if let Some(index) = op.value_indices.get(&record_key).copied() {
+        let existing = &op.values[index];
+        let existing_revision = op.value_versions[&record_key];
+        if revision
+            .cmp(&existing_revision)
+            .then_with(|| value.expires_at.cmp(&existing.expires_at))
+            .then_with(|| value.value.cmp(&existing.value))
+            .is_gt()
+        {
+            op.values[index] = value;
+            op.value_versions.insert(record_key, revision);
+            return true;
+        }
+        return false;
+    }
+
+    if op
+        .value_versions
+        .get(&record_key)
+        .is_some_and(|current| revision <= *current)
+    {
+        return false;
+    }
+
+    op.value_indices.insert(record_key, op.values.len());
+    op.value_versions.insert(record_key, revision);
+    op.values.push(value);
+    true
+}
+
+fn insert_get_floor(op: &mut GetOp, entry: &StoredValue) -> bool {
+    let record_key = (entry.publisher, entry.realm_id);
+    if op
+        .value_versions
+        .get(&record_key)
+        .is_some_and(|revision| entry.revision <= *revision)
+    {
+        return false;
+    }
+
+    op.value_versions.insert(record_key, entry.revision);
+    remove_get_value(op, record_key);
+    true
+}
+
+fn remove_get_value(op: &mut GetOp, record_key: (NodeId, RealmId)) {
+    let Some(index) = op.value_indices.remove(&record_key) else {
+        return;
+    };
+    op.remote_values.remove(&record_key);
+    op.values.swap_remove(index);
+    if let Some(moved) = op.values.get(index) {
+        op.value_indices
+            .insert((moved.node_id, moved.realm_id), index);
+    }
+}
+
+fn storage_error_response(error: &DhtIoError) -> DhtResponse {
+    let (code, message) = match error {
+        DhtIoError::StorageFull => (ErrorCode::StorageFull, "DHT key capacity exceeded"),
+        DhtIoError::InvalidRequest(_) => (ErrorCode::InvalidRequest, "stale DHT record"),
+        _ => (ErrorCode::Internal, "storage error"),
+    };
+    DhtResponse::Error {
+        code,
+        message: message.to_string(),
+    }
+}
+
+fn get_stats(op: &GetOp, completed_reason: GetCompletedReason) -> DhtGetStats {
+    let queried_peers = limited_sorted_peers(&op.frontier.queried, LOG_PEER_LIMIT);
+    let queried_peer_count = op.frontier.queried.len();
+
+    DhtGetStats {
+        completed_reason,
+        local_value_count: op.values.len().saturating_sub(op.remote_values.len()),
+        remote_value_count: op.remote_values.len(),
+        queried_peer_count,
+        queried_peers,
+        queried_peers_truncated: queried_peer_count > LOG_PEER_LIMIT,
+        peer_error_count: op.peer_error_count,
+        peer_errors: op.peer_errors.clone(),
+        peer_errors_truncated: op.peer_error_count > op.peer_errors.len(),
+    }
+}
+
+fn limited_sorted_peers(peers: &HashSet<NodeId>, limit: usize) -> Vec<NodeId> {
+    let mut peers: Vec<_> = peers.iter().copied().collect();
+    peers.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    peers.truncate(limit);
+    peers
+}
+
+fn record_peer_error(op: &mut GetOp, peer: NodeId, error: impl Into<String>) {
+    op.peer_error_count = op.peer_error_count.saturating_add(1);
+    if op.peer_errors.len() >= LOG_ERROR_LIMIT {
+        return;
+    }
+
+    op.peer_errors.push(DhtPeerError {
+        peer,
+        error: error.into(),
+    });
+}
+
+fn io_error_label(error: &DhtIoError) -> &'static str {
+    match error {
+        DhtIoError::QueueFull => "queue_full",
+        DhtIoError::Shutdown => "shutdown",
+        DhtIoError::Timeout => "timeout",
+        DhtIoError::Network(_) => "network",
+        DhtIoError::Storage(_) => "storage",
+        DhtIoError::InvalidResponse(_) => "invalid_response",
+        DhtIoError::InvalidRequest(_) => "invalid_request",
+        DhtIoError::StorageFull => "storage_full",
+    }
+}
+
+fn pending_rpc_count(pending: &PendingMap, phase: RpcPhase) -> usize {
+    pending
+        .keys()
+        .filter(|key| matches!(key, PendingKey::Rpc { phase: p, .. } if *p == phase))
+        .count()
+}
+
+fn take_pending_rpc(pending: &mut PendingMap, phase: RpcPhase, peer: NodeId) -> bool {
+    pending.remove(&PendingKey::Rpc { phase, peer }).is_some()
+}
+
+fn take_pending_storage(pending: &mut PendingMap, stage: StorageStage) -> bool {
+    pending.remove(&PendingKey::Storage { stage }).is_some()
+}
+
+fn realm_matches_filter(filter: Option<&RealmId>, realm_id: &RealmId) -> bool {
+    match filter {
+        Some(filter) => filter == realm_id,
+        None => true,
+    }
+}
+
+fn compare_distance(target: &[u8; 32], a: &NodeId, b: &NodeId) -> Ordering {
+    let dist_a = xor_distance_32(target, a.as_bytes());
+    let dist_b = xor_distance_32(target, b.as_bytes());
+    dist_a
+        .cmp(&dist_b)
+        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+}
+
+fn rpc_phase_order(phase: RpcPhase) -> u8 {
+    match phase {
+        RpcPhase::PutLookup => 0,
+        RpcPhase::PutStore => 1,
+        RpcPhase::GetLookup => 2,
+        RpcPhase::Bootstrap => 3,
+        RpcPhase::EvictionPing => 4,
+        RpcPhase::MaintenancePing => 5,
+    }
+}
+
+#[cfg(test)]
+#[path = "state_tests.rs"]
+mod tests;

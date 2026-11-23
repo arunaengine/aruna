@@ -1,0 +1,268 @@
+//! A storage move copies a bucket's versions to the backend its rules choose now, resumes from
+//! stored progress, reclaims the old copies and serves the same bytes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::blob_node::{
+    BUCKET, TestContext, bucket_info, content, progress, put, read, run, setup_on, version, write,
+};
+use aruna_blob::blob::BlobHandler;
+use aruna_blob::blob::registry::{BackendRegistry, NodeBackend};
+use aruna_core::effects::{BlobEffect, StorageEffect};
+use aruna_core::egress::EgressPolicy;
+use aruna_core::events::BlobEvent;
+use aruna_core::keyspaces::{BLOB_LOCATIONS_KEYSPACE, BLOB_RECLAIM_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::storage::blob::{
+    Backend, BackendConfig, BackendLocation, BackendRef, VersionKey,
+};
+use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
+use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
+use aruna_ops_data::blob::migration::misplaced::CountMisplacedOperation;
+use aruna_ops_data::s3::bucket::storage_move::StartMoveOperation;
+use aruna_p2p::NetHandle;
+use aruna_runner::driver::{drive, node_routing};
+use aruna_storage::storage::memory::MemoryStorage;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use ulid::Ulid;
+
+fn filesystem(root: String, prefix: &str) -> BackendConfig {
+    std::fs::create_dir_all(&root).unwrap();
+    BackendConfig {
+        backend_type: Backend::FileSystem,
+        root,
+        service_config: HashMap::new(),
+        bucket_prefix: Some(prefix.to_string()),
+        max_bucket_size: Some(100_000),
+        multipart_bucket: Some(format!("{prefix}parts")),
+        timeouts: Default::default(),
+    }
+}
+
+/// A node with Aruna's default backend and a second one offering the class `cold`.
+async fn setup_context() -> TestContext {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let root = temp_dir.path().to_str().unwrap().to_string();
+    let storage_handle = MemoryStorage::open();
+    let net_handle = NetHandle::new(aruna_runner::testing::local_net(), storage_handle.clone())
+        .await
+        .unwrap();
+    let mut backends = BTreeMap::new();
+    let hot = NodeBackend::new(filesystem(format!("{root}/hot"), "hot-"), None);
+    let cold = NodeBackend::new(
+        filesystem(format!("{root}/cold"), "cold-"),
+        Some("cold".into()),
+    );
+    backends.insert(BackendRef::DEFAULT_NODE_NAME.to_string(), Arc::new(hot));
+    backends.insert("cold".to_string(), Arc::new(cold));
+    let registry = BackendRegistry::new(backends, BackendRef::DEFAULT_NODE_NAME.into()).unwrap();
+    let policy = EgressPolicy::loopback();
+    let blob_handle = BlobHandler::with_registry(
+        registry,
+        storage_handle.clone(),
+        net_handle.clone(),
+        policy,
+        None,
+    )
+    .await
+    .unwrap();
+    setup_on(temp_dir, storage_handle, net_handle, blob_handle).await
+}
+
+/// Sends new writes under `prefix` to the `cold` class.
+async fn route_cold(context: &TestContext, prefix: &str) {
+    let rule = StorageRoutingRule {
+        key_prefix: prefix.to_string(),
+        exact: false,
+        target: RoutingTarget::Class("cold".to_string()),
+    };
+    let info = bucket_info(context.group_id, context.user_id, vec![rule]);
+    write(
+        context,
+        S3_BUCKET_KEYSPACE,
+        BUCKET,
+        &info.to_bytes().unwrap(),
+    )
+    .await;
+}
+
+fn cold() -> BackendRef {
+    BackendRef::Node("cold".to_string())
+}
+
+#[tokio::test]
+async fn moves_bucket_copies() {
+    let context = setup_context().await;
+    let first = put(&context, "data/a.txt", b"moved research data").await;
+    let kept = put(&context, "other/b.txt", b"kept research data").await;
+    // More versions than one page, so the move has to resume from stored progress.
+    let mut small = Vec::new();
+    for index in 0..260 {
+        let key = format!("data/{index:03}");
+        small.push((key.clone(), put(&context, &key, key.as_bytes()).await));
+    }
+    let old = version(&context, "data/a.txt", first)
+        .await
+        .location_key()
+        .unwrap();
+    route_cold(&context, "data/").await;
+    let counted = drive(
+        CountMisplacedOperation::new(node_routing(&context.driver), BUCKET, ""),
+        &context.driver,
+    )
+    .await
+    .unwrap();
+    assert_eq!((counted.count, counted.complete), (261, true));
+
+    let start = StartMoveOperation::new(BUCKET.to_string(), context.group_id, "data/".into(), 1);
+    drive(start, &context.driver).await.unwrap();
+    // Each run only reads the stored record, so a second run is what a restart sees.
+    assert!(run(&context).await.is_some());
+    let partial = progress(&context).await;
+    assert!(partial.cursor.is_some() && partial.finished_at_ms.is_none());
+    assert!(run(&context).await.is_none());
+    let done = progress(&context).await;
+    assert_eq!((done.migrated, done.failed, done.skipped), (261, 0, 1));
+
+    let moved = version(&context, "data/a.txt", first).await;
+    assert_eq!(moved.location_key().unwrap().backend, cold());
+    assert_eq!(content(&context, &moved).await, b"moved research data");
+    let candidate = ReclaimCandidateKey::new(old.backend, old.encoding, old.blake3_hash);
+    let queued = read(&context, BLOB_RECLAIM_KEYSPACE, candidate.to_bytes()).await;
+    assert!(queued.is_some());
+    let other = version(&context, "other/b.txt", kept).await;
+    assert_eq!(
+        other.location_key().unwrap().backend,
+        BackendRef::node_default()
+    );
+    for (key, version_id) in &small {
+        let small = version(&context, key, *version_id).await;
+        assert_eq!(content(&context, &small).await, key.as_bytes());
+    }
+    let counted = drive(
+        CountMisplacedOperation::new(node_routing(&context.driver), BUCKET, ""),
+        &context.driver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(counted.count, 0);
+}
+
+#[tokio::test]
+async fn placed_versions_skip() {
+    // Without a rule change nothing moves and nothing is reclaimed.
+    let context = setup_context().await;
+    let id = put(&context, "a.txt", b"stays").await;
+    let before = version(&context, "a.txt", id).await;
+
+    let start = StartMoveOperation::new(BUCKET.to_string(), context.group_id, String::new(), 1);
+    drive(start, &context.driver).await.unwrap();
+    assert!(run(&context).await.is_none());
+
+    let done = progress(&context).await;
+    assert_eq!((done.migrated, done.skipped, done.failed), (0, 1, 0));
+    assert_eq!(version(&context, "a.txt", id).await, before);
+}
+
+#[tokio::test]
+async fn settles_gone_versions() {
+    // A move intent of a version that is gone is retired once the storage shows its path
+    // holds nothing to release.
+    use aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE;
+    use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
+    use aruna_core::structs::storage::blob::VersionKey;
+    use aruna_ops_data::blob::migration::drain::SettleMoveOperation;
+    let context = setup_context().await;
+    let id = Ulid::generate();
+    let intent = WriteIntent {
+        key: "a.csv".to_string(),
+        version_id: id,
+        backend: BackendRef::node_default(),
+        created_by: context.user_id,
+        written: Some([1; 32]),
+        mover: Some(7),
+    };
+    let key = intent_key(Ulid::generate(), "raw/a.csv~X", id).to_vec();
+    let write = aruna_core::effects::StorageEffect::Write {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: key.clone().into(),
+        value: intent.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context
+        .driver
+        .storage_handle
+        .send_storage_effect(write)
+        .await;
+    let version = VersionKey::new(BUCKET, "a.csv", id);
+    assert!(
+        drive(
+            SettleMoveOperation::new(
+                node_routing(&context.driver),
+                &version,
+                vec![(key.clone(), intent)]
+            ),
+            &context.driver
+        )
+        .await
+        .unwrap()
+    );
+    assert!(read(&context, IMPORT_INTENT_KEYSPACE, key).await.is_none());
+}
+
+#[tokio::test]
+async fn settles_missing_copies() {
+    // A version whose copy the storage lost cannot move. Its move settles once the storage
+    // check records it as broken, instead of failing on every pass; the version row stays.
+    use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE};
+    use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
+    use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
+    use aruna_ops_data::blob::migration::drain::SettleMoveOperation;
+    let context = setup_context().await;
+    let id = put(&context, "data/a.txt", b"lost research data").await;
+    let stored = version(&context, "data/a.txt", id).await;
+    let key = stored.location_key().unwrap().to_bytes();
+    let location = read(&context, BLOB_LOCATIONS_KEYSPACE, key).await.unwrap();
+    let location = BackendLocation::from_bytes(&location).unwrap();
+    let blob = context.driver.blob_handle.as_ref().unwrap();
+    let deleted = blob.send_blob_effect(BlobEffect::Delete { location }).await;
+    assert!(matches!(deleted.as_blob(), Some(BlobEvent::DeleteFinished)));
+    route_cold(&context, "data/").await;
+    let intent = WriteIntent {
+        key: "data/a.txt".to_string(),
+        version_id: id,
+        backend: BackendRef::node_default(),
+        created_by: context.user_id,
+        written: Some([1; 32]),
+        mover: Some(7),
+    };
+    let row = intent_key(Ulid::generate(), "raw/a.txt~X", id).to_vec();
+    let write = StorageEffect::Write {
+        key_space: IMPORT_INTENT_KEYSPACE.to_string(),
+        key: row.clone().into(),
+        value: intent.to_bytes().unwrap().into(),
+        txn_id: None,
+    };
+    context
+        .driver
+        .storage_handle
+        .send_storage_effect(write)
+        .await;
+    let moved = VersionKey::new(BUCKET, "data/a.txt", id);
+
+    let settled = drive(
+        SettleMoveOperation::new(
+            node_routing(&context.driver),
+            &moved,
+            vec![(row.clone(), intent)],
+        ),
+        &context.driver,
+    )
+    .await;
+    assert!(settled.unwrap(), "a missing copy must settle its move");
+    assert!(read(&context, IMPORT_INTENT_KEYSPACE, row).await.is_none());
+    let broken = read(&context, BROKEN_VERSION_KEYSPACE, moved.to_bytes().unwrap()).await;
+    let broken = BrokenVersion::from_bytes(&broken.unwrap()).unwrap();
+    assert_eq!(broken.reason, BrokenReason::MissingBlob);
+    assert_eq!(version(&context, "data/a.txt", id).await, stored);
+}

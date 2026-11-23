@@ -1,0 +1,273 @@
+//! Tests that group creation, renames and policy changes materialize and flag conflicts.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+
+#[test]
+fn deletion_survives_replay() {
+    use crate::structs::identity::group_delete::{
+        GroupDeleteCertificate, GroupDeletePlan, GroupDeleteProof,
+    };
+    let created = create_group(1, 1, "Engineering", realm_id());
+    let mut state = group_state();
+    state.apply(&created).unwrap();
+    let origin = actor(node(1));
+    let plan = GroupDeletePlan {
+        request_id: Ulid::from_bytes([30; 16]),
+        group_id: group_id(),
+        realm_id: realm_id(),
+        owner: state.materialized_group_owner().unwrap(),
+        requested_by: origin.user_id,
+        coordinator: origin.node_id,
+        nodes: BTreeSet::from([origin.node_id]),
+    };
+    let proof = GroupDeleteProof {
+        node_id: origin.node_id,
+        signature: iroh::SecretKey::from_bytes(&[1; 32]).sign(&plan.signing_bytes().unwrap()),
+    };
+    let deleted = state
+        .apply_operation(
+            &origin,
+            AdminDocumentOperation::GroupDeleted {
+                certificate: Box::new(GroupDeleteCertificate {
+                    plan: plan.clone(),
+                    proofs: vec![proof],
+                }),
+            },
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    assert!(state.group_deleted());
+    assert_eq!(state.apply(&deleted).unwrap(), AdminApplyStatus::Duplicate);
+    state
+        .apply(&create_group(2, 2, "Replayed", realm_id()))
+        .unwrap();
+    assert!(state.group_deleted());
+    assert_eq!(state.group_deletion().unwrap().plan, plan);
+    let mut reversed = group_state();
+    reversed.apply(&deleted).unwrap();
+    reversed.apply(&created).unwrap();
+    assert!(reversed.group_deleted());
+}
+
+#[test]
+fn group_policies_materialize() {
+    let mut state = group_state();
+    let policies = vec![crate::request_policy::RequestPolicy {
+        policy_id: Ulid::from_bytes([2; 16]),
+        name: "no-writes".to_string(),
+        kind: crate::request_policy::PolicyKind::Deny,
+        when: None,
+        expression: "permission == 'write'".to_string(),
+        enabled: true,
+    }];
+    state
+        .apply_operation(
+            &actor(node(1)),
+            AdminDocumentOperation::GroupPoliciesSet {
+                policies: policies.clone(),
+            },
+            ulid::Ulid::generate(),
+        )
+        .unwrap();
+    assert_eq!(state.materialized_group_policies(), Some(policies));
+}
+
+#[test]
+fn group_created_owner() {
+    let mut state = group_state();
+    let realm_id = realm_id();
+    let owner = user_id_seed(5);
+
+    state
+        .apply(&create_group(1, 1, "Engineering", realm_id))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_group_name().as_deref(),
+        Some("Engineering")
+    );
+    assert_eq!(state.materialized_group_realm(), Some(realm_id));
+    assert_eq!(state.materialized_group_owner(), Some(owner));
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn group_created_name() {
+    let mut state = group_state();
+    let realm_id = realm_id();
+
+    state
+        .apply(&create_group(1, 1, "Engineering", realm_id))
+        .unwrap();
+    state
+        .apply(&create_group(2, 2, "Research", realm_id))
+        .unwrap();
+
+    assert_eq!(state.materialized_group_name(), None);
+    assert_eq!(state.materialized_group_realm(), Some(realm_id));
+    assert!(!state.conflicts.contains_key(REALM_ID_PATH));
+
+    let conflict = state
+        .conflicts
+        .get(DISPLAY_NAME_PATH)
+        .expect("display name conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("Engineering"))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some("Research"))
+    );
+}
+
+#[test]
+fn rename_replaces_name() {
+    let mut state = group_state();
+    state
+        .apply(&create_group(1, 1, "Engineering", realm_id()))
+        .unwrap();
+    state.apply(&rename_group(2, 1, 2, "Platform")).unwrap();
+
+    assert_eq!(state.materialized_group_name().as_deref(), Some("Platform"));
+    assert!(state.conflicts.is_empty());
+}
+
+#[test]
+fn older_rename_stale() {
+    // The second rename observes the first, so replaying the first loses.
+    let mut state = group_state();
+    state
+        .apply(&create_group(1, 1, "Engineering", realm_id()))
+        .unwrap();
+    let first = rename_group(2, 1, 2, "Platform");
+    let second = rename_group(3, 1, 3, "Infrastructure");
+    state.apply(&second).unwrap();
+    state.apply(&first).unwrap();
+
+    assert_eq!(
+        state.materialized_group_name().as_deref(),
+        Some("Infrastructure")
+    );
+}
+
+#[test]
+fn concurrent_renames_conflict() {
+    let mut state = group_state();
+    state
+        .apply(&create_group(1, 1, "Engineering", realm_id()))
+        .unwrap();
+    state.apply(&rename_group(2, 2, 1, "Platform")).unwrap();
+    state.apply(&rename_group(3, 3, 1, "Research")).unwrap();
+
+    assert_eq!(state.materialized_group_name(), None);
+    let conflict = state
+        .conflicts
+        .get(DISPLAY_NAME_PATH)
+        .expect("display name conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+}
+
+#[test]
+fn group_created_id() {
+    let mut state = group_state();
+    let first_realm_id = realm_id_seed(9);
+    let second_realm_id = realm_id_seed(10);
+    let first_realm_value = first_realm_id.to_string();
+    let second_realm_value = second_realm_id.to_string();
+
+    state
+        .apply(&create_group(1, 1, "Engineering", first_realm_id))
+        .unwrap();
+    state
+        .apply(&create_group(2, 2, "Engineering", second_realm_id))
+        .unwrap();
+
+    assert_eq!(
+        state.materialized_group_name().as_deref(),
+        Some("Engineering")
+    );
+    assert_eq!(state.materialized_group_realm(), None);
+    assert!(!state.conflicts.contains_key(DISPLAY_NAME_PATH));
+
+    let conflict = state
+        .conflicts
+        .get(REALM_ID_PATH)
+        .expect("realm id conflict is recorded");
+    assert_eq!(conflict.values.len(), 2);
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(first_realm_value.as_str()))
+    );
+    assert!(
+        conflict
+            .values
+            .iter()
+            .any(|value| value.value.as_deref() == Some(second_realm_value.as_str()))
+    );
+}
+
+#[test]
+fn group_created_change() {
+    let mut state = user_state();
+    let before = state.clone();
+    let event = event(
+        1,
+        node(1),
+        1,
+        AdminDocumentClock::default(),
+        AdminDocumentOperation::GroupCreated {
+            realm_id: realm_id(),
+            display_name: "Engineering".to_string(),
+            owner: user_id_seed(5),
+        },
+    );
+
+    assert_eq!(
+        state.apply(&event),
+        Err(AdminDocumentError::UnsupportedTarget)
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn group_location_materializes() {
+    use crate::structs::storage::dataset_location::DatasetLocation;
+    let location = DatasetLocation::new("lab-data", "datasets").unwrap();
+    let mut state = group_state();
+    let mut other = AdminDocumentState::new(crate::admin_documents::AdminDocumentTarget::Group {
+        group_id: Ulid::from_bytes([9; 16]),
+    });
+    let set = |state: &mut AdminDocumentState, location: Option<DatasetLocation>| {
+        state.apply_operation(
+            &actor(node(1)),
+            AdminDocumentOperation::GroupLocationSet { location },
+            ulid::Ulid::generate(),
+        )
+    };
+    set(&mut state, Some(location.clone())).unwrap();
+    set(
+        &mut other,
+        Some(DatasetLocation::new("other-data", "").unwrap()),
+    )
+    .unwrap();
+    assert_eq!(state.group_location(), Some(location.clone()));
+    assert_eq!(other.group_location().unwrap().bucket, "other-data");
+    let invalid = DatasetLocation {
+        bucket: "Bad_Bucket".into(),
+        prefix: String::new(),
+    };
+    assert!(set(&mut state, Some(invalid)).is_err());
+    assert_eq!(state.group_location(), Some(location));
+    set(&mut state, None).unwrap();
+    assert_eq!(state.group_location(), None);
+}

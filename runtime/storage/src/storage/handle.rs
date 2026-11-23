@@ -1,0 +1,1403 @@
+//! Fronts the storage worker: admits effects to a lane, fences on close and maps replies.
+//! Aborts take the foreground lane, and cleanup registers before an effect is queued.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::key_index::RangeIndexes;
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use aruna_core::credential_encryption::CredentialEncryptionKey;
+use aruna_core::effects::{Effect, StorageEffect, StoragePriority};
+use aruna_core::errors::StorageError;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::{Handle, StoragePort};
+use aruna_core::node::vault::NodeVaultKey;
+use aruna_core::realm_vault::{RealmKeys, RealmVaultError};
+use aruna_core::telemetry::record_stage;
+use async_trait::async_trait;
+use byteview::ByteView;
+use crossfire::{TrySendError, mpsc};
+use tokio::sync::oneshot;
+use tracing::{Span, warn};
+use ulid::Ulid;
+
+use super::hot_cache::{HotCache, Row, cached_slot};
+use super::metrics::{InFlightGuard, StorageMetrics, StorageMetricsSnapshot};
+use super::owner::TransactionOwner;
+use super::policies::PolicyPrograms;
+use super::sealing::{open_event, seal_effect};
+use super::telemetry::{effect_kind, storage_effect_kind, storage_effect_span, storage_event_kind};
+use super::vault::{vault_effect, vault_event};
+
+pub type EffectHandle = (StorageEffect, ResponseSender, Span, Instant, InFlightGuard);
+pub type EffectSender = crossfire::MTx<mpsc::Array<EffectHandle>>;
+pub(super) type AsyncEffectSender = crossfire::MAsyncTx<mpsc::Array<EffectHandle>>;
+pub type EffectReceiver = crossfire::Rx<mpsc::Array<EffectHandle>>;
+pub(super) type StorageReply = (StorageEvent, ResponseToken);
+
+pub(super) const QUEUE_CAPACITY: usize = 65_536;
+// Bulk lane queues are small so background work hits QueueFull backpressure early
+// instead of building an unbounded backlog ahead of foreground sync traffic.
+pub(super) const EFFECT_QUEUE_CAPACITY: usize = 4_096;
+pub(super) const MAX_TRANSACTION_CLEANUP: usize = 1024;
+pub(super) const MAX_CLEANUP_ATTEMPTS: u8 = 2;
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CleanupKind {
+    Open,
+    Abort,
+    Aborted,
+    CommitQueued,
+    CommitUnknown,
+    /// Holds the commit's sequence, so a repeated commit answers it again.
+    Committed(u64),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CleanupEntry {
+    pub(super) kind: CleanupKind,
+    pub(super) attempts: u8,
+    /// An effect for this entry is in the worker queue; retries must not race it.
+    pub(super) queued: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct CleanupAdmission {
+    txn_id: Ulid,
+    requested: CleanupKind,
+    previous: Option<CleanupKind>,
+}
+
+/// Named dispatch lanes for the handle's three contractual routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EffectRoute {
+    Foreground,
+    Background,
+    Abort,
+}
+pub(super) const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Write-actor receivers, one per dispatch lane. Foreground is drained before
+/// bulk so background work never starves sync traffic.
+pub struct StorageReceivers {
+    pub foreground: EffectReceiver,
+    pub bulk: EffectReceiver,
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageHandle {
+    pub(super) write_channel: EffectSender,
+    pub(super) bulk_channel: EffectSender,
+    pub(super) write_async: AsyncEffectSender,
+    pub(super) bulk_async: AsyncEffectSender,
+    pub(super) priority: StoragePriority,
+    pub(super) metrics: Arc<StorageMetrics>,
+    pub(super) transaction_cleanup: Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    pub(super) worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    pub(super) secret_key: Arc<OnceLock<CredentialEncryptionKey>>,
+    pub(super) vault_key: Arc<OnceLock<NodeVaultKey>>,
+    pub(super) realm_keys: Arc<OnceLock<RealmKeys>>,
+    pub(super) database: Arc<OnceLock<OpenDatabase>>,
+    /// The key indexes of distributed bucket ranges, on a node that keeps them.
+    pub(super) range_indexes: Arc<OnceLock<Arc<RangeIndexes>>>,
+    /// Compiled request policy sets by content, shared by every clone of the handle.
+    pub(super) policies: Arc<PolicyPrograms>,
+    /// Point reads of read-mostly keyspaces; only a handle with its own worker keeps one.
+    pub(super) cache: Option<Arc<HotCache>>,
+    /// The in-memory store that answers effects in place of the worker, in tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) memory: Option<Arc<super::memory::MemoryStore>>,
+}
+
+/// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
+/// futures stop here instead of walking Fjall's internals; Fjall's handle has no `Debug`.
+#[derive(Clone)]
+pub(super) struct OpenDatabase(pub(super) Arc<dyn Fn() -> fjall::Database + Send + Sync>);
+
+impl std::fmt::Debug for OpenDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OpenDatabase")
+    }
+}
+
+#[derive(Debug)]
+enum ResponseCleanup {
+    Start(Option<Ulid>),
+    Abort(Ulid, bool),
+    Commit(Ulid),
+    Terminal(Ulid),
+}
+
+#[derive(Debug)]
+pub(super) struct ResponseToken {
+    handle: Option<StorageHandle>,
+    cleanup: Option<ResponseCleanup>,
+}
+
+#[doc(hidden)]
+pub struct ResponseSender {
+    sender: oneshot::Sender<StorageReply>,
+    token: ResponseToken,
+}
+
+impl ResponseSender {
+    pub(super) fn new(sender: oneshot::Sender<StorageReply>, token: ResponseToken) -> Self {
+        Self { sender, token }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
+    pub(super) fn observe(&mut self, event: &StorageEvent) {
+        self.token.observe(event);
+    }
+
+    pub fn send(mut self, event: StorageEvent) -> bool {
+        self.token.observe(&event);
+        self.sender.send((event, self.token)).is_ok()
+    }
+}
+impl StorageHandle {
+    pub fn new() -> (Self, StorageReceivers) {
+        let (sender, foreground) = mpsc::bounded_blocking(QUEUE_CAPACITY);
+        let (bulk_sender, bulk) = mpsc::bounded_blocking(EFFECT_QUEUE_CAPACITY);
+        (
+            StorageHandle {
+                write_async: sender.clone().into_async(),
+                bulk_async: bulk_sender.clone().into_async(),
+                write_channel: sender,
+                bulk_channel: bulk_sender,
+                priority: StoragePriority::Foreground,
+                metrics: Arc::new(StorageMetrics::default()),
+                transaction_cleanup: Arc::new(Mutex::new(BTreeMap::new())),
+                worker: Arc::new(Mutex::new(None)),
+                secret_key: Arc::new(OnceLock::new()),
+                vault_key: Arc::new(OnceLock::new()),
+                realm_keys: Arc::new(OnceLock::new()),
+                database: Arc::new(OnceLock::new()),
+                range_indexes: Arc::new(OnceLock::new()),
+                policies: Arc::new(PolicyPrograms::default()),
+                cache: None,
+                #[cfg(any(test, feature = "test-hooks"))]
+                memory: None,
+            },
+            StorageReceivers { foreground, bulk },
+        )
+    }
+
+    /// Installs the range key indexes on first call; later calls get the installed ones.
+    pub fn install_range_indexes(&self, indexes: RangeIndexes) -> Arc<RangeIndexes> {
+        self.range_indexes.get_or_init(|| Arc::new(indexes)).clone()
+    }
+
+    /// Installs the range indexes below the metadata storage `path`; only a metadata node keeps
+    /// them.
+    pub fn install_metadata_indexes(&self, path: impl AsRef<std::path::Path>) {
+        let root = path.as_ref().join(crate::key_index::RANGE_INDEX_DIR);
+        self.install_range_indexes(RangeIndexes::new(root));
+    }
+
+    /// The range key indexes; `None` on a node that keeps none.
+    pub fn range_indexes(&self) -> Option<Arc<RangeIndexes>> {
+        self.range_indexes.get().cloned()
+    }
+
+    /// The opened node database, for consistent read snapshots such as live backups. `None`
+    /// on a handle without opened storage behind it.
+    pub fn database(&self) -> Option<fjall::Database> {
+        self.database.get().map(|database| (database.0)())
+    }
+
+    /// False once fjall refuses writes after a failed flush or commit. The buffered journal
+    /// persist is the call the worker already makes after every commit.
+    pub async fn accepts_writes(&self) -> bool {
+        let Some(database) = self.database() else {
+            return true;
+        };
+        tokio::task::spawn_blocking(move || database.persist(fjall::PersistMode::Buffer).is_ok())
+            .await
+            .unwrap_or(false)
+    }
+
+    /// New channels sharing this handle's metrics, for test proxies that forward effects to
+    /// this handle and must report its realm config change count.
+    #[doc(hidden)]
+    pub fn proxy_channels(&self) -> (StorageHandle, StorageReceivers) {
+        let (mut handle, receivers) = StorageHandle::new();
+        handle.metrics = self.metrics.clone();
+        (handle, receivers)
+    }
+
+    /// Seals connector secret and share link rows with `key` from now on, for this
+    /// handle and all its clones. Set once at startup; a later key is ignored.
+    pub fn seal_secrets(&self, key: CredentialEncryptionKey) {
+        let _ = self.secret_key.set(key);
+    }
+
+    /// Opens the node vault with `key` for this handle and all its clones. Set once
+    /// at startup; vault effects fail until then, and a later key is ignored.
+    pub fn open_vault(&self, key: NodeVaultKey) {
+        let _ = self.vault_key.set(key);
+    }
+
+    /// Gives this handle and its clones the realm keys; only management nodes hold them. Set
+    /// once at startup; a later key is ignored.
+    pub fn open_realm(&self, keys: RealmKeys) {
+        let _ = self.realm_keys.set(keys);
+    }
+
+    /// The realm keys this handle was given, for plugin releases that still open secrets in the
+    /// operation; `None` on nodes without them.
+    pub fn realm_keys(&self) -> Option<&RealmKeys> {
+        self.realm_keys.get()
+    }
+
+    /// A handle whose effects dispatch on the bulk lane, served only when the
+    /// foreground lane is idle.
+    pub fn bulk(&self) -> StorageHandle {
+        let mut handle = self.clone();
+        handle.priority = StoragePriority::Bulk;
+        handle
+    }
+
+    /// Contractual dispatch route for an effect. Aborts always route foreground
+    /// so cleanup never waits behind bulk backpressure; everything else follows
+    /// the handle's priority. The routes map onto distinct queues below.
+    fn route_for(&self, effect: &StorageEffect) -> EffectRoute {
+        if matches!(effect, StorageEffect::AbortTransaction { .. }) {
+            return EffectRoute::Abort;
+        }
+        match self.priority {
+            StoragePriority::Foreground => EffectRoute::Foreground,
+            StoragePriority::Bulk => EffectRoute::Background,
+        }
+    }
+
+    fn channel_for(&self, effect: &StorageEffect) -> &EffectSender {
+        match self.route_for(effect) {
+            EffectRoute::Foreground | EffectRoute::Abort => &self.write_channel,
+            EffectRoute::Background => &self.bulk_channel,
+        }
+    }
+
+    fn async_channel_for(&self, effect: &StorageEffect) -> &AsyncEffectSender {
+        match self.route_for(effect) {
+            EffectRoute::Foreground | EffectRoute::Abort => &self.write_async,
+            EffectRoute::Background => &self.bulk_async,
+        }
+    }
+
+    pub fn get_errors(&self) -> u64 {
+        self.metrics.errors_total.load(Ordering::Relaxed)
+    }
+
+    /// Number of storage effects currently enqueued or being processed.
+    pub fn in_flight(&self) -> u64 {
+        self.metrics.in_flight.load(Ordering::Acquire)
+    }
+
+    /// Count of commit attempts that may have changed a realm config row. A reader that sees a
+    /// new count also sees the committed row.
+    pub fn config_changes(&self) -> u64 {
+        self.metrics.config_changes.load(Ordering::Acquire)
+    }
+
+    pub fn snapshot_metrics(&self) -> StorageMetricsSnapshot {
+        StorageMetricsSnapshot {
+            requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
+            errors_total: self.metrics.errors_total.load(Ordering::Relaxed),
+            conflicts_total: self.metrics.conflicts_total.load(Ordering::Relaxed),
+            failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
+            channel_closed: self.metrics.channel_closed.load(Ordering::Relaxed),
+            closed: self.writes_closed(),
+            rejected_writes: self.rejected_writes(),
+            last_error: self
+                .metrics
+                .last_error
+                .lock()
+                .expect("storage metrics mutex poisoned")
+                .clone(),
+        }
+    }
+
+    /// Transfers transaction ownership to the storage node when the caller is
+    /// cancelled. Unknown commits are retained for reconciliation and never
+    /// aborted; other states receive bounded local abort retries.
+    pub fn retain_transaction(&self, txn_id: Ulid, commit_unknown: bool) -> bool {
+        let kind = if commit_unknown {
+            CleanupKind::CommitUnknown
+        } else {
+            CleanupKind::Abort
+        };
+        let mut pending = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned");
+        if pending.get(&txn_id).is_some_and(|entry| {
+            matches!(entry.kind, CleanupKind::Committed(_) | CleanupKind::Aborted)
+        }) {
+            pending.remove(&txn_id);
+            return true;
+        }
+        if pending.get(&txn_id).is_none() {
+            return true;
+        }
+        if commit_unknown
+            && pending
+                .get(&txn_id)
+                .is_some_and(|entry| matches!(entry.kind, CleanupKind::Open))
+        {
+            return false;
+        }
+        let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
+            Ok(admission) => admission,
+            Err(_) => return false,
+        };
+        let enqueue = !commit_unknown
+            && admission
+                .previous
+                .is_none_or(|previous| matches!(previous, CleanupKind::Open));
+        drop(pending);
+        if enqueue {
+            self.send_abort(txn_id, "owner_handoff");
+        }
+        true
+    }
+
+    /// Number of transaction owners retained by this storage node.
+    pub fn pending_transactions(&self) -> usize {
+        self.transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .len()
+    }
+
+    /// True after a commit was retained as possibly accepted by storage.
+    pub fn commit_unknown(&self, txn_id: Ulid) -> bool {
+        self.transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .get(&txn_id)
+            .is_some_and(|entry| {
+                matches!(
+                    entry.kind,
+                    CleanupKind::CommitQueued
+                        | CleanupKind::CommitUnknown
+                        | CleanupKind::Committed(_)
+                        | CleanupKind::Aborted
+                )
+            })
+    }
+
+    /// Starts a write transaction and returns its id; panics on any other answer.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn begin_write(&self) -> Ulid {
+        match self
+            .send_storage_effect(StorageEffect::StartTransaction { read: false })
+            .await
+        {
+            Event::Storage(StorageEvent::TransactionStarted { txn_id }) => txn_id,
+            other => panic!("unexpected storage event: {other:?}"),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "storage.handle.send_storage_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(operation = storage_effect_kind(&effect))
+    )]
+    pub async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
+        Event::Storage(self.dispatch_storage_effect(effect).await)
+    }
+
+    pub async fn start_transaction(&self, read: bool) -> Result<TransactionOwner, StorageError> {
+        match self
+            .dispatch_storage_effect(StorageEffect::StartTransaction { read })
+            .await
+        {
+            StorageEvent::TransactionStarted { txn_id } => {
+                Ok(TransactionOwner::new(Arc::new(self.clone()), txn_id))
+            }
+            StorageEvent::Error { error } => Err(error),
+            _ => Err(StorageError::InvalidEffect),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "storage.handle.dispatch",
+        level = "debug",
+        skip(self, effect),
+        fields(operation = storage_effect_kind(&effect))
+    )]
+    pub(super) async fn dispatch_storage_effect(&self, effect: StorageEffect) -> StorageEvent {
+        self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
+        if let StorageEffect::CompilePolicies(sets) = &effect {
+            return StorageEvent::PoliciesCompiled(self.policies.compile(sets));
+        }
+        #[cfg(debug_assertions)]
+        super::ledger::record_outbox(&effect);
+        if let StorageEffect::RealmOpen(sealed) = &effect {
+            let keys = self.realm_keys.get();
+            let result = keys.map_or(Err(RealmVaultError::NoKey), |keys| sealed.open(keys));
+            return StorageEvent::RealmOpened { result };
+        }
+        let (effect, vault_entry) = match vault_effect(self.vault_key.get(), effect) {
+            Ok(translated) => translated,
+            Err(error) => return self.observe_storage_event(StorageEvent::Error { error }),
+        };
+        let (effect, opening) = match self.secret_key.get() {
+            Some(key) => match seal_effect(key, effect) {
+                Ok(sealed) => sealed,
+                Err(error) => return self.observe_storage_event(StorageEvent::Error { error }),
+            },
+            None => (effect, None),
+        };
+        let mut event = self.dispatch_cached(effect).await;
+        if let (Some(key), Some(opening)) = (self.secret_key.get(), opening) {
+            event = open_event(key, opening, event)
+                .unwrap_or_else(|error| self.observe_storage_event(StorageEvent::Error { error }));
+        }
+        if let Some(entry) = vault_entry {
+            event = vault_event(self.vault_key.get(), entry, event)
+                .unwrap_or_else(|error| self.observe_storage_event(StorageEvent::Error { error }));
+        }
+        record_stage("storage", started.elapsed());
+        event
+    }
+
+    /// Answers point reads outside a transaction from the hot cache where it can, and fills
+    /// it from the rows read; every other effect goes to the worker unchanged.
+    async fn dispatch_cached(&self, effect: StorageEffect) -> StorageEvent {
+        // A closed worker channel answers every read with its error, as a cold read does.
+        let closed = self.metrics.channel_closed.load(Ordering::Relaxed);
+        let Some(cache) = self.cache.as_deref().filter(|_| !closed) else {
+            return self.dispatch_queued(effect).await;
+        };
+        match effect {
+            StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            } => {
+                let row = cached_slot(&key_space).map(|slot| (slot, key.clone()));
+                if let Some(value) = row.as_ref().and_then(|row| cache.get(row)) {
+                    return StorageEvent::ReadResult { key, value };
+                }
+                let generation = cache.generation();
+                let effect = StorageEffect::Read {
+                    key_space,
+                    key,
+                    txn_id: None,
+                };
+                let event = self.dispatch_queued(effect).await;
+                if let (Some(row), StorageEvent::ReadResult { value, .. }) = (row, &event) {
+                    cache.fill(generation, [(row, value.clone())]);
+                }
+                event
+            }
+            StorageEffect::BatchRead {
+                reads,
+                txn_id: None,
+            } if reads
+                .iter()
+                .any(|(key_space, _)| cached_slot(key_space).is_some()) =>
+            {
+                self.read_batch(cache, reads).await
+            }
+            effect => self.dispatch_queued(effect).await,
+        }
+    }
+
+    /// Reads only the rows the cache misses, in one batch. Hits are kept only while no cached
+    /// row changed until that batch was answered; else the whole batch reads one snapshot.
+    async fn read_batch(&self, cache: &HotCache, reads: Vec<(String, ByteView)>) -> StorageEvent {
+        let mut generation = cache.generation();
+        let rows: Vec<Option<Row>> = reads
+            .iter()
+            .map(|(key_space, key)| Some((cached_slot(key_space)?, key.clone())))
+            .collect();
+        let mut hits = cache.lookup(&rows);
+        let missing: Vec<_> = reads
+            .iter()
+            .zip(&hits)
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(read, _)| read.clone())
+            .collect();
+        let mut event = StorageEvent::BatchReadResult { values: Vec::new() };
+        if !missing.is_empty() {
+            let mixed = missing.len() < reads.len();
+            let batch = StorageEffect::BatchRead {
+                reads: missing,
+                txn_id: None,
+            };
+            event = self.dispatch_queued(batch).await;
+            if mixed && cache.generation() != generation {
+                generation = cache.generation();
+                hits = vec![None; reads.len()];
+                let batch = StorageEffect::BatchRead {
+                    reads: reads.clone(),
+                    txn_id: None,
+                };
+                event = self.dispatch_queued(batch).await;
+            }
+        }
+        let StorageEvent::BatchReadResult { values: fetched } = event else {
+            return event;
+        };
+        let mut fetched = fetched.into_iter();
+        let mut values = Vec::with_capacity(reads.len());
+        let mut filled = Vec::new();
+        for (((_, key), row), hit) in reads.into_iter().zip(rows).zip(hits) {
+            let value = match hit {
+                Some(value) => value,
+                None => match fetched.next() {
+                    Some((_, value)) => {
+                        filled.extend(row.map(|row| (row, value.clone())));
+                        value
+                    }
+                    None => {
+                        let error = StorageError::ReadError("short batch read".to_string());
+                        return StorageEvent::Error { error };
+                    }
+                },
+            };
+            values.push((key, value));
+        }
+        cache.fill(generation, filled);
+        StorageEvent::BatchReadResult { values }
+    }
+
+    async fn dispatch_queued(&self, effect: StorageEffect) -> StorageEvent {
+        let (sender, response_rx) = oneshot::channel();
+        let operation = storage_effect_kind(&effect);
+        let active_txn_id = effect_txn_id(&effect);
+        let cleanup = cleanup_effect(&effect);
+        let cleanup_write = is_cleanup_write(&effect);
+        if let StorageEffect::CommitTransaction { txn_id } = &effect
+            && let Some(CleanupKind::Committed(sequence)) = self
+                .transaction_cleanup
+                .lock()
+                .expect("transaction cleanup mutex poisoned")
+                .get(txn_id)
+                .map(|entry| entry.kind)
+        {
+            let committed = StorageEvent::TransactionCommitted {
+                txn_id: *txn_id,
+                sequence,
+            };
+            return self.observe_storage_event(committed);
+        }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(memory) = &self.memory {
+            // One yield per effect lets joined futures interleave as they do on the worker queue.
+            tokio::task::yield_now().await;
+            return self.dispatch_memory(memory, effect);
+        }
+        let mut deferred = None;
+        let send_result: Result<(), StorageError> = {
+            // Guard held across the close check and the queue send (never an
+            // await), so a concurrent `close_writes` cannot slip between them.
+            let _close_guard = storage_effect_mutates(&effect).then(|| {
+                self.metrics
+                    .close_lock
+                    .read()
+                    .expect("storage close lock poisoned")
+            });
+            if _close_guard.is_some() && self.writes_closed() {
+                self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    event = "storage.write.after_close",
+                    operation, "Rejected a storage write issued after the shutdown close"
+                );
+                return self.observe_storage_event(StorageEvent::Error {
+                    error: StorageError::Closed,
+                });
+            }
+            if let Some((txn_id, kind)) = cleanup {
+                let mut pending = self
+                    .transaction_cleanup
+                    .lock()
+                    .expect("transaction cleanup mutex poisoned");
+                let admission = match reserve_cleanup(&mut pending, txn_id, kind) {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        return self.observe_storage_event(StorageEvent::Error { error });
+                    }
+                };
+                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+                let span = storage_effect_span(&effect);
+                let in_flight = InFlightGuard::acquire(&self.metrics);
+                match self.channel_for(&effect).try_send((
+                    effect,
+                    response_tx,
+                    span,
+                    Instant::now(),
+                    in_flight,
+                )) {
+                    Ok(()) => {
+                        if let Some(entry) = pending.get_mut(&txn_id) {
+                            entry.queued = true;
+                        }
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(item)) => {
+                        rollback_cleanup(&mut pending, admission);
+                        // The item's ResponseToken re-locks the cleanup mutex on drop.
+                        drop(pending);
+                        drop(item);
+                        Err(StorageError::QueueFull)
+                    }
+                    Err(TrySendError::Disconnected(item)) => {
+                        rollback_cleanup(&mut pending, admission);
+                        drop(pending);
+                        drop(item);
+                        Err(StorageError::ChannelClosed)
+                    }
+                }
+            } else {
+                let response_tx = ResponseSender::new(sender, ResponseToken::new(self, &effect));
+                let span = storage_effect_span(&effect);
+                let in_flight = InFlightGuard::acquire(&self.metrics);
+                let item = (effect, response_tx, span, Instant::now(), in_flight);
+                match self.channel_for(&item.0).try_send(item) {
+                    Ok(()) => Ok(()),
+                    Err(TrySendError::Full(item)) if cleanup_write => {
+                        // Release the close guard before waiting; the worker fence rejects a late write.
+                        deferred = Some(item);
+                        Ok(())
+                    }
+                    Err(TrySendError::Full(_)) => Err(StorageError::QueueFull),
+                    Err(TrySendError::Disconnected(_)) => Err(StorageError::ChannelClosed),
+                }
+            }
+        };
+        let send_result = match deferred {
+            Some(item) => {
+                let channel = self.async_channel_for(&item.0).clone();
+                match channel.send(item).await {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(StorageError::ChannelClosed),
+                }
+            }
+            None => send_result,
+        };
+        match send_result {
+            Ok(()) => {}
+            Err(error) => {
+                return self.observe_storage_event(StorageEvent::Error { error });
+            }
+        }
+
+        match tokio::time::timeout(STORAGE_REQUEST_TIMEOUT, response_rx).await {
+            Ok(Ok((event, response_token))) => {
+                response_token.claim();
+                self.observe_cleanup(cleanup, &event);
+                self.observe_storage_event(event)
+            }
+            Ok(Err(_)) => {
+                let event = StorageEvent::Error {
+                    error: StorageError::ChannelClosed,
+                };
+                self.observe_cleanup(cleanup, &event);
+                self.observe_storage_event(event)
+            }
+            Err(error) => {
+                if let Some(txn_id) = active_txn_id
+                    && !matches!(
+                        cleanup,
+                        Some((_, CleanupKind::CommitQueued | CleanupKind::CommitUnknown))
+                    )
+                {
+                    self.enqueue_abort_transaction(txn_id, "request_timeout");
+                }
+                warn!(
+                    event = "storage.request.timeout",
+                    operation,
+                    timeout_ms = STORAGE_REQUEST_TIMEOUT.as_millis() as u64,
+                    error = %error,
+                    "Timed out waiting for storage response"
+                );
+                let event = StorageEvent::Error {
+                    error: StorageError::Timeout,
+                };
+                self.observe_cleanup(cleanup, &event);
+                self.observe_storage_event(event)
+            }
+        }
+    }
+
+    /// Runs an effect on the in-memory store at once, with the close fence and the cleanup
+    /// bookkeeping of a queued effect, so callers see the same answers as from the worker.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn dispatch_memory(
+        &self,
+        memory: &super::memory::MemoryStore,
+        effect: StorageEffect,
+    ) -> StorageEvent {
+        let cleanup = cleanup_effect(&effect);
+        let event = {
+            let close_guard = storage_effect_mutates(&effect).then(|| {
+                self.metrics
+                    .close_lock
+                    .read()
+                    .expect("storage close lock poisoned")
+            });
+            if close_guard.is_some() && self.writes_closed() {
+                self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                let error = StorageError::Closed;
+                return self.observe_storage_event(StorageEvent::Error { error });
+            }
+            if let Some((txn_id, kind)) = cleanup {
+                let mut pending = self
+                    .transaction_cleanup
+                    .lock()
+                    .expect("transaction cleanup mutex poisoned");
+                if let Err(error) = reserve_cleanup(&mut pending, txn_id, kind) {
+                    drop(pending);
+                    return self.observe_storage_event(StorageEvent::Error { error });
+                }
+                if let Some(entry) = pending.get_mut(&txn_id) {
+                    entry.queued = true;
+                }
+            }
+            let mut token = ResponseToken::new(self, &effect);
+            let _in_flight = InFlightGuard::acquire(&self.metrics);
+            let event = memory.run(effect);
+            token.observe(&event);
+            token.claim();
+            event
+        };
+        self.observe_cleanup(cleanup, &event);
+        self.observe_storage_event(event)
+    }
+
+    pub(super) fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
+        let mut pending = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned");
+        let admission = match reserve_cleanup(&mut pending, txn_id, CleanupKind::Abort) {
+            Ok(admission) => admission,
+            Err(_) => {
+                warn!(%txn_id, reason, "Skipping abort after an accepted commit or full cleanup");
+                return;
+            }
+        };
+        let enqueue = !matches!(admission.previous, Some(CleanupKind::Abort));
+        drop(pending);
+        if enqueue {
+            self.send_abort(txn_id, reason);
+        }
+    }
+
+    fn send_abort(&self, txn_id: Ulid, reason: &'static str) {
+        let effect = StorageEffect::AbortTransaction { txn_id };
+        let (response_tx, _response_rx) = response_channel(ResponseToken::abort(self, txn_id));
+        let span = storage_effect_span(&effect);
+        let in_flight = InFlightGuard::acquire(&self.metrics);
+        self.mark_queued(txn_id, true);
+        // The worker drops an abort's answer, so its token ends the cleanup entry on drop.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(memory) = &self.memory {
+            let mut response_tx = response_tx;
+            response_tx.observe(&memory.run(effect));
+            drop((in_flight, response_tx));
+            return;
+        }
+        match self.channel_for(&effect).try_send((
+            effect,
+            response_tx,
+            span,
+            Instant::now(),
+            in_flight,
+        )) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.requeue_warn(txn_id, reason),
+            Err(TrySendError::Disconnected(_)) => {
+                self.transaction_cleanup
+                    .lock()
+                    .expect("transaction cleanup mutex poisoned")
+                    .remove(&txn_id);
+                warn!(
+                    event = "storage.transaction.abort_enqueue_closed",
+                    txn_id = %txn_id,
+                    reason,
+                    "Failed to enqueue storage transaction abort: channel closed"
+                );
+            }
+        }
+    }
+
+    fn mark_queued(&self, txn_id: Ulid, queued: bool) {
+        if let Some(entry) = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .get_mut(&txn_id)
+        {
+            entry.queued = queued;
+        }
+    }
+
+    fn requeue_warn(&self, txn_id: Ulid, reason: &'static str) {
+        self.mark_queued(txn_id, false);
+        warn!(
+            event = "storage.transaction.abort_enqueue_full",
+            txn_id = %txn_id,
+            reason,
+            "Failed to enqueue storage transaction abort: queue full"
+        );
+    }
+
+    fn retry_abort(&self, txn_id: Ulid, reason: &'static str) {
+        let retry = self
+            .transaction_cleanup
+            .lock()
+            .expect("transaction cleanup mutex poisoned")
+            .get(&txn_id)
+            .is_some_and(|entry| matches!(entry.kind, CleanupKind::Abort));
+        if retry {
+            self.send_abort(txn_id, reason);
+        }
+    }
+
+    fn observe_cleanup(&self, cleanup: Option<(Ulid, CleanupKind)>, event: &StorageEvent) {
+        if let Some((txn_id, _)) = cleanup
+            && observe_cleanup(&self.transaction_cleanup, cleanup, event)
+        {
+            finish_cleanup(&self.transaction_cleanup, txn_id);
+        }
+    }
+
+    #[tracing::instrument(
+        name = "storage.handle.observe_event",
+        level = "trace",
+        skip(self, event),
+        fields(event = storage_event_kind(&event))
+    )]
+    fn observe_storage_event(&self, event: StorageEvent) -> StorageEvent {
+        if let StorageEvent::Error { error } = &event {
+            self.observe_storage_error(error);
+        }
+
+        event
+    }
+
+    #[tracing::instrument(name = "storage.handle.observe_error", level = "debug", skip(self), fields(error = %error))]
+    fn observe_storage_error(&self, error: &StorageError) {
+        self.metrics.errors_total.fetch_add(1, Ordering::Relaxed);
+        *self
+            .metrics
+            .last_error
+            .lock()
+            .expect("storage metrics mutex poisoned") = Some(error.to_string());
+
+        if matches!(error, StorageError::TransactionConflict) {
+            self.metrics.conflicts_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if matches!(error, StorageError::ChannelClosed) {
+            self.metrics.channel_closed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+/// Effects that can commit durable state. Reads, iterations, transaction aborts
+/// and `SyncAll` stay open after the close.
+pub(super) fn storage_effect_mutates(effect: &StorageEffect) -> bool {
+    match effect {
+        StorageEffect::Write { .. }
+        | StorageEffect::BatchWrite { .. }
+        | StorageEffect::AddUsage { .. }
+        | StorageEffect::AddCounters { .. }
+        | StorageEffect::Delete { .. }
+        | StorageEffect::BatchDelete { .. }
+        | StorageEffect::VaultWrite { .. }
+        | StorageEffect::VaultDelete { .. }
+        | StorageEffect::CommitTransaction { .. }
+        | StorageEffect::BeginUsageRebuild { .. }
+        | StorageEffect::FinishUsageRebuild { .. } => true,
+        StorageEffect::StartTransaction { read } => !read,
+        StorageEffect::Read { .. }
+        | StorageEffect::BatchRead { .. }
+        | StorageEffect::Iter { .. }
+        | StorageEffect::IterRange { .. }
+        | StorageEffect::Last { .. }
+        | StorageEffect::VaultRead { .. }
+        | StorageEffect::AbortTransaction { .. }
+        | StorageEffect::SyncAll
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => false,
+    }
+}
+
+pub(super) fn effect_txn_id(effect: &StorageEffect) -> Option<Ulid> {
+    match effect {
+        StorageEffect::Read {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchRead {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Write {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchWrite {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Delete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::BatchDelete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Iter {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::IterRange {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::Last {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::VaultWrite {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::VaultRead {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::VaultDelete {
+            txn_id: Some(txn_id),
+            ..
+        }
+        | StorageEffect::AddUsage { txn_id, .. }
+        | StorageEffect::AddCounters { txn_id, .. }
+        | StorageEffect::CommitTransaction { txn_id }
+        | StorageEffect::AbortTransaction { txn_id } => Some(*txn_id),
+        StorageEffect::StartTransaction { .. }
+        | StorageEffect::SyncAll
+        | StorageEffect::Read { txn_id: None, .. }
+        | StorageEffect::BatchRead { txn_id: None, .. }
+        | StorageEffect::Write { txn_id: None, .. }
+        | StorageEffect::BatchWrite { txn_id: None, .. }
+        | StorageEffect::Delete { txn_id: None, .. }
+        | StorageEffect::BatchDelete { txn_id: None, .. }
+        | StorageEffect::Iter { txn_id: None, .. }
+        | StorageEffect::IterRange { txn_id: None, .. }
+        | StorageEffect::Last { txn_id: None, .. }
+        | StorageEffect::VaultWrite { txn_id: None, .. }
+        | StorageEffect::VaultRead { txn_id: None, .. }
+        | StorageEffect::VaultDelete { txn_id: None, .. }
+        | StorageEffect::BeginUsageRebuild { .. }
+        | StorageEffect::FinishUsageRebuild { .. }
+        | StorageEffect::RealmOpen(_)
+        | StorageEffect::CompilePolicies(_) => None,
+    }
+}
+
+pub(super) fn cleanup_effect(effect: &StorageEffect) -> Option<(Ulid, CleanupKind)> {
+    match effect {
+        StorageEffect::AbortTransaction { txn_id } => Some((*txn_id, CleanupKind::Abort)),
+        StorageEffect::CommitTransaction { txn_id } => Some((*txn_id, CleanupKind::CommitQueued)),
+        _ => None,
+    }
+}
+
+pub(super) fn is_cleanup_write(effect: &StorageEffect) -> bool {
+    matches!(
+        effect,
+        StorageEffect::Write { key_space, .. } if aruna_core::keyspaces::is_cleanup_keyspace(key_space)
+    )
+}
+
+pub(super) fn reserve_cleanup(
+    pending: &mut BTreeMap<Ulid, CleanupEntry>,
+    txn_id: Ulid,
+    kind: CleanupKind,
+) -> Result<CleanupAdmission, StorageError> {
+    let previous = pending.get(&txn_id).map(|entry| entry.kind);
+    match (kind, previous) {
+        (
+            CleanupKind::Abort,
+            Some(
+                CleanupKind::CommitQueued | CleanupKind::CommitUnknown | CleanupKind::Committed(_),
+            ),
+        )
+        | (CleanupKind::CommitQueued, Some(CleanupKind::Abort | CleanupKind::Aborted))
+        | (CleanupKind::CommitUnknown, Some(CleanupKind::Abort | CleanupKind::Aborted)) => {
+            return Err(StorageError::TransactionConflict);
+        }
+        (
+            CleanupKind::CommitQueued,
+            Some(CleanupKind::CommitQueued | CleanupKind::CommitUnknown),
+        ) => {
+            return Err(StorageError::CommitFailed);
+        }
+        _ => {}
+    }
+
+    if previous.is_none() {
+        if pending.len() >= MAX_TRANSACTION_CLEANUP {
+            return Err(StorageError::CleanupCapacity);
+        }
+        pending.insert(
+            txn_id,
+            CleanupEntry {
+                kind,
+                attempts: 0,
+                queued: false,
+            },
+        );
+    } else if matches!(
+        (kind, previous),
+        (CleanupKind::Abort, Some(CleanupKind::Open))
+            | (CleanupKind::CommitQueued, Some(CleanupKind::Open))
+            | (CleanupKind::CommitUnknown, Some(CleanupKind::CommitQueued))
+    ) && let Some(entry) = pending.get_mut(&txn_id)
+    {
+        entry.kind = kind;
+        entry.attempts = 0;
+    }
+
+    Ok(CleanupAdmission {
+        txn_id,
+        requested: kind,
+        previous,
+    })
+}
+
+fn rollback_cleanup(pending: &mut BTreeMap<Ulid, CleanupEntry>, admission: CleanupAdmission) {
+    if !matches!(admission.requested, CleanupKind::CommitQueued) {
+        return;
+    }
+    let Some(entry) = pending.get(&admission.txn_id) else {
+        return;
+    };
+    if !matches!(entry.kind, CleanupKind::CommitQueued) {
+        return;
+    }
+    match admission.previous {
+        Some(previous) => {
+            if let Some(entry) = pending.get_mut(&admission.txn_id) {
+                entry.kind = previous;
+                entry.attempts = 0;
+            }
+        }
+        None => {
+            pending.remove(&admission.txn_id);
+        }
+    }
+}
+
+pub(super) fn observe_cleanup(
+    pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>,
+    cleanup: Option<(Ulid, CleanupKind)>,
+    event: &StorageEvent,
+) -> bool {
+    let Some((txn_id, kind)) = cleanup else {
+        return false;
+    };
+    let mut pending = pending.lock().expect("transaction cleanup mutex poisoned");
+    if let Some(entry) = pending.get_mut(&txn_id) {
+        entry.queued = false;
+    }
+    if pending
+        .get(&txn_id)
+        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Committed(_) | CleanupKind::Aborted))
+    {
+        return true;
+    }
+    let terminal_kind = match (kind, event) {
+        (CleanupKind::Abort, StorageEvent::TransactionAborted { txn_id: aborted })
+            if txn_id == *aborted =>
+        {
+            Some(CleanupKind::Aborted)
+        }
+        (
+            CleanupKind::Abort,
+            StorageEvent::Error {
+                error: StorageError::TransactionNotFound,
+            },
+        ) => Some(CleanupKind::Aborted),
+        (
+            CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
+            StorageEvent::TransactionCommitted {
+                txn_id: committed,
+                sequence,
+            },
+        ) if txn_id == *committed => Some(CleanupKind::Committed(*sequence)),
+        (
+            CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
+            StorageEvent::Error {
+                error:
+                    StorageError::TransactionConflict
+                    | StorageError::TransactionNotFound
+                    | StorageError::RolledBack(_),
+            },
+        ) => Some(CleanupKind::Aborted),
+        _ => None,
+    };
+    if let Some(terminal_kind) = terminal_kind {
+        if let Some(entry) = pending.get_mut(&txn_id) {
+            entry.kind = terminal_kind;
+            entry.attempts = 0;
+        }
+        return true;
+    } else if matches!(
+        (kind, event),
+        (
+            CleanupKind::CommitQueued | CleanupKind::CommitUnknown,
+            StorageEvent::Error {
+                error: StorageError::CommitFailed
+            }
+        )
+    ) {
+        if let Some(entry) = pending.get_mut(&txn_id)
+            && matches!(
+                entry.kind,
+                CleanupKind::CommitQueued | CleanupKind::CommitUnknown
+            )
+        {
+            // An unknown commit cannot progress after the worker forgets its transaction.
+            // Count retries so the cleanup slot is eventually freed.
+            if matches!(entry.kind, CleanupKind::CommitUnknown) {
+                entry.attempts = entry.attempts.saturating_add(1);
+                return entry.attempts >= MAX_CLEANUP_ATTEMPTS;
+            }
+            entry.kind = CleanupKind::CommitUnknown;
+            entry.attempts = 0;
+        }
+    } else if matches!(
+        (kind, event),
+        (
+            CleanupKind::CommitQueued,
+            StorageEvent::Error {
+                error: StorageError::Timeout | StorageError::ChannelClosed
+            }
+        )
+    ) {
+        if let Some(entry) = pending.get_mut(&txn_id)
+            && matches!(entry.kind, CleanupKind::CommitQueued)
+        {
+            entry.kind = CleanupKind::CommitUnknown;
+            entry.attempts = 0;
+        }
+    } else if let Some(entry) = pending.get_mut(&txn_id)
+        && matches!(entry.kind, CleanupKind::Abort | CleanupKind::CommitUnknown)
+    {
+        entry.attempts = entry.attempts.saturating_add(1);
+    }
+    false
+}
+
+pub(super) fn finish_cleanup(pending: &Arc<Mutex<BTreeMap<Ulid, CleanupEntry>>>, txn_id: Ulid) {
+    pending
+        .lock()
+        .expect("transaction cleanup mutex poisoned")
+        .remove(&txn_id);
+}
+
+impl ResponseToken {
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self {
+            handle: None,
+            cleanup: None,
+        }
+    }
+
+    pub(super) fn new(handle: &StorageHandle, effect: &StorageEffect) -> Self {
+        let cleanup = match effect {
+            StorageEffect::StartTransaction { .. } | StorageEffect::BeginUsageRebuild { .. } => {
+                Some(ResponseCleanup::Start(None))
+            }
+            StorageEffect::CommitTransaction { txn_id } => Some(ResponseCleanup::Commit(*txn_id)),
+            StorageEffect::AbortTransaction { txn_id } => {
+                Some(ResponseCleanup::Abort(*txn_id, true))
+            }
+            _ => effect_txn_id(effect).map(|txn_id| ResponseCleanup::Abort(txn_id, false)),
+        };
+        Self {
+            handle: cleanup.as_ref().map(|_| handle.clone()),
+            cleanup,
+        }
+    }
+
+    fn abort(handle: &StorageHandle, txn_id: Ulid) -> Self {
+        Self {
+            handle: Some(handle.clone()),
+            cleanup: Some(ResponseCleanup::Abort(txn_id, false)),
+        }
+    }
+
+    fn observe(&mut self, event: &StorageEvent) {
+        let Some(cleanup) = self.cleanup.take() else {
+            return;
+        };
+        let cleanup = match cleanup {
+            ResponseCleanup::Start(None) => match event {
+                StorageEvent::TransactionStarted { txn_id } => {
+                    ResponseCleanup::Start(Some(*txn_id))
+                }
+                _ => ResponseCleanup::Start(None),
+            },
+            ResponseCleanup::Abort(txn_id, force) => {
+                if matches!(
+                    event,
+                    StorageEvent::TransactionAborted { txn_id: aborted }
+                        if txn_id == *aborted
+                ) || matches!(
+                    event,
+                    StorageEvent::Error {
+                        error: StorageError::TransactionNotFound
+                    }
+                ) {
+                    ResponseCleanup::Terminal(txn_id)
+                } else {
+                    ResponseCleanup::Abort(txn_id, force)
+                }
+            }
+            ResponseCleanup::Commit(txn_id) => {
+                if matches!(
+                    event,
+                    StorageEvent::TransactionCommitted {
+                        txn_id: committed,
+                        ..
+                    } if txn_id == *committed
+                ) || matches!(
+                    event,
+                    StorageEvent::Error {
+                        error: StorageError::TransactionConflict
+                            | StorageError::TransactionNotFound
+                            | StorageError::RolledBack(_)
+                    }
+                ) {
+                    ResponseCleanup::Terminal(txn_id)
+                } else {
+                    ResponseCleanup::Commit(txn_id)
+                }
+            }
+            cleanup => cleanup,
+        };
+        self.cleanup = Some(cleanup);
+    }
+
+    fn claim(mut self) {
+        self.disarm();
+    }
+
+    fn disarm(&mut self) {
+        let cleanup = self.cleanup.take();
+        let handle = self.handle.take();
+        if let (Some(ResponseCleanup::Terminal(txn_id)), Some(handle)) = (cleanup, handle) {
+            finish_cleanup(&handle.transaction_cleanup, txn_id);
+        }
+    }
+}
+
+impl Drop for ResponseToken {
+    fn drop(&mut self) {
+        let cleanup = self.cleanup.take();
+        let Some(cleanup) = cleanup else {
+            self.handle = None;
+            return;
+        };
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        match cleanup {
+            ResponseCleanup::Start(Some(txn_id)) => {
+                let _ = handle.retain_transaction(txn_id, false);
+            }
+            ResponseCleanup::Abort(txn_id, force) => {
+                let retry = force
+                    && handle
+                        .transaction_cleanup
+                        .lock()
+                        .expect("transaction cleanup mutex poisoned")
+                        .get(&txn_id)
+                        .is_some_and(|entry| matches!(entry.kind, CleanupKind::Abort));
+                let retained = handle.retain_transaction(txn_id, false);
+                if retry && retained {
+                    handle.retry_abort(txn_id, "response_abandoned");
+                }
+            }
+            ResponseCleanup::Commit(txn_id) => {
+                if !handle.retain_transaction(txn_id, true) {
+                    let _ = handle.retain_transaction(txn_id, false);
+                }
+            }
+            ResponseCleanup::Terminal(txn_id) => {
+                finish_cleanup(&handle.transaction_cleanup, txn_id);
+            }
+            ResponseCleanup::Start(None) => {}
+        }
+    }
+}
+
+pub(super) fn response_channel(
+    token: ResponseToken,
+) -> (ResponseSender, oneshot::Receiver<StorageReply>) {
+    let (sender, receiver) = oneshot::channel();
+    (ResponseSender::new(sender, token), receiver)
+}
+impl From<StorageHandle> for Arc<dyn StoragePort> {
+    fn from(handle: StorageHandle) -> Self {
+        Arc::new(handle)
+    }
+}
+
+#[async_trait]
+impl StoragePort for StorageHandle {
+    async fn send_storage_effect(&self, effect: StorageEffect) -> Event {
+        StorageHandle::send_storage_effect(self, effect).await
+    }
+
+    async fn start_transaction(&self, read: bool) -> Result<TransactionOwner, StorageError> {
+        StorageHandle::start_transaction(self, read).await
+    }
+
+    fn config_changes(&self) -> u64 {
+        StorageHandle::config_changes(self)
+    }
+}
+
+#[async_trait]
+impl Handle for StorageHandle {
+    #[tracing::instrument(
+        name = "storage.handle.send_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(effect = effect_kind(&effect))
+    )]
+    async fn send_effect(&self, effect: Effect) -> Event {
+        match effect {
+            Effect::Storage(storage_effect) => {
+                Event::Storage(self.dispatch_storage_effect(storage_effect).await)
+            }
+            _ => {
+                self.metrics.requests_total.fetch_add(1, Ordering::Relaxed);
+                let error = StorageError::InvalidEffect;
+                self.observe_storage_error(&error);
+                Event::Storage(StorageEvent::Error { error })
+            }
+        }
+    }
+}

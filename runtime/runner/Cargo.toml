@@ -1,0 +1,53 @@
+# Manifest of aruna-runner: the drive loop, the effect adapters to the backends and the job runtime.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+# Shared test helpers; only dev-dependencies enable it.
+test-hooks = ["dep:async-trait", "dep:tempfile", "aruna-storage/test-hooks"]
+
+[dependencies]
+aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
+aruna-clock = { workspace = true }
+aruna-core = { workspace = true }
+aruna-rdf-graph = { workspace = true }
+aruna-p2p = { workspace = true }
+aruna-egress = { workspace = true }
+aruna-wasm-host = { workspace = true }
+aruna-storage = { workspace = true }
+aruna-scheduler = { workspace = true }
+async-trait = { workspace = true, optional = true }
+bytes = { workspace = true }
+byteview = { workspace = true }
+chacha20poly1305 = { workspace = true }
+craqle = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+irokle = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+sysinfo = { workspace = true }
+tempfile = { workspace = true, optional = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+ulid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+aruna-core = { workspace = true, features = ["test-hooks"] }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+iroh = { workspace = true }
+smallvec = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

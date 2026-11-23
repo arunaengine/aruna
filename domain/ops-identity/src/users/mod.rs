@@ -1,0 +1,19 @@
+//! Groups the user operations for lookup, search, updates and the vault.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod account_status;
+pub mod admin_audit;
+pub mod get_oidc;
+pub mod get_user;
+pub mod install_account;
+pub mod list_users;
+pub mod merge;
+pub mod oidc_user;
+pub mod read_document;
+pub mod resolve_users;
+pub mod revoke_all;
+pub mod search_users;
+pub mod service_account;
+pub mod update_user;
+pub mod vault;

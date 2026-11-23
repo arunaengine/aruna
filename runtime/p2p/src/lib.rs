@@ -1,0 +1,1262 @@
+//! Owns the node networking layer: peer state, DHT, document sync and the network handle.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+#![warn(missing_debug_implementations, rust_2018_idioms)]
+#![deny(unsafe_code)]
+#![recursion_limit = "256"]
+
+pub mod config;
+pub mod connection_pool;
+mod connectivity;
+mod construction;
+pub mod contacts;
+pub mod device_limits;
+pub mod dht;
+mod discovery;
+pub mod document_sync;
+mod effect_handlers;
+pub mod error;
+mod eviction;
+pub mod frames;
+pub mod heartbeat;
+pub mod issuer_keys;
+pub mod job_control;
+pub mod notification;
+pub mod shard_manifest;
+mod signing;
+pub mod streams;
+mod tasks;
+mod telemetry;
+#[cfg(test)]
+mod test_support;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod tests_reload;
+
+use std::collections::{BTreeMap, HashMap};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use aruna_core::alpn::Alpn;
+use aruna_core::document::{DocumentEvictedDocument, DocumentTarget};
+use aruna_core::effects::{Effect, NetEffect, StorageEffect};
+use aruna_core::events::{Event, NetError as CoreNetError, NetEvent, StorageEvent};
+use aruna_core::handle::{Handle, StoragePort};
+use aruna_core::heartbeat::{HeldHeartbeat, NodeHeartbeat};
+use aruna_core::id::NodeId;
+use aruna_core::metrics::NotificationWatchMetrics;
+use aruna_core::structs::execution::notification_watch::{WatchInterestEntry, WatchInterestTable};
+use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
+use aruna_core::structs::info::{NetState, NetworkDiagnosticsState};
+use aruna_core::structs::placement::record::PlacementRef;
+use aruna_core::user::id::UserId;
+use async_trait::async_trait;
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::{Endpoint, EndpointAddr};
+use parking_lot::RwLock;
+use tokio::sync::{Mutex, Notify, broadcast, mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
+use tracing::{Span, debug, warn};
+use ulid::Ulid;
+
+use config::{DiscoveryMethod, RelayMethod};
+use connection_pool::{Monitor, PoolCounts};
+use dht::handle::DhtHandle;
+use document_sync::{DocumentSyncService, PendingEviction, ShardGenesisProbe};
+use error::{NetError, Result};
+use heartbeat::HeartbeatSlot;
+use streams::StreamsService;
+
+use connection_pool::ConnectionPool;
+use connectivity::{
+    PeerEvent, PeerManagerState, net_warnings, peer_connection_states, peer_connectivity_status,
+    send_connectivity_event,
+};
+use discovery::{
+    authorize_signed_node, install_signed_endpoint, local_endpoint_addr, replace_authorized_nodes,
+    resolve_signed_endpoint,
+};
+use tasks::BackgroundTasks;
+
+/// Drain budget for inbound stream handlers when `shutdown` is called without one.
+const DEFAULT_INBOUND_DRAIN: Duration = Duration::from_secs(5);
+/// Grace for the same handlers once the endpoint is closed under them.
+pub const FORCED_INBOUND_DRAIN: Duration = Duration::from_secs(5);
+const NOTIFICATION_WAKE_CAPACITY: usize = 256;
+// Overall open_stream budget: first open attempt, DHT-signed endpoint
+// re-resolution, and the retry combined.
+const OPEN_STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+
+pub(crate) type EffectHandle = (NetEffect, oneshot::Sender<NetEvent>, Span);
+
+#[async_trait]
+pub trait InboundEventHandler: Send + Sync {
+    async fn handle_incoming_stream(&self, alpn: Alpn, stream: streams::BiStream, node_id: NodeId);
+
+    /// Re-emits documents recovered from a genesis tie-break eviction: the loser's
+    /// payloads replayed onto the winning genesis via durable outbox records.
+    /// Returns whether every replacement committed; otherwise the journal stays.
+    async fn handle_evicted_documents(&self, _documents: Vec<DocumentEvictedDocument>) -> bool {
+        false
+    }
+}
+
+#[derive(Clone)]
+pub struct NetHandle {
+    inner: Arc<NetInner>,
+    monitor: Monitor,
+}
+
+struct NetInner {
+    effect_tx: mpsc::Sender<EffectHandle>,
+    storage: Arc<dyn StoragePort>,
+    node_id: NodeId,
+    realm_id: RealmId,
+    endpoint: Endpoint,
+    address_lookup: MemoryLookup,
+    discovery_method: DiscoveryMethod,
+    relay_method: RelayMethod,
+    realm_peers: Arc<RwLock<Vec<NodeId>>>,
+    /// Storage change count of the last realm config reload; `None` forces the next reload.
+    config_applied: tokio::sync::Mutex<Option<u64>>,
+    /// A lock-free copy of `config_applied` (`u64::MAX` for `None`), so an unchanged config
+    /// costs a storage commit no lock.
+    config_seen: AtomicU64,
+    inbound_admission: streams::InboundAdmission,
+    watch_interest: Arc<RwLock<WatchInterestTable>>,
+    heartbeats: Arc<heartbeat::HeartbeatTable>,
+    peer_contacts: contacts::PeerContacts,
+    issuer_keys: issuer_keys::IssuerKeys,
+    /// The realm or issuer key this node signs federation payloads with, installed at start.
+    federation_keys: std::sync::OnceLock<aruna_core::structs::identity::auth::NodeCapabilities>,
+    /// Test hook: the payload of the next answer a frame request drops as if lost.
+    #[cfg(feature = "test-hooks")]
+    dropped_answer: parking_lot::Mutex<Option<Vec<u8>>>,
+    download_gauge: Arc<aruna_core::download_slots::DownloadGauge>,
+    avoided_holders: aruna_core::download_slots::AvoidList,
+    notification_watch_metrics: NotificationWatchMetrics,
+    notification_wakes: broadcast::Sender<UserId>,
+    dashboard_epoch: Ulid,
+    dashboard_changes: watch::Sender<u64>,
+    signed_authorized_nodes: Arc<RwLock<Vec<NodeId>>>,
+    dht: Arc<DhtHandle>,
+    document_sync: Arc<DocumentSyncService>,
+    streams: Arc<StreamsService>,
+    connection_pool: ConnectionPool,
+    peer_connectivity: Arc<Mutex<PeerManagerState>>,
+    network_diagnostics: Arc<Mutex<NetworkDiagnosticsState>>,
+    peer_connectivity_tx: mpsc::Sender<PeerEvent>,
+    inbound_handler: Arc<RwLock<Option<Arc<dyn InboundEventHandler>>>>,
+    inbound_handler_registered: Arc<Notify>,
+    inbound_tasks: TaskTracker,
+    // Released at final network teardown, not at admission close: handlers
+    // already accepted keep reaching this node while the writers drain.
+    loopback_streams: parking_lot::Mutex<Option<mpsc::Sender<(Alpn, streams::BiStream, NodeId)>>>,
+    /// Accepted effect futures the dispatcher spawned; shutdown waits for these
+    /// as well as for the dispatcher that accepted them.
+    effect_tasks: TaskTracker,
+    eviction_shutdown: CancellationToken,
+    accept_shutdown: CancellationToken,
+    shutdown: CancellationToken,
+    /// Runs the DHT/document-sync/pool/endpoint teardown exactly once. A
+    /// previous attempt dropped part-way leaves the cell uninitialized, so a
+    /// later shutdown call retries it instead of assuming it completed.
+    teardown: tokio::sync::OnceCell<()>,
+    /// The endpoint close teardown starts; kept until joined, so a cut-short join is retried.
+    endpoint_close: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    tasks: Mutex<BackgroundTasks>,
+}
+
+impl std::fmt::Debug for NetHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetHandle")
+            .field("node_id", &self.inner.node_id)
+            .finish()
+    }
+}
+
+/// What one attempt at the network shutdown boundary accomplished. The handle
+/// retains every unfinished owner, so an incomplete outcome can be resumed and
+/// is never proof that work admitted before closure ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetShutdownOutcome {
+    /// Inbound handlers still running when the soft drain deadline expired.
+    pub inbound_pending_deadline: usize,
+    /// Accepted effect futures that did not finish before the final join.
+    pub effects_pending: usize,
+    /// Inbound handlers that did not finish before the final join.
+    pub inbound_pending: usize,
+    /// The endpoint close still waits for peers to acknowledge it.
+    pub endpoint_pending: bool,
+}
+
+impl NetShutdownOutcome {
+    /// True only when the endpoint closed and every tracked child joined.
+    pub fn complete(&self) -> bool {
+        self.effects_pending == 0 && self.inbound_pending == 0 && !self.endpoint_pending
+    }
+}
+
+impl NetHandle {
+    pub fn node_id(&self) -> NodeId {
+        self.inner.node_id
+    }
+
+    pub fn sign(&self, message: &[u8]) -> iroh::Signature {
+        self.inner.endpoint.secret_key().sign(message)
+    }
+
+    /// Signs a member statement when it names this node; see the `StatementSign` effect.
+    pub fn sign_statement(
+        &self,
+        claim: aruna_core::structs::storage::distribution::statement::StatementClaim,
+    ) -> aruna_core::events::StatementSignEvent {
+        effect_handlers::sign_statement(self.inner.endpoint.secret_key(), claim)
+    }
+
+    /// Issuer-local key that encrypts S3 credential secrets at rest. Derived
+    /// from this node's secret, so only this node can decrypt what it wrote.
+    pub fn credential_encryption_key(
+        &self,
+    ) -> aruna_core::credential_encryption::CredentialEncryptionKey {
+        aruna_core::credential_encryption::CredentialEncryptionKey::derive(
+            &self.inner.endpoint.secret_key().to_bytes(),
+        )
+    }
+
+    pub fn realm_id(&self) -> &RealmId {
+        &self.inner.realm_id
+    }
+
+    pub fn endpoint_addr(&self) -> EndpointAddr {
+        local_endpoint_addr(&self.inner.endpoint, &self.inner.relay_method.relay_urls())
+    }
+
+    pub fn document_sync_node(&self) -> ::irokle::Irokle<::irokle::FjallStorage> {
+        self.inner.document_sync.node()
+    }
+
+    /// Whether an unreleased eviction journal entry may still enqueue outbox
+    /// rows for `placement`. A placement drain must not report the bucket clear
+    /// while one is outstanding.
+    pub fn eviction_pending(&self, placement: &PlacementRef) -> bool {
+        self.inner.document_sync.eviction_pending(placement)
+    }
+
+    /// Closes a shard topic before a departing holder checks its eviction
+    /// journal and outbox, ordering those checks after any reset transaction.
+    pub fn close_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<bool> {
+        self.inner.document_sync.close_topic(topic_id)
+    }
+
+    pub fn reopen_sync_topic(&self, topic_id: ::irokle::TopicId) -> Result<()> {
+        self.inner.document_sync.reopen_topic(topic_id)
+    }
+
+    /// Takes one genesis tie-break eviction into the re-emission hand-off. The
+    /// journal entry stays registered against the buckets it targets until the
+    /// replacement outbox rows commit.
+    pub async fn consume_eviction(
+        &self,
+        eviction: ::irokle::TopicEviction,
+    ) -> Option<PendingEviction> {
+        self.inner.document_sync.consume_eviction(eviction).await
+    }
+
+    pub fn document_sync_database(&self) -> fjall::OptimisticTxDatabase {
+        self.inner.document_sync.database()
+    }
+
+    /// Waits until no document reconcile, shard membership change or eviction runs, and keeps
+    /// them out while the guard lives.
+    pub async fn hold_reconcile(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.inner.document_sync.hold_reconcile().await
+    }
+
+    pub async fn sync_topic_peers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .sync_with_peers(topic_id, peers)
+            .await
+    }
+
+    /// One realm config catch-up round with `peer`; `None` when it stopped at its page budget.
+    pub async fn catch_up_round(
+        &self,
+        topic_id: ::irokle::TopicId,
+        peer: NodeId,
+    ) -> Result<Option<::irokle::ActorClock>> {
+        self.inner.document_sync.sync_round(topic_id, peer).await
+    }
+
+    /// Whether this node applied `topic_id` up to every one of `targets`.
+    pub async fn applied_covers(
+        &self,
+        topic_id: ::irokle::TopicId,
+        targets: &[::irokle::ActorClock],
+    ) -> Result<bool> {
+        self.inner
+            .document_sync
+            .applied_covers(topic_id, targets)
+            .await
+    }
+
+    pub async fn allow_topic_peers(
+        &self,
+        topics: &[::irokle::TopicId],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        let (sync, topics) = (Arc::clone(&self.inner.document_sync), topics.to_vec());
+        run_blocking(move || sync.allow_topic_peers(&topics, peers)).await
+    }
+
+    /// Reconciles shard-only topics to their exact sync membership (delivery)
+    /// and accepted publisher set (authority). Shared topic membership and
+    /// default peers are unchanged.
+    pub async fn reconcile_shard_membership(
+        &self,
+        topics: &[::irokle::TopicId],
+        members: Vec<NodeId>,
+        publishers: Vec<NodeId>,
+        retained: &std::collections::BTreeSet<NodeId>,
+        verified_topics: &std::collections::BTreeSet<::irokle::TopicId>,
+    ) -> Result<()> {
+        self.inner
+            .document_sync
+            .reconcile_shard_membership(topics, members, publishers, retained, verified_topics)
+            .await
+    }
+
+    pub async fn ensure_sync_topics(
+        &self,
+        topics: &[::irokle::TopicId],
+        peers: Vec<NodeId>,
+    ) -> Result<()> {
+        let (sync, topics) = (Arc::clone(&self.inner.document_sync), topics.to_vec());
+        run_blocking(move || sync.ensure_sync_topics(&topics, peers)).await
+    }
+
+    /// Ensures topics this node is the only holder of. No peer is added to
+    /// their membership, so a device's own topics stay entirely local.
+    pub async fn ensure_local_topics(&self, topics: &[::irokle::TopicId]) -> Result<()> {
+        let (sync, topics) = (Arc::clone(&self.inner.document_sync), topics.to_vec());
+        run_blocking(move || sync.ensure_local_topics(&topics)).await
+    }
+
+    /// Whether a document sync topic's genesis is known locally.
+    pub fn sync_topic_exists(&self, topic: ::irokle::TopicId) -> Result<bool> {
+        self.inner.document_sync.topic_exists(topic)
+    }
+
+    /// Probes a shard's co-holders for an existing genesis of `topics` (see
+    /// [`ShardGenesisProbe`]). A rank-0 holder uses the result to create a fresh
+    /// genesis only when every co-holder was reached and none had the topic.
+    pub async fn probe_shard_geneses(
+        &self,
+        topics: Vec<::irokle::TopicId>,
+        co_holders: Vec<NodeId>,
+    ) -> ShardGenesisProbe {
+        self.inner
+            .document_sync
+            .probe_shard_geneses(topics, co_holders)
+            .await
+    }
+
+    pub async fn handle_sync_stream(
+        &self,
+        stream: streams::BiStream,
+        peer: NodeId,
+    ) -> Result<Vec<::irokle::TopicId>> {
+        self.inner
+            .document_sync
+            .handle_inbound_stream(stream, peer)
+            .await
+    }
+
+    /// Connection-attempt counters behind the structured connection
+    /// diagnostics; fixed outcome classes with no peer dimension.
+    pub fn pool_counts(&self) -> PoolCounts {
+        self.inner.connection_pool.counts()
+    }
+
+    #[doc(hidden)]
+    pub fn pool_counts_for(&self, node_id: NodeId, alpn: Alpn) -> PoolCounts {
+        self.inner.connection_pool.counts_for(node_id, alpn)
+    }
+
+    pub async fn add_peer_addr(&self, endpoint_addr: EndpointAddr) {
+        if endpoint_addr.id == self.inner.node_id {
+            return;
+        }
+
+        self.inner.inbound_admission.add_bootstrap(endpoint_addr.id);
+        self.inner
+            .address_lookup
+            .set_endpoint_info(endpoint_addr.clone());
+        // A newly installed address invalidates the failures recorded against
+        // the previous one.
+        if let Err(error) = self
+            .inner
+            .connection_pool
+            .clear_failures(endpoint_addr.id)
+            .await
+        {
+            debug!(node_id = %endpoint_addr.id, %error, "Connection pool stopped during address installation");
+        }
+        send_connectivity_event(
+            &self.inner.peer_connectivity_tx,
+            PeerEvent::ManagePeer {
+                node_id: endpoint_addr.id,
+                source: "endpoint_addr".to_string(),
+                immediate: true,
+            },
+        );
+        if let Err(err) = self.inner.dht.add_peer(endpoint_addr.id) {
+            warn!(
+                node_id = %endpoint_addr.id,
+                error = %err,
+                "Failed to add endpoint address peer to DHT"
+            );
+        }
+    }
+
+    pub async fn refresh_document_peers(
+        &self,
+        document: &RealmConfigDocument,
+    ) -> Result<Vec<NodeId>> {
+        let mut applied = self.inner.config_applied.lock().await;
+        // A supplied document may be older than storage, so the next check reloads.
+        self.mark_applied(&mut applied, None);
+        self.apply_document(document).await
+    }
+
+    /// Applies a realm config to peer admission and sync. Callers hold `config_applied`.
+    async fn apply_document(&self, document: &RealmConfigDocument) -> Result<Vec<NodeId>> {
+        if document.realm_id != self.inner.realm_id {
+            return Err(NetError::Bootstrap(format!(
+                "realm config {} does not match net realm {}",
+                document.realm_id, self.inner.realm_id
+            )));
+        }
+        // Node kind decides which protocols each side may speak and is published
+        // first: a peer admitted before its kind is known would pass as unconfigured.
+        let mut peer_kinds = BTreeMap::new();
+        let mut local_kind = None;
+        for node in &document.nodes {
+            let Ok(node_id) = NodeId::from_str(&node.node_id) else {
+                continue;
+            };
+            if node_id == self.inner.node_id {
+                local_kind = Some(node.kind.clone());
+            } else {
+                peer_kinds.insert(node_id, node.kind.clone());
+            }
+        }
+        self.inner
+            .inbound_admission
+            .set_kinds(local_kind, peer_kinds);
+        // Device limits are keyed by the kinds just published, so they follow the
+        // same refresh rather than a second source of truth.
+        self.inner
+            .inbound_admission
+            .set_device_limits(device_limits::DeviceLimits {
+                requests_per_minute: document.quota.device_request_rate,
+                concurrent: document.quota.device_concurrent_pulls,
+            });
+        // Connection admission covers every registered realm node, User kind
+        // included: user nodes forward metadata and job-control requests.
+        let admitted = unique_peer_nodes(
+            document
+                .node_ids()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.inner.inbound_admission.set_admitted(admitted);
+        // Sync fan-out and DHT trust stay restricted to sync-eligible nodes.
+        let peers = unique_peer_nodes(
+            document
+                .sync_eligible_nodes()
+                .map_err(|error| NetError::Bootstrap(error.to_string()))?,
+            self.inner.node_id,
+        );
+        self.refresh_realm_peers(peers.clone()).await;
+        Ok(peers)
+    }
+
+    pub async fn refresh_encoded_peers(&self, bytes: &[u8]) -> Result<Vec<NodeId>> {
+        let document = RealmConfigDocument::from_bytes(bytes)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        self.refresh_document_peers(&document).await
+    }
+
+    pub async fn reload_realm_peers(&self) -> Result<Option<Vec<NodeId>>> {
+        let mut applied = self.inner.config_applied.lock().await;
+        self.reload_locked(&mut applied).await
+    }
+
+    /// Reloads realm peers only when storage reports a realm config change since the last
+    /// successful reload, or when peers came from a supplied document since then.
+    pub async fn reload_if_changed(&self) -> Result<Option<Vec<NodeId>>> {
+        if self.inner.config_seen.load(Ordering::Acquire) == self.inner.storage.config_changes() {
+            return Ok(None);
+        }
+        let mut applied = self.inner.config_applied.lock().await;
+        if *applied == Some(self.inner.storage.config_changes()) {
+            return Ok(None);
+        }
+        self.reload_locked(&mut applied).await
+    }
+
+    async fn reload_locked(&self, applied: &mut Option<u64>) -> Result<Option<Vec<NodeId>>> {
+        // Read before the row, so a change during this reload moves the count past it.
+        let seen = self.inner.storage.config_changes();
+        self.mark_applied(applied, None);
+        let target = DocumentTarget::RealmConfig {
+            realm_id: self.inner.realm_id,
+        };
+        let Some(bytes) = self
+            .read_storage(target.storage_keyspace().to_string(), target.storage_key())
+            .await?
+        else {
+            self.mark_applied(applied, Some(seen));
+            return Ok(None);
+        };
+        let document = RealmConfigDocument::from_bytes(&bytes)
+            .map_err(|error| NetError::Bootstrap(error.to_string()))?;
+        let peers = self.apply_document(&document).await?;
+        self.mark_applied(applied, Some(seen));
+        Ok(Some(peers))
+    }
+
+    /// Records the applied change count under the `config_applied` lock and in its copy.
+    fn mark_applied(&self, applied: &mut Option<u64>, value: Option<u64>) {
+        *applied = value;
+        let seen = value.unwrap_or(u64::MAX);
+        self.inner.config_seen.store(seen, Ordering::Release);
+    }
+
+    pub async fn realm_peers(&self) -> Vec<NodeId> {
+        self.inner.realm_peers.read().clone()
+    }
+
+    /// A slot for reading one inbound heartbeat of `node`, or none past the stream limits.
+    pub fn heartbeat_slot(&self, node: NodeId) -> Option<HeartbeatSlot> {
+        self.inner.heartbeats.slot(node)
+    }
+
+    /// Stores an admitted heartbeat of `node`. False when it is not newer than the held one,
+    /// arrives too soon after it, or `node` is no longer a sync peer.
+    pub fn record_heartbeat(&self, node: NodeId, heartbeat: NodeHeartbeat) -> bool {
+        self.inner.heartbeats.record(node, heartbeat, || {
+            self.inner.realm_peers.read().contains(&node)
+        })
+    }
+
+    pub fn record_own_heartbeat(&self, heartbeat: NodeHeartbeat) {
+        self.inner
+            .heartbeats
+            .record_own(self.inner.node_id, heartbeat);
+    }
+
+    pub fn held_heartbeats(&self) -> Vec<HeldHeartbeat> {
+        self.inner.heartbeats.held()
+    }
+
+    /// This node's DRS download slots, which its heartbeat reports.
+    pub fn download_gauge(&self) -> &Arc<aruna_core::download_slots::DownloadGauge> {
+        &self.inner.download_gauge
+    }
+
+    /// Holders this node skips for a while after they failed.
+    pub fn avoided_holders(&self) -> &aruna_core::download_slots::AvoidList {
+        &self.inner.avoided_holders
+    }
+
+    /// When this node last saw each authorized peer.
+    pub fn peer_contacts(&self) -> contacts::PeerContacts {
+        self.inner.peer_contacts.clone()
+    }
+
+    /// The trusted issuer keys this node checked.
+    pub fn issuer_keys(&self) -> &issuer_keys::IssuerKeys {
+        &self.inner.issuer_keys
+    }
+
+    /// Installs the key this node signs federation payloads with; a second install is ignored.
+    pub fn install_federation_keys(
+        &self,
+        capabilities: aruna_core::structs::identity::auth::NodeCapabilities,
+    ) {
+        let _ = self.inner.federation_keys.set(capabilities);
+    }
+
+    /// The key this node signs federation payloads with, once installed.
+    pub fn federation_keys(
+        &self,
+    ) -> Option<&aruna_core::structs::identity::auth::NodeCapabilities> {
+        self.inner.federation_keys.get()
+    }
+
+    /// Test hook: the next frame request whose answer payload is `payload` fails as if the
+    /// answer was lost after the peer acted on the request.
+    #[cfg(feature = "test-hooks")]
+    pub fn drop_answer(&self, payload: Vec<u8>) {
+        *self.inner.dropped_answer.lock() = Some(payload);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn take_dropped(&self, answer: &[u8]) -> bool {
+        let mut dropped = self.inner.dropped_answer.lock();
+        let matches = dropped.as_deref() == Some(answer);
+        if matches {
+            dropped.take();
+        }
+        matches
+    }
+
+    /// Time since the last heartbeat of `node`, or since this node started without one.
+    pub fn heartbeat_silence(&self, node: NodeId) -> Duration {
+        self.inner.heartbeats.silence(&node)
+    }
+
+    /// Cheap clone of the origin-side watch interest cache. Consumers match
+    /// events against this table without any per-event storage read.
+    pub fn watch_interest_snapshot(&self) -> WatchInterestTable {
+        self.inner.watch_interest.read().clone()
+    }
+
+    pub fn notification_watch_metrics(&self) -> &NotificationWatchMetrics {
+        &self.inner.notification_watch_metrics
+    }
+
+    /// Replaces the whole watch interest cache (startup and full rebuilds).
+    pub fn replace_watch_interest(&self, table: WatchInterestTable) {
+        *self.inner.watch_interest.write() = table;
+    }
+
+    /// Subscribes to the per-node notification wake bus. Each subscriber gets an
+    /// independent receiver carrying the `UserId` whose inbox just changed; live
+    /// streams filter by recipient and refetch the unread count on wake.
+    pub fn subscribe_notification_wakes(&self) -> broadcast::Receiver<UserId> {
+        self.inner.notification_wakes.subscribe()
+    }
+
+    /// Best-effort wake fired after a successful inbox mutation (new record or a
+    /// mark-read that changed the unread count). A send with no subscribers is a
+    /// no-op, never an error; nothing may fail through this path.
+    pub fn notify_inbox_activity(&self, recipient: UserId) {
+        let _ = self.inner.notification_wakes.send(recipient);
+    }
+
+    /// Subscribes to the retained dashboard revision for this node.
+    pub fn subscribe_dashboard_changes(&self) -> watch::Receiver<u64> {
+        self.inner.dashboard_changes.subscribe()
+    }
+
+    pub fn dashboard_epoch(&self) -> Ulid {
+        self.inner.dashboard_epoch
+    }
+
+    /// Advances the retained dashboard revision and wakes every subscriber.
+    pub fn notify_dashboard_change(&self) {
+        self.inner
+            .dashboard_changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    /// Replaces one realm's node map after a reconcile touched its digests,
+    /// leaving every other realm's cached interest untouched.
+    pub fn update_realm_interest(
+        &self,
+        realm_id: RealmId,
+        nodes: HashMap<NodeId, Vec<WatchInterestEntry>>,
+    ) {
+        self.inner.watch_interest.write().set_realm(realm_id, nodes);
+    }
+
+    /// Records a locally-known holder for a freshly created watch so matching
+    /// events route to it before its digest replicates back. Retracted by
+    /// [`Self::retract_local_interest`].
+    pub fn register_local_interest(
+        &self,
+        watch_id: Ulid,
+        realm_id: RealmId,
+        holder: NodeId,
+        entry: WatchInterestEntry,
+    ) {
+        self.inner
+            .watch_interest
+            .write()
+            .register_local(watch_id, realm_id, holder, entry);
+    }
+
+    /// Drops the local watch-interest registration for a deleted watch.
+    pub fn retract_local_interest(&self, watch_id: Ulid) {
+        self.inner.watch_interest.write().retract_local(watch_id);
+    }
+
+    async fn refresh_realm_peers(&self, peers: Vec<NodeId>) {
+        *self.inner.realm_peers.write() = peers.clone();
+        let node_id = self.inner.node_id;
+        self.inner
+            .heartbeats
+            .retain(|node| *node == node_id || peers.contains(node));
+        self.inner.inbound_admission.mark_materialized();
+        replace_authorized_nodes(
+            &self.inner.signed_authorized_nodes,
+            &peers,
+            self.inner.node_id,
+        );
+        if let Err(err) = self
+            .inner
+            .document_sync
+            .refresh_peer_candidates(peers.clone())
+        {
+            warn!(
+                error = %err,
+                "Failed to refresh document sync potential peers from realm config"
+            );
+        }
+        for node_id in peers {
+            self.register_realm_peer(node_id, true).await;
+        }
+    }
+
+    async fn register_realm_peer(&self, node_id: NodeId, immediate: bool) {
+        if node_id == self.inner.node_id {
+            return;
+        }
+
+        authorize_signed_node(
+            &self.inner.signed_authorized_nodes,
+            node_id,
+            self.inner.node_id,
+        );
+        send_connectivity_event(
+            &self.inner.peer_connectivity_tx,
+            PeerEvent::ManagePeer {
+                node_id,
+                source: "realm_config".to_string(),
+                immediate,
+            },
+        );
+        if let Err(err) = self.inner.dht.add_peer(node_id) {
+            warn!(
+                node_id = %node_id,
+                error = %err,
+                "Failed to add realm peer to DHT routing queue"
+            );
+        }
+    }
+
+    async fn read_storage(
+        &self,
+        key_space: String,
+        key: aruna_core::types::Key,
+    ) -> Result<Option<aruna_core::types::Value>> {
+        match self
+            .inner
+            .storage
+            .send_storage_effect(StorageEffect::Read {
+                key_space,
+                key,
+                txn_id: None,
+            })
+            .await
+        {
+            Event::Storage(StorageEvent::ReadResult { value, .. }) => Ok(value),
+            Event::Storage(StorageEvent::Error { error }) => Err(error.into()),
+            other => Err(NetError::Dht(format!(
+                "unexpected storage event while reading realm config: {other:?}"
+            ))),
+        }
+    }
+
+    pub async fn open_stream(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
+        if matches!(alpn, Alpn::Dht) {
+            return Err(NetError::Stream(format!(
+                "{alpn} is an internal network protocol"
+            )));
+        }
+        // Outbound half of the accept matrix: a device must not even dial a
+        // protocol its own node kind is refused on.
+        if !self.inner.inbound_admission.local_dials(alpn) {
+            return Err(NetError::Stream(format!(
+                "{alpn} is not permitted for this node kind"
+            )));
+        }
+
+        // An offline peer must fail within a bounded window; the inner path is
+        // otherwise open (10s) + unbounded DHT resolve + open (10s).
+        match tokio::time::timeout(OPEN_STREAM_TIMEOUT, self.open_stream_inner(node_id, alpn)).await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if node_id != self.inner.node_id {
+                    send_connectivity_event(
+                        &self.inner.peer_connectivity_tx,
+                        PeerEvent::ConnectionFailure {
+                            node_id,
+                            source: "stream_open".to_string(),
+                            error: "stream open timed out".to_string(),
+                        },
+                    );
+                }
+                Err(NetError::Stream(format!(
+                    "stream open to {node_id} timed out after {}s",
+                    OPEN_STREAM_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn open_stream_inner(&self, node_id: NodeId, alpn: Alpn) -> Result<streams::BiStream> {
+        // iroh refuses to dial its own endpoint, so a stream to this node is
+        // an in-process pipe that still passes through the inbound handler.
+        if node_id == self.inner.node_id {
+            if !self.inner.inbound_admission.local_serves(alpn) {
+                return Err(NetError::Stream(format!(
+                    "{alpn} is not served by this node kind"
+                )));
+            }
+            let Some(loopback_streams) = self.inner.loopback_streams.lock().clone() else {
+                return Err(NetError::Stream(
+                    "node no longer admits streams".to_string(),
+                ));
+            };
+            return self
+                .inner
+                .streams
+                .open_loopback(alpn, node_id, &loopback_streams);
+        }
+        if node_id != self.inner.node_id {
+            if let Err(err) = self.inner.dht.add_peer(node_id) {
+                warn!(
+                    node_id = %node_id,
+                    error = %err,
+                    "Failed to add stream target peer to DHT"
+                );
+            }
+            send_connectivity_event(
+                &self.inner.peer_connectivity_tx,
+                PeerEvent::ManagePeer {
+                    node_id,
+                    source: "stream_target".to_string(),
+                    immediate: false,
+                },
+            );
+        }
+
+        match self.inner.streams.open(node_id, alpn).await {
+            Ok(stream) => {
+                if node_id != self.inner.node_id {
+                    send_connectivity_event(
+                        &self.inner.peer_connectivity_tx,
+                        PeerEvent::ConnectionSuccess {
+                            node_id,
+                            source: "stream_open".to_string(),
+                        },
+                    );
+                }
+                Ok(stream)
+            }
+            Err(mut err) => {
+                if node_id != self.inner.node_id {
+                    let authorized_nodes = self.inner.signed_authorized_nodes.read().clone();
+                    match resolve_signed_endpoint(
+                        &self.inner.dht,
+                        self.inner.realm_id,
+                        &authorized_nodes,
+                        node_id,
+                        self.inner.discovery_method.dht_signed_config(),
+                        &self.inner.network_diagnostics,
+                    )
+                    .await
+                    {
+                        Ok(Some(endpoint_addr)) => {
+                            install_signed_endpoint(
+                                &self.inner.address_lookup,
+                                &self.inner.dht,
+                                &self.inner.connection_pool,
+                                endpoint_addr,
+                            )
+                            .await;
+                            debug!(
+                                node_id = %node_id,
+                                "Retrying stream after DHT-signed endpoint resolution"
+                            );
+                            match self.inner.streams.open(node_id, alpn).await {
+                                Ok(stream) => {
+                                    send_connectivity_event(
+                                        &self.inner.peer_connectivity_tx,
+                                        PeerEvent::ConnectionSuccess {
+                                            node_id,
+                                            source: "stream_open_dht_signed".to_string(),
+                                        },
+                                    );
+                                    return Ok(stream);
+                                }
+                                Err(retry_err) => {
+                                    err = retry_err;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(resolve_err) => {
+                            debug!(
+                                node_id = %node_id,
+                                error = %resolve_err,
+                                "DHT-signed endpoint resolution failed"
+                            );
+                        }
+                    }
+                }
+
+                if node_id != self.inner.node_id {
+                    send_connectivity_event(
+                        &self.inner.peer_connectivity_tx,
+                        PeerEvent::ConnectionFailure {
+                            node_id,
+                            source: "stream_open".to_string(),
+                            error: err.to_string(),
+                        },
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    pub fn set_inbound_handler(&self, handler: Arc<dyn InboundEventHandler>) {
+        *self.inner.inbound_handler.write() = Some(handler);
+        self.inner.inbound_handler_registered.notify_one();
+    }
+
+    pub fn clear_inbound_handler(&self) {
+        self.inner.inbound_handler.write().take();
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutdown_with_drain(DEFAULT_INBOUND_DRAIN).await;
+    }
+
+    /// Stops external inbound admission without waiting for in-flight handlers
+    /// or tearing the endpoint down: effects and the same-node loopback stay
+    /// open until final closure, so accepted work can still reach this node.
+    pub fn close_admission(&self) {
+        self.inner.accept_shutdown.cancel();
+        self.inner.inbound_tasks.close();
+    }
+
+    /// Final loopback closure: new same-node dials fail and pending local IO
+    /// wakes with a broken pipe. Idempotent, so a resumed shutdown repeats it.
+    fn close_loopback_admission(&self) {
+        self.inner.loopback_streams.lock().take();
+        self.inner.streams.close_loopback();
+    }
+
+    /// Stops inbound admission, gives running handlers up to `drain`, then
+    /// closes the effect boundary, tears down, and joins every child. A timed
+    /// out phase stays owned and is retried; cancellation never proves the end.
+    pub async fn shutdown_with_drain(&self, drain: Duration) -> NetShutdownOutcome {
+        // The inbound boundary closes first, while outgoing effects stay
+        // available for the writer drains ahead of the network phase.
+        self.close_admission();
+        let drained_before_teardown = tokio::time::timeout(drain, self.inner.inbound_tasks.wait())
+            .await
+            .is_ok();
+        let inbound_pending_deadline = self.inner.inbound_tasks.len();
+        if !drained_before_teardown {
+            warn!(
+                pending = inbound_pending_deadline,
+                drain_ms = drain.as_millis(),
+                "Inbound stream handlers outlived the drain deadline; closing the endpoint under them"
+            );
+        }
+
+        // Every accepted handler had its drain window. Close the in-process
+        // loopback so local IO they still await fails instead of blocking the
+        // forced joins, and no new same-node work is admitted from here on.
+        self.close_loopback_admission();
+
+        // Final closure of the outgoing-effect boundary. The dispatcher settles
+        // every buffered effect and outstanding send reservation under the
+        // tracker before its receiver drops, and later submissions fail closed.
+        self.inner.shutdown.cancel();
+        self.inner.effect_tasks.close();
+
+        // Teardown runs once; a previous attempt dropped part-way is retried.
+        self.inner
+            .teardown
+            .get_or_init(|| async {
+                if let Err(err) = self.inner.dht.shutdown().await {
+                    warn!(error = %err, "DHT shutdown returned error");
+                }
+                // Document sync closes the same endpoint and would wait unbounded for close
+                // acknowledgements a departed peer never sends; once started, its close returns.
+                self.start_close().await;
+                self.inner.eviction_shutdown.cancel();
+                self.inner.document_sync.shutdown().await;
+                if let Err(err) = self.inner.connection_pool.shutdown().await {
+                    warn!(error = %err, "Connection pool shutdown returned error");
+                }
+            })
+            .await;
+
+        // Joining the dispatcher first is the admission barrier: it cannot have
+        // inserted an effect after this returns.
+        let mut tasks = self.inner.tasks.lock().await;
+        tasks.join_all().await;
+        drop(tasks);
+
+        // The endpoint is closed, so surviving handlers and accepted effects now
+        // fail their stream IO instead of blocking; join both before the caller
+        // closes storage.
+        let (effects_drained, inbound_drained, endpoint_closed) = tokio::join!(
+            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.effect_tasks.wait()),
+            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.inner.inbound_tasks.wait()),
+            tokio::time::timeout(FORCED_INBOUND_DRAIN, self.join_close()),
+        );
+        let effects_pending = self.inner.effect_tasks.len();
+        if effects_drained.is_err() {
+            warn!(
+                pending = effects_pending,
+                "Gave up joining accepted effect futures during shutdown"
+            );
+        }
+        let inbound_pending = self.inner.inbound_tasks.len();
+        if inbound_drained.is_err() {
+            warn!(
+                pending = inbound_pending,
+                "Gave up joining inbound stream handlers during shutdown"
+            );
+        }
+        let endpoint_pending = endpoint_closed.is_err();
+        if endpoint_pending {
+            warn!("Gave up waiting for peers to acknowledge the endpoint close during shutdown");
+        }
+        // The handler holds the node context, which holds this handle; release the cycle.
+        self.clear_inbound_handler();
+        NetShutdownOutcome {
+            inbound_pending_deadline,
+            effects_pending,
+            inbound_pending,
+            endpoint_pending,
+        }
+    }
+
+    /// Starts the endpoint close in an owned task and returns once closing began, which
+    /// ends every connection.
+    async fn start_close(&self) {
+        let started = self.inner.endpoint.closed();
+        let mut close = self.inner.endpoint_close.lock().await;
+        if close.is_none() {
+            let endpoint = self.inner.endpoint.clone();
+            *close = Some(tokio::spawn(async move { endpoint.close().await }));
+        }
+        drop(close);
+        started.await;
+    }
+
+    /// Joins the endpoint close; a join cut short keeps the task for a resumed shutdown.
+    async fn join_close(&self) {
+        let mut close = self.inner.endpoint_close.lock().await;
+        if let Some(task) = close.as_mut() {
+            let _ = task.await;
+            *close = None;
+        }
+    }
+
+    pub async fn get_status(&self) -> NetState {
+        let peer_nodes = self.inner.realm_peers.read().clone();
+        let configured_relay_urls = self.inner.relay_method.relay_urls();
+        let monitor = self.monitor.get_status().await;
+        let mut diagnostics = self.inner.network_diagnostics.lock().await.clone();
+        if let Ok(size) = self.inner.dht.routing_table_size().await {
+            diagnostics.routing_table_size = Some(size);
+        }
+        let peer_connectivity = peer_connectivity_status(&self.inner.peer_connectivity).await;
+        let connections = peer_connection_states(
+            &self.inner.endpoint,
+            &monitor,
+            &peer_connectivity,
+            &peer_nodes,
+            self.inner.node_id,
+        )
+        .await;
+        let warnings = net_warnings(&peer_nodes, &connections, diagnostics.routing_table_size);
+
+        NetState {
+            endpoint_addr: local_endpoint_addr(&self.inner.endpoint, &configured_relay_urls),
+            realm_id: *self.realm_id(),
+            node_id: self.node_id(),
+            discovery_methods: self.inner.discovery_method.enabled_methods(),
+            relay_method: self.inner.relay_method.method_name().to_string(),
+            relay_urls: configured_relay_urls,
+            connections,
+            requests: diagnostics.requests,
+            routing_table_size: diagnostics.routing_table_size,
+            warnings,
+        }
+    }
+}
+
+#[async_trait]
+impl Handle for NetHandle {
+    #[tracing::instrument(
+        name = "net.handle.send_effect",
+        level = "debug",
+        skip(self, effect),
+        fields(effect = effect_kind(&effect))
+    )]
+    async fn send_effect(&self, effect: Effect) -> Event {
+        match effect {
+            // The round trip needs this handle's streams, so it never reaches the effect actor.
+            Effect::Net(NetEffect::JobControl(job)) => Event::Net(NetEvent::JobControl(
+                job_control::exchange(self, job.owner, job.request).await,
+            )),
+            // The heartbeat table belongs to this handle.
+            Effect::Net(NetEffect::HeartbeatSilence(nodes)) => {
+                let silence = nodes
+                    .into_iter()
+                    .map(|node| (node, self.heartbeat_silence(node).as_millis() as u64))
+                    .collect();
+                Event::Net(NetEvent::HeartbeatSilence(silence))
+            }
+            Effect::Net(net_effect) => {
+                let (tx, rx) = oneshot::channel();
+                if self
+                    .inner
+                    .effect_tx
+                    .send((net_effect, tx, Span::current()))
+                    .await
+                    .is_err()
+                {
+                    return Event::Net(NetEvent::Error(CoreNetError::ChannelClosed));
+                }
+
+                match rx.await {
+                    Ok(event) => Event::Net(event),
+                    Err(_) => Event::Net(NetEvent::Error(CoreNetError::ChannelClosed)),
+                }
+            }
+            _ => Event::Net(NetEvent::Error(CoreNetError::InvalidEffect)),
+        }
+    }
+}
+
+fn effect_kind(effect: &Effect) -> &'static str {
+    match effect {
+        Effect::Net(NetEffect::Dht(_)) => "dht",
+        Effect::Net(NetEffect::DocumentSync(_)) => "document_sync",
+        Effect::Net(NetEffect::Stream(_)) => "stream",
+        Effect::Net(NetEffect::JobControl(_)) => "job_control",
+        Effect::Net(NetEffect::PolicySign(_)) => "policy_sign",
+        Effect::Net(NetEffect::SignDeletePlan(_)) => "sign_delete_plan",
+        Effect::Net(NetEffect::SignCountRelay(_)) => "sign_count_relay",
+        Effect::Net(NetEffect::VaultSign(_)) => "vault_sign",
+        Effect::Net(NetEffect::SnapshotSign(_)) => "snapshot_sign",
+        Effect::Net(NetEffect::StatementSign(_)) => "statement_sign",
+        Effect::Net(NetEffect::ExecutionSign(_)) => "execution_sign",
+        Effect::Net(NetEffect::MetadataRequest(_)) => "metadata_request",
+        Effect::Net(NetEffect::RefreshDocumentPeers(_)) => "refresh_document_peers",
+        Effect::Net(NetEffect::GrantedRead(_)) => "granted_read",
+        Effect::Net(NetEffect::DelegatedRead(_)) => "delegated_read",
+        Effect::Net(NetEffect::PeerContact(_)) => "peer_contact",
+        Effect::Net(NetEffect::GrantSign(_)) => "grant_sign",
+        Effect::Net(NetEffect::DelegationSign(_)) => "delegation_sign",
+        Effect::Net(NetEffect::AvoidHolder { .. }) => "avoid_holder",
+        Effect::Net(NetEffect::CursorSign(_)) => "cursor_sign",
+        Effect::Net(NetEffect::FederationSign(_)) => "federation_sign",
+        Effect::Net(NetEffect::OpenCredential(_)) => "open_credential",
+        Effect::Net(NetEffect::AdminSign { .. }) => "admin_sign",
+        Effect::Net(NetEffect::SealPosition(_)) => "seal_position",
+        Effect::Net(NetEffect::OpenPosition(_)) => "open_position",
+        Effect::Net(NetEffect::DrawSecret(_)) => "draw_secret",
+        Effect::Net(NetEffect::Shard(_)) => "shard",
+        Effect::Net(NetEffect::EnsureTopics { .. }) => "ensure_topics",
+        Effect::Net(NetEffect::AllowTopicPeers { .. }) => "allow_topic_peers",
+        Effect::Net(NetEffect::SyncTopic { .. }) => "sync_topic",
+        Effect::Net(NetEffect::MissingTopicPeers { .. }) => "missing_topic_peers",
+        Effect::Net(NetEffect::ConfigCatchUp(_)) => "config_catch_up",
+        Effect::Net(NetEffect::Notification(_)) => "notification",
+        Effect::Net(NetEffect::WakeInbox(_)) => "wake_inbox",
+        Effect::Net(NetEffect::Heartbeat(_)) => "heartbeat",
+        Effect::Net(NetEffect::HeartbeatSilence(_)) => "heartbeat_silence",
+        Effect::Net(NetEffect::DashboardChanged) => "dashboard_changed",
+        Effect::Net(NetEffect::RecordSuppression(_)) => "record_suppression",
+        Effect::Net(NetEffect::PeerContacts { .. }) => "peer_contacts",
+        Effect::Net(NetEffect::LocalNode) => "local_node",
+        Effect::Net(NetEffect::LocalRealm) => "local_realm",
+        Effect::Net(NetEffect::IssuerKey { .. }) => "issuer_key",
+        Effect::Net(NetEffect::WatchHolders { .. }) => "watch_holders",
+        Effect::Net(NetEffect::RegisterInterest { .. }) => "register_interest",
+        Effect::Net(NetEffect::RetractInterest(_)) => "retract_interest",
+        Effect::Net(NetEffect::ReplaceInterest(_)) => "replace_interest",
+        Effect::Net(NetEffect::UpdateRealmInterest { .. }) => "update_realm_interest",
+        Effect::Blob(_) => "blob",
+        Effect::StagingSource(_) => "staging_source",
+        Effect::LocalFile(_) => "local_file",
+        Effect::Storage(_) => "storage",
+        Effect::Metadata(_) => "metadata",
+        Effect::SubOperation(_) => "suboperation",
+        Effect::Background(_) => "background",
+        Effect::Detached(_) => "detached",
+        Effect::Task(_) => "task",
+        Effect::Index(_) => "index",
+        Effect::Group(_) => "group",
+        Effect::Session(_) => "session",
+        Effect::Compute(_) => "compute",
+        Effect::Git(_) => "git",
+        Effect::Outbound(_) => "outbound",
+        Effect::Plugin(_) => "plugin",
+        Effect::Delay(_) => "delay",
+        Effect::Job(_) => "job",
+    }
+}
+pub(crate) fn unique_endpoint_addrs(
+    mut endpoint_addrs: Vec<EndpointAddr>,
+    local_id: NodeId,
+) -> Vec<EndpointAddr> {
+    let mut unique = Vec::<EndpointAddr>::new();
+    for endpoint_addr in endpoint_addrs.drain(..) {
+        if endpoint_addr.id == local_id {
+            continue;
+        }
+        if let Some(existing) = unique
+            .iter_mut()
+            .find(|existing| existing.id == endpoint_addr.id)
+        {
+            *existing = endpoint_addr;
+        } else {
+            unique.push(endpoint_addr);
+        }
+    }
+    unique.sort_unstable_by(|a, b| a.id.as_bytes().cmp(b.id.as_bytes()));
+    unique
+}
+
+/// Runs topic writes and flushes, which block, off the async runtime.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| NetError::Bootstrap(error.to_string()))?
+}
+
+pub(crate) fn unique_peer_nodes(mut nodes: Vec<NodeId>, local_id: NodeId) -> Vec<NodeId> {
+    nodes.retain(|node| *node != local_id);
+    nodes.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    nodes.dedup();
+    nodes
+}

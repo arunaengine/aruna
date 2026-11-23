@@ -1,0 +1,198 @@
+//! Tests the share link records, the owner index and the access log.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::*;
+use aruna_core::effects::StorageEffect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::share::{ShareAction, ShareMode, ShareTarget, ShareUses};
+use aruna_runner::driver::{DriverContext, drive, drive_retry};
+
+fn context() -> DriverContext {
+    aruna_runner::testing::memory_context()
+}
+
+async fn save(context: &DriverContext, link: ShareLink) {
+    let writes = save_rows(&link).unwrap();
+    let effect = StorageEffect::BatchWrite {
+        writes,
+        txn_id: None,
+    };
+    let event = context.storage_handle.send_storage_effect(effect).await;
+    assert!(matches!(
+        event,
+        Event::Storage(StorageEvent::BatchWriteResult { .. })
+    ));
+}
+
+fn link(owner: u8, id: u8) -> ShareLink {
+    let realm = RealmId::from_bytes([1; 32]);
+    ShareLink {
+        id: Ulid::from_bytes([id; 16]),
+        group_id: Ulid::from_bytes([2; 16]),
+        target: ShareTarget::Bucket {
+            bucket: "data".into(),
+        },
+        mode: ShareMode::Read,
+        created_by: UserId::new(Ulid::from_bytes([owner; 16]), realm),
+        created_at: 1,
+        label: String::new(),
+        expires_at: None,
+        password: None,
+        secret: [id; 32],
+        signing_key: [id; 32],
+        revoked_at: None,
+    }
+}
+
+#[tokio::test]
+async fn lists_own_links() {
+    let context = context();
+    for (owner, id) in [(3, 10), (3, 11), (4, 12)] {
+        save(&context, link(owner, id)).await;
+    }
+    let mut revoked = link(3, 10);
+    revoked.revoked_at = Some(5);
+    save(&context, revoked.clone()).await;
+    let mine = drive(ListSharesOperation::new(link(3, 0).created_by), &context)
+        .await
+        .unwrap();
+    assert_eq!(mine, vec![revoked.clone(), link(3, 11)]);
+    let read = drive(GetShareOperation::new(revoked.id), &context)
+        .await
+        .unwrap();
+    assert_eq!(read, Some(revoked));
+    let missing = drive(GetShareOperation::new(Ulid::from_bytes([99; 16])), &context)
+        .await
+        .unwrap();
+    assert_eq!(missing, None);
+    // Another user reads someone else's link as missing.
+    let foreign = GetShareOperation::for_owner(Ulid::from_bytes([12; 16]), link(3, 0).created_by);
+    assert_eq!(drive(foreign, &context).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn log_pages_ordered() {
+    let context = context();
+    let share = Ulid::from_bytes([7; 16]);
+    let other = Ulid::from_bytes([8; 16]);
+    let event = |at| ShareEvent {
+        at,
+        action: ShareAction::Download,
+        key: Some("a.txt".into()),
+        bytes: Some(3),
+        client: Some("192.0.2.0/24".into()),
+    };
+    for (index, id) in [share, share, share, other].into_iter().enumerate() {
+        let entry = Ulid::from_parts(index as u64 + 1, 0);
+        drive(
+            LogShareOperation::new(id, entry, event(index as u64)),
+            &context,
+        )
+        .await
+        .unwrap();
+    }
+    let (first, next) = drive(ShareEventsOperation::new(share, None, 2), &context)
+        .await
+        .unwrap();
+    assert_eq!(first.iter().map(|(_, e)| e.at).collect::<Vec<_>>(), [0, 1]);
+    let (rest, end) = drive(ShareEventsOperation::new(share, next, 2), &context)
+        .await
+        .unwrap();
+    assert_eq!(rest.iter().map(|(_, e)| e.at).collect::<Vec<_>>(), [2]);
+    assert_eq!(end, None);
+    // Each entry counts in the link's use row; the other link keeps its own.
+    let uses = drive(
+        ReadUsesOperation::new(vec![share, other, Ulid::nil()]),
+        &context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(uses[0].downloads, 3);
+    assert_eq!(uses[0].last_access_at, Some(2));
+    assert_eq!(uses[1].downloads, 1);
+    assert_eq!(uses[2], ShareUses::default());
+}
+
+#[tokio::test]
+async fn concurrent_logs_count() {
+    let context = context();
+    let share = Ulid::from_bytes([7; 16]);
+    let event = ShareEvent {
+        at: 1,
+        action: ShareAction::Upload,
+        key: None,
+        bytes: None,
+        client: None,
+    };
+    let seeds: Vec<_> = (1..=8u8).map(|entry| [entry; 8]).collect();
+    let log = |entry: u64| LogShareOperation::new(share, Ulid::from_parts(entry, 0), event.clone());
+    let runs: Vec<_> = (seeds.iter().zip(1..))
+        .map(|(seed, entry)| drive_retry(move || log(entry), &context, seed))
+        .collect();
+    for result in futures_util::future::join_all(runs).await {
+        result.unwrap();
+    }
+    let uses = drive(ReadUsesOperation::new(vec![share]), &context)
+        .await
+        .unwrap();
+    assert_eq!(uses[0].uploads, 8);
+}
+
+fn log_event() -> ShareEvent {
+    ShareEvent {
+        at: 5,
+        action: ShareAction::Download,
+        key: None,
+        bytes: Some(3),
+        client: None,
+    }
+}
+
+#[test]
+fn log_counts_use() {
+    // The stored counters grow by the entry, and the entry lands in the same write.
+    let (share, entry) = (Ulid::from_bytes([1; 16]), Ulid::from_bytes([2; 16]));
+    let mut stored = ShareUses::default();
+    stored.record(&log_event());
+    let mut operation = LogShareOperation::new(share, entry, log_event());
+    assert_eq!(operation.transaction(), TransactionMode::Write);
+    let row = (
+        SHARE_USE_KEYSPACE.to_string(),
+        share.to_bytes().to_vec().into(),
+    );
+    assert_eq!(operation.first(), Ok(Next::Call(IoCall::Read(vec![row]))));
+    let answer = IoResult::Values(vec![Some(stored.to_bytes().unwrap().into())]);
+    let Ok(Next::Call(IoCall::Write(writes))) = operation.next(answer) else {
+        panic!("expected the entry and the counters");
+    };
+    assert_eq!(writes[0].0, SHARE_EVENT_KEYSPACE);
+    assert_eq!(writes[0].1, Key::from(event_key(share, entry)));
+    assert_eq!(writes[1].0, SHARE_USE_KEYSPACE);
+    assert_eq!(ShareUses::from_bytes(&writes[1].2).unwrap().downloads, 2);
+    assert_eq!(operation.next(IoResult::Done), Ok(Next::Done(())));
+}
+
+#[test]
+fn log_retries_conflicts() {
+    // However often it loses, the entry is tried again: a visit never drops its count.
+    let id = Ulid::from_bytes([1; 16]);
+    let mut operation = LogShareOperation::new(id, id, log_event());
+    assert_eq!(operation.on_conflict(u32::MAX), AfterConflict::Rerun);
+    let lost = ShareStoreError::from(IoError::Conflict);
+    assert!(LogShareOperation::is_conflict(&lost));
+}
+
+#[test]
+fn log_refuses_garbage() {
+    // An unreadable counter row fails the entry instead of restarting the count at zero.
+    let id = Ulid::from_bytes([1; 16]);
+    let mut operation = LogShareOperation::new(id, id, log_event());
+    operation.first().unwrap();
+    let answer = IoResult::Values(vec![Some(vec![0xff; 3].into())]);
+    assert!(matches!(
+        operation.next(answer),
+        Err(ShareStoreError::Conversion(_))
+    ));
+}

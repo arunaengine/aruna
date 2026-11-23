@@ -1,0 +1,1436 @@
+//! Drains the materialization queue: applies pending events, retries and dead-letters.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::time::Duration;
+
+use aruna_core::backoff::capped_backoff;
+use aruna_core::calls::{ChildOutcome, IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, EffectGroup, GroupForm};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::events::{Event, GroupEvent, GroupResult};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{
+    CAPTURE_SEQUENCE_KEYSPACE, DEAD_LETTER_KEYSPACE, DOCUMENT_JOB_KEYSPACE, EVENT_LOG_KEYSPACE,
+    MATERIALIZATION_CAPTURE_KEYSPACE, MATERIALIZATION_JOB_KEYSPACE,
+    MATERIALIZATION_STATUS_KEYSPACE,
+};
+use aruna_core::metadata::{
+    ApplyRoCrateRequest, DeadLetterRecord, MaterializationState, MaterializationStatusRecord,
+    MetadataCrateRequest, MetadataEffect, MetadataError, MetadataEvent, MetadataEventPayload,
+    MetadataEventRecord, MetadataGraphPolicy, MetadataMaterializationRecord, MetadataRawRevision,
+    MetadataRequestDurability, ProfileValidationStatus, deterministic_materialization_actor,
+};
+use aruna_core::operation::{Operation, TransactionMode, boxed_suboperation};
+use aruna_core::repository::link::{link_change_entry, schedule_drain};
+use aruna_core::rows::values;
+use aruna_core::storage_entries::{
+    capture_key, dead_letter_entry, dead_letter_key, document_job_entry, document_job_key,
+    document_job_prefix, event_log_key, materialization_job_entry, materialization_job_key,
+    materialization_status_entry, materialization_status_key, profile_validation_entry,
+};
+use aruna_core::task::TaskEvent;
+use aruna_core::telemetry::duration_ms;
+use aruna_core::types::{Key, Value};
+use byteview::ByteView;
+use thiserror::Error;
+use tracing::{debug, info, warn};
+use ulid::Ulid;
+
+use crate::metadata::checkpoint::{CheckpointError, CheckpointOperation};
+use crate::metadata::deletion_guard::metadata_call;
+use crate::metadata::graph_deleted::{GraphDeletedError, GraphDeletedOperation};
+use crate::metadata::topic_sync::GraphSyncOperation;
+use aruna_core::git::{CaptureMark, GitNode, schedule_capture_drain};
+use aruna_ops_identity::queue_backoff::{RETRY_BASE_MS, due_after, retry_delay_ms};
+
+use super::data_links::{DataLinkError, LinkRows};
+use super::iri_index::{MetadataIriError, ProjectRowsOperation};
+use super::profile::validation::{
+    MetadataProfilePreview, ProfileAssessOperation, render_verdict, violation_count,
+};
+use super::raw_events::RawReadError;
+use super::raw_revision::{
+    PrepareMergedOperation, PrepareRawOperation, RawEventPlan, RawStateCache,
+};
+
+const MATERIALIZATION_PAGE_SIZE: usize = 512;
+const MATERIALIZATION_BATCH_SIZE: usize = 512;
+// Only application failures count here: infrastructure errors retry forever with
+// backoff, so an overloaded node never parks work it could still finish.
+const MATERIALIZATION_MAX_FAILURES: u32 = 10;
+// Parked jobs return to the queue on this backoff, doubling per park up to the
+// cap, so a node recovers on its own once the cause clears.
+const REQUEUE_BASE_MS: u64 = 60_000;
+const REQUEUE_MAX_MS: u64 = 3_600_000;
+const REQUEUE_PAGE_SIZE: usize = 256;
+// Jobs per finish transaction. Small enough that a failed commit costs little,
+// large enough that a full batch commits in a handful of transactions.
+const MATERIALIZATION_FINISH_CHUNK: usize = 256;
+
+pub const MATERIALIZATION_POLL_AFTER: Duration = Duration::from_secs(5);
+pub const MATERIALIZATION_RETRY_AFTER: Duration = Duration::from_secs(1);
+// The bulk storage lane enforces fairness when immediate timer refires bypass this gap.
+pub const NEXT_BATCH_AFTER: Duration = Duration::from_millis(25);
+
+#[derive(Debug, PartialEq)]
+pub struct MetadataDrainResult {
+    pub processed: usize,
+    pub has_more_due: bool,
+    pub next_due_after: Option<Duration>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CompletedMaterializationJob {
+    job_key: Vec<u8>,
+    document_job_key: Option<Vec<u8>>,
+    status: Option<MaterializationStatusRecord>,
+    iri_index_writes: Vec<(String, ByteView, ByteView)>,
+    /// Older IRI index and data link rows of the document that this materialization replaces.
+    link_deletes: Vec<(String, ByteView)>,
+    raw_state_write: Option<(String, ByteView, ByteView)>,
+    validation_write: Option<(String, ByteView, ByteView)>,
+    sync: Option<CompletedMaterializationSync>,
+    /// A merge renders the whole merged graph, so its raw state stays valid under a newer status.
+    merge: bool,
+    /// The capture mark the job wrote; the finish that stores the graph marks it ready.
+    capture: Option<CaptureMark>,
+}
+
+impl CompletedMaterializationJob {
+    /// A job that ends without graph rows, with the status it leaves, if any.
+    fn without_rows(job_key: Vec<u8>, document_job_key: Vec<u8>, status: Option<Status>) -> Self {
+        Self {
+            job_key,
+            document_job_key: Some(document_job_key),
+            status,
+            iri_index_writes: Vec::new(),
+            link_deletes: Vec::new(),
+            raw_state_write: None,
+            validation_write: None,
+            sync: None,
+            merge: false,
+            capture: None,
+        }
+    }
+}
+
+type Status = MaterializationStatusRecord;
+
+#[derive(Debug, Clone, PartialEq)]
+struct CompletedMaterializationSync {
+    graph_iri: String,
+    peers: Vec<NodeId>,
+}
+
+/// The outcome of one job attempt, resolved together in the per-batch finish
+/// transaction so a batch of failures costs one transaction, not one each.
+#[derive(Clone, Debug, PartialEq)]
+enum FinishedMaterializationJob {
+    Completed(CompletedMaterializationJob),
+    Rescheduled {
+        job_key: Vec<u8>,
+        job: MetadataMaterializationRecord,
+        status: MaterializationStatusRecord,
+        /// Waits for causal dependencies still in transit, so it retries soon.
+        waiting: bool,
+        /// A merge that later events never make obsolete.
+        merge: bool,
+    },
+    Parked {
+        job_key: Vec<u8>,
+        job: MetadataMaterializationRecord,
+        status: MaterializationStatusRecord,
+    },
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct MaterializationGroupOutcome {
+    finished: Vec<FinishedMaterializationJob>,
+    processed: usize,
+    craqle_elapsed: Duration,
+    error: Option<MetadataMaterializationError>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct MaterializationBatchTimings {
+    processed: usize,
+    groups: usize,
+    craqle_elapsed: Duration,
+    finish_elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterializationJobObsolescence {
+    Live,
+    Final,
+    RetryAdvanced,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum MetadataMaterializationError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Metadata(#[from] MetadataError),
+    #[error("metadata create event log record not found for {document_id}/{event_id}")]
+    CreateEventMissing { document_id: Ulid, event_id: Ulid },
+    #[error("unexpected event while processing metadata materialization queue: {0}")]
+    UnexpectedEvent(String),
+    #[error("inconsistent metadata raw event log: {0}")]
+    InconsistentLog(String),
+}
+
+impl From<IoError> for MetadataMaterializationError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Conflict => Self::Storage(StorageError::TransactionConflict),
+            IoError::Storage(error) => Self::Storage(error),
+            error => Self::UnexpectedEvent(error.to_string()),
+        }
+    }
+}
+
+impl From<RawReadError> for MetadataMaterializationError {
+    fn from(error: RawReadError) -> Self {
+        match error {
+            RawReadError::Storage(error) => Self::Storage(error),
+            RawReadError::Conversion(error) => Self::Conversion(error),
+            RawReadError::Metadata(error) => Self::Metadata(error),
+            RawReadError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+            RawReadError::LimitExceeded(message) => Self::UnexpectedEvent(message),
+            RawReadError::InconsistentLog(message) => Self::InconsistentLog(message),
+        }
+    }
+}
+
+impl From<MetadataIriError> for MetadataMaterializationError {
+    fn from(error: MetadataIriError) -> Self {
+        match error {
+            MetadataIriError::Storage(error) => Self::Storage(error),
+            MetadataIriError::Conversion(error) => Self::Conversion(error),
+            MetadataIriError::DataLink(DataLinkError::Storage(error)) => Self::Storage(error),
+            MetadataIriError::DataLink(DataLinkError::Conversion(error)) => Self::Conversion(error),
+            MetadataIriError::UnexpectedEvent(event) => Self::UnexpectedEvent(event),
+            error @ MetadataIriError::DataLink(DataLinkError::UnexpectedEvent(_)) => {
+                Self::UnexpectedEvent(error.to_string())
+            }
+        }
+    }
+}
+
+type MaterializationTurn<T> = Result<Next<T>, MetadataMaterializationError>;
+
+/// When the materialization drain should run next: now while a job is due, at the earliest
+/// due time otherwise, and never with an empty queue.
+#[derive(Debug, Default, PartialEq)]
+pub struct NextTimerOperation {
+    now_ms: u64,
+}
+
+impl NextTimerOperation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Operation for NextTimerOperation {
+    type Output = Option<Duration>;
+    type Error = MetadataMaterializationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> MaterializationTurn<Option<Duration>> {
+        Ok(Next::Call(IoCall::child(DueJobsOperation::new(
+            self.now_ms,
+            1,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> MaterializationTurn<Option<Duration>> {
+        let (jobs, has_more_due, next_due_ms) =
+            result.child::<DueJobs, MetadataMaterializationError>()??;
+        if !jobs.is_empty() || has_more_due {
+            return Ok(Next::Done(Some(Duration::ZERO)));
+        }
+        let after = next_due_ms.map(|due_at_ms| due_after(self.now_ms, due_at_ms));
+        Ok(Next::Done(after))
+    }
+}
+
+/// The graph groups one drain finishes at once on a host with `cores` logical cores: half of
+/// them, so capacity stays for foreground create and validation traffic.
+pub fn group_concurrency(cores: usize) -> usize {
+    cores.div_ceil(2).max(1)
+}
+
+/// The cores a caller assumes when the host cannot tell how many logical cores it offers.
+pub const UNKNOWN_CORES: usize = 4;
+
+#[derive(Debug, PartialEq)]
+enum BatchStage {
+    Scan,
+    Groups,
+    Commit,
+    Sync(CompletedMaterializationSync),
+    Timer,
+    Captures,
+}
+
+/// One drain pass: materializes the due jobs one document group at a time, `concurrency`
+/// groups at once, then settles them in finish transactions of a bounded size.
+#[derive(Debug, PartialEq)]
+pub struct MaterializationBatchOperation {
+    node: GitNode,
+    concurrency: usize,
+    link_timer: bool,
+    now_ms: u64,
+    started_ms: u64,
+    scan_ms: u64,
+    finish_started_ms: u64,
+    jobs: usize,
+    oldest_lag_ms: u64,
+    has_more_due: bool,
+    next_due_ms: Option<u64>,
+    timings: MaterializationBatchTimings,
+    chunks: VecDeque<Vec<FinishedMaterializationJob>>,
+    syncs: VecDeque<CompletedMaterializationSync>,
+    first_error: Option<MetadataMaterializationError>,
+    stage: BatchStage,
+}
+
+impl MaterializationBatchOperation {
+    /// `link_timer` arms the repository link and Git capture drains after finished jobs, on a
+    /// node with tasks.
+    pub fn new(node: GitNode, concurrency: usize, link_timer: bool) -> Self {
+        Self {
+            node,
+            concurrency,
+            link_timer,
+            now_ms: 0,
+            started_ms: 0,
+            scan_ms: 0,
+            finish_started_ms: 0,
+            jobs: 0,
+            oldest_lag_ms: 0,
+            has_more_due: false,
+            next_due_ms: None,
+            timings: MaterializationBatchTimings::default(),
+            chunks: VecDeque::new(),
+            syncs: VecDeque::new(),
+            first_error: None,
+            stage: BatchStage::Scan,
+        }
+    }
+
+    fn groups(&mut self, jobs: ScannedJobs) -> MaterializationTurn<MetadataDrainResult> {
+        self.jobs = jobs.len();
+        self.oldest_lag_ms = (jobs.iter())
+            .map(|(_, job)| self.started_ms.saturating_sub(job.due_at_ms))
+            .max()
+            .unwrap_or(0);
+        let mut groups: BTreeMap<Ulid, ScannedJobs> = BTreeMap::new();
+        for (job_key, job) in jobs {
+            groups
+                .entry(job.document_id)
+                .or_default()
+                .push((job_key, job));
+        }
+        self.timings.groups = groups.len();
+        if groups.is_empty() {
+            return self.summary();
+        }
+        let members = (groups.into_values())
+            .map(|mut jobs| {
+                jobs.sort_by_key(|(_, job)| job.event_id);
+                let group = JobGroupOperation::new(jobs, self.node.clone());
+                Effect::SubOperation(boxed_suboperation(group, |result| {
+                    Event::Child(ChildOutcome::new(result))
+                }))
+            })
+            .collect();
+        self.stage = BatchStage::Groups;
+        Ok(Next::Call(IoCall::Group(EffectGroup {
+            members,
+            limit: self.concurrency.max(1),
+            form: GroupForm::All { deadline: None },
+        })))
+    }
+
+    fn collect(&mut self, result: IoResult) -> Vec<FinishedMaterializationJob> {
+        let results = match result {
+            IoResult::Group(GroupEvent::Finished { results }) => results,
+            other => {
+                let error = MetadataMaterializationError::UnexpectedEvent(other.label().into());
+                self.first_error.get_or_insert(error);
+                return Vec::new();
+            }
+        };
+        let mut finished = Vec::new();
+        for member in results {
+            let outcome = match member {
+                GroupResult::Done(event) => match *event {
+                    Event::Child(outcome) => {
+                        outcome.take::<MaterializationGroupOutcome, MetadataMaterializationError>()
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            match outcome {
+                Some(Ok(outcome)) => {
+                    self.timings.processed =
+                        self.timings.processed.saturating_add(outcome.processed);
+                    self.timings.craqle_elapsed =
+                        (self.timings.craqle_elapsed).saturating_add(outcome.craqle_elapsed);
+                    finished.extend(outcome.finished);
+                    if let Some(error) = outcome.error {
+                        self.first_error.get_or_insert(error);
+                    }
+                }
+                Some(Err(error)) => {
+                    self.first_error.get_or_insert(error);
+                }
+                None => {
+                    let error = MetadataMaterializationError::UnexpectedEvent(
+                        "materialization group did not finish".to_string(),
+                    );
+                    self.first_error.get_or_insert(error);
+                }
+            }
+        }
+        finished
+    }
+
+    // Chunked so a failure costs one chunk instead of the whole batch, and the craqle work
+    // behind the committed chunks survives.
+    fn finish(&mut self) -> MaterializationTurn<MetadataDrainResult> {
+        let Some(chunk) = self.chunks.pop_front() else {
+            self.timings.finish_elapsed = elapsed(self.finish_started_ms, self.now_ms);
+            return self.sync();
+        };
+        self.stage = BatchStage::Commit;
+        let build = move || CommitFinishOperation::new(chunk.clone());
+        Ok(Next::Call(IoCall::retry_with(
+            build,
+            b"materialization-finish",
+        )))
+    }
+
+    fn finish_failed(
+        &mut self,
+        error: MetadataMaterializationError,
+    ) -> MaterializationTurn<MetadataDrainResult> {
+        self.chunks.clear();
+        self.first_error.get_or_insert(error);
+        self.finish()
+    }
+
+    // Schedule syncs for committed chunks because their deleted job rows cannot retry them.
+    fn sync(&mut self) -> MaterializationTurn<MetadataDrainResult> {
+        let Some(sync) = self.syncs.pop_front() else {
+            return self.timer();
+        };
+        let graph_sync = GraphSyncOperation::new(sync.graph_iri.clone(), sync.peers.clone());
+        self.stage = BatchStage::Sync(sync);
+        Ok(Next::Call(IoCall::detached(graph_sync)))
+    }
+
+    // Finished jobs may queue link pushes and Git snapshots, and both drains stop once their
+    // rows are gone.
+    fn timer(&mut self) -> MaterializationTurn<MetadataDrainResult> {
+        if let Some(error) = self.first_error.take() {
+            return Err(error);
+        }
+        if self.timings.processed > 0 && self.link_timer {
+            self.stage = BatchStage::Timer;
+            return Ok(Next::Call(IoCall::from(schedule_drain(Duration::ZERO))));
+        }
+        self.summary()
+    }
+
+    fn summary(&mut self) -> MaterializationTurn<MetadataDrainResult> {
+        let timings = &self.timings;
+        if self.jobs > 0 {
+            info!(
+                event = "pipeline.materialization.summary",
+                jobs = self.jobs,
+                processed = timings.processed,
+                groups = timings.groups,
+                scan_ms = self.scan_ms,
+                craqle_apply_ms = duration_ms(timings.craqle_elapsed),
+                finish_ms = duration_ms(timings.finish_elapsed),
+                total_ms = self.now_ms.saturating_sub(self.started_ms),
+                oldest_lag_ms = self.oldest_lag_ms,
+                has_more_due = self.has_more_due,
+                "Metadata materialization batch summary"
+            );
+        }
+        let next_due_after = match self.has_more_due {
+            true => Some(Duration::ZERO),
+            false => (self.next_due_ms).map(|due_at_ms| due_after(self.now_ms, due_at_ms)),
+        };
+        Ok(Next::Done(MetadataDrainResult {
+            processed: timings.processed,
+            has_more_due: self.has_more_due,
+            next_due_after,
+        }))
+    }
+}
+
+impl Operation for MaterializationBatchOperation {
+    type Output = MetadataDrainResult;
+    type Error = MetadataMaterializationError;
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> MaterializationTurn<MetadataDrainResult> {
+        self.started_ms = self.now_ms;
+        let scan = DueJobsOperation::new(self.now_ms, MATERIALIZATION_BATCH_SIZE);
+        Ok(Next::Call(IoCall::child(scan)))
+    }
+
+    fn next(&mut self, result: IoResult) -> MaterializationTurn<MetadataDrainResult> {
+        match std::mem::replace(&mut self.stage, BatchStage::Scan) {
+            BatchStage::Scan => {
+                let (jobs, has_more_due, next_due_ms) =
+                    result.child::<DueJobs, MetadataMaterializationError>()??;
+                self.scan_ms = self.now_ms.saturating_sub(self.started_ms);
+                self.has_more_due = has_more_due;
+                self.next_due_ms = next_due_ms;
+                self.groups(jobs)
+            }
+            BatchStage::Groups => {
+                let finished = self.collect(result);
+                self.finish_started_ms = self.now_ms;
+                self.syncs = dedupe_graph_syncs(&finished).into();
+                let mut finished = finished.into_iter().peekable();
+                while finished.peek().is_some() {
+                    let chunk = finished.by_ref().take(MATERIALIZATION_FINISH_CHUNK);
+                    self.chunks.push_back(chunk.collect());
+                }
+                self.finish()
+            }
+            BatchStage::Commit => match result.child::<(), MetadataMaterializationError>() {
+                Ok(Ok(())) => self.finish(),
+                Ok(Err(error)) => self.finish_failed(error),
+                Err(error) => self.finish_failed(error.into()),
+            },
+            // Each sync runs detached without a slot limit, so the drain never waits for one.
+            BatchStage::Sync(sync) => match result.event() {
+                Ok(Event::Task(TaskEvent::BackgroundStarted { started: true })) => self.sync(),
+                other => {
+                    warn!(event = ?other, graph_iri = %sync.graph_iri, "Unexpected metadata graph sync result after materialization");
+                    self.sync()
+                }
+            },
+            BatchStage::Timer => {
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the repository link queue")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Failed to arm the repository link queue"),
+                }
+                self.stage = BatchStage::Captures;
+                Ok(Next::Call(IoCall::from(schedule_capture_drain())))
+            }
+            // The capture marks stay until the drain took the snapshots, so a missed arming
+            // only waits for the next one or the restart.
+            BatchStage::Captures => {
+                match result.event() {
+                    Ok(Event::Task(TaskEvent::Error { message, .. })) => {
+                        warn!(%message, "Failed to arm the Git capture drain")
+                    }
+                    Ok(_) => {}
+                    Err(error) => warn!(%error, "Failed to arm the Git capture drain"),
+                }
+                self.summary()
+            }
+        }
+    }
+}
+
+fn elapsed(started_ms: u64, now_ms: u64) -> Duration {
+    Duration::from_millis(now_ms.saturating_sub(started_ms))
+}
+
+// One SyncGraphBestEffort per graph, keeping the last peers seen, so a batch
+// carrying many events for one document schedules a single sync.
+fn dedupe_graph_syncs(
+    finished: &[FinishedMaterializationJob],
+) -> Vec<CompletedMaterializationSync> {
+    let mut by_graph: BTreeMap<String, CompletedMaterializationSync> = BTreeMap::new();
+    for job in finished {
+        if let FinishedMaterializationJob::Completed(job) = job
+            && let Some(sync) = &job.sync
+        {
+            by_graph.insert(sync.graph_iri.clone(), sync.clone());
+        }
+    }
+    by_graph.into_values().collect()
+}
+
+/// Row changes for one finish chunk, resolved in the transaction that writes them.
+#[derive(Debug, Default, PartialEq)]
+struct FinishPlan {
+    writes: Vec<(String, ByteView, ByteView)>,
+    deletes: Vec<(String, ByteView)>,
+}
+
+/// The rows a finish chunk writes and deletes, judged against the statuses read before it,
+/// and the documents whose new final status supersedes the stored one.
+fn plan_rows(
+    finished: Vec<FinishedMaterializationJob>,
+    snapshot: &HashMap<Ulid, Status>,
+    parked: &HashMap<(Ulid, Ulid), DeadLetterRecord>,
+    (now_ms, mut sequences): (u64, HashMap<Ulid, u64>),
+) -> Result<(FinishPlan, Vec<Ulid>), MetadataMaterializationError> {
+    let mut plan = FinishPlan {
+        deletes: Vec::with_capacity(finished.len().saturating_mul(2)),
+        ..FinishPlan::default()
+    };
+    let mut planned: HashMap<Ulid, MaterializationStatusRecord> = HashMap::new();
+    let mut superseding: HashMap<Ulid, Ulid> = HashMap::new();
+    let mut counted: BTreeMap<Ulid, u64> = BTreeMap::new();
+    for finished in finished {
+        match finished {
+            FinishedMaterializationJob::Completed(job) => {
+                // The document, once the finish keeps the job's graph and so queues its capture.
+                let mut ready = None;
+                if let Some(status) = job.status {
+                    let current = guard_status(snapshot, &planned, status.document_id);
+                    // A newer event not materialized yet leaves this graph the newest one made.
+                    let newer = current.is_some_and(|current| {
+                        current.event_id > status.event_id
+                            && current.state != MaterializationState::Materialized
+                    });
+                    ready = newer.then_some(status.document_id);
+                    if should_write_final(current, &status) {
+                        ready = Some(status.document_id);
+                        superseding.insert(status.document_id, status.event_id);
+                        plan.writes.extend(job.iri_index_writes);
+                        plan.deletes.extend(job.link_deletes);
+                        if let Some(raw_state_write) = job.raw_state_write {
+                            plan.writes.push(raw_state_write);
+                        }
+                        if let Some(validation_write) = job.validation_write {
+                            plan.writes.push(validation_write);
+                        }
+                        plan.writes.push(materialization_status_entry(&status)?);
+                        planned.insert(status.document_id, status);
+                    } else if job.merge
+                        && current.is_some_and(|current| current.event_id > status.event_id)
+                        && let Some(raw_state_write) = job.raw_state_write
+                    {
+                        // A late merge keeps the newer status but stores the graph it published.
+                        ready = Some(status.document_id);
+                        plan.writes.push(raw_state_write);
+                    }
+                }
+                plan.deletes.push((
+                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(job.job_key),
+                ));
+                if let Some(document_job_key) = job.document_job_key {
+                    let space = MATERIALIZATION_CAPTURE_KEYSPACE.to_string();
+                    let hold = ByteView::from(document_job_key.clone());
+                    plan.deletes.push((space.clone(), hold));
+                    // The finish that stores the graph, or keeps it the newest made, queues its
+                    // capture under the document's next sequence, so the drain takes finish order.
+                    if let (Some(capture), Some(document_id)) = (job.capture, ready) {
+                        let sequence = sequences.entry(document_id).or_default();
+                        let key = capture_key(document_id, *sequence);
+                        *sequence = sequence.saturating_add(1);
+                        plan.writes
+                            .push((space, key, ByteView::from(capture.to_bytes()?)));
+                        counted.insert(document_id, *sequence);
+                    }
+                    plan.deletes.push((
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
+                        ByteView::from(document_job_key),
+                    ));
+                }
+            }
+            FinishedMaterializationJob::Rescheduled {
+                job_key,
+                job,
+                status,
+                waiting,
+                merge,
+            } => {
+                let old_index_delete = (
+                    MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                    ByteView::from(job_key),
+                );
+                let current = guard_status(snapshot, &planned, job.document_id);
+                if current.is_some_and(|current| job_superseded(current, &job, merge)) {
+                    plan.deletes.push(old_index_delete);
+                    plan.deletes.push((
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
+                        document_job_key(job.document_id, job.event_id),
+                    ));
+                    continue;
+                }
+                let attempts = job.attempts.saturating_add(1);
+                // A dependency that stays missing is checked rarely, not every two seconds.
+                let delay = if waiting {
+                    waiting_delay_ms(attempts)
+                } else {
+                    retry_delay_ms(attempts)
+                };
+                let next_job = MetadataMaterializationRecord {
+                    document_id: job.document_id,
+                    event_id: job.event_id,
+                    due_at_ms: now_ms.saturating_add(delay),
+                    attempts,
+                    failures: status.failures,
+                    parks: job.parks,
+                };
+                if should_write_retry(current, &status) {
+                    plan.writes.push(materialization_status_entry(&status)?);
+                    planned.insert(status.document_id, status);
+                }
+                plan.writes.push(materialization_job_entry(&next_job)?);
+                plan.writes.push(document_job_entry(&next_job)?);
+                plan.deletes.push(old_index_delete);
+            }
+            FinishedMaterializationJob::Parked {
+                job_key,
+                job,
+                status,
+            } => {
+                let current = guard_status(snapshot, &planned, job.document_id);
+                let job_deletes = [
+                    (
+                        MATERIALIZATION_JOB_KEYSPACE.to_string(),
+                        ByteView::from(job_key),
+                    ),
+                    (
+                        DOCUMENT_JOB_KEYSPACE.to_string(),
+                        document_job_key(job.document_id, job.event_id),
+                    ),
+                    // A parked job no longer holds refreshes to its graph.
+                    (
+                        MATERIALIZATION_CAPTURE_KEYSPACE.to_string(),
+                        document_job_key(job.document_id, job.event_id),
+                    ),
+                ];
+                // An already-superseded job must not leave a dead letter behind:
+                // requeueing it later would resurrect an obsolete event.
+                if current.is_some_and(|current| retry_already_advanced(current, &job)) {
+                    plan.deletes.extend(job_deletes);
+                    continue;
+                }
+                if should_write_final(current, &status) {
+                    plan.writes.push(materialization_status_entry(&status)?);
+                }
+                let previous = parked.get(&(job.document_id, job.event_id));
+                let dead_letter = parked_dead_letter(&job, &status, previous, now_ms);
+                plan.writes.push(dead_letter_entry(&dead_letter)?);
+                plan.deletes.extend(job_deletes);
+                warn!(
+                    event = "materialization.job.parked",
+                    document_id = %job.document_id,
+                    event_id = %job.event_id,
+                    attempts = status.attempts,
+                    failures = status.failures,
+                    requeue_at_ms = dead_letter.requeue_at_ms,
+                    error = status.last_error.as_deref().unwrap_or_default(),
+                    "Parked metadata materialization job as dead letter"
+                );
+                planned.insert(status.document_id, status);
+            }
+        }
+    }
+    for (document_id, next) in counted {
+        let key = ByteView::from(document_id.to_bytes().to_vec());
+        let value = ByteView::from(next.to_be_bytes().to_vec());
+        plan.writes
+            .push((CAPTURE_SEQUENCE_KEYSPACE.to_string(), key, value));
+    }
+    Ok((plan, superseding.keys().copied().collect()))
+}
+
+#[derive(Debug, PartialEq)]
+enum CommitStage {
+    Read,
+    Written,
+    Deleted,
+}
+
+/// Settles one finish chunk in one write transaction: reads the statuses and dead letters it
+/// guards against and the capture sequences it counts on, then writes and deletes its rows. A
+/// status written meanwhile makes the commit lose its conflict, and the rerun judges it again.
+#[derive(Debug, PartialEq)]
+struct CommitFinishOperation {
+    finished: Vec<FinishedMaterializationJob>,
+    documents: BTreeSet<Ulid>,
+    parked: BTreeSet<(Ulid, Ulid)>,
+    /// The documents of jobs that hold a capture.
+    captures: BTreeSet<Ulid>,
+    now_ms: u64,
+    plan: FinishPlan,
+    stage: CommitStage,
+}
+
+impl CommitFinishOperation {
+    fn new(finished: Vec<FinishedMaterializationJob>) -> Self {
+        let documents = finished.iter().map(finished_document_id).collect();
+        let parked = (finished.iter())
+            .filter_map(|finished| match finished {
+                FinishedMaterializationJob::Parked { job, .. } => {
+                    Some((job.document_id, job.event_id))
+                }
+                _ => None,
+            })
+            .collect();
+        let captures = (finished.iter())
+            .filter_map(|finished| match finished {
+                FinishedMaterializationJob::Completed(job) if job.capture.is_some() => {
+                    Some(finished_document_id(finished))
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            finished,
+            documents,
+            parked,
+            captures,
+            now_ms: 0,
+            plan: FinishPlan::default(),
+            stage: CommitStage::Read,
+        }
+    }
+
+    fn plan(&mut self, values: Vec<Option<Value>>) -> MaterializationTurn<()> {
+        let mut values = values.into_iter();
+        let mut snapshot = HashMap::new();
+        for (document_id, value) in self.documents.iter().zip(values.by_ref()) {
+            if let Some(status) = decode_status(value)? {
+                snapshot.insert(*document_id, status);
+            }
+        }
+        let mut parked = HashMap::new();
+        for (target, value) in self.parked.iter().zip(values.by_ref()) {
+            if let Some(record) = value.and_then(|value| postcard::from_bytes(&value).ok()) {
+                parked.insert(*target, record);
+            }
+        }
+        let mut sequences = HashMap::new();
+        for (document_id, value) in self.captures.iter().zip(values) {
+            let next = value.map(|value| <[u8; 8]>::try_from(&value[..]));
+            let next = next.transpose().map_err(ConversionError::from)?;
+            sequences.insert(*document_id, next.map_or(0, u64::from_be_bytes));
+        }
+        let finished = std::mem::take(&mut self.finished);
+        let counted = (self.now_ms, sequences);
+        let (mut plan, superseding) = plan_rows(finished, &snapshot, &parked, counted)?;
+        // Linked repositories learn of the change in the same commit as the new status.
+        let changes = superseding
+            .into_iter()
+            .map(|id| link_change_entry(id, self.now_ms));
+        plan.writes.extend(changes);
+        let writes = std::mem::take(&mut plan.writes);
+        self.plan = plan;
+        if writes.is_empty() {
+            return self.delete();
+        }
+        self.stage = CommitStage::Written;
+        Ok(Next::Call(IoCall::Write(writes)))
+    }
+
+    fn delete(&mut self) -> MaterializationTurn<()> {
+        let deletes = std::mem::take(&mut self.plan.deletes);
+        if deletes.is_empty() {
+            return Ok(Next::Done(()));
+        }
+        self.stage = CommitStage::Deleted;
+        Ok(Next::Call(IoCall::Delete(deletes)))
+    }
+}
+
+impl Operation for CommitFinishOperation {
+    type Output = ();
+    type Error = MetadataMaterializationError;
+
+    fn transaction(&self) -> TransactionMode {
+        TransactionMode::Write
+    }
+
+    fn stamp(&mut self, now_ms: u64) {
+        self.now_ms = now_ms;
+    }
+
+    fn first(&mut self) -> MaterializationTurn<()> {
+        let statuses = self
+            .documents
+            .iter()
+            .map(|document_id| status_read(*document_id));
+        let dead_letters = (self.parked.iter()).map(|(document_id, event_id)| {
+            let key = dead_letter_key(*document_id, *event_id);
+            (DEAD_LETTER_KEYSPACE.to_string(), key)
+        });
+        let sequences = (self.captures.iter()).map(|document_id| {
+            let key = ByteView::from(document_id.to_bytes().to_vec());
+            (CAPTURE_SEQUENCE_KEYSPACE.to_string(), key)
+        });
+        let reads: Vec<_> = statuses.chain(dead_letters).chain(sequences).collect();
+        if reads.is_empty() {
+            return self.plan(Vec::new());
+        }
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    fn next(&mut self, result: IoResult) -> MaterializationTurn<()> {
+        match self.stage {
+            CommitStage::Read => self.plan(result.values()?),
+            CommitStage::Written => {
+                result.done()?;
+                self.delete()
+            }
+            CommitStage::Deleted => {
+                result.done()?;
+                Ok(Next::Done(()))
+            }
+        }
+    }
+}
+
+// A status planned earlier in this chunk is newer than the snapshot, so it is
+// what later jobs of the same document must be judged against.
+fn guard_status<'a>(
+    snapshot: &'a HashMap<Ulid, MaterializationStatusRecord>,
+    planned: &'a HashMap<Ulid, MaterializationStatusRecord>,
+    document_id: Ulid,
+) -> Option<&'a MaterializationStatusRecord> {
+    planned
+        .get(&document_id)
+        .or_else(|| snapshot.get(&document_id))
+}
+
+fn finished_document_id(finished: &FinishedMaterializationJob) -> Ulid {
+    match finished {
+        FinishedMaterializationJob::Completed(job) => job
+            .status
+            .as_ref()
+            .map(|status| status.document_id)
+            .unwrap_or_else(|| {
+                job_key_target(&job.job_key)
+                    .map(|(document_id, _)| document_id)
+                    .unwrap_or_else(Ulid::nil)
+            }),
+        FinishedMaterializationJob::Rescheduled { job, .. }
+        | FinishedMaterializationJob::Parked { job, .. } => job.document_id,
+    }
+}
+
+// A re-parked job keeps its park count so its requeue backoff keeps growing instead of
+// restarting at the base delay.
+fn parked_dead_letter(
+    job: &MetadataMaterializationRecord,
+    status: &MaterializationStatusRecord,
+    previous: Option<&DeadLetterRecord>,
+    now_ms: u64,
+) -> DeadLetterRecord {
+    let parks = previous
+        .map_or(job.parks, |previous| previous.parks.max(job.parks))
+        .saturating_add(1);
+    DeadLetterRecord {
+        job: job.clone(),
+        last_error: status.last_error.clone().unwrap_or_default(),
+        parked_at_ms: now_ms,
+        parks,
+        requeue_at_ms: now_ms.saturating_add(requeue_after_ms(parks)),
+    }
+}
+
+/// Delay before a job that waits on a missing dependency is checked again; after 30 attempts the
+/// wait grows to five minutes.
+fn waiting_delay_ms(attempts: u32) -> u64 {
+    let cap = if attempts > 30 { 300_000 } else { 2_000 };
+    let base = Duration::from_millis(RETRY_BASE_MS);
+    let delay = capped_backoff(base, Duration::from_millis(cap), attempts, 0);
+    u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ProcessedMaterializationJob {
+    finished: Option<FinishedMaterializationJob>,
+    craqle_elapsed: Duration,
+    attempted: bool,
+    stop_group: bool,
+    /// The document's raw state cache, advanced by a materialized event.
+    cache: RawStateCache,
+}
+
+impl ProcessedMaterializationJob {
+    fn completed(job: CompletedMaterializationJob, craqle_elapsed: Duration) -> Self {
+        Self {
+            finished: Some(FinishedMaterializationJob::Completed(job)),
+            craqle_elapsed,
+            attempted: true,
+            ..Self::default()
+        }
+    }
+
+    // Rescheduled and parked jobs both stop the group so later events for the
+    // same document do not apply out of order this batch.
+    fn deferred(finished: FinishedMaterializationJob, craqle_elapsed: Duration) -> Self {
+        Self {
+            finished: Some(finished),
+            craqle_elapsed,
+            attempted: true,
+            stop_group: true,
+            ..Self::default()
+        }
+    }
+}
+
+// Jobs that exhaust the failure budget park as a dead letter; others reschedule with backoff.
+// The resulting row writes and deletes are folded into the per-batch finish txn.
+fn defer_materialization_job(
+    job_key: &[u8],
+    job: &MetadataMaterializationRecord,
+    event: &MetadataEventRecord,
+    error: &MetadataMaterializationError,
+    now_ms: u64,
+) -> FinishedMaterializationJob {
+    let application_failure = matches!(
+        materialization_failure_kind(error),
+        MaterializationFailureKind::Application
+    );
+    let failures = job.failures.saturating_add(u32::from(application_failure));
+    let message = error.to_string();
+    if failures >= MATERIALIZATION_MAX_FAILURES {
+        FinishedMaterializationJob::Parked {
+            job_key: job_key.to_vec(),
+            job: job.clone(),
+            status: materialization_failure_status(job, event, (message, failures), true, now_ms),
+        }
+    } else {
+        FinishedMaterializationJob::Rescheduled {
+            job_key: job_key.to_vec(),
+            job: job.clone(),
+            status: materialization_failure_status(job, event, (message, failures), false, now_ms),
+            waiting: matches!(
+                error,
+                MetadataMaterializationError::Metadata(MetadataError::MissingDependencies(_))
+            ),
+            merge: merges(event),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum GroupStage {
+    Load,
+    Older(Vec<u8>, MetadataMaterializationRecord),
+    Job(Ulid),
+}
+
+/// Materializes one document's due jobs in event order. It stops at the first job that must
+/// wait, and keeps a failure as the group's error beside the jobs it already finished.
+#[derive(Debug, PartialEq)]
+struct JobGroupOperation {
+    jobs: VecDeque<(Vec<u8>, MetadataMaterializationRecord)>,
+    node: GitNode,
+    group: GroupJobs,
+    advanced: BTreeSet<Ulid>,
+    cache: RawStateCache,
+    outcome: MaterializationGroupOutcome,
+    stage: GroupStage,
+}
+
+impl JobGroupOperation {
+    fn new(jobs: ScannedJobs, node: GitNode) -> Self {
+        Self {
+            jobs: jobs.into(),
+            node,
+            group: GroupJobs::default(),
+            advanced: BTreeSet::new(),
+            cache: RawStateCache::default(),
+            outcome: MaterializationGroupOutcome::default(),
+            stage: GroupStage::Load,
+        }
+    }
+
+    fn done(&mut self) -> MaterializationTurn<MaterializationGroupOutcome> {
+        Ok(Next::Done(std::mem::take(&mut self.outcome)))
+    }
+
+    fn job(&mut self) -> MaterializationTurn<MaterializationGroupOutcome> {
+        let Some((job_key, job)) = self.jobs.pop_front() else {
+            return self.done();
+        };
+        let pending = older_candidates(&self.group, &job, &self.advanced);
+        if pending.is_empty() {
+            return self.run(job_key, job);
+        }
+        self.stage = GroupStage::Older(job_key, job);
+        Ok(Next::Call(IoCall::child(OlderJobOperation::new(pending))))
+    }
+
+    fn run(
+        &mut self,
+        job_key: Vec<u8>,
+        job: MetadataMaterializationRecord,
+    ) -> MaterializationTurn<MaterializationGroupOutcome> {
+        self.stage = GroupStage::Job(job.event_id);
+        let status = self.group.status.clone();
+        let cache = std::mem::take(&mut self.cache);
+        let run =
+            MaterializationJobOperation::new((job_key, job), status, cache, self.node.clone());
+        Ok(Next::Call(IoCall::child(run)))
+    }
+
+    fn step(&mut self, result: IoResult) -> MaterializationTurn<MaterializationGroupOutcome> {
+        match std::mem::replace(&mut self.stage, GroupStage::Load) {
+            GroupStage::Load => {
+                self.group = result.child::<GroupJobs, MetadataMaterializationError>()??;
+                self.job()
+            }
+            GroupStage::Older(job_key, job) => {
+                if result.child::<bool, MetadataMaterializationError>()?? {
+                    return self.done();
+                }
+                self.run(job_key, job)
+            }
+            GroupStage::Job(event_id) => {
+                let processed = result
+                    .child::<ProcessedMaterializationJob, MetadataMaterializationError>()??;
+                self.cache = processed.cache;
+                let outcome = &mut self.outcome;
+                outcome.craqle_elapsed =
+                    (outcome.craqle_elapsed).saturating_add(processed.craqle_elapsed);
+                if processed.attempted {
+                    outcome.processed = outcome.processed.saturating_add(1);
+                }
+                if let Some(finished) = processed.finished {
+                    if matches!(finished, FinishedMaterializationJob::Completed(_)) {
+                        self.advanced.insert(event_id);
+                    }
+                    outcome.finished.push(finished);
+                }
+                if processed.stop_group {
+                    return self.done();
+                }
+                self.job()
+            }
+        }
+    }
+}
+
+impl Operation for JobGroupOperation {
+    type Output = MaterializationGroupOutcome;
+    type Error = MetadataMaterializationError;
+
+    fn first(&mut self) -> MaterializationTurn<MaterializationGroupOutcome> {
+        let Some(document_id) = self.jobs.front().map(|(_, job)| job.document_id) else {
+            return self.done();
+        };
+        Ok(Next::Call(IoCall::child(GroupJobsOperation::new(
+            document_id,
+        ))))
+    }
+
+    fn next(&mut self, result: IoResult) -> MaterializationTurn<MaterializationGroupOutcome> {
+        match self.step(result) {
+            Err(error) => {
+                self.outcome.error = Some(error);
+                self.done()
+            }
+            turn => turn,
+        }
+    }
+}
+
+/// Everything a document's group needs to order its own events: its queued jobs
+/// and its status, loaded once instead of once per event.
+#[derive(Debug, Default, PartialEq)]
+struct GroupJobs {
+    pending: Vec<MetadataMaterializationRecord>,
+    status: Option<MaterializationStatusRecord>,
+}
+
+#[derive(Debug, PartialEq)]
+enum LoadStage {
+    Status,
+    Page,
+    Delete,
+}
+
+// The sidecar keyspace is per-document and event-ordered, so this costs one
+// prefix scan plus one status read for the whole group.
+#[derive(Debug, PartialEq)]
+struct GroupJobsOperation {
+    document_id: Ulid,
+    group: GroupJobs,
+    malformed: Vec<(String, ByteView)>,
+    stage: LoadStage,
+}
+
+impl GroupJobsOperation {
+    fn new(document_id: Ulid) -> Self {
+        Self {
+            document_id,
+            group: GroupJobs::default(),
+            malformed: Vec::new(),
+            stage: LoadStage::Status,
+        }
+    }
+
+    fn page(&mut self, after: Option<Key>) -> MaterializationTurn<GroupJobs> {
+        self.stage = LoadStage::Page;
+        Ok(Next::Call(IoCall::Page {
+            space: DOCUMENT_JOB_KEYSPACE.to_string(),
+            prefix: Key::from(document_job_prefix(self.document_id)),
+            after,
+            limit: MATERIALIZATION_PAGE_SIZE,
+        }))
+    }
+
+    fn loaded(&mut self) -> MaterializationTurn<GroupJobs> {
+        let mut group = std::mem::take(&mut self.group);
+        group.pending.sort_by_key(|job| job.event_id);
+        Ok(Next::Done(group))
+    }
+}
+
+impl Operation for GroupJobsOperation {
+    type Output = GroupJobs;
+    type Error = MetadataMaterializationError;
+
+    fn first(&mut self) -> MaterializationTurn<GroupJobs> {
+        Ok(Next::Call(IoCall::Read(vec![status_read(
+            self.document_id,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> MaterializationTurn<GroupJobs> {
+        match self.stage {
+            LoadStage::Status => {
+                self.group.status = decode_status(result.value()?)?;
+                self.page(None)
+            }
+            LoadStage::Page => {
+                let (rows, next) = result.page()?;
+                for (key, value) in rows {
+                    match postcard::from_bytes::<MetadataMaterializationRecord>(&value) {
+                        Ok(job) if job.document_id == self.document_id => {
+                            self.group.pending.push(job)
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            warn!(error = %error, key = ?key.to_vec(), "Deleting malformed metadata materialization document job");
+                            self.malformed
+                                .push((DOCUMENT_JOB_KEYSPACE.to_string(), key));
+                        }
+                    }
+                }
+                if let Some(after) = next {
+                    return self.page(Some(after));
+                }
+                if self.malformed.is_empty() {
+                    return self.loaded();
+                }
+                self.stage = LoadStage::Delete;
+                let malformed = std::mem::take(&mut self.malformed);
+                Ok(Next::Call(IoCall::Delete(malformed)))
+            }
+            LoadStage::Delete => {
+                result.done()?;
+                self.loaded()
+            }
+        }
+    }
+}
+
+fn graph_call(effect: MetadataEffect) -> Next<ProcessedMaterializationJob> {
+    Next::Call(metadata_call(effect))
+}
+
+/// The graph store's answer to one metadata effect; an error answer is the effect's failure.
+fn graph_event(result: IoResult) -> Result<MetadataEvent, MetadataMaterializationError> {
+    match result.event()? {
+        Event::Metadata(MetadataEvent::Error { error, .. }) => Err(error.into()),
+        Event::Metadata(answer) => Ok(answer),
+        other => Err(MetadataMaterializationError::UnexpectedEvent(
+            other.label().to_string(),
+        )),
+    }
+}
+
+fn unexpected(answer: MetadataEvent) -> MetadataMaterializationError {
+    MetadataMaterializationError::UnexpectedEvent(Event::Metadata(answer).label().to_string())
+}
+
+fn event_policy(event: &MetadataEventRecord) -> MetadataGraphPolicy {
+    MetadataGraphPolicy {
+        public: event.record.public,
+        permission_paths: vec![event.record.permission_path.clone()],
+    }
+    .normalized()
+}
+
+fn status_read(document_id: Ulid) -> (String, Key) {
+    let key = materialization_status_key(document_id);
+    (MATERIALIZATION_STATUS_KEYSPACE.to_string(), key)
+}
+
+fn event_read(document_id: Ulid, event_id: Ulid) -> (String, Key) {
+    let key = event_log_key(document_id, event_id);
+    (EVENT_LOG_KEYSPACE.to_string(), key)
+}
+
+fn sidecar_read(document_id: Ulid, event_id: Ulid) -> (String, Key) {
+    let key = document_job_key(document_id, event_id);
+    (DOCUMENT_JOB_KEYSPACE.to_string(), key)
+}
+
+fn decode_status(value: Option<Value>) -> Result<Option<Status>, MetadataMaterializationError> {
+    let status = value.map(|value| postcard::from_bytes(&value)).transpose();
+    Ok(status.map_err(ConversionError::from)?)
+}
+
+/// The create event a job materializes, read from the event log row for its key.
+fn logged_event(
+    document_id: Ulid,
+    event_id: Ulid,
+    value: Option<Value>,
+) -> Result<MetadataEventRecord, MetadataMaterializationError> {
+    let Some(value) = value else {
+        return Err(MetadataMaterializationError::CreateEventMissing {
+            document_id,
+            event_id,
+        });
+    };
+    let event: MetadataEventRecord = postcard::from_bytes(&value).map_err(ConversionError::from)?;
+    if event.record.document_id != document_id || event.event_id != event_id {
+        return Err(MetadataMaterializationError::UnexpectedEvent(format!(
+            "metadata event log key mismatch for {document_id}/{event_id}"
+        )));
+    }
+    Ok(event)
+}
+
+fn job_obsolescence(
+    status: Option<&MaterializationStatusRecord>,
+    job: &MetadataMaterializationRecord,
+) -> MaterializationJobObsolescence {
+    let Some(status) = status else {
+        return MaterializationJobObsolescence::Live;
+    };
+    if status_obsoletes_job(status, job) {
+        return MaterializationJobObsolescence::Final;
+    }
+    if status.event_id == job.event_id && status.attempts > job.attempts {
+        return MaterializationJobObsolescence::RetryAdvanced;
+    }
+    MaterializationJobObsolescence::Live
+}
+
+fn status_is_final(status: &MaterializationStatusRecord) -> bool {
+    matches!(
+        status.state,
+        MaterializationState::Materialized | MaterializationState::Failed
+    )
+}
+
+/// Batches and checkpoints merge by dot, in any order and more than once.
+fn merges(event: &MetadataEventRecord) -> bool {
+    matches!(
+        event.payload,
+        MetadataEventPayload::ApplyBatch { .. } | MetadataEventPayload::Checkpoint { .. }
+    )
+}
+
+fn status_obsoletes_job(
+    status: &MaterializationStatusRecord,
+    job: &MetadataMaterializationRecord,
+) -> bool {
+    status.event_id >= job.event_id && status_is_final(status)
+}
+
+fn retry_already_advanced(
+    status: &MaterializationStatusRecord,
+    job: &MetadataMaterializationRecord,
+) -> bool {
+    status_obsoletes_job(status, job)
+        || (status.event_id == job.event_id && status.attempts > job.attempts)
+}
+
+/// Whether the status moved past the job; only a retry of the same event does for a merge.
+fn job_superseded(
+    status: &MaterializationStatusRecord,
+    job: &MetadataMaterializationRecord,
+    merge: bool,
+) -> bool {
+    if merge {
+        status.event_id == job.event_id && status.attempts > job.attempts
+    } else {
+        retry_already_advanced(status, job)
+    }
+}
+
+fn should_write_final(
+    current: Option<&MaterializationStatusRecord>,
+    next: &MaterializationStatusRecord,
+) -> bool {
+    !current.is_some_and(|current| {
+        current.event_id > next.event_id
+            || (current.event_id == next.event_id && current.attempts >= next.attempts)
+            || (current.event_id == next.event_id && status_is_final(current))
+    })
+}
+
+fn should_write_retry(
+    current: Option<&MaterializationStatusRecord>,
+    next: &MaterializationStatusRecord,
+) -> bool {
+    !current.is_some_and(|current| {
+        current.event_id > next.event_id
+            || retry_already_advanced(
+                current,
+                &MetadataMaterializationRecord {
+                    document_id: next.document_id,
+                    event_id: next.event_id,
+                    due_at_ms: 0,
+                    attempts: next.attempts,
+                    failures: next.failures,
+                    parks: 0,
+                },
+            )
+    })
+}
+
+#[path = "due_scan.rs"]
+mod due_scan;
+#[path = "job_apply.rs"]
+mod job_apply;
+#[path = "parked_requeue.rs"]
+mod parked_requeue;
+
+pub use due_scan::JobsExistOperation;
+use due_scan::*;
+use job_apply::*;
+#[cfg(test)]
+use parked_requeue::RequeueJobOperation;
+pub use parked_requeue::RequeueParkedOperation;
+use parked_requeue::requeue_after_ms;
+
+#[cfg(test)]
+#[path = "materialization_queue_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "queue_calls.rs"]
+mod call_tests;

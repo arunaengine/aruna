@@ -1,0 +1,340 @@
+//! Tests the start of a saved coverage count, how pages add up in it and how a run advances it,
+//! as calls and results.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::calls::ChildOutcome;
+use ulid::Ulid;
+
+use super::*;
+use crate::s3::policy::coverage::{AttachmentGap, CopyCounts, CoverageGap};
+
+fn report(generation: u64, observed: usize, gaps: usize, cursor: Option<&[u8]>) -> CoverageReport {
+    let gap = CoverageGap {
+        key: "object".to_string(),
+        version_id: Ulid::from_bytes([9u8; 16]),
+        attachment: AttachmentGap::Missing,
+        copy: None,
+    };
+    CoverageReport {
+        bucket: "photos".to_string(),
+        scope: CoverageScope::CurrentHeads,
+        generation,
+        target_refs: Vec::new(),
+        observed,
+        deleted: 1,
+        gaps: vec![gap; gaps],
+        copies: CopyCounts {
+            registered: 2,
+            quarantined: 0,
+            absent: 0,
+            reference_only: observed - 3,
+        },
+        cursor: cursor.map(|cursor| cursor.to_vec().into()),
+        complete: cursor.is_none(),
+        limits: Vec::new(),
+        elsewhere: 0,
+    }
+}
+
+fn child<T, E>(result: Result<T, E>) -> IoResult
+where
+    T: Send + std::fmt::Debug + PartialEq + 'static,
+    E: Send + std::fmt::Debug + PartialEq + 'static,
+{
+    IoResult::Child(ChildOutcome::new(result))
+}
+
+fn value(bytes: Option<Vec<u8>>) -> IoResult {
+    IoResult::Values(vec![bytes.map(Into::into)])
+}
+
+/// What a start reads: the bucket row and the saved count, if any.
+fn bucket_rows(saved: Option<&CoverageCount>) -> IoResult {
+    let saved = saved.map(|count| count.to_bytes().unwrap().into());
+    IoResult::Values(vec![Some(b"bucket".to_vec().into()), saved])
+}
+
+#[test]
+fn start_queues_count() {
+    let mut start = StartCountOperation::new("photos".to_string(), None);
+    start.stamp(7);
+    start.seed(5);
+    assert_eq!(start.transaction(), TransactionMode::Write);
+    assert!(matches!(start.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let Ok(Next::Call(IoCall::Write(rows))) = start.next(bucket_rows(None)) else {
+        panic!("the record and the queue entry are written");
+    };
+    let spaces: Vec<&str> = rows.iter().map(|(space, _, _)| space.as_str()).collect();
+    assert_eq!(spaces, [COVERAGE_COUNT_KEYSPACE, COUNT_QUEUE_KEYSPACE]);
+    let written = CoverageCount::from_bytes(rows[0].2.as_ref()).unwrap();
+    let minted = CoverageCount {
+        run: Some(Ulid::from_parts(7, 5)),
+        ..CoverageCount::new(7)
+    };
+    assert_eq!(written, minted);
+    // The migration task wakes only after the commit.
+    let Ok(Next::Then { output, calls }) = start.next(IoResult::Done) else {
+        panic!("the count answers with the wake");
+    };
+    assert_eq!((output, calls.len()), (minted, 1));
+}
+
+// Every coordinator a distributed start reaches saves the run it was given.
+#[test]
+fn start_joins_run() {
+    let run = Ulid::from_parts(3, 9);
+    let mut start = StartCountOperation::new("photos".to_string(), Some(run));
+    start.stamp(7);
+    start.seed(5);
+    start.first().unwrap();
+    let Ok(Next::Call(IoCall::Write(rows))) = start.next(bucket_rows(None)) else {
+        panic!("the record and the queue entry are written");
+    };
+    let written = CoverageCount::from_bytes(rows[0].2.as_ref()).unwrap();
+    assert_eq!(written.run, Some(run));
+    let first = add_page(written, &report(3, 10, 2, Some(b"k")), 20);
+    let restarted = add_page(first, &report(4, 10, 0, Some(b"m")), 20);
+    assert_eq!((restarted.observed, restarted.run), (0, Some(run)));
+}
+
+// Run ids order the starts of a bucket: a delayed start leaves a later run, a start of the saved
+// run answers with its count, and only a later run replaces it.
+#[test]
+fn start_order_kept() {
+    let saved = CoverageCount {
+        run: Some(Ulid::from_parts(9, 1)),
+        observed: 4,
+        ..CoverageCount::new(9)
+    };
+    let starts = [
+        (8, Err(StartCountError::Superseded)),
+        (9, Ok(Next::Done(saved.clone()))),
+    ];
+    for (time, answer) in starts {
+        let run = Some(Ulid::from_parts(time, 1));
+        let mut start = StartCountOperation::new("photos".to_string(), run);
+        start.first().unwrap();
+        assert_eq!(start.next(bucket_rows(Some(&saved))), answer);
+    }
+    let later = Some(Ulid::from_parts(10, 1));
+    let mut start = StartCountOperation::new("photos".to_string(), later);
+    start.first().unwrap();
+    let replaced = start.next(bucket_rows(Some(&saved)));
+    assert!(matches!(replaced, Ok(Next::Call(IoCall::Write(_)))));
+}
+
+// A start that lost its commit to a concurrent one is a conflict, so the route's retry runs it
+// again with the same run and the order rule meets the count that won.
+#[test]
+fn lost_commit_retries() {
+    let conflict = StartCountError::from(IoError::Conflict);
+    assert!(<StartCountOperation as Operation>::is_conflict(&conflict));
+    assert!(!<StartCountOperation as Operation>::is_conflict(
+        &StartCountError::Superseded
+    ));
+}
+
+// A distributed start asks this node's key for one signature over its relay.
+#[test]
+fn signs_count_relay() {
+    let relay = CountRelay {
+        bucket: "photos".to_string(),
+        set_id: Ulid::from_parts(1, 1),
+        run: Ulid::from_parts(2, 2),
+    };
+    let mut sign = SignRelayOperation::new(relay.clone());
+    let Ok(Next::Call(IoCall::Effect(effect))) = sign.first() else {
+        panic!("the signing effect is asked for");
+    };
+    assert_eq!(
+        *effect,
+        Effect::Net(NetEffect::SignCountRelay(Box::new(relay)))
+    );
+    let signature = iroh::SecretKey::from_bytes(&[7; 32]).sign(b"relay");
+    let signed = Event::Net(NetEvent::CountRelaySigned(Ok(signature)));
+    let answer = sign.next(IoResult::Event(Box::new(signed)));
+    assert_eq!(answer, Ok(Next::Done(signature)));
+}
+
+/// A member bucket row of `incarnation` in the set the relay was verified for.
+fn member_row(incarnation: u128) -> (DistributionBinding, IoResult) {
+    use aruna_core::structs::storage::format::Compression;
+    let binding = DistributionBinding {
+        set_id: Ulid::from_bytes([3; 16]),
+        member_id: Ulid::from_bytes([4; 16]),
+        incarnation,
+        revision: Default::default(),
+    };
+    let info = BucketInfo {
+        group_id: Ulid::from_bytes([6; 16]),
+        created_at: std::time::SystemTime::UNIX_EPOCH,
+        created_by: Default::default(),
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(binding.clone()),
+    };
+    let row = IoResult::Values(vec![Some(info.to_bytes().unwrap().into()), None]);
+    (binding, row)
+}
+
+// The bucket was deleted and made again under its name after the relay was verified: the old
+// run finds another incarnation in the write transaction and leaves the new bucket alone.
+#[test]
+fn replaced_bucket_untouched() {
+    let (verified, _) = member_row(5);
+    let (_, recreated) = member_row(6);
+    let run = Some(Ulid::from_parts(9, 1));
+    let mut start = StartCountOperation::new("photos".to_string(), run).bound_to(verified);
+    start.first().unwrap();
+    assert_eq!(start.next(recreated), Err(StartCountError::NoSuchBucket));
+
+    let (verified, same) = member_row(5);
+    let mut start = StartCountOperation::new("photos".to_string(), run).bound_to(verified);
+    start.first().unwrap();
+    assert!(matches!(start.next(same), Ok(Next::Call(IoCall::Write(_)))));
+}
+
+// A coordinator a start missed holds its previous run or no count; either leaves the answer.
+#[test]
+fn other_runs_dropped() {
+    let (old, new) = (Ulid::from_parts(1, 1), Ulid::from_parts(2, 1));
+    let runs = [Some(new), Some(old), None, Some(new)];
+    assert_eq!(current_run(None, &[Some(new), None]), Ok(Some(new)));
+    assert_eq!(other_runs(Some(new), &runs), [1, 2]);
+    // Without an asked run, coordinators on different runs leave no choice.
+    assert_eq!(current_run(None, &runs), Err(vec![old, new]));
+    // A caller polls the run its start answered with.
+    assert_eq!(current_run(Some(old), &runs), Ok(Some(old)));
+    assert_eq!(other_runs(Some(old), &runs), [0, 2, 3]);
+    assert_eq!(current_run(None, &[None, None]), Ok(None));
+    assert!(other_runs(None, &[None, None]).is_empty());
+}
+
+// One run for every coordinator of a distributed start, minted before the first one starts.
+#[test]
+fn mints_one_run() {
+    let mut mint = MintRunOperation::default();
+    mint.seed(5);
+    mint.stamp(7);
+    assert_eq!(mint.first(), Ok(Next::Done(Ulid::from_parts(7, 5))));
+}
+
+// A read for a run the node does not hold finds no count of it.
+#[test]
+fn read_filters_run() {
+    let saved = CoverageCount {
+        run: Some(Ulid::from_parts(7, 1)),
+        ..CoverageCount::new(7)
+    };
+    let other = Some(Ulid::from_parts(7, 2));
+    for (run, found) in [(None, true), (saved.run, true), (other, false)] {
+        let mut read = ReadCountOperation::new("photos", run);
+        read.first().unwrap();
+        let answer = read.next(value(Some(saved.to_bytes().unwrap())));
+        assert_eq!(answer, Ok(Next::Done(found.then(|| saved.clone()))));
+    }
+}
+
+#[test]
+fn missing_bucket_refused() {
+    let mut start = StartCountOperation::new("photos".to_string(), None);
+    start.first().unwrap();
+    let rows = IoResult::Values(vec![None, None]);
+    assert_eq!(start.next(rows), Err(StartCountError::NoSuchBucket));
+}
+
+#[test]
+fn pages_add_up() {
+    let first = add_page(CoverageCount::new(7), &report(3, 10, 2, Some(b"k")), 20);
+    assert_eq!(first.cursor.as_deref(), Some(&b"k"[..]));
+    assert_eq!(first.finished_at_ms, None);
+    let last = add_page(first, &report(3, 5, 1, None), 20);
+    assert_eq!(
+        (last.generation, last.observed, last.deleted, last.gaps),
+        (3, 15, 2, 3)
+    );
+    assert_eq!((last.registered, last.reference_only), (4, 9));
+    assert_eq!((last.cursor, last.finished_at_ms), (None, Some(20)));
+}
+
+#[test]
+fn changed_rules_restart() {
+    let first = add_page(CoverageCount::new(7), &report(3, 10, 2, Some(b"k")), 20);
+    let restarted = add_page(first, &report(4, 10, 0, Some(b"m")), 20);
+    assert_eq!(restarted, CoverageCount::new(7));
+}
+
+#[test]
+fn pages_stop_early() {
+    let mut pages = CountPagesOperation::new("photos".to_string(), CoverageCount::new(7));
+    pages.stamp(20);
+    assert!(matches!(pages.first(), Ok(Next::Call(IoCall::Child(_)))));
+    for _ in 1..COUNT_PAGES {
+        let more = child(Ok::<_, CoverageError>(report(3, 10, 0, Some(b"k"))));
+        pages.next(more).unwrap();
+        assert!(!pages.stored);
+    }
+    // The last page of the run stores the progress, which leaves more to count.
+    let more = child(Ok::<_, CoverageError>(report(3, 10, 0, Some(b"k"))));
+    pages.next(more).unwrap();
+    assert!(pages.stored);
+    assert_eq!(
+        pages.next(child(Ok::<_, MigrationError>(()))),
+        Ok(Next::Done(true))
+    );
+}
+
+#[test]
+fn deleted_bucket_finishes() {
+    let mut pages = CountPagesOperation::new("photos".to_string(), CoverageCount::new(7));
+    pages.stamp(20);
+    pages.first().unwrap();
+    let gone = child(Err::<CoverageReport, _>(CoverageError::NoSuchBucket));
+    pages.next(gone).unwrap();
+    assert_eq!(pages.record.finished_at_ms, Some(20));
+    assert_eq!(
+        pages.next(child(Ok::<_, MigrationError>(()))),
+        Ok(Next::Done(false))
+    );
+}
+
+#[test]
+fn run_skips_finished() {
+    let mut run = ProcessCountsOperation::new();
+    assert!(matches!(run.first(), Ok(Next::Call(IoCall::Page { .. }))));
+    let queued = IoResult::Page {
+        rows: vec![(Key::from(b"photos".to_vec()), Value::from(Vec::new()))],
+        next: None,
+    };
+    assert!(matches!(run.next(queued), Ok(Next::Call(IoCall::Read(_)))));
+    let mut finished = CoverageCount::new(7);
+    finished.finished_at_ms = Some(9);
+    let read = value(Some(finished.to_bytes().unwrap()));
+    assert_eq!(run.next(read), Ok(Next::Done(None)));
+}
+
+#[test]
+fn stale_store_skipped() {
+    // A newer count replaced the record, so the old progress is dropped.
+    let mut store = StoreCountOperation::new("photos", CoverageCount::new(7));
+    store.first().unwrap();
+    let newer = value(Some(CoverageCount::new(8).to_bytes().unwrap()));
+    assert_eq!(store.next(newer), Ok(Next::Done(())));
+}
+
+// A run started in the same millisecond replaced the record; the old worker leaves it alone.
+#[test]
+fn same_millisecond_skipped() {
+    let count = |id| CoverageCount {
+        run: Some(Ulid::from_parts(7, id)),
+        ..CoverageCount::new(7)
+    };
+    let mut store = StoreCountOperation::new("photos", count(1));
+    store.first().unwrap();
+    let newer = value(Some(count(2).to_bytes().unwrap()));
+    assert_eq!(store.next(newer), Ok(Next::Done(())));
+}

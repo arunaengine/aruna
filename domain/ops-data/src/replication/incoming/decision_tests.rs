@@ -1,0 +1,109 @@
+//! Tests the placement gate decision for an inbound replica, a missing subject and a reference.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use super::pure_tests::{make_manifest, make_reference_manifest};
+use super::*;
+use aruna_core::keyspaces::MANAGED_COPY_KEYSPACE;
+use aruna_core::structs::placement::policy::{PlacementSubject, VerifiedPolicy};
+use aruna_core::structs::storage::replication::ReplicationItemKind;
+use std::collections::BTreeMap;
+
+fn realm() -> RealmId {
+    RealmId::from_bytes([3u8; 32])
+}
+
+fn policy(location: &str) -> VerifiedPolicy {
+    crate::tests::policy::residency(1, location)
+}
+
+fn gate(location: &str) -> GateContext {
+    GateContext {
+        realm_id: realm(),
+        subject: PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[9u8; 32]).public(),
+            generation: 1,
+            location: location.to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        },
+        now_ms: 1_000,
+        admitting: true,
+    }
+}
+
+fn governed(rule: &VerifiedPolicy) -> IncomingVersionOperation {
+    let mut manifest = make_manifest(ReplicationItemKind::Materialized);
+    manifest.placement_policies = vec![rule.policy_ref()];
+    IncomingVersionOperation::new(
+        Ulid::from_parts(1, 1),
+        iroh::SecretKey::from_bytes(&[65; 32]).public(),
+        realm(),
+        manifest,
+    )
+}
+
+fn rejected(operation: &IncomingVersionOperation) -> bool {
+    matches!(
+        operation.negotiation_result,
+        Some(ReplicationNegotiationResult::Rejected(_))
+    )
+}
+
+#[test]
+fn denies_incoming_replica() {
+    // The manifest's rule admits another location, so the negotiation that
+    // would invite bytes is refused instead.
+    let rule = policy("us-east");
+    let mut operation = governed(&rule).with_gate(gate("eu-west"));
+    let turn = operation.send_negotiation(ReplicationNegotiationResult::NeedBlobVersion);
+    let Ok(Next::Call(IoCall::Child(mut gate))) = turn else {
+        panic!("expected the gate child")
+    };
+
+    gate.start();
+    assert!(
+        gate.step(crate::tests::policy::resolved_policy(&rule))
+            .is_empty()
+    );
+    assert!(gate.is_complete());
+    let Event::Child(outcome) = gate.finalize() else {
+        panic!("the gate finishes as a child")
+    };
+    operation.next(IoResult::Child(outcome)).unwrap();
+
+    assert!(rejected(&operation));
+}
+
+#[test]
+fn missing_subject_refuses() {
+    // A node that advertises no subject may hold nothing governed, so it
+    // never invites the bytes.
+    let rule = policy("eu-west");
+    let mut operation = governed(&rule);
+    operation
+        .send_negotiation(ReplicationNegotiationResult::NeedBlobVersion)
+        .unwrap();
+    assert!(rejected(&operation));
+}
+
+#[test]
+fn reference_registers_nothing() {
+    // A reference materializes no bytes here, so no managed copy may claim
+    // this node holds one.
+    let manifest = make_reference_manifest();
+    let mut operation = IncomingVersionOperation::new(
+        Ulid::from_parts(2, 2),
+        iroh::SecretKey::from_bytes(&[66; 32]).public(),
+        realm(),
+        manifest,
+    );
+    operation.destination_group_id = Some(Ulid::from_parts(4, 4));
+
+    let turn = operation.write_version();
+    let Ok(Next::Call(IoCall::Write(rows))) = &turn else {
+        panic!("expected the version rows, got {turn:?}")
+    };
+    assert!(rows.iter().all(|row| row.0 != MANAGED_COPY_KEYSPACE));
+}

@@ -1,0 +1,149 @@
+//! Serves the realm default on/off state of optional portal features.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use aruna_core::errors::StorageError;
+use aruna_core::structs::identity::auth::Permission;
+use aruna_core::structs::placement::policy::document::policy_admin_path;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::set_portal::{SetPortalConfig, SetPortalError, SetPortalOperation};
+use aruna_runner::driver::drive;
+use axum::Json;
+use axum::extract::State;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+use crate::auth::RealmAuth;
+use crate::auth::ensure_permission;
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::lookup::actor;
+use crate::server::state::ServerState;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::new().routes(routes!(get_portal_features, set_portal_features))
+}
+
+/// Realm default on/off state per portal feature name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PortalFeatures {
+    pub features: BTreeMap<String, bool>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/system/realm/portal-features",
+    tag = "system/realm",
+    summary = "Read the realm portal feature defaults",
+    description = r#"Returns the realm default on/off state of optional portal features.
+
+**Authentication**: any realm bearer token.
+
+**Behavior**
+- A feature missing from the map is on. A user can override each default with the user
+  attribute `ui.feature.<name>`."#,
+    responses(
+        (status = 200, description = "The stored feature defaults", body = PortalFeatures,
+            example = json!({"features": {"compute": false}})),
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_portal_features(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+) -> ServerResult<Json<PortalFeatures>> {
+    let config = drive(GetConfigOperation::new(auth.realm_id), &state.get_ctx())
+        .await
+        .map_err(|error| match error {
+            GetConfigError::DocumentNotFound => ServerError::NotFound,
+            other => ServerError::InternalError(other.into()),
+        })?;
+    Ok(Json(PortalFeatures {
+        features: config.portal_features,
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/system/realm/portal-features",
+    tag = "system/realm",
+    summary = "Replace the realm portal feature defaults",
+    description = r#"Replaces the realm default on/off state of optional portal features.
+
+**Authentication**: realm bearer token with WRITE on the realm configuration admin path. A
+management node serves the call and every other node relays it to one.
+
+**Behavior**
+- The body replaces the stored map. Features absent from it fall back to on.
+
+**Limits**
+- At most 64 features. Names hold 1 to 64 characters of `a-z`, `0-9` and `-`."#,
+    request_body(
+        content = PortalFeatures,
+        description = "The complete feature defaults to store",
+        example = json!({"features": {"compute": false}})
+    ),
+    responses(
+        (status = 200, description = "The stored feature defaults", body = PortalFeatures,
+            example = json!({"features": {"compute": false}})),
+        (status = 400, description = "Too many features or a malformed feature name", body = ErrorResponse),
+        (status = 403, description = "Caller is not a realm config admin", body = ErrorResponse),
+        (status = 404, description = "This node holds no configuration document for its realm", body = ErrorResponse),
+        (status = 409, description = "Another update of the realm configuration won the race; retry", body = ErrorResponse),
+        crate::openapi::RelayErrors
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_portal_features(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Json(request): Json<PortalFeatures>,
+) -> ServerResult<Json<PortalFeatures>> {
+    // Request policies live at this boundary; the operation only checks roles.
+    ensure_permission(
+        &state,
+        &auth,
+        policy_admin_path(state.get_realm_id()),
+        Permission::WRITE,
+    )
+    .await?;
+    let stored = drive(
+        SetPortalOperation::new(SetPortalConfig {
+            actor: actor(&state, &auth),
+            auth_context: auth,
+            features: request.features,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(ServerError::from)?;
+    Ok(Json(PortalFeatures {
+        features: stored.portal_features,
+    }))
+}
+
+impl From<SetPortalError> for ServerError {
+    fn from(error: SetPortalError) -> Self {
+        match error {
+            SetPortalError::ConfigMissing => ServerError::NotFound,
+            SetPortalError::Unauthorized | SetPortalError::NotManagementNode => {
+                ServerError::Forbidden
+            }
+            SetPortalError::InvalidFeatures { reason } => ServerError::BadRequestReason(reason),
+            SetPortalError::StorageError(StorageError::TransactionConflict) => {
+                ServerError::config_conflict()
+            }
+            SetPortalError::StorageError(error) => error.into(),
+            other => ServerError::InternalError(other.into()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "portal_tests.rs"]
+mod tests;

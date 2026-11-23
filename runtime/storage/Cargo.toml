@@ -1,0 +1,41 @@
+# Manifest of aruna-storage, the Fjall-backed storage crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+fjall = { workspace = true }
+thiserror = { workspace = true }
+crossfire = { workspace = true }
+aruna-clock = { workspace = true }
+aruna-core = { workspace = true }
+ulid = { workspace = true }
+byteview = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+lru = { workspace = true }
+postcard = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tantivy = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[features]
+# Test helpers for crates that use the storage handle: smaller key index limits and memory storage.
+test-hooks = []
+
+[dev-dependencies]
+aruna-clock = { workspace = true, features = ["test-hooks"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

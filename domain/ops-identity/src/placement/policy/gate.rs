@@ -1,0 +1,793 @@
+//! Resolves the governing policy refs and evaluates one subject against all of them.
+//! This is the shared gate: it gathers the rules and calls the pure evaluator.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::effects::{Effect, StorageEffect};
+use aruna_core::id::NodeId;
+use aruna_core::keyspaces::{NODE_SUBJECT_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::operation::Operation;
+use aruna_core::rows::values;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::placement::node_subject::{NODE_SUBJECT_KEY, NodeSubjectRecord};
+use aruna_core::structs::placement::policy::{
+    PlacementDecision, PlacementPolicyRef, PlacementSubject, PolicyResolution, evaluate_placement,
+};
+use aruna_core::structs::storage::blob::{BucketIdentity, BucketInfo};
+use aruna_core::types::{GroupId, Key, TxnId, Value};
+use std::collections::BTreeMap;
+use thiserror::Error;
+use tracing::debug;
+use ulid::Ulid;
+
+use super::cache::PolicyCacheStats;
+use super::foreign_owner;
+use super::read::ReadPolicyError;
+use super::resolve::{ResolvePolicyConfig, ResolvePolicyOperation, ResolvedPolicy};
+use crate::groups::backends::RecordReadError;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyGateConfig {
+    pub realm_id: RealmId,
+    pub local_node_id: NodeId,
+    /// Refs of the governed record; every one of them must admit the subject.
+    pub refs: Vec<PlacementPolicyRef>,
+    pub subject: PlacementSubject,
+    /// Group owning the destination bucket. `None` where the destination names
+    /// no bucket of this realm, which skips the ownership check alone.
+    pub group_id: Option<GroupId>,
+    pub now_ms: u64,
+}
+
+/// The decision plus the cache diagnostics of the run that produced it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PolicyGateOutcome {
+    pub decision: PlacementDecision,
+    /// The first resolved rule another group owns, refused whatever the
+    /// decision says.
+    pub foreign_owner: Option<Ulid>,
+    pub stats: PolicyCacheStats,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PolicyGateOperation {
+    config: PolicyGateConfig,
+    /// Refs still to resolve, in reverse order so the next one pops off the end.
+    remaining: Vec<PlacementPolicyRef>,
+    current: Option<PlacementPolicyRef>,
+    resolved: BTreeMap<Ulid, PolicyResolution>,
+    foreign_owner: Option<Ulid>,
+    stats: PolicyCacheStats,
+}
+
+type GateTurn = Result<Next<PolicyGateOutcome>, ReadPolicyError>;
+
+impl PolicyGateOperation {
+    pub fn new(config: PolicyGateConfig) -> Self {
+        Self {
+            config,
+            remaining: Vec::new(),
+            current: None,
+            resolved: BTreeMap::new(),
+            foreign_owner: None,
+            stats: PolicyCacheStats::default(),
+        }
+    }
+
+    /// Resolves the next ref as a child, or decides once every ref has an outcome.
+    fn next_ref(&mut self) -> GateTurn {
+        let Some(policy_ref) = self.remaining.pop() else {
+            return self.evaluate();
+        };
+        self.current = Some(policy_ref);
+        Ok(Next::Call(IoCall::child(ResolvePolicyOperation::new(
+            ResolvePolicyConfig {
+                realm_id: self.config.realm_id,
+                policy_ref,
+                local_node_id: self.config.local_node_id,
+                now_ms: self.config.now_ms,
+            },
+        ))))
+    }
+
+    /// Records one resolution. Only an obtained definition becomes `Known`; every
+    /// other outcome either blocks the decision or is reported as unresolved.
+    fn record(&mut self, policy_ref: PlacementPolicyRef, result: ResolveResult) -> GateTurn {
+        match result {
+            Ok(resolved) => {
+                self.stats.merge(resolved.stats);
+                self.resolved.insert(
+                    policy_ref.policy_id,
+                    PolicyResolution::Known(resolved.policy),
+                );
+                self.next_ref()
+            }
+            Err(
+                ReadPolicyError::NotFound { .. }
+                | ReadPolicyError::Unavailable(_)
+                | ReadPolicyError::UnexpectedPublisher,
+            ) => {
+                self.resolved
+                    .insert(policy_ref.policy_id, PolicyResolution::Unresolved);
+                self.next_ref()
+            }
+            Err(ReadPolicyError::DigestMismatch | ReadPolicyError::RealmMismatch) => {
+                self.decide(PlacementDecision::DigestMismatch {
+                    refs: vec![policy_ref],
+                })
+            }
+            // An unauthenticated publication is an invalid rule, never a grant.
+            Err(ReadPolicyError::Policy(_) | ReadPolicyError::Authority(_)) => {
+                self.decide(PlacementDecision::Invalid {
+                    policy_ids: vec![policy_ref.policy_id],
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn evaluate(&mut self) -> GateTurn {
+        // A rule another group owns governs its owner's buckets only, whatever
+        // its selectors admit.
+        self.foreign_owner = self
+            .config
+            .group_id
+            .and_then(|group_id| foreign_owner(&self.resolved, group_id));
+        let decision = evaluate_placement(&self.config.refs, &self.resolved, &self.config.subject);
+        self.decide(decision)
+    }
+
+    fn decide(&mut self, decision: PlacementDecision) -> GateTurn {
+        let allowed = decision == PlacementDecision::Allowed && self.foreign_owner.is_none();
+        debug!(
+            refs = self.config.refs.len(),
+            allowed,
+            hits = self.stats.hits,
+            misses = self.stats.misses,
+            evictions = self.stats.evictions,
+            "Placement gate decided"
+        );
+        Ok(Next::Done(PolicyGateOutcome {
+            decision,
+            foreign_owner: self.foreign_owner,
+            stats: self.stats,
+        }))
+    }
+}
+
+type ResolveResult = Result<ResolvedPolicy, ReadPolicyError>;
+
+/// The destination details a governed write or serve is evaluated against.
+/// Absent means this node advertises no subject, so nothing governed may be
+/// materialized or served here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GateContext {
+    pub realm_id: RealmId,
+    pub subject: PlacementSubject,
+    pub now_ms: u64,
+    /// False while this node revalidates its inventory. Only a governed write
+    /// is stopped by it; an ungoverned one never consults the gate.
+    pub admitting: bool,
+}
+
+/// Why a caller could not build a destination gate. An admission stop is not
+/// one: the gate is built either way and `write_gate` refuses a governed write.
+#[derive(Debug, Error, PartialEq)]
+pub enum GateContextError {
+    #[error("node placement subject unavailable: {0}")]
+    NodeSubject(#[source] RecordReadError),
+}
+
+impl From<IoError> for GateContextError {
+    fn from(error: IoError) -> Self {
+        Self::NodeSubject(error.into())
+    }
+}
+
+/// The destination this node evaluates governed writes and serves against. `None` means no
+/// subject was ever advertised, failing governed operations closed; a node revalidating
+/// inventory reports `admitting: false` to stop governed writes.
+#[derive(Debug, PartialEq)]
+pub struct GateOperation {
+    realm_id: RealmId,
+    now_ms: u64,
+}
+
+impl GateOperation {
+    pub fn new(realm_id: RealmId, now_ms: u64) -> Self {
+        Self { realm_id, now_ms }
+    }
+}
+
+impl Operation for GateOperation {
+    type Output = Option<GateContext>;
+    type Error = GateContextError;
+
+    fn first(&mut self) -> Result<Next<Option<GateContext>>, GateContextError> {
+        let key = Key::from(NODE_SUBJECT_KEY.to_vec());
+        Ok(Next::Call(IoCall::Read(vec![(
+            NODE_SUBJECT_KEYSPACE.to_string(),
+            key,
+        )])))
+    }
+
+    fn next(&mut self, result: IoResult) -> Result<Next<Option<GateContext>>, GateContextError> {
+        let [value] = values::<1>(result)?;
+        let record = value
+            .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
+            .transpose()
+            .map_err(|error| GateContextError::NodeSubject(RecordReadError::Conversion(error)))?;
+        Ok(Next::Done(record.map(|record| GateContext {
+            realm_id: self.realm_id,
+            admitting: !record.serving_blocked && !record.policy_draining,
+            subject: record.subject,
+            now_ms: self.now_ms,
+        })))
+    }
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum PolicyGateError {
+    #[error("this node advertises no placement subject for governed data")]
+    NoSubject,
+    /// Ids stay out of the message: a public caller must not learn them.
+    #[error("placement policy denies this destination")]
+    Denied { policy_ids: Vec<Ulid> },
+    /// A group-owned rule governs only its owner's buckets.
+    #[error("placement policy {policy_id} belongs to another group")]
+    ForeignPolicy { policy_id: Ulid },
+    #[error("a referenced placement policy is not available")]
+    Unavailable { policy_ids: Vec<Ulid> },
+    #[error("a referenced placement policy is invalid or its digest does not match")]
+    Invalid,
+    /// The requester has never resolved these refs; internal peers learn them
+    /// through the handshake, public callers never do.
+    #[error("the destination has not resolved every required placement policy")]
+    Required { refs: Vec<PlacementPolicyRef> },
+    #[error("the destination policy generation changed during this write")]
+    Drift,
+    /// This node is mid-transition, so it admits nothing governed until its
+    /// inventory has been revalidated under the new subject.
+    #[error("this node is not admitting governed data right now")]
+    AdmissionStopped,
+    #[error("unexpected event during a placement drift re-check")]
+    InvalidEvent,
+    #[error(transparent)]
+    Conversion(#[from] aruna_core::errors::ConversionError),
+    #[error(transparent)]
+    Read(#[from] ReadPolicyError),
+    #[error(transparent)]
+    Policy(#[from] aruna_core::structs::placement::policy::PlacementPolicyError),
+}
+
+/// Builds the gate for one governed destination. `Ok(None)` means the ref set is
+/// empty, so the ungoverned path runs unchanged; `group_id` owns the destination
+/// bucket, `None` skips the check, and a stopped admission refuses a governed write.
+pub fn write_gate(
+    context: Option<&GateContext>,
+    refs: &[PlacementPolicyRef],
+    group_id: Option<GroupId>,
+) -> Result<Option<PolicyGateOperation>, PolicyGateError> {
+    let refs = PlacementPolicyRef::canonical_set(refs)?;
+    if refs.is_empty() {
+        return Ok(None);
+    }
+    let Some(context) = context else {
+        return Err(PolicyGateError::NoSubject);
+    };
+    if !context.admitting {
+        return Err(PolicyGateError::AdmissionStopped);
+    }
+    Ok(Some(PolicyGateOperation::new(PolicyGateConfig {
+        realm_id: context.realm_id,
+        local_node_id: context.subject.node_id,
+        refs,
+        subject: context.subject.clone(),
+        group_id,
+        now_ms: context.now_ms,
+    })))
+}
+
+/// Every non-`Allowed` decision blocks, and a rule another group owns blocks
+/// before the subject is weighed at all. Nothing here is reinterpreted as a
+/// grant, and an incomplete evaluation is never reported as a denial.
+pub fn gate_decision(outcome: PolicyGateOutcome) -> Result<(), PolicyGateError> {
+    if let Some(policy_id) = outcome.foreign_owner {
+        return Err(PolicyGateError::ForeignPolicy { policy_id });
+    }
+    match outcome.decision {
+        PlacementDecision::Allowed => Ok(()),
+        PlacementDecision::Denied { policy_ids } => Err(PolicyGateError::Denied { policy_ids }),
+        PlacementDecision::Unavailable { policy_ids } => {
+            Err(PolicyGateError::Unavailable { policy_ids })
+        }
+        PlacementDecision::Required { refs } => Err(PolicyGateError::Required { refs }),
+        PlacementDecision::DigestMismatch { .. } | PlacementDecision::Invalid { .. } => {
+            Err(PolicyGateError::Invalid)
+        }
+        PlacementDecision::InvalidInput { reason } => Err(reason.into()),
+    }
+}
+
+/// The destination details the gate decided on. A change between the gate and the
+/// exposing transaction means the copy would commit refs nothing evaluated.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GatedBucket {
+    pub identity: Option<BucketIdentity>,
+    pub generation: u64,
+    pub policies: Vec<PlacementPolicyRef>,
+    /// Subject generation the gate ran against. `None` leaves the write
+    /// ungoverned, so no subject advance can invalidate it.
+    pub subject_generation: Option<u64>,
+}
+
+impl GatedBucket {
+    pub fn observe(bucket: Option<&BucketInfo>) -> Self {
+        Self {
+            identity: bucket.map(BucketInfo::identity),
+            generation: bucket.map_or(0, |bucket| bucket.placement_policy_generation),
+            policies: bucket
+                .map(|bucket| bucket.placement_policies.clone())
+                .unwrap_or_default(),
+            subject_generation: None,
+        }
+    }
+
+    /// Stores the subject the gate decided under. Only a governed write has one.
+    pub fn stored_under(mut self, context: Option<&GateContext>, governed: bool) -> Self {
+        self.subject_generation = governed
+            .then(|| context.map(|c| c.subject.generation))
+            .flatten();
+        self
+    }
+
+    /// True when the destination details the gate decided on still hold. The
+    /// stored subject is checked separately, against the live subject row.
+    pub fn matches(&self, observed: &Self) -> bool {
+        self.identity == observed.identity
+            && self.generation == observed.generation
+            && self.policies == observed.policies
+    }
+
+    /// Re-check inside the exposing transaction. A missing subject row, an
+    /// advanced generation, or a node that entered draining all mean the copy
+    /// would commit refs that nothing evaluated against the current subject.
+    pub fn check_subject(
+        &self,
+        observed: Option<&NodeSubjectRecord>,
+    ) -> Result<(), PolicyGateError> {
+        let Some(stored) = self.subject_generation else {
+            return Ok(());
+        };
+        match observed {
+            Some(record)
+                if record.subject.generation == stored
+                    && !record.serving_blocked
+                    && !record.policy_draining =>
+            {
+                Ok(())
+            }
+            _ => Err(PolicyGateError::Drift),
+        }
+    }
+}
+
+/// Reads the destination bucket and the local subject in one round trip, so the
+/// exposing transaction re-checks every value the gate decided on.
+pub fn drift_reads(bucket: &str, txn_id: Option<TxnId>) -> Effect {
+    Effect::Storage(StorageEffect::BatchRead {
+        reads: vec![
+            (S3_BUCKET_KEYSPACE.to_string(), bucket.as_bytes().into()),
+            (
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                Key::from(NODE_SUBJECT_KEY.to_vec()),
+            ),
+        ],
+        txn_id,
+    })
+}
+
+/// Splits the `drift_reads` answer into the two records it re-checks.
+pub fn split_drift_reads(
+    values: Vec<(Key, Option<Value>)>,
+) -> Result<(Option<BucketInfo>, Option<NodeSubjectRecord>), PolicyGateError> {
+    let mut values = values.into_iter();
+    let (_, bucket) = values.next().ok_or(PolicyGateError::InvalidEvent)?;
+    let (_, subject) = values.next().ok_or(PolicyGateError::InvalidEvent)?;
+    Ok((
+        bucket
+            .map(|value| BucketInfo::from_bytes(value.as_ref()))
+            .transpose()?,
+        subject
+            .map(|value| NodeSubjectRecord::from_bytes(value.as_ref()))
+            .transpose()?,
+    ))
+}
+
+/// Union of what a write inherits and what its destination requires. A sender
+/// or copy can only tighten: an inherited ref is never dropped.
+pub fn union_refs(
+    destination: &[PlacementPolicyRef],
+    inherited: &[PlacementPolicyRef],
+) -> Result<Vec<PlacementPolicyRef>, PolicyGateError> {
+    let mut refs = destination.to_vec();
+    refs.extend_from_slice(inherited);
+    Ok(PlacementPolicyRef::canonical_set(&refs)?)
+}
+
+impl Operation for PolicyGateOperation {
+    type Output = PolicyGateOutcome;
+    type Error = ReadPolicyError;
+
+    fn first(&mut self) -> GateTurn {
+        match PlacementPolicyRef::canonical_set(&self.config.refs) {
+            Ok(refs) => {
+                self.remaining = refs;
+                self.remaining.reverse();
+                self.next_ref()
+            }
+            Err(reason) => self.decide(PlacementDecision::InvalidInput { reason }),
+        }
+    }
+
+    fn next(&mut self, result: IoResult) -> GateTurn {
+        let policy_ref = self.current.take().ok_or(ReadPolicyError::NotFinished)?;
+        let resolved = result.child::<ResolvedPolicy, ReadPolicyError>()?;
+        self.record(policy_ref, resolved)
+    }
+
+    fn expected_error(error: &Self::Error) -> bool {
+        ResolvePolicyOperation::expected_error(error)
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::super::read::PolicySource;
+    use super::*;
+    use aruna_core::calls::ChildOutcome;
+    use aruna_core::structs::placement::policy::{
+        PlacementPolicy, PlacementSelector, VerifiedPolicy,
+    };
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    fn policy(seed: u8, location: &str) -> VerifiedPolicy {
+        crate::tests::policy::residency(seed, location)
+    }
+
+    /// The same rule under one group's ownership.
+    fn owned_policy(seed: u8, location: &str, owner: GroupId) -> VerifiedPolicy {
+        let policy = PlacementPolicy::new(
+            Ulid::from_bytes([seed; 16]),
+            "residency".to_string(),
+            vec![PlacementSelector {
+                node_id: None,
+                location: Some(location.to_string()),
+                labels: Vec::new(),
+                executor_kind: None,
+            }],
+        )
+        .expect("policy is valid")
+        .owned_by(owner)
+        .expect("owner is valid");
+        VerifiedPolicy::verify(policy).expect("policy verifies")
+    }
+
+    fn subject(location: &str) -> PlacementSubject {
+        PlacementSubject {
+            node_id: node(9),
+            generation: 1,
+            location: location.to_string(),
+            labels: BTreeMap::new(),
+            executor_kind: None,
+            local_to_controller: true,
+        }
+    }
+
+    fn context(location: &str) -> GateContext {
+        GateContext {
+            realm_id: realm(),
+            subject: subject(location),
+            now_ms: 0,
+            admitting: true,
+        }
+    }
+
+    /// The group owning the destination every gate test writes into.
+    fn group() -> GroupId {
+        Ulid::from_bytes([2u8; 16])
+    }
+
+    fn operation(refs: Vec<PlacementPolicyRef>, location: &str) -> PolicyGateOperation {
+        gate_for(refs, location, Some(group()))
+    }
+
+    fn gate_for(
+        refs: Vec<PlacementPolicyRef>,
+        location: &str,
+        group_id: Option<GroupId>,
+    ) -> PolicyGateOperation {
+        PolicyGateOperation::new(PolicyGateConfig {
+            realm_id: realm(),
+            local_node_id: node(9),
+            refs,
+            subject: subject(location),
+            group_id,
+            now_ms: 1_000,
+        })
+    }
+
+    /// A resolve child that obtained `policy` from the cache.
+    fn resolved(policy: &VerifiedPolicy) -> IoResult {
+        let stats = PolicyCacheStats {
+            hits: 1,
+            ..PolicyCacheStats::default()
+        };
+        let resolved = ResolvedPolicy {
+            policy: policy.clone(),
+            source: PolicySource::Cached,
+            stats,
+        };
+        IoResult::Child(ChildOutcome::new(Ok::<_, ReadPolicyError>(resolved)))
+    }
+
+    fn failed(error: ReadPolicyError) -> IoResult {
+        IoResult::Child(ChildOutcome::new(Err::<ResolvedPolicy, _>(error)))
+    }
+
+    /// Answers one resolve child per ref and returns the decided outcome.
+    fn decided(operation: &mut PolicyGateOperation, answers: Vec<IoResult>) -> PolicyGateOutcome {
+        let mut turn = operation.first();
+        for answer in answers {
+            assert!(matches!(turn, Ok(Next::Call(IoCall::Child(_)))));
+            turn = operation.next(answer);
+        }
+        match turn {
+            Ok(Next::Done(outcome)) => outcome,
+            other => panic!("expected a decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allows_ungoverned() {
+        let mut operation = operation(Vec::new(), "eu-west");
+        assert_eq!(
+            decided(&mut operation, Vec::new()).decision,
+            PlacementDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn denies_subject() {
+        // Two refs intersect: a subject outside either one is denied.
+        let first = policy(1, "eu-west");
+        let second = policy(2, "us-east");
+        let mut operation = operation(vec![first.policy_ref(), second.policy_ref()], "eu-west");
+        let outcome = decided(&mut operation, vec![resolved(&first), resolved(&second)]);
+        assert_eq!(
+            outcome.decision,
+            PlacementDecision::Denied {
+                policy_ids: vec![second.policy().policy_id]
+            }
+        );
+        assert_eq!(outcome.stats.hits, 2);
+    }
+
+    #[test]
+    fn refuses_foreign_owner() {
+        // The subject satisfies the rule, so only its owning group refuses it.
+        let owner = Ulid::from_bytes([8u8; 16]);
+        let rule = owned_policy(1, "eu-west", owner);
+        let mut operation = operation(vec![rule.policy_ref()], "eu-west");
+        let outcome = decided(&mut operation, vec![resolved(&rule)]);
+        assert_eq!(outcome.decision, PlacementDecision::Allowed);
+        assert_eq!(
+            gate_decision(outcome),
+            Err(PolicyGateError::ForeignPolicy {
+                policy_id: rule.policy().policy_id
+            })
+        );
+    }
+
+    #[test]
+    fn allows_own_group() {
+        // An unowned realm-wide rule and one the destination's own group owns
+        // both govern this write.
+        let realm_wide = policy(1, "eu-west");
+        let owned = owned_policy(2, "eu-west", group());
+        let mut operation = operation(vec![realm_wide.policy_ref(), owned.policy_ref()], "eu-west");
+        let outcome = decided(
+            &mut operation,
+            vec![resolved(&realm_wide), resolved(&owned)],
+        );
+        assert_eq!(outcome.foreign_owner, None);
+        assert_eq!(gate_decision(outcome), Ok(()));
+    }
+
+    #[test]
+    fn skips_unknown_group() {
+        // Subject revalidation names no destination bucket, so ownership is
+        // decided by the write that registers the copy instead.
+        let owner = Ulid::from_bytes([8u8; 16]);
+        let rule = owned_policy(1, "eu-west", owner);
+        let mut operation = gate_for(vec![rule.policy_ref()], "eu-west", None);
+        let outcome = decided(&mut operation, vec![resolved(&rule)]);
+        assert_eq!(outcome.foreign_owner, None);
+        assert_eq!(gate_decision(outcome), Ok(()));
+    }
+
+    #[test]
+    fn unresolved_stays_closed() {
+        // An unavailable rule must block the subject without denying it, so a
+        // later valid policy is still evaluated on its merits.
+        let rule = policy(1, "eu-west");
+        let mut operation = operation(vec![rule.policy_ref()], "eu-west");
+        let unavailable = ReadPolicyError::Unavailable("recently unreachable".to_string());
+        assert_eq!(
+            decided(&mut operation, vec![failed(unavailable)]).decision,
+            PlacementDecision::Unavailable {
+                policy_ids: vec![rule.policy().policy_id]
+            }
+        );
+    }
+
+    #[test]
+    fn mismatch_stays_closed() {
+        // A resolve that answers with a mismatch makes the gate refuse instead of
+        // falling back to allow.
+        let requested = policy(1, "eu-west");
+        let mut operation = operation(vec![requested.policy_ref()], "eu-west");
+        assert_eq!(
+            decided(
+                &mut operation,
+                vec![failed(ReadPolicyError::DigestMismatch)]
+            )
+            .decision,
+            PlacementDecision::DigestMismatch {
+                refs: vec![requested.policy_ref()]
+            }
+        );
+    }
+
+    #[test]
+    fn storage_fault_fails() {
+        // A resolve that failed for another reason ends the gate in that error.
+        let rule = policy(1, "eu-west");
+        let mut operation = operation(vec![rule.policy_ref()], "eu-west");
+        operation.first().unwrap();
+        assert_eq!(
+            operation.next(failed(ReadPolicyError::NotFinished)),
+            Err(ReadPolicyError::NotFinished)
+        );
+    }
+
+    #[test]
+    fn subject_must_hold() {
+        // The subject that admitted the write must still be the one advertised
+        // when the exposing transaction runs.
+        let gated = GatedBucket::observe(None).stored_under(Some(&context("eu-west")), true);
+        let record = aruna_core::structs::placement::node_subject::NodeSubjectRecord::seed(
+            subject("eu-west"),
+        )
+        .expect("subject");
+        assert_eq!(gated.check_subject(Some(&record)), Ok(()));
+        assert_eq!(gated.check_subject(None), Err(PolicyGateError::Drift));
+
+        let mut advanced = record.clone();
+        advanced.subject.generation = 2;
+        assert_eq!(
+            gated.check_subject(Some(&advanced)),
+            Err(PolicyGateError::Drift)
+        );
+
+        let mut draining = record.clone();
+        draining.policy_draining = true;
+        assert_eq!(
+            gated.check_subject(Some(&draining)),
+            Err(PolicyGateError::Drift)
+        );
+    }
+
+    #[test]
+    fn blocked_admits_ungoverned() {
+        // A node that stopped admitting governed data still writes ungoverned
+        // objects; only a write carrying refs is refused.
+        let mut blocked = context("eu-west");
+        blocked.admitting = false;
+        let governed = vec![policy(1, "eu-west").policy_ref()];
+
+        assert_eq!(write_gate(Some(&blocked), &[], Some(group())), Ok(None));
+        assert_eq!(
+            write_gate(Some(&blocked), &governed, Some(group())).err(),
+            Some(PolicyGateError::AdmissionStopped)
+        );
+        assert!(write_gate(Some(&context("eu-west")), &governed, Some(group())).is_ok());
+    }
+
+    #[test]
+    fn ungoverned_ignores_subject() {
+        // Nothing evaluated an ungoverned write, so no subject change can
+        // invalidate it.
+        let gated = GatedBucket::observe(None).stored_under(None, false);
+        assert_eq!(gated.check_subject(None), Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    use aruna_core::errors::StorageError;
+
+    fn record(blocked: bool) -> NodeSubjectRecord {
+        let mut record = NodeSubjectRecord::seed(PlacementSubject {
+            node_id: iroh::SecretKey::from_bytes(&[5u8; 32]).public(),
+            generation: 1,
+            location: "eu-west".to_string(),
+            labels: Default::default(),
+            executor_kind: None,
+            local_to_controller: true,
+        })
+        .expect("subject is valid");
+        record.serving_blocked = blocked;
+        record
+    }
+
+    fn realm() -> RealmId {
+        RealmId::from_bytes([3u8; 32])
+    }
+
+    /// Reads the subject row and answers it with `value`.
+    fn answered(value: Option<Vec<u8>>) -> Result<Next<Option<GateContext>>, GateContextError> {
+        let mut operation = GateOperation::new(realm(), 7);
+        let key = Key::from(NODE_SUBJECT_KEY.to_vec());
+        assert_eq!(
+            operation.first(),
+            Ok(Next::Call(IoCall::Read(vec![(
+                NODE_SUBJECT_KEYSPACE.to_string(),
+                key
+            )])))
+        );
+        operation.next(IoResult::Values(vec![value.map(Into::into)]))
+    }
+
+    #[test]
+    fn blocked_subject_reads() {
+        // A blocked node still reports its subject; only the gate stops a governed write.
+        let Ok(Next::Done(Some(gate))) = answered(Some(record(true).to_bytes().unwrap())) else {
+            panic!("subject is advertised");
+        };
+        assert!(!gate.admitting);
+        assert_eq!((gate.realm_id, gate.now_ms), (realm(), 7));
+        assert_eq!(gate.subject, record(true).subject);
+
+        let Ok(Next::Done(Some(open))) = answered(Some(record(false).to_bytes().unwrap())) else {
+            panic!("subject is advertised");
+        };
+        assert!(open.admitting);
+    }
+
+    #[test]
+    fn missing_subject_none() {
+        // A node that never advertised a subject has no gate at all.
+        assert_eq!(answered(None), Ok(Next::Done(None)));
+    }
+
+    #[test]
+    fn read_failures_error() {
+        // A storage error or an undecodable record fails instead of reading as absent.
+        assert!(matches!(
+            answered(Some(vec![0xff; 4])),
+            Err(GateContextError::NodeSubject(_))
+        ));
+        let fault = GateContextError::from(IoError::Storage(StorageError::Timeout));
+        assert!(matches!(fault, GateContextError::NodeSubject(_)));
+    }
+}

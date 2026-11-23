@@ -1,0 +1,868 @@
+//! Federation contracts: the signed realm descriptor, realm-wide settings and registry payloads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::net::IpAddr;
+use std::str::FromStr;
+
+use base64::Engine;
+use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::{Host, Url};
+
+use crate::structs::identity::auth::NodeCapabilities;
+use crate::structs::identity::realm::RealmId;
+
+pub const DESCRIPTOR_DOMAIN: &str = "aruna-realm-descriptor-v1";
+pub const REGISTRATION_DOMAIN: &str = "aruna-registry-registration-v1";
+pub const WITHDRAWAL_DOMAIN: &str = "aruna-registry-withdrawal-v1";
+pub const TOTALS_DOMAIN: &str = "aruna-registry-totals-v1";
+/// Delay of the first registry publication after a settings change, so renames reach the
+/// registry at once.
+pub const PUBLISH_SOON: std::time::Duration = std::time::Duration::from_secs(5);
+/// How often the reporting node renews its registration.
+pub const PUBLISH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Longest realm name a descriptor carries.
+pub const MAX_NAME_LEN: usize = 128;
+/// Longest realm description, so a descriptor stays well below the registry's fetch bound.
+pub const MAX_DESCRIPTION_LEN: usize = 4096;
+/// Longest contact address (the RFC 5321 path limit).
+pub const MAX_CONTACT_LEN: usize = 254;
+/// Most realms an `Only` admission list may name.
+pub const MAX_ACCEPTED_REALMS: usize = 1024;
+/// Largest realm total, so JSON readers in browsers keep it exact (2^53 - 1).
+pub const MAX_TOTAL: u64 = (1 << 53) - 1;
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum FederationError {
+    #[error("payload names another realm")]
+    RealmMismatch,
+    #[error("signature does not verify")]
+    BadSignature,
+    #[error("realm delegation does not verify")]
+    BadDelegation,
+    #[error("this node holds no realm or delegated issuer key")]
+    NoSigningKey,
+    #[error("invalid federation settings: {0}")]
+    InvalidSettings(&'static str),
+    #[error("payload encoding failed: {0}")]
+    Encoding(String),
+}
+
+/// A payload with its own signature domain, naming the realm that must sign it.
+pub trait Signable: Serialize {
+    const DOMAIN: &'static str;
+    fn realm_id(&self) -> RealmId;
+
+    /// The domain-tagged bytes a signature covers.
+    fn signing_bytes(&self) -> Result<Vec<u8>, FederationError> {
+        encode(&(Self::DOMAIN, self))
+    }
+
+    /// The bytes of a payload type's older layout, which nodes from before it grew signed;
+    /// checked only when the current layout does not verify.
+    fn legacy_signing_bytes(&self) -> Option<Result<Vec<u8>, FederationError>> {
+        None
+    }
+}
+
+fn encode(value: &impl Serialize) -> Result<Vec<u8>, FederationError> {
+    postcard::to_allocvec(value).map_err(|error| FederationError::Encoding(error.to_string()))
+}
+
+/// Public realm facts. A newer `issued_at` supersedes older descriptors.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmDescriptor {
+    pub realm_id: RealmId,
+    pub name: String,
+    pub description: String,
+    pub api_url: Url,
+    pub portal_url: Url,
+    /// Public contact email address of the realm operator.
+    #[serde(default)]
+    pub contact: Option<String>,
+    /// Login providers the realm shows to other realms and the registry.
+    #[serde(default)]
+    pub login_providers: Vec<LoginProvider>,
+    pub issued_at: u64,
+}
+
+/// An OIDC provider of the realm by its configured id and issuer URL.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginProvider {
+    pub id: String,
+    pub issuer: String,
+}
+
+impl RealmDescriptor {
+    /// The same bounds realm settings enforce, so a receiver can check a foreign descriptor.
+    pub fn check_facts(&self) -> Result<(), FederationError> {
+        let ids = self
+            .login_providers
+            .iter()
+            .map(|provider| provider.id.as_str());
+        check_facts(&self.name, &self.description, self.contact.as_deref(), ids)
+    }
+}
+
+/// Name, description and contact bounds, and login provider ids listed once each.
+fn check_facts<'a>(
+    name: &str,
+    description: &str,
+    contact: Option<&str>,
+    provider_ids: impl Iterator<Item = &'a str>,
+) -> Result<(), FederationError> {
+    if name.trim().is_empty() || name.chars().count() > MAX_NAME_LEN {
+        return Err(FederationError::InvalidSettings("name length"));
+    }
+    if description.chars().count() > MAX_DESCRIPTION_LEN {
+        return Err(FederationError::InvalidSettings("description length"));
+    }
+    if !contact.is_none_or(valid_contact) {
+        return Err(FederationError::InvalidSettings(
+            "contact must be an email address",
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    if !provider_ids.into_iter().all(|id| seen.insert(id)) {
+        return Err(FederationError::InvalidSettings(
+            "login provider listed twice",
+        ));
+    }
+    Ok(())
+}
+
+impl Signable for RealmDescriptor {
+    const DOMAIN: &'static str = DESCRIPTOR_DOMAIN;
+    fn realm_id(&self) -> RealmId {
+        self.realm_id
+    }
+
+    fn legacy_signing_bytes(&self) -> Option<Result<Vec<u8>, FederationError>> {
+        Some(encode(&(Self::DOMAIN, self.factless()?)))
+    }
+}
+
+/// A descriptor in the layout of nodes that predate the contact and login provider facts.
+#[derive(Serialize)]
+struct FactlessDescriptor<'a> {
+    realm_id: RealmId,
+    name: &'a str,
+    description: &'a str,
+    api_url: &'a Url,
+    portal_url: &'a Url,
+    issued_at: u64,
+}
+
+/// `Signed<RealmDescriptor>` with its descriptor in the older layout.
+#[derive(Serialize)]
+pub(crate) struct FactlessSigned<'a> {
+    payload: FactlessDescriptor<'a>,
+    signer: &'a Signer,
+    signature: &'a str,
+}
+
+impl RealmDescriptor {
+    /// The descriptor in the older layout, which can only carry one without the newer facts.
+    fn factless(&self) -> Option<FactlessDescriptor<'_>> {
+        if self.contact.is_some() || !self.login_providers.is_empty() {
+            return None;
+        }
+        Some(FactlessDescriptor {
+            realm_id: self.realm_id,
+            name: &self.name,
+            description: &self.description,
+            api_url: &self.api_url,
+            portal_url: &self.portal_url,
+            issued_at: self.issued_at,
+        })
+    }
+}
+
+impl Signed<RealmDescriptor> {
+    /// The signed descriptor in the older layout, if its descriptor fits it.
+    pub(crate) fn factless(&self) -> Option<FactlessSigned<'_>> {
+        Some(FactlessSigned {
+            payload: self.payload.factless()?,
+            signer: &self.signer,
+            signature: &self.signature,
+        })
+    }
+}
+
+/// Self-reported realm totals. `None` means unknown, never zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmKpis {
+    pub live_datasets: Option<u64>,
+    pub groups: Option<u64>,
+    pub nodes_configured: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Registration {
+    pub descriptor: Signed<RealmDescriptor>,
+    pub kpis: RealmKpis,
+    pub observed_at: u64,
+    pub issued_at: u64,
+}
+
+impl Signable for Registration {
+    const DOMAIN: &'static str = REGISTRATION_DOMAIN;
+    fn realm_id(&self) -> RealmId {
+        self.descriptor.payload.realm_id
+    }
+
+    fn legacy_signing_bytes(&self) -> Option<Result<Vec<u8>, FederationError>> {
+        let layout = (
+            self.descriptor.factless()?,
+            &self.kpis,
+            self.observed_at,
+            self.issued_at,
+        );
+        Some(encode(&(Self::DOMAIN, layout)))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Withdrawal {
+    pub realm_id: RealmId,
+    pub issued_at: u64,
+}
+
+impl Signable for Withdrawal {
+    const DOMAIN: &'static str = WITHDRAWAL_DOMAIN;
+    fn realm_id(&self) -> RealmId {
+        self.realm_id
+    }
+}
+
+/// Self-reported realm-wide totals, signed apart from the registration, so they never touch
+/// the descriptor and with it the realm's identity or approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealmTotals {
+    pub realm_id: RealmId,
+    /// Stored and referenced bytes together, each object counted once.
+    pub data_bytes: u64,
+    pub objects: u64,
+    /// Live metadata documents, counted like `RealmKpis::live_datasets`.
+    pub datasets: u64,
+    pub observed_at: u64,
+}
+
+impl RealmTotals {
+    /// Refuses a total above `MAX_TOTAL`.
+    pub fn check(&self) -> Result<(), FederationError> {
+        if [self.data_bytes, self.objects, self.datasets]
+            .iter()
+            .any(|total| *total > MAX_TOTAL)
+        {
+            return Err(FederationError::InvalidSettings("total too large"));
+        }
+        Ok(())
+    }
+}
+
+impl Signable for RealmTotals {
+    const DOMAIN: &'static str = TOTALS_DOMAIN;
+    fn realm_id(&self) -> RealmId {
+        self.realm_id
+    }
+}
+
+/// The key behind a signature: the realm key itself, or an issuer key the realm delegated.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Signer {
+    Realm,
+    Delegated {
+        issuer_pubkey: String,
+        delegation_signature: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signed<T> {
+    pub payload: T,
+    pub signer: Signer,
+    /// Hex ed25519 signature over the domain-tagged postcard payload.
+    pub signature: String,
+}
+
+/// The domain-tagged bytes a signature covers.
+pub fn signing_bytes<T: Signable>(payload: &T) -> Result<Vec<u8>, FederationError> {
+    payload.signing_bytes()
+}
+
+/// A signature over a payload's signing bytes and the key behind it, made by the holder of the
+/// node's federation key and attached to the payload by [`Signed::with_signature`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FederationSignature {
+    pub signer: Signer,
+    pub signature: String,
+}
+
+/// Signs domain-tagged `bytes` with the realm key on a management node or the delegated issuer
+/// key on a server.
+pub fn sign_bytes(
+    bytes: &[u8],
+    capabilities: &NodeCapabilities,
+) -> Result<FederationSignature, FederationError> {
+    let (key, signer) = match capabilities {
+        NodeCapabilities::Management {
+            realm_signing_key, ..
+        } => (realm_signing_key, Signer::Realm),
+        NodeCapabilities::Server {
+            issuer_signing_key,
+            delegation_signature,
+            ..
+        } => (
+            issuer_signing_key,
+            Signer::Delegated {
+                issuer_pubkey: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(issuer_signing_key.verifying_key().to_bytes()),
+                delegation_signature: delegation_signature.clone(),
+            },
+        ),
+        NodeCapabilities::User { .. } => return Err(FederationError::NoSigningKey),
+    };
+    let signature = sign_hex(key, bytes);
+    Ok(FederationSignature { signer, signature })
+}
+
+impl<T: Signable> Signed<T> {
+    /// Signs with the realm key on a management node or the delegated issuer key on a server.
+    pub fn sign(payload: T, capabilities: &NodeCapabilities) -> Result<Self, FederationError> {
+        let bytes = signing_bytes(&payload)?;
+        let signature = sign_bytes(&bytes, capabilities)?;
+        Ok(Self::with_signature(payload, signature))
+    }
+
+    /// `payload` with a signature made over its signing bytes.
+    pub fn with_signature(payload: T, signature: FederationSignature) -> Self {
+        Self {
+            payload,
+            signer: signature.signer,
+            signature: signature.signature,
+        }
+    }
+
+    /// Accepts only a payload naming `realm_id`, signed by that realm's key or its delegate.
+    pub fn verify(&self, realm_id: &RealmId) -> Result<(), FederationError> {
+        self.verified_layout(realm_id).map(|_| ())
+    }
+
+    /// The layout the signature verifies in: the current one, else the payload's older one.
+    pub(crate) fn verified_layout(&self, realm_id: &RealmId) -> Result<Layout, FederationError> {
+        if self.payload.realm_id() != *realm_id {
+            return Err(FederationError::RealmMismatch);
+        }
+        let realm_key = verifying_key(realm_id.as_bytes())?;
+        let key = match &self.signer {
+            Signer::Realm => realm_key,
+            Signer::Delegated {
+                issuer_pubkey,
+                delegation_signature,
+            } => {
+                let delegation = parse_signature(delegation_signature)
+                    .map_err(|_| FederationError::BadDelegation)?;
+                realm_key
+                    .verify_strict(issuer_pubkey.as_bytes(), &delegation)
+                    .map_err(|_| FederationError::BadDelegation)?;
+                let issuer = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(issuer_pubkey)
+                    .ok()
+                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+                    .ok_or(FederationError::BadDelegation)?;
+                verifying_key(&issuer)?
+            }
+        };
+        let signature = parse_signature(&self.signature)?;
+        if key
+            .verify_strict(&signing_bytes(&self.payload)?, &signature)
+            .is_ok()
+        {
+            return Ok(Layout::Current);
+        }
+        let legacy = self
+            .payload
+            .legacy_signing_bytes()
+            .ok_or(FederationError::BadSignature)??;
+        key.verify_strict(&legacy, &signature)
+            .map_err(|_| FederationError::BadSignature)?;
+        Ok(Layout::Older)
+    }
+}
+
+/// Which layout of a payload its signature covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Layout {
+    Current,
+    Older,
+}
+
+fn sign_hex(key: &SigningKey, bytes: &[u8]) -> String {
+    key.sign(bytes).to_string()
+}
+
+fn parse_signature(value: &str) -> Result<Signature, FederationError> {
+    Signature::from_str(value).map_err(|_| FederationError::BadSignature)
+}
+
+fn verifying_key(bytes: &[u8; 32]) -> Result<VerifyingKey, FederationError> {
+    VerifyingKey::from_bytes(bytes).map_err(|_| FederationError::BadSignature)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegistrationMode {
+    #[default]
+    Enabled,
+    Disabled,
+}
+
+/// Realms whose users may log in here as foreign users.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcceptedRealms {
+    #[default]
+    None,
+    Only(Vec<RealmId>),
+    Any,
+}
+
+impl AcceptedRealms {
+    /// Whether logins of `realm_id` are admitted.
+    pub fn admits(&self, realm_id: &RealmId) -> bool {
+        match self {
+            Self::None => false,
+            Self::Only(realms) => realms.contains(realm_id),
+            Self::Any => true,
+        }
+    }
+}
+
+/// Realm-wide federation settings with the descriptor signed from them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederationSettings {
+    pub name: String,
+    pub description: String,
+    pub contact: Option<String>,
+    /// Ids of the realm's OIDC providers shown in the descriptor, in order.
+    pub login_providers: Vec<String>,
+    pub api_url: Url,
+    pub portal_url: Url,
+    /// No URL means no registry traffic.
+    pub registry_url: Option<Url>,
+    pub registration: RegistrationMode,
+    pub accepted_realms: AcceptedRealms,
+    pub descriptor: Signed<RealmDescriptor>,
+}
+
+impl FederationSettings {
+    /// Hex SHA-256 over the postcard encoding, so equal settings have equal digests.
+    pub fn digest(&self) -> Result<String, FederationError> {
+        crate::transfer::digest_of(self)
+    }
+
+    /// Checks bounds, URL rules and that the descriptor is signed for these values.
+    pub fn validate(&self, realm_id: &RealmId) -> Result<(), FederationError> {
+        check_facts(
+            &self.name,
+            &self.description,
+            self.contact.as_deref(),
+            self.login_providers.iter().map(String::as_str),
+        )?;
+        let urls = [
+            Some(&self.api_url),
+            Some(&self.portal_url),
+            self.registry_url.as_ref(),
+        ];
+        if !urls.into_iter().flatten().all(valid_federation_url) {
+            return Err(FederationError::InvalidSettings("url must be https"));
+        }
+        if matches!(&self.accepted_realms, AcceptedRealms::Only(realms) if realms.len() > MAX_ACCEPTED_REALMS)
+        {
+            return Err(FederationError::InvalidSettings("too many accepted realms"));
+        }
+        let descriptor = &self.descriptor.payload;
+        let provider_ids = descriptor
+            .login_providers
+            .iter()
+            .map(|provider| &provider.id);
+        if descriptor.name != self.name
+            || descriptor.description != self.description
+            || descriptor.contact != self.contact
+            || !provider_ids.eq(self.login_providers.iter())
+            || descriptor.api_url != self.api_url
+            || descriptor.portal_url != self.portal_url
+        {
+            return Err(FederationError::InvalidSettings(
+                "descriptor does not match",
+            ));
+        }
+        self.descriptor.verify(realm_id)
+    }
+}
+
+/// One `local@domain` address without spaces or control characters.
+fn valid_contact(contact: &str) -> bool {
+    let plain = !contact.chars().any(|c| c.is_whitespace() || c.is_control());
+    let parts = contact.split_once('@').filter(|(local, domain)| {
+        !local.is_empty() && domain.contains('.') && !domain.contains('@')
+    });
+    plain && parts.is_some() && contact.len() <= MAX_CONTACT_LEN
+}
+
+/// HTTPS, or plain HTTP to a loopback host for local development.
+pub fn valid_federation_url(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => url.host().is_some(),
+        "http" => match url.host() {
+            Some(Host::Domain(domain)) => domain == "localhost",
+            Some(Host::Ipv4(address)) => IpAddr::V4(address).is_loopback(),
+            Some(Host::Ipv6(address)) => IpAddr::V6(address).is_loopback(),
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn realm_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn realm_of(key: &SigningKey) -> RealmId {
+        RealmId::from_bytes(key.verifying_key().to_bytes())
+    }
+
+    fn management(key: &SigningKey) -> NodeCapabilities {
+        NodeCapabilities::management_node(key.clone()).unwrap()
+    }
+
+    fn descriptor(realm_id: RealmId) -> RealmDescriptor {
+        RealmDescriptor {
+            realm_id,
+            name: "Realm".to_string(),
+            description: String::new(),
+            api_url: Url::parse("https://api.example.org").unwrap(),
+            portal_url: Url::parse("https://portal.example.org").unwrap(),
+            contact: None,
+            login_providers: Vec::new(),
+            issued_at: 10,
+        }
+    }
+
+    /// The descriptor of nodes that predate the contact and login provider facts.
+    #[derive(Clone, Serialize)]
+    struct OldDescriptor {
+        realm_id: RealmId,
+        name: String,
+        description: String,
+        api_url: Url,
+        portal_url: Url,
+        issued_at: u64,
+    }
+
+    #[derive(Clone, Serialize)]
+    struct OldSigned<T> {
+        payload: T,
+        signer: Signer,
+        signature: String,
+    }
+
+    #[derive(Serialize)]
+    struct OldRegistration {
+        descriptor: OldSigned<OldDescriptor>,
+        kpis: RealmKpis,
+        observed_at: u64,
+        issued_at: u64,
+    }
+
+    /// What an older node sends: its own layout, signed with the realm key.
+    fn old_signed<T: Serialize>(key: &SigningKey, domain: &str, payload: T) -> OldSigned<T> {
+        let bytes = postcard::to_allocvec(&(domain, &payload)).unwrap();
+        OldSigned {
+            signature: sign_hex(key, &bytes),
+            signer: Signer::Realm,
+            payload,
+        }
+    }
+
+    #[test]
+    fn old_descriptors_verify() {
+        let key = realm_key(9);
+        let realm_id = realm_of(&key);
+        let old = OldDescriptor {
+            realm_id,
+            name: "Realm".to_string(),
+            description: "Old node".to_string(),
+            api_url: Url::parse("https://api.example.org/api/v1").unwrap(),
+            portal_url: Url::parse("https://portal.example.org/").unwrap(),
+            issued_at: 10,
+        };
+        let old_payload = old.clone();
+        let old_descriptor = old_signed(&key, DESCRIPTOR_DOMAIN, old);
+        let json = serde_json::to_value(&old_descriptor).unwrap();
+        assert!(json["payload"].get("login_providers").is_none());
+        let descriptor: Signed<RealmDescriptor> = serde_json::from_value(json).unwrap();
+        assert_eq!(descriptor.payload.contact, None);
+        assert!(descriptor.payload.login_providers.is_empty());
+        descriptor.verify(&realm_id).unwrap();
+        // A registration that embeds the old descriptor verifies too.
+        let registration = OldRegistration {
+            descriptor: old_descriptor,
+            kpis: RealmKpis::default(),
+            observed_at: 11,
+            issued_at: 12,
+        };
+        let wire = serde_json::to_value(old_signed(&key, REGISTRATION_DOMAIN, registration));
+        let parsed: Signed<Registration> = serde_json::from_value(wire.unwrap()).unwrap();
+        parsed.verify(&realm_id).unwrap();
+        parsed.payload.descriptor.verify(&realm_id).unwrap();
+        assert_eq!(descriptor.verified_layout(&realm_id), Ok(Layout::Older));
+        // An older node digests its own layout; the digest here must match it.
+        let old_bytes = postcard::to_allocvec(&old_signed(&key, DESCRIPTOR_DOMAIN, old_payload));
+        let old_digest = hex::encode(Sha256::digest(old_bytes.unwrap()));
+        assert_eq!(
+            crate::handoff::descriptor_digest(&descriptor).unwrap(),
+            old_digest
+        );
+        // The new facts are signed: adding one breaks the old signature.
+        let mut changed = descriptor;
+        changed.payload.contact = Some("ops@example.org".to_string());
+        assert!(changed.verify(&realm_id).is_err());
+    }
+
+    #[test]
+    fn factless_signed_fully() {
+        // Descriptors and registrations without facts are signed in the full layout, as before.
+        let key = realm_key(9);
+        let realm_id = realm_of(&key);
+        let signed = Signed::sign(descriptor(realm_id), &management(&key)).unwrap();
+        let full = postcard::to_allocvec(&(DESCRIPTOR_DOMAIN, &signed.payload)).unwrap();
+        let signature = parse_signature(&signed.signature).unwrap();
+        key.verifying_key()
+            .verify_strict(&full, &signature)
+            .unwrap();
+        assert_eq!(signed.verified_layout(&realm_id), Ok(Layout::Current));
+        let registration = Registration {
+            descriptor: signed.clone(),
+            kpis: RealmKpis::default(),
+            observed_at: 11,
+            issued_at: 12,
+        };
+        let outer = Signed::sign(registration, &management(&key)).unwrap();
+        let full = postcard::to_allocvec(&(REGISTRATION_DOMAIN, &outer.payload)).unwrap();
+        let signature = parse_signature(&outer.signature).unwrap();
+        key.verifying_key()
+            .verify_strict(&full, &signature)
+            .unwrap();
+        assert_eq!(outer.verified_layout(&realm_id), Ok(Layout::Current));
+        // The digest is that of the full layout, as nodes on the full layout compute it.
+        let digest = hex::encode(Sha256::digest(postcard::to_allocvec(&signed).unwrap()));
+        assert_eq!(crate::handoff::descriptor_digest(&signed).unwrap(), digest);
+    }
+
+    #[test]
+    fn facts_signed_fully() {
+        // A descriptor with facts signs and verifies in the full layout.
+        let key = realm_key(9);
+        let realm_id = realm_of(&key);
+        let mut facts = descriptor(realm_id);
+        facts.contact = Some("ops@example.org".to_string());
+        facts.login_providers.push(LoginProvider {
+            id: "keycloak".to_string(),
+            issuer: "https://login.example.org/realms/aruna".to_string(),
+        });
+        let signed = Signed::sign(facts, &management(&key)).unwrap();
+        signed.verify(&realm_id).unwrap();
+        let mut stripped = signed;
+        stripped.payload.login_providers.clear();
+        assert!(stripped.verify(&realm_id).is_err());
+    }
+
+    fn delegated(realm: &SigningKey, issuer: &SigningKey) -> NodeCapabilities {
+        let pubkey = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(issuer.verifying_key().to_bytes());
+        let delegation = sign_hex(realm, pubkey.as_bytes());
+        NodeCapabilities::server_node(issuer.clone(), realm_of(realm), delegation).unwrap()
+    }
+
+    #[test]
+    fn realm_key_verifies() {
+        let key = realm_key(1);
+        let signed = Signed::sign(descriptor(realm_of(&key)), &management(&key)).unwrap();
+        assert_eq!(signed.verify(&realm_of(&key)), Ok(()));
+    }
+
+    #[test]
+    fn delegated_key_verifies() {
+        let key = realm_key(1);
+        let caps = delegated(&key, &realm_key(2));
+        let signed = Signed::sign(descriptor(realm_of(&key)), &caps).unwrap();
+        assert_eq!(signed.verify(&realm_of(&key)), Ok(()));
+    }
+
+    #[test]
+    fn rejects_wrong_key() {
+        // Another realm's key cannot sign for this realm id.
+        let key = realm_key(1);
+        let other = realm_key(3);
+        let signed = Signed::sign(descriptor(realm_of(&key)), &management(&other)).unwrap();
+        assert_eq!(
+            signed.verify(&realm_of(&key)),
+            Err(FederationError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_realm() {
+        let key = realm_key(1);
+        let signed = Signed::sign(descriptor(realm_of(&key)), &management(&key)).unwrap();
+        assert_eq!(
+            signed.verify(&realm_of(&realm_key(4))),
+            Err(FederationError::RealmMismatch)
+        );
+    }
+
+    #[test]
+    fn rejects_undelegated_node() {
+        // A node key without a realm delegation is not a realm signer.
+        let key = realm_key(1);
+        let node = realm_key(5);
+        let forged = delegated(&node, &node);
+        let signed = Signed::sign(descriptor(realm_of(&key)), &forged).unwrap();
+        assert_eq!(
+            signed.verify(&realm_of(&key)),
+            Err(FederationError::BadDelegation)
+        );
+        let mut as_realm = signed;
+        as_realm.signer = Signer::Realm;
+        assert_eq!(
+            as_realm.verify(&realm_of(&key)),
+            Err(FederationError::BadSignature)
+        );
+    }
+
+    #[derive(Serialize)]
+    #[serde(transparent)]
+    struct Mirror(Withdrawal);
+
+    impl Signable for Mirror {
+        const DOMAIN: &'static str = REGISTRATION_DOMAIN;
+        fn realm_id(&self) -> RealmId {
+            self.0.realm_id
+        }
+    }
+
+    #[test]
+    fn rejects_tag_confusion() {
+        // Identical payload bytes under another domain tag do not verify.
+        let key = realm_key(1);
+        let realm_id = realm_of(&key);
+        let payload = Withdrawal {
+            realm_id,
+            issued_at: 10,
+        };
+        let withdrawal = Signed::sign(payload.clone(), &management(&key)).unwrap();
+        let confused = Signed {
+            payload: Mirror(payload),
+            signer: Signer::Realm,
+            signature: withdrawal.signature,
+        };
+        assert_eq!(
+            confused.verify(&realm_id),
+            Err(FederationError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_payload() {
+        let key = realm_key(1);
+        let mut signed = Signed::sign(descriptor(realm_of(&key)), &management(&key)).unwrap();
+        signed.payload.portal_url = Url::parse("https://evil.example.org").unwrap();
+        assert_eq!(
+            signed.verify(&realm_of(&key)),
+            Err(FederationError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn settings_bind_descriptor() {
+        // Settings whose values differ from the signed descriptor are refused.
+        let key = realm_key(1);
+        let realm_id = realm_of(&key);
+        let signed = Signed::sign(descriptor(realm_id), &management(&key)).unwrap();
+        let mut settings = FederationSettings {
+            name: "Realm".to_string(),
+            description: String::new(),
+            contact: None,
+            login_providers: Vec::new(),
+            api_url: signed.payload.api_url.clone(),
+            portal_url: signed.payload.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            descriptor: signed,
+        };
+        assert_eq!(settings.validate(&realm_id), Ok(()));
+        settings.portal_url = Url::parse("https://other.example.org").unwrap();
+        assert!(settings.validate(&realm_id).is_err());
+    }
+
+    #[test]
+    fn settings_check_facts() {
+        // Contact, description and provider lists are bounded and must match the descriptor.
+        let key = realm_key(1);
+        let realm_id = realm_of(&key);
+        let mut payload = descriptor(realm_id);
+        payload.contact = Some("data@example.org".to_string());
+        let signed = Signed::sign(payload, &management(&key)).unwrap();
+        let settings = FederationSettings {
+            name: "Realm".to_string(),
+            description: String::new(),
+            contact: Some("data@example.org".to_string()),
+            login_providers: Vec::new(),
+            api_url: signed.payload.api_url.clone(),
+            portal_url: signed.payload.portal_url.clone(),
+            registry_url: None,
+            registration: RegistrationMode::Enabled,
+            accepted_realms: AcceptedRealms::None,
+            descriptor: signed,
+        };
+        assert_eq!(settings.validate(&realm_id), Ok(()));
+        for contact in ["data", "@example.org", "a b@example.org", "data@example"] {
+            let mut bad = settings.clone();
+            bad.contact = Some(contact.to_string());
+            assert!(bad.validate(&realm_id).is_err(), "{contact}");
+        }
+        let mut long = settings.clone();
+        long.description = "a".repeat(MAX_DESCRIPTION_LEN + 1);
+        assert!(long.validate(&realm_id).is_err());
+        let mut twice = settings.clone();
+        twice.login_providers = vec!["a".to_string(), "a".to_string()];
+        assert!(twice.validate(&realm_id).is_err());
+        let mut unsigned = settings;
+        unsigned.contact = None;
+        assert_eq!(
+            unsigned.validate(&realm_id),
+            Err(FederationError::InvalidSettings(
+                "descriptor does not match"
+            ))
+        );
+    }
+
+    #[test]
+    fn url_rules() {
+        let valid = |url: &str| valid_federation_url(&Url::parse(url).unwrap());
+        assert!(valid("https://realm.example.org"));
+        assert!(valid("http://localhost:8080"));
+        assert!(valid("http://127.0.0.1:8080"));
+        assert!(!valid("http://realm.example.org"));
+        assert!(!valid("ftp://realm.example.org"));
+    }
+}

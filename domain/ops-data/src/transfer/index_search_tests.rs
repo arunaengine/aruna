@@ -1,0 +1,595 @@
+//! Tests distributed bucket search through range indexes: coordinated ranges only, the
+//! examined budget, incomplete ranges, authorization, prefix windows and realm-wide skips.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use aruna_core::keyspaces::{BLOB_VERSIONS_KEYSPACE, S3_BUCKET_KEYSPACE};
+use aruna_core::structs::execution::table::{SEARCH_EXACT_KEY, SEARCH_TEXT_KEY, search_terms};
+use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
+use aruna_core::structs::storage::blob::{
+    BackendRef, BlobVersion, BucketInfo, VersionKey, object_permission_path,
+};
+use aruna_core::structs::storage::distribution::inventory::head_position;
+use aruna_core::structs::storage::format::{Compression, EncodingClass};
+use tempfile::TempDir;
+
+use super::super::tests::{
+    Fixture, input, search_local_objects, seed_materialized, setup, write_value,
+};
+use super::*;
+use crate::distribution::test_record::{binding, record};
+use aruna_core::key_index::{IndexedKey, KeyChange};
+use aruna_runner::driver::drive;
+use aruna_storage::key_index::RangeIndexes;
+
+struct Distributed {
+    fixture: Fixture,
+    _index_dir: TempDir,
+    indexes: Arc<RangeIndexes>,
+    binding: DistributionBinding,
+    lower: Ulid,
+}
+
+/// A bucket "spire" whose lower range (keys before "m") member 1 coordinates; `keys` get
+/// live heads and, in generation `state`, index documents.
+async fn distributed(state: IndexState, keys: &[&str]) -> Distributed {
+    distributed_with(state, keys, |path| RangeIndexes::new(path)).await
+}
+
+/// `distributed` with the range indexes `make` opens.
+async fn distributed_with(
+    state: IndexState,
+    keys: &[&str],
+    make: impl FnOnce(&Path) -> RangeIndexes,
+) -> Distributed {
+    let fixture = setup().await;
+    let (snapshot, bytes) = record(true);
+    aruna_runner::testing::write_value(
+        &fixture.context.storage_handle,
+        aruna_core::keyspaces::DISTRIBUTION_KEYSPACE,
+        snapshot.set_id().to_bytes().to_vec(),
+        bytes,
+    )
+    .await;
+    let binding = binding(&snapshot, 1, 5);
+    let bucket = BucketInfo {
+        group_id: fixture.visible_group,
+        created_at: UNIX_EPOCH,
+        created_by: fixture.owner,
+        cors_configuration: None,
+        storage_routing: Vec::new(),
+        placement_policies: Vec::new(),
+        placement_policy_generation: 0,
+        compression: Compression::Off,
+        distribution: Some(binding.clone()),
+    };
+    let bucket = bucket.to_bytes().unwrap();
+    write_value(
+        &fixture.context,
+        S3_BUCKET_KEYSPACE,
+        b"spire".to_vec(),
+        bucket,
+    )
+    .await;
+    let lower = snapshot.config.ranges[0].range_id;
+    let index_dir = tempfile::tempdir().unwrap();
+    let storage = &fixture.context.storage_handle;
+    let indexes = storage.install_range_indexes(make(index_dir.path()));
+    let mut changes = Vec::new();
+    for (seed, key) in keys.iter().enumerate() {
+        seed_materialized(&fixture, "spire", key, UNIX_EPOCH, seed as u8 + 10).await;
+        changes.push(KeyChange::Put(IndexedKey {
+            key: key.to_string(),
+            size: 42,
+            version_id: Ulid::nil(),
+            terms: None,
+        }));
+    }
+    let set_id = binding.set_id;
+    indexes
+        .apply(set_id, lower, state.generation(), changes)
+        .await
+        .unwrap();
+    let state_row = state.to_bytes().unwrap();
+    write_value(
+        &fixture.context,
+        SEARCH_INDEX_KEYSPACE,
+        state_key(set_id, lower),
+        state_row,
+    )
+    .await;
+    Distributed {
+        fixture,
+        _index_dir: index_dir,
+        indexes,
+        binding,
+        lower,
+    }
+}
+
+fn owner(fixture: &Fixture) -> AuthContext {
+    AuthContext::new(fixture.owner, fixture.realm_id)
+}
+
+impl Distributed {
+    async fn search(&self, input: SearchObjectsInput, budget: usize) -> SearchNodePage {
+        let binding = self.binding.clone();
+        let search = RangeSearchOperation::new(input, binding, budget, true);
+        drive(search, &self.fixture.context).await.unwrap()
+    }
+
+    /// Marks the lower range's index as building, with every head up to `key` written.
+    async fn building_through(&self, key: &str) {
+        let state = IndexState::Building {
+            generation: 1,
+            cursor: Some(head_position(self.binding.set_id, key)),
+        };
+        let row = state_key(self.binding.set_id, self.lower);
+        write_value(
+            &self.fixture.context,
+            SEARCH_INDEX_KEYSPACE,
+            row,
+            state.to_bytes().unwrap(),
+        )
+        .await;
+    }
+
+    fn input(&self, auth: AuthContext, query: &str) -> SearchObjectsInput {
+        let mut input = input(&self.fixture, auth, query, 10);
+        input.bucket = Some("spire".to_string());
+        input
+    }
+}
+
+/// Gives `key` of "spire" a current version whose search text is `organism` and whose exact
+/// `taxid` is the key's length, and returns its index document.
+async fn describe(fixture: &Fixture, key: &str, organism: &str) -> KeyChange {
+    let hash = key.as_bytes()[0];
+    let version_id = seed_materialized(fixture, "spire", key, UNIX_EPOCH, hash).await;
+    let raw = EncodingClass::Raw;
+    let backend = BackendRef::node_default();
+    let mut version =
+        BlobVersion::materialized([hash; 32], backend, raw, UNIX_EPOCH, fixture.owner, None);
+    version.metadata = HashMap::from([
+        (SEARCH_TEXT_KEY.to_string(), "organism".to_string()),
+        ("organism".to_string(), organism.to_string()),
+        (SEARCH_EXACT_KEY.to_string(), "taxid".to_string()),
+        ("taxid".to_string(), key.len().to_string()),
+    ]);
+    let version_key = VersionKey::new("spire", key, version_id)
+        .to_bytes()
+        .unwrap();
+    let bytes = version.to_bytes().unwrap();
+    write_value(&fixture.context, BLOB_VERSIONS_KEYSPACE, version_key, bytes).await;
+    let (text, exact) = search_terms(&version.metadata);
+    KeyChange::Put(IndexedKey {
+        key: key.to_string(),
+        size: 0,
+        version_id,
+        terms: Some(MetaTerms { text, exact }),
+    })
+}
+
+fn keys(page: &SearchNodePage) -> Vec<&str> {
+    page.hits.iter().map(|hit| hit.hit.key.as_str()).collect()
+}
+
+#[tokio::test]
+async fn searches_coordinated_ranges() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1.txt", "b/needle-2.txt", "c/other.txt"]).await;
+    // A live head the index does not hold is never found by a scan.
+    seed_materialized(&test.fixture, "spire", "d/needle-3.txt", UNIX_EPOCH, 3).await;
+
+    let page = test
+        .search(test.input(owner(&test.fixture), "needle"), 100)
+        .await;
+    assert_eq!(keys(&page), ["a/needle-1.txt", "b/needle-2.txt"]);
+    assert_eq!(page.next_start_after, None);
+    assert_eq!(
+        page.remote_ranges, 1,
+        "member 2 coordinates the upper range"
+    );
+    assert_eq!(page.incomplete_ranges, 0);
+    assert_eq!(page.hits[0].hit.size, Some(42));
+}
+
+#[tokio::test]
+async fn denied_pages_bounded() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1", "b/needle-2", "c/needle-3"]).await;
+    let fixture = &test.fixture;
+    let allowed = object_permission_path(
+        fixture.realm_id,
+        fixture.visible_group,
+        fixture.node_id,
+        "spire",
+        "elsewhere",
+    );
+    let denied = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: allowed,
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+
+    let first = test.search(test.input(denied.clone(), "needle"), 2).await;
+    assert!(first.hits.is_empty());
+    let cursor = first
+        .next_start_after
+        .expect("the budget ends the page early");
+    // The position of a key the caller may not see is sealed, never readable.
+    assert!(sealed_position(&cursor));
+    let hidden = b"b/needle-2";
+    assert!(!cursor.windows(hidden.len()).any(|part| part == hidden));
+    assert_eq!(
+        aruna_runner::position::open_position(&cursor).unwrap(),
+        BlobHeadKey::new("spire", "b/needle-2").to_bytes().unwrap()
+    );
+
+    let mut next = test.input(denied, "needle");
+    next.start_after = Some(cursor);
+    let second = test.search(next, 2).await;
+    assert!(second.hits.is_empty());
+    assert_eq!(
+        second.next_start_after, None,
+        "the last key ends the ranges"
+    );
+}
+
+#[tokio::test]
+async fn building_range_incomplete() {
+    let building = IndexState::Building {
+        generation: 1,
+        cursor: None,
+    };
+    let test = distributed(building, &["a/needle-1"]).await;
+    let page = test
+        .search(test.input(owner(&test.fixture), "needle"), 100)
+        .await;
+    assert!(page.hits.is_empty(), "a building index is not searched");
+    assert_eq!(page.incomplete_ranges, 1);
+    assert_eq!(page.next_start_after, None);
+}
+
+#[tokio::test]
+async fn building_range_partial() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1", "b/needle-2", "c/needle-3"]).await;
+    test.building_through("b/needle-2").await;
+    let page = test
+        .search(test.input(owner(&test.fixture), "needle"), 100)
+        .await;
+    assert_eq!(
+        keys(&page),
+        ["a/needle-1", "b/needle-2"],
+        "keys past the cursor wait"
+    );
+    assert_eq!(page.incomplete_ranges, 1);
+    let through = Some("b/needle-2".to_string());
+    assert_eq!(page.partial_ranges, [(test.lower, through)]);
+    assert_eq!(page.next_start_after, None);
+}
+
+#[tokio::test]
+async fn partial_hides_key() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1", "b/needle-2"]).await;
+    test.building_through("b/needle-2").await;
+    let fixture = &test.fixture;
+    let allowed = object_permission_path(
+        fixture.realm_id,
+        fixture.visible_group,
+        fixture.node_id,
+        "spire",
+        "a/needle-1",
+    );
+    let narrow = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: allowed,
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    let page = test.search(test.input(narrow, "needle"), 100).await;
+    assert_eq!(keys(&page), ["a/needle-1"]);
+    assert_eq!(
+        page.partial_ranges,
+        [(test.lower, None)],
+        "a hidden key is never named"
+    );
+}
+
+#[tokio::test]
+async fn prefix_below_cursor() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jz/d"]).await;
+    test.building_through("job0/c").await;
+    let mut prefix = test.input(owner(&test.fixture), "job/");
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    let page = test.search(prefix.clone(), 100).await;
+    assert_eq!(keys(&page), ["job/a", "job/b"]);
+    assert_eq!(
+        page.incomplete_ranges, 0,
+        "every key of the prefix is indexed"
+    );
+    assert!(page.partial_ranges.is_empty());
+
+    prefix.query = "jz/".to_string();
+    let page = test.search(prefix, 100).await;
+    assert!(page.hits.is_empty(), "the prefix lies past the cursor");
+    assert_eq!(page.incomplete_ranges, 1);
+}
+
+#[tokio::test]
+async fn hidden_cursor_incomplete() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jz/d"]).await;
+    test.building_through("job0/c").await;
+    let fixture = &test.fixture;
+    let only = |key: &str| AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: object_permission_path(
+                fixture.realm_id,
+                fixture.visible_group,
+                fixture.node_id,
+                "spire",
+                key,
+            ),
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    for query in ["job/", "jz/"] {
+        let mut prefix = test.input(only("job/a"), query);
+        prefix.key_match = ObjectKeyMatch::Prefix;
+        let page = test.search(prefix, 100).await;
+        assert_eq!(
+            page.incomplete_ranges, 1,
+            "{query} must not reveal the cursor"
+        );
+        assert_eq!(page.partial_ranges, [(test.lower, None)]);
+    }
+
+    let mut prefix = test.input(only("job0/c"), "job/");
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    let page = test.search(prefix, 100).await;
+    assert_eq!(page.incomplete_ranges, 0, "a readable cursor still covers");
+}
+
+#[tokio::test]
+async fn prefix_window_continues() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["job/a", "job/b", "job0/c", "jo/d"]).await;
+    let mut prefix = test.input(owner(&test.fixture), "job/");
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    prefix.limit = 1;
+    let first = test.search(prefix.clone(), 100).await;
+    assert_eq!(keys(&first), ["job/a"]);
+    prefix.start_after = first.next_start_after;
+    let second = test.search(prefix, 100).await;
+    assert_eq!(keys(&second), ["job/b"]);
+    assert_eq!(second.next_start_after, None);
+}
+
+#[test]
+fn computes_prefix_end() {
+    assert_eq!(prefix_end("run/").as_deref(), Some("run0"));
+    assert_eq!(prefix_end("a\u{D7FF}").as_deref(), Some("a\u{E000}"));
+    assert_eq!(prefix_end("a\u{10FFFF}").as_deref(), Some("b"));
+    assert_eq!(prefix_end("\u{10FFFF}"), None);
+}
+
+#[tokio::test]
+async fn ordinary_prefix_search() {
+    let fixture = setup().await;
+    for (seed, key) in [(1, "aaa/x"), (2, "pre/1"), (3, "pre/2"), (4, "zzz/pre/3")] {
+        seed_materialized(&fixture, "visible", key, UNIX_EPOCH, seed).await;
+    }
+    let mut prefix = input(&fixture, owner(&fixture), "pre/", 10);
+    prefix.key_match = ObjectKeyMatch::Prefix;
+    prefix.bucket = Some("visible".to_string());
+    let page = search_local_objects(&fixture.context, prefix)
+        .await
+        .unwrap();
+    assert_eq!(keys(&page), ["pre/1", "pre/2"]);
+    assert_eq!(page.next_start_after, None);
+}
+
+#[tokio::test]
+async fn realm_skips_distributed() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["needle-spire"]).await;
+    let fixture = &test.fixture;
+    seed_materialized(fixture, "visible", "needle-visible", UNIX_EPOCH, 2).await;
+    let mut realm = input(fixture, owner(fixture), "needle", 10);
+    realm.as_of = SystemTime::now();
+    let page = search_local_objects(&fixture.context, realm).await.unwrap();
+    assert_eq!(keys(&page), ["needle-visible"]);
+    assert_eq!(
+        page.incomplete_ranges, 1,
+        "the skipped bucket is not covered"
+    );
+}
+
+// Metadata search goes through the same authorization and sealed continuation: a caller who
+// may not read the folders sees no hit and no key, the owner finds them by their terms.
+#[tokio::test]
+async fn metadata_hits_authorized() {
+    let ready = IndexState::Ready { generation: 1 };
+    let folders = ["a/", "b/", "c/"];
+    let test = distributed(ready, &folders).await;
+    let mut described = Vec::new();
+    for key in folders {
+        let organism = match key {
+            "b/" => "salmonella",
+            _ => "escherichia",
+        };
+        described.push(describe(&test.fixture, key, organism).await);
+    }
+    let set_id = test.binding.set_id;
+    (test.indexes.apply(set_id, test.lower, 1, described))
+        .await
+        .unwrap();
+    let metadata = |auth, query: &str| {
+        let mut input = test.input(auth, query);
+        input.key_match = ObjectKeyMatch::Metadata;
+        input
+    };
+    let fixture = &test.fixture;
+    let found = test
+        .search(metadata(owner(fixture), "Escherichia taxid=2"), 10)
+        .await;
+    assert_eq!(keys(&found), ["a/", "c/"]);
+
+    let elsewhere = object_permission_path(
+        fixture.realm_id,
+        fixture.visible_group,
+        fixture.node_id,
+        "spire",
+        "x",
+    );
+    let denied = AuthContext {
+        path_restrictions: Some(vec![PathRestriction {
+            pattern: elsewhere,
+            permission: Permission::READ,
+        }]),
+        ..owner(fixture)
+    };
+    let first = test.search(metadata(denied, "escherichia"), 1).await;
+    assert!(first.hits.is_empty());
+    let cursor = first
+        .next_start_after
+        .expect("the budget ends the page early");
+    assert!(sealed_position(&cursor));
+    let last = BlobHeadKey::new("spire", "a/").to_bytes().unwrap();
+    assert_eq!(
+        aruna_runner::position::open_position(&cursor).unwrap(),
+        last
+    );
+}
+
+// Metadata words of at least three characters match by their start, through the index query
+// and, for a prefix too common or too costly for the index, through the version check.
+#[tokio::test]
+async fn metadata_prefixes_found() {
+    let ready = IndexState::Ready { generation: 1 };
+    let folders = [("a/", "SAMD00012345"), ("b/", "SAMN00000001"), ("c/", "sa")];
+    for (scan, bytes) in [(1_000_000, usize::MAX), (0, usize::MAX), (1_000_000, 0)] {
+        let make = |path: &Path| RangeIndexes::with_scan(path, scan).with_range_bytes(bytes);
+        let test = distributed_with(ready.clone(), &[], make).await;
+        let mut changes = Vec::new();
+        for (key, organism) in folders {
+            changes.push(describe(&test.fixture, key, organism).await);
+        }
+        let set_id = test.binding.set_id;
+        (test.indexes.apply(set_id, test.lower, 1, changes))
+            .await
+            .unwrap();
+        let metadata = |query: &str| {
+            let mut input = test.input(owner(&test.fixture), query);
+            input.key_match = ObjectKeyMatch::Metadata;
+            input
+        };
+        assert_eq!(keys(&test.search(metadata("samd"), 10).await), ["a/"]);
+        assert_eq!(keys(&test.search(metadata("sa"), 10).await), ["c/"]);
+        assert!(test.search(metadata("amd0"), 10).await.hits.is_empty());
+    }
+}
+
+// A realm-wide scan skips the distributed bucket and names it, so the realm search can search
+// it through its ranges instead.
+#[tokio::test]
+async fn names_skipped_bucket() {
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1.txt"]).await;
+    let mut input = test.input(owner(&test.fixture), "needle");
+    input.bucket = None;
+
+    let page = search_local_objects(&test.fixture.context, input)
+        .await
+        .unwrap();
+
+    assert!(page.hits.is_empty());
+    assert_eq!(page.skipped_buckets, ["spire"]);
+    assert_eq!(page.incomplete_ranges, 1);
+}
+
+#[tokio::test]
+async fn removed_keys_uncounted() {
+    // The feed drops a deleted key from the index, so a commit after `as_of` leaves the
+    // changed keys unknown instead of zero.
+    let ready = IndexState::Ready { generation: 1 };
+    let test = distributed(ready, &["a/needle-1.txt", "b/needle-2.txt"]).await;
+    let input = test.input(owner(&test.fixture), "needle");
+    let before = test.search(input.clone(), 100).await;
+    assert_eq!(keys(&before), ["a/needle-1.txt", "b/needle-2.txt"]);
+    assert_eq!(before.changed, Some(Vec::new()));
+
+    let removed = vec![KeyChange::Remove("b/needle-2.txt".to_string())];
+    let (set_id, lower) = (test.binding.set_id, test.lower);
+    test.indexes.apply(set_id, lower, 1, removed).await.unwrap();
+
+    let after = test.search(input, 100).await;
+    assert_eq!(keys(&after), ["a/needle-1.txt"]);
+    assert_eq!(after.changed, None);
+}
+
+#[test]
+fn layout_tracks_coordinators() {
+    let (snapshot, _) = record(true);
+    let ranges = snapshot.config.ranges;
+    let mut moved = ranges.clone();
+    moved[0].coordinator = Ulid::from_bytes([9; 16]);
+    moved[0].epoch += 1;
+    let mut replicated = ranges.clone();
+    replicated[0].replicas.push(Ulid::from_bytes([8; 16]));
+    assert_eq!(layout_digest(&ranges), layout_digest(&ranges.clone()));
+    assert_ne!(layout_digest(&ranges), layout_digest(&moved));
+    assert_eq!(layout_digest(&ranges), layout_digest(&replicated));
+}
+
+fn step_input() -> SearchObjectsInput {
+    let realm_id = aruna_core::structs::identity::realm::RealmId::from_bytes([1; 32]);
+    SearchObjectsInput {
+        auth: AuthContext::anonymous(realm_id),
+        realm_id,
+        node_id: iroh::SecretKey::from_bytes(&[2; 32]).public(),
+        query: "needle".to_string(),
+        key_match: ObjectKeyMatch::Substring,
+        bucket: Some("spire".to_string()),
+        limit: 10,
+        start_after: None,
+        as_of: UNIX_EPOCH,
+    }
+}
+
+#[test]
+fn missing_record_uncovers() {
+    let (snapshot, _) = record(true);
+    let mut search =
+        RangeSearchOperation::new(step_input(), binding(&snapshot, 1, 5), EXAMINE_BUDGET, true);
+    search.first().unwrap();
+    let absent: Result<Option<DistributionView>, RecordError> = Ok(None);
+    let outcome = aruna_core::calls::ChildOutcome::new(absent);
+    let Ok(Next::Done(found)) = search.next(IoResult::Child(outcome)) else {
+        panic!("a missing record ends the search");
+    };
+    assert_eq!(found.incomplete_ranges, 1);
+    assert!(found.hits.is_empty());
+}
+
+#[test]
+fn absent_heads_skipped() {
+    let keys = ["a".to_string()];
+    let mut resolve = ResolveKeysOperation::new(&step_input(), "spire", &keys);
+    assert!(matches!(resolve.first(), Ok(Next::Call(IoCall::Read(_)))));
+    let answer = resolve.next(IoResult::Values(vec![None]));
+    assert_eq!(answer, Ok(Next::Done(Vec::new())));
+}

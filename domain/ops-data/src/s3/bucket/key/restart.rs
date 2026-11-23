@@ -1,0 +1,488 @@
+//! Finds the buckets whose holder-unlocked keys were unlocked before this start, also in mode off
+//! while a decryption keeps its source key, with those generations and the current holders.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::s3::bucket::key::rows::{SettingsError, authority_keys, keyless, parse_authority};
+use crate::s3::restart_notice::RestartedBucket;
+use aruna_core::calls::{IoCall, IoError, IoResult, Next};
+use aruna_core::errors::{ConversionError, StorageError};
+use aruna_core::keyspaces::{
+    BUCKET_AUDIT_KEYSPACE, BUCKET_ENCRYPTION_KEYSPACE, BUCKET_HOLDER_KEYSPACE, BUCKET_KEY_KEYSPACE,
+    KEY_COPY_KEYSPACE, S3_BUCKET_KEYSPACE,
+};
+use aruna_core::operation::Operation;
+use aruna_core::rows::read_row;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::structs::storage::blob::BucketInfo;
+use aruna_core::structs::storage::encryption::{
+    BucketEncryption, BucketHolder, BucketKeyRecord, KeyState, SealedCopy,
+};
+use aruna_core::structs::storage::holders::resolve_holders;
+use aruna_core::structs::storage::key_audit::{AuditAction, AuditOutcome, BucketAuditRecord};
+use aruna_core::types::{Key, Value};
+use aruna_core::user::id::UserId;
+use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
+use ulid::Ulid;
+
+const SCAN_LIMIT: usize = 1_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScanStep {
+    ScanSettings,
+    ScanKeys,
+    ScanAudit,
+    ReadBucket,
+    ReadAuthority,
+    ScanGrants,
+    ScanCopies,
+}
+
+#[derive(Debug, Error, PartialEq)]
+pub enum RestartScanError {
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
+    #[error("the restart scan did not finish")]
+    NotFinished,
+    #[error("the restart scan failed: {0}")]
+    Io(IoError),
+}
+
+impl From<IoError> for RestartScanError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Storage(error) => Self::Storage(error),
+            other => Self::Io(other),
+        }
+    }
+}
+
+type Step = Result<Next<Vec<RestartedBucket>>, RestartScanError>;
+
+/// One unlock session as the audit trail describes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Session {
+    id: Option<Ulid>,
+    deadline_ms: Option<u64>,
+}
+
+/// An unresolved intent, applied above the confirmed registry state.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Pending {
+    action: AuditAction,
+    session: Session,
+    at_ms: u64,
+}
+
+/// The action and time of the lock that ended a generation's last session.
+pub(crate) type Lock = (AuditAction, u64);
+
+/// Confirmed registry state and unresolved intents of one generation.
+#[derive(Debug, Default, PartialEq)]
+struct Trail {
+    open: Option<Session>,
+    intents: BTreeMap<Ulid, Pending>,
+    lock: Option<Lock>,
+    sequence: Option<Ulid>,
+}
+
+/// A record without a session applies to every session of its generation.
+fn same(left: Option<Ulid>, right: Option<Ulid>) -> bool {
+    left.is_none() || right.is_none() || left == right
+}
+
+impl Trail {
+    fn current(&self) -> (Option<Session>, Option<Lock>) {
+        let candidates = self.open.into_iter().chain(
+            self.intents
+                .values()
+                .filter(|pending| pending.action == AuditAction::Unlock)
+                .map(|pending| pending.session),
+        );
+        let open = candidates
+            .map(|mut session| {
+                for pending in self.intents.values().filter(|pending| {
+                    pending.action == AuditAction::Extend && same(session.id, pending.session.id)
+                }) {
+                    session.deadline_ms = match (session.deadline_ms, pending.session.deadline_ms) {
+                        (Some(left), Some(right)) => Some(left.max(right)),
+                        _ => None,
+                    };
+                }
+                session
+            })
+            .max_by_key(|session| (session.deadline_ms.is_none(), session.deadline_ms));
+        (open, open.is_none().then_some(self.lock).flatten())
+    }
+}
+
+impl Pending {
+    fn apply(&self, open: &mut Option<Session>, lock: &mut Option<Lock>) {
+        let matches = open.is_some_and(|open| same(open.id, self.session.id));
+        match self.action {
+            AuditAction::Unlock => (*open, *lock) = (Some(self.session), None),
+            AuditAction::Extend if matches => *open = Some(self.session),
+            AuditAction::Lock | AuditAction::TimedLock if open.is_none() || matches => {
+                (*open, *lock) = (None, Some((self.action, self.at_ms)));
+            }
+            AuditAction::RestartLock => {
+                (*open, *lock) = (None, Some((self.action, self.at_ms)));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Replays unlock state in storage order; failures undo only their own intent and session.
+/// An intent without an outcome counts as applied: a crash may lose the outcome after key use.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Replay {
+    trails: BTreeMap<u64, Trail>,
+}
+
+impl Replay {
+    pub(crate) fn apply(&mut self, record: &BucketAuditRecord) {
+        let Some(generation) = record.generation else {
+            return;
+        };
+        if !matches!(
+            record.action,
+            AuditAction::Unlock
+                | AuditAction::Extend
+                | AuditAction::Lock
+                | AuditAction::TimedLock
+                | AuditAction::RestartLock
+        ) {
+            return;
+        }
+        let trail = self.trails.entry(generation).or_default();
+        let pending = Pending {
+            action: record.action,
+            session: Session {
+                id: record.session_id,
+                deadline_ms: record.deadline_ms,
+            },
+            at_ms: record.at_ms,
+        };
+        if let Some(intent) = record.intent_id {
+            trail.intents.remove(&intent);
+        }
+        match record.outcome {
+            AuditOutcome::Intent => {
+                if matches!(record.action, AuditAction::Unlock | AuditAction::Extend) {
+                    let mut pending = pending;
+                    // Activation can follow the request deadline, so only outcomes establish expiry.
+                    pending.session.deadline_ms = None;
+                    trail.intents.insert(record.event_id, pending);
+                }
+            }
+            AuditOutcome::Applied => {
+                let sequence = record.sequence.unwrap_or(record.event_id);
+                if trail.sequence.is_none_or(|previous| previous < sequence) {
+                    trail.sequence = Some(sequence);
+                    if record.sequence.is_some() {
+                        match record.action {
+                            AuditAction::Unlock | AuditAction::Extend => {
+                                (trail.open, trail.lock) = (Some(pending.session), None);
+                            }
+                            _ => {
+                                (trail.open, trail.lock) =
+                                    (None, Some((record.action, record.at_ms)))
+                            }
+                        }
+                    } else {
+                        pending.apply(&mut trail.open, &mut trail.lock);
+                    }
+                    if record.action == AuditAction::RestartLock {
+                        trail.intents.clear();
+                    }
+                }
+            }
+            AuditOutcome::Failed => {}
+        }
+    }
+
+    /// The lock that ended each generation's last session, for the generations it applies to.
+    pub(crate) fn locks(&self) -> BTreeMap<u64, Lock> {
+        (self.trails.iter())
+            .filter_map(|(generation, trail)| trail.current().1.map(|lock| (*generation, lock)))
+            .collect()
+    }
+
+    /// The generations still unlocked at `now_ms`.
+    pub(crate) fn open(&self, now_ms: u64) -> Vec<u64> {
+        let live = |open: &Session| open.deadline_ms.is_none_or(|deadline| deadline > now_ms);
+        self.trails
+            .iter()
+            .filter(|(_, trail)| trail.current().0.as_ref().is_some_and(live))
+            .map(|(generation, _)| *generation)
+            .collect()
+    }
+}
+
+/// The generations `records`, in storage order, leave unlocked at `now_ms`.
+pub fn replay(records: &[BucketAuditRecord], now_ms: u64) -> Vec<u64> {
+    let mut replay = Replay::default();
+    records.iter().for_each(|record| replay.apply(record));
+    replay.open(now_ms)
+}
+
+#[derive(Debug, PartialEq)]
+pub struct RestartScanOperation {
+    /// The time of this start; a session whose deadline passed before it was not unlocked.
+    now_ms: u64,
+    realm_id: RealmId,
+    step: ScanStep,
+    /// Buckets with keys still to scan, by name and stable id.
+    pending: Vec<(String, Ulid)>,
+    current: Option<RestartedBucket>,
+    /// Retained generations of the current bucket that only a holder can unlock.
+    locked_keys: BTreeSet<u64>,
+    replay: Replay,
+    creator: Option<UserId>,
+    /// Current group admins, read from the authorization documents.
+    admins: BTreeSet<UserId>,
+    grants: Vec<BucketHolder>,
+    /// Copies of the unlocked generations.
+    copies: Vec<SealedCopy>,
+    found: Vec<RestartedBucket>,
+}
+
+impl RestartScanOperation {
+    pub fn new(now_ms: u64, realm_id: RealmId) -> Self {
+        Self {
+            now_ms,
+            realm_id,
+            step: ScanStep::ScanSettings,
+            pending: Vec::new(),
+            current: None,
+            locked_keys: BTreeSet::new(),
+            replay: Replay::default(),
+            creator: None,
+            admins: BTreeSet::new(),
+            grants: Vec::new(),
+            copies: Vec::new(),
+            found: Vec::new(),
+        }
+    }
+
+    fn scan(&mut self, step: ScanStep, key_space: &str, prefix: Option<Vec<u8>>) -> Step {
+        self.step = step;
+        Ok(iter(key_space, prefix, None, SCAN_LIMIT))
+    }
+
+    /// Grants and copies of one bucket are read whole.
+    fn scan_rows(&mut self, step: ScanStep, key_space: &str, bucket_id: Ulid) -> Step {
+        self.step = step;
+        let prefix = Some(bucket_id.to_bytes().to_vec());
+        Ok(iter(key_space, prefix, None, usize::MAX))
+    }
+
+    fn next_bucket(&mut self) -> Step {
+        let Some((bucket, bucket_id)) = self.pending.pop() else {
+            return Ok(Next::Done(std::mem::take(&mut self.found)));
+        };
+        self.locked_keys.clear();
+        self.replay = Replay::default();
+        self.grants.clear();
+        self.copies.clear();
+        self.current = Some(RestartedBucket {
+            bucket,
+            bucket_id,
+            group_id: Ulid::nil(),
+            generations: Vec::new(),
+            holders: Vec::new(),
+        });
+        self.scan_rows(ScanStep::ScanKeys, BUCKET_KEY_KEYSPACE, bucket_id)
+    }
+
+    /// A retained generation without a node copy stays locked until a holder unlocks it, also
+    /// in mode off while a decryption still needs its source key.
+    fn keys_scanned(&mut self, values: Vec<(Key, Value)>) -> Step {
+        for (_, value) in values {
+            let Ok(record) = BucketKeyRecord::from_bytes(value.as_ref()) else {
+                continue;
+            };
+            if record.state != KeyState::Retired && record.vault_entry.is_none() {
+                self.locked_keys.insert(record.key.generation);
+            }
+        }
+        let Some(current) = self.current.as_ref() else {
+            return Err(RestartScanError::NotFinished);
+        };
+        if self.locked_keys.is_empty() {
+            return self.next_bucket();
+        }
+        let prefix = current.bucket_id.to_bytes().to_vec();
+        self.scan(ScanStep::ScanAudit, BUCKET_AUDIT_KEYSPACE, Some(prefix))
+    }
+
+    fn settings_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Step {
+        for (key, value) in values {
+            let Ok(settings) = BucketEncryption::from_bytes(value.as_ref()) else {
+                continue;
+            };
+            let bucket = String::from_utf8_lossy(key.as_ref()).into_owned();
+            if let Some(bucket_id) = settings.bucket_id {
+                self.pending.push((bucket, bucket_id));
+            }
+        }
+        match next {
+            Some(start) => Ok(iter(
+                BUCKET_ENCRYPTION_KEYSPACE,
+                None,
+                Some(start),
+                SCAN_LIMIT,
+            )),
+            None => self.next_bucket(),
+        }
+    }
+
+    fn audit_scanned(&mut self, values: Vec<(Key, Value)>, next: Option<Key>) -> Step {
+        for (_, value) in values {
+            if let Ok(record) = BucketAuditRecord::from_bytes(value.as_ref()) {
+                self.replay.apply(&record);
+            }
+        }
+        let Some(current) = self.current.as_mut() else {
+            return Err(RestartScanError::NotFinished);
+        };
+        if let Some(start) = next {
+            let prefix = current.bucket_id.to_bytes().to_vec();
+            return Ok(iter(
+                BUCKET_AUDIT_KEYSPACE,
+                Some(prefix),
+                Some(start),
+                SCAN_LIMIT,
+            ));
+        }
+        let locked_keys = &self.locked_keys;
+        current.generations = (self.replay.open(self.now_ms).into_iter())
+            .filter(|generation| locked_keys.contains(generation))
+            .collect();
+        if current.generations.is_empty() {
+            return self.next_bucket();
+        }
+        self.step = ScanStep::ReadBucket;
+        let read = read_row(S3_BUCKET_KEYSPACE, current.bucket.as_bytes());
+        Ok(Next::Call(read))
+    }
+
+    fn bucket_read(&mut self, value: Option<Value>) -> Step {
+        // A bucket deleted meanwhile has nobody to tell.
+        let Some(value) = value else {
+            return self.next_bucket();
+        };
+        let info = BucketInfo::from_bytes(value.as_ref())?;
+        let Some(current) = self.current.as_mut() else {
+            return Err(RestartScanError::NotFinished);
+        };
+        current.group_id = info.group_id;
+        self.step = ScanStep::ReadAuthority;
+        let reads = authority_keys(&current.bucket, self.realm_id, info.group_id);
+        Ok(Next::Call(IoCall::Read(reads)))
+    }
+
+    /// Admin rights come from the current authorization documents, not from stored copies.
+    fn authority_scanned(&mut self, values: Vec<(Key, Option<Value>)>) -> Step {
+        let Some(current) = self.current.as_ref() else {
+            return Err(RestartScanError::NotFinished);
+        };
+        let state = parse_authority(values, self.realm_id, current.group_id)?;
+        self.creator = Some(state.info.created_by);
+        self.admins = state.admins;
+        let bucket_id = current.bucket_id;
+        self.scan_rows(ScanStep::ScanGrants, BUCKET_HOLDER_KEYSPACE, bucket_id)
+    }
+
+    fn rows_scanned(&mut self, values: Vec<(Key, Value)>) -> Step {
+        let Some(current) = self.current.as_mut() else {
+            return Err(RestartScanError::NotFinished);
+        };
+        for (key, value) in values {
+            match self.step {
+                ScanStep::ScanGrants => {
+                    let grant = BucketHolder::from_bytes(value.as_ref()).ok();
+                    self.grants.extend(grant);
+                }
+                // Token copies are not holder copies.
+                _ if SealedCopy::parse_key(&key).is_err() => {}
+                _ => {
+                    let copy = SealedCopy::from_bytes(value.as_ref())
+                        .ok()
+                        .filter(|copy| current.generations.contains(&copy.key.generation));
+                    self.copies.extend(copy);
+                }
+            }
+        }
+        if self.step == ScanStep::ScanGrants {
+            let bucket_id = current.bucket_id;
+            return self.scan_rows(ScanStep::ScanCopies, KEY_COPY_KEYSPACE, bucket_id);
+        }
+        // The holders now: creator, current admins and explicit grants; former admins are not.
+        let Some(creator) = self.creator.take() else {
+            return Err(RestartScanError::NotFinished);
+        };
+        let lookups = BTreeMap::new();
+        let report = resolve_holders(creator, &self.admins, &self.grants, &lookups, &self.copies);
+        let mut bucket = self.current.take();
+        if let Some(bucket) = bucket.as_mut() {
+            // Only local holders have an inbox to tell.
+            let holders = report.holders.iter().map(|holder| holder.user_id);
+            bucket.holders = holders
+                .filter(|user| user.realm_id == self.realm_id)
+                .collect();
+        }
+        self.found.extend(bucket);
+        self.next_bucket()
+    }
+}
+
+fn iter(
+    key_space: &str,
+    prefix: Option<Vec<u8>>,
+    start: Option<Key>,
+    limit: usize,
+) -> Next<Vec<RestartedBucket>> {
+    Next::Call(IoCall::Page {
+        space: key_space.to_string(),
+        prefix: prefix.unwrap_or_default().into(),
+        after: start,
+        limit,
+    })
+}
+
+impl Operation for RestartScanOperation {
+    type Output = Vec<RestartedBucket>;
+    type Error = RestartScanError;
+
+    fn first(&mut self) -> Step {
+        self.scan(ScanStep::ScanSettings, BUCKET_ENCRYPTION_KEYSPACE, None)
+    }
+
+    fn next(&mut self, result: IoResult) -> Step {
+        match self.step {
+            ScanStep::ScanSettings => {
+                let (values, next) = result.page()?;
+                self.settings_scanned(values, next)
+            }
+            ScanStep::ScanKeys => self.keys_scanned(result.page()?.0),
+            ScanStep::ScanAudit => {
+                let (values, next) = result.page()?;
+                self.audit_scanned(values, next)
+            }
+            ScanStep::ReadBucket => self.bucket_read(result.value()?),
+            ScanStep::ReadAuthority => self.authority_scanned(keyless(result.values()?)),
+            ScanStep::ScanGrants | ScanStep::ScanCopies => self.rows_scanned(result.page()?.0),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "restart_tests.rs"]
+mod tests;

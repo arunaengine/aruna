@@ -1,0 +1,114 @@
+# Manifest of aruna-api, the REST, S3 and MCP transport crate.
+# Copyright (c) 2026 The Aruna Contributors
+# SPDX-License-Identifier: MIT or Apache-2.0
+
+[package]
+name = "aruna-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+# Integration tests build as one binary; declare each new tests/ file in tests/main.rs.
+autotests = false
+
+[features]
+# Exposes the shared metadata test fixtures to the node crate's route tests.
+test-hooks = ["aruna-ops-work/test-hooks", "aruna-runner/test-hooks", "dep:aruna-test-harness"]
+
+[dependencies]
+zeroize = { workspace = true }
+# Aruna modules
+aruna-clock = { workspace = true }
+aruna-core = { workspace = true }
+aruna-ops-data = { workspace = true }
+aruna-ops-identity = { workspace = true }
+aruna-ops-work = { workspace = true }
+aruna-runner = { workspace = true }
+aruna-wire = { workspace = true }
+aruna-test-harness = { workspace = true, optional = true }
+
+# General
+ahash = { workspace = true }
+base64 = { workspace = true }
+hex.workspace = true
+opentelemetry = { workspace = true }
+percent-encoding = { workspace = true }
+prometheus-client = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+async_zip = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+ulid = { workspace = true }
+uuid = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { workspace = true }
+
+# HTTPS
+rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
+# REST
+axum = { workspace = true }
+byteview = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+crypto_box = { workspace = true }
+ed25519-dalek = { workspace = true }
+governor = { workspace = true }
+ipnet = { workspace = true }
+jsonwebtoken = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+utoipa-swagger-ui = { workspace = true }
+
+# S3
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+httparse = { workspace = true }
+mime = { workspace = true }
+tracing-core = { workspace = true }
+tower-http = { workspace = true }
+tower = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+s3s = { workspace = true }
+
+[dev-dependencies]
+aruna-core = { workspace = true, features = ["test-hooks"] }
+iroh = { workspace = true }
+aruna-test-harness = { workspace = true }
+aruna-rdf-graph = { workspace = true }
+aruna-ops-data = { workspace = true, features = ["test-hooks"] }
+aruna-ops-work = { workspace = true, features = ["test-hooks"] }
+aruna-runner = { workspace = true, features = ["test-hooks"] }
+aruna-blob = { workspace = true }
+aruna-compute = { workspace = true, default-features = false }
+tokio = { workspace = true, features = ["test-util"] }
+aruna-p2p = { workspace = true, features = ["test-hooks"] }
+tracing-subscriber = { workspace = true }
+aruna-storage = { workspace = true, features = ["test-hooks"] }
+aruna-scheduler = { workspace = true }
+rmcp = { workspace = true, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+] }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
+zip = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"

@@ -1,0 +1,163 @@
+//! Hashes every value a plan was made from, so a replayed launch can be checked against it.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::compute::ResourceEnvelope;
+use crate::scheduling::cost::InputRoute;
+use crate::scheduling::inputs::{PlanRequest, TargetCandidate, TargetScore};
+use crate::structs::execution::job::input::InputContent;
+use crate::structs::execution::source_access::write_fingerprint_field;
+
+pub const PLAN_DIGEST_DOMAIN: &[u8] = b"aruna-execution-plan-v2";
+
+/// Digest over the request identity, the pinned inputs and their chosen
+/// sources, the target's eligibility values and stored subject, and the score.
+/// `routes` is parallel to `request.inputs`, which is canonically ordered.
+pub fn plan_digest(
+    request: &PlanRequest,
+    candidate: &TargetCandidate,
+    routes: &[InputRoute],
+    score: &TargetScore,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(PLAN_DIGEST_DOMAIN);
+    hasher.update(&request.submission_id.0);
+    hasher.update(&request.request_digest);
+    hasher.update(&request.spec_digest);
+
+    let resources = &request.resources;
+    hasher.update(&u64::from(resources.cpu_cores).to_le_bytes());
+    hasher.update(&resources.ram_bytes.to_le_bytes());
+    hasher.update(&resources.disk_bytes.to_le_bytes());
+    hasher.update(&resources.max_walltime_ms.to_le_bytes());
+    flag(&mut hasher, resources.preemptible);
+    hasher.update(&request.group_id.to_bytes());
+    write_fingerprint_field(&mut hasher, request.executor_constraint.as_deref());
+    write_fingerprint_field(&mut hasher, request.backend.as_deref());
+    count(&mut hasher, request.required_labels.len());
+    for label in &request.required_labels {
+        write_fingerprint_field(&mut hasher, Some(&label.key));
+        write_fingerprint_field(&mut hasher, Some(&label.value));
+    }
+    hasher.update(&[request.staging as u8, request.network as u8]);
+    flag(&mut hasher, request.session);
+
+    count(&mut hasher, request.inputs.len());
+    for (input, route) in request.inputs.iter().zip(routes) {
+        write_fingerprint_field(&mut hasher, Some(&input.destination_key));
+        hasher.update(&input.version_id.to_bytes());
+        content(&mut hasher, &input.content);
+        hasher.update(&input.bytes.to_le_bytes());
+        count(&mut hasher, input.policies.len());
+        for policy in &input.policies {
+            hasher.update(&policy.policy_id.to_bytes());
+            hasher.update(&policy.digest);
+        }
+        match route.source_node_id {
+            Some(node_id) => {
+                hasher.update(&[1]);
+                hasher.update(node_id.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&route.transfer_ms.to_le_bytes());
+        hasher.update(&route.transfer_bytes.to_le_bytes());
+        flag(&mut hasher, route.known_link);
+    }
+    count(&mut hasher, request.output_policies.len());
+    for policy in &request.output_policies {
+        hasher.update(&policy.policy_id.to_bytes());
+        hasher.update(&policy.digest);
+    }
+
+    let capability = &candidate.capability;
+    hasher.update(candidate.node_id.as_bytes());
+    write_fingerprint_field(&mut hasher, Some(&capability.backend));
+    write_fingerprint_field(&mut hasher, Some(&capability.kind));
+    write_fingerprint_field(&mut hasher, Some(candidate.node_kind.label()));
+    hasher.update(&capability.subject_digest);
+    hasher.update(&capability.subject.generation.to_le_bytes());
+    hasher.update(&capability.config_digest);
+    hasher.update(&capability.config_generation.to_le_bytes());
+    ceiling(&mut hasher, capability.max_walltime_ms);
+    count(&mut hasher, capability.groups.len());
+    for group_id in &capability.groups {
+        hasher.update(&group_id.to_bytes());
+    }
+    let suitability = &capability.suitability;
+    for value in [
+        suitability.batch,
+        suitability.sessions,
+        suitability.services,
+    ] {
+        hasher.update(&[value as u8]);
+    }
+    for value in [
+        candidate.active,
+        candidate.compute_draining,
+        candidate.group_allowed,
+        capability.file_staging,
+        capability.direct_s3,
+        capability.s3_mount,
+        capability.network_policy,
+        capability.session,
+        capability.policy_draining,
+    ] {
+        flag(&mut hasher, value);
+    }
+    let ResourceEnvelope {
+        max_cpu_cores,
+        max_ram_bytes,
+        max_disk_bytes,
+        max_concurrent,
+    } = capability.limits;
+    ceiling(&mut hasher, max_cpu_cores.map(u64::from));
+    ceiling(&mut hasher, max_ram_bytes);
+    ceiling(&mut hasher, max_disk_bytes);
+    ceiling(&mut hasher, max_concurrent.map(u64::from));
+
+    hasher.update(&score.estimated_transfer_ms.to_le_bytes());
+    hasher.update(&score.transfer_bytes.to_le_bytes());
+    hasher.update(&score.availability_pressure_permille.to_le_bytes());
+    hasher.update(&score.node_load_permille.to_le_bytes());
+    hasher.update(&score.compute_priority_inverse.to_le_bytes());
+    hasher.update(&score.unknown_link_count.to_le_bytes());
+    *hasher.finalize().as_bytes()
+}
+
+/// A tag per content kind, so a hash and an ETag never encode alike.
+fn content(hasher: &mut blake3::Hasher, value: &InputContent) {
+    match value {
+        InputContent::Blake3(hash) => {
+            hasher.update(&[0]);
+            hasher.update(hash);
+        }
+        InputContent::Reference { etag, range_bound } => {
+            hasher.update(&[1]);
+            write_fingerprint_field(hasher, etag.as_deref());
+            flag(hasher, *range_bound);
+        }
+    }
+}
+
+fn count(hasher: &mut blake3::Hasher, value: usize) {
+    hasher.update(&(value as u64).to_le_bytes());
+}
+
+fn flag(hasher: &mut blake3::Hasher, value: bool) {
+    hasher.update(&[u8::from(value)]);
+}
+
+fn ceiling(hasher: &mut blake3::Hasher, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+        None => {
+            hasher.update(&[0]);
+        }
+    }
+}

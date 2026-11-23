@@ -1,0 +1,109 @@
+//! Audit records of a bucket's key state: unlocks, locks, mode changes and holder changes. They
+//! stay on the bucket node and never carry key bytes, grants or vault payloads.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::errors::ConversionError;
+use crate::id::NodeId;
+use crate::user::id::UserId;
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditAction {
+    Unlock,
+    Extend,
+    Lock,
+    TimedLock,
+    RestartLock,
+    ModeChange,
+    HolderGrant,
+    HolderRemoval,
+    Rotation,
+    /// A token credential got sealed copies of the bucket key.
+    TokenCreated,
+}
+
+/// A volatile change records its intent before it applies, then its outcome; an intent alone
+/// never reads as success.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Intent,
+    Applied,
+    Failed,
+}
+
+/// One audit event, stored in `bucket_audit` under bucket id and its time-ordered event id.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+pub struct BucketAuditRecord {
+    pub event_id: Ulid,
+    pub bucket_id: Ulid,
+    pub at_ms: u64,
+    pub action: AuditAction,
+    /// None for actions of the node itself, such as a timed or restart lock.
+    pub actor: Option<UserId>,
+    pub node_id: NodeId,
+    pub generation: Option<u64>,
+    /// The unlock session an unlock, extension or lock names; none for actions of a generation.
+    pub session_id: Option<Ulid>,
+    /// The event id of the intent an applied or failed outcome completes.
+    pub intent_id: Option<Ulid>,
+    pub sequence: Option<Ulid>,
+    pub deadline_ms: Option<u64>,
+    pub reason: Option<String>,
+    pub outcome: AuditOutcome,
+}
+
+impl BucketAuditRecord {
+    /// Bucket id, then the event id, so one bucket's trail scans in time order.
+    pub fn key(&self) -> Vec<u8> {
+        [&self.bucket_id.to_bytes()[..], &self.event_id.to_bytes()].concat()
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ConversionError> {
+        Ok(postcard::to_allocvec(self)?)
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConversionError> {
+        Ok(postcard::from_bytes(bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::structs::identity::realm::RealmId;
+
+    #[test]
+    fn trail_keys_ordered() {
+        let record = |event: u64| BucketAuditRecord {
+            event_id: Ulid::from_parts(event, 1),
+            bucket_id: Ulid::from_bytes([2; 16]),
+            at_ms: event,
+            action: AuditAction::Unlock,
+            actor: Some(UserId::new(
+                Ulid::from_bytes([3; 16]),
+                RealmId::from_bytes([1; 32]),
+            )),
+            node_id: iroh::SecretKey::from_bytes(&[4; 32]).public(),
+            generation: Some(1),
+            session_id: None,
+            intent_id: None,
+            sequence: None,
+            deadline_ms: None,
+            reason: None,
+            outcome: AuditOutcome::Intent,
+        };
+        let (early, late) = (record(5), record(6));
+        assert!(early.key() < late.key());
+        assert!(early.key().starts_with(&early.bucket_id.to_bytes()));
+        assert_eq!(
+            BucketAuditRecord::from_bytes(&late.to_bytes().unwrap()).unwrap(),
+            late
+        );
+        let names = serde_json::to_value((AuditAction::TimedLock, AuditOutcome::Applied)).unwrap();
+        assert_eq!(names, serde_json::json!(["timed_lock", "applied"]));
+    }
+}

@@ -1,0 +1,37 @@
+//! Builds realm, node and auth fixtures for location summary request tests.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::id::NodeId;
+use aruna_core::replication_protocol::LocationSummaryRequest;
+use aruna_core::structs::identity::auth::AuthContext;
+use aruna_core::structs::identity::realm::RealmId;
+use aruna_core::user::id::UserId;
+use ulid::Ulid;
+
+pub fn realm_id() -> RealmId {
+    RealmId::from_bytes([1u8; 32])
+}
+
+pub fn node_id(seed: u8) -> NodeId {
+    iroh::SecretKey::from_bytes(&[seed; 32]).public()
+}
+
+pub fn auth() -> AuthContext {
+    AuthContext {
+        user_id: UserId::nil(realm_id()),
+        realm_id: realm_id(),
+        path_restrictions: None,
+        session: None,
+    }
+}
+
+pub fn request(version_id: Option<Ulid>) -> LocationSummaryRequest {
+    LocationSummaryRequest {
+        realm_id: realm_id(),
+        bucket: "raw".to_string(),
+        key: "run1.tar".to_string(),
+        version_id,
+        auth_context: auth(),
+    }
+}

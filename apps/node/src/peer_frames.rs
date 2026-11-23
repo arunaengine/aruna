@@ -1,0 +1,245 @@
+//! Reads the request of a peer protocol the trigger table serves and writes its answer back, in
+//! that protocol's framing. The table decides what a request means; this file only moves bytes.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::sync::Arc;
+
+use crate::inbound_frames;
+use aruna_blob::native;
+use aruna_core::alpn::Alpn;
+use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
+use aruna_core::id::NodeId;
+use aruna_core::structs::execution::notification::NotificationTransportMessage;
+use aruna_ops_identity::shard::incoming::ManifestAnswer;
+use aruna_ops_work::triggers::{PeerAnswer, PeerFailure, PeerInput, PeerRequest};
+use aruna_p2p::NetHandle;
+use aruna_p2p::heartbeat::HeartbeatSlot;
+use aruna_p2p::job_control;
+use aruna_p2p::notification::{
+    close_stream, drain_request, read_frame, write_frame, write_message,
+};
+use aruna_p2p::shard_manifest::{
+    close_shard_stream, read_manifest_request, write_manifest, write_rejection,
+};
+use aruna_p2p::streams::BiStream;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, error, warn};
+
+/// A peer request as its protocol frames it, with the admission it holds while it is served.
+pub(crate) struct PeerRead {
+    pub(crate) request: PeerRequest,
+    pub(crate) slot: Option<HeartbeatSlot>,
+    pub(crate) metadata: Option<MetadataHeld>,
+}
+
+/// What metadata requests share while they are served: the payload bytes and the audit slots.
+#[derive(Debug)]
+pub(crate) struct PeerLimits {
+    pub(crate) frame_budget: Arc<Semaphore>,
+    pub(crate) audit_slots: Arc<Semaphore>,
+}
+
+/// The frame bytes and audit slot a metadata request holds until its answer is written.
+pub(crate) struct MetadataHeld {
+    _budget: OwnedSemaphorePermit,
+    _audit_slot: Option<OwnedSemaphorePermit>,
+    /// An audit request keeps one deadline for every step after it was read.
+    pub(crate) audit: Option<tokio::time::Instant>,
+}
+
+/// Reads the request of one converted protocol in its framing; a refused or broken read is
+/// only logged.
+pub(crate) async fn read_peer(
+    alpn: Alpn,
+    stream: &mut BiStream,
+    peer: NodeId,
+    net_handle: &NetHandle,
+    limits: &PeerLimits,
+) -> Option<PeerRead> {
+    let (request, slot) = match alpn {
+        Alpn::Heartbeat => {
+            let Some(slot) = net_handle.heartbeat_slot(peer) else {
+                debug!(%peer, "Dropping a heartbeat stream past the stream limits");
+                return None;
+            };
+            let read = tokio::time::timeout(HEARTBEAT_IO_TIMEOUT, heartbeat_frame(stream)).await;
+            let _ = stream.0.finish();
+            match read {
+                Ok(Ok(frame)) => (PeerRequest::Frame(frame), Some(slot)),
+                Ok(Err(error)) => {
+                    debug!(%peer, %error, "Dropping an invalid heartbeat");
+                    return None;
+                }
+                Err(_) => {
+                    debug!(%peer, "Heartbeat read timed out");
+                    return None;
+                }
+            }
+        }
+        Alpn::Shard => match read_manifest_request(stream).await {
+            Ok(message) => (PeerRequest::Manifest(message), None),
+            Err(error) => {
+                warn!(peer = %peer, error = %error, "Failed to read shard manifest request");
+                return None;
+            }
+        },
+        Alpn::JobControl => {
+            let request = job_control::read_request(stream, peer).await?;
+            (PeerRequest::Job(request), None)
+        }
+        Alpn::NativeReference => {
+            let request = native::read_request(stream, peer).await?;
+            (PeerRequest::Native(request), None)
+        }
+        Alpn::Notification => {
+            let frame = match read_frame(stream).await {
+                Ok(frame) => frame,
+                Err(error) => {
+                    warn!(peer = %peer, error = %error, "Failed to read notification message");
+                    return None;
+                }
+            };
+            if let Err(error) = drain_request(stream).await {
+                warn!(peer = %peer, error = %error, "Failed to drain notification request stream");
+                close_stream(stream).await;
+                return None;
+            }
+            (PeerRequest::Frame(frame), None)
+        }
+        Alpn::Metadata => return read_metadata(stream, peer, limits).await,
+        other => {
+            warn!(peer = %peer, alpn = ?other, "No peer table framing for this protocol");
+            return None;
+        }
+    };
+    Some(PeerRead {
+        request,
+        slot,
+        metadata: None,
+    })
+}
+
+/// Reads a metadata request within the frame budget; an audit page past the audit slots is read
+/// as refused.
+async fn read_metadata(
+    stream: &mut BiStream,
+    peer: NodeId,
+    limits: &PeerLimits,
+) -> Option<PeerRead> {
+    let read = match inbound_frames::read_request(stream, &limits.frame_budget).await {
+        Ok(read) => read,
+        Err(error) => {
+            error!(peer = %peer, error = ?error, "Failed to read inbound metadata request");
+            return None;
+        }
+    };
+    let slots = limits.audit_slots.clone();
+    let admitted = read.audit.map(|_| slots.try_acquire_owned().ok());
+    let request = PeerRequest::Metadata {
+        message: Box::new(read.message),
+        refused: matches!(admitted, Some(None)),
+    };
+    let held = MetadataHeld {
+        _budget: read.budget,
+        _audit_slot: admitted.flatten(),
+        audit: read.audit,
+    };
+    Some(PeerRead {
+        request,
+        slot: None,
+        metadata: Some(held),
+    })
+}
+
+/// Writes the answer of one converted protocol in its framing and closes the stream.
+pub(crate) async fn write_peer(
+    input: &PeerInput,
+    mut stream: BiStream,
+    answer: Result<PeerAnswer, PeerFailure>,
+    audit: Option<tokio::time::Instant>,
+) {
+    let peer = input.peer;
+    let written = match (input.alpn, answer) {
+        (Alpn::Metadata, Ok(PeerAnswer::Metadata((response, body)))) => {
+            let written = inbound_frames::write_answer(stream, audit, &response, body).await;
+            written.map_err(|error| error.to_string())
+        }
+        (Alpn::JobControl, Ok(PeerAnswer::Job(answer))) => {
+            job_control::write_answer(stream, peer, &answer.response, answer.body).await;
+            Ok(())
+        }
+        (Alpn::NativeReference, Ok(PeerAnswer::Native((response, body)))) => {
+            native::write_answer(stream, peer, &response, body).await;
+            Ok(())
+        }
+        (Alpn::Shard, answer) => {
+            let written = match answer {
+                Ok(PeerAnswer::Manifest(ManifestAnswer::Manifest(manifest))) => {
+                    write_manifest(&mut stream, &manifest).await
+                }
+                Ok(PeerAnswer::Manifest(ManifestAnswer::Reject(reason))) => {
+                    write_rejection(&mut stream, reason).await
+                }
+                Ok(_) => {
+                    let reason = "unexpected shard answer".to_string();
+                    write_rejection(&mut stream, reason).await
+                }
+                Err(error) => write_rejection(&mut stream, error.to_string()).await,
+            };
+            close_shard_stream(&mut stream).await;
+            written
+        }
+        (Alpn::Notification, answer) => {
+            let written = match answer {
+                Ok(PeerAnswer::Frame(frame)) => write_frame(&mut stream, &frame).await,
+                Ok(_) => refuse_notification(input, &mut stream).await,
+                Err(error) => Err(error.to_string()),
+            };
+            close_stream(&mut stream).await;
+            written
+        }
+        (Alpn::Heartbeat, Ok(PeerAnswer::Kept)) => Ok(()),
+        (Alpn::Heartbeat, Err(failure)) => Err(failure.to_string()),
+        (Alpn::JobControl | Alpn::NativeReference, Err(failure)) => Err(failure.to_string()),
+        (alpn, Ok(_)) => Err(format!("unexpected {alpn:?} answer")),
+        (alpn, Err(failure)) => Err(format!("no {alpn:?} framing for a failed run: {failure}")),
+    };
+    if let Err(error) = written {
+        warn!(peer = %peer, alpn = ?input.alpn, error = %error, "Failed to write peer answer");
+    }
+}
+
+/// Every notification request has an operation; an answer frame sent as a request is refused.
+async fn refuse_notification(input: &PeerInput, stream: &mut BiStream) -> Result<(), String> {
+    let PeerRequest::Frame(frame) = &input.request else {
+        return Err("notification request without a frame".to_string());
+    };
+    let message = postcard::from_bytes::<NotificationTransportMessage>(frame)
+        .map_err(|error| error.to_string())?;
+    debug!(peer = %input.peer, message = message.label(), "Received notification message");
+    let reason = "unexpected notification control message".to_string();
+    write_message(stream, &NotificationTransportMessage::Reject(reason)).await
+}
+
+/// One length-prefixed heartbeat frame, at most [`MAX_HEARTBEAT_BYTES`] long.
+async fn heartbeat_frame(stream: &mut BiStream) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncReadExt;
+    let mut length = [0u8; 4];
+    stream
+        .1
+        .read_exact(&mut length)
+        .await
+        .map_err(|error| error.to_string())?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_HEARTBEAT_BYTES {
+        return Err("heartbeat frame exceeds the size limit".to_string());
+    }
+    let mut bytes = vec![0u8; length];
+    stream
+        .1
+        .read_exact(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(bytes)
+}

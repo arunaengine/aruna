@@ -5,7 +5,7 @@
 use std::cell::RefCell;
 
 use crate::Level;
-use crate::bindings::aruna::plugin::jobs::{DownloadRequest, Status, UploadRequest};
+use crate::bindings::aruna::plugin::jobs::{DownloadRequest, Status, TaskRequest, UploadRequest};
 use crate::bindings::aruna::plugin::metadata_create::Created;
 use crate::bindings::aruna::plugin::metadata_read::{Document, FilePage, Listing};
 use crate::bindings::aruna::plugin::objects_read::{ObjectInfo, ObjectPage};
@@ -43,6 +43,7 @@ pub(crate) trait Host {
     fn job_copy(&self, source: &str, version: Option<&str>, target: &str) -> Answer<String>;
     fn job_download(&self, request: &DownloadRequest) -> Answer<String>;
     fn job_upload(&self, request: &UploadRequest) -> Answer<String>;
+    fn job_task(&self, request: &TaskRequest) -> Answer<String>;
     fn job_get(&self, id: &str) -> Answer<Status>;
     fn job_outputs(&self, id: &str, cursor: Option<&str>) -> Answer<ObjectPage>;
     fn job_cancel(&self, id: &str) -> Answer<()>;
@@ -129,6 +130,10 @@ impl Host for Imports {
 
     fn job_upload(&self, request: &UploadRequest) -> Answer<String> {
         jobs::upload(request)
+    }
+
+    fn job_task(&self, request: &TaskRequest) -> Answer<String> {
+        jobs::start_task(request)
     }
 
     fn job_get(&self, id: &str) -> Answer<Status> {

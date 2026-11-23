@@ -1,0 +1,309 @@
+//! Tests the terminal publication a receipted execution owes: outputs, update and projection.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use aruna_core::compute::ResourceEnvelope;
+use aruna_core::effects::JobRecordFrame;
+use aruna_core::keyspaces::JOB_RESERVATION_KEYSPACE;
+use aruna_core::structs::execution::job::family::{
+    ExecutionReceipt, JobFamilyRecord, LogicalJobState, PhysicalExecutionState,
+};
+use aruna_core::structs::execution::job::identity::{JobId, JobState};
+use aruna_core::structs::execution::job::input::JobPayload;
+use aruna_core::structs::execution::job::local::{
+    AttemptIntent, JobClaim, JobRecord, JobResultPayload, OutputObject,
+};
+use aruna_p2p::NetHandle;
+use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
+use tempfile::TempDir;
+use ulid::Ulid;
+
+use super::resources;
+use crate::jobs::lifecycle::chain::ExecutionChainOperation;
+use crate::jobs::lifecycle::reservation::{ReserveExecutionConfig, ReserveExecutionOperation};
+use crate::jobs::lifecycle::updates::{PublishStateOperation, PublishTerminalOperation};
+use crate::jobs::output_record::StoreOutputsOperation;
+use crate::jobs::records::append::{AppendRecordConfig, AppendRecordOperation, RecordOrigin};
+use crate::jobs::records::family::LoadFamilyOperation;
+use crate::jobs::records::reduce::reduce_family;
+use crate::tests::records::{Family, REALM, context};
+use aruna_runner::driver::{DriverContext, drive};
+use aruna_storage::scan::iter_prefix_page;
+
+const TOKEN: Ulid = Ulid(0x7E12);
+
+/// The local physical row a target mints for an admitted launch. It is never
+/// the logical job id the family records are keyed by.
+pub(super) fn physical() -> JobId {
+    JobId::from_bytes([31u8; 16])
+}
+
+/// One node of the family with a live net handle, so it can sign the records
+/// only that node may publish.
+pub(super) async fn node_context(
+    family: &Family,
+    key: &iroh::SecretKey,
+) -> (TempDir, DriverContext) {
+    let (dir, ctx) = context(&family.config, family.holder.public()).await;
+    let net_handle = NetHandle::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback address"),
+            secret_key: Some(key.clone()),
+            realm_id: REALM,
+            discovery_method: DiscoveryMethod::None,
+            relay_method: RelayMethod::None,
+            ..NetConfig::default()
+        },
+        ctx.storage_handle.clone(),
+    )
+    .await
+    .expect("net handle starts");
+    (
+        dir,
+        DriverContext {
+            net_handle: Some(net_handle),
+            ..ctx
+        },
+    )
+}
+
+/// Stores every family record the receipt chains to, exactly as replication
+/// delivers them to the target before it admits the launch.
+pub(super) async fn seed_family(ctx: &DriverContext, family: &Family) -> ExecutionReceipt {
+    let spec = family.spec();
+    let launch = family.launch(&spec, family.holder.public(), 0);
+    for record in [
+        JobFamilyRecord::Spec(Box::new(spec.clone())),
+        JobFamilyRecord::Claim(family.claim(&spec)),
+        JobFamilyRecord::Budget(family.budget(&spec, family.holder.public())),
+        JobFamilyRecord::Launch(Box::new(launch.clone())),
+    ] {
+        let frame =
+            JobRecordFrame::new(family.sign(&family.holder, record)).expect("bounded record");
+        drive(
+            AppendRecordOperation::new(AppendRecordConfig {
+                realm_id: REALM,
+                local_node_id: family.target.public(),
+                record: frame,
+                local: None,
+                origin: RecordOrigin::Peer(family.holder.public()),
+                now_ms: 3_000,
+            }),
+            ctx,
+        )
+        .await
+        .expect("append completes");
+    }
+    family.receipt(&launch, 1)
+}
+
+/// Commits the receipt with the reservation that binds the local physical row
+/// to the logical job the family knows.
+pub(super) async fn reserve_execution(
+    ctx: &DriverContext,
+    family: &Family,
+    receipt: &ExecutionReceipt,
+) -> JobRecord {
+    let spec = family.spec();
+    let launch = family.launch(&spec, family.holder.public(), 0);
+    let frame = JobRecordFrame::new(family.sign(
+        &family.target,
+        JobFamilyRecord::Receipt(Box::new(receipt.clone())),
+    ))
+    .expect("bounded receipt");
+    let mut record = JobRecord::new(
+        physical(),
+        JobPayload::Execution(spec.payload.clone()),
+        spec.created_by,
+        family.target.public(),
+        4_000,
+        4_000,
+        None,
+    );
+    record.state = JobState::Running;
+    record.claim = Some(JobClaim {
+        holder_node_id: family.target.public(),
+        claim_token: TOKEN,
+        lease_expires_ms: 100_000,
+    });
+    drive(
+        ReserveExecutionOperation::new(ReserveExecutionConfig {
+            realm_id: REALM,
+            local_node_id: family.target.public(),
+            envelope: ResourceEnvelope::default(),
+            receipt: frame,
+            launch: Box::new(launch),
+            job_id: physical(),
+            logical_job_id: spec.job_id,
+            execution_id: receipt.execution_id,
+            resources: resources(),
+            subject_generation: receipt.subject_generation,
+            subject_digest: receipt.subject_digest,
+            config_generation: receipt.config_generation,
+            config_digest: receipt.config_digest,
+            record: Box::new(record.clone()),
+            now_ms: 4_000,
+            fence: None,
+        }),
+        ctx,
+    )
+    .await
+    .expect("offer is admitted");
+    record
+}
+
+#[tokio::test]
+async fn publishes_terminal_success() {
+    // The whole terminal path of one receipted execution: the local physical
+    // job id must never be read as the logical alias the family is keyed by.
+    let family = Family::new([21u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    let record = reserve_execution(&ctx, &family, &receipt).await;
+    let intent = AttemptIntent {
+        attempt_no: 1,
+        external_name: "aruna-terminal-1".to_string(),
+        executor_kind: "docker".to_string(),
+        pinned_image: "alpine@sha256:0".to_string(),
+        attempt_epoch: 0,
+        backend: "docker".to_string(),
+        config_generation: 0,
+        home_digest: aruna_core::compute::identity::home_digest("docker", None),
+    };
+    let commit = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::record_attempt_intent(
+            physical(),
+            TOKEN,
+            intent,
+            Some(receipt.execution_id),
+            None,
+            4_100,
+        ),
+        &ctx,
+    )
+    .await
+    .expect("attempt intent commits");
+    let executor = family.target.public();
+    let destinations = [(executor, "ws".to_string(), "out.txt".to_string())];
+    let control = aruna_runner::driver::drive(
+        crate::jobs::store::job_calls::reserve_output_commits(
+            physical(),
+            destinations.to_vec(),
+            Default::default(),
+            aruna_core::time::unix_timestamp_millis(),
+        ),
+        &ctx,
+    )
+    .await
+    .expect("output commits reserved");
+    let outputs = vec![OutputObject {
+        node_id: executor,
+        bucket: "ws".to_string(),
+        key: "out.txt".to_string(),
+        version_id: control.output_commits[0].version_id,
+        execution_id: control.execution_id,
+        container_path: "/out/out.txt".to_string(),
+        size: 3,
+        digest: None,
+    }];
+
+    let store = StoreOutputsOperation::new(
+        &commit.record,
+        &control,
+        &outputs,
+        ctx.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    let output_digest = aruna_runner::driver::drive(store, &ctx)
+        .await
+        .expect("outputs stored");
+    let mut terminal = record;
+    terminal.state = JobState::Succeeded;
+    terminal.finished_at_ms = Some(5_000);
+    terminal.result = Some(JobResultPayload::Execution {
+        exit_code: Some(0),
+        workspace_bucket: None,
+        outputs,
+        stdout: String::new(),
+        stderr: String::new(),
+        output_digest: Some(output_digest),
+    });
+    assert!(publish_terminal(&ctx, &terminal).await);
+
+    let records = drive(LoadFamilyOperation::family(family.family()), &ctx)
+        .await
+        .expect("family read completes");
+    assert!(records.iter().any(|envelope| matches!(
+        &envelope.record,
+        JobFamilyRecord::Update(update)
+            if update.state == PhysicalExecutionState::Succeeded
+                && update.execution_id == receipt.execution_id
+    )));
+    let projection = reduce_family(family.family(), &records)
+        .expect("family reduces")
+        .expect("family has a projection");
+    assert_eq!(projection.state, LogicalJobState::Succeeded);
+    assert_eq!(
+        projection.canonical_execution_id,
+        Some(receipt.execution_id)
+    );
+    assert_eq!(projection.outputs.as_slice().len(), 1);
+    let (held, _) = iter_prefix_page(
+        &ctx.storage_handle,
+        JOB_RESERVATION_KEYSPACE,
+        None,
+        None,
+        8,
+        None,
+    )
+    .await
+    .expect("reservation scan");
+    assert!(held.is_empty());
+}
+
+#[tokio::test]
+async fn bumps_dashboard_once() {
+    // A new state advances the dashboard revision; a replay of it does not.
+    let family = Family::new([22u8; 32]);
+    let (_dir, ctx) = node_context(&family, &family.target).await;
+    let receipt = seed_family(&ctx, &family).await;
+    let mut terminal = reserve_execution(&ctx, &family, &receipt).await;
+    let chain = drive(ExecutionChainOperation::of_job(physical()), &ctx)
+        .await
+        .expect("chain read")
+        .expect("chain resolves");
+    let mut changes = ctx
+        .net_handle
+        .as_ref()
+        .expect("net handle")
+        .subscribe_dashboard_changes();
+    let before = *changes.borrow_and_update();
+
+    terminal.state = JobState::Cancelled;
+    terminal.finished_at_ms = Some(5_000);
+    assert!(publish_terminal(&ctx, &terminal).await);
+    assert_eq!(*changes.borrow_and_update(), before + 1);
+
+    let publish = PublishStateOperation::new(
+        chain,
+        (PhysicalExecutionState::Cancelled, None, 5_000),
+        ctx.node_and_realm(),
+        5_000,
+    );
+    assert!(aruna_runner::driver::drive(publish, &ctx).await.unwrap());
+    assert_eq!(*changes.borrow_and_update(), before + 1);
+}
+
+async fn publish_terminal(
+    ctx: &aruna_runner::driver::DriverContext,
+    record: &aruna_core::structs::execution::job::local::JobRecord,
+) -> bool {
+    let publish = PublishTerminalOperation::new(
+        record.clone(),
+        ctx.node_and_realm(),
+        aruna_core::time::unix_timestamp_millis(),
+    );
+    aruna_runner::driver::drive(publish, ctx)
+        .await
+        .unwrap_or(false)
+}

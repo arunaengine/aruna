@@ -1,0 +1,913 @@
+//! Builds the REST router from every route family and adds the auth and tracing layers.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::auth_middleware;
+use crate::server::state::ServerState;
+use crate::telemetry::request_tracing_middleware;
+use axum::Router;
+use axum::middleware::from_fn_with_state;
+use std::sync::Arc;
+use utoipa::openapi::{Components, OpenApi};
+use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
+
+pub mod access;
+pub mod assistant;
+pub mod audit;
+pub mod device;
+pub mod drs;
+pub mod email_profile;
+pub mod emails;
+pub mod execution;
+pub mod federation;
+pub mod git;
+pub mod hooks;
+pub mod identifiers;
+pub mod info;
+pub mod install_changes;
+pub mod link_routes;
+pub mod management_relay;
+pub mod metadata;
+pub mod node_names;
+pub(crate) mod notification_calls;
+pub mod notifications;
+pub mod oai;
+pub mod oidc_providers;
+pub mod onboarding;
+pub mod pid;
+pub mod placement;
+pub mod plugin_installs;
+pub mod plugin_runs;
+pub mod plugins;
+pub mod policies;
+pub mod portal;
+pub mod promotion;
+pub mod realm_admins;
+pub mod repository;
+pub mod rocrate_import;
+pub mod running_jobs;
+pub mod search;
+pub mod secrets;
+pub mod shares;
+pub mod staging;
+pub mod storage;
+pub mod sync;
+pub mod webhooks;
+
+// Temporary aliases for the pre-family module paths; the access, execution
+// and storage families own these modules now. Remove once consumers migrate.
+
+/// The single REST source: every route is registered from a `#[utoipa::path]`
+/// handler, so the runtime router and the generated document cannot diverge.
+fn rest_api() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::new()
+        .merge(audit::router())
+        .merge(assistant::router())
+        .merge(info::router())
+        .merge(running_jobs::router())
+        .merge(federation::router())
+        .merge(federation::export::router())
+        .merge(federation::import::router())
+        .merge(federation::link::router())
+        .merge(federation::login::router())
+        .merge(onboarding::router())
+        .merge(storage::archive::router())
+        .merge(storage::blobs::router())
+        .merge(storage::bucket::usage::router())
+        .merge(storage::compression::router())
+        .merge(storage::bucket::dataset::router())
+        .merge(storage::bucket::metadata::router())
+        .merge(storage::releases::router())
+        .merge(storage::moves::router())
+        .merge(storage::rename::router())
+        .merge(storage::checks::router())
+        .merge(storage::encryption::router())
+        .merge(storage::abe::router())
+        .merge(storage::bucket::keys::router())
+        .merge(identifiers::router())
+        .merge(drs::router())
+        .merge(staging::router())
+        .merge(storage::deletion::router())
+        .merge(storage::group_backends::router())
+        .merge(storage::imports::router())
+        .merge(storage::discovery::router())
+        .merge(storage::distributed::router())
+        .merge(storage::text::router())
+        .merge(storage::objects::router())
+        .merge(storage::organize::router())
+        .merge(storage::origin::router())
+        .merge(storage::source_edit::router())
+        .merge(storage::source_health::router())
+        .merge(storage::provenance::router())
+        .merge(storage::routing::router())
+        .merge(sync::router())
+        .merge(sync::quarantine::router())
+        .merge(execution::compute::router())
+        .merge(storage::connectors::router())
+        .merge(access::admin_tokens::router())
+        .merge(access::audit::router())
+        .merge(access::credentials::router())
+        .merge(device::router())
+        .merge(execution::device_compute::router())
+        .merge(access::groups::router())
+        .merge(access::group_join::router())
+        .merge(access::group_stats::router())
+        .merge(execution::job::session::router())
+        .merge(execution::jobs::router())
+        .merge(execution::runs::router())
+        .merge(execution::job::audit::router())
+        .merge(metadata::router())
+        .merge(git::router())
+        .merge(oai::router())
+        .merge(pid::router())
+        .merge(placement::router())
+        .merge(rocrate_import::router())
+        .merge(repository::router())
+        .merge(repository::links::router())
+        .merge(repository::check::router())
+        .merge(link_routes::router())
+        .merge(node_names::router())
+        .merge(notifications::router())
+        .merge(webhooks::router())
+        .merge(emails::router())
+        .merge(email_profile::router())
+        .merge(plugins::router())
+        .merge(plugin_installs::router())
+        .merge(install_changes::router())
+        .merge(plugin_runs::router())
+        .merge(hooks::router())
+        .merge(policies::router())
+        .merge(portal::router())
+        .merge(oidc_providers::router())
+        .merge(promotion::router())
+        .merge(realm_admins::router())
+        .merge(search::router())
+        .merge(secrets::node::router())
+        .merge(secrets::realm::router())
+        .merge(secrets::group::router())
+        .merge(secrets::user::router())
+        .merge(shares::router())
+        .merge(access::service_accounts::router())
+        .merge(access::sessions::router())
+        .merge(execution::tes::router())
+        .merge(access::tokens::router())
+        .merge(access::users::router())
+}
+
+pub fn rest_router(state: Arc<ServerState>) -> Router {
+    let (router, _) = rest_api().split_for_parts();
+    router
+        .layer(from_fn_with_state(
+            state.clone(),
+            management_relay::relay_middleware,
+        ))
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::rate_limit::principal_middleware,
+        ))
+        .layer(from_fn_with_state(state.clone(), auth_middleware))
+        .layer(axum::middleware::from_fn(git::credentials))
+        .layer(from_fn_with_state(
+            state.clone(),
+            request_tracing_middleware,
+        ))
+        .layer(axum::middleware::from_fn(crate::object_key::middleware))
+        .with_state(state)
+}
+
+/// The co-registered REST operations, merged into `ApiDoc` and served by Swagger UI.
+pub fn rest_openapi() -> OpenApi {
+    rest_api().into_openapi()
+}
+
+/// Registers documented handlers under a runtime template that differs from the
+/// documented path. Catch-all ids and the TES `:cancel` suffix use it; all are
+/// asserted by `preserves_route_inventory`.
+fn routes_at(
+    mut router: OpenApiRouter<Arc<ServerState>>,
+    path: &str,
+    (schemas, paths, method_router): UtoipaMethodRouter<Arc<ServerState>>,
+) -> OpenApiRouter<Arc<ServerState>> {
+    let api = router.get_openapi_mut();
+    for (documented, item) in paths.paths {
+        match api.paths.paths.get_mut(&documented) {
+            Some(existing) => existing.merge_operations(item),
+            None => {
+                api.paths.paths.insert(documented, item);
+            }
+        }
+    }
+    api.components
+        .get_or_insert_with(Components::new)
+        .schemas
+        .extend(schemas);
+    router.route(path, method_router)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+
+    use super::rest_openapi;
+    use std::collections::BTreeSet;
+
+    /// Runtime method/path pairs registered before REST/OpenAPI co-registration.
+    /// A route added or removed without this fixture changing is a regression.
+    const RUNTIME_ROUTES: &[(&str, &str)] = &[
+        ("GET", "/metadata/{document_id}/git"),
+        ("GET", "/metadata/{document_id}/storage-location"),
+        ("PUT", "/metadata/{document_id}/storage-location"),
+        ("POST", "/metadata/{document_id}/git/push"),
+        ("GET", "/metadata/{document_id}/git/rocrate"),
+        ("GET", "/git/{repository}/info/refs"),
+        ("POST", "/git/{repository}/{service}"),
+        ("POST", "/git/{repository}/info/lfs/objects/batch"),
+        ("GET", "/git/{repository}/info/lfs/objects/{oid}"),
+        ("PUT", "/git/{repository}/info/lfs/objects/{oid}"),
+        ("GET", "/git/{repository}/info/lfs/locks"),
+        ("POST", "/git/{repository}/info/lfs/locks"),
+        ("POST", "/git/{repository}/info/lfs/locks/verify"),
+        ("POST", "/git/{repository}/info/lfs/locks/{id}/unlock"),
+        ("GET", "/metadata/{document_id}/versions"),
+        ("GET", "/metadata/{document_id}/versions/{version}"),
+        ("GET", "/metadata/{document_id}/versions/{version}/rocrate"),
+        ("GET", "/metadata/{document_id}/compare"),
+        ("GET", "/metadata/{document_id}/branches"),
+        ("POST", "/metadata/{document_id}/branches"),
+        ("DELETE", "/metadata/{document_id}/branches/{name}"),
+        ("PUT", "/metadata/{document_id}/branches/{name}/rocrate"),
+        ("POST", "/metadata/{document_id}/branches/{name}/merge"),
+        ("GET", "/metadata/{document_id}/tags"),
+        ("POST", "/metadata/{document_id}/tags"),
+        ("DELETE", "/metadata/{document_id}/tags/{name}"),
+        ("GET", "/metadata/{document_id}/conflicts"),
+        ("POST", "/metadata/{document_id}/conflicts/{id}/merge"),
+        ("DELETE", "/metadata/{document_id}/conflicts/{id}"),
+        ("POST", "/access/groups/{id}/join-requests"),
+        ("GET", "/access/groups/{id}/join-requests"),
+        ("DELETE", "/access/groups/{id}/join-requests/{request_id}"),
+        (
+            "POST",
+            "/access/groups/{id}/join-requests/{request_id}/decide",
+        ),
+        ("GET", "/access/users/join-requests"),
+        ("DELETE", "/access/devices/{node_id}"),
+        ("DELETE", "/access/onboarding/secrets/{id}"),
+        ("DELETE", "/data/sync/quarantine"),
+        ("DELETE", "/data/sync/relationships/{id}"),
+        ("DELETE", "/device/drafts/{draft_id}"),
+        ("DELETE", "/device/folders/{folder_id}"),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/connectors/{connector_id}",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/storage/backends/{backend_id}",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/storage/imports/{import_id}",
+        ),
+        ("DELETE", "/access/groups/{id}"),
+        ("DELETE", "/access/groups/{id}/members/{user_id}"),
+        ("DELETE", "/access/groups/{id}/members/{user_id}/tokens"),
+        ("DELETE", "/access/groups/{id}/tokens/{kind}/{token_id}"),
+        ("DELETE", "/access/users/{id}/tokens"),
+        ("DELETE", "/access/groups/{id}/roles/{role_id}"),
+        ("DELETE", "/metadata/{document_id}"),
+        ("POST", "/data/archives"),
+        ("POST", "/data/archives/links"),
+        ("GET", "/data/archives/download"),
+        ("GET", "/access/audit"),
+        ("GET", "/system/notifications/webhook"),
+        ("PUT", "/system/notifications/webhook"),
+        ("DELETE", "/system/notifications/webhook"),
+        ("GET", "/system/notifications/email"),
+        ("PUT", "/system/notifications/email"),
+        ("DELETE", "/system/notifications/email"),
+        (
+            "DELETE",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
+        (
+            "POST",
+            "/metadata/groups/{group_id}/repositories/{connector_id}/harvests",
+        ),
+        ("DELETE", "/system/notifications/watches/{id}"),
+        ("DELETE", "/system/realm/oidc-providers/{id}"),
+        ("DELETE", "/system/realm/admins/{user_id}"),
+        ("DELETE", "/pid/{document_id}"),
+        ("DELETE", "/access/credentials/{access_key_id}"),
+        ("DELETE", "/system/assistant/providers/{id}"),
+        ("DELETE", "/system/assistant/central"),
+        ("DELETE", "/access/users/me/assistant/chats/{id}"),
+        ("DELETE", "/access/users/me/devices/{id}"),
+        ("DELETE", "/access/users/me/vault"),
+        ("DELETE", "/access/sessions/{session_id}"),
+        ("DELETE", "/access/s3/sessions/{access_key_id}"),
+        ("GET", "/compute/config"),
+        ("GET", "/compute/snapshots"),
+        ("GET", "/access/onboarding/secrets"),
+        ("GET", "/data/placement/diagnostics"),
+        ("GET", "/data/placement/policies"),
+        ("GET", "/data/placement/policies/{policy_id}"),
+        ("GET", "/data/sync/quarantine"),
+        ("GET", "/data/sync/quarantine/{record_id}"),
+        ("GET", "/metadata/audit"),
+        ("POST", "/data/buckets/{bucket}/abe/requests"),
+        ("GET", "/data/buckets/{bucket}/abe/requests"),
+        (
+            "POST",
+            "/data/buckets/{bucket}/abe/requests/{request_id}/grant",
+        ),
+        ("GET", "/data/buckets/{bucket}/abe/grants"),
+        ("POST", "/data/buckets/{bucket}/abe/epoch"),
+        ("POST", "/data/buckets/{bucket}/abe/rekey"),
+        ("GET", "/data/blobs/envelope"),
+        ("GET", "/data/blobs/content"),
+        ("GET", "/data/blobs/locations"),
+        ("GET", "/data/buckets/{bucket}/distribution"),
+        ("GET", "/data/buckets/{bucket}/datasets"),
+        ("POST", "/data/buckets/{bucket}/dataset"),
+        ("GET", "/data/buckets/{bucket}/metadata"),
+        ("PUT", "/data/buckets/{bucket}/metadata"),
+        ("GET", "/data/buckets/{bucket}/releases"),
+        ("GET", "/data/buckets/{bucket}/releases/{version_id}/files"),
+        ("POST", "/data/buckets/{bucket}/releases"),
+        ("GET", "/data/buckets/{bucket}/objects"),
+        ("GET", "/data/buckets/{bucket}/objects/origin"),
+        ("GET", "/data/origin"),
+        ("GET", "/data/provenance/crate"),
+        ("GET", "/data/buckets/{bucket}/objects/part-of"),
+        ("GET", "/data/buckets/{bucket}/sources"),
+        ("GET", "/data/buckets/{bucket}/runs"),
+        ("GET", "/data/buckets/{bucket}/sources/health"),
+        ("POST", "/data/buckets/{bucket}/sources/add"),
+        ("POST", "/data/buckets/{bucket}/sources/remove"),
+        ("POST", "/data/identifier-rules/test"),
+        ("POST", "/system/realm/nodes/{node_id}/promote"),
+        ("GET", "/data/buckets/{bucket}/placement"),
+        ("GET", "/data/buckets/{bucket}/placement/coverage"),
+        ("GET", "/data/buckets/{bucket}/placement/coverage/count"),
+        ("GET", "/data/buckets/{bucket}/placement/objects"),
+        ("GET", "/data/buckets/{bucket}/storage/check"),
+        ("GET", "/data/buckets/{bucket}/storage/compression"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/audit"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/copies/me"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/holders"),
+        ("GET", "/data/buckets/{bucket}/storage/encryption/tokens"),
+        ("GET", "/data/buckets/{bucket}/storage/move"),
+        ("GET", "/data/buckets/{bucket}/storage/routing"),
+        ("GET", "/data/buckets/{bucket}/usage"),
+        ("GET", "/data/sync/relationships"),
+        ("GET", "/data/sync/relationships/{id}"),
+        ("GET", "/device/compute"),
+        ("GET", "/device/compute/runs/{job_id}/crate"),
+        ("GET", "/device/documents"),
+        ("GET", "/device/drafts"),
+        ("GET", "/device/drafts/{draft_id}"),
+        ("GET", "/device/folders"),
+        ("GET", "/device/folders/{folder_id}"),
+        ("GET", "/device/folders/{folder_id}/actions"),
+        ("GET", "/device/folders/{folder_id}/entries"),
+        ("GET", "/device/origins/{version_id}"),
+        ("GET", "/device/sync/status"),
+        ("GET", "/device/transfers"),
+        ("GET", "/ga4gh/drs/v1/download"),
+        ("GET", "/ga4gh/drs/v1/objects/{*object_id}"),
+        ("GET", "/ga4gh/drs/v1/service-info"),
+        ("GET", "/resolve/{*id}"),
+        ("GET", "/ga4gh/tes/v1/service-info"),
+        ("GET", "/ga4gh/tes/v1/tasks"),
+        ("GET", "/ga4gh/tes/v1/tasks/{id}"),
+        ("GET", "/access/groups"),
+        ("GET", "/data/groups/{group_id}/connectors"),
+        ("GET", "/data/groups/{group_id}/connectors/{connector_id}"),
+        (
+            "GET",
+            "/data/groups/{group_id}/connectors/{connector_id}/entries",
+        ),
+        ("GET", "/metadata/groups/{group_id}"),
+        ("GET", "/metadata/groups/{group_id}/path"),
+        ("GET", "/metadata/groups/{group_id}/repositories"),
+        (
+            "GET",
+            "/metadata/groups/{group_id}/repositories/{connector_id}/records",
+        ),
+        ("GET", "/metadata/repository/kinds"),
+        ("GET", "/metadata/{document_id}/repository/links"),
+        ("GET", "/metadata/{document_id}/repository/links/{link_id}"),
+        (
+            "PATCH",
+            "/metadata/{document_id}/repository/links/{link_id}",
+        ),
+        (
+            "DELETE",
+            "/metadata/{document_id}/repository/links/{link_id}",
+        ),
+        (
+            "GET",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
+        ("GET", "/data/groups/{group_id}/storage/backends"),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/backends/{backend_id}",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/backends/{backend_id}/reclaim/status",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/backends/{backend_id}/buckets/{bucket}",
+        ),
+        ("GET", "/data/groups/{group_id}/storage/buckets"),
+        ("GET", "/data/groups/{group_id}/storage/import-roots"),
+        (
+            "GET",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}",
+        ),
+        ("GET", "/data/groups/{group_id}/storage/routing"),
+        ("GET", "/data/groups/{group_id}/storage/imports"),
+        ("GET", "/data/groups/{group_id}/storage/imports/{import_id}"),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/discovery",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/rename",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/job",
+        ),
+        (
+            "GET",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/status",
+        ),
+        ("GET", "/access/groups/{id}"),
+        ("GET", "/access/groups/{id}/data/paths"),
+        ("GET", "/access/groups/{id}/service-accounts"),
+        ("GET", "/access/groups/{id}/members"),
+        ("GET", "/access/groups/{id}/tokens"),
+        ("GET", "/access/groups/{id}/statistics"),
+        ("GET", "/system/groups/statistics"),
+        ("GET", "/access/groups/{id}/usage"),
+        ("GET", "/access/groups/{id}/deletion-blockers"),
+        ("PATCH", "/access/groups/{id}"),
+        ("GET", "/system/info"),
+        ("GET", "/system/jobs"),
+        ("GET", "/system/realm"),
+        ("GET", "/system/realm/descriptor"),
+        ("GET", "/system/realm/email"),
+        ("PUT", "/system/realm/email"),
+        ("DELETE", "/system/realm/email"),
+        ("GET", "/system/node/secrets"),
+        ("POST", "/system/node/secrets"),
+        ("GET", "/system/node/secrets/{name}"),
+        ("PUT", "/system/node/secrets/{name}"),
+        ("DELETE", "/system/node/secrets/{name}"),
+        ("POST", "/system/node/secrets/{name}/rotate"),
+        ("GET", "/system/realm/secrets"),
+        ("POST", "/system/realm/secrets"),
+        ("GET", "/system/realm/secrets/{name}"),
+        ("PUT", "/system/realm/secrets/{name}"),
+        ("DELETE", "/system/realm/secrets/{name}"),
+        ("POST", "/system/realm/secrets/{name}/rotate"),
+        ("GET", "/data/groups/{group_id}/secrets"),
+        ("POST", "/data/groups/{group_id}/secrets"),
+        ("GET", "/data/groups/{group_id}/secrets/{name}"),
+        ("PUT", "/data/groups/{group_id}/secrets/{name}"),
+        ("DELETE", "/data/groups/{group_id}/secrets/{name}"),
+        ("POST", "/data/groups/{group_id}/secrets/{name}/rotate"),
+        ("GET", "/access/users/me/secrets"),
+        ("POST", "/access/users/me/secrets"),
+        ("GET", "/access/users/me/secrets/{name}"),
+        ("PUT", "/access/users/me/secrets/{name}"),
+        ("DELETE", "/access/users/me/secrets/{name}"),
+        ("POST", "/access/users/me/secrets/{name}/rotate"),
+        ("GET", "/access/users/me/secrets/{name}/value"),
+        ("GET", "/system/realm/federation"),
+        ("GET", "/system/realm/placement"),
+        ("GET", "/system/realm/portal-features"),
+        ("GET", "/system/usage"),
+        ("GET", "/compute/jobs"),
+        ("DELETE", "/compute/jobs/{job_id}"),
+        ("GET", "/compute/jobs/{job_id}"),
+        ("GET", "/compute/runs/{run_id}"),
+        ("GET", "/compute/jobs/{job_id}/artifacts/rocrate"),
+        ("GET", "/compute/jobs/{job_id}/audit"),
+        ("GET", "/compute/jobs/{job_id}/report"),
+        ("GET", "/compute/jobs/{job_id}/session"),
+        ("GET", "/compute/jobs/{job_id}/session/events"),
+        ("GET", "/compute/jobs/{job_id}/session/scratch"),
+        ("GET", "/compute/jobs/{job_id}/session/scratch/read"),
+        ("GET", "/metadata"),
+        ("GET", "/metadata/links"),
+        ("GET", "/metadata/links/target"),
+        ("GET", "/metadata/profile/validation/capabilities"),
+        ("GET", "/metadata/references"),
+        ("GET", "/metadata/search"),
+        ("GET", "/metadata/{document_id}"),
+        ("GET", "/metadata/{document_id}/profile/validation"),
+        ("GET", "/metadata/{document_id}/pids"),
+        ("GET", "/metadata/{document_id}/rocrate"),
+        ("GET", "/system/notifications"),
+        ("GET", "/system/notifications/stream"),
+        ("GET", "/system/notifications/unread"),
+        ("GET", "/system/notifications/watches"),
+        ("GET", "/oai"),
+        ("GET", "/access/onboarding/secrets/{id}/status"),
+        ("GET", "/pid/{document_id}"),
+        ("GET", "/pid/lookup"),
+        ("GET", "/profile/{document_id}"),
+        ("GET", "/w3id/{*rest}"),
+        ("GET", "/access/policies/effective"),
+        ("GET", "/access/policies/group/{group_id}"),
+        ("GET", "/access/policies/realm"),
+        ("GET", "/search"),
+        ("POST", "/shares"),
+        ("GET", "/shares"),
+        ("GET", "/shares/{id}"),
+        ("DELETE", "/shares/{id}"),
+        ("GET", "/shares/{id}/log"),
+        ("POST", "/shares/open"),
+        ("GET", "/shares/visit/files"),
+        ("PUT", "/shares/visit/uploads"),
+        ("POST", "/shares/visit/tickets"),
+        ("GET", "/shares/download"),
+        ("GET", "/shares/visit/dataset"),
+        ("GET", "/shares/visit/dataset/files"),
+        ("POST", "/shares/visit/dataset/tickets"),
+        ("GET", "/search/buckets"),
+        ("GET", "/search/objects"),
+        ("GET", "/data/staging/jobs"),
+        ("GET", "/data/staging/jobs/{job_id}"),
+        ("GET", "/data/staging/references"),
+        ("GET", "/access/users"),
+        ("GET", "/system/assistant/providers"),
+        ("GET", "/system/assistant/central"),
+        ("GET", "/system/assistant/providers/{id}/models"),
+        ("GET", "/system/assistant/providers/{id}/proxy/{*path}"),
+        ("GET", "/access/credentials"),
+        ("GET", "/access/users/me"),
+        ("GET", "/access/users/me/assistant/chats"),
+        ("GET", "/access/users/me/assistant/chats/{id}/turns"),
+        ("GET", "/access/users/me/devices"),
+        ("GET", "/access/users/me/vault"),
+        ("GET", "/access/users/search"),
+        ("GET", "/access/sessions"),
+        ("GET", "/access/s3/sessions"),
+        ("GET", "/access/token"),
+        ("GET", "/access/users/{id}"),
+        ("GET", "/access/users/{id}/keys"),
+        ("HEAD", "/compute/jobs/{job_id}/artifacts/rocrate"),
+        ("OPTIONS", "/ga4gh/drs/v1/objects/{*object_id}"),
+        ("PATCH", "/data/sync/relationships/{id}"),
+        ("PATCH", "/device/folders/{folder_id}"),
+        ("PATCH", "/system/realm/placement"),
+        ("PATCH", "/system/realm/nodes/{node_id}"),
+        ("PATCH", "/access/users/me/devices/{id}"),
+        ("PATCH", "/access/users/me"),
+        ("PATCH", "/system/assistant/providers/{id}"),
+        ("PATCH", "/access/users/{id}"),
+        ("POST", "/compute/drain"),
+        ("POST", "/access/onboarding/secrets"),
+        ("POST", "/data/placement/policies"),
+        ("POST", "/data/placement/quarantine"),
+        ("POST", "/data/sync/quarantine/{record_id}/acknowledge"),
+        ("POST", "/data/blobs/replicate"),
+        ("POST", "/data/buckets/{bucket}/placement/coverage/count"),
+        ("POST", "/data/buckets/{bucket}/placement/objects"),
+        ("POST", "/data/buckets/{bucket}/objects/text"),
+        ("POST", "/data/buckets/{bucket}/placement/runs"),
+        ("POST", "/data/sync/relationships"),
+        ("POST", "/data/sync/relationships/{id}/run"),
+        ("POST", "/device/buckets"),
+        ("POST", "/device/compute/runs/{job_id}/publish"),
+        ("POST", "/device/drafts"),
+        ("POST", "/device/drafts/preview"),
+        ("POST", "/device/folders"),
+        ("POST", "/device/folders/{folder_id}/actions"),
+        ("POST", "/device/folders/{folder_id}/entries/{path}/actions"),
+        ("POST", "/device/folders/{folder_id}/pause"),
+        ("POST", "/device/folders/{folder_id}/resume"),
+        ("POST", "/device/folders/{folder_id}/sync"),
+        ("POST", "/device/sync/run"),
+        ("POST", "/device/wipe"),
+        ("POST", "/ga4gh/drs/v1/objects"),
+        ("POST", "/ga4gh/tes/v1/tasks"),
+        ("POST", "/ga4gh/tes/v1/tasks/{id}"),
+        ("POST", "/access/groups"),
+        ("POST", "/data/groups/{group_id}/connectors"),
+        ("POST", "/data/groups/{group_id}/connectors/check"),
+        ("POST", "/data/groups/{group_id}/distributed-buckets"),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/admission",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/connectors/{connector_id}/check",
+        ),
+        ("POST", "/data/groups/{group_id}/storage/backends"),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/backends/{backend_id}/enable",
+        ),
+        ("POST", "/data/groups/{group_id}/storage/imports"),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/run",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/rename",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/discovery/preview",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/move",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/move/preview",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/duplicates",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/duplicates/preview",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/storage/imports/{import_id}/organize/job/{action}",
+        ),
+        ("POST", "/access/groups/{id}/leave"),
+        ("POST", "/access/groups/{id}/members"),
+        ("POST", "/access/groups/{id}/service-accounts"),
+        (
+            "POST",
+            "/access/groups/{id}/service-accounts/{account_id}/credentials",
+        ),
+        (
+            "POST",
+            "/access/groups/{id}/service-accounts/{account_id}/tokens",
+        ),
+        ("POST", "/access/groups/{id}/roles"),
+        ("POST", "/compute/jobs"),
+        ("POST", "/compute/jobs/{job_id}/cancel"),
+        ("POST", "/compute/jobs/{job_id}/session/cells"),
+        ("POST", "/compute/jobs/{job_id}/session/end"),
+        ("POST", "/compute/jobs/{job_id}/session/inputs"),
+        ("POST", "/compute/jobs/{job_id}/session/interrupt"),
+        ("POST", "/metadata"),
+        ("POST", "/metadata/profile/validation/preview"),
+        ("POST", "/metadata/references/preflight"),
+        ("POST", "/metadata/rocrate/imports"),
+        ("POST", "/metadata/groups/{group_id}/repositories"),
+        ("POST", "/metadata/repository/imports"),
+        ("POST", "/metadata/{document_id}/repository/exports"),
+        ("POST", "/metadata/{document_id}/repository/check"),
+        ("POST", "/metadata/{document_id}/repository/links"),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/push",
+        ),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/publish",
+        ),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/accept-remote",
+        ),
+        (
+            "POST",
+            "/metadata/{document_id}/repository/links/{link_id}/pull",
+        ),
+        (
+            "PUT",
+            "/metadata/{document_id}/repository/links/{link_id}/token",
+        ),
+        ("POST", "/metadata/rocrate/uploads"),
+        ("POST", "/metadata/sparql/query"),
+        (
+            "POST",
+            "/metadata/{document_id}/rocrate/entities/contextual",
+        ),
+        ("POST", "/metadata/{document_id}/rocrate/entities/data"),
+        ("DELETE", "/metadata/{document_id}/rocrate/entities/data"),
+        ("POST", "/metadata/{document_id}/rocrate/exports"),
+        (
+            "POST",
+            "/metadata/{document_id}/profile/validation/revalidate",
+        ),
+        ("POST", "/metadata/{document_id}/sparql/query"),
+        ("POST", "/system/notifications/read"),
+        ("POST", "/system/notifications/watches"),
+        ("POST", "/oai"),
+        ("POST", "/access/onboarding/bootstrap"),
+        ("POST", "/access/policies/dryrun"),
+        ("POST", "/access/policies/validate"),
+        ("POST", "/data/staging"),
+        ("POST", "/data/storage/deletion/preflight"),
+        ("POST", "/data/storage/purge/jobs"),
+        ("POST", "/data/staging/batch"),
+        ("POST", "/data/staging/jobs"),
+        ("POST", "/access/credentials"),
+        ("POST", "/access/users/me/keys"),
+        ("POST", "/access/users/me/merge"),
+        ("POST", "/access/users/me/subjects"),
+        ("POST", "/access/users/register"),
+        ("POST", "/system/assistant/providers"),
+        ("POST", "/system/assistant/providers/chatgpt/login"),
+        ("POST", "/system/assistant/providers/{id}/login/poll"),
+        ("POST", "/system/assistant/providers/{id}/proxy/{*path}"),
+        ("POST", "/system/assistant/providers/{id}/test"),
+        ("POST", "/system/assistant/central/test"),
+        ("POST", "/access/sessions"),
+        ("POST", "/federation/login-handoffs"),
+        ("POST", "/federation/sessions"),
+        ("POST", "/federation/exports"),
+        ("POST", "/federation/exports/{job_id}/grant"),
+        ("DELETE", "/federation/exports/{job_id}/grant"),
+        ("POST", "/federation/exports/{job_id}/push"),
+        ("POST", "/federation/import-intents"),
+        ("POST", "/federation/imports"),
+        ("POST", "/federation/link-confirmations"),
+        ("POST", "/federation/links"),
+        ("GET", "/federation/links"),
+        ("DELETE", "/federation/links/{user_id}/{login}"),
+        ("POST", "/access/users/resolve"),
+        ("POST", "/access/s3/sessions"),
+        ("POST", "/access/s3/sessions/{access_key_id}/refresh"),
+        ("POST", "/access/tokens/revoke"),
+        ("PUT", "/access/groups/{id}/storage-location"),
+        ("PUT", "/access/users/me/assistant/chats/{id}"),
+        ("PUT", "/system/assistant/central"),
+        ("PUT", "/access/users/me/assistant/chats/{id}/turns/{seq}"),
+        ("PUT", "/access/users/me/vault"),
+        ("PUT", "/access/users/{id}/status"),
+        ("PUT", "/compute/config"),
+        ("PUT", "/data/buckets/{bucket}/placement"),
+        ("PUT", "/data/buckets/{bucket}/storage/compression"),
+        ("PUT", "/data/buckets/{bucket}/storage/encryption"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/extend"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/holders"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/lock"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/rotate"),
+        ("POST", "/data/buckets/{bucket}/storage/encryption/unlock"),
+        ("POST", "/data/buckets/{bucket}/storage/move"),
+        ("POST", "/data/buckets/{bucket}/storage/rename"),
+        ("POST", "/data/buckets/{bucket}/storage/delete/preview"),
+        ("POST", "/data/storage/purge/jobs/{job_id}/{action}"),
+        ("GET", "/data/storage/purge/jobs/{job_id}"),
+        ("POST", "/data/buckets/{bucket}/storage/rename/preview"),
+        ("POST", "/data/buckets/{bucket}/storage/check"),
+        ("POST", "/data/buckets/{bucket}/storage/check/cleanup"),
+        (
+            "DELETE",
+            "/data/buckets/{bucket}/storage/encryption/holders/{user}",
+        ),
+        ("PUT", "/data/buckets/{bucket}/storage/routing"),
+        ("PUT", "/device/documents/{document_id}/selection"),
+        ("PUT", "/data/groups/{group_id}/connectors/{connector_id}"),
+        (
+            "PUT",
+            "/data/groups/{group_id}/storage/backends/{backend_id}",
+        ),
+        ("PUT", "/data/groups/{group_id}/storage/routing"),
+        ("PUT", "/data/groups/{group_id}/storage/imports/{import_id}"),
+        (
+            "PUT",
+            "/data/groups/{group_id}/storage/imports/{import_id}/discovery",
+        ),
+        ("PUT", "/system/realm/federation"),
+        ("PUT", "/system/realm/merge-coordinator"),
+        ("PUT", "/system/realm/oidc-providers/{id}"),
+        ("PUT", "/system/realm/admins/{user_id}"),
+        ("PUT", "/system/realm/portal-features"),
+        ("PUT", "/system/realm/quota"),
+        ("PUT", "/metadata/{document_id}/rocrate"),
+        (
+            "PUT",
+            "/metadata/groups/{group_id}/repositories/{connector_id}",
+        ),
+        ("PUT", "/access/policies/group/{group_id}"),
+        ("PUT", "/access/policies/realm"),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/members",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/members/{member_id}",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/copies",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/splits",
+        ),
+        (
+            "POST",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/transfers",
+        ),
+        (
+            "PUT",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}/settings",
+        ),
+        (
+            "DELETE",
+            "/data/groups/{group_id}/distributed-buckets/{set_id}",
+        ),
+        ("POST", "/plugins"),
+        ("GET", "/plugins"),
+        ("POST", "/plugins/{name}/installs"),
+        ("GET", "/plugin-installs"),
+        ("GET", "/plugin-installs/{id}"),
+        ("DELETE", "/plugin-installs/{id}"),
+        ("PUT", "/plugin-installs/{id}/grants"),
+        ("PUT", "/plugin-installs/{id}/version"),
+        ("POST", "/plugin-installs/{id}/pause"),
+        ("POST", "/plugin-installs/{id}/resume"),
+        ("POST", "/plugin-installs/{id}/runs"),
+        ("GET", "/plugin-installs/{id}/runs"),
+        ("GET", "/plugin-installs/{id}/runs/{run}"),
+        ("POST", "/plugin-installs/{id}/runs/{run}/resolve"),
+        ("POST", "/plugin-installs/{id}/runs/{run}/retry"),
+        ("GET", "/plugin-installs/{id}/work"),
+        ("GET", "/plugin-installs/{id}/delivery"),
+        ("POST", "/plugin-installs/{id}/jobs/{job}/drop"),
+        ("POST", "/plugin-hooks/{id}"),
+    ];
+
+    /// Documented path to the runtime template that serves it. Catch-all ids
+    /// span segments and TES cancel carries its action suffix inside `{id}`.
+    const PATH_ALIASES: &[(&str, &str)] = &[
+        (
+            "/ga4gh/drs/v1/objects/{object_id}",
+            "/ga4gh/drs/v1/objects/{*object_id}",
+        ),
+        ("/resolve/{id}", "/resolve/{*id}"),
+        ("/w3id/{rest}", "/w3id/{*rest}"),
+        (
+            "/ga4gh/tes/v1/tasks/{id}:cancel",
+            "/ga4gh/tes/v1/tasks/{id}",
+        ),
+        (
+            "/system/assistant/providers/{id}/proxy/{path}",
+            "/system/assistant/providers/{id}/proxy/{*path}",
+        ),
+    ];
+
+    fn documented_routes() -> BTreeSet<(String, String)> {
+        let mut routes = BTreeSet::new();
+        for (documented, item) in rest_openapi().paths.paths {
+            let path = PATH_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == documented)
+                .map(|(_, runtime)| (*runtime).to_owned())
+                .unwrap_or(documented);
+            for (method, operation) in [
+                ("DELETE", &item.delete),
+                ("GET", &item.get),
+                ("HEAD", &item.head),
+                ("OPTIONS", &item.options),
+                ("PATCH", &item.patch),
+                ("POST", &item.post),
+                ("PUT", &item.put),
+                ("TRACE", &item.trace),
+            ] {
+                if operation.is_some() {
+                    routes.insert((method.to_owned(), path.clone()));
+                }
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn preserves_route_inventory() {
+        let expected = RUNTIME_ROUTES
+            .iter()
+            .map(|(method, path)| ((*method).to_owned(), (*path).to_owned()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            documented_routes(),
+            expected,
+            "co-registered routes must match the runtime inventory exactly"
+        );
+    }
+}

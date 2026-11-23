@@ -1,0 +1,601 @@
+//! Validates connector names and the public and secret config keys allowed per kind.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::{HashMap, HashSet};
+
+use aruna_core::structs::execution::offered_directory::OFFERED_DIRECTORY_BUCKET;
+use aruna_core::structs::execution::source_access::{MAX_WEIGHT, SOURCE_WEIGHT, source_weight};
+use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+use aruna_ops_identity::endpoint_screening;
+use thiserror::Error;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceConnectorRules {
+    pub required_public_keys: &'static [&'static str],
+    pub allowed_public_keys: &'static [&'static str],
+    pub allowed_secret_keys: &'static [&'static str],
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ValidationError {
+    #[error("connector name must not be empty")]
+    EmptyName,
+    #[error("connector kind `{kind}` is not supported")]
+    UnsupportedConnectorKind { kind: SourceConnectorKind },
+    #[error("missing required public config key `{key}` for connector kind `{kind}`")]
+    PublicKeyMissing {
+        kind: SourceConnectorKind,
+        key: String,
+    },
+    #[error("public config key `{key}` is not allowed for connector kind `{kind}`")]
+    UnknownPublicKey {
+        kind: SourceConnectorKind,
+        key: String,
+    },
+    #[error("secret config key `{key}` is not allowed for connector kind `{kind}`")]
+    UnknownSecretKey {
+        kind: SourceConnectorKind,
+        key: String,
+    },
+    #[error("public config key `{key}` must not be empty")]
+    EmptyPublicValue { key: String },
+    #[error("secret config key `{key}` must not be empty")]
+    EmptySecretValue { key: String },
+    #[error("public config key `{key}` must be `true` or `false`")]
+    InvalidBoolValue { key: String },
+    #[error(
+        "public config key `{SOURCE_WEIGHT}` must be a number above 0 and at most {MAX_WEIGHT}"
+    )]
+    InvalidWeight,
+    #[error("endpoint must be spelled as the http client parses it")]
+    AmbiguousEndpoint,
+    #[error(
+        "endpoint must not carry a user name, password or fragment; put credentials in the \
+         connector's secret settings"
+    )]
+    EndpointCredentials,
+    #[error(
+        "Endpoint addresses cannot carry a query. Put the server address in the endpoint and the \
+         file path in the source path."
+    )]
+    EndpointQuery,
+    #[error("bucket `{0}` must not contain `/`, `\\`, `?`, `#` or `@`")]
+    UnsafeBucket(String),
+    #[error("credentials must not be set when `skip_signature` is enabled")]
+    CredentialsSkipSignature,
+    #[error("signed s3 connectors require `{ACCESS_KEY_ID}` and `{SECRET_ACCESS_KEY}`")]
+    MissingCredentials,
+}
+
+pub const S3_SKIP_SIGNATURE: &str = "skip_signature";
+const ACCESS_KEY_ID: &str = "access_key_id";
+const SECRET_ACCESS_KEY: &str = "secret_access_key";
+
+pub fn validate_connector_input(
+    name: &str,
+    kind: SourceConnectorKind,
+    public_config: &HashMap<String, String>,
+    secret_config: &HashMap<String, String>,
+) -> Result<(), ValidationError> {
+    if name.trim().is_empty() {
+        return Err(ValidationError::EmptyName);
+    }
+
+    // ftp is refused because opendal cannot constrain its passive data address; a local
+    // directory is registered on its device and Invenio files come from repository connectors.
+    if matches!(
+        kind,
+        SourceConnectorKind::Ftp
+            | SourceConnectorKind::ArunaNative
+            | SourceConnectorKind::LocalDirectory
+            | SourceConnectorKind::Invenio
+            | SourceConnectorKind::ArunaLink
+    ) {
+        return Err(ValidationError::UnsupportedConnectorKind { kind });
+    }
+
+    for (key, value) in public_config {
+        if value.trim().is_empty() {
+            return Err(ValidationError::EmptyPublicValue { key: key.clone() });
+        }
+    }
+
+    for (key, value) in secret_config {
+        if value.trim().is_empty() {
+            return Err(ValidationError::EmptySecretValue { key: key.clone() });
+        }
+    }
+
+    let rules = rules_for_kind(kind);
+    let allowed_public: HashSet<_> = rules.allowed_public_keys.iter().copied().collect();
+    let allowed_secret: HashSet<_> = rules.allowed_secret_keys.iter().copied().collect();
+
+    for key in public_config.keys() {
+        if !allowed_public.contains(key.as_str()) {
+            return Err(ValidationError::UnknownPublicKey {
+                kind,
+                key: key.clone(),
+            });
+        }
+    }
+
+    for key in secret_config.keys() {
+        if !allowed_secret.contains(key.as_str()) {
+            return Err(ValidationError::UnknownSecretKey {
+                kind,
+                key: key.clone(),
+            });
+        }
+    }
+
+    if public_config.contains_key(SOURCE_WEIGHT) && source_weight(public_config).is_none() {
+        return Err(ValidationError::InvalidWeight);
+    }
+
+    for key in rules.required_public_keys {
+        if !public_config.contains_key(*key) {
+            return Err(ValidationError::PublicKeyMissing {
+                kind,
+                key: (*key).to_string(),
+            });
+        }
+    }
+
+    if let Some(endpoint) = public_config.get("endpoint")
+        && !endpoint_screening::is_canonical(endpoint)
+    {
+        return Err(ValidationError::AmbiguousEndpoint);
+    }
+    if let Some(url) = (public_config.get("endpoint")).and_then(|url| url::Url::parse(url).ok()) {
+        // Version and source root records copy the endpoint, and listings show it.
+        if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+            return Err(ValidationError::EndpointCredentials);
+        }
+        // Reads append the source path to the endpoint, so a query would come before it.
+        if url.query().is_some() {
+            return Err(ValidationError::EndpointQuery);
+        }
+    }
+    if let Some(bucket) = public_config.get("bucket")
+        && endpoint_screening::breaks_authority(bucket)
+    {
+        return Err(ValidationError::UnsafeBucket(bucket.clone()));
+    }
+
+    let mut anonymous = false;
+    if let Some(value) = public_config.get(S3_SKIP_SIGNATURE) {
+        if value != "true" && value != "false" {
+            return Err(ValidationError::InvalidBoolValue {
+                key: S3_SKIP_SIGNATURE.to_string(),
+            });
+        }
+        anonymous = value == "true";
+        if anonymous && !secret_config.is_empty() {
+            return Err(ValidationError::CredentialsSkipSignature);
+        }
+    }
+
+    // Without static keys a signed connector makes reqsign walk the node's own
+    // ambient credential chain against a tenant-chosen endpoint.
+    if kind == SourceConnectorKind::S3
+        && !anonymous
+        && !(secret_config.contains_key(ACCESS_KEY_ID)
+            && secret_config.contains_key(SECRET_ACCESS_KEY))
+    {
+        return Err(ValidationError::MissingCredentials);
+    }
+
+    Ok(())
+}
+
+pub const fn rules_for_kind(kind: SourceConnectorKind) -> SourceConnectorRules {
+    match kind {
+        SourceConnectorKind::Http => SourceConnectorRules {
+            required_public_keys: &["endpoint"],
+            allowed_public_keys: &["endpoint", "root", SOURCE_WEIGHT],
+            allowed_secret_keys: &["username", "password", "token"],
+        },
+        SourceConnectorKind::S3 => SourceConnectorRules {
+            required_public_keys: &["bucket", "endpoint"],
+            allowed_public_keys: &[
+                "bucket",
+                "endpoint",
+                "region",
+                "root",
+                S3_SKIP_SIGNATURE,
+                SOURCE_WEIGHT,
+            ],
+            allowed_secret_keys: &["access_key_id", "secret_access_key"],
+        },
+        SourceConnectorKind::Webdav => SourceConnectorRules {
+            required_public_keys: &["endpoint"],
+            allowed_public_keys: &["endpoint", "root", SOURCE_WEIGHT],
+            allowed_secret_keys: &["username", "password", "token"],
+        },
+        SourceConnectorKind::Ftp => SourceConnectorRules {
+            required_public_keys: &["endpoint"],
+            allowed_public_keys: &["endpoint", "root"],
+            allowed_secret_keys: &["user", "password"],
+        },
+        SourceConnectorKind::ArunaNative => SourceConnectorRules {
+            required_public_keys: &["endpoint"],
+            allowed_public_keys: &["endpoint", "realm_id", "default_node_id"],
+            allowed_secret_keys: &["bearer_token", "access_key", "secret_key"],
+        },
+        SourceConnectorKind::LocalDirectory => SourceConnectorRules {
+            required_public_keys: &[OFFERED_DIRECTORY_BUCKET],
+            allowed_public_keys: &[OFFERED_DIRECTORY_BUCKET],
+            allowed_secret_keys: &[],
+        },
+        SourceConnectorKind::Invenio | SourceConnectorKind::ArunaLink => SourceConnectorRules {
+            required_public_keys: &[],
+            allowed_public_keys: &[],
+            allowed_secret_keys: &[],
+        },
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_name() {
+        let err = validate_connector_input(
+            "  ",
+            SourceConnectorKind::Http,
+            &HashMap::from([("endpoint".to_string(), "https://example.org".to_string())]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::EmptyName);
+    }
+
+    #[test]
+    fn unknown_public_rejected() {
+        let err = validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([
+                ("endpoint".to_string(), "https://example.org".to_string()),
+                ("bucket".to_string(), "nope".to_string()),
+            ]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnknownPublicKey {
+                kind: SourceConnectorKind::Http,
+                key: "bucket".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn missing_public_rejected() {
+        let err = validate_connector_input(
+            "s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([("bucket".to_string(), "reads".to_string())]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::PublicKeyMissing {
+                kind: SourceConnectorKind::S3,
+                key: "endpoint".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unknown_secret_rejected() {
+        let err = validate_connector_input(
+            "webdav",
+            SourceConnectorKind::Webdav,
+            &HashMap::from([(
+                "endpoint".to_string(),
+                "https://dav.example.org".to_string(),
+            )]),
+            &HashMap::from([("session_token".to_string(), "nope".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnknownSecretKey {
+                kind: SourceConnectorKind::Webdav,
+                key: "session_token".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_ftp_kind() {
+        // An otherwise well-formed ftp connector must still fail registration.
+        let err = validate_connector_input(
+            "ftp",
+            SourceConnectorKind::Ftp,
+            &HashMap::from([
+                (
+                    "endpoint".to_string(),
+                    "ftp://ftp.example.org:21".to_string(),
+                ),
+                ("root".to_string(), "/datasets".to_string()),
+            ]),
+            &HashMap::from([
+                ("user".to_string(), "alice".to_string()),
+                ("password".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsupportedConnectorKind {
+                kind: SourceConnectorKind::Ftp,
+            }
+        );
+    }
+
+    #[test]
+    fn accepts_skip_signature() {
+        // A public bucket needs no credentials at all.
+        validate_connector_input(
+            "public-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "ngi-igenomes".to_string()),
+                (
+                    "endpoint".to_string(),
+                    "https://s3.amazonaws.com".to_string(),
+                ),
+                (S3_SKIP_SIGNATURE.to_string(), "true".to_string()),
+            ]),
+            &HashMap::new(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn skip_forbids_credentials() {
+        // Unsigned requests would silently ignore the stored secrets.
+        let err = validate_connector_input(
+            "public-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                (S3_SKIP_SIGNATURE.to_string(), "true".to_string()),
+            ]),
+            &HashMap::from([("access_key_id".to_string(), "AKIA".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::CredentialsSkipSignature);
+    }
+
+    #[test]
+    fn signed_requires_credentials() {
+        // Both an absent and an explicitly disabled `skip_signature` sign requests.
+        for skip in [None, Some("false")] {
+            let mut public = HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]);
+            if let Some(skip) = skip {
+                public.insert(S3_SKIP_SIGNATURE.to_string(), skip.to_string());
+            }
+
+            let err = validate_connector_input(
+                "signed-s3",
+                SourceConnectorKind::S3,
+                &public,
+                &HashMap::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ValidationError::MissingCredentials);
+        }
+    }
+
+    #[test]
+    fn requires_both_keys() {
+        let err = validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([("access_key_id".to_string(), "AKIA".to_string())]),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::MissingCredentials);
+    }
+
+    #[test]
+    fn accepts_signed_s3() {
+        validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_bad_skip() {
+        let err = validate_connector_input(
+            "public-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "reads".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+                (S3_SKIP_SIGNATURE.to_string(), "yes".to_string()),
+            ]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::InvalidBoolValue {
+                key: S3_SKIP_SIGNATURE.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn checks_source_weight() {
+        let config = |weight: &str| {
+            HashMap::from([
+                ("endpoint".to_string(), "https://example.org".to_string()),
+                (SOURCE_WEIGHT.to_string(), weight.to_string()),
+            ])
+        };
+        let none = HashMap::new();
+        let validate = |weight| {
+            validate_connector_input("mirror", SourceConnectorKind::Http, &config(weight), &none)
+        };
+        assert_eq!(validate("2.5"), Ok(()));
+        assert_eq!(validate("1000"), Ok(()));
+        for weight in ["0", "-1", "NaN", "inf", "1e308", "1000.5", "fast"] {
+            assert_eq!(
+                validate(weight),
+                Err(ValidationError::InvalidWeight),
+                "{weight}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_endpoint_credentials() {
+        let refused = |endpoint: &str, expected: &ValidationError| {
+            let public = HashMap::from([("endpoint".to_string(), endpoint.to_string())]);
+            for kind in [SourceConnectorKind::Http, SourceConnectorKind::Webdav] {
+                let error = validate_connector_input("source", kind, &public, &HashMap::new());
+                assert_eq!(error.err().as_ref(), Some(expected), "{endpoint}");
+            }
+        };
+        for endpoint in [
+            "https://reader:canary-11@example.org/data",
+            "https://reader@example.org/data",
+            "https://example.org/data#canary-11",
+        ] {
+            refused(endpoint, &ValidationError::EndpointCredentials);
+        }
+        let error = ValidationError::EndpointCredentials.to_string();
+        assert!(error.contains("secret settings") && !error.contains("canary"));
+        // The source path would follow a query, so every query is refused, a public one too.
+        for endpoint in [
+            "https://example.org/data?download=1",
+            "https://example.org/data?token=canary-11",
+            "https://example.org/data?X-Amz-Credential=canary-11",
+        ] {
+            refused(endpoint, &ValidationError::EndpointQuery);
+        }
+        let error = ValidationError::EndpointQuery.to_string();
+        assert!(error.contains("cannot carry a query") && error.contains("source path"));
+    }
+
+    #[test]
+    fn rejects_respelled_endpoint() {
+        // The http client reads each of these as a link-local or loopback host.
+        for host in [
+            "2852039166",
+            "0xa9fea9fe",
+            "169.254.169.254.",
+            "127.1",
+            "2851995650",
+            "0251.0376.0251.0376",
+        ] {
+            let endpoint = format!("https://{host}");
+            let err = validate_connector_input(
+                "http",
+                SourceConnectorKind::Http,
+                &HashMap::from([("endpoint".to_string(), endpoint)]),
+                &HashMap::new(),
+            )
+            .unwrap_err();
+
+            assert_eq!(err, ValidationError::AmbiguousEndpoint);
+        }
+    }
+
+    #[test]
+    fn refusal_hides_credentials() {
+        // The host is respelled, so the endpoint is refused; the password must not come back.
+        let err = validate_connector_input(
+            "http",
+            SourceConnectorKind::Http,
+            &HashMap::from([(
+                "endpoint".to_string(),
+                "https://reader:canary-346-source@SOURCE.example.org/".to_string(),
+            )]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(err, ValidationError::AmbiguousEndpoint);
+        assert!(!format!("{err} {err:?}").contains("canary"));
+    }
+
+    #[test]
+    fn rejects_spliced_bucket() {
+        // A bucket is spliced into the authority under virtual-host style.
+        let err = validate_connector_input(
+            "signed-s3",
+            SourceConnectorKind::S3,
+            &HashMap::from([
+                ("bucket".to_string(), "2852039166/".to_string()),
+                ("endpoint".to_string(), "https://s3.example.org".to_string()),
+            ]),
+            &HashMap::from([
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), "secret".to_string()),
+            ]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsafeBucket("2852039166/".to_string())
+        );
+    }
+
+    #[test]
+    fn unsupported_native_rejected() {
+        let err = validate_connector_input(
+            "native",
+            SourceConnectorKind::ArunaNative,
+            &HashMap::from([(
+                "endpoint".to_string(),
+                "https://aruna.example.org".to_string(),
+            )]),
+            &HashMap::new(),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            ValidationError::UnsupportedConnectorKind {
+                kind: SourceConnectorKind::ArunaNative,
+            }
+        );
+    }
+}

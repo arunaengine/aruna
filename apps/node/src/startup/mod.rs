@@ -1,0 +1,13 @@
+//! Groups the startup phases: resources, realm, federation, listeners, background and test hooks.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod background;
+pub mod federation;
+pub mod https;
+pub mod listeners;
+pub mod realm;
+pub mod recovery;
+pub mod resources;
+mod sweeps;
+pub mod test_hooks;

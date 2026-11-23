@@ -186,6 +186,13 @@ export class Fake {
     return id;
   }
 
+  jobTask(request) {
+    this.calls.push(["task", request]);
+    const id = `job-${this.calls.length}`;
+    this.job(id, { kind: "task", state: "queued" });
+    return id;
+  }
+
   jobGet(id) {
     if (!this.jobs.has(id)) throw new NotFound(`the install has no job ${id}`);
     return this.jobs.get(id).status;

@@ -1,0 +1,2010 @@
+//! Serves the staging routes for single and batch stages, staging jobs and references.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use crate::auth::RealmAuth;
+use crate::auth::{
+    ValidatedBearer, blob_permission_path, ensure_permission, parse_connector_id, parse_group_id,
+};
+use crate::error::{ErrorResponse, ServerError, ServerResult};
+use crate::job_service::{list_owned_jobs, read_staging_routed, submit_staging_job};
+use crate::jobs::{decode_cursor as decode_job_cursor, encode_cursor as encode_job_cursor};
+use crate::lookup::bucket_info;
+use crate::routes::management_relay::RELAY_HOP_HEADER;
+use crate::routes::storage::connectors::{
+    ApiConnectorKind, CreateConnectorRequest, SourceConnectorResponse,
+};
+use crate::routes::storage::relay::{RestForward, relay_json, rest_target};
+use crate::server::state::ServerState;
+use aruna_core::errors::{SourceResolutionError, StagingSourceError};
+use aruna_core::id::NodeId;
+use aruna_core::job_request::SubmitJobError;
+use aruna_core::live_version::LiveVersionInput;
+use aruna_core::staging_checkpoint::ReadCheckpointOperation;
+use aruna_core::structs::execution::job::identity::JobState;
+use aruna_core::structs::execution::job::input::{
+    JobPayload, StagingJobCheckpoint, StagingJobItem, StagingJobPhase, StagingJobPrefix,
+    StagingJobSpec,
+};
+use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::structs::execution::source_access::{ListRequest, SourceEntry, SourceEntryKind};
+use aruna_core::structs::execution::staging::{SourceMapping, StagingStrategy};
+use aruna_core::structs::execution::table::{
+    TableImport, TableSource, source_path as table_source_path,
+};
+use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_core::structs::storage::blob::bucket_permission_path;
+use aruna_core::structs::storage::distribution::route::ReadRoute;
+use aruna_ops_data::connectors::get_connector::{GetSourceOperation, GetSourceResult};
+use aruna_ops_data::distribution::routing::{bound_view, route_read};
+use aruna_ops_data::replication::live_queue::QueueLiveOperation;
+use aruna_ops_data::s3::object::head_source::HeadSourceError;
+use aruna_ops_data::s3::object::list::{
+    ListBucketInput, ListBucketOperation, ListContinuationToken,
+};
+use aruna_ops_data::s3::object::put::PutObjectError;
+use aruna_ops_data::s3::object::reference::{
+    MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
+};
+use aruna_ops_data::staging::list_source::{
+    ListStagingError, ListStagingInput, ListStagingOperation,
+};
+use aruna_ops_data::staging::read_source::ReadSourceError;
+use aruna_ops_data::staging::snapshot::{
+    MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
+};
+use aruna_ops_identity::auth::request_authorization::rules_operation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_runner::driver::{drive, node_routing};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::StatusCode;
+use axum::{Extension, Json};
+use serde::{Deserialize, Serialize};
+use std::path::{Component, Path as FsPath};
+use std::str::FromStr;
+use std::sync::Arc;
+use tracing::warn;
+use utoipa::ToSchema;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
+
+pub fn router() -> OpenApiRouter<Arc<ServerState>> {
+    OpenApiRouter::new()
+        .routes(routes!(stage_blob))
+        .routes(routes!(stage_batch))
+        .routes(routes!(list_staging_jobs, submit_staging))
+        .routes(routes!(get_staging_job))
+        .routes(routes!(list_references))
+}
+
+const DEFAULT_REFERENCE_LIMIT: usize = 500;
+const MAX_REFERENCE_LIMIT: usize = 1000;
+const DEFAULT_JOB_LIMIT: usize = 50;
+const MAX_JOB_LIMIT: usize = 200;
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct StagingJobQuery {
+    pub limit: Option<usize>,
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReferenceListQuery {
+    pub bucket: String,
+    #[serde(default)]
+    pub prefix: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReferenceListEntry {
+    pub key: String,
+    pub size: u64,
+    pub referenced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ApiConnectorKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ReferenceListResponse {
+    /// Includes materialized and referenced objects so clients can aggregate totals.
+    pub entries: Vec<ReferenceListEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// False when this member of a distributed bucket does not keep every range the listing
+    /// reaches, or is still catching up, so objects may be missing.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiStagingStrategy {
+    Snapshot,
+    Reference,
+    Sync,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = StageBlobTargetRequest)]
+pub struct StageTargetRequest {
+    pub group_id: String,
+    pub connector_id: String,
+    pub source_path: String,
+    pub bucket: String,
+    pub key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "strategy", rename_all = "snake_case")]
+#[schema(as = StageBlobRequest)]
+pub enum StageRequest {
+    Snapshot(StageTargetRequest),
+    Reference(StageTargetRequest),
+    Sync(StageTargetRequest),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = StageBlobResponse)]
+pub struct StageResponse {
+    pub strategy: ApiStagingStrategy,
+    pub bucket: String,
+    pub key: String,
+    pub version_id: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_modified: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchItem {
+    pub source_path: String,
+    pub target_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchPrefix {
+    pub source_prefix: String,
+    pub target_prefix: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchRequest {
+    pub group_id: String,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    /// The connector every staged file is read through; an uploaded table list needs none itself.
+    #[serde(default)]
+    pub connector_id: String,
+    pub bucket: String,
+    pub strategy: ApiStagingStrategy,
+    #[serde(default)]
+    pub items: Option<Vec<StageBatchItem>>,
+    #[serde(default)]
+    pub prefixes: Option<Vec<StageBatchPrefix>>,
+    /// Name of an `md5sum` or `sha256sum` manifest below each prefix; jobs only.
+    #[serde(default)]
+    pub checksum_manifest: Option<String>,
+    /// A CSV or TSV list whose rows name the files or folders to import; jobs only.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub table: Option<TableImport>,
+    /// Further sources of each imported file, equal to the first: `{connector_id, from, to}`
+    /// adds the file's source path with `from` replaced by `to`, read through that connector
+    /// of the group. Jobs only, not for distributed buckets.
+    #[serde(default)]
+    #[schema(value_type = Vec<Object>)]
+    pub mirrors: Vec<SourceMapping>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum StageBatchStatus {
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchResult {
+    pub source_path: String,
+    pub target_key: String,
+    pub status: StageBatchStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StageBatchResponse {
+    pub results: Vec<StageBatchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = SubmitStagingJobResponse)]
+pub struct SubmitStagingResponse {
+    /// This node's job, or the first coordinator's when this node coordinates no range of a
+    /// distributed bucket.
+    pub job_id: String,
+    /// The jobs the other coordinators of a distributed bucket run for their own keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coordinator_jobs: Vec<CoordinatorJobResponse>,
+}
+
+/// A coordinator's job of a distributed bucket import, or why it was not started.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct CoordinatorJobResponse {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = StagingJobProgressResponse)]
+pub struct StagingProgressResponse {
+    pub items_current: u64,
+    pub items_total: Option<u64>,
+    pub bytes_current: u64,
+    pub bytes_total: Option<u64>,
+    pub current_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = StagingJobErrorResponse)]
+pub struct StagingErrorResponse {
+    pub source_path: String,
+    pub target_key: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct StagingJobResponse {
+    pub job_id: String,
+    pub strategy: ApiStagingStrategy,
+    pub group_id: String,
+    pub connector_id: String,
+    pub bucket: String,
+    pub state: String,
+    pub phase: String,
+    pub submitted_at: String,
+    pub finished_at: Option<String>,
+    pub error: Option<String>,
+    /// While set, the job waits until then because its source answered with `Retry-After`.
+    pub paused_until: Option<String>,
+    pub progress: StagingProgressResponse,
+    pub errors: Vec<StagingErrorResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[schema(as = StagingJobListResponse)]
+pub struct StagingListResponse {
+    pub jobs: Vec<StagingJobResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/staging",
+    tag = "data/staging",
+    summary = "Stage a single source object into a bucket",
+    description = r#"Stages one source object into a bucket, either by copying its bytes now or by recording a pointer.
+
+**Authentication**: realm bearer token with WRITE on the target bucket key and READ on the
+connector's source path, both checked against the concrete path rather than a prefix alone.
+
+**Behavior**
+- `snapshot` reads the object from the source connector and commits its bytes to this node's storage
+  before answering, so it is as slow as the transfer.
+- `reference` records the object as a pointer to its source and copies nothing, so the bytes are
+  fetched on demand at read time.
+- `sync` is accepted by the schema but not implemented and always fails.
+- A 201 means the new version is committed here and immediately readable through S3; propagating it
+  to any sync target is queued afterwards and neither awaited nor reported here.
+- In a distributed bucket only the coordinator of the key's range writes. Another member relays
+  the request there with the caller's bearer token, and the coordinator checks it again. An
+  unreachable coordinator answers 503 and the write is not queued.
+
+**Limits**
+- A snapshot is charged against the realm's quota ceiling for the group."#,
+    request_body(
+        content = StageRequest,
+        description = "The staging strategy and the source and target it applies to",
+        example = json!({
+            "strategy": "snapshot",
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "connector_id": "01JCONNECTOR0123456789ABCD",
+            "source_path": "refseq/2026/genome.fna.gz",
+            "bucket": "research-raw",
+            "key": "genomes/2026/genome.fna.gz"
+        })
+    ),
+    responses(
+        (
+            status = 201,
+            description = "The object version committed on this node; content type, entity tag and modification time are echoed from the source when it reported them",
+            body = StageResponse,
+            example = json!({
+                "strategy": "snapshot",
+                "bucket": "research-raw",
+                "key": "genomes/2026/genome.fna.gz",
+                "version_id": "01JVERSION0123456789ABCDE",
+                "size": 1048576,
+                "content_type": "application/gzip",
+                "etag": "9b2cf5d8a1e04c7fb3d20e6a5c81f47b",
+                "last_modified": "2026-04-09T14:23:11.123+00:00"
+            })
+        ),
+        (status = 400, description = "The group or connector id does not parse, or the source path is empty, absolute or contains a `.` or `..` segment", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, no WRITE on the target key or READ on the source path, or the snapshot would exceed the group's quota ceiling", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, the connector does not exist, or the source object is absent", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
+        (status = 502, description = "The source connector could not be read; nothing was staged and the caller may retry", body = ErrorResponse),
+        (status = 503, description = "The coordinator of the key's distributed range is unreachable or the bucket is not active yet", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn stage_blob(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<StageRequest>,
+) -> ServerResult<(StatusCode, Json<StageResponse>)> {
+    // A member that does not coordinate the key's range relays the write with the bearer.
+    if let StageRequest::Snapshot(target) | StageRequest::Reference(target) = &request {
+        let bucket_info = bucket_info(&state, &target.bucket).await?;
+        let forward = rest_target(&state, &bucket_info, &target.key, &headers).await?;
+        if let Some(forward) = forward {
+            let path = "/data/staging";
+            let (status, answer) =
+                relay_json(&state, &forward, path, bearer.as_ref(), &request).await?;
+            return Ok((status, Json(answer)));
+        }
+    }
+
+    match request {
+        StageRequest::Snapshot(request) => snapshot_blob(state, auth, request).await,
+        StageRequest::Reference(request) => reference_blob(state, auth, request).await,
+        StageRequest::Sync(_) => Err(ServerError::Unimplemented),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/staging/batch",
+    tag = "data/staging",
+    summary = "Stage many source objects in one blocking request",
+    description = r#"Stages many source objects inside one request, reporting the outcome of each separately.
+
+**Authentication**: realm bearer token; each item is authorized exactly as on the single-object
+route, and sending `prefixes` additionally requires READ on the group's data path.
+
+**Behavior**
+- Every object is staged inside this request, one after another, so the call blocks for the whole
+  transfer and a large batch is better submitted as a job.
+- The outcome is per item and best effort: a 200 only means the batch ran, and each entry in
+  `results` carries its own status, so a caller must inspect them rather than trust the status code.
+- `prefixes` are expanded by listing the connector recursively, taking files only; a prefix that
+  cannot be listed contributes one error entry naming that prefix instead of its objects.
+- Result text is deliberately coarse for server-side and upstream failures, which appear only as
+  `Internal server error` and `Bad gateway`.
+- Items that succeeded are committed here and their propagation to sync targets is queued
+  afterwards.
+
+**Limits**
+- Named and expanded objects together may not exceed 1000, and a prefix that would expand past that
+  limit fails the entire request rather than truncating.
+- All prefixes of one request are listed in at most 8 pages together; a request that needs more
+  fails with 400 and belongs in a staging job.
+- `node_id`, when given, must be this node: staging always runs where the request lands.
+- `checksum_manifest` is refused with 400; manifests are read by staging jobs only."#,
+    request_body(
+        content = StageBatchRequest,
+        description = "One connector and target bucket for the whole batch, plus explicit `items`, `prefixes` to expand, or both; leaving both out runs an empty batch",
+        example = json!({
+            "group_id": "01JABCDEF0123456789ABCDEFG",
+            "connector_id": "01JCONNECTOR0123456789ABCD",
+            "bucket": "research-raw",
+            "strategy": "reference",
+            "items": [
+                {
+                    "source_path": "refseq/2026/a.fna.gz",
+                    "target_key": "genomes/2026/a.fna.gz"
+                }
+            ],
+            "prefixes": [
+                {
+                    "source_prefix": "refseq/2026/batch-7",
+                    "target_prefix": "genomes/2026/batch-7"
+                }
+            ]
+        })
+    ),
+    responses(
+        (
+            status = 200,
+            description = "One result per staged object plus one per prefix that could not be expanded, in that order",
+            body = StageBatchResponse,
+            example = json!({
+                "results": [
+                    {
+                        "source_path": "refseq/2026/a.fna.gz",
+                        "target_key": "genomes/2026/a.fna.gz",
+                        "status": "ok"
+                    },
+                    {
+                        "source_path": "refseq/2026/batch-7/b.fna.gz",
+                        "target_key": "genomes/2026/batch-7/b.fna.gz",
+                        "status": "error",
+                        "error": "Not found"
+                    }
+                ]
+            })
+        ),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a prefix is not a confined relative path, or the batch would exceed 1000 objects", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or prefixes were given and the caller has no READ on the group's data path", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn stage_batch(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Json(request): Json<StageBatchRequest>,
+) -> ServerResult<(StatusCode, Json<StageBatchResponse>)> {
+    const BATCH_LIMIT: usize = 1000;
+
+    let group_id = parse_group_id(&request.group_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
+    if request.strategy == ApiStagingStrategy::Sync {
+        return Err(ServerError::Unimplemented);
+    }
+    if request.checksum_manifest.is_some() || request.table.is_some() || !request.mirrors.is_empty()
+    {
+        return Err(ServerError::BadRequestReason(
+            "checksum manifests, tables and mirrors are read by staging jobs only".to_string(),
+        ));
+    }
+    let node_id = request
+        .node_id
+        .as_deref()
+        .map(NodeId::from_str)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest)?
+        .unwrap_or_else(|| state.get_node_id());
+    if node_id != state.get_node_id() {
+        return Err(ServerError::BadRequestReason(
+            "staging node must be the local node".to_string(),
+        ));
+    }
+    let mut items = request.items.unwrap_or_default();
+    ensure_batch_capacity(0, items.len(), BATCH_LIMIT)?;
+    let prefixes = request.prefixes.unwrap_or_default();
+    if !prefixes.is_empty() {
+        crate::routes::storage::connectors::ensure_data_permission(
+            &state,
+            &auth,
+            group_id,
+            Permission::READ,
+        )
+        .await?;
+    }
+    let mut expansion_errors = Vec::new();
+    // One page budget for the whole request, however many prefixes it names.
+    let mut pages_left = BATCH_LIST_PAGES;
+    for prefix in prefixes {
+        let source_prefix = match normalize_prefix(&prefix.source_prefix) {
+            Ok(prefix) => prefix,
+            Err(error) => {
+                expansion_errors.push(StageBatchResult {
+                    source_path: prefix.source_prefix,
+                    target_key: prefix.target_prefix,
+                    status: StageBatchStatus::Error,
+                    error: Some(batch_error_message(&error)),
+                });
+                continue;
+            }
+        };
+        let remaining = BATCH_LIMIT - items.len();
+        let listed = list_prefix(
+            &state,
+            (group_id, connector_id),
+            &source_prefix,
+            remaining,
+            &mut pages_left,
+        )
+        .await;
+        match listed {
+            Ok(None) => {
+                return Err(ServerError::BadRequestReason(
+                    "the prefixes list more than a batch examines; submit them as a staging job"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(entries)) => {
+                if entries.len() > remaining {
+                    return Err(ServerError::BadRequestReason(format!(
+                        "batch expands beyond {BATCH_LIMIT} items"
+                    )));
+                }
+                let expanded = map_prefix_entries(entries, &source_prefix, &prefix.target_prefix);
+                ensure_batch_capacity(items.len(), expanded.len(), BATCH_LIMIT)?;
+                items.extend(expanded);
+            }
+            Err(error) => {
+                let error = ServerError::from(error);
+                expansion_errors.push(StageBatchResult {
+                    source_path: prefix.source_prefix,
+                    target_key: prefix.target_prefix,
+                    status: StageBatchStatus::Error,
+                    error: Some(batch_error_message(&error)),
+                });
+            }
+        }
+    }
+
+    let mut results = Vec::with_capacity(items.len() + expansion_errors.len());
+    for item in items {
+        let result = stage_item(
+            state.clone(),
+            auth.clone(),
+            group_id,
+            connector_id,
+            &request.bucket,
+            request.strategy,
+            &item,
+        )
+        .await;
+        results.push(stage_result(item, result));
+    }
+    results.extend(expansion_errors);
+
+    Ok((StatusCode::OK, Json(StageBatchResponse { results })))
+}
+
+/// Listing pages one batch request may examine across its prefixes; more belongs in a job.
+const BATCH_LIST_PAGES: usize = 8;
+
+/// Lists the files below a prefix page by page, stopping once more than `remaining` are found.
+/// Each page spends one of `pages_left`; `None` once the request's pages are spent.
+async fn list_prefix(
+    state: &ServerState,
+    (group_id, connector_id): (aruna_core::types::GroupId, ulid::Ulid),
+    source_prefix: &str,
+    remaining: usize,
+    pages_left: &mut usize,
+) -> Result<Option<Vec<SourceEntry>>, ListStagingError> {
+    let mut entries = Vec::new();
+    let mut cursor = None;
+    while *pages_left > 0 {
+        *pages_left -= 1;
+        let page = drive(
+            ListStagingOperation::new(ListStagingInput {
+                group_id,
+                connector_id,
+                source_path: source_prefix.to_string(),
+                // One spare entry tells a listing that fits from one that does not.
+                request: ListRequest {
+                    cursor,
+                    limit: remaining + 1 - entries.len(),
+                    recursive: true,
+                    files_only: true,
+                    ..Default::default()
+                },
+            }),
+            &state.get_ctx(),
+        )
+        .await?;
+        entries.extend(page.entries);
+        match page.next_cursor {
+            Some(next) if entries.len() <= remaining => cursor = Some(next),
+            _ => return Ok(Some(entries)),
+        }
+    }
+    Ok(None)
+}
+
+#[utoipa::path(
+    post,
+    path = "/data/staging/jobs",
+    tag = "data/staging",
+    summary = "Submit a background staging job",
+    description = r#"Records a staging batch as a durable job on this node and returns before any object is read.
+
+**Authentication**: realm bearer token; every named item and prefix is authorized before the job is
+accepted, so acceptance already implies READ on each source path and WRITE on each target key.
+Nothing is authorized later while the job runs.
+
+**Behavior**
+- Takes the same body as the blocking batch route but returns as soon as the work is recorded: a 202
+  means the job is durable and queued on this node, and nothing has been read or copied yet.
+- Unlike the blocking route there is no cap on the number of items, and prefixes are stored and
+  walked by the job rather than expanded here.
+- S3 prefixes are walked as one flat listing with a provider cursor; other sources are walked
+  directory by directory from a durable queue. Each page and its checkpoint are written together,
+  and references are registered from listing metadata (size, ETag, last-modified) without a HEAD
+  per file. HTTP index pages round sizes and times, so each of their files gets one HEAD.
+- `checksum_manifest` names an `md5sum` or `sha256sum` file below each prefix. It is read before
+  the prefix, and each imported file carries its digest; a later complete read of a reference and a
+  snapshot copy keep bytes only when they match it.
+- There is no idempotency key, so resubmitting the same body creates another job and stages the same
+  objects a second time.
+- `table` imports from a CSV or TSV list instead of `items` and `prefixes` (reference strategy
+  only). `source` is `{"connector": path or URL below the connector}` or
+  `{"object": {"bucket", "key"}}`, a list uploaded into Aruna and read as the caller.
+  `format`: `delimiter` (default `,`), `quote` (default `"`, `null` for none), `header`
+  (`first_row` default, `{"row": n}`, `last_comment`, `{"columns": [...]}`), `comment`, `nulls`
+  (default `[""]`), `gzip` (default: by `.gz` name or magic bytes); UTF-8. `rows`: `kind` (`file`:
+  one object per row; `folder`: the row names a directory whose files are listed), `source` and
+  `target` templates (`{column}`, `{column|basename}`), `filter` (`[{"column", "any_of"}]`),
+  `keep` (columns stored as object metadata; `null` keeps all), `text` and `exact` (columns
+  search matches as free text or as `column=value`). File rows may name `size` (column of the
+  byte count; such a row is registered without a HEAD), `checksums` (`[{"algorithm": "md5" |
+  "sha1" | "sha256", "column"}]`, hex digests recorded on the reference: a read whose source
+  gives no strong ETag checks the whole bytes against them) and `modified` (column of an RFC
+  3339 time, recorded as the file's modification time, or a date, which is only checked).
+  `record` rows are complete object records that are trusted, so the source is never asked:
+  they need `size`, take `checksums` and `modified` like file rows, and the columns `etag`,
+  `content_type` and `metadata` (a JSON object of strings) when the table has them. A record
+  row without a source writes an empty object, such as a folder marker `name/`. A
+  bad value fails its row. `connector_id` is always required: every row is read through it, so
+  rows that name http(s) URLs need a connector whose base holds them for egress. A list in a
+  bucket (`object`) is itself read without the connector. `rate` paces requests to the connector per
+  node (default 10 per second); transient answers back off and honour `Retry-After`. A folder row
+  writes a zero-byte folder object at `target/` carrying the row's metadata. The table and every
+  row are read under the caller's permissions; rows are authorized by the job, one by one.
+- `mirrors` gives every imported file further sources of the same bytes, all equal to the
+  first: `[{"connector_id", "from", "to"}]` adds the file's source path with `from` replaced by
+  `to`, read through that connector of the group (the caller needs READ below `to`). File and
+  record rows may also name `mirrors` (`[{"connector_id", "source"}]`, a template like
+  `source`). A read tries the sources that did not fail lately first; a source serves only
+  bytes it proves equal to the version (recorded checksums or the same strong ETag). A file
+  whose further source is invalid or unreadable for the caller fails. A re-import without
+  `mirrors` keeps the further sources of unchanged files. Not for distributed buckets.
+- Progress and completion are observed by reading the job by its id.
+- In a distributed bucket every coordinator imports only the keys of the ranges it coordinates:
+  this node relays the job to the other coordinators with the caller's bearer token and lists their
+  jobs in `coordinator_jobs`; it starts no job of its own when it coordinates no range.
+- Every coordinator imports with its own copy of the connector under the same id. A connector
+  without credentials is registered on the other coordinators first; credentials never leave this
+  node, so a connector holding some must be registered on each coordinator by its owner with the
+  same `connector_id`, else that coordinator's entry names the missing connector.
+
+**Limits**
+- At least one item or prefix is required, or a `table`.
+- A header and every row of a table must fit into 256 KiB.
+- `node_id`, when given, must be this node, because the job runs where it was submitted."#,
+    request_body(
+        content = StageBatchRequest,
+        description = "One connector and target bucket for the job, plus the `items` and `prefixes` it should stage, or one `table`",
+        examples(
+            ("Prefixes" = (
+                summary = "Stage a prefix with its checksum manifest",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "connector_id": "01JCONNECTOR0123456789ABCD",
+                    "bucket": "research-raw",
+                    "strategy": "snapshot",
+                    "prefixes": [
+                        {
+                            "source_prefix": "refseq/2026",
+                            "target_prefix": "genomes/2026"
+                        }
+                    ],
+                    "checksum_manifest": "MD5SUMS"
+                })
+            )),
+            ("Assembly summary" = (
+                summary = "Import NCBI assembly folders from a summary file (connector rooted at https://ftp.ncbi.nlm.nih.gov/genomes/)",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "connector_id": "01JCONNECTOR0123456789ABCD",
+                    "bucket": "ncbi-refseq",
+                    "strategy": "reference",
+                    "table": {
+                        "source": {"connector": "ASSEMBLY_REPORTS/assembly_summary_refseq.txt"},
+                        "format": {"delimiter": "\t", "header": "last_comment", "comment": "#", "nulls": ["na", ""]},
+                        "rows": {
+                            "kind": "folder",
+                            "source": "{ftp_path}",
+                            "target": "{ftp_path|basename}",
+                            "filter": [{"column": "assembly_accession", "any_of": ["GCF_000005845.2", "GCF_000001405.40"]}],
+                            "text": ["assembly_accession", "bioproject", "biosample", "wgs_master", "organism_name", "infraspecific_name", "isolate", "asm_name", "asm_submitter", "gbrs_paired_asm"],
+                            "exact": ["taxid", "species_taxid", "assembly_level", "group"]
+                        }
+                    }
+                })
+            )),
+            ("Uploaded list" = (
+                summary = "Import one file per row of an uploaded CSV, keeping two columns",
+                value = json!({
+                    "group_id": "01JABCDEF0123456789ABCDEFG",
+                    "connector_id": "01JCONNECTOR0123456789ABCD",
+                    "bucket": "samples",
+                    "strategy": "reference",
+                    "table": {
+                        "source": {"object": {"bucket": "lists", "key": "samples.csv"}},
+                        "rows": {
+                            "kind": "file",
+                            "source": "{url}",
+                            "target": "samples/{url|basename}",
+                            "keep": ["sample", "description"],
+                            "text": ["description"],
+                            "exact": ["sample"]
+                        }
+                    }
+                })
+            ))
+        )
+    ),
+    responses(
+        (
+            status = 202,
+            description = "The job is durably queued on this node",
+            body = SubmitStagingResponse,
+            example = json!({
+                "job_id": "01JJOB0123456789ABCDEFGHJ"
+            })
+        ),
+        (status = 400, description = "The group or connector id does not parse, `node_id` names another node, a source path, prefix or checksum manifest name is not confined, a target key is blank, neither items nor prefixes nor a table were given, or the table descriptor is invalid", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on a source path or the table, or no WRITE on a target key or the table's destination bucket", body = ErrorResponse),
+        (status = 404, description = "The bucket is unknown to this node or belongs to another group, a source path does not exist, or the connector is not registered on this node (code `connector_not_found`)", body = ErrorResponse),
+        (status = 501, description = "The `sync` strategy is declared but not implemented", body = ErrorResponse),
+        (status = 503, description = "Job placement or the structured id clock is unavailable, or a key range of the distributed bucket is moving away from this node; the response carries `Retry-After` and the identical body may be resubmitted", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn submit_staging(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    headers: axum::http::HeaderMap,
+    Json(request): Json<StageBatchRequest>,
+) -> ServerResult<(StatusCode, Json<SubmitStagingResponse>)> {
+    let relayed = StageBatchRequest {
+        node_id: None,
+        ..request.clone()
+    };
+    let group_id = parse_group_id(&request.group_id)?;
+    if request.connector_id.trim().is_empty() {
+        return Err(ServerError::BadRequestReason(
+            "connector_id is required: the files of items, prefixes and table rows are read \
+             through a connector; a table list in a bucket is read without one"
+                .to_string(),
+        ));
+    }
+    let connector_id = parse_connector_id(&request.connector_id)?;
+    if request.strategy == ApiStagingStrategy::Sync {
+        return Err(ServerError::Unimplemented);
+    }
+    let node_id = request
+        .node_id
+        .as_deref()
+        .map(NodeId::from_str)
+        .transpose()
+        .map_err(|_| ServerError::BadRequest)?
+        .unwrap_or_else(|| state.get_node_id());
+    if node_id != state.get_node_id() {
+        return Err(ServerError::BadRequestReason(
+            "staging node must be the local node".to_string(),
+        ));
+    }
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
+    if bucket_info.group_id != group_id {
+        return Err(ServerError::NotFound);
+    }
+
+    let mut items = Vec::new();
+    for item in request.items.unwrap_or_default() {
+        validate_source_path(&item.source_path)?;
+        if item.target_key.trim().is_empty() {
+            return Err(ServerError::BadRequest);
+        }
+        ensure_source_permission(&state, &auth, group_id, connector_id, &item.source_path).await?;
+        ensure_permission(
+            &state,
+            &auth,
+            blob_permission_path(&state, group_id, &request.bucket, &item.target_key),
+            Permission::WRITE,
+        )
+        .await?;
+        items.push(StagingJobItem {
+            source_path: item.source_path,
+            target_key: item.target_key,
+        });
+    }
+
+    let mut prefixes = Vec::new();
+    for prefix in request.prefixes.unwrap_or_default() {
+        let source_prefix = normalize_prefix(&prefix.source_prefix)?;
+        ensure_prefix_permission(
+            &state,
+            &auth,
+            group_id,
+            connector_id,
+            source_prefix.trim_end_matches('/'),
+        )
+        .await?;
+        ensure_permission(
+            &state,
+            &auth,
+            blob_permission_path(
+                &state,
+                group_id,
+                &request.bucket,
+                prefix.target_prefix.trim_matches('/'),
+            ),
+            Permission::WRITE,
+        )
+        .await?;
+        prefixes.push(StagingJobPrefix {
+            source_prefix: source_prefix.trim_end_matches('/').to_string(),
+            target_prefix: prefix.target_prefix.trim_matches('/').to_string(),
+        });
+    }
+    let table = request.table;
+    if let Some(table) = table.as_ref() {
+        let reference = request.strategy == ApiStagingStrategy::Reference;
+        if !items.is_empty() || !prefixes.is_empty() || !reference {
+            return Err(ServerError::BadRequestReason(
+                "a table import takes no items or prefixes and uses the reference strategy"
+                    .to_string(),
+            ));
+        }
+        check_table(
+            &state,
+            &auth,
+            (group_id, connector_id),
+            &request.bucket,
+            table,
+        )
+        .await?;
+    } else if items.is_empty() && prefixes.is_empty() {
+        return Err(ServerError::BadRequestReason(
+            "at least one staging item or prefix is required".to_string(),
+        ));
+    }
+    let checksum_manifest = request
+        .checksum_manifest
+        .filter(|name| !name.trim().is_empty());
+    if let Some(name) = checksum_manifest.as_deref() {
+        validate_source_path(name)?;
+    }
+
+    let mirror_columns = (table.iter()).flat_map(|table| &table.rows.mirrors);
+    let mirror_connectors = (request.mirrors.iter())
+        .map(|mapping| (mapping.connector_id, mapping.to.as_str()))
+        .chain(mirror_columns.map(|column| (column.connector_id, "")));
+    for (mirror_id, prefix) in mirror_connectors {
+        if bucket_info.distribution.is_some() {
+            return Err(ServerError::BadRequestReason(
+                "imports into a distributed bucket take no further sources".to_string(),
+            ));
+        }
+        local_connector(&state, group_id, mirror_id).await?;
+        let prefix = prefix.trim_matches('/');
+        ensure_prefix_permission(&state, &auth, group_id, mirror_id, prefix).await?;
+    }
+
+    crate::routes::storage::relay::relayed_set(&bucket_info, &headers)?;
+    let source = local_connector(&state, group_id, connector_id).await?;
+    // A distributed bucket imports by range: every coordinator runs a job for its own keys.
+    let fan_out =
+        (bucket_info.distribution.as_ref()).filter(|_| !headers.contains_key(RELAY_HOP_HEADER));
+    let (local, coordinator_jobs) = match fan_out {
+        Some(binding) => {
+            let caller = (bearer.as_ref(), &relayed);
+            coordinator_jobs(&state, binding, caller, &source).await?
+        }
+        None => (true, Vec::new()),
+    };
+    if !local {
+        let job_id = (coordinator_jobs.iter())
+            .find_map(|job| job.job_id.clone())
+            .ok_or_else(|| {
+                ServerError::ServiceUnavailableReason(
+                    "no coordinator of the distributed bucket accepted the job".to_string(),
+                )
+            })?;
+        let response = SubmitStagingResponse {
+            job_id,
+            coordinator_jobs,
+        };
+        return Ok((StatusCode::ACCEPTED, Json(response)));
+    }
+    let result = submit_staging_job(
+        &state.get_ctx(),
+        StagingJobSpec {
+            auth_context: auth,
+            group_id,
+            node_id,
+            connector_id,
+            bucket: request.bucket,
+            bucket_identity: bucket_info.identity(),
+            strategy: match request.strategy {
+                ApiStagingStrategy::Snapshot => StagingStrategy::Snapshot,
+                ApiStagingStrategy::Reference => StagingStrategy::Reference,
+                ApiStagingStrategy::Sync => unreachable!(),
+            },
+            items,
+            prefixes,
+            checksum_manifest,
+            table,
+            mirrors: request.mirrors,
+        },
+        node_id,
+        state.rocrate_limits().artifact_retention_ms,
+    )
+    .await
+    .map_err(ServerError::from)?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(SubmitStagingResponse {
+            job_id: result.job_id.to_string(),
+            coordinator_jobs,
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/staging/jobs",
+    tag = "data/staging",
+    summary = "List your staging jobs on this node",
+    description = r#"Returns one page of the calling user's own staging jobs that this node owns, oldest first.
+
+**Authentication**: realm bearer token; a path-restricted token sees only the jobs submitted under
+exactly the same restrictions.
+
+**Behavior**
+- A job submitted to another node is not visible here and must be listed there; other users' jobs
+  and non-staging jobs never appear.
+- Progress and per-object errors come from the runner's last checkpoint, so a running job's counts
+  trail the work and a job that has not started reports the queued phase with zero progress."#,
+    params(
+        ("limit" = Option<usize>, Query, description = "Page size; defaults to 50 when absent or zero and is capped at 200"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from the previous page, passed back unchanged; omit for the first page")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "One page of the caller's staging jobs on this node; `next_cursor` appears only when a further page exists",
+            body = StagingListResponse,
+            example = json!({
+                "jobs": [
+                    {
+                        "job_id": "01JJOB0123456789ABCDEFGHJ",
+                        "strategy": "snapshot",
+                        "group_id": "01JABCDEF0123456789ABCDEFG",
+                        "connector_id": "01JCONNECTOR0123456789ABCD",
+                        "bucket": "research-raw",
+                        "state": "running",
+                        "phase": "downloading",
+                        "submitted_at": "2026-04-09T14:23:11.123+00:00",
+                        "finished_at": null,
+                        "error": null,
+                        "progress": {
+                            "items_current": 12,
+                            "items_total": 40,
+                            "bytes_current": 5242880,
+                            "bytes_total": 20971520,
+                            "current_path": "refseq/2026/genome.fna.gz"
+                        },
+                        "errors": []
+                    }
+                ],
+                "next_cursor": "AAABkWPGovsBAgMEBQYHCAkKCwwNDg8Q"
+            })
+        ),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_staging_jobs(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Query(query): Query<StagingJobQuery>,
+) -> ServerResult<(StatusCode, Json<StagingListResponse>)> {
+    let cursor = decode_job_cursor(query.cursor.as_deref())?;
+    let limit = query
+        .limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_JOB_LIMIT)
+        .min(MAX_JOB_LIMIT);
+    let (records, next_cursor) =
+        list_owned_jobs(&state.get_ctx(), auth.user_id, cursor, limit, |record| {
+            matches!(record.payload, JobPayload::Staging(_)) && staging_job_visible(record, &auth)
+        })
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+    let mut jobs = Vec::with_capacity(records.len());
+    for record in records {
+        let checkpoint = drive(
+            ReadCheckpointOperation::new(record.job_id),
+            &state.get_ctx(),
+        )
+        .await
+        .map_err(|error| ServerError::InternalError(error.to_string().into()))?;
+        jobs.push(staging_job_response(&record, checkpoint.as_ref())?);
+    }
+    Ok((
+        StatusCode::OK,
+        Json(StagingListResponse {
+            jobs,
+            next_cursor: encode_job_cursor(next_cursor),
+        }),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/staging/jobs/{job_id}",
+    tag = "data/staging",
+    summary = "Read one staging job and its progress",
+    description = r#"Returns one staging job as the node that owns it currently records it, with its progress.
+
+**Authentication**: realm bearer token, forwarded unchanged to the owning node, which re-checks it.
+
+**Behavior**
+- The job is always answered by the node that owns it: a request landing anywhere else is forwarded
+  to that owner, so the same id can be read from any node and the answer is the owner's current
+  record rather than a replica.
+- `state` collapses the lifecycle into queued, running, done or failed; `awaiting_key`,
+  `cancelling`, `indeterminate` and `cancelled` are reported as the job store names them. `phase`
+  names the stage the runner last checkpointed, so a job can read as running before bytes move.
+- `progress` and `errors` come from that same checkpoint, so they trail the work; per-object
+  failures are listed while the job as a whole may still succeed, and `finished_at` is set only once
+  the job has stopped."#,
+    params(("job_id" = String, Path, description = "Staging job id as a 26-character ULID, as returned when the job was submitted")),
+    responses(
+        (
+            status = 200,
+            description = "The job as the owning node currently records it, including per-object errors gathered so far",
+            body = StagingJobResponse,
+            example = json!({
+                "job_id": "01JJOB0123456789ABCDEFGHJ",
+                "strategy": "snapshot",
+                "group_id": "01JABCDEF0123456789ABCDEFG",
+                "connector_id": "01JCONNECTOR0123456789ABCD",
+                "bucket": "research-raw",
+                "state": "done",
+                "phase": "completed",
+                "submitted_at": "2026-04-09T14:23:11.123+00:00",
+                "finished_at": "2026-04-09T14:41:02.884+00:00",
+                "error": null,
+                "progress": {
+                    "items_current": 40,
+                    "items_total": 40,
+                    "bytes_current": 20971520,
+                    "bytes_total": 20971520,
+                    "current_path": null
+                },
+                "errors": [
+                    {
+                        "source_path": "refseq/2026/broken.fna.gz",
+                        "target_key": "genomes/2026/broken.fna.gz",
+                        "error": "Not found"
+                    }
+                ]
+            })
+        ),
+        (status = 401, description = "Missing or invalid bearer token, or the owning node rejected the forwarded one", body = ErrorResponse),
+        (status = 404, description = "The owning node, the sole authority on this, holds no such staging job for this caller; another user's job, a non-staging job and a job whose restrictions do not match the token all read as not found rather than forbidden", body = ErrorResponse),
+        (status = 503, description = "The node that owns the job could not be reached; the caller may retry", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_staging_job(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Extension(bearer): Extension<Option<ValidatedBearer>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> ServerResult<(StatusCode, Json<StagingJobResponse>)> {
+    let job_id = aruna_core::structs::execution::job::identity::JobId::from_str(&job_id)
+        .map_err(|_| ServerError::BadRequest)?;
+    // The owner is the sole 404 authority; a non-owner routes or reports 503.
+    let (record, checkpoint) = read_staging_routed(
+        &state.get_ctx(),
+        auth.user_id,
+        job_id,
+        crate::jobs::forwarded_job_auth(bearer)?,
+    )
+    .await
+    .map_err(crate::jobs::map_job_route)?
+    .filter(|(record, _)| staging_job_visible(record, &auth))
+    .ok_or(ServerError::NotFound)?;
+    Ok((
+        StatusCode::OK,
+        Json(staging_job_response(&record, checkpoint.as_ref())?),
+    ))
+}
+
+#[utoipa::path(
+    get,
+    path = "/data/staging/references",
+    tag = "data/staging",
+    summary = "List a bucket's objects with their source bindings",
+    description = r#"Lists a bucket's live objects in key order, saying for each whether it is stored here or referenced.
+
+**Authentication**: realm bearer token with READ on the bucket, checked against the group that owns
+the bucket, which is resolved first. Keys the caller may not read, for example under a deny or
+outside a path restriction, are left out of the page.
+
+**Behavior**
+- This is a node-local listing of the bucket as this node currently sees it, so objects written
+  elsewhere appear once they have replicated here.
+- In a distributed bucket `complete` is false when this node does not keep every key range the
+  prefix reaches, or is still catching up; the page then lists only what this node holds, and
+  a node that keeps every range answers in full.
+- Every live object is returned, materialized and referenced alike, which is what lets a caller
+  total a bucket in one pass.
+- `referenced` false means the bytes are stored here and `size` is the stored blob size.
+- `referenced` true means the object is still only a pointer, `size` is the length its source
+  reported, and `kind` with `source_path` describe where it points, `connector_id` for an external
+  source connector or `origin_node_id` for another Aruna node."#,
+    params(
+        ("bucket" = String, Query, description = "Bucket to list, as used by the S3 surface"),
+        ("prefix" = Option<String>, Query, description = "Return only objects whose key starts with this prefix; an empty value is treated as no prefix"),
+        ("limit" = Option<usize>, Query, description = "Page size; defaults to 500 when absent or zero and is capped at 1000"),
+        ("cursor" = Option<String>, Query, description = "Opaque `next_cursor` from the previous page, passed back unchanged; omit for the first page")
+    ),
+    responses(
+        (
+            status = 200,
+            description = "One page of the bucket's objects with their binding details; `next_cursor` appears only when a further page exists",
+            body = ReferenceListResponse,
+            example = json!({
+                "entries": [
+                    {
+                        "key": "genomes/2026/a.fna.gz",
+                        "size": 1048576,
+                        "referenced": false
+                    },
+                    {
+                        "key": "genomes/2026/b.fna.gz",
+                        "size": 2097152,
+                        "referenced": true,
+                        "kind": "http",
+                        "source_path": "refseq/2026/b.fna.gz",
+                        "connector_id": "01JCONNECTOR0123456789ABCD"
+                    }
+                ],
+                "next_cursor": "AWdlbm9tZXMvMjAyNi9iLmZuYS5neg",
+                "complete": true
+            })
+        ),
+        (status = 400, description = "The cursor could not be decoded", body = ErrorResponse),
+        (status = 403, description = "Token from another realm, or no READ on the bucket", body = ErrorResponse),
+        (status = 404, description = "No bucket of that name is known to this node", body = ErrorResponse)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_references(
+    State(state): State<Arc<ServerState>>,
+    RealmAuth(auth): RealmAuth,
+    Query(query): Query<ReferenceListQuery>,
+) -> ServerResult<(StatusCode, Json<ReferenceListResponse>)> {
+    let bucket_info = bucket_info(&state, &query.bucket).await?;
+    let bucket_path = bucket_permission_path(
+        state.get_realm_id(),
+        bucket_info.group_id,
+        state.get_node_id(),
+        &query.bucket,
+    );
+    ensure_permission(&state, &auth, bucket_path.clone(), Permission::READ).await?;
+    // Denies and path restrictions below the bucket hide single keys from the page.
+    let rules = drive(rules_operation(&auth, &bucket_path), &state.get_ctx())
+        .await
+        .map_err(|error| ServerError::InternalError(error.into()))?;
+
+    let continuation_token = decode_reference_cursor(query.cursor.as_deref())?;
+    let limit = query
+        .limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_REFERENCE_LIMIT)
+        .min(MAX_REFERENCE_LIMIT);
+    let prefix = query.prefix.filter(|prefix| !prefix.is_empty());
+    let complete = match bucket_info.distribution.as_ref() {
+        None => true,
+        Some(binding) => {
+            let reach = prefix.as_deref().unwrap_or_default();
+            let route = drive(route_read(binding, reach, true), state.get_ctx().as_ref()).await;
+            matches!(route, Ok(ReadRoute::Local { catching_up: false }))
+        }
+    };
+    let result = drive(
+        ListBucketOperation::new(ListBucketInput {
+            bucket: query.bucket,
+            group_id: bucket_info.group_id,
+            continuation_token,
+            max_keys: Some(limit),
+            prefix,
+            delimiter: None,
+            start_after: None,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|error| ServerError::InternalError(error.into()))?;
+
+    let entries = result
+        .objects
+        .into_iter()
+        .filter(|object| {
+            rules.allows(
+                &format!("{bucket_path}/{}", object.head.key),
+                &Permission::READ,
+            )
+        })
+        .map(|object| ReferenceListEntry {
+            size: object
+                .location
+                .as_ref()
+                .map(|location| location.blob_size)
+                .or_else(|| {
+                    object
+                        .source_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.content_length)
+                })
+                .unwrap_or_default(),
+            key: object.head.key,
+            referenced: object.referenced,
+            kind: object.kind.map(Into::into),
+            source_path: object.source_path,
+            connector_id: object.connector_id.map(|id| id.to_string()),
+            origin_node_id: object.origin_node_id.map(|id| id.to_string()),
+        })
+        .collect();
+    let next_cursor = result
+        .continuation_token
+        .map(encode_reference_cursor)
+        .transpose()?;
+
+    Ok((
+        StatusCode::OK,
+        Json(ReferenceListResponse {
+            entries,
+            next_cursor,
+            complete,
+        }),
+    ))
+}
+
+async fn stage_item(
+    state: Arc<ServerState>,
+    auth: AuthContext,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    bucket: &str,
+    strategy: ApiStagingStrategy,
+    item: &StageBatchItem,
+) -> ServerResult<()> {
+    let target = StageTargetRequest {
+        group_id: group_id.to_string(),
+        connector_id: connector_id.to_string(),
+        source_path: item.source_path.clone(),
+        bucket: bucket.to_string(),
+        key: item.target_key.clone(),
+    };
+    let _ = match strategy {
+        ApiStagingStrategy::Snapshot => snapshot_blob(state, auth, target).await?,
+        ApiStagingStrategy::Reference => reference_blob(state, auth, target).await?,
+        ApiStagingStrategy::Sync => return Err(ServerError::Unimplemented),
+    };
+    Ok(())
+}
+
+fn stage_result(item: StageBatchItem, result: ServerResult<()>) -> StageBatchResult {
+    match result {
+        Ok(()) => StageBatchResult {
+            source_path: item.source_path,
+            target_key: item.target_key,
+            status: StageBatchStatus::Ok,
+            error: None,
+        },
+        Err(error) => StageBatchResult {
+            source_path: item.source_path,
+            target_key: item.target_key,
+            status: StageBatchStatus::Error,
+            error: Some(batch_error_message(&error)),
+        },
+    }
+}
+
+fn batch_error_message(error: &ServerError) -> String {
+    match error {
+        ServerError::InternalError(_) => "Internal server error".to_string(),
+        ServerError::BadGateway | ServerError::BadGatewayReason(_) => "Bad gateway".to_string(),
+        _ => error.to_string(),
+    }
+}
+
+fn ensure_batch_capacity(current: usize, additional: usize, limit: usize) -> ServerResult<()> {
+    if current
+        .checked_add(additional)
+        .is_none_or(|total| total > limit)
+    {
+        return Err(ServerError::BadRequestReason(format!(
+            "batch expands beyond {limit} items"
+        )));
+    }
+    Ok(())
+}
+
+fn staging_job_visible(record: &JobRecord, auth: &AuthContext) -> bool {
+    let JobPayload::Staging(spec) = &record.payload else {
+        return false;
+    };
+    auth.path_restrictions.is_none() || spec.auth_context == *auth
+}
+
+/// The staging view of a job state; states outside the collapsed four keep their job name.
+fn staging_state(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued | JobState::Claimed => "queued",
+        JobState::Preparing | JobState::Ready | JobState::Running => "running",
+        JobState::Succeeded => "done",
+        JobState::Failed => "failed",
+        JobState::AwaitingKey
+        | JobState::Cancelling
+        | JobState::Indeterminate
+        | JobState::Cancelled
+        | JobState::NotRun => state.name(),
+    }
+}
+
+fn staging_job_response(
+    record: &JobRecord,
+    checkpoint: Option<&StagingJobCheckpoint>,
+) -> ServerResult<StagingJobResponse> {
+    let JobPayload::Staging(spec) = &record.payload else {
+        return Err(ServerError::NotFound);
+    };
+    let phase = match record.state {
+        JobState::Succeeded => StagingJobPhase::Completed,
+        JobState::Failed | JobState::Cancelled => StagingJobPhase::Failed,
+        _ => checkpoint
+            .map(|checkpoint| checkpoint.phase)
+            .unwrap_or(StagingJobPhase::Queued),
+    };
+    let progress = checkpoint
+        .map(|checkpoint| StagingProgressResponse {
+            items_current: checkpoint.items_current,
+            items_total: checkpoint.items_total,
+            bytes_current: checkpoint.bytes_current,
+            bytes_total: checkpoint.bytes_total,
+            current_path: checkpoint.current_path.clone(),
+        })
+        .unwrap_or_else(|| StagingProgressResponse {
+            items_current: record.progress.current,
+            items_total: record.progress.total,
+            bytes_current: 0,
+            bytes_total: None,
+            current_path: None,
+        });
+    Ok(StagingJobResponse {
+        job_id: record.job_id.to_string(),
+        strategy: match spec.strategy {
+            StagingStrategy::Reference => ApiStagingStrategy::Reference,
+            StagingStrategy::Snapshot => ApiStagingStrategy::Snapshot,
+            StagingStrategy::Sync => ApiStagingStrategy::Sync,
+        },
+        group_id: spec.group_id.to_string(),
+        connector_id: spec.connector_id.to_string(),
+        bucket: spec.bucket.clone(),
+        state: staging_state(record.state).to_string(),
+        phase: staging_phase_name(phase).to_string(),
+        submitted_at: format_job_time(record.created_at_ms),
+        finished_at: record.finished_at_ms.map(format_job_time),
+        error: record
+            .last_error
+            .as_ref()
+            .map(|error| error.message.clone()),
+        paused_until: (record.progress.paused_until)
+            .and_then(|until| until.duration_since(std::time::UNIX_EPOCH).ok())
+            .and_then(|since| i64::try_from(since.as_millis()).ok())
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|until| until.to_rfc3339()),
+        progress,
+        errors: checkpoint
+            .map(|checkpoint| {
+                checkpoint
+                    .errors
+                    .iter()
+                    .map(|error| StagingErrorResponse {
+                        source_path: error.source_path.clone(),
+                        target_key: error.target_key.clone(),
+                        error: error.error.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn staging_phase_name(phase: StagingJobPhase) -> &'static str {
+    match phase {
+        StagingJobPhase::Queued => "queued",
+        StagingJobPhase::Discovering => "discovering",
+        StagingJobPhase::Inspecting => "inspecting",
+        StagingJobPhase::Registering => "registering",
+        StagingJobPhase::Downloading => "downloading",
+        StagingJobPhase::Writing => "writing",
+        StagingJobPhase::Completed => "completed",
+        StagingJobPhase::Failed => "failed",
+    }
+}
+
+fn format_job_time(timestamp_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
+        .map(|timestamp| timestamp.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn decode_reference_cursor(cursor: Option<&str>) -> ServerResult<Option<ListContinuationToken>> {
+    cursor
+        .map(|cursor| {
+            let bytes = aruna_core::cursor::decode(cursor).map_err(|_| ServerError::BadRequest)?;
+            ListContinuationToken::from_bytes(&bytes).map_err(|_| ServerError::BadRequest)
+        })
+        .transpose()
+}
+
+fn encode_reference_cursor(token: ListContinuationToken) -> ServerResult<String> {
+    token
+        .to_bytes()
+        .map(aruna_core::cursor::encode)
+        .map_err(|error| ServerError::InternalError(error.into()))
+}
+
+fn normalize_prefix(prefix: &str) -> ServerResult<String> {
+    let mut prefix = prefix.trim();
+    while let Some(stripped) = prefix.strip_prefix("./") {
+        prefix = stripped;
+    }
+    if prefix.is_empty() || prefix == "." {
+        return Ok(String::new());
+    }
+    validate_source_path(prefix)?;
+    Ok(format!("{}/", prefix.trim().trim_end_matches('/')))
+}
+
+fn map_prefix_entries(
+    entries: Vec<SourceEntry>,
+    source_prefix: &str,
+    target_prefix: &str,
+) -> Vec<StageBatchItem> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.kind == SourceEntryKind::File)
+        .map(|entry| {
+            let relative = entry
+                .path
+                .strip_prefix(source_prefix)
+                .unwrap_or(&entry.path)
+                .trim_start_matches('/');
+            let target_prefix = target_prefix.trim_matches('/');
+            let target_key = if target_prefix.is_empty() {
+                relative.to_string()
+            } else if relative.is_empty() {
+                target_prefix.to_string()
+            } else {
+                format!("{target_prefix}/{relative}")
+            };
+            StageBatchItem {
+                source_path: entry.path,
+                target_key,
+            }
+        })
+        .collect()
+}
+
+async fn snapshot_blob(
+    state: Arc<ServerState>,
+    auth: AuthContext,
+    request: StageTargetRequest,
+) -> ServerResult<(StatusCode, Json<StageResponse>)> {
+    let group_id = parse_group_id(&request.group_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
+    if bucket_info.group_id != group_id {
+        return Err(ServerError::NotFound);
+    }
+
+    ensure_permission(
+        &state,
+        &auth,
+        blob_permission_path(&state, group_id, &request.bucket, &request.key),
+        Permission::WRITE,
+    )
+    .await?;
+    ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
+
+    let quota_ceiling = resolve_quota_ceiling(&state, group_id).await?;
+
+    let result = drive(
+        stage_snapshot_blob(
+            &node_routing(&state.get_ctx()),
+            MaterializeSnapshotInput {
+                job_id: None,
+                group_id,
+                user_id: auth.user_id,
+                realm_id: state.get_realm_id(),
+                node_id: state.get_node_id(),
+                connector_id,
+                source_path: request.source_path,
+                bucket: request.bucket.clone(),
+                key: request.key.clone(),
+                quota_ceiling,
+                retry_key: None,
+                expected_bucket: bucket_info,
+                restrictions: auth.path_restrictions.clone(),
+                expected_checksums: Vec::new(),
+            },
+        ),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(ServerError::from)?;
+
+    queue_live_replication(
+        &state,
+        auth,
+        request.bucket.clone(),
+        request.key.clone(),
+        result.version_id,
+        false,
+    )
+    .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(StageResponse {
+            strategy: ApiStagingStrategy::Snapshot,
+            bucket: request.bucket,
+            key: request.key,
+            version_id: result.version_id.to_string(),
+            size: result.location.blob_size,
+            content_type: result.source_metadata.content_type,
+            etag: result.source_metadata.etag,
+            last_modified: result.source_metadata.last_modified.map(format_system_time),
+        }),
+    ))
+}
+
+async fn reference_blob(
+    state: Arc<ServerState>,
+    auth: AuthContext,
+    request: StageTargetRequest,
+) -> ServerResult<(StatusCode, Json<StageResponse>)> {
+    let group_id = parse_group_id(&request.group_id)?;
+    let connector_id = parse_connector_id(&request.connector_id)?;
+    let bucket_info = bucket_info(&state, &request.bucket).await?;
+    if bucket_info.group_id != group_id {
+        return Err(ServerError::NotFound);
+    }
+
+    ensure_permission(
+        &state,
+        &auth,
+        blob_permission_path(&state, group_id, &request.bucket, &request.key),
+        Permission::WRITE,
+    )
+    .await?;
+    ensure_source_permission(&state, &auth, group_id, connector_id, &request.source_path).await?;
+
+    let materialize = MaterializeReferenceOperation::new(
+        MaterializeReferenceInput {
+            job_id: None,
+            group_id,
+            user_id: auth.user_id,
+            realm_id: state.get_realm_id(),
+            node_id: state.get_node_id(),
+            connector_id,
+            source_path: request.source_path,
+            bucket: request.bucket.clone(),
+            key: request.key.clone(),
+            expected_bucket: bucket_info,
+            inherited_policies: Vec::new(),
+            restrictions: auth.path_restrictions.clone(),
+            mirrors: Vec::new(),
+        },
+        std::time::SystemTime::now(),
+        ulid::Ulid::generate(),
+    );
+    let result = drive(materialize, &state.get_ctx())
+        .await
+        .map_err(ServerError::from)?;
+
+    queue_live_replication(
+        &state,
+        auth,
+        request.bucket.clone(),
+        request.key.clone(),
+        result.version_id,
+        false,
+    )
+    .await;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(StageResponse {
+            strategy: ApiStagingStrategy::Reference,
+            bucket: request.bucket,
+            key: request.key,
+            version_id: result.version_id.to_string(),
+            size: result.source_metadata.content_length,
+            content_type: result.source_metadata.content_type,
+            etag: result.source_metadata.etag,
+            last_modified: result.source_metadata.last_modified.map(format_system_time),
+        }),
+    ))
+}
+
+/// The job's connector as this node stores it; a coordinator imports only with its own copy.
+async fn local_connector(
+    state: &ServerState,
+    group_id: aruna_core::types::GroupId,
+    connector_id: ulid::Ulid,
+) -> ServerResult<GetSourceResult> {
+    use aruna_ops_data::connectors::get_connector::{GetSourceError, GetSourceInput};
+    let input = GetSourceInput {
+        group_id,
+        connector_id,
+    };
+    match drive(GetSourceOperation::new(input), &state.get_ctx()).await {
+        Ok(source) => Ok(source),
+        Err(GetSourceError::NotFound) => Err(ServerError::Refused(
+            StatusCode::NOT_FOUND,
+            "connector_not_found",
+            format!(
+                "connector {connector_id} is not registered on this node; register it here under \
+                 the same connector_id"
+            ),
+        )),
+        Err(error) => Err(ServerError::InternalError(error.into())),
+    }
+}
+
+/// Registers a connector without credentials on another coordinator under its own id;
+/// credentials are never sent, so a connector holding some must be registered there by its owner.
+async fn share_connector(
+    state: &ServerState,
+    forward: &RestForward,
+    bearer: Option<&ValidatedBearer>,
+    source: &GetSourceResult,
+) -> ServerResult<()> {
+    if source.has_secret_config {
+        return Ok(());
+    }
+    let connector = &source.connector;
+    let request = CreateConnectorRequest {
+        name: connector.name.clone(),
+        kind: connector.kind.into(),
+        public_config: connector.public_config.clone(),
+        secret_config: Default::default(),
+        connector_id: Some(connector.connector_id.to_string()),
+    };
+    let path = format!("/data/groups/{}/connectors", connector.group_id);
+    relay_json::<SourceConnectorResponse>(state, forward, &path, bearer, &request).await?;
+    Ok(())
+}
+
+/// Starts the job on every other coordinator of a distributed bucket with the caller's bearer;
+/// reports whether this node coordinates a range itself.
+async fn coordinator_jobs(
+    state: &ServerState,
+    binding: &aruna_core::structs::storage::distribution::DistributionBinding,
+    (bearer, request): (Option<&ValidatedBearer>, &StageBatchRequest),
+    source: &GetSourceResult,
+) -> ServerResult<(bool, Vec<CoordinatorJobResponse>)> {
+    let view = drive(bound_view(binding), state.get_ctx().as_ref())
+        .await
+        .map_err(ServerError::from)?;
+    let snapshot = view.snapshot();
+    // Refused before any relay, as the local job would be while a range moves away from here.
+    let moving = (snapshot.lifecycle.transfers.iter()).any(|open| open.from == binding.member_id);
+    if moving {
+        let error = SubmitJobError::RangeMoving(binding.set_id);
+        return Err(ServerError::ServiceUnavailableReason(error.to_string()));
+    }
+    let local = state.get_node_id();
+    let (mut coordinates, mut nodes) = (false, Vec::<RestForward>::new());
+    for range in &snapshot.config.ranges {
+        let Some(member) = snapshot.member(range.coordinator) else {
+            continue;
+        };
+        if member.node_id == local {
+            coordinates = true;
+        } else if !nodes
+            .iter()
+            .any(|forward| forward.node_id == member.node_id)
+        {
+            nodes.push(RestForward {
+                set_id: binding.set_id,
+                range_id: range.range_id,
+                node_id: member.node_id,
+            });
+        }
+    }
+    let mut jobs = Vec::with_capacity(nodes.len());
+    for forward in nodes {
+        let path = "/data/staging/jobs";
+        let answer = async {
+            share_connector(state, &forward, bearer, source).await?;
+            relay_json::<SubmitStagingResponse>(state, &forward, path, bearer, request).await
+        };
+        let (job_id, error) = match answer.await {
+            Ok((_, answer)) => (Some(answer.job_id), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        jobs.push(CoordinatorJobResponse {
+            node_id: forward.node_id.to_string(),
+            job_id,
+            error,
+        });
+    }
+    Ok((coordinates, jobs))
+}
+
+/// Resolves the hard byte ceiling for a group's realm-wide `logical_bytes` from
+/// the realm quota config, mirroring the S3 surface's `resolve_quota_ceiling`.
+/// `None` means the group is unlimited.
+async fn resolve_quota_ceiling(
+    state: &ServerState,
+    group_id: ulid::Ulid,
+) -> ServerResult<Option<u64>> {
+    let config = drive(
+        GetConfigOperation::new(state.get_realm_id()),
+        &state.get_ctx(),
+    )
+    .await
+    .map_err(|err| ServerError::InternalError(err.into()))?;
+    Ok(config.quota.effective_group_ceiling(&group_id))
+}
+
+/// Checks a table descriptor, READ on the table and WRITE on the destination bucket; the rows
+/// are authorized by the job, row by row.
+async fn check_table(
+    state: &ServerState,
+    auth: &AuthContext,
+    (group_id, connector_id): (ulid::Ulid, ulid::Ulid),
+    bucket: &str,
+    table: &TableImport,
+) -> ServerResult<()> {
+    table
+        .validate()
+        .map_err(|error| ServerError::BadRequestReason(error.to_string()))?;
+    match &table.source {
+        TableSource::Connector(path) => {
+            let source = local_connector(state, group_id, connector_id).await?;
+            let path = table_source_path(path, source.connector.base_url().as_deref())
+                .map_err(ServerError::BadRequestReason)?;
+            ensure_source_permission(state, auth, group_id, connector_id, &path).await?;
+        }
+        TableSource::Object { bucket, key } => {
+            let info = bucket_info(state, bucket).await?;
+            let path = blob_permission_path(state, info.group_id, bucket, key);
+            ensure_permission(state, auth, path, Permission::READ).await?;
+        }
+    }
+    let target = blob_permission_path(state, group_id, bucket, "");
+    ensure_permission(state, auth, target, Permission::WRITE).await
+}
+
+async fn ensure_source_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    source_path: &str,
+) -> ServerResult<()> {
+    validate_source_path(source_path)?;
+
+    ensure_permission(
+        state,
+        auth,
+        connector_permission_path(state, group_id, connector_id, source_path),
+        Permission::READ,
+    )
+    .await
+}
+
+async fn ensure_prefix_permission(
+    state: &ServerState,
+    auth: &AuthContext,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    source_prefix: &str,
+) -> ServerResult<()> {
+    ensure_permission(
+        state,
+        auth,
+        connector_permission_path(state, group_id, connector_id, source_prefix),
+        Permission::READ,
+    )
+    .await
+}
+
+fn connector_permission_path(
+    state: &ServerState,
+    group_id: ulid::Ulid,
+    connector_id: ulid::Ulid,
+    source_path: &str,
+) -> String {
+    format!(
+        "/{}/g/{group_id}/data/{}/_sources/{connector_id}/{source_path}",
+        state.get_realm_id(),
+        state.get_node_id(),
+    )
+}
+
+fn validate_source_path(source_path: &str) -> ServerResult<()> {
+    let trimmed = source_path.trim();
+    if trimmed.is_empty() {
+        return Err(ServerError::BadRequest);
+    }
+
+    let mut has_normal_component = false;
+    if trimmed
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(ServerError::BadRequest);
+    }
+    for component in FsPath::new(trimmed).components() {
+        match component {
+            Component::Normal(_) => has_normal_component = true,
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(ServerError::BadRequest);
+            }
+        }
+    }
+
+    has_normal_component
+        .then_some(())
+        .ok_or(ServerError::BadRequest)
+}
+
+impl From<MaterializeSnapshotError> for ServerError {
+    fn from(error: MaterializeSnapshotError) -> Self {
+        match error {
+            MaterializeSnapshotError::Read(error) => ServerError::from(error),
+            MaterializeSnapshotError::Write(PutObjectError::QuotaExceeded { .. }) => {
+                ServerError::Forbidden
+            }
+            MaterializeSnapshotError::Write(error) => ServerError::InternalError(error.into()),
+            MaterializeSnapshotError::Storage(error) => ServerError::InternalError(error.into()),
+            MaterializeSnapshotError::Conversion(error) => ServerError::InternalError(error.into()),
+            MaterializeSnapshotError::Routing(error) => ServerError::InternalError(error.into()),
+            // A node revalidating its inventory admits nothing governed; the client
+            // learns only that this node is busy, never which rule applies.
+            MaterializeSnapshotError::Gate(_) => ServerError::ServiceUnavailable,
+        }
+    }
+}
+
+impl From<MaterializeReferenceError> for ServerError {
+    fn from(error: MaterializeReferenceError) -> Self {
+        match error {
+            MaterializeReferenceError::Head(error) => ServerError::from(error),
+            MaterializeReferenceError::Storage(error) => ServerError::InternalError(error.into()),
+            MaterializeReferenceError::Conversion(error) => {
+                ServerError::InternalError(error.into())
+            }
+            MaterializeReferenceError::Usage(error) => ServerError::InternalError(error.into()),
+            // A policy error names the ids it conflicts on, which a client must
+            // never learn: the refusal is reported without them.
+            MaterializeReferenceError::Policy(_) => ServerError::Forbidden,
+            MaterializeReferenceError::Purge(_) => ServerError::ServiceUnavailable,
+            MaterializeReferenceError::Distribution(error) => ServerError::from(error),
+        }
+    }
+}
+
+impl From<HeadSourceError> for ServerError {
+    fn from(error: HeadSourceError) -> Self {
+        match error {
+            HeadSourceError::Resolve(error) => ServerError::from(error),
+            HeadSourceError::Staging(error) => ServerError::from(error),
+            _ => ServerError::InternalError(error.into()),
+        }
+    }
+}
+
+impl From<ReadSourceError> for ServerError {
+    fn from(error: ReadSourceError) -> Self {
+        match error {
+            ReadSourceError::Resolve(error) => ServerError::from(error),
+            ReadSourceError::Staging(error) => ServerError::from(error),
+            _ => ServerError::InternalError(error.into()),
+        }
+    }
+}
+
+impl From<SourceResolutionError> for ServerError {
+    fn from(error: SourceResolutionError) -> Self {
+        match error {
+            SourceResolutionError::NotFound => ServerError::NotFound,
+            SourceResolutionError::InvalidSourcePath
+            | SourceResolutionError::UnsupportedConnectorKind(_) => ServerError::BadRequest,
+            _ => ServerError::InternalError(error.into()),
+        }
+    }
+}
+
+impl From<StagingSourceError> for ServerError {
+    fn from(error: StagingSourceError) -> Self {
+        match error {
+            StagingSourceError::NotFound => ServerError::NotFound,
+            _ => ServerError::BadGateway,
+        }
+    }
+}
+
+impl From<ListStagingError> for ServerError {
+    fn from(error: ListStagingError) -> Self {
+        match error {
+            ListStagingError::Resolve(error) => ServerError::from(error),
+            ListStagingError::Staging(error) => ServerError::from(error),
+            _ => ServerError::InternalError(error.into()),
+        }
+    }
+}
+
+pub(crate) async fn queue_live_replication(
+    state: &ServerState,
+    auth_context: AuthContext,
+    bucket: String,
+    key: String,
+    version_id: ulid::Ulid,
+    delete_marker: bool,
+) {
+    if let Err(error) = drive(
+        QueueLiveOperation::new(LiveVersionInput {
+            local_node_id: state.get_node_id(),
+            auth_context,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id,
+            delete_marker,
+        }),
+        &state.get_ctx(),
+    )
+    .await
+    {
+        warn!(
+            error = %error,
+            bucket,
+            key,
+            version_id = %version_id,
+            delete_marker,
+            "Failed to queue live replication after committed staging snapshot; durable obligation remains for repair"
+        );
+    }
+}
+
+fn format_system_time(value: std::time::SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(value).to_rfc3339()
+}
+
+#[cfg(test)]
+#[path = "staging_tests.rs"]
+mod tests;

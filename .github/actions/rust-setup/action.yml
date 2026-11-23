@@ -9,6 +9,10 @@ inputs:
     description: Cache key shared by jobs that build the same artifacts; empty keys by job.
     required: false
     default: ""
+  save:
+    description: Save the Rust cache on main; set false when another job owns the same shared-key.
+    required: false
+    default: "true"
 runs:
   using: composite
   steps:
@@ -31,4 +35,4 @@ runs:
       uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       with:
         shared-key: ${{ inputs.shared-key }}
-        save-if: ${{ github.ref == 'refs/heads/main' }}
+        save-if: ${{ inputs.save == 'true' && github.ref == 'refs/heads/main' }}

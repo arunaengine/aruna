@@ -1,0 +1,146 @@
+//! Opens the fjall database, spawns the read and bulk pools, and builds the storage handle.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::thread;
+
+use fjall::OptimisticTxDatabase;
+
+use crate::compaction::Compactor;
+use crate::errors::StorageLibError;
+
+use super::handle::{EFFECT_QUEUE_CAPACITY, OpenDatabase, QUEUE_CAPACITY, StorageHandle};
+use super::hot_cache::{CacheWriter, HotCache};
+use super::metrics::WorkerLifecycleGuard;
+use super::persistence::FjallPersistPolicy;
+use super::preimage::flush_empty;
+use super::rebuild::running_rebuild;
+use super::worker::{BULK_POOL_THREADS, FjallStorage, READ_POOL_THREADS, Store, spawn_read_pool};
+
+pub use aruna_core::persistence::CACHE_BYTES;
+
+impl FjallStorage {
+    #[tracing::instrument(name = "storage.open", level = "debug", fields(path = %path))]
+    pub fn open(path: &str) -> Result<StorageHandle, StorageLibError> {
+        Self::open_with_policy(path, FjallPersistPolicy::default())
+    }
+
+    #[doc(hidden)]
+    pub fn open_test(path: &str) -> Result<StorageHandle, StorageLibError> {
+        Self::open_pools(path, FjallPersistPolicy::default(), CACHE_BYTES, (1, 1))
+    }
+
+    #[tracing::instrument(
+        name = "storage.open",
+        level = "debug",
+        fields(path = %path, persist_policy = policy.label())
+    )]
+    pub fn open_with_policy(
+        path: &str,
+        policy: FjallPersistPolicy,
+    ) -> Result<StorageHandle, StorageLibError> {
+        Self::open_with_cache(path, policy, CACHE_BYTES)
+    }
+
+    /// Opens the database with a block cache of `cache_bytes`.
+    pub fn open_with_cache(
+        path: &str,
+        policy: FjallPersistPolicy,
+        cache_bytes: u64,
+    ) -> Result<StorageHandle, StorageLibError> {
+        Self::open_pools(
+            path,
+            policy,
+            cache_bytes,
+            (READ_POOL_THREADS, BULK_POOL_THREADS),
+        )
+    }
+
+    fn open_pools(
+        path: &str,
+        policy: FjallPersistPolicy,
+        cache_bytes: u64,
+        (read_threads, bulk_threads): (usize, usize),
+    ) -> Result<StorageHandle, StorageLibError> {
+        let db = OptimisticTxDatabase::builder(path)
+            .manual_journal_persist(true)
+            .cache_size(cache_bytes)
+            .open()?;
+
+        let (mut sender, receivers) = StorageHandle::new();
+        sender.cache = Some(Arc::new(HotCache::default()));
+        let database = db.inner().clone();
+        let _ = sender
+            .database
+            .set(OpenDatabase(Arc::new(move || database.clone())));
+        let mut storage = Self::new(Store::new(db), policy, &sender, read_threads, bulk_threads);
+        let channel_closed = sender.metrics.channel_closed.clone();
+
+        let worker = thread::spawn(move || {
+            let _lifecycle = WorkerLifecycleGuard(channel_closed);
+            storage.receive_loop(receivers);
+            storage.close();
+        });
+        sender
+            .worker
+            .lock()
+            .expect("storage worker mutex poisoned")
+            .replace(worker);
+
+        Ok(sender)
+    }
+
+    fn close(self) {
+        let Self {
+            mut compactor,
+            read_pool,
+            bulk_read_pool,
+            pool_threads,
+            ..
+        } = self;
+        compactor.shutdown();
+        drop((read_pool, bulk_read_pool));
+        for reader in pool_threads {
+            let _ = reader.join();
+        }
+    }
+
+    pub(super) fn new(
+        store: Store,
+        policy: FjallPersistPolicy,
+        handle: &StorageHandle,
+        read_threads: usize,
+        bulk_threads: usize,
+    ) -> Self {
+        let (read_pool, mut pool_threads) =
+            spawn_read_pool(store.clone(), read_threads, QUEUE_CAPACITY);
+        let (bulk_read_pool, bulk_threads) =
+            spawn_read_pool(store.clone(), bulk_threads, EFFECT_QUEUE_CAPACITY);
+        pool_threads.extend(bulk_threads);
+        let usage_shadow = running_rebuild(&store);
+        flush_empty(&store);
+        Self {
+            store,
+            persist_policy: policy,
+            txns: HashMap::new(),
+            transaction_cleanup: handle.transaction_cleanup.clone(),
+            metrics: handle.metrics.clone(),
+            read_pool,
+            bulk_read_pool,
+            pool_threads,
+            compactor: Compactor::spawn(),
+            deletes: HashMap::new(),
+            swept: 0,
+            commits: 0,
+            txn_deletes: HashMap::new(),
+            txn_usage: HashMap::new(),
+            config_txns: HashSet::new(),
+            usage_shadow,
+            usage_views: HashSet::new(),
+            txn_rows: HashMap::new(),
+            cache: CacheWriter::new(handle.cache.clone()),
+        }
+    }
+}

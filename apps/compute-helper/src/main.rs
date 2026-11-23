@@ -1,0 +1,535 @@
+//! Runs the in-container helper that stages inputs, fetches outputs and lists files.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path, PathBuf};
+
+/// Bounds one output listing well above the caller's match limit.
+const MAX_LISTED_FILES: u64 = 100_000;
+/// Mirrors the listing bound the caller reads with, so an oversized listing
+/// fails here instead of being cut short in transit.
+const MAX_LISTING_BYTES: u64 = 16 * 1024 * 1024;
+
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), String> {
+    let mut arguments = std::env::args_os().skip(1);
+    let command = arguments
+        .next()
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| "expected stage, fetch, or probe".to_string())?;
+    let arguments = arguments.collect::<Vec<_>>();
+    match command.as_str() {
+        "stage" => stage_command(&arguments),
+        "fetch" => fetch_command(&arguments),
+        "list" => list_command(&arguments),
+        "probe" => probe_command(&arguments),
+        _ => Err(format!("unknown helper command `{command}`")),
+    }
+}
+
+fn stage_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    let workspace = required_path(arguments, "--workspace")?;
+    let sentinel = required_path(arguments, "--sentinel")?;
+    let marker = required_value(arguments, "--marker")?;
+    stage_archive(io::stdin().lock(), &workspace, &sentinel, marker.as_bytes())
+        .map_err(|error| format!("stage failed: {error}"))
+}
+
+fn fetch_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    let workspace = required_path(arguments, "--workspace")?;
+    let path = required_value(arguments, "--path")?;
+    let offset = required_number(arguments, "--offset")?;
+    let length = required_number(arguments, "--length")?;
+    fetch_range(&workspace, &path, offset, length, io::stdout().lock())
+        .map_err(|error| format!("fetch failed: {error}"))
+}
+
+fn list_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    let workspace = required_path(arguments, "--workspace")?;
+    let prefix = required_value(arguments, "--prefix")?;
+    list_files(&workspace, &prefix, io::stdout().lock())
+        .map_err(|error| format!("list failed: {error}"))
+}
+
+fn probe_command(arguments: &[std::ffi::OsString]) -> Result<(), String> {
+    if has_flag(arguments, "--hold") {
+        loop {
+            std::thread::park();
+        }
+    }
+    if let Some(path) = optional_path(arguments, "--install")? {
+        install_probe(&path).map_err(|error| format!("probe install failed: {error}"))?;
+    }
+    let marker = required_path(arguments, "--marker")?;
+    let sentinel = required_path(arguments, "--sentinel")?;
+    compare_marker(&marker, &sentinel).map_err(|error| format!("probe failed: {error}"))
+}
+
+fn stage_archive(
+    reader: impl Read,
+    workspace: &Path,
+    sentinel: &Path,
+    marker: &[u8],
+) -> io::Result<()> {
+    std::fs::create_dir_all(workspace)?;
+    remove_sentinel(sentinel)?;
+    clear_workspace(workspace)?;
+    let mut archive = tar::Archive::new(reader);
+    let mut transferred = 0u64;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let relative = safe_relative(&entry.path()?)?;
+        let target = workspace.join(&relative);
+        match entry.header().entry_type() {
+            kind if kind.is_dir() => {
+                std::fs::create_dir_all(&target)?;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o770))?;
+                sync_parent(&target)?;
+            }
+            kind if kind.is_file() => {
+                let size = entry.size();
+                // The workspace volume's size bounds what fits; the sum only must not wrap.
+                transferred = transferred
+                    .checked_add(size)
+                    .ok_or_else(|| io::Error::other("input size overflows"))?;
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                    reject_symlink_path(workspace, parent)?;
+                }
+                if target.symlink_metadata().is_ok() {
+                    return Err(io::Error::other("archive path already exists"));
+                }
+                let mut file = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .open(&target)?;
+                let copied = io::copy(&mut entry, &mut file)?;
+                if copied != size {
+                    return Err(io::Error::other("archive entry size mismatch"));
+                }
+                file.sync_all()?;
+                std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o440))?;
+                sync_parent(&target)?;
+            }
+            _ => return Err(io::Error::other("archive entry type is not allowed")),
+        }
+    }
+    let workspace_file = File::open(workspace)?;
+    rustix::fs::syncfs(&workspace_file)?;
+    write_sentinel(sentinel, marker)?;
+    rustix::fs::syncfs(workspace_file)?;
+    Ok(())
+}
+
+/// Write the file size as eight big-endian bytes, then at most `length` bytes
+/// from `offset`, so the caller can read a large file in short execs.
+fn fetch_range(
+    workspace: &Path,
+    path: &str,
+    offset: u64,
+    length: u64,
+    mut writer: impl Write,
+) -> io::Result<()> {
+    let relative = safe_absolute(path)?;
+    let root = workspace.canonicalize()?;
+    let source = root.join(&relative).canonicalize()?;
+    if !source.starts_with(&root) || !source.symlink_metadata()?.file_type().is_file() {
+        return Err(io::Error::other("output is not a regular workspace file"));
+    }
+    let mut file = File::open(source)?;
+    writer.write_all(&file.metadata()?.len().to_be_bytes())?;
+    file.seek(SeekFrom::Start(offset))?;
+    io::copy(&mut file.take(length), &mut writer)?;
+    writer.flush()
+}
+
+/// Emit every regular file below `prefix` as NUL-terminated absolute container
+/// paths, then an empty record and the count, so the caller can reject a truncated
+/// listing. Every folder opens one component at a time without following a link.
+fn list_files(workspace: &Path, prefix: &str, mut writer: impl Write) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, statat};
+    use std::os::unix::ffi::OsStrExt;
+
+    let relative = safe_absolute(prefix)?;
+    let root = workspace.canonicalize()?;
+    let mut pending = vec![relative];
+    let mut listed = 0u64;
+    // Starts at the widest terminator record so it always fits under the bound.
+    let mut written = 32u64;
+    while let Some(directory) = pending.pop() {
+        let Some(handle) = open_beneath(&root, &directory)? else {
+            continue;
+        };
+        for entry in Dir::read_from(&handle)? {
+            let entry = entry?;
+            let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == "." || name == ".." {
+                continue;
+            }
+            let kind = match entry.file_type() {
+                FileType::Unknown => match statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => FileType::from_raw_mode(stat.st_mode),
+                    Err(rustix::io::Errno::NOENT) => continue,
+                    Err(error) => return Err(error.into()),
+                },
+                kind => kind,
+            };
+            if kind == FileType::Directory {
+                pending.push(directory.join(name));
+                continue;
+            }
+            if kind != FileType::RegularFile {
+                continue;
+            }
+            listed += 1;
+            if listed > MAX_LISTED_FILES {
+                return Err(io::Error::other("listing limit exceeded"));
+            }
+            let path = directory.join(name);
+            let bytes = path.as_os_str().as_bytes();
+            written = written
+                .checked_add(bytes.len() as u64 + 2)
+                .ok_or_else(|| io::Error::other("listing size overflows"))?;
+            if written > MAX_LISTING_BYTES {
+                return Err(io::Error::other("listing byte limit exceeded"));
+            }
+            writer.write_all(b"/")?;
+            writer.write_all(bytes)?;
+            writer.write_all(&[0])?;
+        }
+    }
+    writer.write_all(&[0])?;
+    writer.write_all(listed.to_string().as_bytes())?;
+    writer.write_all(&[0])?;
+    writer.flush()
+}
+
+/// Opens the folder `relative` below `root` one component at a time without following a link,
+/// so a folder swapped for a link meanwhile is never entered; `None` when one is missing or a link.
+fn open_beneath(root: &Path, relative: &Path) -> io::Result<Option<rustix::fd::OwnedFd>> {
+    use rustix::fs::{AtFlags, FileType, Mode, OFlags, open, openat, statat};
+    use rustix::io::Errno;
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut handle = open(root, flags, Mode::empty())?;
+    for component in relative.components() {
+        let name = component.as_os_str();
+        match openat(&handle, name, flags, Mode::empty()) {
+            Ok(next) => handle = next,
+            Err(Errno::NOENT | Errno::LOOP) => return Ok(None),
+            // Linux answers a link opened as a folder without following with ENOTDIR.
+            Err(Errno::NOTDIR) => match statat(&handle, name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+                    return Ok(None);
+                }
+                Err(Errno::NOENT) => return Ok(None),
+                _ => return Err(Errno::NOTDIR.into()),
+            },
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(handle))
+}
+
+fn compare_marker(marker: &Path, sentinel: &Path) -> io::Result<()> {
+    let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(marker)?)?;
+    let sentinel: serde_json::Value = serde_json::from_slice(&std::fs::read(sentinel)?)?;
+    if marker != sentinel {
+        return Err(io::Error::other("stage marker and sentinel differ"));
+    }
+    Ok(())
+}
+
+fn install_probe(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let source = std::env::current_exe()?;
+    let temp = path.with_extension("tmp");
+    let mut input = File::open(source)?;
+    let mut output = File::create(&temp)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()?;
+    std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o555))?;
+    std::fs::rename(&temp, path)?;
+    sync_parent(path)
+}
+
+fn write_sentinel(path: &Path, marker: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("sentinel path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let temp = path.with_extension("tmp");
+    let mut file = File::create(&temp)?;
+    file.write_all(marker)?;
+    file.sync_all()?;
+    std::fs::rename(&temp, path)?;
+    sync_parent(path)
+}
+
+fn remove_sentinel(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => sync_parent(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn clear_workspace(workspace: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(workspace)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() && !file_type.is_symlink() {
+            std::fs::remove_dir_all(entry.path())?;
+        } else {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    File::open(workspace)?.sync_all()
+}
+
+fn reject_symlink_path(workspace: &Path, path: &Path) -> io::Result<()> {
+    let relative = path
+        .strip_prefix(workspace)
+        .map_err(|_| io::Error::other("archive path escaped workspace"))?;
+    let mut current = workspace.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        if current.symlink_metadata()?.file_type().is_symlink() {
+            return Err(io::Error::other("archive path crosses a symlink"));
+        }
+    }
+    Ok(())
+}
+
+fn safe_relative(path: &Path) -> io::Result<PathBuf> {
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::other("archive path is not a safe relative path"));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn safe_absolute(path: &str) -> io::Result<PathBuf> {
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(io::Error::other("output path is not absolute"));
+    }
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => relative.push(part),
+            _ => return Err(io::Error::other("output path has an unsafe component")),
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        return Err(io::Error::other("output path is root"));
+    }
+    Ok(relative)
+}
+
+fn required_value(arguments: &[std::ffi::OsString], name: &str) -> Result<String, String> {
+    option_value(arguments, name)?
+        .and_then(|value| value.into_string().ok())
+        .ok_or_else(|| format!("{name} is required and must be UTF-8"))
+}
+
+fn required_number(arguments: &[std::ffi::OsString], name: &str) -> Result<u64, String> {
+    required_value(arguments, name)?
+        .parse()
+        .map_err(|error| format!("{name} is not a byte count: {error}"))
+}
+
+fn required_path(arguments: &[std::ffi::OsString], name: &str) -> Result<PathBuf, String> {
+    optional_path(arguments, name)?.ok_or_else(|| format!("{name} is required"))
+}
+
+fn optional_path(arguments: &[std::ffi::OsString], name: &str) -> Result<Option<PathBuf>, String> {
+    option_value(arguments, name).map(|value| value.map(PathBuf::from))
+}
+
+fn option_value(
+    arguments: &[std::ffi::OsString],
+    name: &str,
+) -> Result<Option<std::ffi::OsString>, String> {
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == name {
+            return arguments
+                .get(index + 1)
+                .cloned()
+                .map(Some)
+                .ok_or_else(|| format!("{name} has no value"));
+        }
+        index += if arguments[index].to_string_lossy().starts_with("--") {
+            2
+        } else {
+            1
+        };
+    }
+    Ok(None)
+}
+
+fn has_flag(arguments: &[std::ffi::OsString], name: &str) -> bool {
+    arguments.iter().any(|argument| argument == name)
+}
+
+fn sync_parent(path: &Path) -> io::Result<()> {
+    File::open(
+        path.parent()
+            .ok_or_else(|| io::Error::other("path has no parent"))?,
+    )?
+    .sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_path() {
+        assert!(safe_relative(Path::new("../escape")).is_err());
+        assert!(safe_absolute("/safe/path").is_ok());
+    }
+
+    #[test]
+    fn fetches_byte_range() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("out")).unwrap();
+        std::fs::write(directory.path().join("out/data"), b"0123456789").unwrap();
+
+        let mut middle = Vec::new();
+        fetch_range(directory.path(), "/out/data", 3, 4, &mut middle).unwrap();
+        assert_eq!(middle, [&10u64.to_be_bytes()[..], b"3456"].concat());
+
+        // A range past the end still reports the size, so the caller can stop.
+        let mut tail = Vec::new();
+        fetch_range(directory.path(), "/out/data", 8, 4, &mut tail).unwrap();
+        assert_eq!(tail, [&10u64.to_be_bytes()[..], b"89"].concat());
+        let mut past = Vec::new();
+        fetch_range(directory.path(), "/out/data", 12, 4, &mut past).unwrap();
+        assert_eq!(past, 10u64.to_be_bytes());
+
+        assert!(fetch_range(directory.path(), "/out", 0, 4, &mut Vec::new()).is_err());
+    }
+
+    #[test]
+    fn compares_stage_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("marker");
+        let sentinel = directory.path().join("sentinel");
+        std::fs::write(&marker, br#"{"epoch":1}"#).unwrap();
+        std::fs::write(&sentinel, br#"{"epoch":1}"#).unwrap();
+        assert!(compare_marker(&marker, &sentinel).is_ok());
+        std::fs::write(&sentinel, br#"{"epoch":2}"#).unwrap();
+        assert!(compare_marker(&marker, &sentinel).is_err());
+    }
+
+    #[test]
+    fn lists_workspace_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir_all(workspace.join("out/sub")).unwrap();
+        std::fs::write(workspace.join("out/a.txt"), b"a").unwrap();
+        std::fs::write(workspace.join("out/sub/b.txt"), b"b").unwrap();
+        std::fs::write(workspace.join("other.txt"), b"c").unwrap();
+
+        let mut listed = Vec::new();
+        list_files(&workspace, "/out", &mut listed).unwrap();
+
+        // The stream ends with an empty record and the decimal path count.
+        let mut records: Vec<&[u8]> = listed
+            .strip_suffix(&[0])
+            .expect("listing ends with the terminator")
+            .split(|byte| *byte == 0)
+            .collect();
+        assert_eq!(records.pop(), Some(&b"2"[..]));
+        assert_eq!(records.pop(), Some(&b""[..]));
+        let mut paths: Vec<_> = records
+            .into_iter()
+            .map(|path| String::from_utf8(path.to_vec()).unwrap())
+            .collect();
+        paths.sort();
+        assert_eq!(paths, vec!["/out/a.txt", "/out/sub/b.txt"]);
+
+        // A missing prefix directory lists nothing instead of failing.
+        let mut empty = Vec::new();
+        list_files(&workspace, "/absent", &mut empty).unwrap();
+        assert_eq!(empty, b"\x000\x00");
+    }
+
+    #[test]
+    fn opens_without_links() {
+        // A folder path through a link or a missing folder opens nothing.
+        let directory = tempfile::tempdir().unwrap();
+        let (workspace, outside) = (
+            directory.path().join("workspace"),
+            directory.path().join("o"),
+        );
+        std::fs::create_dir_all(workspace.join("real/sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("real/link")).unwrap();
+        let open = |path: &str| open_beneath(&workspace, Path::new(path)).unwrap().is_some();
+        assert!(open("real/sub"));
+        assert!(!open("real/link"));
+        assert!(!open("real/absent"));
+    }
+
+    #[test]
+    fn skips_linked_prefix() {
+        // A prefix that is, or lies below, a link lists nothing from outside the workspace.
+        let directory = tempfile::tempdir().unwrap();
+        let (workspace, outside) = (
+            directory.path().join("workspace"),
+            directory.path().join("o"),
+        );
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("sub/secret.txt"), b"s").unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("out")).unwrap();
+        for prefix in ["/out", "/out/sub"] {
+            let mut listed = Vec::new();
+            list_files(&workspace, prefix, &mut listed).unwrap();
+            assert_eq!(listed, b"\x000\x00", "{prefix}");
+        }
+    }
+
+    #[test]
+    fn stages_safe_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let sentinel = workspace.join(".aruna-stage");
+        let mut bytes = Vec::new();
+        {
+            let mut archive = tar::Builder::new(&mut bytes);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o440);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "input/data", &b"data"[..])
+                .unwrap();
+            archive.finish().unwrap();
+        }
+        stage_archive(&bytes[..], &workspace, &sentinel, br#"{"epoch":1}"#).unwrap();
+        assert_eq!(
+            std::fs::read(workspace.join("input/data")).unwrap(),
+            b"data"
+        );
+        assert_eq!(std::fs::read(sentinel).unwrap(), br#"{"epoch":1}"#);
+    }
+}

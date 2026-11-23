@@ -1,0 +1,683 @@
+//! Tests every watch check against a local store: creation, listing, delivery and forwarding.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+#[cfg(test)]
+mod tests {
+    use crate::notifications::watch::check::WatchCheckOperation;
+    use crate::notifications::watch::paths::WatchAuthorization;
+    use aruna_core::effects::StorageEffect;
+    use aruna_core::events::{Event, StorageEvent};
+    use aruna_core::keyspaces::{AUTH_KEYSPACE, GROUP_KEYSPACE, REALM_CONFIG_KEYSPACE};
+    use aruna_core::structs::execution::notification_watch::WatchEventMask;
+    use aruna_core::structs::execution::notification_watch::{
+        WatchEvent, WatchEventDetail, WatchEventKind, watch_resource_path,
+    };
+    use aruna_core::structs::identity::auth::AuthContext;
+    use aruna_core::structs::identity::auth::{Actor, PathRestriction, Permission};
+    use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
+    use aruna_core::structs::identity::realm::RealmId;
+    use aruna_core::structs::identity::realm::{
+        RealmAuthorizationDocument, RealmConfigDocument, RealmNodeKind,
+    };
+    use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
+    use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
+    use aruna_runner::driver::{DriverContext, drive};
+    use aruna_storage::storage::handle::StorageHandle;
+    use aruna_storage::storage::memory::MemoryStorage;
+    use ulid::Ulid;
+
+    use aruna_core::id::NodeId;
+    use aruna_core::structs::execution::notification_watch::{
+        WatchAuthorizationBinding, WatchSubscription,
+    };
+    use aruna_core::user::id::UserId;
+
+    use crate::notifications::watch::check::{AuthorizedWatchSubscriptions, WatchFilterOperation};
+    use crate::notifications::watch::paths::{
+        WatchAuthorizationDenial, event_permission_path, watch_permission_path,
+    };
+
+    async fn checked(
+        context: &DriverContext,
+        check: WatchCheckOperation,
+    ) -> Result<WatchAuthorization, String> {
+        drive(check, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate_watch_creation(
+        context: &DriverContext,
+        realm_id: RealmId,
+        auth_context: &AuthContext,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+    ) -> Result<WatchAuthorization, String> {
+        let check = WatchCheckOperation::creation(realm_id, auth_context, path_prefix, event_mask);
+        checked(context, check).await
+    }
+
+    /// Canonical authorization result every watch surface shares: the owner must
+    /// still hold READ on the watched prefix's permission path. No resource
+    /// identity or a non-user owner denies; unevaluable checks are errors, not grants.
+    async fn is_watch_authorized(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<bool, String> {
+        let check =
+            WatchCheckOperation::listing(realm_id, owner, path_prefix, event_mask, authorization);
+        Ok(matches!(
+            checked(context, check).await?,
+            WatchAuthorization::Authorized
+        ))
+    }
+
+    async fn filter_authorized_subscriptions(
+        context: &DriverContext,
+        realm_id: RealmId,
+        realm_config: &RealmConfigDocument,
+        local_node_id: NodeId,
+        subscriptions: Vec<WatchSubscription>,
+    ) -> Result<AuthorizedWatchSubscriptions, String> {
+        let filter =
+            WatchFilterOperation::realm(realm_id, realm_config, local_node_id, subscriptions)
+                .map_err(|error| error.to_string())?;
+        drive(filter, context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn evaluate_watch_delivery(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<WatchAuthorization, String> {
+        let check =
+            WatchCheckOperation::delivery(realm_id, owner, path_prefix, event_mask, authorization);
+        checked(context, check).await
+    }
+
+    async fn authorize_forwarded_watch(
+        context: &DriverContext,
+        realm_id: RealmId,
+        owner: UserId,
+        path_prefix: &str,
+        event_mask: WatchEventMask,
+        authorization: &WatchAuthorizationBinding,
+    ) -> Result<WatchAuthorization, String> {
+        let check =
+            WatchCheckOperation::forwarded(realm_id, owner, path_prefix, event_mask, authorization);
+        checked(context, check).await
+    }
+
+    fn node(seed: u8) -> NodeId {
+        iroh::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn temp_context() -> (tempfile::TempDir, DriverContext) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let storage = MemoryStorage::open();
+        (
+            dir,
+            DriverContext {
+                storage_handle: storage,
+                net_handle: None,
+                blob_handle: None,
+                graph_handle: None,
+                task_handle: None,
+                compute_handle: None,
+                outbound_handle: None,
+            },
+        )
+    }
+
+    /// Seeds every document policy loading resolves: realm authorization, the
+    /// group record behind group policies, its authorization and the realm config.
+    async fn seed_watch_auth(
+        storage: &StorageHandle,
+        realm_id: RealmId,
+        node_id: NodeId,
+        owner: UserId,
+        group_auth: &GroupAuthorizationDocument,
+    ) {
+        let group_id = group_auth.group_id;
+        let actor = Actor {
+            node_id,
+            user_id: owner,
+            realm_id,
+        };
+        let realm_auth = RealmAuthorizationDocument::default_realm_doc(realm_id);
+        let group = Group {
+            display_name: "watch".to_string(),
+            group_id,
+            realm_id,
+            roles: group_auth.roles.keys().copied().collect(),
+            owner,
+        };
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.ensure_node(node_id, RealmNodeKind::Server);
+        for (key_space, key, value) in [
+            (
+                AUTH_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                AUTH_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group_auth.to_bytes(&actor).unwrap(),
+            ),
+            (
+                GROUP_KEYSPACE,
+                group_id.to_bytes().to_vec(),
+                group.to_bytes(&actor).unwrap(),
+            ),
+            (
+                REALM_CONFIG_KEYSPACE,
+                realm_id.as_bytes().to_vec(),
+                realm_config.to_bytes(&actor).unwrap(),
+            ),
+        ] {
+            match storage
+                .send_storage_effect(StorageEffect::Write {
+                    key_space: key_space.to_string(),
+                    key: key.into(),
+                    value: value.into(),
+                    txn_id: None,
+                })
+                .await
+            {
+                Event::Storage(StorageEvent::WriteResult { .. }) => {}
+                other => panic!("unexpected auth write event: {other:?}"),
+            }
+        }
+    }
+
+    // A public READ role cannot admit an anonymous caller, because no caller owns its inbox.
+    // Refuse nil ownership before evaluating roles.
+    #[tokio::test]
+    async fn current_owner_decides() {
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([9u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([4u8; 16]);
+        let node_id = node(3);
+
+        let mut group_auth =
+            GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        group_auth
+            .roles
+            .values_mut()
+            .find(|role| role.name == "viewer")
+            .expect("viewer role")
+            .assigned_users
+            .insert(UserId::nil(realm_id));
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+
+        let prefix = watch_resource_path(group_id, node_id, "bucket", "");
+        let expired_binding = WatchAuthorizationBinding {
+            expires_at_secs: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            is_watch_authorized(
+                &context,
+                realm_id,
+                owner,
+                &prefix,
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                &expired_binding,
+            )
+            .await,
+            Ok(true),
+            "the owner's current READ permission outlives the creating token"
+        );
+
+        assert_eq!(
+            is_watch_authorized(
+                &context,
+                realm_id,
+                UserId::nil(realm_id),
+                &prefix,
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+                &WatchAuthorizationBinding::default(),
+            )
+            .await,
+            Ok(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_authorization_retryable() {
+        let storage = MemoryStorage::open();
+        let realm_id = RealmId([8u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let path = watch_resource_path(group_id, node_id, "bucket", "");
+        let event_mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let subscription =
+            WatchSubscription::new(ulid::Ulid::generate(), owner, path.clone(), event_mask, 1);
+        let mut realm_config = RealmConfigDocument::default_for_realm(realm_id, Vec::new());
+        realm_config.ensure_node(node_id, RealmNodeKind::Server);
+        let context = DriverContext {
+            storage_handle: storage,
+            net_handle: None,
+            blob_handle: None,
+            graph_handle: None,
+            task_handle: None,
+            compute_handle: None,
+            outbound_handle: None,
+        };
+
+        assert_eq!(
+            is_watch_authorized(
+                &context,
+                realm_id,
+                owner,
+                &path,
+                event_mask,
+                &subscription.authorization,
+            )
+            .await,
+            Ok(false),
+            "external callers still fail closed without exposing missing state"
+        );
+        let filtered = filter_authorized_subscriptions(
+            &context,
+            realm_id,
+            &realm_config,
+            node_id,
+            vec![subscription],
+        )
+        .await
+        .expect("filter succeeds");
+        assert!(filtered.subscriptions.is_empty());
+        assert!(filtered.dropped);
+        assert!(filtered.check_failed, "interest publication must retry");
+    }
+
+    #[test]
+    fn canonical_permission_paths() {
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let data_prefix = watch_resource_path(group_id, node_id, "bucket", "reports/");
+
+        assert_eq!(
+            watch_permission_path(
+                realm_id,
+                &data_prefix,
+                WatchEventMask::from_kinds([WatchEventKind::DataUploaded]),
+            ),
+            Some(object_permission_path(
+                realm_id, group_id, node_id, "bucket", "reports/"
+            ))
+        );
+        assert_eq!(
+            watch_permission_path(
+                realm_id,
+                &format!("meta/{group_id}/datasets/project"),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            ),
+            Some(format!("/{realm_id}/g/{group_id}/meta/datasets/project"))
+        );
+        assert_eq!(
+            watch_permission_path(
+                realm_id,
+                &data_prefix,
+                WatchEventMask::from_kinds([
+                    WatchEventKind::SyncCompleted,
+                    WatchEventKind::SyncFailed,
+                ]),
+            ),
+            Some(object_permission_path(
+                realm_id, group_id, node_id, "bucket", "reports/"
+            ))
+        );
+    }
+
+    #[test]
+    fn exact_event_identity() {
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let document_id = Ulid::from_bytes([3u8; 16]);
+        let node_id = node(4);
+        let actor = UserId::new(Ulid::from_bytes([5u8; 16]), realm_id);
+        let data = WatchEvent {
+            event_id: Ulid::from_bytes([6u8; 16]),
+            realm_id,
+            kind: WatchEventKind::DataUploaded,
+            path: watch_resource_path(group_id, node_id, "bucket", "reports/a.csv"),
+            actor,
+            occurred_at_ms: 1,
+            detail: WatchEventDetail::DataUploaded {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                key: "reports/a.csv".to_string(),
+                size_bytes: 1,
+            },
+        };
+        assert_eq!(
+            event_permission_path(&data),
+            Some(object_permission_path(
+                realm_id,
+                group_id,
+                node_id,
+                "bucket",
+                "reports/a.csv",
+            ))
+        );
+
+        let sync = WatchEvent {
+            event_id: Ulid::from_bytes([9u8; 16]),
+            realm_id,
+            kind: WatchEventKind::SyncCompleted,
+            path: watch_resource_path(group_id, node_id, "bucket", ""),
+            actor,
+            occurred_at_ms: 1,
+            detail: WatchEventDetail::SyncCompleted {
+                group_id,
+                node_id,
+                bucket: "bucket".to_string(),
+                relationship_id: Ulid::from_bytes([10u8; 16]),
+                versions_synced: 2,
+            },
+        };
+        assert_eq!(
+            event_permission_path(&sync),
+            Some(bucket_permission_path(
+                realm_id, group_id, node_id, "bucket"
+            ))
+        );
+
+        let mut metadata = WatchEvent {
+            event_id: Ulid::from_bytes([7u8; 16]),
+            realm_id,
+            kind: WatchEventKind::MetadataCreated,
+            path: format!("meta/{group_id}/datasets/project"),
+            actor,
+            occurred_at_ms: 1,
+            detail: WatchEventDetail::MetadataCreated {
+                group_id,
+                document_id,
+            },
+        };
+        assert_eq!(
+            event_permission_path(&metadata),
+            Some(MetadataRegistryRecord::permission_path_for(
+                &realm_id,
+                group_id,
+                "datasets/project",
+                document_id,
+            ))
+        );
+        // A federated actor keeps the same permission path, checked for the recipient.
+        metadata.actor = UserId::new(Ulid::from_bytes([5u8; 16]), RealmId([2u8; 32]));
+        assert!(event_permission_path(&metadata).is_some());
+        metadata.path = format!("meta/{}/datasets/project", Ulid::from_bytes([8u8; 16]));
+        assert!(event_permission_path(&metadata).is_none());
+    }
+
+    #[test]
+    fn accepts_group_prefix() {
+        // An empty document prefix watches every dataset of the group.
+        let realm_id = RealmId([1u8; 32]);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        assert_eq!(
+            watch_permission_path(
+                realm_id,
+                &format!("meta/{group_id}/"),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            ),
+            Some(format!("/{realm_id}/g/{group_id}/meta/"))
+        );
+        assert!(
+            watch_permission_path(
+                realm_id,
+                &format!("meta/{group_id}"),
+                WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]),
+            )
+            .is_none(),
+            "the slash after the group stays mandatory"
+        );
+    }
+
+    #[test]
+    fn mixed_mask_invalid() {
+        let mask = WatchEventMask::from_kinds([
+            WatchEventKind::MetadataCreated,
+            WatchEventKind::DataUploaded,
+        ]);
+        assert!(watch_permission_path(RealmId([1u8; 32]), "meta/x/y", mask).is_none());
+    }
+
+    #[test]
+    fn nil_groups_invalid() {
+        let realm_id = RealmId([1u8; 32]);
+        let metadata_mask = WatchEventMask::from_kinds([WatchEventKind::MetadataCreated]);
+        let data_mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let nil_group = Ulid::nil();
+
+        assert!(
+            watch_permission_path(
+                realm_id,
+                &format!("meta/{nil_group}/datasets"),
+                metadata_mask,
+            )
+            .is_none()
+        );
+        assert!(
+            watch_permission_path(
+                realm_id,
+                &watch_resource_path(nil_group, node(3), "bucket", ""),
+                data_mask,
+            )
+            .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarded_prefix_binding() {
+        // An unbound binding over the same foreign prefix is authorized, so the
+        // refusal can only come from the binding, not from a missing grant.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([5u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = watch_resource_path(group_id, node_id, "bucket", "");
+        let foreign = watch_resource_path(group_id, node_id, "other", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let bound = WatchAuthorizationBinding {
+            watch_path_prefix: prefix.clone(),
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, owner, &prefix, mask, &bound)
+                .await
+                .expect("bound prefix"),
+            WatchAuthorization::Authorized
+        ));
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, owner, &foreign, mask, &bound)
+                .await
+                .expect("foreign prefix"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidState)
+        ));
+        assert!(matches!(
+            authorize_forwarded_watch(
+                &context,
+                realm_id,
+                owner,
+                &foreign,
+                mask,
+                &WatchAuthorizationBinding::default(),
+            )
+            .await
+            .expect("unbound prefix"),
+            WatchAuthorization::Authorized
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarded_owner_scope() {
+        // A forwarded watch is only ever created for a real user of this realm.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([6u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = watch_resource_path(group_id, node_id, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let binding = WatchAuthorizationBinding::default();
+
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, owner, &prefix, mask, &binding)
+                .await
+                .expect("realm owner"),
+            WatchAuthorization::Authorized
+        ));
+        assert!(matches!(
+            authorize_forwarded_watch(
+                &context,
+                realm_id,
+                UserId::nil(realm_id),
+                &prefix,
+                mask,
+                &binding,
+            )
+            .await
+            .expect("anonymous owner"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidOwner)
+        ));
+        let outsider = UserId::new(Ulid::from_bytes([1u8; 16]), RealmId([7u8; 32]));
+        assert!(matches!(
+            authorize_forwarded_watch(&context, realm_id, outsider, &prefix, mask, &binding)
+                .await
+                .expect("foreign realm owner"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidOwner)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_binding_denied() {
+        // The owner holds READ throughout: only the binding's own validity decides
+        // whether a stored watch may still be delivered.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([3u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = watch_resource_path(group_id, node_id, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let mut binding = WatchAuthorizationBinding::default();
+
+        assert!(matches!(
+            evaluate_watch_delivery(&context, realm_id, owner, &prefix, mask, &binding)
+                .await
+                .expect("valid binding"),
+            WatchAuthorization::Authorized
+        ));
+        binding.path_restrictions = Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{group_id}/**"),
+            permission: Permission::READ,
+        }]);
+        assert!(matches!(
+            evaluate_watch_delivery(&context, realm_id, owner, &prefix, mask, &binding)
+                .await
+                .expect("restricted binding"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::InvalidState)
+        ));
+    }
+
+    #[tokio::test]
+    async fn restricted_token_refused() {
+        // The restriction covers the watched path, so the refusal is the blanket
+        // rule that a path-restricted token may not open a watch at all.
+        let (_dir, context) = temp_context();
+        let realm_id = RealmId([4u8; 32]);
+        let owner = UserId::new(Ulid::from_bytes([1u8; 16]), realm_id);
+        let group_id = Ulid::from_bytes([2u8; 16]);
+        let node_id = node(3);
+        let group_auth = GroupAuthorizationDocument::default_group_doc(owner, realm_id, group_id);
+        seed_watch_auth(
+            &context.storage_handle,
+            realm_id,
+            node_id,
+            owner,
+            &group_auth,
+        )
+        .await;
+        let prefix = watch_resource_path(group_id, node_id, "bucket", "");
+        let mask = WatchEventMask::from_kinds([WatchEventKind::DataUploaded]);
+        let mut auth_context = AuthContext {
+            user_id: owner,
+            realm_id,
+            path_restrictions: None,
+            session: None,
+        };
+
+        assert!(matches!(
+            evaluate_watch_creation(&context, realm_id, &auth_context, &prefix, mask)
+                .await
+                .expect("unrestricted token"),
+            WatchAuthorization::Authorized
+        ));
+        auth_context.path_restrictions = Some(vec![PathRestriction {
+            pattern: format!("/{realm_id}/g/{group_id}/**"),
+            permission: Permission::READ,
+        }]);
+        assert!(matches!(
+            evaluate_watch_creation(&context, realm_id, &auth_context, &prefix, mask)
+                .await
+                .expect("restricted token"),
+            WatchAuthorization::Denied(WatchAuthorizationDenial::TokenRestricted)
+        ));
+    }
+}

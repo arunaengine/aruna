@@ -1,0 +1,48 @@
+//! Groups the operations that answer which nodes hold a copy of a version, plus their error.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub mod holders;
+pub mod local;
+pub mod queued;
+pub mod relationships;
+pub mod remote;
+
+use aruna_core::calls::IoError;
+use aruna_core::errors::{BlobError, ConversionError};
+use thiserror::Error;
+
+#[derive(Debug, Error, PartialEq)]
+pub enum LocationSummaryError {
+    #[error(transparent)]
+    ManagedCopy(#[from] aruna_core::managed_copy::ManagedCopyError),
+    #[error(transparent)]
+    Conversion(#[from] ConversionError),
+    #[error(transparent)]
+    Blob(#[from] BlobError),
+    #[error("peer is not a member of the realm")]
+    PeerDenied,
+    #[error("read access denied")]
+    Denied,
+    #[error("bucket not found")]
+    BucketNotFound,
+    #[error("unexpected event in state {state}: {event}")]
+    Unexpected { state: &'static str, event: String },
+    #[error("peer did not answer before the request deadline")]
+    Aborted,
+    #[error("could not read the locations: {0}")]
+    Io(IoError),
+}
+
+/// A run cut off at its deadline counts as a peer that did not answer in time.
+impl From<IoError> for LocationSummaryError {
+    fn from(error: IoError) -> Self {
+        match error {
+            IoError::Aborted | IoError::Hung { .. } => Self::Aborted,
+            other => Self::Io(other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

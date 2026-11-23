@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, MutexGuard};
 
-use aruna_plugins::limits::Limits;
+use aruna_wasm_host::limits::Limits;
 use elabftw_sync::host::{
     Created, Document, Fault, FilePage, Host, Kind, Meter, Method, Reply, Request, Result,
 };
@@ -199,8 +199,8 @@ impl World {
     }
 }
 
-/// The world behind the host's bounds of `plugins/src/limits.rs`: a request or a reply of one
-/// call up to `call_bytes`, and a run up to `bytes` in all; anything more is refused.
+/// The world behind the host's bounds of `runtime/wasm-host/src/limits.rs`: a request or a reply
+/// of one call up to `call_bytes`, and a run up to `bytes` in all; anything more is refused.
 pub struct Bounded<'a>(pub &'a World);
 
 impl Bounded<'_> {

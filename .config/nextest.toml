@@ -36,7 +36,7 @@ final-status-level = "flaky"
 test-threads = 4
 
 [[profile.ci.overrides]]
-filter = '(package(aruna) | package(aruna-operations)) & kind(test)'
+filter = 'package(aruna) & kind(test)'
 threads-required = 2
 
 # The longest tests start first instead of trailing the run.

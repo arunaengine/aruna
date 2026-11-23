@@ -23,6 +23,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
-aruna-plugins = { workspace = true, features = ["build", "runtime"] }
+aruna-plugin-contract = { workspace = true }
+aruna-wasm-host = { workspace = true, features = ["build", "runtime"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }

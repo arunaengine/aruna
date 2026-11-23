@@ -1,0 +1,481 @@
+//! Owns the background task handler and the queues that run its timers and drains.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use aruna_clock::unix_timestamp_millis;
+use aruna_core::effects::Effect;
+use aruna_core::events::{Event, StorageEvent};
+use aruna_core::handle::Handle;
+use aruna_core::structs::execution::job::identity::JobExecutionClass;
+use aruna_core::structs::execution::job::input::RoCrateLimits;
+use aruna_core::structs::execution::job::local::JobRecord;
+use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
+use aruna_core::types::Key;
+use aruna_scheduler::shutdown::Shutdown;
+use aruna_scheduler::{InboundTaskHandler, TaskHandle};
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+use tracing::{error, warn};
+
+#[cfg(debug_assertions)]
+struct OutboxBarrier {
+    marker: std::path::PathBuf,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for OutboxBarrier {
+    fn drop(&mut self) {
+        tracing::info!(event = "test.outbox.joined", "Outbox drain joined");
+        if let Err(error) = std::fs::write(&self.marker, b"joined") {
+            warn!(error = %error, "Failed to record outbox join");
+        }
+    }
+}
+
+use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
+use crate::tasks::task_persistence::restore_task_timers;
+use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
+use aruna_ops_data::blob::sweep_timer::ArmSweepOperation;
+use aruna_ops_data::metadata::materialization_queue::{
+    NextTimerOperation, RequeueParkedOperation, UNKNOWN_CORES,
+};
+use aruna_ops_data::metadata::projection::ProjectionTimerOperation;
+use aruna_ops_data::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
+use aruna_ops_data::replication::drain::RestoreDrainOperation;
+use aruna_ops_data::replication::mirror_repair::drain::RestoreTimerOperation;
+use aruna_ops_data::s3::bucket::key::lock::LockBucketOperation;
+use aruna_ops_identity::sync::document_outbox::OutboxTimerOperation;
+use aruna_ops_identity::sync::outbox::batches::OutboxLimits;
+use aruna_ops_identity::sync::outbox::rotation::OutboxRotation;
+use aruna_ops_work::jobs::drain::DrainTimerOperation;
+use aruna_ops_work::jobs::prune::PruneTimerOperation;
+use aruna_ops_work::jobs::store::job_calls;
+use aruna_ops_work::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
+use aruna_ops_work::notifications::prune::RestorePruneOperation;
+use aruna_ops_work::notifications::watch::digest::InterestOperation;
+use aruna_ops_work::notifications::watch::table::RebuildTableOperation;
+use aruna_ops_work::triggers::{
+    TimerHandoff, TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
+};
+use aruna_runner::driver::node_facts;
+use aruna_runner::driver::{DriverContext, drive, drive_retry, node_routing};
+use aruna_runner::effect_adapters::task::{arm_unless_stored, change_timer};
+use aruna_runner::jobs::runtime::JobsRuntime;
+use aruna_storage::task_timers::delete_persisted_timer;
+use drained::remove_drained_backends;
+use folder_pass::{restore_publish_timer, restore_sync_timers};
+
+pub(crate) mod drained;
+pub mod folder_pass;
+pub mod git_drain;
+pub mod outbox;
+pub mod restore;
+
+/// The logical cores this host offers, as the operating system reports them.
+fn host_cores() -> usize {
+    std::thread::available_parallelism().map_or(UNKNOWN_CORES, |cores| cores.get())
+}
+
+/// Arms the graph prune drain for its next due job at start.
+async fn restore_graph_prune(
+    context: &aruna_runner::driver::DriverContext,
+    task_handle: &aruna_scheduler::TaskHandle,
+) {
+    match aruna_runner::driver::drive(GraphPruneTimerOperation::new(), context).await {
+        Ok(None) => {}
+        Ok(Some(after)) => {
+            let wake =
+                aruna_core::effects::Effect::Task(aruna_core::task::TaskEffect::ResetTimer {
+                    key: TaskKey::DrainPruneQueue,
+                    after,
+                });
+            if let aruna_core::events::Event::Task(aruna_core::task::TaskEvent::Error {
+                message,
+                ..
+            }) = task_handle.send_effect(wake).await
+            {
+                warn!(message = %message, "Failed to restore metadata graph prune timer");
+            }
+        }
+        Err(error) => warn!(error = ?error, "Failed to scan metadata graph prune jobs"),
+    }
+}
+
+const QUEUE_REARM_AFTER: Duration = Duration::from_secs(5);
+/// Rearm ticks between dead-letter sweeps, i.e. one sweep a minute.
+const DEAD_LETTER_TICKS: usize = 12;
+
+/// Dispatches scheduled tasks and background drains to their operations.
+pub(crate) struct OperationsTaskHandler {
+    context: Arc<DriverContext>,
+    jobs_runtime: Arc<JobsRuntime>,
+    rocrate_limits: RoCrateLimits,
+    // What each converted timer keeps between runs; the operations decide on it. Loss on
+    // restart is fine: a restarted timer starts afresh.
+    timer_memory: std::sync::Mutex<HashMap<TaskKey, TimerMemory>>,
+    outbox_limits: OutboxLimits,
+}
+
+impl OperationsTaskHandler {
+    pub(crate) fn new(context: Arc<DriverContext>, jobs_runtime: Arc<JobsRuntime>) -> Self {
+        Self {
+            context,
+            jobs_runtime,
+            rocrate_limits: RoCrateLimits::default(),
+            timer_memory: std::sync::Mutex::new(HashMap::new()),
+            outbox_limits: OutboxLimits::default(),
+        }
+    }
+
+    fn with_rocrate_limits(mut self, limits: RoCrateLimits) -> Self {
+        self.rocrate_limits = limits;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_outbox_limits(
+        mut self,
+        pages: usize,
+        records: usize,
+        continuation_streak: u32,
+    ) -> Self {
+        assert!(pages > 0 && records > 0 && continuation_streak > 0);
+        self.outbox_limits = OutboxLimits {
+            pages,
+            records,
+            continuation_streak,
+        };
+        self
+    }
+
+    async fn reschedule_timer(&self, key: TaskKey, after: std::time::Duration) -> bool {
+        let effect = TaskEffect::ResetTimer {
+            key: key.clone(),
+            after,
+        };
+        let storage = &self.context.storage_handle;
+        let task_handle = self.context.task_handle.as_ref();
+        match change_timer(storage, task_handle, effect, false).await {
+            Event::Task(TaskEvent::TimerScheduled { .. }) => true,
+            Event::Task(TaskEvent::Error { message, .. }) => {
+                warn!(task_id = ?key, message = %message, "Failed to re-arm failed timer");
+                false
+            }
+            other => {
+                warn!(task_id = ?key, event = ?other, "Unexpected timer re-arm result");
+                false
+            }
+        }
+    }
+
+    /// Re-arms a timer in memory even when storage cannot persist it, so an outage does not end
+    /// the retries; the persisted copy is best effort.
+    async fn keep_retrying(&self, key: TaskKey, after: std::time::Duration) {
+        self.rearm_live(TaskEffect::ResetTimer { key, after }).await;
+    }
+
+    /// Applies a timer arming in memory even when storage cannot persist it.
+    async fn rearm_live(&self, effect: TaskEffect) {
+        let storage = &self.context.storage_handle;
+        let task_handle = self.context.task_handle.as_ref();
+        if let Event::Task(TaskEvent::Error { key, message }) =
+            change_timer(storage, task_handle, effect, true).await
+        {
+            warn!(task_id = ?key, message = %message, "Failed to arm the retry timer");
+        }
+    }
+
+    /// Arms the backend import pass at start, live even when its row cannot be stored, since
+    /// no restored wake runs the rules until a rule changes.
+    pub(super) async fn arm_backend_imports(&self) {
+        self.keep_retrying(TaskKey::RunBackendImports, Duration::ZERO)
+            .await;
+    }
+
+    /// Runs the operation the trigger table names for `key` and arms the timer when it asks.
+    async fn run_trigger(&self, key: TaskKey) {
+        let memory = self.kept_memory(&key);
+        let needs = timer_needs(&key);
+        let context = self.context.as_ref();
+        let runtime = self.jobs_runtime.as_ref();
+        let slots = |class| needs.jobs.then(|| runtime.available_slots_for(class));
+        let input = TimerInput {
+            now_ms: unix_timestamp_millis(),
+            local_node: context.net_handle.as_ref().map(|net| net.node_id()),
+            serving: context.node_and_realm(),
+            memory: memory.clone(),
+            facts: if needs.facts {
+                node_facts(context)
+            } else {
+                Default::default()
+            },
+            routing: if needs.routing {
+                node_routing(context)
+            } else {
+                Default::default()
+            },
+            has_blob: context.blob_handle.is_some(),
+            running: needs.running.then(|| self.jobs_runtime.running_jobs()),
+            has_tasks: context.task_handle.is_some(),
+            host_cores: (needs.cores.then(host_cores)).unwrap_or(UNKNOWN_CORES),
+            heartbeats: if needs.cluster {
+                context.fresh_heartbeats()
+            } else {
+                Default::default()
+            },
+            limits: if needs.cluster {
+                context.compute_limits()
+            } else {
+                Default::default()
+            },
+            rocrate_limits: self.rocrate_limits.clone(),
+            outbox: self.outbox_limits,
+            jobs_started: needs.jobs && runtime.is_started(),
+            in_process_slots: slots(JobExecutionClass::InProcess).unwrap_or_default(),
+            external_slots: slots(JobExecutionClass::ExternalAttempt).unwrap_or_default(),
+        };
+        let Some(operation) = timer_operation(&key, &input) else {
+            error!(task_id = ?key, "The trigger table names no operation for this timer");
+            return;
+        };
+        // Jobs are claimed only while no stop drains the runtime, and stay gated until started.
+        let gate = match operation.claims_jobs() {
+            true => match claim_producer(runtime).await {
+                Some(gate) => Some(gate),
+                None => return,
+            },
+            false => None,
+        };
+        // A lost commit conflict reruns a fresh copy, as the operation's conflict hook decides.
+        let seed = key
+            .storage_key()
+            .map(|key| key.to_vec())
+            .unwrap_or_default();
+        let build = || operation.clone();
+        let bulk = operation.bulk_lane().then(|| self.context.bulk());
+        let context = bulk.as_ref().unwrap_or(self.context.as_ref());
+        let plan = match drive_retry(build, context, &seed).await {
+            Ok(plan) => plan,
+            Err(failure) => {
+                warn!(task_id = ?key, error = %failure, "Timer run failed");
+                TimerPlan::keep(Some(failure.retry_after), memory)
+            }
+        };
+        self.keep_memory(&key, plan.memory);
+        self.hand_off(plan.handoff).await;
+        drop(gate);
+        let Some(after) = plan.after else {
+            return;
+        };
+        // The fired row is gone, so a refused rearm keeps a live wake that stores it again.
+        if keeps_earlier(&key) {
+            return self.rearm_stored(key, after).await;
+        }
+        self.rearm_live(TaskEffect::ResetTimer { key, after }).await;
+    }
+
+    /// Starts the work a timer run handed to this shell.
+    async fn hand_off(&self, handoff: TimerHandoff) {
+        match handoff {
+            TimerHandoff::Nothing => {}
+            TimerHandoff::RemoveBackends => {
+                if let Err(error) = remove_drained_backends(&self.context).await {
+                    warn!(error = %error, "Failed to remove drained storage backends");
+                }
+            }
+            TimerHandoff::StartJobs {
+                claimed,
+                lost_attempts,
+            } => self.start_jobs(claimed, lost_attempts).await,
+        }
+    }
+
+    /// Reconciles the lost attempts and starts the claimed jobs, releasing a claim whose class
+    /// filled up since the drain read its budget.
+    async fn start_jobs(&self, claimed: Vec<JobRecord>, lost_attempts: Vec<JobRecord>) {
+        for record in lost_attempts {
+            reconcile_lost_attempt(&self.jobs_runtime, self.context.as_ref(), record).await;
+        }
+        for record in claimed {
+            if self
+                .jobs_runtime
+                .available_slots_for(record.execution_class)
+                == 0
+            {
+                let Some(token) = record.claim.as_ref().map(|claim| claim.claim_token) else {
+                    warn!(job_id = %record.job_id, "Claimed job has no claim token; cannot release");
+                    continue;
+                };
+                let release = job_calls::release_job(record.job_id, token, unix_timestamp_millis());
+                if let Err(error) = drive(release, self.context.as_ref()).await {
+                    warn!(job_id = %record.job_id, error = %error, "Failed to release excess job claim");
+                }
+                continue;
+            }
+            spawn_job(&self.jobs_runtime, self.context.clone(), record);
+        }
+    }
+
+    /// Rearms `key` unless a row stored while it ran holds a newer wake, also one no longer live
+    /// after a stop; live even when the row cannot be stored.
+    async fn rearm_stored(&self, key: TaskKey, after: Duration) {
+        let Some(task_handle) = self.context.task_handle.as_ref() else {
+            warn!(task_id = ?key, "Cannot rearm a timer without task handle");
+            return;
+        };
+        let storage = &self.context.storage_handle;
+        let effect = TaskEffect::ShortenTimer { key, after };
+        if let Event::Task(TaskEvent::Error { key, message }) =
+            arm_unless_stored(storage, task_handle, effect).await
+        {
+            warn!(task_id = ?key, message = %message, "Failed to arm the retry timer");
+        }
+    }
+
+    /// What a timer kept from its last run, empty for its first run since the start.
+    fn kept_memory(&self, key: &TaskKey) -> TimerMemory {
+        (self.timer_memory.lock())
+            .unwrap_or_else(|error| error.into_inner())
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Stores what a timer keeps until its next run; an empty memory is dropped.
+    fn keep_memory(&self, key: &TaskKey, memory: TimerMemory) {
+        let mut kept = (self.timer_memory.lock()).unwrap_or_else(|error| error.into_inner());
+        if memory == TimerMemory::default() {
+            kept.remove(key);
+        } else {
+            kept.insert(key.clone(), memory);
+        }
+    }
+
+    fn timer_work(&self, key: TaskKey) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        match key {
+            TaskKey::LockBucket {
+                bucket_id,
+                generation,
+                session_id,
+            } => Box::pin(async move {
+                let key = BucketKeyRef::new(bucket_id, generation);
+                let ticket = KeyTicket { key, session_id };
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot record a timed bucket lock without net handle");
+                    return;
+                };
+                let now_ms = unix_timestamp_millis();
+                let operation = LockBucketOperation::timed(ticket, net_handle.node_id(), now_ms);
+                if let Err(error) = drive(operation, &self.context).await {
+                    warn!(error = %error, "Timed bucket lock failed");
+                }
+            }),
+            TaskKey::PromotePending {
+                bucket_id,
+                generation,
+            } => Box::pin(async move {
+                let Some(net_handle) = self.context.net_handle.as_ref() else {
+                    warn!("Cannot promote pending archives without net handle");
+                    return;
+                };
+                let key = BucketKeyRef::new(bucket_id, generation);
+                let origin = (*net_handle.realm_id(), net_handle.node_id());
+                let promoted = aruna_ops_data::blob::unlocked::PromoteUnlockedOperation::new(
+                    key,
+                    origin,
+                    &self.rocrate_limits,
+                );
+                // A locked key leaves the archives pending; its next unlock promotes them.
+                if let Err(error) = drive(promoted, &self.context).await {
+                    warn!(bucket_id = %bucket_id, error = %error, "Pending promotion failed");
+                }
+            }),
+            TaskKey::RealmPresence { .. }
+            | TaskKey::SyncPlacements { .. }
+            | TaskKey::DrainSyncOutbox
+            | TaskKey::PublishUsageSnapshots
+            | TaskKey::PublishNodeInfo
+            | TaskKey::DrainProjectionQueue
+            | TaskKey::DrainMaterializationQueue
+            | TaskKey::DrainPruneQueue
+            | TaskKey::DrainReplicationQueue
+            | TaskKey::DrainRefreshQueue
+            | TaskKey::DrainNotificationOutbox
+            | TaskKey::PruneNotifications
+            | TaskKey::PublishWatchInterest
+            | TaskKey::DrainWatchEvents
+            | TaskKey::DrainAppliedSync
+            | TaskKey::DrainJobQueue
+            | TaskKey::PruneJobs
+            | TaskKey::PruneFamilies
+            | TaskKey::ConfigCatchUp
+            | TaskKey::DrainMirrorRepair
+            | TaskKey::SweepHiddenBlobs
+            | TaskKey::DrainCleanupQueue
+            | TaskKey::DrainReclaimQueue
+            | TaskKey::MigrateCompression
+            | TaskKey::RefreshBlobHolders
+            | TaskKey::RecordAudit { .. }
+            | TaskKey::DeliverKeyWakes
+            | TaskKey::PublishRegistration
+            | TaskKey::PruneConnectorReferences
+            | TaskKey::MaintainRanges
+            | TaskKey::RunBackendImports
+            | TaskKey::DrainFamilyOutbox
+            | TaskKey::DrainWitnessQueue
+            | TaskKey::SettleJobTerminals
+            | TaskKey::DrainLinkQueue
+            | TaskKey::DrainCaptures
+            | TaskKey::ReconcileSyncedFolders
+            | TaskKey::DrainUploadOutbox
+            | TaskKey::DrainDeviceIntake => Box::pin(self.run_trigger(key)),
+        }
+    }
+}
+
+/// The durable queue work deferred until after the local serving gate.
+#[derive(Clone)]
+pub struct TaskQueues {
+    context: Arc<DriverContext>,
+    task_handle: TaskHandle,
+    handler: Arc<OperationsTaskHandler>,
+    refresh_holders: bool,
+}
+
+/// A document sync drain that keeps its rotation across invocations like the
+/// timer-driven handler. A fresh drainer starts at the head, which is the same
+/// reset a process restart performs.
+pub struct OutboxDrainer {
+    handler: Arc<OperationsTaskHandler>,
+}
+
+#[async_trait]
+impl InboundTaskHandler for OperationsTaskHandler {
+    async fn handle_timer(&self, key: TaskKey) {
+        self.handle_firing(key, None).await;
+    }
+
+    async fn handle_firing(&self, key: TaskKey, stamp: Option<u64>) {
+        // A test pins the first outbox drain of a launch until it releases the barrier.
+        #[cfg(debug_assertions)]
+        if matches!(key, TaskKey::DrainSyncOutbox)
+            && let Some(barrier) = OutboxBarrier::new()
+        {
+            barrier.wait_start().await;
+        }
+        // An audit record retry keeps its row until the record is stored, in one transaction.
+        if !matches!(key, TaskKey::RecordAudit { .. }) {
+            delete_persisted_timer(&self.context.storage_handle, &key, stamp).await;
+        }
+        self.timer_work(key).await;
+    }
+}
+
+#[cfg(test)]
+mod tests;

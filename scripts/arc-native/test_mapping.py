@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from schema_salad.exceptions import ValidationException
 from arc import scaffold
 
-spec = importlib.util.spec_from_file_location("aruna_conversion", Path(__file__).resolve().parents[2] / "blob/src/arc.py")
+spec = importlib.util.spec_from_file_location("aruna_conversion", Path(__file__).resolve().parents[2] / "runtime/blob/src/arc.py")
 conversion = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(conversion)
 

@@ -1,0 +1,34 @@
+//! Owns the read-only inspection of a stopped node's persisted state.
+//! Note that node-state prints the persisted identity including its network secret.
+// Copyright (c) 2026 The Aruna Contributors
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+pub(crate) mod commands;
+mod decode;
+mod present;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum ExplorerError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Fjall(#[from] fjall::Error),
+    #[error(transparent)]
+    Irokle(#[from] irokle::Error),
+    #[error(transparent)]
+    Craqle(Box<craqle::CraqleError>),
+    #[error("keyspace not found: {0}")]
+    KeyspaceNotFound(String),
+    #[error("no database at {0}: name the folder of a node's database")]
+    MissingDatabase(String),
+    #[error("decode failed: {0}")]
+    Decode(String),
+    #[error("migration refused: {0}")]
+    Refused(String),
+}
+
+impl From<craqle::CraqleError> for ExplorerError {
+    fn from(error: craqle::CraqleError) -> Self {
+        Self::Craqle(Box::new(error))
+    }
+}
