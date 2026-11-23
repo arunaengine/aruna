@@ -173,7 +173,7 @@ mod tests {
 
     fn vector() -> Vector {
         let all: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/vault.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/vault.json")).unwrap();
         let field = |name: &str| hex::decode(all["hpke"][name].as_str().unwrap()).unwrap();
         Vector {
             private: field("recipient_private").try_into().unwrap(),
@@ -238,7 +238,7 @@ mod tests {
 
         // Shared with the portal: both sides must produce and open these exact bytes.
         let all: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/bucket-copy.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/bucket-copy.json")).unwrap();
         let text = |name: &str| all[name].as_str().unwrap();
         let bytes = |name: &str| hex::decode(text(name)).unwrap();
         let realm_id = RealmId::from_base64(text("realm_id")).unwrap();

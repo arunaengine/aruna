@@ -81,7 +81,7 @@ mod tests {
 
     fn vector() -> (String, [u8; 32]) {
         let all: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/vault.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/vault.json")).unwrap();
         let code = all["vault"]["recovery_code"].as_str().unwrap().to_string();
         let bytes = hex::decode(all["vault"]["recovery_bytes"].as_str().unwrap()).unwrap();
         (code, bytes.try_into().unwrap())

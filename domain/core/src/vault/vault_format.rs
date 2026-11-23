@@ -407,7 +407,7 @@ mod tests {
 
     fn vector() -> Vector {
         let all: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/vault.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/vault.json")).unwrap();
         let text = |section: &str, name: &str| all[section][name].as_str().unwrap().to_string();
         let bytes = |section: &str, name: &str| -> [u8; 32] {
             hex::decode(text(section, name))
@@ -561,7 +561,7 @@ mod tests {
 
     fn argon2_payload() -> VaultPayload {
         let all: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/vectors/vault.json")).unwrap();
+            serde_json::from_str(include_str!("../../tests/vectors/vault.json")).unwrap();
         VaultPayload::parse(all["argon2_vault"]["payload"].as_str().unwrap()).unwrap()
     }
 
