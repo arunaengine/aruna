@@ -36,7 +36,7 @@ fn tag(key_space: &str) -> Vec<u8> {
     tag
 }
 
-fn tagged(key_space: &str, key: &[u8]) -> ByteView {
+pub(super) fn tagged(key_space: &str, key: &[u8]) -> ByteView {
     let mut row = tag(key_space);
     row.extend_from_slice(key);
     ByteView::from(row)
@@ -61,7 +61,15 @@ pub(super) fn flush_empty(store: &Store) {
     }
 }
 
-fn kept_value(row: &[u8]) -> Result<Option<ByteView>, StorageError> {
+/// The kept row of a source row that held `value` when the rebuild began.
+pub(super) fn kept_row(value: Option<&[u8]>) -> ByteView {
+    match value {
+        Some(value) => ByteView::from([&[PRESENT][..], value].concat()),
+        None => ByteView::from(vec![ABSENT]),
+    }
+}
+
+pub(super) fn kept_value(row: &[u8]) -> Result<Option<ByteView>, StorageError> {
     match row.split_first() {
         Some((&PRESENT, value)) => Ok(Some(ByteView::from(value))),
         Some((&ABSENT, [])) => Ok(None),
@@ -96,11 +104,8 @@ impl FjallStorage {
                 continue;
             }
             let keyspace = self.store.resolve_keyspace(key_space)?;
-            let value = match snapshot.get(&keyspace, key).map_err(read_error)? {
-                Some(value) => [&[PRESENT][..], value.as_ref()].concat(),
-                None => vec![ABSENT],
-            };
-            tx.insert(kept.clone(), row, ByteView::from(value));
+            let value = snapshot.get(&keyspace, key).map_err(read_error)?;
+            tx.insert(kept.clone(), row, kept_row(value.as_deref()));
         }
         Ok(())
     }
@@ -170,45 +175,65 @@ impl FjallStorage {
             Some(kept) if is_source(key_space) => kept,
             _ => return Ok((rows, next)),
         };
-        let tag = tag(key_space);
-        let kept_prefix = tagged(key_space, prefix.map_or(&[][..], |prefix| prefix.as_ref()));
-        let kept_start = start.map(|start| match start {
-            IterStart::After(key) => IterStart::After(tagged(key_space, key)),
-            IterStart::At(key) => IterStart::At(tagged(key_space, key)),
-        });
-        let (values, kept_next) = iterate_page(
+        let (kept_prefix, kept_start) = kept_cursor(key_space, prefix, start);
+        let kept_page = iterate_page(
             snapshot,
             &kept,
             Some(&kept_prefix),
             kept_start.as_ref(),
             limit,
         )?;
-        let strip = |key: &ByteView| ByteView::from(&key.as_ref()[tag.len()..]);
-        // A page that ended early covers keys only up to its last row.
-        let bound = [
-            next.and(rows.last().map(|(key, _)| key.clone())),
-            kept_next.and(values.last().map(|(key, _)| strip(key))),
-        ]
-        .into_iter()
-        .flatten()
-        .min();
-        let mut merged: BTreeMap<ByteView, Option<ByteView>> = rows
-            .into_iter()
-            .map(|(key, value)| (key, Some(value)))
-            .collect();
-        for (key, row) in values {
-            merged.insert(strip(&key), kept_value(row.as_ref())?);
-        }
-        let mut page: Vec<(ByteView, ByteView)> = merged
-            .into_iter()
-            .filter(|(key, _)| bound.as_ref().is_none_or(|bound| key <= bound))
-            .filter_map(|(key, value)| value.map(|value| (key, value)))
-            .collect();
-        if page.len() > limit {
-            page.truncate(limit);
-            let last = page.last().map(|(key, _)| key.clone());
-            return Ok((page, last));
-        }
-        Ok((page, bound))
+        merge_kept(key_space, (rows, next), kept_page, limit)
     }
+}
+
+/// The prefix and start of the kept rows that match a page of `key_space`.
+pub(super) fn kept_cursor(
+    key_space: &str,
+    prefix: Option<&ByteView>,
+    start: Option<&IterStart>,
+) -> (ByteView, Option<IterStart>) {
+    let kept_prefix = tagged(key_space, prefix.map_or(&[][..], |prefix| prefix.as_ref()));
+    let kept_start = start.map(|start| match start {
+        IterStart::After(key) => IterStart::After(tagged(key_space, key)),
+        IterStart::At(key) => IterStart::At(tagged(key_space, key)),
+    });
+    (kept_prefix, kept_start)
+}
+
+/// Lays a page of kept values over a page of `key_space` rows, up to the last key both cover.
+pub(super) fn merge_kept(
+    key_space: &str,
+    (rows, next): PageResult,
+    (values, kept_next): PageResult,
+    limit: usize,
+) -> Result<PageResult, StorageError> {
+    let tag = tag(key_space);
+    let strip = |key: &ByteView| ByteView::from(&key.as_ref()[tag.len()..]);
+    // A page that ended early covers keys only up to its last row.
+    let bound = [
+        next.and(rows.last().map(|(key, _)| key.clone())),
+        kept_next.and(values.last().map(|(key, _)| strip(key))),
+    ]
+    .into_iter()
+    .flatten()
+    .min();
+    let mut merged: BTreeMap<ByteView, Option<ByteView>> = rows
+        .into_iter()
+        .map(|(key, value)| (key, Some(value)))
+        .collect();
+    for (key, row) in values {
+        merged.insert(strip(&key), kept_value(row.as_ref())?);
+    }
+    let mut page: Vec<(ByteView, ByteView)> = merged
+        .into_iter()
+        .filter(|(key, _)| bound.as_ref().is_none_or(|bound| key <= bound))
+        .filter_map(|(key, value)| value.map(|value| (key, value)))
+        .collect();
+    if page.len() > limit {
+        page.truncate(limit);
+        let last = page.last().map(|(key, _)| key.clone());
+        return Ok((page, last));
+    }
+    Ok((page, bound))
 }

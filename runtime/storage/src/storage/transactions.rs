@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use aruna_core::effects::StorageEffect;
 use aruna_core::errors::StorageError;
@@ -20,7 +20,7 @@ use ulid::Ulid;
 
 use crate::compaction::{DELETE_THRESHOLD, compactable, sweep_due};
 
-use super::rebuild::shadow_row;
+use super::rebuild::{shadow_copies, shadow_row};
 
 use super::handle::{CleanupEntry, CleanupKind, MAX_TRANSACTION_CLEANUP};
 use super::worker::{FjallStorage, Txn};
@@ -65,13 +65,7 @@ impl FjallStorage {
         buckets: Vec<(ByteView, BucketDelta)>,
         txn_id: Ulid,
     ) -> StorageEvent {
-        let usage = deltas
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Usage(delta)));
-        let rows = buckets
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
-        self.pend_changes(key_space, usage.chain(rows).collect(), txn_id)
+        self.pend_changes(key_space, usage_changes(deltas, buckets), txn_id)
     }
 
     #[tracing::instrument(
@@ -86,11 +80,7 @@ impl FjallStorage {
         deltas: Vec<(ByteView, RangeCounters)>,
         txn_id: Ulid,
     ) -> StorageEvent {
-        let changes = deltas
-            .into_iter()
-            .map(|(key, delta)| (key, CounterChange::Range(delta)))
-            .collect();
-        self.pend_changes(key_space, changes, txn_id)
+        self.pend_changes(key_space, range_changes(deltas), txn_id)
     }
 
     /// Queues counter changes of an open write transaction for its commit.
@@ -108,21 +98,11 @@ impl FjallStorage {
                 error: StorageError::TransactionNotFound,
             };
         }
-        let pending = self.txn_usage.entry(txn_id).or_default();
-        let mut entries = Vec::with_capacity(changes.len());
-        for (key, change) in changes {
-            entries.push((key_space.clone(), key.clone()));
-            match pending.entry((key_space.clone(), key)) {
-                Entry::Occupied(mut existing) => match existing.get().merge(change) {
-                    Ok(merged) => *existing.get_mut() = merged,
-                    Err(error) => return StorageEvent::Error { error },
-                },
-                Entry::Vacant(slot) => {
-                    slot.insert(change);
-                }
-            }
-        }
-        StorageEvent::BatchWriteResult { entries }
+        pend_into(
+            self.txn_usage.entry(txn_id).or_default(),
+            key_space,
+            changes,
+        )
     }
 
     /// Writes the transaction's usage deltas on top of the latest committed counters. Only
@@ -135,42 +115,14 @@ impl FjallStorage {
         let Some(mut pending) = self.txn_usage.remove(&txn_id) else {
             return Ok(());
         };
-        self.shadow_changes(&mut pending)?;
+        shadow_copies(&self.usage_shadow, &mut pending)?;
         let snapshot = self.store.db.read_tx();
-        let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
         for ((key_space, key), change) in pending {
             let keyspace = self.store.resolve_keyspace(&key_space)?;
             let stored = snapshot
                 .get(&keyspace, &key)
                 .map_err(|error| StorageError::ReadError(error.to_string()))?;
-            let stored = stored.as_deref();
-            let (value, shortfalls) = match change {
-                CounterChange::Usage(_) | CounterChange::Bucket(_)
-                    if key.as_ref().starts_with(USAGE_SHADOW_PREFIX) =>
-                {
-                    (shadow_row(stored, change)?, Vec::new())
-                }
-                CounterChange::Usage(delta) => {
-                    let counters = stored.map(UsageCounters::from_bytes).transpose();
-                    let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
-                    let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
-                    (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
-                }
-                CounterChange::Bucket(delta) => {
-                    let counters = stored.map(BucketCounters::from_bytes).transpose();
-                    let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
-                    let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
-                    (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
-                }
-                CounterChange::Range(delta) => {
-                    let counters = stored.map(RangeCounters::from_bytes).transpose();
-                    let counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
-                    let merged = counters.merge(delta).map_err(|e| failed(&e))?;
-                    let value = merged.to_bytes();
-                    (value.map_err(|e| failed(&e))?, Vec::new())
-                }
-            };
-            warn_clamped(&key, shortfalls);
+            let value = counter_row(&key, stored.as_deref(), change)?;
             txn.insert(keyspace, key, value);
         }
         Ok(())
@@ -183,29 +135,9 @@ impl FjallStorage {
         fields(read)
     )]
     pub(super) fn start_transaction(&mut self, read: bool) -> StorageEvent {
-        let txn_id = loop {
-            let candidate = Ulid::generate();
-            let mut pending = self
-                .transaction_cleanup
-                .lock()
-                .expect("transaction cleanup mutex poisoned");
-            if pending.len() >= MAX_TRANSACTION_CLEANUP {
-                return StorageEvent::Error {
-                    error: StorageError::CleanupCapacity,
-                };
-            }
-            if pending.contains_key(&candidate) {
-                continue;
-            }
-            pending.insert(
-                candidate,
-                CleanupEntry {
-                    kind: CleanupKind::Open,
-                    attempts: 0,
-                    queued: false,
-                },
-            );
-            break candidate;
+        let txn_id = match reserve_txn(&self.transaction_cleanup) {
+            Ok(txn_id) => txn_id,
+            Err(error) => return StorageEvent::Error { error },
         };
 
         let txn = if read {
@@ -233,21 +165,7 @@ impl FjallStorage {
 
     #[tracing::instrument(name = "storage.abort_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
     pub(super) fn abort_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        if self
-            .transaction_cleanup
-            .lock()
-            .expect("transaction cleanup mutex poisoned")
-            .get(&txn_id)
-            .is_some_and(|entry| {
-                matches!(
-                    entry.kind,
-                    CleanupKind::CommitQueued
-                        | CleanupKind::CommitUnknown
-                        | CleanupKind::Committed(_)
-                        | CleanupKind::Aborted
-                )
-            })
-        {
+        if abort_blocked(&self.transaction_cleanup, txn_id) {
             return StorageEvent::Error {
                 error: StorageError::TransactionConflict,
             };
@@ -269,39 +187,9 @@ impl FjallStorage {
 
     #[tracing::instrument(name = "storage.commit_transaction", level = "debug", skip(self), fields(txn_id = %txn_id))]
     pub(super) fn commit_transaction(&mut self, txn_id: Ulid) -> StorageEvent {
-        let state = self
-            .transaction_cleanup
-            .lock()
-            .expect("transaction cleanup mutex poisoned")
-            .get(&txn_id)
-            .map(|entry| entry.kind);
-        match state {
-            Some(CleanupKind::Abort | CleanupKind::Aborted) => {
-                return StorageEvent::Error {
-                    error: StorageError::TransactionConflict,
-                };
-            }
-            Some(CleanupKind::CommitQueued) => {}
-            Some(CleanupKind::CommitUnknown) if self.txns.contains_key(&txn_id) => {}
-            Some(CleanupKind::CommitUnknown) => {
-                return StorageEvent::Error {
-                    error: StorageError::CommitFailed,
-                };
-            }
-            Some(CleanupKind::Open) => {
-                if let Some(entry) = self
-                    .transaction_cleanup
-                    .lock()
-                    .expect("transaction cleanup mutex poisoned")
-                    .get_mut(&txn_id)
-                {
-                    entry.kind = CleanupKind::CommitQueued;
-                }
-            }
-            Some(CleanupKind::Committed(sequence)) => {
-                return StorageEvent::TransactionCommitted { txn_id, sequence };
-            }
-            None => {}
+        let open = self.txns.contains_key(&txn_id);
+        if let Some(event) = commit_gate(&self.transaction_cleanup, txn_id, open) {
+            return event;
         }
 
         let config_txn = self.config_txns.remove(&txn_id);
@@ -441,6 +329,150 @@ impl FjallStorage {
             }
         }
     }
+}
+
+/// Converts usage and bucket deltas into pending counter changes.
+pub(super) fn usage_changes(
+    deltas: Vec<(ByteView, UsageDelta)>,
+    buckets: Vec<(ByteView, BucketDelta)>,
+) -> Vec<(ByteView, CounterChange)> {
+    let usage = deltas
+        .into_iter()
+        .map(|(key, delta)| (key, CounterChange::Usage(delta)));
+    let rows = buckets
+        .into_iter()
+        .map(|(key, delta)| (key, CounterChange::Bucket(delta)));
+    usage.chain(rows).collect()
+}
+
+/// Converts range counter deltas into pending counter changes.
+pub(super) fn range_changes(
+    deltas: Vec<(ByteView, RangeCounters)>,
+) -> Vec<(ByteView, CounterChange)> {
+    deltas
+        .into_iter()
+        .map(|(key, delta)| (key, CounterChange::Range(delta)))
+        .collect()
+}
+
+/// Folds counter changes into a transaction's pending changes; answers the rows changed.
+pub(super) fn pend_into(
+    pending: &mut PendingChanges,
+    key_space: String,
+    changes: Vec<(ByteView, CounterChange)>,
+) -> StorageEvent {
+    let mut entries = Vec::with_capacity(changes.len());
+    for (key, change) in changes {
+        entries.push((key_space.clone(), key.clone()));
+        match pending.entry((key_space.clone(), key)) {
+            Entry::Occupied(mut existing) => match existing.get().merge(change) {
+                Ok(merged) => *existing.get_mut() = merged,
+                Err(error) => return StorageEvent::Error { error },
+            },
+            Entry::Vacant(slot) => {
+                slot.insert(change);
+            }
+        }
+    }
+    StorageEvent::BatchWriteResult { entries }
+}
+
+/// The new value of counter row `key` after `change`, on top of its `stored` value.
+pub(super) fn counter_row(
+    key: &ByteView,
+    stored: Option<&[u8]>,
+    change: CounterChange,
+) -> Result<Vec<u8>, StorageError> {
+    let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
+    let (value, shortfalls) = match change {
+        CounterChange::Usage(_) | CounterChange::Bucket(_)
+            if key.as_ref().starts_with(USAGE_SHADOW_PREFIX) =>
+        {
+            (shadow_row(stored, change)?, Vec::new())
+        }
+        CounterChange::Usage(delta) => {
+            let counters = stored.map(UsageCounters::from_bytes).transpose();
+            let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+            let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
+            (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
+        }
+        CounterChange::Bucket(delta) => {
+            let counters = stored.map(BucketCounters::from_bytes).transpose();
+            let mut counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+            let shortfalls = counters.apply(&delta).map_err(|e| failed(&e))?;
+            (counters.to_bytes().map_err(|e| failed(&e))?, shortfalls)
+        }
+        CounterChange::Range(delta) => {
+            let counters = stored.map(RangeCounters::from_bytes).transpose();
+            let counters = counters.map_err(|e| failed(&e))?.unwrap_or_default();
+            let merged = counters.merge(delta).map_err(|e| failed(&e))?;
+            let value = merged.to_bytes();
+            (value.map_err(|e| failed(&e))?, Vec::new())
+        }
+    };
+    warn_clamped(key, shortfalls);
+    Ok(value)
+}
+
+/// Reserves a cleanup slot for a new transaction under a fresh id.
+pub(super) fn reserve_txn(
+    cleanup: &Mutex<BTreeMap<Ulid, CleanupEntry>>,
+) -> Result<Ulid, StorageError> {
+    loop {
+        let candidate = Ulid::generate();
+        let mut pending = cleanup.lock().expect("transaction cleanup mutex poisoned");
+        if pending.len() >= MAX_TRANSACTION_CLEANUP {
+            return Err(StorageError::CleanupCapacity);
+        }
+        if pending.contains_key(&candidate) {
+            continue;
+        }
+        let entry = CleanupEntry {
+            kind: CleanupKind::Open,
+            attempts: 0,
+            queued: false,
+        };
+        pending.insert(candidate, entry);
+        return Ok(candidate);
+    }
+}
+
+/// True once a commit was queued or the transaction ended, so an abort must not run.
+pub(super) fn abort_blocked(cleanup: &Mutex<BTreeMap<Ulid, CleanupEntry>>, txn_id: Ulid) -> bool {
+    let pending = cleanup.lock().expect("transaction cleanup mutex poisoned");
+    pending.get(&txn_id).is_some_and(|entry| {
+        matches!(
+            entry.kind,
+            CleanupKind::CommitQueued
+                | CleanupKind::CommitUnknown
+                | CleanupKind::Committed(_)
+                | CleanupKind::Aborted
+        )
+    })
+}
+
+/// The answer a commit gets from its cleanup state alone, if any; an open entry turns queued.
+/// `open` tells whether the transaction is still open, which an unknown commit retries.
+pub(super) fn commit_gate(
+    cleanup: &Mutex<BTreeMap<Ulid, CleanupEntry>>,
+    txn_id: Ulid,
+    open: bool,
+) -> Option<StorageEvent> {
+    let mut pending = cleanup.lock().expect("transaction cleanup mutex poisoned");
+    let entry = pending.get_mut(&txn_id)?;
+    let error = match entry.kind {
+        CleanupKind::Abort | CleanupKind::Aborted => StorageError::TransactionConflict,
+        CleanupKind::CommitUnknown if !open => StorageError::CommitFailed,
+        CleanupKind::CommitQueued | CleanupKind::CommitUnknown => return None,
+        CleanupKind::Open => {
+            entry.kind = CleanupKind::CommitQueued;
+            return None;
+        }
+        CleanupKind::Committed(sequence) => {
+            return Some(StorageEvent::TransactionCommitted { txn_id, sequence });
+        }
+    };
+    Some(StorageEvent::Error { error })
 }
 
 pub(super) fn warn_clamped(key: &[u8], shortfalls: Vec<CounterShortfall>) {

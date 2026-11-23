@@ -64,34 +64,99 @@ pub(super) fn shadow_row(
     row.to_bytes().map_err(|error| failed(error.to_string()))
 }
 
-impl FjallStorage {
-    /// Adds each usage change of a rebuilding keyspace to its rebuild row in the same commit.
-    pub(super) fn shadow_changes(&self, pending: &mut PendingChanges) -> Result<(), StorageError> {
-        if self.usage_shadow.is_empty() {
-            return Ok(());
-        }
-        let copies: Vec<_> = pending
-            .iter()
-            .filter(|((key_space, key), change)| {
-                self.usage_shadow.contains(key_space)
-                    && !is_rebuild_row(key)
-                    && !matches!(change, CounterChange::Range(_))
-            })
-            .map(|((key_space, key), change)| {
-                let shadow = ByteView::from(usage_shadow_key(key));
-                ((key_space.clone(), shadow), *change)
-            })
-            .collect();
-        for (row, change) in copies {
-            let merged = match pending.get(&row) {
-                Some(existing) => existing.merge(change)?,
-                None => change,
-            };
-            pending.insert(row, merged);
-        }
-        Ok(())
+/// Adds each usage change of a rebuilding keyspace in `shadow` to its rebuild row, so both
+/// land in the same commit.
+pub(super) fn shadow_copies(
+    shadow: &HashSet<String>,
+    pending: &mut PendingChanges,
+) -> Result<(), StorageError> {
+    if shadow.is_empty() {
+        return Ok(());
     }
+    let copies: Vec<_> = pending
+        .iter()
+        .filter(|((key_space, key), change)| {
+            shadow.contains(key_space)
+                && !is_rebuild_row(key)
+                && !matches!(change, CounterChange::Range(_))
+        })
+        .map(|((key_space, key), change)| {
+            let shadow = ByteView::from(usage_shadow_key(key));
+            ((key_space.clone(), shadow), *change)
+        })
+        .collect();
+    for (row, change) in copies {
+        let merged = match pending.get(&row) {
+            Some(existing) => existing.merge(change)?,
+            None => change,
+        };
+        pending.insert(row, merged);
+    }
+    Ok(())
+}
 
+/// The rows a new rebuild generation starts with: every global shard row at zero, then the
+/// progress and the marker.
+pub(super) fn rebuild_seed() -> Result<Vec<(ByteView, ByteView)>, StorageError> {
+    let failed = |error: &dyn std::fmt::Display| StorageError::WriteError(error.to_string());
+    let seed = ShadowCounters::Usage(UsageDelta::default()).to_bytes();
+    let seed = seed.map_err(|error| failed(&error))?;
+    let mut rows: Vec<_> = (global_shard_keys().into_iter())
+        .map(|shard| {
+            let row = ByteView::from(usage_shadow_key(&shard));
+            (row, ByteView::from(seed.as_slice()))
+        })
+        .collect();
+    let progress = RebuildProgress::new(Ulid::generate()).to_bytes();
+    let progress = progress.map_err(|error| failed(&error))?;
+    rows.push((ByteView::from(USAGE_PROGRESS_KEY), ByteView::from(progress)));
+    rows.push((ByteView::from(USAGE_REBUILD_KEY), ByteView::from(&[][..])));
+    Ok(rows)
+}
+
+/// What finishing a rebuild does with one row of the usage keyspace.
+pub(super) struct Swap {
+    /// The live counter row a rebuild row becomes, with its value.
+    pub(super) live: Option<(ByteView, ByteView)>,
+    pub(super) remove: bool,
+    /// The group whose counter row changed.
+    pub(super) group: Option<Ulid>,
+}
+
+/// Decides the fate of row `key`; `kept` tells whether a live row has its rebuild row.
+pub(super) fn swap_row(
+    key: &ByteView,
+    value: &[u8],
+    kept: impl FnOnce() -> Result<bool, StorageError>,
+) -> Result<Swap, StorageError> {
+    let failed = |message: String| StorageError::WriteError(message);
+    let mut swap = Swap {
+        live: None,
+        remove: false,
+        group: None,
+    };
+    let key = key.as_ref();
+    if key == USAGE_COMPLETE_KEY {
+        return Ok(swap);
+    }
+    if key == USAGE_REBUILD_KEY || key == USAGE_PROGRESS_KEY {
+        swap.remove = true;
+    } else if let Some(live) = key.strip_prefix(USAGE_SHADOW_PREFIX) {
+        let row = ShadowCounters::from_bytes(value).map_err(|error| failed(error.to_string()))?;
+        let (live_value, shortfalls) = row.live_row().map_err(|error| failed(error.to_string()))?;
+        warn_clamped(live, shortfalls);
+        swap.group = counter_group(live);
+        swap.live = Some((ByteView::from(live), ByteView::from(live_value)));
+        swap.remove = true;
+    } else if !kept()? {
+        // A counter row the rebuild did not produce is stale.
+        swap.group = counter_group(key);
+        swap.remove = true;
+    }
+    Ok(swap)
+}
+
+impl FjallStorage {
     /// Answers a view that reads source rows as the rebuild began. A rebuild already running,
     /// also one begun before a restart, resumes with its rows and kept values.
     #[tracing::instrument(name = "storage.begin_usage_rebuild", level = "debug", skip(self))]
@@ -135,24 +200,9 @@ impl FjallStorage {
                 None => break,
             }
         }
-        let seed = ShadowCounters::Usage(UsageDelta::default()).to_bytes();
-        let seed = seed.map_err(|error| StorageError::WriteError(error.to_string()))?;
-        for shard in global_shard_keys() {
-            let row = ByteView::from(usage_shadow_key(&shard));
-            tx.insert(keyspace.clone(), row, ByteView::from(seed.as_slice()));
+        for (row, value) in rebuild_seed()? {
+            tx.insert(keyspace.clone(), row, value);
         }
-        let progress = RebuildProgress::new(Ulid::generate()).to_bytes();
-        let progress = progress.map_err(|error| StorageError::WriteError(error.to_string()))?;
-        tx.insert(
-            keyspace.clone(),
-            ByteView::from(USAGE_PROGRESS_KEY),
-            ByteView::from(progress),
-        );
-        tx.insert(
-            keyspace,
-            ByteView::from(USAGE_REBUILD_KEY),
-            ByteView::from(&[][..]),
-        );
         self.commit_buffered(tx)?;
         self.persist_journal()
     }
@@ -185,7 +235,6 @@ impl FjallStorage {
         let keyspace = self.store.resolve_keyspace(key_space)?;
         let snapshot = self.store.db.read_tx();
         let mut tx = self.buffered_write_tx()?;
-        let failed = |message: String| StorageError::WriteError(message);
         let mut entries = Vec::new();
         let mut groups = BTreeSet::new();
         let mut start = None;
@@ -193,32 +242,20 @@ impl FjallStorage {
             let (values, next) =
                 iterate_page(&snapshot, &keyspace, None, start.as_ref(), REBUILD_PAGE)?;
             for (key, value) in values {
-                if key.as_ref() == USAGE_COMPLETE_KEY {
-                    continue;
-                }
-                if key.as_ref() == USAGE_REBUILD_KEY || key.as_ref() == USAGE_PROGRESS_KEY {
-                    tx.remove(keyspace.clone(), key);
-                } else if let Some(live) = key.as_ref().strip_prefix(USAGE_SHADOW_PREFIX) {
-                    let row = ShadowCounters::from_bytes(value.as_ref())
-                        .map_err(|error| failed(error.to_string()))?;
-                    let (live_value, shortfalls) =
-                        row.live_row().map_err(|error| failed(error.to_string()))?;
-                    warn_clamped(live, shortfalls);
-                    groups.extend(counter_group(live));
-                    let live = ByteView::from(live);
-                    tx.insert(keyspace.clone(), live.clone(), ByteView::from(live_value));
-                    tx.remove(keyspace.clone(), key);
-                    entries.push((key_space.to_string(), live));
-                } else {
+                let kept = || {
                     let shadow = usage_shadow_key(key.as_ref());
-                    let kept = snapshot
-                        .get(&keyspace, &shadow)
-                        .map_err(|error| StorageError::ReadError(error.to_string()))?;
-                    // A counter row the rebuild did not produce is stale.
-                    if kept.is_none() {
-                        groups.extend(counter_group(key.as_ref()));
-                        tx.remove(keyspace.clone(), key);
-                    }
+                    let kept = snapshot.get(&keyspace, &shadow);
+                    let kept = kept.map_err(|error| StorageError::ReadError(error.to_string()));
+                    Ok(kept?.is_some())
+                };
+                let swap = swap_row(&key, value.as_ref(), kept)?;
+                groups.extend(swap.group);
+                if let Some((live, live_value)) = swap.live {
+                    tx.insert(keyspace.clone(), live.clone(), live_value);
+                    entries.push((key_space.to_string(), live));
+                }
+                if swap.remove {
+                    tx.remove(keyspace.clone(), key);
                 }
             }
             match next {
@@ -246,7 +283,7 @@ impl FjallStorage {
 }
 
 /// The group of a `group/<id>` counter row.
-fn counter_group(key: &[u8]) -> Option<Ulid> {
+pub(super) fn counter_group(key: &[u8]) -> Option<Ulid> {
     let id = key.strip_prefix(b"group/")?;
     Some(Ulid::from_bytes(id.try_into().ok()?))
 }

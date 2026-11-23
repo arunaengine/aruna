@@ -392,7 +392,7 @@ fn read_keyspace(
     }
 }
 
-fn page_event(page: Result<PageResult, StorageError>) -> StorageEvent {
+pub(super) fn page_event(page: Result<PageResult, StorageError>) -> StorageEvent {
     match page {
         Ok((values, next_start_after)) => StorageEvent::IterResult {
             values,

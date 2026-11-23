@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ops::Bound::{Excluded, Included, Unbounded};
+use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -41,6 +41,8 @@ pub(super) enum Txn {
     Write(Arc<fjall::OptimisticWriteTx>),
 }
 type PageResult = (Vec<(ByteView, ByteView)>, Option<ByteView>);
+/// The lower and upper key bound of a scan.
+pub(super) type KeyBounds = (Bound<Vec<u8>>, Bound<Vec<u8>>);
 /// A read and the transaction it reads in.
 pub(super) type PoolItem = (EffectHandle, Option<Txn>);
 /// One queue per read pool, so a slow read holds one thread, never the reads behind it.
@@ -1297,50 +1299,37 @@ pub(super) fn iterate_page<R: Readable>(
     start: Option<&IterStart>,
     limit: usize,
 ) -> Result<PageResult, StorageError> {
-    let prefix_bytes = prefix.map(|p| p.as_ref().to_vec());
-    let start_bound = start.map(|start| match start {
+    let rows = reader.range(keyspace, page_bounds(prefix, start));
+    collect_page(rows.map(guard_row), limit)
+}
+
+/// The key bounds of a page under `prefix` from `start`; a start below the prefix begins at it.
+pub(super) fn page_bounds(prefix: Option<&ByteView>, start: Option<&IterStart>) -> KeyBounds {
+    let start = start.map(|start| match start {
         IterStart::After(key) => Excluded(key.as_ref().to_vec()),
         IterStart::At(key) => Included(key.as_ref().to_vec()),
     });
-
-    let iter = match (prefix_bytes.as_ref(), start_bound) {
-        (Some(prefix), Some(start_bound)) => {
-            let start_bound = match start_bound {
-                Excluded(key) | Included(key) if &key < prefix => Included(prefix.clone()),
-                bound => bound,
-            };
-
-            match prefix_upper_bound(prefix) {
-                Some(end) => reader.range(keyspace, (start_bound, Excluded(end))),
-                None => reader.range(keyspace, (start_bound, Unbounded::<Vec<u8>>)),
-            }
-        }
-        (Some(prefix), None) => match prefix_upper_bound(prefix) {
-            Some(end) => reader.range(keyspace, (Included(prefix.clone()), Excluded(end))),
-            None => reader.range(keyspace, (Included(prefix.clone()), Unbounded::<Vec<u8>>)),
-        },
-        (None, Some(start_bound)) => reader.range(keyspace, (start_bound, Unbounded::<Vec<u8>>)),
-        (None, None) => reader.iter(keyspace),
+    let Some(prefix) = prefix.map(|prefix| prefix.as_ref().to_vec()) else {
+        return (start.unwrap_or(Unbounded), Unbounded);
     };
-
-    collect_page(iter, limit)
+    let end = prefix_upper_bound(&prefix).map_or(Unbounded, Excluded);
+    let start = match start {
+        Some(Excluded(key) | Included(key)) if key < prefix => Included(prefix),
+        Some(bound) => bound,
+        None => Included(prefix),
+    };
+    (start, end)
 }
 
-/// Reads one bounded page of `[start, end]`; only this interval joins a transaction's read set.
-pub(super) fn range_page<R: Readable>(
-    reader: &R,
-    keyspace: &OptimisticTxKeyspace,
-    start: &IterStart,
-    end: &IterEnd,
-    (limit, max_bytes): (usize, usize),
-) -> Result<PageResult, StorageError> {
+/// The key bounds of `[start, end]`, or `None` when the interval holds no key.
+pub(super) fn range_bounds(start: &IterStart, end: &IterEnd) -> Option<KeyBounds> {
     let (from, to) = (start.key().as_ref(), end.key().as_ref());
     let empty = match (start, end) {
         (IterStart::At(_), IterEnd::Through(_)) => from > to,
         _ => from >= to,
     };
-    if empty || limit == 0 {
-        return Ok((Vec::new(), None));
+    if empty {
+        return None;
     }
     let lower = match start {
         IterStart::After(key) => Excluded(key.as_ref().to_vec()),
@@ -1350,39 +1339,59 @@ pub(super) fn range_page<R: Readable>(
         IterEnd::Before(key) => Excluded(key.as_ref().to_vec()),
         IterEnd::Through(key) => Included(key.as_ref().to_vec()),
     };
-    let mut iter = reader.range(keyspace, (lower, upper)).peekable();
+    Some((lower, upper))
+}
+
+/// Reads one bounded page of `[start, end]`; only this interval joins a transaction's read set.
+pub(super) fn range_page<R: Readable>(
+    reader: &R,
+    keyspace: &OptimisticTxKeyspace,
+    start: &IterStart,
+    end: &IterEnd,
+    budget: (usize, usize),
+) -> Result<PageResult, StorageError> {
+    match range_bounds(start, end).filter(|_| budget.0 > 0) {
+        Some(bounds) => budget_page(reader.range(keyspace, bounds).map(guard_row), budget),
+        None => Ok((Vec::new(), None)),
+    }
+}
+
+/// Takes at most `limit` rows and, after the first, at most `max_bytes` of keys and values.
+pub(super) fn budget_page(
+    rows: impl Iterator<Item = Result<(ByteView, ByteView), StorageError>>,
+    (limit, max_bytes): (usize, usize),
+) -> Result<PageResult, StorageError> {
+    let mut rows = rows.peekable();
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
     let mut bytes = 0usize;
-    while let Some(guard) = iter.next() {
-        let (key, value) = guard
-            .into_inner()
-            .map_err(|error| StorageError::ReadError(error.to_string()))?;
+    while let Some(row) = rows.next() {
+        let (key, value) = row?;
         bytes = bytes.saturating_add(key.len() + value.len());
         if !values.is_empty() && bytes > max_bytes {
             let last = values.last().map(|(key, _)| key.clone());
             return Ok((values, last));
         }
-        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
+        values.push((key, value));
         if values.len() == limit || bytes >= max_bytes {
-            let last = iter.peek().and(values.last().map(|(key, _)| key.clone()));
+            let last = rows.peek().and(values.last().map(|(key, _)| key.clone()));
             return Ok((values, last));
         }
     }
     Ok((values, None))
 }
 
-pub(super) fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult, StorageError> {
-    let mut iter = iter.peekable();
+pub(super) fn collect_page(
+    rows: impl Iterator<Item = Result<(ByteView, ByteView), StorageError>>,
+    limit: usize,
+) -> Result<PageResult, StorageError> {
+    let mut rows = rows.peekable();
     let mut values: Vec<(ByteView, ByteView)> = Vec::with_capacity(limit.min(1024));
 
-    while let Some(guard) = iter.next() {
-        let (key, value) = guard
-            .into_inner()
-            .map_err(|error| StorageError::ReadError(error.to_string()))?;
-        values.push((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())));
+    while let Some(row) = rows.next() {
+        values.push(row?);
 
         if values.len() == limit {
-            let next_start_after = if iter.peek().is_some() {
+            let next_start_after = if rows.peek().is_some() {
                 values.last().map(|(k, _)| k.clone())
             } else {
                 None
@@ -1392,4 +1401,11 @@ pub(super) fn collect_page(iter: fjall::Iter, limit: usize) -> Result<PageResult
     }
 
     Ok((values, None))
+}
+
+fn guard_row(guard: fjall::Guard) -> Result<(ByteView, ByteView), StorageError> {
+    let (key, value) = guard
+        .into_inner()
+        .map_err(|error| StorageError::ReadError(error.to_string()))?;
+    Ok((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())))
 }
