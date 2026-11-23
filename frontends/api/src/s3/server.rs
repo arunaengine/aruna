@@ -1841,23 +1841,35 @@ mod tests {
     const CHUNK_BYTES: usize = 64 * 1024;
     const CHUNK_COUNT: usize = 12;
 
-    /// Accepts any object and reads its whole body before it answers.
-    struct SlowS3;
+    /// The upload id, part number and body bytes one part upload delivered.
+    type PartSeen = (String, i32, usize);
+
+    /// Accepts any part upload, reads its whole body and records what arrived.
+    struct SlowS3 {
+        seen: Arc<std::sync::Mutex<Option<PartSeen>>>,
+    }
 
     #[async_trait::async_trait]
     impl s3s::S3 for SlowS3 {
-        async fn put_object(
+        async fn upload_part(
             &self,
-            request: s3s::S3Request<s3s::dto::PutObjectInput>,
-        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::PutObjectOutput>> {
+            request: s3s::S3Request<s3s::dto::UploadPartInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::UploadPartOutput>> {
             use futures_util::StreamExt;
-            let mut body = request.input.body.unwrap();
+            let input = request.input;
             let mut received = 0;
-            while let Some(chunk) = body.next().await {
-                received += chunk.unwrap().len();
+            if let Some(mut body) = input.body {
+                while let Some(chunk) = body.next().await {
+                    received += chunk.map_err(|_| s3s::s3_error!(IncompleteBody))?.len();
+                }
             }
-            assert_eq!(received, CHUNK_BYTES * CHUNK_COUNT);
-            Ok(s3s::S3Response::new(Default::default()))
+            *self.seen.lock().expect("seen lock") =
+                Some((input.upload_id, input.part_number, received));
+            let output = s3s::dto::UploadPartOutput {
+                e_tag: Some(s3s::dto::ETag::Strong("slow-part".to_string())),
+                ..Default::default()
+            };
+            Ok(s3s::S3Response::new(output))
         }
     }
 
@@ -1890,8 +1902,9 @@ mod tests {
             aruna_storage::storage::memory::MemoryStorage::open(),
         ));
         let watch = Arc::new(ConnectionActivity::with_idle(timeouts.connection_idle));
+        let seen = Arc::new(std::sync::Mutex::new(None));
         let service = WrappingService {
-            shared: S3ServiceBuilder::new(SlowS3).build(),
+            shared: S3ServiceBuilder::new(SlowS3 { seen: seen.clone() }).build(),
             cors: CorsConfig::default(),
             domain: "localhost".to_string(),
             driver_ctx,
@@ -1936,14 +1949,27 @@ mod tests {
         let body: s3s::stream::DynByteStream = Box::pin(ChannelChunks(chunks));
         let request = Request::builder()
             .method(Method::PUT)
-            .uri("/slow-part/slow.bin")
+            .uri("/slow-part/slow.bin?uploadId=upload-1&partNumber=1")
             .header(header::HOST, "localhost")
             .header(header::CONTENT_LENGTH, CHUNK_BYTES * CHUNK_COUNT)
             .body(s3s::Body::from(body))
             .unwrap();
-        let response = sender.send_request(request).await.expect("put answered");
+        let response = sender.send_request(request).await.expect("part answered");
 
         assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ETAG)
+                .map(|value| value.as_bytes()),
+            Some(&b"\"slow-part\""[..])
+        );
+        let part = seen.lock().expect("seen lock").clone();
+        assert_eq!(
+            part,
+            Some(("upload-1".to_string(), 1, CHUNK_BYTES * CHUNK_COUNT)),
+            "the part upload must receive its id, number and every streamed byte"
+        );
         feeder.await.expect("feeder finishes");
         drop(sender);
         client.abort();

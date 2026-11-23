@@ -35,9 +35,9 @@ where
         .map(ToOwned::to_owned)
 }
 
-/// Runs the S3 route steps on one complete seed; each step owns its group and bucket.
+/// Runs the bucket steps on one complete seed; each step owns its group and bucket.
 #[tokio::test]
-async fn shared_node_scenario() -> TestResult<()> {
+async fn bucket_lifecycle_scenario() -> TestResult<()> {
     let seed = spawn_complete_seed().await?;
     let result = async {
         run_step("head_bucket_state", head_bucket_state(&seed)).await?;
@@ -46,6 +46,18 @@ async fn shared_node_scenario() -> TestResult<()> {
             versioning_rejects_suspend(&seed),
         )
         .await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+/// Runs the object delete steps on one complete seed; each step owns its group and bucket.
+#[tokio::test]
+async fn object_delete_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
         run_step("delete_marks_keys", delete_marks_keys(&seed)).await?;
         run_step("quiet_delete_omits", quiet_delete_omits(&seed)).await?;
         run_step(
@@ -54,9 +66,33 @@ async fn shared_node_scenario() -> TestResult<()> {
         )
         .await?;
         run_step("delete_bad_version", delete_bad_version(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+/// Runs the version listing steps on one complete seed; each step owns its group and bucket.
+#[tokio::test]
+async fn version_listing_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
         run_step("versions_order_markers", versions_order_markers(&seed)).await?;
         run_step("versions_honor_prefix", versions_honor_prefix(&seed)).await?;
         run_step("versions_paginate_keys", versions_paginate_keys(&seed)).await?;
+        Ok(())
+    }
+    .await;
+    seed.shutdown().await;
+    result
+}
+
+/// Runs the multipart steps on one complete seed; each step owns its group and bucket.
+#[tokio::test]
+async fn multipart_upload_scenario() -> TestResult<()> {
+    let seed = spawn_complete_seed().await?;
+    let result = async {
         run_step("refresh_keeps_presigned", refresh_keeps_presigned(&seed)).await?;
         run_step(
             "multipart_listing_updates",

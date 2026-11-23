@@ -30,7 +30,9 @@ use aruna_core::types::{GroupId, Key, Value};
 use aruna_ops_data::metadata::local_query::LocalQueryOperation;
 use aruna_ops_data::metadata::text_search::LocalSearchOperation;
 use aruna_runner::driver::{DriverContext, drive};
+use aruna_storage::storage::handle::StorageHandle;
 use aruna_storage::storage::memory::MemoryStorage;
+use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;
 use ulid::Ulid;
 
@@ -39,15 +41,30 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 const REALM: RealmId = RealmId([9u8; 32]);
 
 struct TestHarness {
+    _storage_dir: Option<TempDir>,
     _metadata_dir: TempDir,
-    storage: aruna_storage::storage::handle::StorageHandle,
+    storage: StorageHandle,
     context: DriverContext,
     group_id: GroupId,
 }
 
 async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, BoxError> {
+    open_harness(MemoryStorage::open(), None, backend_pool_size).await
+}
+
+/// Builds the harness on a real database, so the manual profile keeps comparable timings.
+async fn fjall_harness(pool_size: usize) -> Result<TestHarness, BoxError> {
+    let storage_dir = tempfile::tempdir()?;
+    let storage = FjallStorage::open(storage_dir.path().to_str().ok_or("invalid storage path")?)?;
+    open_harness(storage, Some(storage_dir), Some(pool_size)).await
+}
+
+async fn open_harness(
+    storage: StorageHandle,
+    storage_dir: Option<TempDir>,
+    backend_pool_size: Option<usize>,
+) -> Result<TestHarness, BoxError> {
     let metadata_dir = tempfile::tempdir()?;
-    let storage = MemoryStorage::open();
     let node_id = iroh::SecretKey::from_bytes(&[9u8; 32]).public();
     let mut options = aruna_rdf_graph::GraphOptions::default()
         .with_search_storage(aruna_rdf_graph::MetadataSearchStorage::Memory);
@@ -112,6 +129,7 @@ async fn build_harness(backend_pool_size: Option<usize>) -> Result<TestHarness, 
         }
     }
     Ok(TestHarness {
+        _storage_dir: storage_dir,
         _metadata_dir: metadata_dir,
         context: DriverContext {
             storage_handle: storage.clone(),
@@ -810,7 +828,7 @@ async fn concurrent_mutation_profile() -> Result<(), BoxError> {
     init_logging();
     // Pool sized like a typical 8-core cluster node so mutation pressure on
     // the permit pools is visible regardless of the host's core count.
-    let harness = Arc::new(build_harness(Some(8)).await?);
+    let harness = Arc::new(fjall_harness(8).await?);
     let real_graphs = 16usize;
     let synthetic_records = 20_000usize;
     let concurrency = 8usize;

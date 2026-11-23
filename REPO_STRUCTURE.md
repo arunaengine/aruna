@@ -227,8 +227,10 @@ The guard also enforces the layer order derived from each crate's top-level fold
 
 - `just test-fast` runs the library tests of `aruna-core` and the three
   `aruna-ops-*` crates with the `fast` nextest profile.
-- Operation tests in `domain/ops-*` and route tests in `frontends/api` run on
+- Most operation tests in `domain/ops-*` and route tests in `frontends/api` run on
   `MemoryStorage::open()` (`runtime/storage/src/storage/memory.rs`), with no disk.
+  Tests of durability, reopen, readiness, backup, filesystem and blob fixtures, and
+  manual timing profiles still use `FjallStorage` in temporary folders.
 - Runtime, storage and multi-node behavior of the node lives in one test binary,
   `apps/node/tests/regimes.rs`. It groups the tests into seven modules:
   `identity_regime`, `storage_regime`, `federation_regime`, `metadata_regime`,

@@ -28,9 +28,12 @@ revision. The same commands are available locally: `just check` compiles every
 supported feature selection, and `just test` runs the nextest and doctest
 commands (it requires `cargo-nextest`).
 
-Each crate builds its `tests/` files as modules of one `integration` test binary.
-Run them with nextest, which starts every test in its own process; select one file
-with `-E 'test(/^<file>::/)'`.
+A crate with several `tests/` files builds them as modules of one test binary,
+named `integration` in most crates. The node crate `apps/node` builds them into
+the `regimes` binary, grouped under seven regime modules. Run them with nextest,
+which starts every test in its own process; select one file with
+`-E 'test(/^<file>::/)'`, and in `apps/node` add the regime prefix, for example
+`cargo nextest run -p aruna --test regimes -E 'test(/^storage_regime::s3_operations::/)'`.
 
 All required PR checks must pass before merge. A failed, partial, or earlier
 run is not a pass; rerun affected checks after corrections. Use the pinned
@@ -48,7 +51,7 @@ keeping a local copy. The root policy is the single owner of the folder
 threshold, the shared-prefix exception, term limits, and hoisting.
 
 - **Behavior homes.** Bucket, object, multipart, and access operations belong
-  under `domain/ops-work/src/s3/<family>/`; routes under
+  under `domain/ops-data/src/s3/<family>/`; routes under
   `frontends/api/src/routes/{execution,access,storage}/`; records under
   `domain/core/src/structs/{placement,identity,storage,execution}/`; effect adapters
   under `runtime/runner/src/effect_adapters/`. See

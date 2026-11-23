@@ -659,6 +659,7 @@ mod tests {
     use aruna_ops_identity::shard::recovery::RecoveryError;
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::memory::MemoryStorage;
+    use aruna_storage::storage::worker::FjallStorage;
     use axum::body::{Body, to_bytes};
     use byteview::ByteView;
     use http::Request;
@@ -676,10 +677,8 @@ mod tests {
         })
     }
 
-    fn fjall_ctx() -> (tempfile::TempDir, Arc<DriverContext>) {
-        let temp = tempfile::tempdir().unwrap();
-        let storage = MemoryStorage::open();
-        (temp, ctx_with_storage(storage))
+    fn memory_ctx() -> Arc<DriverContext> {
+        ctx_with_storage(MemoryStorage::open())
     }
 
     async fn request(router: &Router, path: &str) -> (StatusCode, String) {
@@ -735,7 +734,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_ok_live() {
-        let (_temp, ctx) = fjall_ctx();
+        let ctx = memory_ctx();
         let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), Readiness::new());
         let (status, body) = request(&router(ops), "/healthz").await;
         assert_eq!(status, StatusCode::OK);
@@ -767,7 +766,10 @@ mod tests {
 
     #[tokio::test]
     async fn readyz_gates_startup() {
-        let (_temp, ctx) = fjall_ctx();
+        // A real database, so the storage check runs its write probe.
+        let temp = tempfile::tempdir().unwrap();
+        let storage = FjallStorage::open(temp.path().to_str().unwrap()).unwrap();
+        let ctx = ctx_with_storage(storage);
         let readiness = Readiness::new();
         let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), readiness.clone());
         let router = router(ops);
@@ -812,7 +814,7 @@ mod tests {
     // Degraded recovery is reported in the body, never as a 503.
     #[tokio::test]
     async fn readyz_reports_recovery() {
-        let (_temp, ctx) = fjall_ctx();
+        let ctx = memory_ctx();
         let readiness = Readiness::new();
         readiness.set_ready();
         let recovery = RecoveryStatus::new();
@@ -844,7 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_expose_recovery() {
-        let (_temp, ctx) = fjall_ctx();
+        let ctx = memory_ctx();
         let recovery = RecoveryStatus::new();
         recovery.note_progress(2, 1_000);
         recovery.finish_pass(
@@ -888,7 +890,7 @@ mod tests {
     // without a net handle still answers liveness without peer/cooldown state.
     #[tokio::test]
     async fn probes_ignore_peers() {
-        let (_temp, ctx) = fjall_ctx();
+        let ctx = memory_ctx();
         assert!(ctx.net_handle.is_none());
         let readiness = Readiness::new();
         readiness.set_ready();
@@ -924,7 +926,7 @@ mod tests {
 
     #[tokio::test]
     async fn readyz_reports_draining() {
-        let (_temp, ctx) = fjall_ctx();
+        let ctx = memory_ctx();
         let readiness = Readiness::new();
         readiness.set_ready();
         let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), readiness.clone());
@@ -1098,7 +1100,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_expose_storage() {
-        let (_temp, ctx) = fjall_ctx();
+        let ctx = memory_ctx();
         let ops = MonitoringState::new(ctx, Arc::new(NodeMetrics::new()), Readiness::new());
         let response = router(ops)
             .oneshot(

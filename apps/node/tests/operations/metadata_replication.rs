@@ -69,7 +69,7 @@ use ulid::Ulid;
 use crate::convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
-use crate::topology::{TestNode, spawn_replica, spawn_replica_with, wait_node_convergence};
+use crate::topology::{TestNode, spawn_replica, spawn_replica_with};
 use convergence::wait_for_convergence;
 
 /// How long a write that loses commit races to background work is tried again: a hang cap.
@@ -1217,7 +1217,7 @@ async fn build_realm_nodes(
     for _ in 0..count {
         nodes.push(spawn_replica(*realm_id, true, true).await?);
     }
-    let config = finish_realm_setup(&nodes, realm_id).await?;
+    let config = finish_realm_setup(&nodes, realm_id, &[]).await?;
     Ok((nodes, config))
 }
 
@@ -1234,31 +1234,43 @@ async fn build_pinned_realm(
             spawn_replica_with(*realm_id, Some(secret), true, true, start_tasks[index]).await?,
         );
     }
-    let config = finish_realm_setup(&nodes, realm_id).await?;
+    let hand_driven: Vec<&TestNode> = nodes
+        .iter()
+        .zip(start_tasks)
+        .filter(|(_, started)| !**started)
+        .map(|(node, _)| node)
+        .collect();
+    let config = finish_realm_setup(&nodes, realm_id, &hand_driven).await?;
     Ok((nodes, config))
 }
 
 // A hand-driven node runs no presence timer, so the polls of its tests renew its realm presence,
 // which expires after REALM_PRESENCE_TTL.
 async fn renew_presence(node: Option<&TestNode>) {
-    let Some(node) = node else {
-        return;
-    };
+    if let Some(node) = node {
+        let _ = announce_once(node).await;
+    }
+}
+
+/// Announces the realm presence of a hand-driven node once, without a refresh timer.
+async fn announce_once(node: &TestNode) -> Result<(), Box<dyn std::error::Error>> {
     let config = AnnouncePresenceConfig {
         realm_id: *node.net.realm_id(),
         node_id: node.net.node_id(),
         schedule_refresh: false,
     };
-    let _ = drive(
+    drive(
         AnnouncePresenceOperation::new(config),
         node.context.as_ref(),
     )
-    .await;
+    .await?;
+    Ok(())
 }
 
 async fn finish_realm_setup(
     nodes: &[TestNode],
     realm_id: &RealmId,
+    hand_driven: &[&TestNode],
 ) -> Result<RealmConfigDocument, Box<dyn std::error::Error>> {
     mesh(nodes.iter().map(|node| &node.net)).await;
 
@@ -1274,7 +1286,25 @@ async fn finish_realm_setup(
         .await?;
     }
 
-    wait_node_convergence(nodes, realm_id).await?;
+    // The wait may outlast the presence TTL, so each poll renews the hand-driven presence.
+    let expected: HashSet<_> = nodes.iter().map(|node| node.net.node_id()).collect();
+    wait_for_convergence::<_, _, Box<dyn std::error::Error>>(
+        "realm nodes did not converge",
+        || async {
+            for node in hand_driven {
+                announce_once(node).await?;
+            }
+            let mut pending = 0;
+            for node in nodes {
+                match drive(GetNodesOperation::new(*realm_id), node.context.as_ref()).await {
+                    Ok(realm_nodes) if realm_nodes == expected => {}
+                    _ => pending += 1,
+                }
+            }
+            Ok(pending)
+        },
+    )
+    .await?;
     install_realm_config(nodes, realm_id).await
 }
 
