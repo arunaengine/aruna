@@ -5,9 +5,9 @@
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_ops_work::shard::recovery::RecoveryError;
-use aruna_ops_work::shard::recovery::RecoveryStop;
-use aruna_ops_work::shard::restore::plan::ShardRestoreCursor;
+use aruna_ops_identity::shard::recovery::RecoveryError;
+use aruna_ops_identity::shard::recovery::RecoveryStop;
+use aruna_ops_identity::shard::restore::plan::ShardRestoreCursor;
 use aruna_ops_work::tests::shard::flat_config;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,13 +21,13 @@ use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementStrategy};
 use aruna_core::user::id::UserId;
+use aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation;
+use aruna_ops_identity::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
+use aruna_ops_identity::shard::restore::*;
 use aruna_ops_work::node::recovery_run::{
     PresencePhaseOperation, RECOVERY_RETRY_BASE, RECOVERY_RETRY_MAX, RecoveryConfig,
     RecoveryOperation,
 };
-use aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation;
-use aruna_ops_work::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
-use aruna_ops_work::shard::restore::*;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::NetConfig;
 use aruna_runner::driver::{DriverContext, drive};

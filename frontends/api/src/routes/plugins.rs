@@ -8,7 +8,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::plugins::{MAX_ARTIFACT, MemoryPermit, PublishedPlugin};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_work::plugins::artifacts::ArtifactError;
 use aruna_ops_work::plugins::copies::ReserveMemory;
 use aruna_ops_work::plugins::publish::{EntryError, PublishError, PublishPlugin};
@@ -217,7 +217,7 @@ pub async fn list_plugins(
     )
     .await
     .map_err(|error| match error {
-        aruna_ops_work::document_repository::GetConfigError::DocumentNotFound => {
+        aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),

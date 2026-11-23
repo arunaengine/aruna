@@ -14,20 +14,20 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmId};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::bearer_token::{
+use aruna_ops_identity::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
 };
-use aruna_ops_work::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-use aruna_ops_work::auth::error::ArunaBearerError;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::node::api_state::LoadStateOperation;
-use aruna_ops_work::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
-use aruna_ops_work::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
-use aruna_ops_work::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_ops_work::realm::claim_admin::{
+use aruna_ops_identity::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_ops_identity::auth::error::ArunaBearerError;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+use aruna_ops_identity::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
+use aruna_ops_identity::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
+use aruna_ops_identity::realm::claim_admin::{
     ClaimInitialError, ClaimInitialInput, ClaimInitialOperation, ClaimInitialResult,
 };
-use aruna_ops_work::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
+use aruna_ops_identity::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
+use aruna_ops_work::node::api_state::LoadStateOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use jsonwebtoken::dangerous::insecure_decode;
@@ -515,11 +515,11 @@ mod tests {
     use aruna_core::structs::identity::user::User;
     use aruna_core::testing::EnvGuard;
     use aruna_core::user::id::UserId;
-    use aruna_ops_work::realm::announce_presence::{
+    use aruna_ops_identity::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
-    use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};

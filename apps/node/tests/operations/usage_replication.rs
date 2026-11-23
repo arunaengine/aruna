@@ -16,12 +16,10 @@ use aruna_core::structs::storage::usage::{
     DIRTY_GLOBAL_KEY, NodeUsageSnapshot, UsageCounters, global_group_key, usage_global_key,
     usage_group_key,
 };
-use aruna_ops_work::node::usage_publish::{
-    PublishUsageOperation, PublishedUsage, UsagePublishError,
-};
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
-use aruna_ops_work::sync::replicate_documents::{
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
+use aruna_ops_data::usage_publish::{PublishUsageOperation, PublishedUsage, UsagePublishError};
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
 use aruna_runner::driver::{DriverContext, drive};
@@ -410,7 +408,7 @@ async fn install_realm_config(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
 
     Ok(())

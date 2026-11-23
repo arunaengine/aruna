@@ -591,7 +591,7 @@ mod tests {
     }
 
     fn operation(spec: SubmitJobSpec) -> SubmitJobOperation {
-        let job_id = crate::testing::fresh_job_id(
+        let job_id = aruna_ops_identity::testing::fresh_job_id(
             PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
             BucketId::new(0).unwrap(),
         )

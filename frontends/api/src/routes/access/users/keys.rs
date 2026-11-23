@@ -16,7 +16,7 @@ use aruna_core::structs::identity::user::vault::{
     KEY_ID_BYTES, UserKeyRecord, VaultAppended, VaultChange, VaultRecords,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::s3::holder_seal::SealPublishedOperation;
+use aruna_ops_data::s3::holder_seal::SealPublishedOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

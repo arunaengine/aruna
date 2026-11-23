@@ -19,12 +19,12 @@ use crate::server::state::ServerState;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_ops_work::git::GitError;
-use aruna_ops_work::metadata::api::export_types::GetVisibleRequest;
-use aruna_ops_work::metadata::api::path::LookupPathOperation;
-use aruna_ops_work::metadata::api::path_types::MetadataLookupRequest;
-use aruna_ops_work::metadata::forward::routed::read::RoutedReadOperation;
-use aruna_ops_work::metadata::forward::routed::write::RouteDeleteOperation;
+use aruna_ops_data::git::GitError;
+use aruna_ops_data::metadata::api::export_types::GetVisibleRequest;
+use aruna_ops_data::metadata::api::path::LookupPathOperation;
+use aruna_ops_data::metadata::api::path_types::MetadataLookupRequest;
+use aruna_ops_data::metadata::forward::routed::read::RoutedReadOperation;
+use aruna_ops_data::metadata::forward::routed::write::RouteDeleteOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -183,7 +183,7 @@ pub async fn create_metadata_document(
         ),
     };
     let resolved = drive(
-        aruna_ops_work::git::location::resolve(state.get_ctx().node_id(), &auth, group_id, chosen),
+        aruna_ops_data::git::location::resolve(state.get_ctx().node_id(), &auth, group_id, chosen),
         &state.get_ctx(),
     )
     .await
@@ -201,7 +201,7 @@ pub async fn create_metadata_document(
     )
     .await?;
     drive(
-        aruna_ops_work::git::location::establish(
+        aruna_ops_data::git::location::establish(
             state.get_ctx().node_id(),
             &auth,
             &result,

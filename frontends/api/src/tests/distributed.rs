@@ -35,7 +35,7 @@ use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::distribution::inventory::open_ranges;
+use aruna_ops_data::distribution::inventory::open_ranges;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
@@ -178,7 +178,7 @@ pub(crate) async fn node_state() -> Node {
 pub(crate) async fn hidden_link(node: &Node, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_ops_work::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_ops_data::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let target = LinkTarget {
         arn: VersionedObjectArn {
             realm_id: node.owner.realm_id,

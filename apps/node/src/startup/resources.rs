@@ -15,14 +15,14 @@ use aruna_core::egress::EgressPolicy;
 use aruna_core::id::NodeId;
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_ops_work::groups::deletion::coordinator::InstallOnboardingOperation;
-use aruna_ops_work::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
-use aruna_ops_work::metadata::provenance::export::ForgetSpoolOperation;
+use aruna_ops_data::metadata::projection::{DEFAULT_SKEW_MS, store_clock_skew};
+use aruna_ops_data::metadata::provenance::export::ForgetSpoolOperation;
+use aruna_ops_data::s3::usage_rebuild::RebuildStatsOperation;
+use aruna_ops_data::transfer::sharding::begin_range_rebuilds;
+use aruna_ops_data::usage_publish::PublishUsageOperation;
+use aruna_ops_identity::groups::deletion::coordinator::InstallOnboardingOperation;
+use aruna_ops_identity::shard::recovery::RecoveryStatus;
 use aruna_ops_work::node::counter_check::CounterCheckOperation;
-use aruna_ops_work::node::usage_publish::PublishUsageOperation;
-use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
-use aruna_ops_work::shard::recovery::RecoveryStatus;
-use aruna_ops_work::transfer::sharding::begin_range_rebuilds;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::NetConfig;
 use aruna_rdf_graph::{GraphHandle, GraphOptions};
@@ -644,8 +644,8 @@ async fn open_managed_keys(
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use aruna_clock::unix_timestamp_millis;
+    use aruna_ops_data::s3::bucket::key::startup::OpenManagedOperation;
     use aruna_ops_work::jobs::key_wake::WakeUnlockedOperation;
-    use aruna_ops_work::s3::bucket::key::startup::OpenManagedOperation;
 
     let keys = drive(OpenManagedOperation::new(), driver_ctx).await?;
     for (key, reason) in &keys.failed {
@@ -686,9 +686,9 @@ async fn record_restart_locks(
     driver_ctx: &DriverContext,
     config: &Config,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use aruna_ops_work::s3::bucket::audit_retry::ResumeAuditOperation;
-    use aruna_ops_work::s3::bucket::key::restart::RestartScanOperation;
-    use aruna_ops_work::s3::restart_notice::RestartNoticeOperation;
+    use aruna_ops_data::s3::bucket::audit_retry::ResumeAuditOperation;
+    use aruna_ops_data::s3::bucket::key::restart::RestartScanOperation;
+    use aruna_ops_data::s3::restart_notice::RestartNoticeOperation;
 
     // Records kept by retry timers before the stop join the trail before it is read.
     match drive(ResumeAuditOperation::default(), driver_ctx).await {
@@ -794,7 +794,7 @@ mod tests {
     }
 
     async fn rebuild(driver_ctx: &DriverContext) {
-        use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
+        use aruna_ops_data::s3::usage_rebuild::RebuildStatsOperation;
         drive(RebuildStatsOperation::new(), driver_ctx)
             .await
             .expect("usage rebuild finishes");

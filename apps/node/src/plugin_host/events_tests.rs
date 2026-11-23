@@ -26,17 +26,17 @@ use aruna_core::structs::storage::replication_queue::ReplicationMode;
 use aruna_core::structs::sync_relationship::{
     SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
+use aruna_ops_data::replication::drain::ProcessBatchOperation;
+use aruna_ops_data::replication::page::deliver::MetadataPages;
+use aruna_ops_data::replication::queue::QueueBlobOperation;
+use aruna_ops_data::replication::sync_relationship::SyncRelationshipDirection::Outgoing;
+use aruna_ops_data::replication::sync_relationship::store::StoreRelationshipOperation;
 use aruna_ops_work::plugins::install::InstallCaller;
 use aruna_ops_work::plugins::lifecycle::{SetGrants, match_targets};
 use aruna_ops_work::plugins::matcher::MatchJournal;
 use aruna_ops_work::plugins::peer::AnswerPeer;
 use aruna_ops_work::plugins::replay::PlanReplays;
 use aruna_ops_work::plugins::runs::list_runs;
-use aruna_ops_work::replication::drain::ProcessBatchOperation;
-use aruna_ops_work::replication::page::deliver::MetadataPages;
-use aruna_ops_work::replication::queue::QueueBlobOperation;
-use aruna_ops_work::replication::sync_relationship::SyncRelationshipDirection::Outgoing;
-use aruna_ops_work::replication::sync_relationship::store::StoreRelationshipOperation;
 use aruna_runner::driver::{drive, node_routing};
 use aruna_test_harness::plugins::artifacts::{echoed_sync, install_artifact, installed};
 use aruna_test_harness::plugins::flows::events::{dataset, ran, sync_at};

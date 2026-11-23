@@ -48,7 +48,6 @@ aruna-core = { workspace = true, features = ["test-hooks"] }
 aruna-runner = { workspace = true, features = ["test-hooks"] }
 aruna-rdf-graph = { workspace = true }
 aruna-p2p = { workspace = true, features = ["test-hooks"] }
-aruna-ops-work = { workspace = true }
 aruna-ops-identity = { workspace = true, features = ["test-hooks"] }
 aruna-storage = { workspace = true, features = ["test-hooks"] }
 aruna-scheduler = { workspace = true }

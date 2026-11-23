@@ -34,7 +34,7 @@ GROUPS = (
         "data",
         frozenset(
             "s3 blob staging replication distribution transfer metadata git shares connectors device "
-            "holder_choice".split()
+            "holder_choice usage_publish".split()
         ),
     ),
     ("work and integrations", frozenset("jobs plugins assistant notifications federation harvest node".split())),
@@ -46,6 +46,8 @@ CRATE_TARGETS = {
     "aruna-api": (
         "aruna-core",
         "aruna-clock",
+        "aruna-ops-identity",
+        "aruna-ops-data",
         "aruna-ops-work",
         "aruna-runner",
         "aruna-wire",
@@ -57,6 +59,8 @@ CRATE_TARGETS = {
         "aruna-config",
         "aruna-storage",
         "aruna-blob",
+        "aruna-ops-identity",
+        "aruna-ops-data",
         "aruna-ops-work",
         "aruna-runner",
         "aruna-wire",
@@ -103,6 +107,8 @@ CRATE_TARGETS = {
         "aruna-blob",
         "aruna-rdf-graph",
         "aruna-p2p",
+        "aruna-ops-identity",
+        "aruna-ops-data",
         "aruna-ops-work",
         "aruna-runner",
         "aruna-egress",
@@ -132,6 +138,15 @@ BACKEND_DEV_TARGETS = {
     "aruna-p2p": ("aruna-storage",),
     "aruna-blob": ("aruna-storage",),
 }
+# Layers are the first directory of a workspace member. Domain crates reach only domain
+# crates; the operations crates reach only lower ones, in tests as well.
+LAYERS = ("domain", "runtime", "frontends", "apps", "plugins", "testing")
+OPS_ORDER = ("aruna-ops-identity", "aruna-ops-data", "aruna-ops-work")
+RUNTIME_FOUNDATIONS = frozenset({"aruna-core", "aruna-kpabe", "aruna-plugin-contract"})
+RUNTIME_EXTRAS = {"aruna-config": ("aruna-wire",)}
+FRONTEND_RUNTIME = frozenset({"aruna-clock", "aruna-runner"})
+API_SRC = "frontends/api/src/"
+RAW_EFFECT = re.compile(r"\b(?:Storage|Net|Blob)Effect::")
 TRIGGER_MATCHES = (
     ("apps/node/src/tasks/incoming/mod.rs", "TaskKey::"),
     ("apps/node/src/inbound.rs", "Alpn::"),
@@ -170,6 +185,7 @@ COUNTS = (
     ("test_sleeps", "real sleeps in tests without paused time"),
     ("silent_skips", "tests that print and return early"),
     ("duplicate_groups", "duplicate function bodies of six or more lines"),
+    ("api_raw_effects", "raw storage, net and blob effects in API production code"),
 )
 DUPLICATE_LINES = 6
 
@@ -736,8 +752,8 @@ def similar_names(sources):
     return rows
 
 
-def crate_manifests(root):
-    """Map each workspace crate name to its internal normal dependencies, for backends all of them."""
+def workspace_members(root):
+    """Map each workspace member directory to its manifest; also return the dependency renames."""
     with open(os.path.join(root, "Cargo.toml"), "rb") as handle:
         workspace = tomllib.load(handle).get("workspace", {})
     renames = {
@@ -749,6 +765,12 @@ def crate_manifests(root):
     for member in workspace.get("members", []):
         with open(os.path.join(root, member, "Cargo.toml"), "rb") as handle:
             manifests[member] = tomllib.load(handle)
+    return manifests, renames
+
+
+def crate_manifests(root):
+    """Map each workspace crate name to its internal normal dependencies, for backends all of them."""
+    manifests, renames = workspace_members(root)
     names = {data["package"]["name"] for data in manifests.values()}
     result = {}
     for data in manifests.values():
@@ -789,6 +811,77 @@ def crate_findings(root, allow):
     return outside_deps, unused
 
 
+def member_deps(data, renames, names):
+    """Internal normal dependencies with their optional flag, and internal dev-dependencies."""
+    normal, dev = {}, set()
+    for section in [data, *data.get("target", {}).values()]:
+        for kind in ("dependencies", "dev-dependencies"):
+            for key, value in section.get(kind, {}).items():
+                spec = value if isinstance(value, dict) else {}
+                name = spec.get("package", renames.get(key, key))
+                if name not in names:
+                    continue
+                if kind == "dev-dependencies":
+                    dev.add(name)
+                else:
+                    normal[name] = normal.get(name, True) and spec.get("optional", False)
+    return normal, dev
+
+
+def layer_rule(crate, layer, dep, dep_layer, optional, layers):
+    """Why the normal dependency crate -> dep breaks the layer order, or None."""
+    if dep_layer == "testing" and not optional and layer in ("apps", "domain", "runtime"):
+        return "testing crates are never a required dependency here"
+    if layer == "domain" and dep_layer != "domain":
+        return "domain crates depend only on domain crates"
+    if layer == "runtime":
+        allowed = dep in RUNTIME_FOUNDATIONS or dep_layer == "runtime" or dep in RUNTIME_EXTRAS.get(crate, ())
+        if not allowed:
+            return "runtime crates depend only on runtime crates and domain foundations"
+    if layer == "frontends":
+        if dep_layer == "apps":
+            return "frontends never depend on apps"
+        if dep_layer == "runtime" and dep not in FRONTEND_RUNTIME:
+            return "frontends reach the runtime only through the clock and the runner"
+        if dep_layer == "testing" and not optional:
+            return "frontends name test helpers only as an optional dependency"
+    return None
+
+
+def layer_findings(root):
+    """Dependencies that break the directory-derived layer order, and crates the table lacks."""
+    manifests, renames = workspace_members(root)
+    layers = {data["package"]["name"]: member.split("/")[0] for member, data in manifests.items()}
+    found = []
+    for member, data in sorted(manifests.items()):
+        crate = data["package"]["name"]
+        layer = layers[crate]
+        if layer not in LAYERS:
+            found.append(f"{crate}: {member} lies outside the layer directories")
+        if crate not in CRATE_TARGETS:
+            found.append(f"{crate}: missing from CRATE_TARGETS")
+        normal, dev = member_deps(data, renames, layers)
+        for dep, optional in sorted(normal.items()):
+            reason = layer_rule(crate, layer, dep, layers[dep], optional, layers)
+            if reason:
+                found.append(f"{crate} -> {dep}: {reason}")
+        if crate in OPS_ORDER:
+            higher = OPS_ORDER[OPS_ORDER.index(crate) + 1 :]
+            for dep in sorted((set(normal) | dev) & set(higher)):
+                found.append(f"{crate} -> {dep}: operations crates never reach a higher one")
+    return found
+
+
+def raw_effects(sources):
+    """Raw storage, net and blob effect paths in API production code; handlers use operations."""
+    return [
+        f"{source.rel}:{source.masked.count(chr(10), 0, hit.start()) + 1}"
+        for source in sources
+        if source.rel.startswith(API_SRC)
+        for hit in RAW_EFFECT.finditer(source.masked)
+    ]
+
+
 def measure(root):
     """Measure every count; returns (counts, details, async lines per module, operations, sources)."""
     sources = [load_source(root, rel) for rel in rust_files(root)]
@@ -808,6 +901,7 @@ def measure(root):
     details["operation_clocks"] = core_clocks(sources, OPERATIONS_SRCS)
     duplicates = duplicate_groups(sources)
     details["duplicate_groups"] = [" | ".join(group) for group in duplicates]
+    details["api_raw_effects"] = raw_effects(sources)
     for key in (
         "trigger_arms",
         "state_clones",
@@ -817,6 +911,7 @@ def measure(root):
         "core_clocks",
         "operation_clocks",
         "duplicate_groups",
+        "api_raw_effects",
     ):
         counts[key] = len(details[key])
     return counts, details, async_lines(ops), ops, sources
@@ -909,6 +1004,11 @@ def report(root, baseline, show_all):
         print(f"  error: {dep}")
     for dep in unused:
         print(f"  note: allow list entry not used: {dep}")
+    layer_breaks = layer_findings(root)
+    print(f"layer order breaks: {len(layer_breaks)}")
+    for finding in layer_breaks:
+        errors += 1
+        print(f"  error: {finding}")
     print("similar function names (report):")
     for pattern, defs, files in similar_names(sources):
         print(f"  {pattern}: {defs} definitions in {files} files")

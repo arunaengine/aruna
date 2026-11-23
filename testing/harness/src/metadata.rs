@@ -8,11 +8,11 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::git::GitNode;
 use aruna_core::metadata::{GraphLifecycleRecord, MetadataEffect, MetadataError, MetadataEvent};
-use aruna_ops_work::metadata::materialization_queue::{
+use aruna_ops_data::metadata::materialization_queue::{
     JobsExistOperation, MaterializationBatchOperation, MetadataDrainResult,
     MetadataMaterializationError, UNKNOWN_CORES, group_concurrency,
 };
-use aruna_ops_work::metadata::prune_queue::{
+use aruna_ops_data::metadata::prune_queue::{
     GraphDrainResult, MetadataGraphError, PruneBatchOperation, TombstoneProcessingResult,
     TombstonesOperation, jobs_queued,
 };

@@ -11,11 +11,11 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::errors::AuthorizationError;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::storage::blob::{UserAccess, group_permission_path, never_expiry};
-use aruna_ops_work::abe::{KeyAction, KeyResult};
-use aruna_ops_work::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
-use aruna_ops_work::s3::access::get::{GetAccessError, GetAccessOperation};
-use aruna_ops_work::s3::access::list::{ListUserInput, ListUserOperation};
-use aruna_ops_work::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use aruna_ops_data::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
+use aruna_ops_data::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_ops_data::s3::access::list::{ListUserInput, ListUserOperation};
+use aruna_ops_data::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
+use aruna_ops_identity::abe::{KeyAction, KeyResult};
 use aruna_runner::driver::drive;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -924,7 +924,7 @@ pub(crate) async fn authorize_credential_issuance(
         // a credential: authorization uses the derived roots, while probing the
         // bare directory would ask a `/**` grant to match the directory itself.
         let rules = aruna_runner::driver::drive(
-            aruna_ops_work::auth::request_authorization::rules_operation(
+            aruna_ops_identity::auth::request_authorization::rules_operation(
                 &effective_auth,
                 &group_root,
             ),
@@ -939,7 +939,7 @@ pub(crate) async fn authorize_credential_issuance(
             | AuthorizationError::InvalidGroupId => ServerError::Forbidden,
             _ => ServerError::InternalError(error.into()),
         })?;
-        let roots = aruna_ops_work::auth::request_authorization::reachable_roots(
+        let roots = aruna_ops_identity::auth::request_authorization::reachable_roots(
             &rules,
             &effective_auth,
             &group_root,

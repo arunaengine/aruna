@@ -37,15 +37,15 @@ use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::get_document::GetDocumentOperation;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_ops_work::sync::notification_outbox::{
+use aruna_ops_data::metadata::get_document::GetDocumentOperation;
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
 use aruna_p2p::NetHandle;

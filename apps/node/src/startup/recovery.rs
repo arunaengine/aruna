@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use aruna_ops_work::node::recovery_run::{RecoveryConfig, RecoveryOperation};
-use aruna_ops_work::shard::recovery::{
+use aruna_ops_identity::shard::recovery::{
     RecoveryError, RecoveryOutcome, RecoveryStatus, RecoveryStop,
 };
+use aruna_ops_work::node::recovery_run::{RecoveryConfig, RecoveryOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use tokio_util::sync::CancellationToken;
 

@@ -21,7 +21,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::storage::blob::BlobVersion;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::context::JobContext;
 use aruna_runner::testing::seed_bucket;

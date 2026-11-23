@@ -43,18 +43,18 @@ use aruna_core::structs::identity::user::User;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_ops_data::s3::object::put::PutObjectOperation;
+use aruna_ops_data::testing_objects::put_config;
+use aruna_ops_identity::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::secrets::SecretChange;
+use aruna_ops_identity::secrets::owner::{OwnerChange, OwnerSecretOperation};
 use aruna_ops_work::plugins::install::{
     InstallCaller, InstallPrepared, InstallRequest, PrepareInstall,
 };
 use aruna_ops_work::plugins::publish::{PublishEntryConfig, PublishEntryOperation};
 use aruna_ops_work::plugins::rows::read_rows;
 use aruna_ops_work::plugins::work::reserve;
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_ops_work::s3::object::put::PutObjectOperation;
-use aruna_ops_work::secrets::SecretChange;
-use aruna_ops_work::secrets::owner::{OwnerChange, OwnerSecretOperation};
-use aruna_ops_work::testing_objects::put_config;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::context::JobContext;
 use aruna_runner::testing::{seed_bucket, with_blob};

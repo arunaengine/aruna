@@ -13,14 +13,14 @@ use aruna_core::structs::storage::blob::{bucket_permission_path, object_permissi
 use aruna_core::structs::storage::share::{
     ShareAction, ShareEvent, ShareLink, ShareMode, ShareTarget, ShareUses,
 };
-use aruna_ops_work::auth::error::AuthorizeError;
-use aruna_ops_work::shares::lifecycle::{
+use aruna_ops_data::shares::lifecycle::{
     CreateShareConfig, CreateShareOperation, RevokeShareOperation, ShareError,
 };
-use aruna_ops_work::shares::rules::required_permission;
-use aruna_ops_work::shares::store::{
+use aruna_ops_data::shares::rules::required_permission;
+use aruna_ops_data::shares::store::{
     GetShareOperation, ListSharesOperation, ReadUsesOperation, ShareEventsOperation,
 };
+use aruna_ops_identity::auth::error::AuthorizeError;
 use aruna_runner::driver::{drive, drive_retry};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -37,7 +37,7 @@ use crate::auth::map_authorize_error;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::lookup::bucket_info;
 use crate::server::state::ServerState;
-use aruna_ops_work::auth::enforcement::EnforcePolicyOperation;
+use aruna_ops_identity::auth::enforcement::EnforcePolicyOperation;
 
 mod dataset;
 mod relay;
@@ -626,7 +626,7 @@ fn action_name(action: ShareAction) -> &'static str {
 pub(crate) async fn log_event(state: &ServerState, share_id: Ulid, event: ShareEvent) {
     let entry = Ulid::generate();
     let build =
-        || aruna_ops_work::shares::store::LogShareOperation::new(share_id, entry, event.clone());
+        || aruna_ops_data::shares::store::LogShareOperation::new(share_id, entry, event.clone());
     if let Err(error) = drive_retry(build, &state.get_ctx(), &entry.to_bytes()).await {
         tracing::warn!(share_id = %share_id, error = %error, "Share link log entry not written");
     }

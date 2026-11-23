@@ -24,14 +24,14 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::structs::synced_folder::{RemoteBinding, SyncRefusal};
 use aruna_core::types::GroupId;
-use aruna_ops_work::device_node::realm_documents::fetch_realm_documents;
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_identity::device_node::realm_documents::fetch_realm_documents;
 use aruna_ops_work::jobs::workflow::publish_run::{
     PublishRunError, PublishRunInput, local_run_crate, publish_run,
 };
 use aruna_ops_work::jobs::workflow::run_crate::{WriteCrateOperation, crate_outcome};
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::context::JobContext;
 use futures_util::StreamExt;

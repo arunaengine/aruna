@@ -14,7 +14,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_runner::driver::{DriverContext, drive};

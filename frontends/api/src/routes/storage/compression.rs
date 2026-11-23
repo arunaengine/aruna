@@ -12,8 +12,8 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::format::{Compression, CompressionMigration};
-use aruna_ops_work::replication::plaintext::EncryptionCheckOperation;
-use aruna_ops_work::s3::bucket::compression::{
+use aruna_ops_data::replication::plaintext::EncryptionCheckOperation;
+use aruna_ops_data::s3::bucket::compression::{
     MigrationStatusOperation, PutCompressionError, PutCompressionOperation,
 };
 use aruna_runner::driver::drive;

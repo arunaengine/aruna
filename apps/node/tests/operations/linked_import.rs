@@ -43,23 +43,23 @@ use aruna_core::structs::storage::group_backend::{
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::request_authorization::BucketAccessOperation;
-use aruna_ops_work::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
-use aruna_ops_work::blob::merge_copies::{Unified, UnifyOperation};
-use aruna_ops_work::blob::migration::misplaced::AnyKey;
-use aruna_ops_work::blob::purge::{ScopeTotalsOperation, StorageFilesOperation};
-use aruna_ops_work::blob::unify::{PreviewPageOperation, PreviewQuery};
-use aruna_ops_work::groups::backends::record_writes;
-use aruna_ops_work::groups::fence::GroupWriteOperation;
-use aruna_ops_work::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::fence_store::AcquireFenceOperation;
-use aruna_ops_work::s3::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_ops_work::transfer::discovery::{
+use aruna_ops_data::blob::cleanup::{CleanupNode, ProcessCleanupOperation};
+use aruna_ops_data::blob::merge_copies::{Unified, UnifyOperation};
+use aruna_ops_data::blob::migration::misplaced::AnyKey;
+use aruna_ops_data::blob::purge::{ScopeTotalsOperation, StorageFilesOperation};
+use aruna_ops_data::blob::unify::{PreviewPageOperation, PreviewQuery};
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::fence_store::AcquireFenceOperation;
+use aruna_ops_data::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_data::transfer::discovery::{
     AuthorizedPreviewOperation, FileOutcome, SetDiscoveryOperation,
 };
+use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
+use aruna_ops_identity::groups::backends::record_writes;
+use aruna_ops_identity::groups::fence::GroupWriteOperation;
+use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
@@ -658,7 +658,7 @@ async fn content(context: &TestContext, key: &str, id: Ulid) -> Vec<u8> {
 }
 
 /// The duplicates preview of the whole bucket.
-async fn duplicates(context: &TestContext) -> aruna_ops_work::blob::unify::UnifyPage {
+async fn duplicates(context: &TestContext) -> aruna_ops_data::blob::unify::UnifyPage {
     let scope = (context.auth.realm_id, context.group_id, context.node_id);
     let access = drive(
         BucketAccessOperation::new(&context.auth, scope, BUCKET),

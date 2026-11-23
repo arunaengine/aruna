@@ -146,9 +146,9 @@ async fn record_pages_resume() {
     use aruna_core::key_index::KeyQuery;
     use aruna_core::keyspaces::USAGE_STATS_KEYSPACE;
     use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key};
-    use aruna_ops_work::distribution::test_store::Feeder;
-    use aruna_ops_work::staging::page::rows::MAX_PAGE_ENTRIES;
-    use aruna_ops_work::transfer::feed_walks::FeedLimits;
+    use aruna_ops_data::distribution::test_store::Feeder;
+    use aruna_ops_data::staging::page::rows::MAX_PAGE_ENTRIES;
+    use aruna_ops_data::transfer::feed_walks::FeedLimits;
     use aruna_storage::key_index::RangeIndexes;
     use std::ops::Bound;
 
@@ -369,8 +369,8 @@ async fn import_records(
         }
         loop {
             let drained = aruna_runner::driver::drive(
-                aruna_ops_work::replication::drain::ProcessBatchOperation::new(
-                    aruna_ops_work::replication::page::deliver::MetadataPages,
+                aruna_ops_data::replication::drain::ProcessBatchOperation::new(
+                    aruna_ops_data::replication::page::deliver::MetadataPages,
                     aruna_runner::driver::node_routing(&drain),
                     drain.node_and_realm(),
                 ),
@@ -389,8 +389,8 @@ async fn import_records(
     let stopping = stop.clone();
     let mut woken = pages.subscribe();
     let feed = tokio::spawn(async move {
-        use aruna_ops_work::distribution::test_store::Feeder;
-        use aruna_ops_work::transfer::feed_walks::FeedLimits;
+        use aruna_ops_data::distribution::test_store::Feeder;
+        use aruna_ops_data::transfer::feed_walks::FeedLimits;
         use aruna_storage::key_index::RangeIndexes;
         feed.storage_handle
             .install_range_indexes(RangeIndexes::new(indexes));
@@ -467,9 +467,9 @@ async fn searched_set(ctx: &JobContext, spec: &StagingJobSpec) -> (Ulid, Ulid) {
     use aruna_core::structs::storage::distribution::accounting::{
         RangeCounters, SAMPLE_SIZE, SampleEntry, sample_count_key,
     };
-    use aruna_ops_work::distribution::inventory::open_ranges;
-    use aruna_ops_work::distribution::test_record::{binding, searched};
-    use aruna_ops_work::distribution::test_store::range;
+    use aruna_ops_data::distribution::inventory::open_ranges;
+    use aruna_ops_data::distribution::test_record::{binding, searched};
+    use aruna_ops_data::distribution::test_store::range;
     let handle = &ctx.driver.storage_handle;
     let (snapshot, bytes) = searched();
     let set_id = snapshot.set_id();

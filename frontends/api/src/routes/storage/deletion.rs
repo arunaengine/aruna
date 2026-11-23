@@ -13,18 +13,18 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::listing::ListVersionsItem;
 use aruna_core::structs::storage::storage_purge::{StoragePurgeScope, StoragePurgeSpec};
-use aruna_ops_work::blob::migration::misplaced::AccessRule;
-use aruna_ops_work::blob::purge::ScopeTotalsOperation;
-use aruna_ops_work::jobs::JOB_RETENTION_MS;
-use aruna_ops_work::metadata::api::links::set_preview_distributed;
-use aruna_ops_work::replication::sync_relationship::SyncRelationshipDirection;
-use aruna_ops_work::replication::sync_relationship::list::ListRelationshipsOperation;
-use aruna_ops_work::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_ops_work::s3::object::versions::{
+use aruna_ops_data::blob::migration::misplaced::AccessRule;
+use aruna_ops_data::blob::purge::ScopeTotalsOperation;
+use aruna_ops_data::metadata::api::links::set_preview_distributed;
+use aruna_ops_data::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_ops_data::replication::sync_relationship::list::ListRelationshipsOperation;
+use aruna_ops_data::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
+use aruna_ops_data::s3::object::versions::{
     ListVersionsError, ListVersionsInput, ListVersionsOperation,
 };
-use aruna_ops_work::transfer::pinned::{PinnedError, RefuseScopeOperation};
-use aruna_ops_work::transfer::release::BucketScope;
+use aruna_ops_data::transfer::pinned::{PinnedError, RefuseScopeOperation};
+use aruna_ops_data::transfer::release::BucketScope;
+use aruna_ops_work::jobs::JOB_RETENTION_MS;
 use aruna_runner::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -42,7 +42,7 @@ use crate::lookup::bucket_info;
 use crate::metadata::{bearer_token_string, map_api_error};
 use crate::routes::metadata::links::DataLinkDocument;
 use crate::server::state::ServerState;
-use aruna_ops_work::auth::request_authorization::BucketAccessOperation;
+use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
 
 const DEFAULT_PREFLIGHT_LIMIT: usize = 1_000;
 const MAX_PREFLIGHT_LIMIT: usize = 1_000;
@@ -833,7 +833,7 @@ pub async fn delete_preview(
         .collect();
     let routing = aruna_runner::driver::node_routing(&context);
     let place = (bucket.as_str(), info.group_id);
-    let lookup = aruna_ops_work::blob::purge::StorageFilesOperation::new(
+    let lookup = aruna_ops_data::blob::purge::StorageFilesOperation::new(
         routing,
         place,
         &versions,
@@ -843,7 +843,7 @@ pub async fn delete_preview(
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;
     let kept_files = files.iter().filter(|file| file.kept.is_some()).count() as u64;
-    let unchecked = aruna_ops_work::blob::purge::UNCHECKED_READERS;
+    let unchecked = aruna_ops_data::blob::purge::UNCHECKED_READERS;
     let unchecked = files
         .iter()
         .any(|file| file.kept.as_deref() == Some(unchecked));
@@ -970,7 +970,7 @@ pub async fn control_purge(
     match action.as_str() {
         "pause" | "resume" => {
             let paused = action == "pause";
-            let pause = aruna_ops_work::blob::pause::PausePurgeOperation::new(id, paused);
+            let pause = aruna_ops_data::blob::pause::PausePurgeOperation::new(id, paused);
             drive(pause, &context)
                 .await
                 .map_err(|error| failed(error.to_string()))?;
@@ -984,7 +984,7 @@ pub async fn control_purge(
             if let CancelJobOutcome::AlreadyTerminal(_) | CancelJobOutcome::Requested(_) = outcome
                 && purge_ended(&state, job_id).await?
             {
-                let resume = aruna_ops_work::blob::pause::PausePurgeOperation::new(id, false);
+                let resume = aruna_ops_data::blob::pause::PausePurgeOperation::new(id, false);
                 drive(resume, &context)
                     .await
                     .map_err(|error| failed(error.to_string()))?;
@@ -1016,7 +1016,7 @@ async fn purge_job(
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?
         .ok_or(ServerError::NotFound)?;
-    let paused = aruna_ops_work::blob::pause::PausedOperation::new(job_id.as_ulid());
+    let paused = aruna_ops_data::blob::pause::PausedOperation::new(job_id.as_ulid());
     let paused = drive(paused, &context)
         .await
         .map_err(|error| ServerError::InternalError(error.into()))?;

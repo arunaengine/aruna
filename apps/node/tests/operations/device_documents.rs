@@ -15,22 +15,22 @@ use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::node_info::NodeUrls;
-use aruna_ops_work::auth::revoke_token::{
+use aruna_ops_identity::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
-use aruna_ops_work::device_node::realm_documents::{fetch_realm_documents, realm_removed};
-use aruna_ops_work::groups::list_groups::ListGroupOperation;
-use aruna_ops_work::node::info::flows::SeedInfoOperation;
-use aruna_ops_work::sync::replicate_documents::{
+use aruna_ops_identity::device_node::realm_documents::{fetch_realm_documents, realm_removed};
+use aruna_ops_identity::groups::list_groups::ListGroupOperation;
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
-use aruna_ops_work::users::read_document::ReadUserOperation;
+use aruna_ops_identity::users::read_document::ReadUserOperation;
+use aruna_ops_work::node::info::flows::SeedInfoOperation;
 use aruna_runner::driver::drive;
 use aruna_runner::driver::node_facts;
 use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
-use aruna_ops_work::auth::bearer_token::TokenRevokedOperation;
+use aruna_ops_identity::auth::bearer_token::TokenRevokedOperation;
 use topology::{
     TestNode, TestResult, Topology, read_group_auth, read_group_record, read_realm_auth,
     read_realm_config, replicate_config, spawn_node, write,

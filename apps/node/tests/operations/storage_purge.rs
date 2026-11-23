@@ -47,33 +47,33 @@ use aruna_core::structs::storage::storage_purge::{
 };
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::blob::pause::{PausePurgeOperation, PausedOperation};
-use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::fence_store::AcquireFenceOperation;
-use aruna_ops_work::s3::multipart::complete::{
+use aruna_ops_data::blob::pause::{PausePurgeOperation, PausedOperation};
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::fence_store::AcquireFenceOperation;
+use aruna_ops_data::s3::multipart::complete::{
     CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
-use aruna_ops_work::s3::multipart::create::{
+use aruna_ops_data::s3::multipart::create::{
     CreateMultipartError, CreateMultipartInput, CreateMultipartOperation,
 };
-use aruna_ops_work::s3::multipart::part_upload::{
+use aruna_ops_data::s3::multipart::part_upload::{
     UploadPartError, UploadPartInput, UploadPartOperation,
 };
-use aruna_ops_work::s3::object::delete::bulk::{
+use aruna_ops_data::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
 };
-use aruna_ops_work::s3::object::delete::{
+use aruna_ops_data::s3::object::delete::{
     DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
 };
-use aruna_ops_work::s3::object::put::{
+use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation,
 };
-use aruna_ops_work::s3::purge_fence::{PurgeFenceError, fence_key};
-use aruna_ops_work::transfer::copy::{
+use aruna_ops_data::s3::purge_fence::{PurgeFenceError, fence_key};
+use aruna_ops_data::transfer::copy::{
     CopyObjectError, CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
 };
-use aruna_ops_work::transfer::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
+use aruna_ops_data::transfer::part_copy::{PartCopyError, PartCopyInput, PartCopyOperation};
+use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
@@ -999,7 +999,7 @@ async fn aborted_purge_releases() {
     // A page planned before the abort stays in the cleanup queue, released once it ended.
     let versions: Vec<_> = list_linked(&context).await;
     let found = drive(
-        aruna_ops_work::blob::purge::StorageFilesOperation::new(
+        aruna_ops_data::blob::purge::StorageFilesOperation::new(
             aruna_runner::driver::node_routing(&context.driver),
             ("bucket", context.group_id),
             &versions,
@@ -1010,7 +1010,7 @@ async fn aborted_purge_releases() {
     .await
     .unwrap();
     drive(
-        aruna_ops_work::blob::purge::PlanFilesOperation::new(job.job_id.as_ulid(), &found),
+        aruna_ops_data::blob::purge::PlanFilesOperation::new(job.job_id.as_ulid(), &found),
         &context.driver,
     )
     .await
@@ -1076,7 +1076,7 @@ async fn cancelled_queue_releases() {
     insert_job(&context.driver, &record).await.unwrap();
     let versions = list_linked(&context).await;
     let found = drive(
-        aruna_ops_work::blob::purge::StorageFilesOperation::new(
+        aruna_ops_data::blob::purge::StorageFilesOperation::new(
             aruna_runner::driver::node_routing(&context.driver),
             ("bucket", context.group_id),
             &versions,
@@ -1087,7 +1087,7 @@ async fn cancelled_queue_releases() {
     .await
     .unwrap();
     drive(
-        aruna_ops_work::blob::purge::PlanFilesOperation::new(job_id.as_ulid(), &found),
+        aruna_ops_data::blob::purge::PlanFilesOperation::new(job_id.as_ulid(), &found),
         &context.driver,
     )
     .await
@@ -1120,13 +1120,13 @@ async fn cancelled_queue_releases() {
     write_value(
         storage,
         aruna_core::keyspaces::STORAGE_BACKEND_KEYSPACE,
-        aruna_ops_work::groups::backends::backend_key(backend.backend_id).to_vec(),
+        aruna_ops_identity::groups::backends::backend_key(backend.backend_id).to_vec(),
         backend.to_bytes().unwrap(),
     )
     .await;
     let outcome = drive(
-        aruna_ops_work::blob::cleanup::ProcessCleanupOperation::new(
-            aruna_ops_work::blob::cleanup::CleanupNode {
+        aruna_ops_data::blob::cleanup::ProcessCleanupOperation::new(
+            aruna_ops_data::blob::cleanup::CleanupNode {
                 routing: aruna_runner::driver::node_routing(&context.driver),
                 has_blob: context.driver.blob_handle.is_some(),
             },
@@ -1169,7 +1169,9 @@ async fn seed_copy(
         disabled: false,
         cleanup: aruna_core::structs::storage::cleanup::CleanupStrategy::Retain,
     };
-    for (space, key, value) in aruna_ops_work::groups::backends::record_writes(&backend).unwrap() {
+    for (space, key, value) in
+        aruna_ops_identity::groups::backends::record_writes(&backend).unwrap()
+    {
         write_value(storage, &space, key.to_vec(), value.to_vec()).await;
     }
     let rule = BackendImport {
@@ -1241,10 +1243,10 @@ async fn purge_releases_copies() {
     let location = seed_linked(&context, "linked/a.txt", version_id).await;
     let copy = seed_copy(&context, ("linked/a.txt", version_id), &location).await;
     let spec = files_spec(&context);
-    let totals = aruna_ops_work::blob::purge::ScopeTotalsOperation::new(
+    let totals = aruna_ops_data::blob::purge::ScopeTotalsOperation::new(
         aruna_runner::driver::node_routing(&context.driver),
         &spec.scope,
-        aruna_ops_work::blob::migration::misplaced::AnyKey,
+        aruna_ops_data::blob::migration::misplaced::AnyKey,
     );
     let totals = drive(totals, &context.driver).await.unwrap();
     assert_eq!((totals.storage_files, totals.storage_bytes), (2, 8));

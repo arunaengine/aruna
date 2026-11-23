@@ -11,12 +11,12 @@ use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::auth::{bearer_token_hash, valid_revocation_expiry};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_ops_work::auth::revoke_token::{
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::fanout_types::forwarded_bearer;
+use aruna_ops_identity::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenError, RevokeTokenOperation,
 };
-use aruna_ops_work::forward::token::ForwardRevokeOperation;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::fanout_types::forwarded_bearer;
+use aruna_ops_identity::forward::token::ForwardRevokeOperation;
 use aruna_runner::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -179,9 +179,9 @@ mod tests {
     use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, PathRestriction};
     use aruna_core::structs::identity::realm::{RealmId, TokenRevocation};
     use aruna_core::user::id::UserId;
-    use aruna_ops_work::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_ops_work::document_repository::GetConfigOperation;
-    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_ops_identity::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_ops_identity::document_repository::GetConfigOperation;
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_runner::driver::DriverContext;
     use aruna_runner::jobs::runtime::JobsRuntime;
     use aruna_storage::storage::worker::FjallStorage;

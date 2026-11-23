@@ -13,7 +13,7 @@ use aruna_core::keyspaces::REALM_CONFIG_KEYSPACE;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::device::publish_queue::{PublishEntry, PublishState};
+use aruna_ops_data::device::publish_queue::{PublishEntry, PublishState};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;

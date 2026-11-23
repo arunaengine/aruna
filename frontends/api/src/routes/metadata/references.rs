@@ -16,12 +16,12 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::metadata::api::MetadataIndexState;
-use aruna_ops_work::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
-use aruna_ops_work::metadata::api::preflight_types::{
+use aruna_ops_data::metadata::api::preflight::fanout::references_preflight as run_references_preflight;
+use aruna_ops_data::metadata::api::preflight_types::{
     MetadataStorageOperation, ReferenceExecution, ReferenceRequest, ReferenceTarget,
 };
-use aruna_ops_work::metadata::api::read_types::MetadataReferencesRequest;
-use aruna_ops_work::metadata::api::references::ReferencesOperation;
+use aruna_ops_data::metadata::api::read_types::MetadataReferencesRequest;
+use aruna_ops_data::metadata::api::references::ReferencesOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

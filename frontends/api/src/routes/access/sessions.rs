@@ -14,13 +14,13 @@ use aruna_core::structs::identity::auth::{
     Actor, AuthContext, PathRestriction, Permission, SessionKind,
 };
 use aruna_core::structs::identity::user::session::UserSession;
-use aruna_ops_work::auth::create_token::CreateTokenError;
-use aruna_ops_work::session::create::{
+use aruna_ops_identity::auth::create_token::CreateTokenError;
+use aruna_ops_identity::session::create::{
     CreateSessionConfig, CreateSessionError, bound_session_expiry,
 };
-use aruna_ops_work::session::limit::MakeRoomOperation;
-use aruna_ops_work::session::list::ListSessionOperation;
-use aruna_ops_work::session::revoke::{RevokeSessionError, RevokeSessionOperation};
+use aruna_ops_identity::session::limit::MakeRoomOperation;
+use aruna_ops_identity::session::list::ListSessionOperation;
+use aruna_ops_identity::session::revoke::{RevokeSessionError, RevokeSessionOperation};
 use aruna_runner::driver::drive;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

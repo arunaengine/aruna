@@ -17,26 +17,26 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permiss
 use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, StaticRealmEndpoint,
 };
-use aruna_ops_work::auth::enforcement::EnforcePolicyOperation;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::onboarding::consume_secret::ConsumeSecretError;
-use aruna_ops_work::onboarding::create_secret::{
+use aruna_ops_identity::auth::enforcement::EnforcePolicyOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::onboarding::consume_secret::ConsumeSecretError;
+use aruna_ops_identity::onboarding::create_secret::{
     CreateSecretError, CreateSecretInput, CreateSecretOperation,
 };
-use aruna_ops_work::onboarding::delete_secret::{
+use aruna_ops_identity::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
-use aruna_ops_work::onboarding::expiry_page::ExpiryPageOperation;
-use aruna_ops_work::onboarding::finalize_bootstrap::{
+use aruna_ops_identity::onboarding::expiry_page::ExpiryPageOperation;
+use aruna_ops_identity::onboarding::finalize_bootstrap::{
     BootstrapFinalizeError, BootstrapFinalizeInput, FinalizeBootstrapOperation,
 };
-use aruna_ops_work::onboarding::inspect_secret::{
+use aruna_ops_identity::onboarding::inspect_secret::{
     InspectSecretError, InspectSecretInput, InspectSecretOperation,
 };
-use aruna_ops_work::onboarding::live_page::LivePageOperation;
-use aruna_ops_work::onboarding::read_secret::ReadSecretOperation;
-use aruna_ops_work::onboarding::reserve_secret::ReserveSecretError;
-use aruna_ops_work::realm::ensure_config::EnsureConfigError;
+use aruna_ops_identity::onboarding::live_page::LivePageOperation;
+use aruna_ops_identity::onboarding::read_secret::ReadSecretOperation;
+use aruna_ops_identity::onboarding::reserve_secret::ReserveSecretError;
+use aruna_ops_identity::realm::ensure_config::EnsureConfigError;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

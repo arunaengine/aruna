@@ -181,6 +181,10 @@ impl Operation for WakeUnlockedOperation {
 }
 
 #[cfg(test)]
+#[path = "unlock_tests.rs"]
+mod unlock_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::jobs::key_locks::{KeyCheckError, LockedInputsOperation, ParkLockedOperation};

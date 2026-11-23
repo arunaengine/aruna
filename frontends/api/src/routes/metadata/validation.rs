@@ -15,12 +15,12 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_ops_work::metadata::api::export_types::GetVisibleRequest;
-use aruna_ops_work::metadata::forward::routed::status::RoutedStatusOperation;
-use aruna_ops_work::metadata::profile::validation::{
+use aruna_ops_data::metadata::api::export_types::GetVisibleRequest;
+use aruna_ops_data::metadata::forward::routed::status::RoutedStatusOperation;
+use aruna_ops_data::metadata::profile::validation::{
     ProfileAssessOperation, SUPPORTED_PROFILE_CONSTRAINTS, evaluator_name,
 };
-use aruna_ops_work::metadata::public_preview::RestrictedFilesOperation;
+use aruna_ops_data::metadata::public_preview::RestrictedFilesOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

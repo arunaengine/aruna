@@ -13,9 +13,11 @@ use aruna_core::structs::placement::compute_config::{
     GroupComputeQuota, LocationLink, RealmComputeConfig,
 };
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_ops_work::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::set_compute::{
+    SetComputeConfig, SetComputeError, SetComputeOperation,
+};
 use aruna_ops_work::node::info::flows::{GroupDemandOperation, OperatorDrainOperation};
-use aruna_ops_work::realm::set_compute::{SetComputeConfig, SetComputeError, SetComputeOperation};
 use aruna_runner::driver::drive;
 use aruna_runner::driver::node_facts;
 use axum::Json;

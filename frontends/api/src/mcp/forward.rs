@@ -12,7 +12,7 @@ use crate::routes::storage::relay::node_directed;
 use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_ops_work::distribution::guard::GuardError;
+use aruna_ops_data::distribution::guard::GuardError;
 use aruna_ops_work::relay::tool::route::{Missed, ToolNodeOperation, ToolRoute, ToolRouteError};
 use aruna_ops_work::relay::tool::{RouteError, ToolCall, ToolCallOperation, ToolRefusal};
 use aruna_runner::driver::drive;

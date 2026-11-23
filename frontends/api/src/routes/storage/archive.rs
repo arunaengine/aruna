@@ -10,10 +10,10 @@ use aruna_core::stream::BackendStream;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::backend_import::TokenGrant;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::error::token_grant;
-use aruna_ops_work::transfer::archive::{
+use aruna_ops_data::transfer::archive::{
     OpenArchiveOperation, SelectionEntry, WriteSelectionOperation, validate_selection,
 };
+use aruna_ops_identity::auth::error::token_grant;
 use axum::extract::{Query, State};
 use axum::http::header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
 use axum::http::{HeaderValue, StatusCode};
@@ -37,7 +37,7 @@ use crate::routes::shares::rfc3339;
 use crate::routes::storage::objects::{bearer_access, page_node};
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_ops_work::auth::bearer_token::GrantValidOperation;
+use aruna_ops_identity::auth::bearer_token::GrantValidOperation;
 use aruna_runner::driver::drive;
 
 /// Seconds an archive link works at most.

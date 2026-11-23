@@ -17,6 +17,8 @@ aruna-config = { workspace = true }
 aruna-core = { workspace = true }
 aruna-blob = { workspace = true }
 aruna-storage = { workspace = true }
+aruna-ops-data = { workspace = true }
+aruna-ops-identity = { workspace = true }
 aruna-ops-work = { workspace = true }
 aruna-runner = { workspace = true }
 aruna-wire = { workspace = true }

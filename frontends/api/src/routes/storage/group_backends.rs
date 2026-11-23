@@ -11,15 +11,15 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::cleanup::CleanupStrategy;
 use aruna_core::structs::storage::group_backend::{GroupBackendKind, GroupStorage, valid_bucket};
-use aruna_ops_work::blob::reclaim_sweep::BackendStatusOperation;
-use aruna_ops_work::groups::backends::create::{
+use aruna_ops_data::blob::reclaim_sweep::BackendStatusOperation;
+use aruna_ops_identity::groups::backends::create::{
     CreateBackendError, CreateBackendInput, CreateBackendOperation,
 };
-use aruna_ops_work::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
-use aruna_ops_work::groups::backends::query::{
+use aruna_ops_identity::groups::backends::disable::{SetDisabledError, SetDisabledOperation};
+use aruna_ops_identity::groups::backends::query::{
     BucketCheckOperation, GetBackendOperation, ListBackendsOperation,
 };
-use aruna_ops_work::groups::backends::replace::ReplaceBackendOperation;
+use aruna_ops_identity::groups::backends::replace::ReplaceBackendOperation;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};

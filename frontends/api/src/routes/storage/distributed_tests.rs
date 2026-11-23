@@ -8,9 +8,9 @@ use aruna_core::structs::storage::distribution::DistributionRevision;
 use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::structs::storage::distribution::search::IndexProgress;
 use aruna_core::structs::storage::distribution::validate::DistributionError;
-use aruna_ops_work::distribution::guard::GuardError;
-use aruna_ops_work::replication::members::CopyLag;
-use aruna_ops_work::transfer::status_view::{
+use aruna_ops_data::distribution::guard::GuardError;
+use aruna_ops_data::replication::members::CopyLag;
+use aruna_ops_data::transfer::status_view::{
     CopyStatus, DeletionStatus, FillProgress, FillStatus, LifecycleStatus, MemberStatus,
     RangeStatus, TransferStatus,
 };
@@ -422,7 +422,7 @@ fn report_lists_members() {
     let report = CreationReport {
         set_id: Ulid::from_bytes([1; 16]),
         active: true,
-        members: vec![aruna_ops_work::transfer::create::MemberOutcome {
+        members: vec![aruna_ops_data::transfer::create::MemberOutcome {
             member_id: Ulid::from_bytes([2; 16]),
             node_id: node,
             admitted: false,

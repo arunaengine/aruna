@@ -2038,7 +2038,7 @@ async fn offered_drift_replaces() {
     let counters = usage().await;
     assert_eq!((counters.objects, counters.referenced_bytes), (1, 11));
     drive(
-        aruna_ops_work::node::usage_rebuild::RebuildStatsOperation::new(),
+        crate::s3::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await

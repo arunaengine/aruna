@@ -402,6 +402,129 @@ class CratesTest(unittest.TestCase):
             )
 
 
+def crate_toml(name, normal=(), dev=()):
+    """A member manifest with internal normal and dev-dependencies; a trailing ? marks optional."""
+    lines = [f'[package]\nname = "{name}"\n\n[dependencies]']
+    for dep in normal:
+        extra = ", optional = true" if dep.endswith("?") else ""
+        lines.append(f"{dep.rstrip('?')} = {{ workspace = true{extra} }}")
+    lines.append("\n[dev-dependencies]")
+    lines.extend(f"{dep} = {{ workspace = true }}" for dep in dev)
+    return "\n".join(lines) + "\n"
+
+
+def layer_tree(crates):
+    """A workspace of `crates`, each (member directory, name, normal deps, dev deps)."""
+    members = ", ".join(f'"{member}"' for member, *_ in crates)
+    files = {"Cargo.toml": f"[workspace]\nmembers = [{members}]\n"}
+    for member, name, normal, dev in crates:
+        files[f"{member}/Cargo.toml"] = crate_toml(name, normal, dev)
+    return files
+
+
+def layer_breaks(crates):
+    with tempfile.TemporaryDirectory() as root:
+        write_tree(root, layer_tree(crates))
+        return check_layers.layer_findings(root)
+
+
+class LayersTest(unittest.TestCase):
+    def test_clean_order(self):
+        crates = [
+            ("domain/core", "aruna-core", (), ()),
+            ("domain/ops-identity", "aruna-ops-identity", ["aruna-core"], ["aruna-storage"]),
+            ("domain/ops-data", "aruna-ops-data", ["aruna-ops-identity"], ["aruna-test-harness"]),
+            ("runtime/storage", "aruna-storage", ["aruna-core"], ()),
+            ("frontends/api", "aruna-api", ["aruna-runner", "aruna-test-harness?"], ()),
+            ("runtime/runner", "aruna-runner", ["aruna-storage"], ()),
+            ("testing/harness", "aruna-test-harness", ["aruna-ops-data"], ()),
+        ]
+        self.assertEqual(layer_breaks(crates), [])
+
+    def test_domain_runtime(self):
+        crates = [
+            ("domain/ops-work", "aruna-ops-work", ["aruna-storage"], ()),
+            ("runtime/storage", "aruna-storage", (), ()),
+        ]
+        self.assertEqual(
+            layer_breaks(crates),
+            ["aruna-ops-work -> aruna-storage: domain crates depend only on domain crates"],
+        )
+
+    def test_ops_dev(self):
+        crates = [
+            ("domain/ops-identity", "aruna-ops-identity", (), ["aruna-ops-data"]),
+            ("domain/ops-data", "aruna-ops-data", ["aruna-ops-identity"], ["aruna-ops-work"]),
+            ("domain/ops-work", "aruna-ops-work", ["aruna-ops-data"], ["aruna-ops-work"]),
+        ]
+        self.assertEqual(
+            layer_breaks(crates),
+            [
+                "aruna-ops-data -> aruna-ops-work: operations crates never reach a higher one",
+                "aruna-ops-identity -> aruna-ops-data: operations crates never reach a higher one",
+            ],
+        )
+
+    def test_unknown_crate(self):
+        crates = [("domain/extra", "aruna-extra", (), ()), ("misc/tool", "aruna-plugin", (), ())]
+        self.assertEqual(
+            layer_breaks(crates),
+            [
+                "aruna-extra: missing from CRATE_TARGETS",
+                "aruna-plugin: misc/tool lies outside the layer directories",
+            ],
+        )
+
+    def test_frontend_reach(self):
+        crates = [
+            ("frontends/api", "aruna-api", ["aruna", "aruna-storage", "aruna-test-harness"], ()),
+            ("apps/node", "aruna", ["aruna-test-harness"], ()),
+            ("runtime/storage", "aruna-storage", ["aruna-ops-work"], ()),
+            ("domain/ops-work", "aruna-ops-work", (), ()),
+            ("testing/harness", "aruna-test-harness", (), ()),
+        ]
+        self.assertEqual(
+            layer_breaks(crates),
+            [
+                "aruna -> aruna-test-harness: testing crates are never a required dependency here",
+                "aruna-api -> aruna: frontends never depend on apps",
+                "aruna-api -> aruna-storage: frontends reach the runtime only through the clock and the runner",
+                "aruna-api -> aruna-test-harness: frontends name test helpers only as an optional dependency",
+                "aruna-storage -> aruna-ops-work: runtime crates depend only on runtime crates and domain "
+                "foundations",
+            ],
+        )
+
+    def test_report_errors(self):
+        files = pure_tree({"domain/ops-work/Cargo.toml": MANIFEST + "aruna-storage = { workspace = true }\n"})
+        files["Cargo.toml"] = '[workspace]\nmembers = ["domain/ops-work", "runtime/storage"]\n'
+        files["runtime/storage/Cargo.toml"] = '[package]\nname = "aruna-storage"\n'
+        errors, output = run_report(files, zero_baseline())
+        self.assertEqual(errors, 2, output)
+        self.assertIn("error: aruna-ops-work -> aruna-storage: domain crates depend only on domain crates", output)
+
+
+class EffectsTest(unittest.TestCase):
+    def test_api_effects(self):
+        text = (
+            "fn handler() {\n    let read = StorageEffect::Read;\n}\n"
+            "#[cfg(test)]\nmod tests {\n    fn fixture() {\n        let read = StorageEffect::Read;\n    }\n}\n"
+        )
+        files = {
+            "frontends/api/src/routes.rs": text,
+            "frontends/api/src/routes_tests.rs": "fn fixture() { BlobEffect::Write; }\n",
+            "frontends/api/tests/flow.rs": "fn flow() { NetEffect::Send; }\n",
+            "apps/node/src/serve.rs": "fn serve() { StorageEffect::Read; }\n",
+        }
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, files)
+            sources = [check_layers.load_source(root, rel) for rel in sorted(files)]
+        self.assertEqual(check_layers.raw_effects(sources), ["frontends/api/src/routes.rs:2"])
+        errors, output = run_report(pure_tree({"frontends/api/src/routes.rs": text}), zero_baseline())
+        self.assertEqual(errors, 1, output)
+        self.assertIn("error: api_raw_effects rose above its baseline", output)
+
+
 class GuardTest(unittest.TestCase):
     def test_production_await(self):
         errors, output = run_report(pure_tree(), zero_baseline())

@@ -9,7 +9,7 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::coverage::{CountRelay, CoverageCount};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_ops_work::blob::migration::count::{
+use aruna_ops_data::blob::migration::count::{
     MintRunOperation, ReadCountOperation, SignRelayOperation, StartCountError, StartCountOperation,
     current_run, other_runs,
 };

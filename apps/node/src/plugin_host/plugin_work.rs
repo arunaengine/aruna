@@ -20,7 +20,7 @@ use aruna_runner::driver::{drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
 
 use super::transfers::{Download, Upload, download_work, upload_work};
-use aruna_ops_work::transfer::copy::CopyObjectOperation;
+use aruna_ops_data::transfer::copy::CopyObjectOperation;
 
 /// How often the bytes moved so far reach the job's progress.
 pub(super) const PROGRESS_TICK: Duration = Duration::from_secs(1);

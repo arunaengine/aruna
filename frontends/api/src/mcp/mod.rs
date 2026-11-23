@@ -5,7 +5,7 @@
 use crate::auth::require_unrestricted_auth;
 use crate::cors::CorsConfig;
 use crate::server::state::ServerState;
-use aruna_ops_work::auth::enforcement::EnforcePolicyOperation;
+use aruna_ops_identity::auth::enforcement::EnforcePolicyOperation;
 use aruna_runner::driver::drive;
 use axum::Router;
 use axum::extract::{Request, State};

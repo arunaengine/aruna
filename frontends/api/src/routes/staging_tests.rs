@@ -932,7 +932,7 @@ mod distributed {
     /// Stores the job's connector on the node, with or without credentials.
     async fn store_connector(node: &Node, secret: bool) {
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-        use aruna_ops_work::connectors::create_connector::{
+        use aruna_ops_data::connectors::create_connector::{
             SourceConnectorInput, SourceConnectorOperation,
         };
         use std::collections::HashMap;

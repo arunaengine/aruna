@@ -17,9 +17,9 @@ use utoipa_axum::routes;
 use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_ops_work::device::replica::{ReplicaOrigin, ReplicaRecord, SelectionError};
-use aruna_ops_work::device::replica_store::{cache_budget, cache_usage, list_replicas};
-use aruna_ops_work::metadata::device::selection::{deselect_document, select_document};
+use aruna_ops_data::device::replica::{ReplicaOrigin, ReplicaRecord, SelectionError};
+use aruna_ops_data::device::replica_store::{cache_budget, cache_usage, list_replicas};
+use aruna_ops_data::metadata::device::selection::{deselect_document, select_document};
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {
     OpenApiRouter::new()
@@ -221,7 +221,7 @@ async fn set_selection(
 #[cfg(test)]
 mod tests {
     use super::DeviceDocument;
-    use aruna_ops_work::device::replica::{ReplicaOrigin, ReplicaRecord};
+    use aruna_ops_data::device::replica::{ReplicaOrigin, ReplicaRecord};
     use ulid::Ulid;
 
     #[test]

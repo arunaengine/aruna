@@ -15,11 +15,11 @@ use aruna_core::handoff::LoginHandoff;
 use aruna_core::link::LinkConfirmation;
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::id::UserId;
+use aruna_ops_identity::users::update_user::UpdateUserError;
 use aruna_ops_work::federation::link::{
     ConfirmLinkConfig, ConfirmLinkOperation, LinkLoginConfig, LinkLoginError, LinkLoginOperation,
     UnlinkLoginConfig, UnlinkLoginOperation,
 };
-use aruna_ops_work::users::update_user::UpdateUserError;
 use aruna_runner::driver::{drive, drive_retry};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -241,11 +241,13 @@ pub async fn list_links(
     if auth.user_id.realm_id != state.get_realm_id() || auth.path_restrictions.is_some() {
         return Err(ServerError::Forbidden);
     }
-    let read = aruna_ops_work::users::read_document::ReadUserOperation::new(auth.user_id);
+    let read = aruna_ops_identity::users::read_document::ReadUserOperation::new(auth.user_id);
     let user = drive(read, &state.get_ctx())
         .await
         .map_err(|error| match error {
-            aruna_ops_work::users::read_document::ReadUserError::NotFound => ServerError::NotFound,
+            aruna_ops_identity::users::read_document::ReadUserError::NotFound => {
+                ServerError::NotFound
+            }
             other => ServerError::InternalError(other.into()),
         })?;
     Ok(Json(linked_logins(&user)))

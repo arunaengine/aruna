@@ -9,12 +9,12 @@ use std::time::{Duration, SystemTime};
 use aruna_core::member_read::MemberBody;
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_ops_work::s3::object::member::read::{
+use aruna_ops_data::s3::object::member::read::{
     MemberCallOperation, MemberFailure, MemberKey, MemberRead, MemberReadOperation, MemberRefusal,
     MemberTextOperation,
 };
-use aruna_ops_work::s3::object::range_list::DelegatedCaller;
-use aruna_ops_work::transfer::status_view::node_reach;
+use aruna_ops_data::s3::object::range_list::DelegatedCaller;
+use aruna_ops_data::transfer::status_view::node_reach;
 use aruna_runner::driver::drive;
 use http::HeaderMap;
 use s3s::dto::{
@@ -28,7 +28,7 @@ use super::{passed_headers, passed_query, refused_error, unix_secs};
 use crate::s3::auth::DelegatedRequest;
 use crate::s3::error::guard_error;
 use crate::s3::service::ArunaS3Service;
-use aruna_ops_work::s3::object::member::read::{
+use aruna_ops_data::s3::object::member::read::{
     MemberRequest as ForwardRequest, MemberTarget as Forward,
 };
 

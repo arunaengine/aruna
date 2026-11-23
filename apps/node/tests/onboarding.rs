@@ -15,8 +15,8 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::node_state::PersistedNodeIdentity;
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
 use aruna_runner::driver::drive;
 use byteview::ByteView;
 use shared::{

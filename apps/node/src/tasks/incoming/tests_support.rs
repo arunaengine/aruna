@@ -32,13 +32,13 @@ use tokio::sync::mpsc;
 use ulid::Ulid;
 
 use crate::tasks::incoming::OperationsTaskHandler;
-use aruna_ops_work::sync::outbox::record::write_outbox_effect;
+use aruna_ops_identity::sync::outbox::record::write_outbox_effect;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::InboundTaskHandler;
 
 pub(crate) fn job_id() -> JobId {
-    aruna_ops_work::testing::fresh_job_id(
+    aruna_ops_data::testing::fresh_job_id(
         PlacementHandle::new(FIRST_GRANTABLE_HANDLE).unwrap(),
         BucketId::new(0).unwrap(),
     )
@@ -114,7 +114,7 @@ pub(crate) async fn installed_setup() -> InstalledHarness {
         .await
         .expect("shared topic genesis");
     for index in 1..=2u128 {
-        let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+        let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),

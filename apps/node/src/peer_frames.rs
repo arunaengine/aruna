@@ -11,7 +11,7 @@ use aruna_core::alpn::Alpn;
 use aruna_core::heartbeat::{HEARTBEAT_IO_TIMEOUT, MAX_HEARTBEAT_BYTES};
 use aruna_core::id::NodeId;
 use aruna_core::structs::execution::notification::NotificationTransportMessage;
-use aruna_ops_work::shard::incoming::ManifestAnswer;
+use aruna_ops_identity::shard::incoming::ManifestAnswer;
 use aruna_ops_work::triggers::{PeerAnswer, PeerFailure, PeerInput, PeerRequest};
 use aruna_p2p::NetHandle;
 use aruna_p2p::heartbeat::HeartbeatSlot;

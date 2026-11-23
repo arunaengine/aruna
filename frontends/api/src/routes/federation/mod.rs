@@ -19,8 +19,8 @@ use aruna_core::federation::{AcceptedRealms, FederationSettings, RegistrationMod
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_ops_work::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_ops_work::realm::set_federation::{
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::set_federation::{
     SetFederationConfig, SetFederationError, SetFederationOperation,
 };
 use aruna_runner::driver::drive;

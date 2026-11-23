@@ -34,13 +34,13 @@ use aruna_core::structs::identity::realm::{QuotaConfig, RealmId};
 use aruna_core::structs::placement::record::{DocumentClass, PlacementScope};
 use aruna_core::structs::storage::usage::UsageCounters;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::placement::allocate_handle::HandleAllocationError;
-use aruna_ops_work::placement::provision::AllocateBindingOperation;
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_ops_work::realm::get_nodes::RealmPresence;
-use aruna_ops_work::realm::mutate_placement::MutatePlacementError;
-use aruna_ops_work::realm::set_quota::SetQuotaError;
+use aruna_ops_identity::placement::allocate_handle::HandleAllocationError;
+use aruna_ops_identity::placement::provision::AllocateBindingOperation;
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::realm::get_nodes::RealmPresence;
+use aruna_ops_identity::realm::mutate_placement::MutatePlacementError;
+use aruna_ops_identity::realm::set_quota::SetQuotaError;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::test_context;
 use aruna_scheduler::TaskHandle;
@@ -647,7 +647,7 @@ fn admin_auth(realm_id: RealmId, user_id: UserId) -> AuthContext {
 async fn deny_path(state: &ServerState, path: &str) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_ops_work::document_repository::GetConfigOperation::new(realm_id),
+        aruna_ops_identity::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -765,7 +765,7 @@ async fn placement_binding_lifecycle() {
     let (state, realm_id, admin, _tempdir) = setup_management_state().await;
     let auth = admin_auth(realm_id, admin);
     let family_strategy_id = drive(
-        aruna_ops_work::document_repository::GetConfigOperation::new(realm_id),
+        aruna_ops_identity::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1926,7 +1926,7 @@ async fn device_never_connected() {
     // this node answering about itself, may still not connect it.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_ops_work::document_repository::GetConfigOperation::new(realm_id),
+        aruna_ops_identity::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -1948,7 +1948,7 @@ async fn device_never_connected() {
         present,
         BTreeMap::new(),
         &BTreeMap::new(),
-        &aruna_ops_work::realm::node_name::NodeDisplays::default(),
+        &aruna_ops_identity::realm::node_name::NodeDisplays::default(),
         10_000,
     );
 
@@ -1975,7 +1975,7 @@ async fn reports_device_seen() {
     // device's own node is serving the request, so it saw itself now.
     let (state, realm_id, owner, _tempdir) = setup_management_state().await;
     let mut config = drive(
-        aruna_ops_work::document_repository::GetConfigOperation::new(realm_id),
+        aruna_ops_identity::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await
@@ -2000,7 +2000,7 @@ async fn reports_device_seen() {
         HashSet::new(),
         BTreeMap::new(),
         &contacts,
-        &aruna_ops_work::realm::node_name::NodeDisplays::default(),
+        &aruna_ops_identity::realm::node_name::NodeDisplays::default(),
         now_ms,
     );
     let device = |node_id: aruna_core::id::NodeId| {
@@ -2298,7 +2298,7 @@ async fn owner_names_device() {
     let owner = UserId::local(Ulid::generate(), realm_id);
     let device = iroh::SecretKey::generate().public();
     let mut config = drive(
-        aruna_ops_work::document_repository::GetConfigOperation::new(realm_id),
+        aruna_ops_identity::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await

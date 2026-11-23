@@ -7,9 +7,9 @@
 
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_ops_work::distribution::routing::upload_tags;
-use aruna_ops_work::distribution::uploads::{InventoryUploadsInput, InventoryUploadsOperation};
-use aruna_ops_work::s3::object::member::merge::{
+use aruna_ops_data::distribution::routing::upload_tags;
+use aruna_ops_data::distribution::uploads::{InventoryUploadsInput, InventoryUploadsOperation};
+use aruna_ops_data::s3::object::member::merge::{
     MarkerQuery, MergedMarkersOperation, UploadSource, UploadsPart,
 };
 use aruna_runner::driver::drive;

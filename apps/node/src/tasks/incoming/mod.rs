@@ -41,25 +41,25 @@ impl Drop for OutboxBarrier {
 use crate::tasks::runner::{claim_producer, reconcile_lost_attempt, spawn_job};
 use crate::tasks::task_persistence::restore_task_timers;
 use aruna_core::structs::storage::encryption::{BucketKeyRef, KeyTicket};
-use aruna_ops_work::blob::sweep_timer::ArmSweepOperation;
+use aruna_ops_data::blob::sweep_timer::ArmSweepOperation;
+use aruna_ops_data::metadata::materialization_queue::{
+    NextTimerOperation, RequeueParkedOperation, UNKNOWN_CORES,
+};
+use aruna_ops_data::metadata::projection::ProjectionTimerOperation;
+use aruna_ops_data::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
+use aruna_ops_data::replication::drain::RestoreDrainOperation;
+use aruna_ops_data::replication::mirror_repair::drain::RestoreTimerOperation;
+use aruna_ops_data::s3::bucket::key::lock::LockBucketOperation;
+use aruna_ops_identity::sync::document_outbox::OutboxTimerOperation;
+use aruna_ops_identity::sync::outbox::batches::OutboxLimits;
+use aruna_ops_identity::sync::outbox::rotation::OutboxRotation;
 use aruna_ops_work::jobs::drain::DrainTimerOperation;
 use aruna_ops_work::jobs::prune::PruneTimerOperation;
 use aruna_ops_work::jobs::store::job_calls;
-use aruna_ops_work::metadata::materialization_queue::{
-    NextTimerOperation, RequeueParkedOperation, UNKNOWN_CORES,
-};
-use aruna_ops_work::metadata::projection::ProjectionTimerOperation;
-use aruna_ops_work::metadata::prune_queue::PruneTimerOperation as GraphPruneTimerOperation;
 use aruna_ops_work::notifications::outbox::{DELIVERY_RETRY_AFTER, RestoreOutboxOperation};
 use aruna_ops_work::notifications::prune::RestorePruneOperation;
 use aruna_ops_work::notifications::watch::digest::InterestOperation;
 use aruna_ops_work::notifications::watch::table::RebuildTableOperation;
-use aruna_ops_work::replication::drain::RestoreDrainOperation;
-use aruna_ops_work::replication::mirror_repair::drain::RestoreTimerOperation;
-use aruna_ops_work::s3::bucket::key::lock::LockBucketOperation;
-use aruna_ops_work::sync::document_outbox::OutboxTimerOperation;
-use aruna_ops_work::sync::outbox::batches::OutboxLimits;
-use aruna_ops_work::sync::outbox::rotation::OutboxRotation;
 use aruna_ops_work::triggers::{
     TimerHandoff, TimerInput, TimerMemory, TimerPlan, keeps_earlier, timer_needs, timer_operation,
 };
@@ -415,7 +415,7 @@ impl OperationsTaskHandler {
                 };
                 let key = BucketKeyRef::new(bucket_id, generation);
                 let origin = (*net_handle.realm_id(), net_handle.node_id());
-                let promoted = aruna_ops_work::blob::unlocked::PromoteUnlockedOperation::new(
+                let promoted = aruna_ops_data::blob::unlocked::PromoteUnlockedOperation::new(
                     key,
                     origin,
                     &self.rocrate_limits,

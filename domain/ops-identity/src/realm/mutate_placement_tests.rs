@@ -1348,10 +1348,13 @@ async fn unauthorized_writes_nothing() {
         .expect("the realm config survives a rejected mutation");
     assert!(stored.candidate_maps.is_empty());
     assert!(
-        aruna_test_harness::documents::read_outbox_tails(&context.storage_handle)
-            .await
-            .expect("outbox scan")
-            .is_empty()
+        drive(
+            crate::sync::document_outbox::OutboxTailsOperation::new(),
+            &context
+        )
+        .await
+        .expect("outbox scan")
+        .is_empty()
     );
 }
 

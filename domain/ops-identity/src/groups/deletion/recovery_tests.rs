@@ -19,7 +19,7 @@ use ulid::Ulid;
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
 use super::tests::{commit, prepare};
-use aruna_test_harness::groups::{Fixture, context, node, read, write};
+use crate::tests::deletion::{Fixture, context, node, read, write};
 
 #[tokio::test]
 async fn unauthorized_prepare_refuses() {

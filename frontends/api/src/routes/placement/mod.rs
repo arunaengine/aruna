@@ -20,37 +20,37 @@ use aruna_core::structs::placement::policy::{
 use aruna_core::structs::placement::record::LabelMatch;
 use aruna_core::structs::storage::blob::{CurrentVersionPointer, VersionKey};
 use aruna_core::structs::storage::distribution::hint::mint_version;
-use aruna_ops_work::forward::routing::HolderWriteError;
-use aruna_ops_work::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
-use aruna_ops_work::placement::policy::diagnostics::{
-    DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
-};
-use aruna_ops_work::placement::policy::forward::{CreateRoutedOperation, PolicyForwardError};
-use aruna_ops_work::placement::policy::gate::{GateOperation, PolicyGateError};
-use aruna_ops_work::placement::policy::list::{
-    ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
-};
-use aruna_ops_work::placement::policy::names::PolicyNamesOperation;
-use aruna_ops_work::placement::policy::quarantine::{
-    QuarantineError, ResolveQuarantineConfig, ResolveQuarantineOperation,
-};
-use aruna_ops_work::placement::policy::read::{
-    ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
-};
-use aruna_ops_work::s3::bucket::placement::{
+use aruna_ops_data::s3::bucket::placement::{
     PutPlacementError, PutPlacementInput, PutPlacementOperation,
 };
-use aruna_ops_work::s3::object::placement::{
+use aruna_ops_data::s3::object::placement::{
     ObjectPlacementError, ObjectPlacementInput, ObjectPlacementOperation,
 };
-use aruna_ops_work::s3::policy::bulk::{BulkConfig, BulkError, PolicyBulkOperation};
-use aruna_ops_work::s3::policy::coverage::{
+use aruna_ops_data::s3::policy::bulk::{BulkConfig, BulkError, PolicyBulkOperation};
+use aruna_ops_data::s3::policy::coverage::{
     CoverageError, CoverageInput, CoverageScope, PolicyCoverageOperation,
 };
-use aruna_ops_work::s3::policy::mutation::{
+use aruna_ops_data::s3::policy::mutation::{
     PolicyMutationConfig, PolicyMutationError, PolicyMutationOperation,
 };
-use aruna_ops_work::s3::policy::successor::{SuccessorError, SuccessorOutcome};
+use aruna_ops_data::s3::policy::successor::{SuccessorError, SuccessorOutcome};
+use aruna_ops_identity::forward::routing::HolderWriteError;
+use aruna_ops_identity::placement::policy::create::{CreatePolicyConfig, CreatePolicyError};
+use aruna_ops_identity::placement::policy::diagnostics::{
+    DiagnosticsError, DiagnosticsInput, PolicyDiagnosticsOperation,
+};
+use aruna_ops_identity::placement::policy::forward::{CreateRoutedOperation, PolicyForwardError};
+use aruna_ops_identity::placement::policy::gate::{GateOperation, PolicyGateError};
+use aruna_ops_identity::placement::policy::list::{
+    ListPoliciesError, ListPoliciesInput, ListPoliciesOperation, POLICY_LIST_DEFAULT,
+};
+use aruna_ops_identity::placement::policy::names::PolicyNamesOperation;
+use aruna_ops_identity::placement::policy::quarantine::{
+    QuarantineError, ResolveQuarantineConfig, ResolveQuarantineOperation,
+};
+use aruna_ops_identity::placement::policy::read::{
+    ReadPolicyConfig, ReadPolicyError, ReadPolicyOperation,
+};
 use aruna_runner::driver::drive;
 use axum::extract::{Path, Query, State};
 use axum::{Extension, Json};
@@ -1640,9 +1640,9 @@ async fn coverage_here(
 
 fn coverage_response(
     bucket: String,
-    report: aruna_ops_work::s3::policy::coverage::CoverageReport,
+    report: aruna_ops_data::s3::policy::coverage::CoverageReport,
 ) -> CoverageResponse {
-    use aruna_ops_work::s3::policy::coverage::{AttachmentGap, CopyState, CoverageLimit};
+    use aruna_ops_data::s3::policy::coverage::{AttachmentGap, CopyState, CoverageLimit};
     CoverageResponse {
         bucket,
         scope: match report.scope {

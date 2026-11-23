@@ -18,14 +18,14 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
+use aruna_ops_data::metadata::create_entry::DocumentMintOperation;
+use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::s3::object::head_source::{
+    HeadSourceError, HeadSourceInput, HeadSourceOperation,
+};
 use aruna_ops_work::federation::import::ReadImportOperation;
 use aruna_ops_work::jobs::import::upload::{
     CreateRoCrateConfig, CreateRoCrateError, CreateRoCrateOperation,
-};
-use aruna_ops_work::metadata::create_entry::DocumentMintOperation;
-use aruna_ops_work::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_ops_work::s3::object::head_source::{
-    HeadSourceError, HeadSourceInput, HeadSourceOperation,
 };
 use aruna_runner::driver::{drive, drive_until};
 use axum::body::Body;

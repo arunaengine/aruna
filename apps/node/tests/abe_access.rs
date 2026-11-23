@@ -22,12 +22,12 @@ use aruna_core::user::id::UserId;
 use aruna_kpabe::envelope::Envelope;
 use aruna_kpabe::policy::{Attribute, Policy};
 use aruna_kpabe::scheme::UserKey;
-use aruna_ops_work::abe::member::MemberKeysOperation;
-use aruna_ops_work::abe::reissue::ReissueOperation;
-use aruna_ops_work::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
-use aruna_ops_work::s3::abe_copies::CompleteCopiesOperation;
-use aruna_ops_work::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
-use aruna_ops_work::transfer::abe_rekey::{RekeyOperation, RekeyProgress};
+use aruna_ops_data::s3::abe_copies::CompleteCopiesOperation;
+use aruna_ops_data::s3::bucket::key::unlock::{UnlockBucketOperation, UnlockInput};
+use aruna_ops_data::transfer::abe_rekey::{RekeyOperation, RekeyProgress};
+use aruna_ops_identity::abe::member::MemberKeysOperation;
+use aruna_ops_identity::abe::reissue::ReissueOperation;
+use aruna_ops_identity::abe::{KeyAction, KeyError, KeyOperation, KeyResult};
 use aruna_runner::driver::{DriverContext, drive};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -599,7 +599,7 @@ async fn abe_restart_child() -> TestResult<()> {
 #[test]
 fn abe_scopes() {
     use aruna_core::structs::identity::auth::{PathRestriction, Permission, Role};
-    use aruna_ops_work::auth::permission_rules::{CollectedRole, PermissionRules};
+    use aruna_ops_identity::auth::permission_rules::{CollectedRole, PermissionRules};
     use std::collections::{HashMap, HashSet};
     let root = "/realm/g/group/data/node/bucket";
     let role = |patterns: &[(&str, Permission)], direct, public| CollectedRole {

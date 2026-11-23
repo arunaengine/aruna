@@ -22,25 +22,25 @@ use aruna_core::structs::storage::replication_queue::{ReplicateScopeInput, Repli
 use aruna_core::structs::sync_relationship::{
     ReferenceHandling, SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
-use aruna_ops_work::replication::mirror_repair::kick::KickRepairOperation;
-use aruna_ops_work::replication::mirror_repair::record::MirrorRecordOperation;
-use aruna_ops_work::replication::mirror_repair::remove::RemoveMirrorOperation;
-use aruna_ops_work::replication::mirror_repair::request::MirrorRequestOperation;
-use aruna_ops_work::replication::mirror_repair::status::StoreStatusOperation;
-use aruna_ops_work::replication::parking::AwaitingJobsOperation;
-use aruna_ops_work::replication::plaintext::{
+use aruna_ops_data::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_ops_data::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_ops_data::replication::mirror_repair::remove::RemoveMirrorOperation;
+use aruna_ops_data::replication::mirror_repair::request::MirrorRequestOperation;
+use aruna_ops_data::replication::mirror_repair::status::StoreStatusOperation;
+use aruna_ops_data::replication::parking::AwaitingJobsOperation;
+use aruna_ops_data::replication::plaintext::{
     ConsentReadOperation, ConsentStoreOperation, EncryptionCheckOperation, consent_delete,
     consent_write, relationship_consent,
 };
-use aruna_ops_work::replication::queue::JobStatsOperation;
-use aruna_ops_work::replication::queue::QueueBlobOperation;
-use aruna_ops_work::replication::sync_relationship::create::CreateRelationshipOperation;
-use aruna_ops_work::replication::sync_relationship::delete::DeleteRelationshipOperation;
-use aruna_ops_work::replication::sync_relationship::get::GetRelationshipOperation;
-use aruna_ops_work::replication::sync_relationship::list::ListRelationshipsOperation;
-use aruna_ops_work::replication::sync_relationship::remove::RemoveOutgoingOperation;
-use aruna_ops_work::replication::sync_relationship::store::StoreRelationshipOperation;
-use aruna_ops_work::replication::sync_relationship::{
+use aruna_ops_data::replication::queue::JobStatsOperation;
+use aruna_ops_data::replication::queue::QueueBlobOperation;
+use aruna_ops_data::replication::sync_relationship::create::CreateRelationshipOperation;
+use aruna_ops_data::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use aruna_ops_data::replication::sync_relationship::get::GetRelationshipOperation;
+use aruna_ops_data::replication::sync_relationship::list::ListRelationshipsOperation;
+use aruna_ops_data::replication::sync_relationship::remove::RemoveOutgoingOperation;
+use aruna_ops_data::replication::sync_relationship::store::StoreRelationshipOperation;
+use aruna_ops_data::replication::sync_relationship::{
     SyncRelationshipDirection, SyncRelationshipError,
 };
 use aruna_runner::driver::{drive, drive_retry};

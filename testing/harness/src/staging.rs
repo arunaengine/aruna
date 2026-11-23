@@ -22,21 +22,21 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::time::unix_timestamp_millis;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::connectors::create_connector::{
+use aruna_ops_data::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::groups::routing::BucketRules;
-use aruna_ops_work::groups::routing::SnapshotOperation;
-use aruna_ops_work::metadata::api::object_search::search_objects;
-use aruna_ops_work::metadata::api::search_types::{ObjectQueryMode, SearchQueryRequest};
-use aruna_ops_work::placement::policy::gate::GateOperation;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::object::head::HeadObjectInput;
-use aruna_ops_work::s3::object::head::HeadObjectOperation;
-use aruna_ops_work::s3::object::put::PutObjectConfig;
-use aruna_ops_work::s3::object::put::PutObjectInput;
-use aruna_ops_work::s3::object::put::PutObjectOperation;
+use aruna_ops_data::metadata::api::object_search::search_objects;
+use aruna_ops_data::metadata::api::search_types::{ObjectQueryMode, SearchQueryRequest};
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::object::head::HeadObjectInput;
+use aruna_ops_data::s3::object::head::HeadObjectOperation;
+use aruna_ops_data::s3::object::put::PutObjectConfig;
+use aruna_ops_data::s3::object::put::PutObjectInput;
+use aruna_ops_data::s3::object::put::PutObjectOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::groups::routing::BucketRules;
+use aruna_ops_identity::groups::routing::SnapshotOperation;
+use aruna_ops_identity::placement::policy::gate::GateOperation;
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
@@ -363,7 +363,7 @@ pub struct Fixture {
 impl Fixture {
     pub async fn new(endpoint: &str, table: serde_json::Value) -> Self {
         use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-        use aruna_ops_work::connectors::create_connector::{
+        use aruna_ops_data::connectors::create_connector::{
             SourceConnectorInput, SourceConnectorOperation,
         };
 
@@ -526,7 +526,7 @@ impl Fixture {
 
     /// The whole object read through the ordinary read, or why it was refused.
     pub async fn read(&self, key: &str) -> Result<Vec<u8>, String> {
-        use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
+        use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
         use futures_util::StreamExt;
         let auth = &self.spec.auth_context;
         let input = GetObjectInput {

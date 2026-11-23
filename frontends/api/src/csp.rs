@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::server::state::ServerState;
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};

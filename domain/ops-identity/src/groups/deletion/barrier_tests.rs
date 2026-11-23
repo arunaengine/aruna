@@ -26,8 +26,8 @@ use super::tests::{commit, prepare};
 use crate::groups::fence::GroupWriteOperation;
 use crate::onboarding::issue_ticket::{IssueSyncInput, IssueSyncOperation};
 use crate::realm::ensure_config::{EnsureConfigError, EnsureConfigOperation, EnsureConfigParams};
+use crate::tests::deletion::{Fixture, context, node, read, write};
 use aruna_runner::driver::drive;
-use aruna_test_harness::groups::{Fixture, context, node, read, write};
 
 fn enrollment(fixture: &Fixture) -> EnsureConfigOperation {
     EnsureConfigOperation::new(EnsureConfigParams {
@@ -234,96 +234,4 @@ async fn ticket_installs_tombstone() {
         .await,
         Err(GroupDeletionError::Invalid(_))
     ));
-}
-
-#[tokio::test]
-async fn replacement_cannot_reopen() {
-    use aruna_core::handle::Handle;
-    use aruna_core::keyspaces::SOURCE_INDEX_KEYSPACE;
-    use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_ops_data::connectors::create_connector::{
-        SourceConnectorInput, SourceConnectorOperation,
-    };
-    use aruna_ops_data::connectors::delete_connector::{DeleteSourceInput, DeleteSourceOperation};
-    use aruna_ops_data::connectors::replace_connector::{
-        ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
-    };
-    use aruna_ops_data::connectors::repository::{
-        parse_secret_read, read_secret_effect, source_connector_key,
-    };
-    use std::collections::HashMap;
-
-    for rotate_secret in [false, true] {
-        let fixture = Fixture::new(&[1]).await;
-        let created = drive(
-            SourceConnectorOperation::new(SourceConnectorInput {
-                group_id: fixture.plan.group_id,
-                created_by: fixture.actor.user_id,
-                name: "Before".into(),
-                kind: SourceConnectorKind::Http,
-                public_config: HashMap::from([("endpoint".into(), "https://example.org".into())]),
-                secret_config: HashMap::new(),
-            }),
-            &fixture.context,
-        )
-        .await
-        .unwrap();
-        let connector_id = created.connector.connector_id;
-        let mut operation = CallRun::new(ReplaceSourceOperation::new(ReplaceSourceInput {
-            group_id: fixture.plan.group_id,
-            connector_id,
-            name: "After".into(),
-            kind: SourceConnectorKind::Http,
-            public_config: created.connector.public_config,
-            secret_config: if rotate_secret {
-                HashMap::from([("token".into(), "replacement".into())])
-            } else {
-                HashMap::new()
-            },
-        }));
-        let mut effects = VecDeque::from_iter(operation.start());
-        let mut deleted = false;
-        while !operation.is_complete() {
-            let Effect::Storage(effect) = effects.pop_front().expect("replacement must progress")
-            else {
-                panic!("unexpected replacement effect");
-            };
-            if !deleted && matches!(&effect, StorageEffect::VaultRead { .. }) {
-                drive(
-                    DeleteSourceOperation::new(DeleteSourceInput {
-                        group_id: fixture.plan.group_id,
-                        connector_id,
-                    }),
-                    &fixture.context,
-                )
-                .await
-                .unwrap();
-                let proof = prepare(&fixture, 1).await.unwrap();
-                commit(&fixture, vec![proof]).await.unwrap();
-                deleted = true;
-            }
-            let event = fixture
-                .context
-                .storage_handle
-                .send_storage_effect(effect)
-                .await;
-            effects.extend(operation.step(event));
-        }
-        assert!(deleted);
-        assert!(matches!(
-            operation.finalize(),
-            Err(ReplaceSourceError::StorageError(
-                StorageError::TransactionConflict
-            ))
-        ));
-        let key = source_connector_key(fixture.plan.group_id, connector_id);
-        let record = read(&fixture.context, SOURCE_INDEX_KEYSPACE, key.to_vec()).await;
-        assert!(record.is_none());
-        let secret = fixture
-            .context
-            .storage_handle
-            .send_effect(read_secret_effect(connector_id, None))
-            .await;
-        assert!(parse_secret_read(secret, connector_id).unwrap().is_none());
-    }
 }

@@ -24,34 +24,34 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::usage::usage_group_key;
 use aruna_core::types::RoleId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::request_authorization::AuthorizeEitherOperation;
-use aruna_ops_work::device_node::realm_documents::install_group_docs;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use aruna_ops_work::git::GitError;
-use aruna_ops_work::git::location::{check_default, group_default};
-use aruna_ops_work::groups::add_member::{AddUserError, AddUserInput, AddUserOperation};
-use aruna_ops_work::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
-use aruna_ops_work::groups::create_group::{
+use aruna_ops_data::git::GitError;
+use aruna_ops_data::git::location::{check_default, group_default};
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::fanout_types::forwarded_bearer;
+use aruna_ops_data::metadata::stats::GroupPurposeOperation;
+use aruna_ops_data::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
+use aruna_ops_data::s3::object::pages::ListRequest;
+use aruna_ops_identity::auth::request_authorization::AuthorizeEitherOperation;
+use aruna_ops_identity::device_node::realm_documents::install_group_docs;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
+use aruna_ops_identity::groups::add_member::{AddUserError, AddUserInput, AddUserOperation};
+use aruna_ops_identity::groups::add_role::{AddRoleConfig, AddRoleError, AddRoleOperation};
+use aruna_ops_identity::groups::create_group::{
     CreateGroupConfig, CreateGroupError, CreateGroupOperation,
 };
-use aruna_ops_work::groups::forward::{ForwardGroupError, ForwardGroupOperation};
-use aruna_ops_work::groups::list_groups::ListGroupOperation;
-use aruna_ops_work::groups::remove_member::{
+use aruna_ops_identity::groups::forward::{ForwardGroupError, ForwardGroupOperation};
+use aruna_ops_identity::groups::list_groups::ListGroupOperation;
+use aruna_ops_identity::groups::remove_member::{
     RemoveFromError, RemoveFromInput, RemoveFromOperation,
 };
-use aruna_ops_work::groups::remove_role::{
+use aruna_ops_identity::groups::remove_role::{
     RemoveGroupConfig, RemoveGroupError, RemoveGroupOperation,
 };
-use aruna_ops_work::groups::update_group::{
+use aruna_ops_identity::groups::update_group::{
     GroupChange, UpdateGroupConfig, UpdateGroupError, UpdateGroupOperation, normalize_group_name,
 };
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::fanout_types::forwarded_bearer;
-use aruna_ops_work::metadata::stats::GroupPurposeOperation;
-use aruna_ops_work::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
-use aruna_ops_work::s3::object::pages::ListRequest;
-use aruna_ops_work::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_ops_identity::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_runner::driver::drive;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -1067,7 +1067,7 @@ pub async fn delete_group(
     let token =
         forwarded_bearer(bearer.as_ref().map(|bearer| bearer.as_str())).map_err(map_api_error)?;
     let ctx = state.get_ctx();
-    let delete = aruna_ops_work::groups::deletion::coordinator::DeleteGroupOperation::new(
+    let delete = aruna_ops_identity::groups::deletion::coordinator::DeleteGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         token,
@@ -1183,7 +1183,7 @@ pub async fn get_deletion_blockers(
     }
     let group_id = parse_group_id(&group_id)?;
     let ctx = state.get_ctx();
-    let check = aruna_ops_work::groups::deletion::check::CheckGroupOperation::new(
+    let check = aruna_ops_identity::groups::deletion::check::CheckGroupOperation::new(
         ctx.node_and_realm(),
         auth,
         group_id,
@@ -1374,7 +1374,7 @@ pub(crate) async fn run_group_usage(
     let local = crate::routes::info::load_usage_counters(state, usage_group_key(group_id)).await?;
     let realm = crate::routes::info::load_realm_usage(
         state,
-        aruna_ops_work::s3::realm_usage::RealmUsageScope::Group(group_id),
+        aruna_ops_data::s3::realm_usage::RealmUsageScope::Group(group_id),
     )
     .await?;
 

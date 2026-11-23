@@ -17,12 +17,12 @@ use aruna_core::compute::session::{EndReason, SessionAnswer, SessionRequest};
 use aruna_core::structs::execution::job::input::JobPayload;
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::{CONTENT_TYPE_KEY, key_content_type};
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_ops_work::jobs::command::{
     AcceptedExecution, CollisionPolicy, ExecutionInput, ExecutionOutput, ExecutionTarget,
     InputMode, SessionMountSpec, SubmitExecutionCommand, WorkspaceMode, WorkspaceSpec,
 };
 use aruna_ops_work::jobs::job::cancel::RoutedCancelOutcome;
-use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
 use aruna_runner::driver::drive;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;

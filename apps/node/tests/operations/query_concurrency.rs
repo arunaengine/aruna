@@ -27,8 +27,8 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::types::{GroupId, Key, Value};
-use aruna_ops_work::metadata::local_query::LocalQueryOperation;
-use aruna_ops_work::metadata::text_search::LocalSearchOperation;
+use aruna_ops_data::metadata::local_query::LocalQueryOperation;
+use aruna_ops_data::metadata::text_search::LocalSearchOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_storage::storage::worker::FjallStorage;
 use tempfile::TempDir;

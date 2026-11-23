@@ -33,29 +33,29 @@ use aruna_core::structs::storage::usage::{
     dirty_group_key, global_shard_keys, usage_bucket_key, usage_group_key, usage_snapshot_key,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::bucket::delete::DeleteBucketOperation;
-use aruna_ops_work::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
-use aruna_ops_work::s3::multipart::complete::{
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::bucket::delete::DeleteBucketOperation;
+use aruna_ops_data::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_ops_data::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
     CompleteUploadResult,
 };
-use aruna_ops_work::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
-use aruna_ops_work::s3::multipart::part_upload::{
+use aruna_ops_data::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_ops_data::s3::multipart::part_upload::{
     UploadPartInput, UploadPartOperation, UploadPartResult,
 };
-use aruna_ops_work::s3::object::delete::{
+use aruna_ops_data::s3::object::delete::{
     DeleteObjectInput, DeleteObjectOperation, DeleteObjectResult,
 };
-use aruna_ops_work::s3::object::put::{
+use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_ops_work::s3::policy::successor::{
+use aruna_ops_data::s3::policy::successor::{
     MintSuccessorOperation, SuccessorOutcome, SuccessorPlan,
 };
-use aruna_ops_work::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
-use aruna_ops_work::transfer::copy::{
+use aruna_ops_data::s3::realm_usage::{RealmUsageOperation, RealmUsageScope};
+use aruna_ops_data::s3::usage_rebuild::RebuildStatsOperation;
+use aruna_ops_data::transfer::copy::{
     CopyObjectInput, CopyReferences, CopyResultData, CopySourceConditions,
 };
 use aruna_p2p::NetHandle;
@@ -699,7 +699,7 @@ async fn uploads_count_records() {
     assert_eq!(uploads().await, 1);
     let later = aruna_clock::unix_timestamp_millis() + 365 * 24 * 3_600_000;
     drive(
-        aruna_ops_work::blob::cleanup::SweepUploadsOperation::new(later),
+        aruna_ops_data::blob::cleanup::SweepUploadsOperation::new(later),
         &h.driver,
     )
     .await
@@ -1025,7 +1025,7 @@ async fn copy_object(
     group_id: Ulid,
 ) -> CopyResultData {
     drive(
-        aruna_ops_work::transfer::copy::CopyObjectOperation::new(
+        aruna_ops_data::transfer::copy::CopyObjectOperation::new(
             CopyObjectInput {
                 source_bucket: bucket.to_string(),
                 source_key: source_key.to_string(),
@@ -1226,8 +1226,8 @@ async fn mint_books_bytes() {
 /// Leaves an offered directory observation as the head of an ordinary bucket:
 /// the offer is withdrawn, then its delete marker is deleted.
 async fn promote_observation(h: &Harness, bucket: &str, group_id: Ulid) {
-    use aruna_ops_work::staging::offer::run::{offer_directory, withdraw_offer};
-    use aruna_ops_work::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
+    use aruna_ops_data::staging::offer::run::{offer_directory, withdraw_offer};
+    use aruna_ops_data::staging::offered_directory::{OfferDirectoryInput, WithdrawOfferInput};
 
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("data.bin"), b"offered").unwrap();

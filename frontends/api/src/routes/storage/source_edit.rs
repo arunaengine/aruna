@@ -9,10 +9,10 @@ use aruna_core::errors::StorageError;
 use aruna_core::structs::execution::staging::SourceMapping;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, bucket_permission_path};
-use aruna_ops_work::connectors::get_connector::{
+use aruna_ops_data::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
 };
-use aruna_ops_work::s3::object::source::edit::{
+use aruna_ops_data::s3::object::source::edit::{
     SourceChange, SourceEditError, SourceEditInput, SourceEditOperation, SourceEditResult,
 };
 use aruna_runner::driver::drive;
@@ -28,7 +28,7 @@ use crate::auth::UnrestrictedAuth;
 use crate::auth::ensure_permission;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
-use aruna_ops_work::auth::request_authorization::rules_operation;
+use aruna_ops_identity::auth::request_authorization::rules_operation;
 
 /// Version rows one call reads; `next` continues after them.
 const PAGE: usize = 1000;

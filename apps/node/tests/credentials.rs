@@ -9,7 +9,7 @@ use aruna_core::auth::{MAX_TOKEN_LIFETIME, REVOCATION_GRACE_SECS};
 use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::blob::never_expiry;
-use aruna_ops_work::s3::access::cutoff::{CutoffSweepConfig, CutoffSweepOperation};
+use aruna_ops_data::s3::access::cutoff::{CutoffSweepConfig, CutoffSweepOperation};
 use aruna_runner::driver::drive;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use base64::engine::general_purpose::STANDARD;
@@ -904,7 +904,7 @@ async fn token_opens_scope() -> TestResult<()> {
         );
         let mut header = String::new();
         for (key, version) in ["allowed/a.txt", "other/b.txt"].into_iter().zip(&versions) {
-            let read = aruna_ops_work::abe::envelope::EnvelopeOperation::new(
+            let read = aruna_ops_identity::abe::envelope::EnvelopeOperation::new(
                 BUCKET.to_string(),
                 key.to_string(),
                 *version,
@@ -1059,7 +1059,7 @@ async fn token_needs_credential() -> TestResult<()> {
     use aruna_core::structs::identity::auth::AuthContext;
     use aruna_core::structs::storage::abe::AbeError;
     use aruna_core::structs::storage::abe_access::{GrantContext, KeyGrant, KeyIssuer};
-    use aruna_ops_work::abe::{KeyAction, KeyError, KeyOperation};
+    use aruna_ops_identity::abe::{KeyAction, KeyError, KeyOperation};
     use aruna_runner::driver::drive;
     const BUCKET: &str = "token-live";
     let seed = spawn_complete_seed().await?;

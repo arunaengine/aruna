@@ -36,7 +36,7 @@ use tempfile::tempdir;
 use ulid::Ulid;
 
 use super::{RebuildStatsError, RebuildStatsOperation};
-use crate::node::rebuild_counts::CounterDeltas;
+use crate::s3::rebuild_counts::CounterDeltas;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::{path_context, test_context};
 use aruna_storage::storage::handle::StorageHandle;
@@ -192,7 +192,7 @@ async fn fixture(ctx: &DriverContext) -> u64 {
     write(ctx, ABE_VERSION_KEYSPACE, row, envelope).await;
 
     let copy_key = version(ctx, "beta", "copy.bin", materialized(hash)).await;
-    let copy = aruna_ops_data::s3::abe_copies::copy_row(Ulid::generate(), &copy_key).unwrap();
+    let copy = crate::s3::abe_copies::copy_row(Ulid::generate(), &copy_key).unwrap();
     write(ctx, ABE_COPY_KEYSPACE, copy, vec![3; 70]).await;
     for index in 0..MARKERS {
         let marker = BlobVersion::deleted(now, Default::default());

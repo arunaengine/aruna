@@ -31,14 +31,14 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::delete_document::DeleteDocumentOperation;
-use aruna_ops_work::metadata::get_document::{GetDocumentError, GetDocumentOperation};
-use aruna_ops_work::metadata::list_documents::ListDocumentsOperation;
-use aruna_ops_work::metadata::registry_cache::RegistryReadOperation;
-use aruna_ops_work::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
+use aruna_ops_data::metadata::delete_document::DeleteDocumentOperation;
+use aruna_ops_data::metadata::get_document::{GetDocumentError, GetDocumentOperation};
+use aruna_ops_data::metadata::list_documents::ListDocumentsOperation;
+use aruna_ops_data::metadata::registry_cache::RegistryReadOperation;
+use aruna_ops_data::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;

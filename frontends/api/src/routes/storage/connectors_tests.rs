@@ -188,7 +188,7 @@ async fn check_returns_failure() {
 
 #[test]
 fn check_maps_unreachable() {
-    let error = aruna_ops_work::staging::check_source::CheckSourceError::Staging(
+    let error = aruna_ops_data::staging::check_source::CheckSourceError::Staging(
         aruna_core::errors::StagingSourceError::CheckError("connection refused".to_string()),
     );
 
@@ -199,7 +199,7 @@ fn check_maps_unreachable() {
 #[test]
 fn check_names_setting() {
     use aruna_core::errors::StagingSourceError;
-    use aruna_ops_work::staging::check_source::CheckSourceError;
+    use aruna_ops_data::staging::check_source::CheckSourceError;
     let missing = CheckSourceError::Staging(StagingSourceError::MissingSetting("region"));
     let failed = StagingSourceError::OperatorCreationFailed("secret-marker".to_string());
 

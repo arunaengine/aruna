@@ -9,8 +9,8 @@ use aruna_core::permission_path::readable_roots;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction, Permission};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::UserAccess;
-use aruna_ops_work::auth::permission_rules::PermissionRules;
-use aruna_ops_work::auth::request_authorization::rules_operation;
+use aruna_ops_identity::auth::permission_rules::PermissionRules;
+use aruna_ops_identity::auth::request_authorization::rules_operation;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::driver::drive;
 use s3s::{S3Result, s3_error};
@@ -114,7 +114,7 @@ pub(super) async fn resolve_scope(
 mod tests {
     use super::SubpathScope;
     use aruna_core::structs::identity::auth::{PathRestriction, Permission, Role};
-    use aruna_ops_work::auth::permission_rules::{CollectedRole, PermissionRules};
+    use aruna_ops_identity::auth::permission_rules::{CollectedRole, PermissionRules};
 
     fn test_scope(
         patterns: &[(&str, Permission)],

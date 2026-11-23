@@ -482,7 +482,7 @@ async fn unique_upload_names() {
     .unwrap();
     let visit = open(&node, &link.token, None).await.unwrap();
     // A running upload holds its name, so the next one takes another.
-    let claim = aruna_ops_work::shares::names::ClaimNameOperation::new(
+    let claim = aruna_ops_data::shares::names::ClaimNameOperation::new(
         BUCKET,
         "drop/a.txt",
         unix_timestamp_secs(),
@@ -648,7 +648,7 @@ async fn deactivation_ends_open() {
         realm_id: node.owner.realm_id,
     };
     let bytes = account.to_bytes(&actor).unwrap();
-    let write = aruna_ops_work::document_repository::write_effect(&creator, bytes, None);
+    let write = aruna_ops_identity::document_repository::write_effect(&creator, bytes, None);
     let Effect::Storage(write) = write else {
         panic!("a user document is one storage write");
     };

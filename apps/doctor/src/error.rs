@@ -6,7 +6,7 @@ use crate::explorer::ExplorerError;
 use aruna_config::SetupError;
 use aruna_config::portal::PortalArtifactError;
 use aruna_core::onboarding::OnboardingSecretError;
-use aruna_ops_work::auth::create_token::CreateTokenError;
+use aruna_ops_identity::auth::create_token::CreateTokenError;
 use aruna_storage::errors::StorageLibError;
 use aruna_storage::snapshot::SnapshotError;
 use thiserror::Error;

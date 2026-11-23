@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNo
 use aruna_core::structs::placement::record::{PlacementRef, PlacementStrategy};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_runner::driver::drive;
@@ -21,10 +21,10 @@ use crate::topology::store_realm_config;
 use crate::topology::{
     TestNode, announce_nodes, install_default_config, spawn_replica, spawn_replicas,
 };
-use aruna_ops_work::shard::AssembleManifestOperation;
-use aruna_ops_work::shard::client::FetchManifestOperation;
-use aruna_ops_work::shard::verify::ShardVerifiedOperation;
-use aruna_ops_work::shard::verify::VerifyHeldOperation;
+use aruna_ops_identity::shard::AssembleManifestOperation;
+use aruna_ops_identity::shard::client::FetchManifestOperation;
+use aruna_ops_identity::shard::verify::ShardVerifiedOperation;
+use aruna_ops_identity::shard::verify::VerifyHeldOperation;
 
 #[tokio::test]
 async fn rejects_nonrealm_peer() -> Result<(), Box<dyn std::error::Error>> {

@@ -22,15 +22,15 @@ use crate::metadata::model::{ProfilePreviewRequest, ProfilePreviewResponse};
 use crate::metadata::{ensure_metadata_scope, forwarded_auth_token};
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_ops_work::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
-use aruna_ops_work::device::enqueue_draft::{
+use aruna_ops_data::device::delete_draft::{DeleteDraftError, DeleteDraftOperation};
+use aruna_ops_data::device::enqueue_draft::{
     EnqueueDraftError, EnqueueDraftInput, EnqueueDraftOperation,
 };
-use aruna_ops_work::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
-use aruna_ops_work::device::list_drafts::ListDraftsOperation;
-use aruna_ops_work::device::publish_queue::{PublishEntry, PublishState, token_issued_at};
-use aruna_ops_work::metadata::profile::validation::ProfileAssessOperation;
-use aruna_ops_work::metadata::public_preview::RestrictedFilesOperation;
+use aruna_ops_data::device::inspect_draft::{InspectDraftError, InspectDraftOperation};
+use aruna_ops_data::device::list_drafts::ListDraftsOperation;
+use aruna_ops_data::device::publish_queue::{PublishEntry, PublishState, token_issued_at};
+use aruna_ops_data::metadata::profile::validation::ProfileAssessOperation;
+use aruna_ops_data::metadata::public_preview::RestrictedFilesOperation;
 use aruna_runner::driver::drive;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {

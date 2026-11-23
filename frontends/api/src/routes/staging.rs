@@ -36,26 +36,26 @@ use aruna_core::structs::execution::table::{
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::bucket_permission_path;
 use aruna_core::structs::storage::distribution::route::ReadRoute;
-use aruna_ops_work::auth::request_authorization::rules_operation;
-use aruna_ops_work::connectors::get_connector::{GetSourceOperation, GetSourceResult};
-use aruna_ops_work::distribution::routing::{bound_view, route_read};
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::replication::live_queue::QueueLiveOperation;
-use aruna_ops_work::s3::object::head_source::HeadSourceError;
-use aruna_ops_work::s3::object::list::{
+use aruna_ops_data::connectors::get_connector::{GetSourceOperation, GetSourceResult};
+use aruna_ops_data::distribution::routing::{bound_view, route_read};
+use aruna_ops_data::replication::live_queue::QueueLiveOperation;
+use aruna_ops_data::s3::object::head_source::HeadSourceError;
+use aruna_ops_data::s3::object::list::{
     ListBucketInput, ListBucketOperation, ListContinuationToken,
 };
-use aruna_ops_work::s3::object::put::PutObjectError;
-use aruna_ops_work::s3::object::reference::{
+use aruna_ops_data::s3::object::put::PutObjectError;
+use aruna_ops_data::s3::object::reference::{
     MaterializeReferenceError, MaterializeReferenceInput, MaterializeReferenceOperation,
 };
-use aruna_ops_work::staging::list_source::{
+use aruna_ops_data::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
 };
-use aruna_ops_work::staging::read_source::ReadSourceError;
-use aruna_ops_work::staging::snapshot::{
+use aruna_ops_data::staging::read_source::ReadSourceError;
+use aruna_ops_data::staging::snapshot::{
     MaterializeSnapshotError, MaterializeSnapshotInput, stage_snapshot_blob,
 };
+use aruna_ops_identity::auth::request_authorization::rules_operation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_runner::driver::{drive, node_routing};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -1662,7 +1662,7 @@ async fn local_connector(
     group_id: aruna_core::types::GroupId,
     connector_id: ulid::Ulid,
 ) -> ServerResult<GetSourceResult> {
-    use aruna_ops_work::connectors::get_connector::{GetSourceError, GetSourceInput};
+    use aruna_ops_data::connectors::get_connector::{GetSourceError, GetSourceInput};
     let input = GetSourceInput {
         group_id,
         connector_id,

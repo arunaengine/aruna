@@ -9,8 +9,8 @@ use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, EntrySide, EntryState, FolderMode, FolderState,
     ReplaceReason, SyncActionRecord, SyncBase, SyncedFolder,
 };
-use aruna_ops_work::device::sync::folders::FolderCounters;
-use aruna_ops_work::device::sync::repository::{SyncUpload, UploadState};
+use aruna_ops_data::device::sync::folders::FolderCounters;
+use aruna_ops_data::device::sync::repository::{SyncUpload, UploadState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

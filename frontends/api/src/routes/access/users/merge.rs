@@ -15,9 +15,11 @@ use aruna_core::link::fresh_local;
 use aruna_core::metadata::AuthToken;
 use aruna_core::structs::identity::auth::{AuthContext, oidc_subject_key};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::users::merge::handoff::{HandoffConfig, HandoffOperation};
-use aruna_ops_work::users::merge::{MergeError, MergeUsersConfig, MergeUsersOperation};
-use aruna_ops_work::users::update_user::{UpdateUserError, UpdateUserInput, UpdateUserOperation};
+use aruna_ops_identity::users::merge::handoff::{HandoffConfig, HandoffOperation};
+use aruna_ops_identity::users::merge::{MergeError, MergeUsersConfig, MergeUsersOperation};
+use aruna_ops_identity::users::update_user::{
+    UpdateUserError, UpdateUserInput, UpdateUserOperation,
+};
 use aruna_runner::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;

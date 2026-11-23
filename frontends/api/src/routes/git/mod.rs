@@ -15,7 +15,7 @@ use crate::auth::map_authorize_error;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::GitNode;
-use aruna_ops_work::git::{self, GitError};
+use aruna_ops_data::git::{self, GitError};
 use aruna_runner::driver::{drive, node_routing};
 use axum::extract::{Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};

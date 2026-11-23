@@ -8,7 +8,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::placement::transition::{preview_transition, transition_health};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::placement::transition::TransitionLimits;
-use aruna_ops_work::realm::mutate_placement::RealmPlacementMutation;
+use aruna_ops_identity::realm::mutate_placement::RealmPlacementMutation;
 
 use topology::{TestResult, Topology};
 

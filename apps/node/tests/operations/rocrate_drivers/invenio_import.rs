@@ -88,8 +88,8 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         matches!(
             denied,
-            Err(aruna_ops_work::metadata::api::MetadataApiError::Forbidden
-                | aruna_ops_work::metadata::api::MetadataApiError::Unauthorized)
+            Err(aruna_ops_data::metadata::api::MetadataApiError::Forbidden
+                | aruna_ops_data::metadata::api::MetadataApiError::Unauthorized)
         ),
         "{denied:?}"
     );
@@ -101,7 +101,7 @@ async fn invenio_history_imports() -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(object_versions(&fixture, &key).await?.len(), 1);
         let provenance = format!("imported/versions/{id}/invenio-record.json");
         assert_eq!(object_versions(&fixture, &provenance).await?.len(), 1);
-        use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
+        use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
         let mut object = drive(
             GetObjectOperation::new(GetObjectInput {
                 bucket: BUCKET.into(),
@@ -182,7 +182,7 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
             _ => panic!("redirected import did not complete"),
         }
         if mode == ImportMode::Reference {
-            use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
+            use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
             let mut object = drive(
                 GetObjectOperation::new(GetObjectInput {
                     bucket: BUCKET.into(),
@@ -226,7 +226,7 @@ async fn invenio_follows_redirects() -> Result<(), Box<dyn std::error::Error>> {
 #[tokio::test]
 async fn invenio_import_modes() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::{ImportMode, ImportOptions};
-    use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
+    use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
     for mode in [ImportMode::Metadata, ImportMode::Reference] {
         let fixture = build_fixture(false).await?;
         let server = serve(Repository {
@@ -578,7 +578,7 @@ async fn start_update(
 async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::list_links;
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_ops_work::metadata::revision_read::RawViewOperation;
+    use aruna_ops_data::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let (ctx, update, _) = start_update(&fixture, &server).await?;
@@ -626,7 +626,7 @@ async fn invenio_pull_updates() -> Result<(), Box<dyn std::error::Error>> {
 /// Adds a contextual entity through the normal update, without materializing it.
 async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::error::Error>> {
     use aruna_core::metadata::api::UpdateDocumentMutation;
-    use aruna_ops_work::metadata::update_document::{
+    use aruna_ops_data::metadata::update_document::{
         UpdateDocumentConfig, UpdateDocumentOperation,
     };
     let note =
@@ -651,7 +651,7 @@ async fn add_note(fixture: &Fixture, name: &str) -> Result<Ulid, Box<dyn std::er
 #[tokio::test]
 async fn pull_keeps_edit() -> Result<(), Box<dyn std::error::Error>> {
     use aruna_core::repository::invenio::crate_versions;
-    use aruna_ops_work::metadata::revision_read::RawViewOperation;
+    use aruna_ops_data::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let (ctx, update, _) = start_update(&fixture, &server).await?;
@@ -708,8 +708,8 @@ async fn pause_stops_pull() -> Result<(), Box<dyn std::error::Error>> {
     use super::driven::{change_link, list_links};
     use aruna_core::repository::invenio::crate_versions;
     use aruna_core::repository::link::{LinkPatch, LinkStatus};
+    use aruna_ops_data::metadata::revision_read::RawViewOperation;
     use aruna_ops_work::jobs::repository::links::LinkChange;
-    use aruna_ops_work::metadata::revision_read::RawViewOperation;
     let fixture = build_fixture(false).await?;
     let server = serve(Repository::default()).await;
     let (ctx, update, first) = start_update(&fixture, &server).await?;

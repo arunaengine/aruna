@@ -15,16 +15,16 @@ use aruna_core::structs::storage::blob::{BlobHeadKey, common_prefix_of};
 use aruna_core::structs::storage::listing::{
     ListUploadsResult, ListVersionsItem, ListVersionsResult,
 };
-use aruna_ops_work::auth::request_authorization::BucketAccess;
-use aruna_ops_work::s3::multipart::parts::ListPartsResult;
-use aruna_ops_work::s3::object::list::ListedObject;
-use aruna_ops_work::s3::object::list::{
+use aruna_ops_data::s3::multipart::parts::ListPartsResult;
+use aruna_ops_data::s3::object::list::ListedObject;
+use aruna_ops_data::s3::object::list::{
     ListBucketInput, ListContinuationToken, decode_list_token, encode_list_token,
 };
-use aruna_ops_work::s3::object::visible::{
+use aruna_ops_data::s3::object::visible::{
     HiddenCursor, LinkShows, ListingKeys, NextPage, RecordSource, VisibleError,
     VisiblePageOperation,
 };
+use aruna_ops_identity::auth::request_authorization::BucketAccess;
 use aruna_runner::driver::drive;
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{
@@ -493,7 +493,7 @@ impl ArunaS3Service {
 #[cfg(test)]
 mod tests {
     use aruna_core::structs::storage::blob::BlobHeadKey;
-    use aruna_ops_work::s3::object::member::merge::merged_marker as scoped_marker;
+    use aruna_ops_data::s3::object::member::merge::merged_marker as scoped_marker;
 
     #[test]
     fn prefix_token_precedence() {

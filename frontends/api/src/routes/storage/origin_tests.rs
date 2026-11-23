@@ -306,7 +306,7 @@ fn view_keeps_fields() {
             relationship_id: Ulid::from_bytes([47; 16]),
             from: OriginVersion::Global(global.clone()),
         }),
-        source: Some(aruna_ops_work::transfer::origin::SourceView {
+        source: Some(aruna_ops_data::transfer::origin::SourceView {
             url: Some("https://s3.example.org/a".to_string()),
             path: "a".to_string(),
             version: None,
@@ -317,13 +317,13 @@ fn view_keeps_fields() {
                 (ChecksumAlgorithm::Sha1, listing),
             ],
             sources: vec![
-                aruna_ops_work::transfer::origin::SourcePlace {
+                aruna_ops_data::transfer::origin::SourcePlace {
                     url: Some("https://s3.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: None,
                     connector_name: None,
                 },
-                aruna_ops_work::transfer::origin::SourcePlace {
+                aruna_ops_data::transfer::origin::SourcePlace {
                     url: Some("https://mirror.example.org/a".to_string()),
                     path: "a".to_string(),
                     connector_id: Some(Ulid::from_bytes([48; 16])),
@@ -585,7 +585,7 @@ async fn by_version(
     if let Some(named) = named {
         let value = named.to_string().parse().unwrap();
         headers.insert(
-            aruna_ops_work::s3::object::member::rest::RELAY_NODE_HEADER,
+            aruna_ops_data::s3::object::member::rest::RELAY_NODE_HEADER,
             value,
         );
     }

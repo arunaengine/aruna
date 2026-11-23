@@ -8,8 +8,8 @@ use crate::server::state::ServerState;
 use aruna_core::errors::StorageError;
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
-use aruna_ops_work::realm::ensure_config::EnsureConfigError;
-use aruna_ops_work::realm::promote_node::{
+use aruna_ops_identity::realm::ensure_config::EnsureConfigError;
+use aruna_ops_identity::realm::promote_node::{
     PromoteNodeConfig, PromoteNodeError, PromoteNodeOperation,
 };
 use aruna_runner::driver::drive;

@@ -8,9 +8,9 @@ use crate::topology::{TestNode, install_replica_config, spawn_replicas};
 use aruna_core::structs::identity::auth::PathRestriction;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::s3::access::create::{CreateUserConfig, CreateUserOperation};
-use aruna_ops_work::s3::access::get::GetAccessOperation;
-use aruna_ops_work::s3::access::revoke::RevokeUserOperation;
+use aruna_ops_data::s3::access::create::{CreateUserConfig, CreateUserOperation};
+use aruna_ops_data::s3::access::get::GetAccessOperation;
+use aruna_ops_data::s3::access::revoke::RevokeUserOperation;
 use aruna_runner::driver::drive;
 use aruna_test_harness::documents::sync_topics;
 use ulid::Ulid;
@@ -68,7 +68,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     assert!(matches!(
         remote,
-        Err(aruna_ops_work::s3::access::get::GetAccessError::NotFound)
+        Err(aruna_ops_data::s3::access::get::GetAccessError::NotFound)
     ));
 
     drive(
@@ -84,7 +84,7 @@ async fn credential_stays_local() -> Result<(), Box<dyn std::error::Error>> {
     .await;
     assert!(matches!(
         revoked,
-        Err(aruna_ops_work::s3::access::get::GetAccessError::NotFound)
+        Err(aruna_ops_data::s3::access::get::GetAccessError::NotFound)
     ));
 
     shutdown_nodes(nodes).await;

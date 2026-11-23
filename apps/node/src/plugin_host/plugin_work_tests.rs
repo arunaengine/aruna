@@ -198,9 +198,9 @@ async fn marked_source_refused() {
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_core::install_work::WorkKind;
+    use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
     use aruna_ops_work::plugins::marks::{MARKED, Mark, mark_row};
     use aruna_ops_work::plugins::rows::write_rows;
-    use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
     use aruna_plugin_contract::calls::Intent;
     use aruna_runner::driver::drive;
     use aruna_wasm_host::broker::JobCopy;
@@ -313,10 +313,10 @@ async fn versioned_info() {
 
     use crate::plugin_host::broker::RunBroker;
     use aruna_core::install_work::WorkKind;
+    use aruna_ops_data::s3::object::put::PutObjectOperation;
+    use aruna_ops_data::testing_objects::put_config;
     use aruna_ops_work::plugins::marks::{Mark, mark_row};
     use aruna_ops_work::plugins::rows::write_rows;
-    use aruna_ops_work::s3::object::put::PutObjectOperation;
-    use aruna_ops_work::testing_objects::put_config;
     use aruna_runner::driver::drive;
     let fixture = Fixture::new().await;
     let (_root, blob, install, _) = ready_copy(&fixture).await;

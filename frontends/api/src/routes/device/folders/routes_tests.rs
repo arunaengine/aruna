@@ -18,7 +18,7 @@ use aruna_core::structs::synced_folder::{EntryState, SyncActionRecord, SyncBase,
 use aruna_core::task::TaskKey;
 use aruna_core::types::{Key, Value};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::device::sync::repository::{action_entry, base_entry, folder_entry};
+use aruna_ops_data::device::sync::repository::{action_entry, base_entry, folder_entry};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;
@@ -606,7 +606,7 @@ async fn sync_skips_scan() {
     .unwrap();
     assert_eq!(view.counters.observed, 0);
     let offers = aruna_runner::driver::drive(
-        aruna_ops_work::staging::offer::list::ListOffersOperation::new(),
+        aruna_ops_data::staging::offer::list::ListOffersOperation::new(),
         &fixture.state.get_ctx(),
     )
     .await

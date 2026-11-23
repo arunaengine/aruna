@@ -11,11 +11,11 @@ use aruna_core::realm_vault::RealmVaultKey;
 use aruna_core::structs::execution::email::{RealmEmailProfile, SmtpTls};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::placement::policy::document::policy_admin_path;
-use aruna_ops_work::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_ops_work::notifications::email::{CheckSmtpOperation, RefreshMailOperation};
-use aruna_ops_work::realm::set_email::{
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::realm::set_email::{
     EmailInput, SetEmailConfig, SetEmailError, SetEmailOperation,
 };
+use aruna_ops_work::notifications::email::{CheckSmtpOperation, RefreshMailOperation};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::State;

@@ -294,10 +294,10 @@ mod tests {
     use aruna_core::structs::identity::auth::NodeCapabilities;
     use aruna_core::structs::identity::realm::RealmId;
     use aruna_core::testing::EnvGuard;
-    use aruna_ops_work::realm::announce_presence::{
+    use aruna_ops_identity::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
-    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};

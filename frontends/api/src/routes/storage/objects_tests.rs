@@ -11,7 +11,7 @@ use crate::tests::distributed::{
     replicate,
 };
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_ops_work::s3::object::pages::decode_resume;
+use aruna_ops_data::s3::object::pages::decode_resume;
 use axum::http::StatusCode;
 
 async fn store(node: &Node, keys: &[&str]) {
@@ -334,7 +334,7 @@ async fn unanswered_range_fails() {
 
 /// Writes a link at `key` in the test bucket to `target`, as the owner.
 async fn link(node: &Node, key: &str, target: aruna_core::structs::storage::link::LinkTarget) {
-    use aruna_ops_work::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_ops_data::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let write = ReferenceWrite {
         job_id: None,
         preassigned_version_id: None,
@@ -436,7 +436,7 @@ async fn hides_link_folders() {
 async fn merges_past_hidden() {
     // A local range that starts with more hidden entries than one request examines goes on
     // from this member's sealed cursor inside the merged cursor, then on to the peer's range.
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let node = node_state().await;
     store(&node, &["a.md"]).await;
     let hidden = aruna_core::structs::storage::link::LinkTarget {
@@ -489,7 +489,7 @@ async fn merges_past_hidden() {
 /// A replicated bucket whose coordinator cannot be reached: this member lists its copy, which
 /// starts with more hidden links than one request examines, and seals the range there.
 async fn sealed_copy_page() -> (Node, String, String) {
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let node = node_state().await;
     store(&node, &["z.md"]).await;
     let hidden = aruna_core::structs::storage::link::LinkTarget {

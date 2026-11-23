@@ -18,8 +18,8 @@ use aruna_core::structs::sync_quarantine::{
     build_quarantine_entries, quarantine_usage_entry,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage::worker::FjallStorage;

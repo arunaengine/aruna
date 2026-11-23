@@ -19,8 +19,8 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use aruna_ops_data::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
-use aruna_ops_data::s3::usage::{dirty_rows, schedule_snapshot_publish};
+use crate::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
+use crate::s3::usage::{dirty_rows, schedule_snapshot_publish};
 
 /// Rows one scan page reads.
 const PAGE_LIMIT: usize = 1_000;

@@ -11,13 +11,13 @@ use crate::server::state::ServerState;
 use aruna_core::join_request::{JoinDecisionKind, JoinRequestState};
 use aruna_core::request_policy::{PolicyRequestExtras, policy_request_with};
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
-use aruna_ops_work::auth::enforcement::EnforcePolicyOperation;
-use aruna_ops_work::auth::error::PolicyEnforcementError;
-use aruna_ops_work::groups::join_request::{
+use aruna_ops_identity::auth::enforcement::EnforcePolicyOperation;
+use aruna_ops_identity::auth::error::PolicyEnforcementError;
+use aruna_ops_identity::groups::join_request::{
     GroupJoinError, GroupJoinInput, GroupJoinOperation, JoinAction,
 };
-use aruna_ops_work::groups::list_requests::{ListJoinError, ListJoinInput, ListJoinOperation};
-use aruna_ops_work::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_ops_identity::groups::list_requests::{ListJoinError, ListJoinInput, ListJoinOperation};
+use aruna_ops_identity::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};

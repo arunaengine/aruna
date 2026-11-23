@@ -23,33 +23,35 @@ use aruna_core::structs::identity::realm::RealmAuthorizationDocument;
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::id::UserId;
 use aruna_core::user::validation::email_hash;
-use aruna_ops_work::auth::enforcement::EnforcePolicyOperation;
-use aruna_ops_work::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
-use aruna_ops_work::device_node::remove_node::{
+use aruna_ops_identity::auth::enforcement::EnforcePolicyOperation;
+use aruna_ops_identity::auth::token_subject::{SubjectCheckError, SubjectCheckOperation};
+use aruna_ops_identity::device_node::remove_node::{
     DeviceEvictionScope, RemoveNodeConfig, RemoveNodeError, RemoveNodeOperation,
 };
-use aruna_ops_work::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_ops_work::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_ops_work::groups::list_groups::ListGroupOperation;
-use aruna_ops_work::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
-use aruna_ops_work::onboarding::delete_secret::{
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupOperation};
+use aruna_ops_identity::groups::list_groups::ListGroupOperation;
+use aruna_ops_identity::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+use aruna_ops_identity::onboarding::delete_secret::{
     DeleteSecretError, DeleteSecretInput, DeleteSecretOperation,
 };
-use aruna_ops_work::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
-use aruna_ops_work::onboarding::list_secrets::{ListSecretsOperation, OnboardingSecretEntry};
-use aruna_ops_work::realm::read_authorization::{
+use aruna_ops_identity::onboarding::inspect_secret::{InspectSecretInput, InspectSecretOperation};
+use aruna_ops_identity::onboarding::list_secrets::{ListSecretsOperation, OnboardingSecretEntry};
+use aruna_ops_identity::realm::read_authorization::{
     ReadAuthorizationError, ReadAuthorizationOperation,
 };
-use aruna_ops_work::session::create::{CreateSessionConfig, CreateSessionError};
-use aruna_ops_work::session::limit::MakeRoomOperation;
-use aruna_ops_work::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
-use aruna_ops_work::users::get_user::{GetUserInput, GetUserOperation};
-use aruna_ops_work::users::list_users::{ListUsersInput, ListUsersOperation};
-use aruna_ops_work::users::oidc_user::{ResolveOidcError, ResolveOidcInput, ResolveOidcOperation};
-use aruna_ops_work::users::read_document::{ReadUserError, ReadUserOperation};
-use aruna_ops_work::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
-use aruna_ops_work::users::search_users::{SearchUsersInput, SearchUsersOperation};
-use aruna_ops_work::users::update_user::{UpdateUserInput, UpdateUserOperation};
+use aruna_ops_identity::session::create::{CreateSessionConfig, CreateSessionError};
+use aruna_ops_identity::session::limit::MakeRoomOperation;
+use aruna_ops_identity::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
+use aruna_ops_identity::users::get_user::{GetUserInput, GetUserOperation};
+use aruna_ops_identity::users::list_users::{ListUsersInput, ListUsersOperation};
+use aruna_ops_identity::users::oidc_user::{
+    ResolveOidcError, ResolveOidcInput, ResolveOidcOperation,
+};
+use aruna_ops_identity::users::read_document::{ReadUserError, ReadUserOperation};
+use aruna_ops_identity::users::resolve_users::{ResolveUsersInput, ResolveUsersOperation};
+use aruna_ops_identity::users::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_ops_identity::users::update_user::{UpdateUserInput, UpdateUserOperation};
 use aruna_runner::driver::drive;
 use aruna_wire::users::{GetTokenResponse, RegisterUserRequest, RegisterUserResponse};
 use axum::extract::{Path, Query, State};
@@ -821,7 +823,7 @@ async fn get_token(
 
     ensure_active(&state, user_id).await?;
     let now = now_timestamp();
-    let expiry = aruna_ops_work::session::create::bound_session_expiry(
+    let expiry = aruna_ops_identity::session::create::bound_session_expiry(
         now,
         query.expires_in_seconds,
         now.saturating_add(TOKEN_EXPIRY_SECONDS),
@@ -1035,16 +1037,20 @@ async fn patch_user_info(
     )
     .await
     .map_err(|err| match err {
-        aruna_ops_work::users::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_ops_work::users::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_ops_work::users::update_user::UpdateUserError::InvalidUserName
-        | aruna_ops_work::users::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_ops_work::users::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_ops_work::users::update_user::UpdateUserError::TooManyAttributes
-        | aruna_ops_work::users::update_user::UpdateUserError::ConversionError(_) => {
+        aruna_ops_identity::users::update_user::UpdateUserError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_ops_identity::users::update_user::UpdateUserError::UserNotFound => {
+            ServerError::NotFound
+        }
+        aruna_ops_identity::users::update_user::UpdateUserError::InvalidUserName
+        | aruna_ops_identity::users::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_ops_identity::users::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_ops_identity::users::update_user::UpdateUserError::TooManyAttributes
+        | aruna_ops_identity::users::update_user::UpdateUserError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_ops_work::users::update_user::UpdateUserError::AuthorizationError(_) => {
+        aruna_ops_identity::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),
@@ -1134,11 +1140,13 @@ pub async fn list_users(
     )
     .await
     .map_err(|err| match err {
-        aruna_ops_work::users::list_users::ListUsersError::Unauthorized => ServerError::Forbidden,
-        aruna_ops_work::users::list_users::ListUsersError::ConversionError(_) => {
+        aruna_ops_identity::users::list_users::ListUsersError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_ops_identity::users::list_users::ListUsersError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_ops_work::users::list_users::ListUsersError::AuthorizationError(_) => {
+        aruna_ops_identity::users::list_users::ListUsersError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),
@@ -1182,7 +1190,7 @@ pub(crate) async fn authorize_directory(
     )
     .await
     .map_err(|error| match error {
-        aruna_ops_work::auth::error::PolicyEnforcementError::Denied { .. } => {
+        aruna_ops_identity::auth::error::PolicyEnforcementError::Denied { .. } => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),
@@ -1458,8 +1466,8 @@ pub async fn get_user(
     )
     .await
     .map_err(|err| match err {
-        aruna_ops_work::users::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
-        aruna_ops_work::users::get_user::GetUserError::UserNotFound => ServerError::NotFound,
+        aruna_ops_identity::users::get_user::GetUserError::Unauthorized => ServerError::Forbidden,
+        aruna_ops_identity::users::get_user::GetUserError::UserNotFound => ServerError::NotFound,
         other => ServerError::InternalError(other.into()),
     })?;
 
@@ -1563,16 +1571,20 @@ pub async fn update_user(
     )
     .await
     .map_err(|err| match err {
-        aruna_ops_work::users::update_user::UpdateUserError::Unauthorized => ServerError::Forbidden,
-        aruna_ops_work::users::update_user::UpdateUserError::UserNotFound => ServerError::NotFound,
-        aruna_ops_work::users::update_user::UpdateUserError::InvalidUserName
-        | aruna_ops_work::users::update_user::UpdateUserError::InvalidAttributeKey(_)
-        | aruna_ops_work::users::update_user::UpdateUserError::InvalidAttributeValue(_)
-        | aruna_ops_work::users::update_user::UpdateUserError::TooManyAttributes
-        | aruna_ops_work::users::update_user::UpdateUserError::ConversionError(_) => {
+        aruna_ops_identity::users::update_user::UpdateUserError::Unauthorized => {
+            ServerError::Forbidden
+        }
+        aruna_ops_identity::users::update_user::UpdateUserError::UserNotFound => {
+            ServerError::NotFound
+        }
+        aruna_ops_identity::users::update_user::UpdateUserError::InvalidUserName
+        | aruna_ops_identity::users::update_user::UpdateUserError::InvalidAttributeKey(_)
+        | aruna_ops_identity::users::update_user::UpdateUserError::InvalidAttributeValue(_)
+        | aruna_ops_identity::users::update_user::UpdateUserError::TooManyAttributes
+        | aruna_ops_identity::users::update_user::UpdateUserError::ConversionError(_) => {
             ServerError::BadRequest
         }
-        aruna_ops_work::users::update_user::UpdateUserError::AuthorizationError(_) => {
+        aruna_ops_identity::users::update_user::UpdateUserError::AuthorizationError(_) => {
             ServerError::Forbidden
         }
         other => ServerError::InternalError(other.into()),

@@ -13,12 +13,12 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::CONTENT_TYPE_KEY;
 use aruna_core::structs::storage::object_read::ObjectInfo;
 use aruna_core::user::validation::RESERVED_PREFIX;
-use aruna_ops_work::s3::multipart::complete::CompleteUploadResult;
-use aruna_ops_work::s3::object::delete::bulk::BulkDeleteOutcome;
-use aruna_ops_work::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
-use aruna_ops_work::s3::object::get::GetObjectResult;
-use aruna_ops_work::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
-use aruna_ops_work::s3::object::put::PutObjectResult;
+use aruna_ops_data::s3::multipart::complete::CompleteUploadResult;
+use aruna_ops_data::s3::object::delete::bulk::BulkDeleteOutcome;
+use aruna_ops_data::s3::object::delete::{DeleteObjectError, DeleteObjectResult};
+use aruna_ops_data::s3::object::get::GetObjectResult;
+use aruna_ops_data::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use aruna_ops_data::s3::object::put::PutObjectResult;
 use aruna_runner::driver::{DriverContext, drive};
 use s3s::dto::{
     CompleteMultipartUploadOutput, DeleteObjectOutput, DeleteObjectsOutput, DeletedObject, ETag,

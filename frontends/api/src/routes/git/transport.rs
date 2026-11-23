@@ -10,7 +10,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::{GitEvent, GitRequest, MAX_GIT_BYTES};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_ops_work::git;
+use aruna_ops_data::git;
 use aruna_runner::driver::drive;
 use axum::Extension;
 use axum::body::{Body, Bytes, to_bytes};

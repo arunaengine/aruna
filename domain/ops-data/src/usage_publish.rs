@@ -24,11 +24,11 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use aruna_ops_data::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
-use aruna_ops_data::s3::usage::{
+use crate::s3::realm_usage::{RealmUsage, RealmUsageError, RealmUsageOperation};
+use crate::s3::usage::{
     LoadCountersError, global_shard_rows, global_sum, schedule_snapshot_publish,
 };
-use aruna_ops_data::transfer::replica_shares::{GroupShare, ReplicaSharesOperation};
+use crate::transfer::replica_shares::{GroupShare, ReplicaSharesOperation};
 use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsError, ReplicateDocumentsOperation,
 };

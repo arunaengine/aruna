@@ -7,7 +7,7 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::structs::identity::auth::{Actor, NodeCapabilities, SessionKind};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_runner::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;

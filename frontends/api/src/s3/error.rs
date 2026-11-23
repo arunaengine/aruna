@@ -12,34 +12,34 @@ use aruna_core::structs::storage::abe::AbeError;
 use aruna_core::structs::storage::distribution::route::RouteError;
 use aruna_core::structs::storage::encryption::BucketKeyError;
 use aruna_core::structs::storage::routing::RoutingError;
-use aruna_ops_work::distribution::guard::GuardError;
-use aruna_ops_work::distribution::inventory::InventoryError;
-use aruna_ops_work::groups::routing::RoutingInputsError;
-use aruna_ops_work::placement::policy::gate::{GateContextError, PolicyGateError};
-use aruna_ops_work::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
-use aruna_ops_work::s3::bucket::create::CreateBucketError;
-use aruna_ops_work::s3::bucket::delete::DeleteBucketError;
-use aruna_ops_work::s3::bucket::list::ListBucketsError;
-use aruna_ops_work::s3::imports::ImportRuleError;
-use aruna_ops_work::s3::multipart::abort::AbortUploadError;
-use aruna_ops_work::s3::multipart::complete::CompleteUploadError;
-use aruna_ops_work::s3::multipart::create::CreateMultipartError;
-use aruna_ops_work::s3::multipart::part_upload::UploadPartError;
-use aruna_ops_work::s3::multipart::parts::ListPartsError;
-use aruna_ops_work::s3::multipart::uploads::ListUploadsError;
-use aruna_ops_work::s3::object::attributes::GetAttributesError;
-use aruna_ops_work::s3::object::delete::DeleteObjectError;
-use aruna_ops_work::s3::object::get::GetObjectError;
-use aruna_ops_work::s3::object::head::HeadObjectError;
-use aruna_ops_work::s3::object::head_source::HeadSourceError;
-use aruna_ops_work::s3::object::list::ListBucketError;
-use aruna_ops_work::s3::object::put::PutObjectError;
-use aruna_ops_work::s3::object::reference::MaterializeReferenceError;
-use aruna_ops_work::s3::object::versions::ListVersionsError;
-use aruna_ops_work::s3::purge_fence::PurgeFenceError;
-use aruna_ops_work::s3::usage::UsageUpdateError;
-use aruna_ops_work::transfer::copy::CopyObjectError;
-use aruna_ops_work::transfer::part_copy::PartCopyError;
+use aruna_ops_data::distribution::guard::GuardError;
+use aruna_ops_data::distribution::inventory::InventoryError;
+use aruna_ops_data::s3::bucket::cors::{DeleteCorsError, GetCorsError, PutCorsError};
+use aruna_ops_data::s3::bucket::create::CreateBucketError;
+use aruna_ops_data::s3::bucket::delete::DeleteBucketError;
+use aruna_ops_data::s3::bucket::list::ListBucketsError;
+use aruna_ops_data::s3::imports::ImportRuleError;
+use aruna_ops_data::s3::multipart::abort::AbortUploadError;
+use aruna_ops_data::s3::multipart::complete::CompleteUploadError;
+use aruna_ops_data::s3::multipart::create::CreateMultipartError;
+use aruna_ops_data::s3::multipart::part_upload::UploadPartError;
+use aruna_ops_data::s3::multipart::parts::ListPartsError;
+use aruna_ops_data::s3::multipart::uploads::ListUploadsError;
+use aruna_ops_data::s3::object::attributes::GetAttributesError;
+use aruna_ops_data::s3::object::delete::DeleteObjectError;
+use aruna_ops_data::s3::object::get::GetObjectError;
+use aruna_ops_data::s3::object::head::HeadObjectError;
+use aruna_ops_data::s3::object::head_source::HeadSourceError;
+use aruna_ops_data::s3::object::list::ListBucketError;
+use aruna_ops_data::s3::object::put::PutObjectError;
+use aruna_ops_data::s3::object::reference::MaterializeReferenceError;
+use aruna_ops_data::s3::object::versions::ListVersionsError;
+use aruna_ops_data::s3::purge_fence::PurgeFenceError;
+use aruna_ops_data::s3::usage::UsageUpdateError;
+use aruna_ops_data::transfer::copy::CopyObjectError;
+use aruna_ops_data::transfer::part_copy::PartCopyError;
+use aruna_ops_identity::groups::routing::RoutingInputsError;
+use aruna_ops_identity::placement::policy::gate::{GateContextError, PolicyGateError};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use std::fmt::Display;
 use tracing::warn;
@@ -1300,7 +1300,7 @@ mod tests {
     fn maps_usage_failure() {
         // The counter fault must not leak a Rust error string to an S3 client.
         let error = DeleteObjectError::UsageUpdateError(
-            aruna_ops_work::s3::usage::UsageUpdateError::UnexpectedEvent(
+            aruna_ops_data::s3::usage::UsageUpdateError::UnexpectedEvent(
                 aruna_core::events::Event::blob(aruna_core::events::BlobEvent::DeleteFinished)
                     .label(),
             ),
@@ -1353,7 +1353,7 @@ mod tests {
     // clear is a 503: a wrong or moving coordinator, a missing record, a range just split.
     #[test]
     fn distributed_codes_stable() {
-        use aruna_ops_work::s3::multipart::create::CreateMultipartError;
+        use aruna_ops_data::s3::multipart::create::CreateMultipartError;
         let set_id = ulid::Ulid::from_bytes([5; 16]);
         let node_id = iroh::SecretKey::from_bytes(&[6; 32]).public();
         let retry = Some(http::StatusCode::SERVICE_UNAVAILABLE);

@@ -15,11 +15,11 @@ use aruna_core::metadata::{MetadataEffect, MetadataEvent};
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::get_document::GetDocumentOperation;
-use aruna_ops_work::metadata::list_documents::ListDocumentsOperation;
+use aruna_ops_data::metadata::get_document::GetDocumentOperation;
+use aruna_ops_data::metadata::list_documents::ListDocumentsOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::send_metadata_effect;
 use aruna_storage::storage::persistence::FjallPersistPolicy;

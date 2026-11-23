@@ -27,15 +27,15 @@ use aruna_core::structs::storage::distribution::delegation::{
 };
 use aruna_core::structs::storage::distribution::route::{ReadRoute, RouteError};
 use aruna_core::structs::storage::distribution::upload::UploadTag;
-use aruna_ops_work::distribution::guard::GuardError;
-use aruna_ops_work::distribution::routing::route_read;
-use aruna_ops_work::distribution::routing::{upload_route, upload_tag, upload_tags};
-use aruna_ops_work::s3::object::delete::bulk::BulkDeleteEntry;
-use aruna_ops_work::s3::object::member::read::MemberTarget as Forward;
-use aruna_ops_work::s3::object::member::read::{
+use aruna_ops_data::distribution::guard::GuardError;
+use aruna_ops_data::distribution::routing::route_read;
+use aruna_ops_data::distribution::routing::{upload_route, upload_tag, upload_tags};
+use aruna_ops_data::s3::object::delete::bulk::BulkDeleteEntry;
+use aruna_ops_data::s3::object::member::read::MemberTarget as Forward;
+use aruna_ops_data::s3::object::member::read::{
     MemberPayload as ForwardBody, MemberRequest as ForwardRequest, TrailerChecksum,
 };
-use aruna_ops_work::s3::object::member::write::{ForwardDeletesOperation, WriteTargetOperation};
+use aruna_ops_data::s3::object::member::write::{ForwardDeletesOperation, WriteTargetOperation};
 use http::{HeaderMap, Method};
 use s3s::dto::{
     DeleteObjectOutput, DeletedObject, ETag, Error as S3DeleteError, PutObjectOutput, StreamingBlob,

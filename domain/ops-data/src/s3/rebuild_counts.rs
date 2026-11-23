@@ -26,9 +26,9 @@ use aruna_core::types::{GroupId, Key, Value};
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::node::usage_rebuild::RebuildStatsError;
-use aruna_ops_data::s3::abe_copies::copy_version;
-use aruna_ops_data::s3::usage::StoredDelta;
+use crate::s3::abe_copies::copy_version;
+use crate::s3::usage::StoredDelta;
+use crate::s3::usage_rebuild::RebuildStatsError;
 
 /// Point reads of one page by keyspace and key; `None` for an absent row.
 pub(crate) type Joined = HashMap<(&'static str, Vec<u8>), Option<Value>>;

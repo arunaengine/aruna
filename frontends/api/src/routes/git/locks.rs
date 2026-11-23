@@ -7,7 +7,7 @@ use crate::auth::RealmAuth;
 use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsLock;
-use aruna_ops_work::git::{self, locks::LockOutcome};
+use aruna_ops_data::git::{self, locks::LockOutcome};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};

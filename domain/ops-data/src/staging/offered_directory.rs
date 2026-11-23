@@ -298,7 +298,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 11));
 
         aruna_runner::driver::drive(
-            aruna_ops_work::node::usage_rebuild::RebuildStatsOperation::new(),
+            crate::s3::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
         .await
@@ -332,7 +332,7 @@ mod tests {
         assert_eq!((usage.objects, usage.referenced_bytes), (1, 4));
 
         aruna_runner::driver::drive(
-            aruna_ops_work::node::usage_rebuild::RebuildStatsOperation::new(),
+            crate::s3::usage_rebuild::RebuildStatsOperation::new(),
             context,
         )
         .await

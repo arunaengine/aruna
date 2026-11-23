@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
-use aruna_ops_work::metadata::forward::route_create::RouteCreateOperation;
+use aruna_ops_data::metadata::forward::route_create::RouteCreateOperation;
 
 use crate::metadata_calls::{
     mint_pid_routed, read_mapping, resolve_pid_routed, route_metadata_delete, withdraw_pid_routed,
@@ -22,13 +22,13 @@ use aruna_core::structs::persistent_id::{
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_test_harness::projection::replay_event_log;
 use ulid::Ulid;

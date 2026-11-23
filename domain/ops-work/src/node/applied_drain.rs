@@ -17,10 +17,10 @@ use aruna_core::types::Key;
 use tracing::{debug, warn};
 use ulid::Ulid;
 
-use crate::node::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
 use crate::notifications::email::RefreshMailOperation;
 use crate::notifications::watch::interest::RefreshInterestOperation;
 use aruna_ops_data::metadata::after_sync::{AfterSyncError, AfterSyncOperation, MetadataTimings};
+use aruna_ops_data::s3::summary_refresh::{RefreshUsageError, RefreshUsageOperation};
 
 /// Rows one page of the drain reads at most.
 pub(crate) const APPLIED_DRAIN_PAGE: usize = 16;

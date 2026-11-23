@@ -6,7 +6,7 @@
 use aruna_core::id::NodeId;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_work::plugins::artifacts::{ArtifactError, FetchArtifact, ServingNode};
 use aruna_ops_work::plugins::copies::Assembled;
 use aruna_ops_work::plugins::install::InstallError;

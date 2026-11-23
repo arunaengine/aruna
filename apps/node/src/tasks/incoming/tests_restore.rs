@@ -12,7 +12,7 @@ async fn restore_document_records() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target(),
@@ -37,7 +37,7 @@ async fn restore_document_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage =
         FjallStorage::open(temp_dir.path().to_str().expect("temp path")).expect("storage opens");
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target(),
@@ -157,7 +157,7 @@ async fn drain_keeps_timer() {
     let temp_dir = tempdir().expect("temp dir");
     let storage = FjallStorage::open(temp_dir.path().to_str().expect("storage opens"))
         .expect("storage opens");
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target(),
@@ -246,7 +246,7 @@ async fn outbox_sync_retry() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target(),
@@ -296,7 +296,7 @@ async fn retained_outbox_timer() {
         outbound_handle: None,
     });
     let handler = OperationsTaskHandler::new(context, JobsRuntime::new());
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target(),
@@ -1044,7 +1044,8 @@ async fn placement_storage_rearms() {
     let timer: aruna_core::task::PersistedTaskTimer =
         postcard::from_bytes(&persisted[0].1).expect("persisted timer decodes");
     assert_eq!(timer.key, key);
-    let retry_ms = aruna_ops_work::sync::shard_placement::PLACEMENT_RETRY_AFTER.as_millis() as u64;
+    let retry_ms =
+        aruna_ops_identity::sync::shard_placement::PLACEMENT_RETRY_AFTER.as_millis() as u64;
     assert!(timer.due_unix_millis >= before_ms.saturating_add(retry_ms));
     assert!(timer.due_unix_millis <= after_ms.saturating_add(retry_ms));
 }

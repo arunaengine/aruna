@@ -25,14 +25,14 @@ use aruna_core::structs::identity::realm::RealmConfigDocument;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
-use aruna_ops_work::notifications::placement::resolve_inbox_holder;
-use aruna_ops_work::sync::outbox::batches::{
+use aruna_ops_identity::sync::outbox::batches::{
     DrainSubBatch, DrainSyncOutcome, OUTBOX_CONTINUATION_AFTER, OUTBOX_CONTINUATION_STREAK,
     OUTBOX_INVOCATION_PAGES, OUTBOX_INVOCATION_RECORDS, publish_from_outbox,
 };
-use aruna_ops_work::sync::outbox::record::{OUTBOX_DRAIN_SIZE, outbox_key};
-use aruna_ops_work::sync::shard_placement::DEFER_RETRY_AFTER;
+use aruna_ops_identity::sync::outbox::record::{OUTBOX_DRAIN_SIZE, outbox_key};
+use aruna_ops_identity::sync::shard_placement::DEFER_RETRY_AFTER;
+use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
+use aruna_ops_work::notifications::placement::resolve_inbox_holder;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_storage::storage::worker::FjallStorage;

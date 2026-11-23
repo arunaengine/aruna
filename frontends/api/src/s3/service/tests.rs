@@ -42,13 +42,13 @@ use aruna_core::structs::storage::multipart::MultipartChecksumType;
 use aruna_core::structs::storage::object_read::ObjectInfo;
 use aruna_core::structs::storage::replication_queue::{LiveObligationRecord, live_obligation_key};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
+use aruna_ops_data::s3::object::list::ListContinuationToken;
+use aruna_ops_data::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
+use aruna_ops_data::s3::object::metadata_drain::RefreshReferenceOperation;
+use aruna_ops_data::s3::object::put::PutObjectResult;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_ops_work::notifications::watch::drain::WatchDrainOperation;
 use aruna_ops_work::notifications::watch::store::StoreWatchOperation;
-use aruna_ops_work::s3::object::list::ListContinuationToken;
-use aruna_ops_work::s3::object::metadata::{QueueRefreshOperation, ReferenceRefresh};
-use aruna_ops_work::s3::object::metadata_drain::RefreshReferenceOperation;
-use aruna_ops_work::s3::object::put::PutObjectResult;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};
@@ -1018,7 +1018,7 @@ fn refresh(
     refreshed_at: SystemTime,
 ) -> ReferenceRefresh {
     let (bucket, key) = (test.bucket.clone(), test.key.clone());
-    aruna_ops_work::testing::reference_refresh(bucket, key, test.version_id, metadata, refreshed_at)
+    aruna_ops_data::testing::reference_refresh(bucket, key, test.version_id, metadata, refreshed_at)
 }
 
 fn version_key(test: &TestState) -> Vec<u8> {
@@ -1921,7 +1921,7 @@ async fn denied_listing_keys() {
 async fn scoped_scan_bounded() {
     // Past more hidden keys than one request examines, a page ends empty with a sealed token
     // that names none of them, and the next page goes on to the first key the caller sees.
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
     let keys: Vec<_> = (0..SCAN_BUDGET + 5)
         .map(|index| format!("hidden/{index:05}"))
@@ -1952,7 +1952,7 @@ async fn scoped_scan_bounded() {
 async fn hides_unreadable_prefix() {
     // A prefix holding more unreadable links than one request examines never shows; the page
     // that stops inside it is empty and sealed, and the listing resumes past it.
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
     grant_group_owner(&service, &user_access, group_id).await;
     for index in 0..=SCAN_BUDGET {
@@ -2054,7 +2054,7 @@ async fn hides_link_versions() {
 async fn prefix_fills_page() {
     // A prefix found after a sealed page fills a page of one by itself, for objects and for
     // versions alike, and the listing goes on after it.
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let (_storage_dir, service, user_access, group_id) = subpath_node().await;
     grant_group_owner(&service, &user_access, group_id).await;
     for index in 0..SCAN_BUDGET {
@@ -2270,7 +2270,7 @@ async fn prefix_token_precedence() {
     let mut request = subpath_request(&service, &user_access, group_id, Some("imaging/")).await;
     request.input.start_after = Some("imaging/z".to_string());
     let token =
-        aruna_ops_work::s3::object::member::merge::merged_marker("study", Some("imaging/0"), None)
+        aruna_ops_data::s3::object::member::merge::merged_marker("study", Some("imaging/0"), None)
             .unwrap();
     request.input.continuation_token = ArunaS3Service::encode_list_token(token.as_ref()).unwrap();
     let output = service.list_objects_v2(request).await.unwrap().output;

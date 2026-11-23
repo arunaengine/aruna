@@ -106,7 +106,7 @@ mod tests {
         IdentifierOrigin, SecondaryIdKind, SecondaryIdentifier,
     };
     use aruna_core::user::id::UserId;
-    use aruna_ops_work::sync::outbox::record::new_identified_record;
+    use aruna_ops_identity::sync::outbox::record::new_identified_record;
     use tempfile::tempdir;
     use ulid::Ulid;
 

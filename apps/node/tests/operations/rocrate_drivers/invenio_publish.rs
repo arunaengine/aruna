@@ -17,8 +17,8 @@ use aruna_core::repository::link::{
     LinkDirection, LinkFailure, LinkPatch, LinkPull, LinkReview, LinkStatus, RepositoryLink,
 };
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_ops_data::metadata::revision_read::RawViewOperation;
 use aruna_ops_work::jobs::repository::links::{LinkChange, LinkError};
-use aruna_ops_work::metadata::revision_read::RawViewOperation;
 use aruna_runner::driver::drive;
 
 async fn push_now(

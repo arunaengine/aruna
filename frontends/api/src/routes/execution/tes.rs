@@ -27,12 +27,12 @@ use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
+use aruna_ops_data::s3::access::get::{GetAccessError, GetAccessOperation};
+use aruna_ops_data::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_ops_work::jobs::job::cancel::RoutedCancelOutcome;
 use aruna_ops_work::jobs::lifecycle::report::FamilyReport;
 use aruna_ops_work::jobs::local_run::LocalExecutionConfig;
 use aruna_ops_work::jobs::route::JobRouteError;
-use aruna_ops_work::s3::access::get::{GetAccessError, GetAccessOperation};
-use aruna_ops_work::s3::access::revoke::{RevokeUserError, RevokeUserOperation};
 use aruna_runner::driver::drive;
 use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode, header::AUTHORIZATION};
@@ -52,8 +52,8 @@ use crate::error::ServerError;
 use crate::forwarded::{DirectOrigin, external_base_url};
 use crate::routes::execution::jobs::{ExecutionTarget, map_local_error};
 use crate::server::state::ServerState;
-use aruna_ops_work::auth::bearer_token::AccountDeactivatedOperation;
-use aruna_ops_work::auth::bearer_token::UserCutoffOperation;
+use aruna_ops_identity::auth::bearer_token::AccountDeactivatedOperation;
+use aruna_ops_identity::auth::bearer_token::UserCutoffOperation;
 
 /// GA4GH TES version this facade implements.
 const TES_VERSION: &str = "1.1.0";

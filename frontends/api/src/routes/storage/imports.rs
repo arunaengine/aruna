@@ -13,20 +13,20 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::backend_import::{BackendImport, PLAIN_PATTERN};
 use aruna_core::structs::storage::blob::bucket_permission_path;
-use aruna_ops_work::auth::error::token_grant;
+use aruna_ops_data::s3::bucket::compression::MigrationStatusOperation;
+use aruna_ops_data::s3::bucket::storage_move::StartMoveOperation;
+use aruna_ops_data::s3::imports::change::{ChangeImportOperation, ImportChange};
+use aruna_ops_data::s3::imports::create::{CreateImportInput, CreateImportOperation};
+use aruna_ops_data::s3::imports::cron::next_due;
+use aruna_ops_data::s3::imports::remove::RemoveImportOperation;
+use aruna_ops_data::s3::imports::{
+    ImportRuleError, LastRunOperation, ListImportsOperation, ReadImportOperation,
+};
+use aruna_ops_data::transfer::discovery::{AuthorizedRenamesOperation, RenameGuardsOperation};
+use aruna_ops_identity::auth::error::token_grant;
 use aruna_ops_work::jobs::backend_import::schedule::{
     ImportRunInput, StartRunOperation, WakeScheduleOperation,
 };
-use aruna_ops_work::s3::bucket::compression::MigrationStatusOperation;
-use aruna_ops_work::s3::bucket::storage_move::StartMoveOperation;
-use aruna_ops_work::s3::imports::change::{ChangeImportOperation, ImportChange};
-use aruna_ops_work::s3::imports::create::{CreateImportInput, CreateImportOperation};
-use aruna_ops_work::s3::imports::cron::next_due;
-use aruna_ops_work::s3::imports::remove::RemoveImportOperation;
-use aruna_ops_work::s3::imports::{
-    ImportRuleError, LastRunOperation, ListImportsOperation, ReadImportOperation,
-};
-use aruna_ops_work::transfer::discovery::{AuthorizedRenamesOperation, RenameGuardsOperation};
 use aruna_runner::driver::{drive, node_routing};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -832,7 +832,7 @@ pub async fn get_renames(
     Path((group_id, import_id)): Path<(String, String)>,
     axum::extract::Query(page): axum::extract::Query<RenamePageQuery>,
 ) -> ServerResult<Json<ImportRenamesResponse>> {
-    use aruna_ops_work::blob::migration::misplaced::{
+    use aruna_ops_data::blob::migration::misplaced::{
         AccessRule, DEFAULT_PAGE, MAX_PAGE, RenamePageOperation, RenameQuery,
     };
     let (group_id, auth) = admin_of_group(&state, auth, &group_id).await?;
@@ -850,7 +850,7 @@ pub async fn get_renames(
     }
     let context = state.get_ctx();
     let access = drive(
-        aruna_ops_work::transfer::discovery::RuleAccessOperation::new(
+        aruna_ops_data::transfer::discovery::RuleAccessOperation::new(
             &auth,
             state.get_node_id(),
             &rule,

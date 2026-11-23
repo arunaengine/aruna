@@ -18,15 +18,15 @@ use utoipa_axum::routes;
 use aruna_core::metadata::api::{ExportMetadataResult, RoCrateExportView};
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_ops_work::harvest::oai_pmh::mapping::jsonld_to_dc;
-use aruna_ops_work::harvest::oai_pmh::request::format_from;
-use aruna_ops_work::metadata::api::export_types::ExportMetadataRequest;
-use aruna_ops_work::metadata::forward::routed::export::RoutedExportOperation;
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::metadata::visibility_index::{
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::metadata::visibility_index::{
     AnonReadableOperation, EarliestVisibleOperation, EffectiveDatestampOperation, VisibilityError,
     VisiblePageOperation,
 };
+use aruna_ops_work::harvest::oai_pmh::mapping::jsonld_to_dc;
+use aruna_ops_work::harvest::oai_pmh::request::format_from;
 use aruna_runner::driver::DriverContext;
 
 use crate::forwarded::external_base_url;

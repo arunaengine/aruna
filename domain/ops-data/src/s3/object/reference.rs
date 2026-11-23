@@ -682,6 +682,7 @@ mod tests {
     use super::*;
     use crate::connectors::repository::{delete_secret_effect, write_secret_effect};
     use crate::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use crate::s3::usage_rebuild::RebuildStatsOperation;
     use aruna_core::effects::StorageEffect;
     use aruna_core::handle::Handle;
     use aruna_core::keyspaces::{
@@ -704,7 +705,6 @@ mod tests {
     use aruna_core::structs::storage::routing::RoutingSnapshot;
     use aruna_core::structs::storage::storage_purge::{StoragePurgeFence, StoragePurgeScope};
     use aruna_core::structs::storage::usage::{UsageCounters, global_group_key, usage_group_key};
-    use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_storage::storage;
     use aruna_test_harness::staging::{

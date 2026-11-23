@@ -13,11 +13,11 @@ use aruna_core::structs::storage::distribution::request::{PublishRefusal, Transf
 use aruna_core::structs::storage::distribution::{
     DataStrategy, DistributionSettings, MemberState, MetadataCoverage, RangeBehaviour, SetPhase,
 };
-use aruna_ops_work::transfer::create::{
+use aruna_ops_data::transfer::create::{
     CreateError, CreateInput, CreationReport, LayoutKind, admit_pending, create_set,
 };
-use aruna_ops_work::transfer::status::{add_progress, read_status};
-use aruna_ops_work::transfer::status_view::{DeletionStatus, DistributionStatus, Reach};
+use aruna_ops_data::transfer::status::{add_progress, read_status};
+use aruna_ops_data::transfer::status_view::{DeletionStatus, DistributionStatus, Reach};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};

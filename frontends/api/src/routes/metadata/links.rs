@@ -8,8 +8,8 @@ use aruna_core::metadata::api::{LinkDocument, LinkNodeRequest, LinkQuery};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::data::link::{DataLink, LinkScope};
-use aruna_ops_work::metadata::api::links::types::{LINKS_MAX_LIMIT, LinkPage};
-use aruna_ops_work::metadata::api::links::{
+use aruna_ops_data::metadata::api::links::types::{LINKS_MAX_LIMIT, LinkPage};
+use aruna_ops_data::metadata::api::links::{
     file_queries, links_distributed, part_of, resolve_part,
 };
 use aruna_runner::driver::drive;

@@ -27,6 +27,9 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
+use aruna_ops_identity::sync::replicate_documents::{
+    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
+};
 use aruna_ops_work::notifications::list::LIST_MAX_LIMIT;
 use aruna_ops_work::notifications::placement::resolve_inbox_holder;
 use aruna_ops_work::notifications::user_call::WatchDispatchError;
@@ -34,9 +37,6 @@ use aruna_ops_work::notifications::watch::digest::InterestOperation;
 use aruna_ops_work::notifications::watch::interest::RefreshInterestOperation;
 use aruna_ops_work::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_ops_work::notifications::watch::origin::EmitEventOperation;
-use aruna_ops_work::sync::replicate_documents::{
-    ReplicateDocumentsConfig, ReplicateDocumentsOperation,
-};
 use aruna_runner::driver::drive;
 use aruna_test_harness::documents::sync_topic;
 use ulid::Ulid;
@@ -797,7 +797,7 @@ async fn install_config_document(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

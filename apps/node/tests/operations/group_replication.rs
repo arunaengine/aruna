@@ -10,8 +10,8 @@ use aruna_core::structs::identity::auth::Actor;
 use aruna_core::structs::identity::group::{Group, GroupAuthorizationDocument};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::{PlacementRef, shard_for_subject};
-use aruna_ops_work::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_ops_work::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupOperation};
+use aruna_ops_identity::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
 use aruna_runner::driver::drive;
 use ulid::Ulid;
 

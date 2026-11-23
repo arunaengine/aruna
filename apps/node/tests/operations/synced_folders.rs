@@ -29,33 +29,33 @@ use aruna_core::structs::synced_folder::{
 };
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::device::sync::ReconcileFolderError;
-use aruna_ops_work::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
-use aruna_ops_work::device::sync::folders::bind::{
+use aruna_ops_data::device::sync::ReconcileFolderError;
+use aruna_ops_data::device::sync::actions::{ApplyActionInput, ExpectedEntry, apply_action};
+use aruna_ops_data::device::sync::folders::bind::{
     bind_folder as reserve_folder, create_realm_bucket, finish_binding,
 };
-use aruna_ops_work::device::sync::folders::reads::{
+use aruna_ops_data::device::sync::folders::reads::{
     list_entries, list_folders, list_transfers, read_bound,
 };
-use aruna_ops_work::device::sync::folders::unbind::unbind_folder;
-use aruna_ops_work::device::sync::folders::{
+use aruna_ops_data::device::sync::folders::unbind::unbind_folder;
+use aruna_ops_data::device::sync::folders::{
     BindFolderInput, FolderError, RealmBucketInput, set_folder_state,
 };
-use aruna_ops_work::device::sync::outbox::{drain_sync_outbox, local_origin};
-use aruna_ops_work::device::sync::repository::{SyncUpload, UploadState, upload_entry};
-use aruna_ops_work::metadata::serve::forwards::needs_view;
-use aruna_ops_work::metadata::serve::{ServeNode, ServeRequestOperation};
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::bucket::delete::DeleteBucketOperation;
-use aruna_ops_work::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
-use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
-use aruna_ops_work::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
-use aruna_ops_work::staging::offer::list::ListOffersOperation;
-use aruna_ops_work::staging::offer::run::offer_directory;
-use aruna_ops_work::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
-use aruna_ops_work::transfer::origin::ReadOriginOperation;
+use aruna_ops_data::device::sync::outbox::{drain_sync_outbox, local_origin};
+use aruna_ops_data::device::sync::repository::{SyncUpload, UploadState, upload_entry};
+use aruna_ops_data::metadata::serve::forwards::needs_view;
+use aruna_ops_data::metadata::serve::{ServeNode, ServeRequestOperation};
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::bucket::delete::DeleteBucketOperation;
+use aruna_ops_data::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_data::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
+use aruna_ops_data::staging::offer::list::ListOffersOperation;
+use aruna_ops_data::staging::offer::run::offer_directory;
+use aruna_ops_data::staging::offered_directory::{OfferDirectoryInput, OfferedDirectoryError};
+use aruna_ops_data::transfer::origin::ReadOriginOperation;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 use futures_util::StreamExt;
 use topology::{TestResult, Topology, wait_until};

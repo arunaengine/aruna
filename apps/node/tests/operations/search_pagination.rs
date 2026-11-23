@@ -16,9 +16,9 @@ use aruna_core::search::ObjectKeyMatch;
 use aruna_core::structs::storage::blob::{
     BackendRef, BlobHeadKey, BlobVersion, BucketInfo, CurrentVersionPointer, VersionKey,
 };
-use aruna_ops_work::metadata::api::bucket_search::search_buckets_distributed;
-use aruna_ops_work::metadata::api::object_search::search_objects;
-use aruna_ops_work::metadata::api::search_types::{
+use aruna_ops_data::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_ops_data::metadata::api::object_search::search_objects;
+use aruna_ops_data::metadata::api::search_types::{
     BucketSearchRequest, ObjectQueryMode, SearchQueryRequest,
 };
 use aruna_runner::driver::drive;

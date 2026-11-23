@@ -70,11 +70,11 @@ async fn durable_rearm_loop(
         };
         ticks = ticks.saturating_add(1);
         drive(RestoreDrainOperation::default(), &context).await.ok();
-        let refresh = aruna_ops_work::s3::object::metadata_drain::RestoreRefreshTimer::new();
+        let refresh = aruna_ops_data::s3::object::metadata_drain::RestoreRefreshTimer::new();
         if let Err(error) = drive(refresh, &context).await {
             warn!(?error, "Failed to scan reference metadata refresh jobs");
         }
-        let restore = aruna_ops_work::connectors::reference_prune::RestorePruneOperation::new();
+        let restore = aruna_ops_data::connectors::reference_prune::RestorePruneOperation::new();
         if let Err(error) = drive(restore, &context).await {
             warn!(%error, "Failed to restore connector reference pruning");
         }
@@ -306,7 +306,7 @@ impl TaskQueues {
         // holder would hand back.
         if context.graph_handle.is_some() {
             drive(
-                aruna_ops_work::metadata::device::edit::replay_queued_edits(),
+                aruna_ops_data::metadata::device::edit::replay_queued_edits(),
                 &context,
             )
             .await
@@ -365,7 +365,7 @@ impl TaskQueues {
         if stopped() {
             return;
         }
-        let refresh = aruna_ops_work::s3::object::metadata_drain::RestoreRefreshTimer::new();
+        let refresh = aruna_ops_data::s3::object::metadata_drain::RestoreRefreshTimer::new();
         if let Err(error) = drive(refresh, &context).await {
             warn!(?error, "Failed to scan reference metadata refresh jobs");
         }
@@ -516,7 +516,7 @@ async fn restore_usage_timer(
     };
     if has_markers
         && let Event::Task(TaskEvent::Error { message, .. }) = task_handle
-            .send_effect(aruna_ops_work::s3::usage::schedule_snapshot_publish())
+            .send_effect(aruna_ops_data::s3::usage::schedule_snapshot_publish())
             .await
     {
         warn!(message = %message, "Failed to restore node usage publish timer");

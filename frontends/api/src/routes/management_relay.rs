@@ -9,6 +9,7 @@ use aruna_core::id::NodeId;
 use aruna_core::member_read::MemberMethod;
 use aruna_core::structs::central_assistant::SESSION_HEADER;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_ops_data::s3::object::member::rest;
 use aruna_ops_work::relay::call::{
     NodeCall, RawHeader, RelayFailure, RelayReply, StartCallOperation,
 };
@@ -20,7 +21,6 @@ use aruna_ops_work::relay::management::{
 use aruna_ops_work::relay::targets::{
     CoordinatorTarget, CoordinatorTargetOperation, HolderTargetOperation, PeerTargetsOperation,
 };
-use aruna_ops_work::s3::object::member::rest;
 use aruna_runner::driver::drive;
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, MatchedPath, OriginalUri, Request, State};

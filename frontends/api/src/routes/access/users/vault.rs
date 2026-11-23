@@ -18,10 +18,10 @@ use aruna_core::structs::identity::user::vault::{
     VaultRefusal, VaultRevision,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::forward::routing::HolderWriteError;
-use aruna_ops_work::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
-use aruna_ops_work::users::vault::route::{AppendRoutedOperation, VaultRouteError};
-use aruna_ops_work::users::vault::write::{AppendVaultConfig, AppendVaultError};
+use aruna_ops_identity::forward::routing::HolderWriteError;
+use aruna_ops_identity::users::vault::read::{ReadVaultConfig, ReadVaultError, ReadVaultOperation};
+use aruna_ops_identity::users::vault::route::{AppendRoutedOperation, VaultRouteError};
+use aruna_ops_identity::users::vault::write::{AppendVaultConfig, AppendVaultError};
 use aruna_runner::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;

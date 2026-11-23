@@ -17,15 +17,15 @@ use aruna_core::structs::storage::origin::{
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
 use aruna_core::structs::sync_relationship::SyncMode;
-use aruna_ops_work::blob::migration::misplaced::AccessRule;
-use aruna_ops_work::distribution::guard::GuardError;
-use aruna_ops_work::distribution::resolve::{
+use aruna_ops_data::blob::migration::misplaced::AccessRule;
+use aruna_ops_data::distribution::guard::GuardError;
+use aruna_ops_data::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, key_holders, resolve_version, resolved,
 };
-use aruna_ops_work::distribution::routing::route_read;
-use aruna_ops_work::distribution::routing::{copy_readers, read_coordinator};
-use aruna_ops_work::s3::bucket::sources::{BucketSourcesOperation, FileSource};
-use aruna_ops_work::transfer::origin::{
+use aruna_ops_data::distribution::routing::route_read;
+use aruna_ops_data::distribution::routing::{copy_readers, read_coordinator};
+use aruna_ops_data::s3::bucket::sources::{BucketSourcesOperation, FileSource};
+use aruna_ops_data::transfer::origin::{
     BucketRunsOperation, OriginError, OriginView, ReadOriginOperation,
 };
 use aruna_runner::driver::{drive, drive_until};
@@ -56,9 +56,9 @@ use crate::routes::storage::relay::{
 use crate::server::state::ServerState;
 use aruna_core::structs::storage::bucket_metadata::ReleaseRef;
 use aruna_core::structs::storage::release::MembershipQuery;
-use aruna_ops_work::auth::request_authorization::BucketAccessOperation;
-use aruna_ops_work::transfer::release::access::MembersCheckOperation;
-use aruna_ops_work::transfer::release::{BucketScope, MembershipCaller};
+use aruna_ops_data::transfer::release::access::MembersCheckOperation;
+use aruna_ops_data::transfer::release::{BucketScope, MembershipCaller};
+use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
 
 /// How long an origin read directed at another node may take, body included.
 const RELAY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);

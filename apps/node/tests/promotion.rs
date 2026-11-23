@@ -8,7 +8,7 @@ use aruna_config::identity::IdentityStore;
 use aruna_core::onboarding::OnboardingMode;
 use aruna_core::structs::identity::auth::NodeCapabilities;
 use aruna_core::structs::identity::realm::RealmNodeKind;
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_runner::driver::drive;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use reqwest::StatusCode;

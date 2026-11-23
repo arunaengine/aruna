@@ -16,7 +16,9 @@ use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::device_wipe::{INCOMPLETE_EXIT_CODE, WIPED_EXIT_CODE};
-use aruna_ops_work::device_node::wipe::{WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation};
+use aruna_ops_identity::device_node::wipe::{
+    WipeDeviceConfig, WipeDeviceError, WipeDeviceOperation,
+};
 use aruna_runner::driver::drive;
 
 pub(super) fn router() -> OpenApiRouter<Arc<ServerState>> {

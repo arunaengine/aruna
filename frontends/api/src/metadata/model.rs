@@ -10,8 +10,8 @@ use aruna_core::metadata::{
     ProfileValidationCompleteness, ProfileValidationState, ProfileValidationStatus,
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_ops_work::metadata::profile::validation::MetadataProfilePreview;
-use aruna_ops_work::metadata::public_preview::RestrictedFilesPreview;
+use aruna_ops_data::metadata::profile::validation::MetadataProfilePreview;
+use aruna_ops_data::metadata::public_preview::RestrictedFilesPreview;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;

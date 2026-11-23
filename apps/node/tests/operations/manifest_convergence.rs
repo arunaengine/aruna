@@ -17,17 +17,17 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::delete_document::DeleteDocumentOperation;
+use aruna_ops_data::metadata::delete_document::DeleteDocumentOperation;
 use aruna_runner::driver::drive;
 use ulid::Ulid;
 
 use crate::convergence;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, announce_nodes, spawn_replicas};
-use aruna_ops_work::shard::AssembleManifestOperation;
+use aruna_ops_identity::shard::AssembleManifestOperation;
 use convergence::wait_for_convergence;
 
 /// A fixed structured id (handle 1, bucket 0) for the strategy-resolution sample,
@@ -324,7 +324,7 @@ async fn install_realm_config(
         store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     for node in nodes {
-        aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(config)
 }

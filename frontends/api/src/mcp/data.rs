@@ -20,21 +20,21 @@ use aruna_core::structs::storage::blob::{
     BucketInfo, CONTENT_TYPE_KEY, bucket_permission_path, key_content_type, object_permission_path,
 };
 use aruna_core::structs::storage::object_read::ObjectRangeRequest;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_ops_work::metadata::api::bucket_search::search_buckets_distributed;
-use aruna_ops_work::metadata::api::search_types::BucketSearchRequest;
-use aruna_ops_work::placement::policy::gate::GateOperation;
-use aruna_ops_work::replication::live_queue::{CompletePutInput, CompletePutOperation};
-use aruna_ops_work::s3::bucket::write_guard::BucketGuardOperation;
-use aruna_ops_work::s3::object::get::{GetObjectError, GetObjectInput};
-use aruna_ops_work::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_ops_work::s3::object::pages::ListRequest;
-use aruna_ops_work::s3::object::put::{
+use aruna_ops_data::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_ops_data::metadata::api::search_types::BucketSearchRequest;
+use aruna_ops_data::replication::live_queue::{CompletePutInput, CompletePutOperation};
+use aruna_ops_data::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_ops_data::s3::object::get::{GetObjectError, GetObjectInput};
+use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::s3::object::pages::ListRequest;
+use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectError, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_ops_work::staging::offered_directory::OfferedDirectoryError;
-use aruna_ops_work::transfer::read::GetRoutedOperation;
+use aruna_ops_data::staging::offered_directory::OfferedDirectoryError;
+use aruna_ops_data::transfer::read::GetRoutedOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_ops_identity::placement::policy::gate::GateOperation;
 use aruna_runner::driver::{drive, node_routing};
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};

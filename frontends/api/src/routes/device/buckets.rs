@@ -19,8 +19,8 @@ use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::id::NodeId;
 use aruna_core::structs::storage::group_backend::valid_bucket;
-use aruna_ops_work::device::sync::folders::RealmBucketInput;
-use aruna_ops_work::device::sync::folders::bind::create_realm_bucket;
+use aruna_ops_data::device::sync::folders::RealmBucketInput;
+use aruna_ops_data::device::sync::folders::bind::create_realm_bucket;
 use aruna_runner::driver::drive;
 
 use super::folders::map_folder_error;

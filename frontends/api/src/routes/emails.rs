@@ -8,7 +8,7 @@ use std::sync::Arc;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::execution::email::EmailPreference;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_ops_work::notifications::email::{ReadEmailOperation, RemoveEmailOperation};
 use aruna_ops_work::notifications::opt_in::{EmailError, EmailOptIn, SetEmailOperation};
 use aruna_ops_work::notifications::setting_rows::SettingError;

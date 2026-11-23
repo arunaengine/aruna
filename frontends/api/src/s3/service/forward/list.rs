@@ -5,13 +5,13 @@
 
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess};
 use aruna_core::structs::storage::distribution::DistributionBinding;
-use aruna_ops_work::distribution::routing::{copies_interval, lists_interval};
-use aruna_ops_work::s3::object::list::ListBucketInput;
-use aruna_ops_work::s3::object::member::merge::MergeResume as Resume;
-use aruna_ops_work::s3::object::member::merge::{
+use aruna_ops_data::distribution::routing::{copies_interval, lists_interval};
+use aruna_ops_data::s3::object::list::ListBucketInput;
+use aruna_ops_data::s3::object::member::merge::MergeResume as Resume;
+use aruna_ops_data::s3::object::member::merge::{
     MergeCaller, MergeError, MergeShows, MergedObject, MergedObjectsOperation,
 };
-use aruna_ops_work::s3::object::visible::VisibleError;
+use aruna_ops_data::s3::object::visible::VisibleError;
 use aruna_runner::driver::drive;
 use percent_encoding::utf8_percent_encode;
 use s3s::dto::{CommonPrefix, ETag, Object, Owner, Timestamp, TimestampFormat};
@@ -257,7 +257,7 @@ impl ArunaS3Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aruna_ops_work::s3::object::list::ListContinuationToken;
+    use aruna_ops_data::s3::object::list::ListContinuationToken;
 
     #[test]
     fn tokens_bind_query() {

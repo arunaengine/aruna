@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use aruna_ops_work::secrets::SecretChange;
+use aruna_ops_identity::secrets::SecretChange;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};

@@ -9,9 +9,9 @@ use std::time::Duration;
 use aruna_scheduler::shutdown::Shutdown;
 use tracing::warn;
 
-use aruna_ops_work::metadata::registry_cache::WarmCachesOperation;
-use aruna_ops_work::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
-use aruna_ops_work::metadata::visibility_index::{
+use aruna_ops_data::metadata::registry_cache::WarmCachesOperation;
+use aruna_ops_data::metadata::timestamp_sweep::{SWEEP_SCAN_LIMIT, TimestampSweepOperation};
+use aruna_ops_data::metadata::visibility_index::{
     PassOutcome, REBUILD_INTERVAL, VisibilityPassOperation, WORK_INTERVAL,
 };
 use aruna_runner::driver::{DriverContext, drive};
@@ -32,7 +32,7 @@ pub fn spawn_metadata_warmup(context: Arc<DriverContext>, shutdown: &Shutdown) {
             warn!(error = %error, "Metadata visibility cache warmup failed");
             return;
         }
-        let rebuild = aruna_ops_work::metadata::iri_index::RebuildIrisOperation::new();
+        let rebuild = aruna_ops_data::metadata::iri_index::RebuildIrisOperation::new();
         if let Err(error) = drive(rebuild, &context).await {
             warn!(error = %error, "Metadata IRI reference index rebuild failed");
         }

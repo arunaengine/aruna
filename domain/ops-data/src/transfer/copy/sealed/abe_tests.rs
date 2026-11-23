@@ -761,7 +761,7 @@ async fn group_bytes(storage: &StorageHandle, sealed: &Sealed) -> u64 {
 
 /// The group's logical bytes after a full recount from the stored rows.
 async fn recounted_bytes(context: &DriverContext, sealed: &Sealed) -> u64 {
-    use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
+    use crate::s3::usage_rebuild::RebuildStatsOperation;
     aruna_runner::driver::drive(RebuildStatsOperation::new(), context)
         .await
         .unwrap();

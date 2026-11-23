@@ -13,13 +13,13 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, PathRestriction};
 use aruna_core::structs::identity::s3_session::{S3Session, SESSION_ACCESS_PREFIX};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_ops_work::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
-use aruna_ops_work::s3::session::create::{CreateS3Config, CreateS3Operation};
-use aruna_ops_work::s3::session::get::GetS3Operation;
-use aruna_ops_work::s3::session::list::ListSessionsOperation;
-use aruna_ops_work::s3::session::refresh::{RefreshS3Config, RefreshS3Operation};
-use aruna_ops_work::s3::session::revoke::{RevokeS3Config, RevokeS3Operation};
-use aruna_ops_work::s3::session::{S3SessionCredentials, S3SessionError};
+use aruna_ops_data::s3::session::create::{CreateS3Config, CreateS3Operation};
+use aruna_ops_data::s3::session::get::GetS3Operation;
+use aruna_ops_data::s3::session::list::ListSessionsOperation;
+use aruna_ops_data::s3::session::refresh::{RefreshS3Config, RefreshS3Operation};
+use aruna_ops_data::s3::session::revoke::{RevokeS3Config, RevokeS3Operation};
+use aruna_ops_data::s3::session::{S3SessionCredentials, S3SessionError};
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupError, GetGroupOperation};
 use aruna_runner::driver::drive;
 use aruna_wire::session::{
     S3SessionRequest, S3SessionsResponse, SessionGroupResponse, SessionIssuerResponse,

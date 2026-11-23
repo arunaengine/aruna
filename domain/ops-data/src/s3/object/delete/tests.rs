@@ -1586,7 +1586,7 @@ async fn delete_then_recount(
         .unwrap();
     let counters = read_counters(context, usage_group_key(offer.group_id)).await;
     drive(
-        aruna_ops_work::node::usage_rebuild::RebuildStatsOperation::new(),
+        crate::s3::usage_rebuild::RebuildStatsOperation::new(),
         context,
     )
     .await
@@ -1690,10 +1690,10 @@ fn marker_needs_head() {
 #[tokio::test]
 async fn bucket_rows_sum() {
     use crate::s3::bucket::create::CreateBucketOperation;
+    use crate::s3::usage_rebuild::RebuildStatsOperation;
     use aruna_core::structs::storage::blob::BucketInfo;
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::structs::storage::usage::{BucketCounters, usage_bucket_key, usage_group_key};
-    use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
 
     let temp_handle = tempdir().unwrap();
     let temp_root = temp_handle.path().to_str().unwrap();

@@ -16,12 +16,12 @@ use aruna_core::structs::identity::auth::{Actor, TokenClaims};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::NodePlacementEntry;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::bearer_token::{
+use aruna_ops_identity::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks,
     TokenRevokedOperation, UserCutoffOperation,
 };
-use aruna_ops_work::auth::error::ArunaBearerError;
-use aruna_ops_work::auth::revoke_token::{
+use aruna_ops_identity::auth::error::ArunaBearerError;
+use aruna_ops_identity::auth::revoke_token::{
     RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
 };
 use aruna_runner::driver::{DriverContext, drive};
@@ -269,7 +269,7 @@ async fn install_realm_config(nodes: &[TestNode], realm_id: RealmId) -> TestResu
     }
     seed_sync_topic(nodes, realm_id, &config).await?;
     for node in nodes {
-        aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

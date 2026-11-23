@@ -10,13 +10,13 @@ use aruna_core::compute::{SecretBytes, SharedSecret};
 use aruna_core::outbound::{RangeEntry, RangeRefusal};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, common_prefix_of};
-use aruna_ops_work::distribution::routing::{copies_interval, lists_interval};
-use aruna_ops_work::s3::object::list::ListedObject;
-use aruna_ops_work::s3::object::pages::{
+use aruna_ops_data::distribution::routing::{copies_interval, lists_interval};
+use aruna_ops_data::s3::object::list::ListedObject;
+use aruna_ops_data::s3::object::pages::{
     self, ListRequest, ObjectPage, ObjectPageOperation, PageError, PageNode, PageObject, Resume,
     encode_resume, listing_path,
 };
-use aruna_ops_work::s3::object::range_list::MemberAccess;
+use aruna_ops_data::s3::object::range_list::MemberAccess;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::{Extension, Json};

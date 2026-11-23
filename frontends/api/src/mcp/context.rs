@@ -9,11 +9,11 @@ use super::{
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, Permission, Role};
 use aruna_core::structs::identity::group::Group;
-use aruna_ops_work::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_ops_work::groups::list_groups::ListGroupOperation;
-use aruna_ops_work::metadata::stats::GroupPurposeOperation;
-use aruna_ops_work::realm::read_authorization::ReadAuthorizationOperation;
-use aruna_ops_work::users::read_document::{ReadUserError, ReadUserOperation};
+use aruna_ops_data::metadata::stats::GroupPurposeOperation;
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupOperation};
+use aruna_ops_identity::groups::list_groups::ListGroupOperation;
+use aruna_ops_identity::realm::read_authorization::ReadAuthorizationOperation;
+use aruna_ops_identity::users::read_document::{ReadUserError, ReadUserOperation};
 use aruna_runner::driver::drive;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;

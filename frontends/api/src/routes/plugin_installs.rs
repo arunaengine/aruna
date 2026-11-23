@@ -15,7 +15,8 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::users::service_account::group_admin_path;
 use aruna_ops_work::plugins::account::PluginAccount;
 use aruna_ops_work::plugins::grants::GrantError;
 use aruna_ops_work::plugins::install::{
@@ -25,7 +26,6 @@ use aruna_ops_work::plugins::install::{
 use aruna_ops_work::plugins::lifecycle::{RemoveConflicted, RemoveInstall};
 use aruna_ops_work::plugins::receiver::lost_reason;
 use aruna_ops_work::plugins::records::{ReadEntry, RecordError};
-use aruna_ops_work::users::service_account::group_admin_path;
 use aruna_runner::driver::{DriverContext, drive};
 use axum::Json;
 use axum::extract::{Path, Query, State};

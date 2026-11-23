@@ -17,11 +17,11 @@ use aruna_core::keys::generate_signing_key;
 use aruna_core::metadata::MetadataQueryResults;
 use aruna_core::structs::identity::auth::{Actor, AuthContext};
 use aruna_core::structured_id::MetaResourceId;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::read::query_metadata as run_query_metadata;
-use aruna_ops_work::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
-use aruna_ops_work::metadata::api::realm_search::search_metadata as run_search_metadata;
-use aruna_ops_work::metadata::api::search_types::MetadataSearchRequest;
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::read::query_metadata as run_query_metadata;
+use aruna_ops_data::metadata::api::read_types::{ApiQueryMode, MetadataQueryRequest};
+use aruna_ops_data::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_ops_data::metadata::api::search_types::MetadataSearchRequest;
 use aruna_runner::driver::drive;
 use aruna_runner::testing::installed_graph_handle;
 use aruna_test_harness::tokens::sign_token;
@@ -42,7 +42,9 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::placement::record::METADATA_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
@@ -494,7 +496,7 @@ async fn search_cluster_page(
     query: &str,
     limit: usize,
     cursor: Option<String>,
-) -> aruna_ops_work::metadata::api::search_types::MetadataSearchExecution {
+) -> aruna_ops_data::metadata::api::search_types::MetadataSearchExecution {
     let coordinator = cluster.coordinator();
     let ctx = coordinator.state.get_ctx();
     let target_nodes = cluster
@@ -617,7 +619,7 @@ async fn search_cluster_group(
     cluster: &SearchPaginationCluster,
     query: &str,
     group_id: Option<Ulid>,
-) -> aruna_ops_work::metadata::api::search_types::MetadataSearchExecution {
+) -> aruna_ops_data::metadata::api::search_types::MetadataSearchExecution {
     let coordinator = cluster.coordinator();
     let ctx = coordinator.state.get_ctx();
     let target_nodes = cluster

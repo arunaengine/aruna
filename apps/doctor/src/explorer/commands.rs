@@ -12,7 +12,7 @@ use aruna_core::structs::placement::policy::attachment::{
 };
 use aruna_core::structs::storage::backends::BackendsFile;
 use aruna_core::structs::storage::blob::{BackendLocation, BackendRef};
-use aruna_ops_work::sync::shard_placement::decode_placement;
+use aruna_ops_identity::sync::shard_placement::decode_placement;
 use fjall::{KeyspaceCreateOptions, OptimisticTxDatabase, Readable};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;

@@ -10,7 +10,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::repo_layout::Layout;
 use aruna_core::structs::storage::dataset_location::default_bucket;
-use aruna_ops_work::git;
+use aruna_ops_data::git;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};

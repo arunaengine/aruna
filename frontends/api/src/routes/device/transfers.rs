@@ -15,7 +15,7 @@ use crate::auth::OwnerAuth;
 use crate::error::{ErrorResponse, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::structs::synced_folder::{EntryState, SyncedFolder};
-use aruna_ops_work::device::sync::folders::reads::{
+use aruna_ops_data::device::sync::folders::reads::{
     list_entries, list_folders, list_transfers as read_uploads,
 };
 use ulid::Ulid;

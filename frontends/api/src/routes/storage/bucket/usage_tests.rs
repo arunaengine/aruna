@@ -216,11 +216,11 @@ async fn reference_import_counted() {
     use aruna_core::structs::execution::job::local::{JobClaim, JobRecord};
     use aruna_core::structs::execution::source_access::SourceMetadata;
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
-    use aruna_ops_work::connectors::create_connector::{
+    use aruna_ops_data::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
-    use aruna_ops_work::staging::page::import::PageImportOperation;
-    use aruna_ops_work::staging::page::rows::{PageEntry, PageImportInput};
+    use aruna_ops_data::staging::page::import::PageImportOperation;
+    use aruna_ops_data::staging::page::rows::{PageEntry, PageImportInput};
     use aruna_runner::driver::drive;
     use std::time::{Duration, SystemTime};
 

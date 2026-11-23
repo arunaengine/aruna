@@ -15,7 +15,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_ops_work::blob::migration::broken::CleanBrokenOperation;
+use aruna_ops_data::blob::migration::broken::CleanBrokenOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, Query, State};
 use std::time::SystemTime;
@@ -292,7 +292,7 @@ async fn cursor_names_visible() {
     }
     assert_eq!(listed, ["b/y.gz", "d/w.gz"]);
 
-    let template = aruna_ops_work::s3::object::delete::DeleteObjectInput {
+    let template = aruna_ops_data::s3::object::delete::DeleteObjectInput {
         bucket: test.bucket.clone(),
         key: String::new(),
         version_id: None,
@@ -357,7 +357,7 @@ async fn scan_budget_bounds() {
         "b/y.gz"
     );
 
-    let template = aruna_ops_work::s3::object::delete::DeleteObjectInput {
+    let template = aruna_ops_data::s3::object::delete::DeleteObjectInput {
         bucket: test.bucket.clone(),
         key: String::new(),
         version_id: None,

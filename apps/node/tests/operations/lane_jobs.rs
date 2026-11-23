@@ -128,7 +128,7 @@ async fn job_context(
     use aruna_core::structs::execution::job::local::{JobClaim, JobProgress, JobRecord};
     use aruna_core::structs::execution::source_connector::SourceConnectorKind;
     use aruna_core::structs::storage::blob::object_permission_path;
-    use aruna_ops_work::connectors::create_connector::{
+    use aruna_ops_data::connectors::create_connector::{
         SourceConnectorInput, SourceConnectorOperation,
     };
     use aruna_runner::driver::drive;

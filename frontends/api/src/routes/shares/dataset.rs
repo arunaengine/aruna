@@ -11,21 +11,21 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission, SessionKind, 
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::share::{ShareLink, ShareTarget, TicketBody};
-use aruna_ops_work::distribution::resolve::{
+use aruna_ops_data::distribution::resolve::{
     GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
 };
-use aruna_ops_work::distribution::routing::bound_view;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::export::ExportOperation;
-use aruna_ops_work::metadata::api::export_types::ExportMetadataRequest;
-use aruna_ops_work::metadata::forward::routed::export::ensure_export_limit;
-use aruna_ops_work::shares::dataset::{
+use aruna_ops_data::distribution::routing::bound_view;
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::export::ExportOperation;
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
+use aruna_ops_data::metadata::forward::routed::export::ensure_export_limit;
+use aruna_ops_data::shares::dataset::{
     DatasetFile, FilePlace, MemberSet, NamedSets, dataset_files, named_sets,
 };
-use aruna_ops_work::shares::rules::{
+use aruna_ops_data::shares::rules::{
     NodeScope, bucket_pattern, exact_pattern, relative_path, visit_context,
 };
-use aruna_ops_work::transfer::status::read_view;
+use aruna_ops_data::transfer::status::read_view;
 use aruna_runner::driver::{drive, drive_until};
 use axum::Json;
 use axum::extract::{Query, State};

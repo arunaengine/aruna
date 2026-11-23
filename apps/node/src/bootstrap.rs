@@ -15,15 +15,15 @@ use aruna_core::onboarding::{
 use aruna_core::placement::target_placement_ref;
 use aruna_core::structs::identity::node_state::PersistedNodeState;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::device_node::realm_documents::fetch_from_peers;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::node::api_state::{LoadStateOperation, SaveStateOperation};
-use aruna_ops_work::notifications::watch::digest::InterestOperation;
-use aruna_ops_work::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_ops_work::sync::reconcile::SyncTopicsOperation;
-use aruna_ops_work::sync::replicate_documents::{
+use aruna_ops_identity::device_node::realm_documents::fetch_from_peers;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_ops_identity::sync::reconcile::SyncTopicsOperation;
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
+use aruna_ops_work::node::api_state::{LoadStateOperation, SaveStateOperation};
+use aruna_ops_work::notifications::watch::digest::InterestOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use byteview::ByteView;
 use crypto_box::{

@@ -40,8 +40,8 @@ use aruna_core::structs::sync_relationship::{SyncRelationship, SyncState, sync_r
 use aruna_core::user::id::UserId;
 use aruna_kpabe::envelope::Envelope;
 use aruna_kpabe::scheme::UserKey;
-use aruna_ops_work::auth::error::AuthorizeError;
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
+use aruna_ops_identity::auth::error::AuthorizeError;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aws_sdk_s3::Client as S3Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;

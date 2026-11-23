@@ -18,12 +18,12 @@ use aruna_core::repository::link::{
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmNodeKind};
 use aruna_core::structs::secondary_id::{IdentifierOrigin, SecondaryIdKind};
 use aruna_core::time::unix_timestamp_millis;
+use aruna_ops_data::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
+use aruna_ops_data::metadata::delete_document::DeleteDocumentOperation;
+use aruna_ops_data::metadata::revision_read::RawViewOperation;
+use aruna_ops_data::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
 use aruna_ops_work::jobs::repository::links::{ChangeLinkOperation, LinkChange};
 use aruna_ops_work::jobs::submit::local::SubmitLocalOperation;
-use aruna_ops_work::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
-use aruna_ops_work::metadata::delete_document::DeleteDocumentOperation;
-use aruna_ops_work::metadata::revision_read::RawViewOperation;
-use aruna_ops_work::metadata::update_document::{UpdateDocumentConfig, UpdateDocumentOperation};
 use aruna_runner::driver::drive;
 use aruna_test_harness::metadata::process_prune_batch;
 
@@ -428,7 +428,7 @@ async fn link_follows_lineage() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(published.remote.record_id.as_deref(), Some("1"));
     assert_eq!(published.remote.identifier.as_deref(), Some("10.1234/1"));
     let auth = Box::pin(run_registration(&fixture, push_job, pusher)).await?;
-    use aruna_ops_work::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
+    use aruna_ops_data::metadata::identifier_lookup::{IdentifierLookupOperation, IdentifierQuery};
     let query = IdentifierQuery {
         kind: SecondaryIdKind::Doi,
         value: "10.1234/1".to_string(),

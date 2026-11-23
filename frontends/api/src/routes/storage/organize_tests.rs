@@ -241,7 +241,7 @@ async fn hides_unmapped_failures() {
     let group = Ulid::from_string(&ids.0).unwrap();
     let import = Ulid::from_string(&ids.1).unwrap();
     let rule = aruna_runner::driver::drive(
-        aruna_ops_work::s3::imports::ReadImportOperation::new(group, import),
+        aruna_ops_data::s3::imports::ReadImportOperation::new(group, import),
         &context,
     )
     .await

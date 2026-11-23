@@ -25,21 +25,21 @@ use aruna_core::structs::identity::realm::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentError, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::forward::profile_export::ProfileLocalOperation;
-use aruna_ops_work::metadata::forward::read::admits_profile_peer;
-use aruna_ops_work::metadata::forward::route_create::RouteCreateOperation;
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::profile::validation::{
+use aruna_ops_data::metadata::forward::profile_export::ProfileLocalOperation;
+use aruna_ops_data::metadata::forward::read::admits_profile_peer;
+use aruna_ops_data::metadata::forward::route_create::RouteCreateOperation;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::profile::validation::{
     MetadataProfilePreview, ProfileAssessOperation, RevalidateOperation, StoredStatusOperation,
     ValidationStatusOperation, profile_public_iri, profile_verdict,
 };
-use aruna_ops_work::metadata::update_document::{
+use aruna_ops_data::metadata::update_document::{
     UpdateDocumentConfig, UpdateDocumentError, UpdateDocumentOperation,
 };
-use aruna_ops_work::metadata::update_entry::UpdateEntryOperation;
+use aruna_ops_data::metadata::update_entry::UpdateEntryOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage::worker::FjallStorage;
@@ -1638,7 +1638,7 @@ async fn create_crate(
     document_id: Ulid,
     path: &str,
     jsonld: String,
-) -> Result<aruna_ops_work::metadata::create_document::CreateDocumentResult, CreateDocumentError> {
+) -> Result<aruna_ops_data::metadata::create_document::CreateDocumentResult, CreateDocumentError> {
     match drive(
         RouteCreateOperation::new(
             CreateDocumentOperation::new_generated_id(CreateDocumentConfig {

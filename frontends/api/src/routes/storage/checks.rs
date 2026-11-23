@@ -11,11 +11,11 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::broken::{BrokenReason, StorageCheck};
-use aruna_ops_work::blob::migration::broken::{
+use aruna_ops_data::blob::migration::broken::{
     CleanBrokenOperation, IsCurrentOperation, ListBrokenOperation, ReadCheckOperation,
 };
-use aruna_ops_work::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
-use aruna_ops_work::s3::object::delete::DeleteObjectInput;
+use aruna_ops_data::s3::bucket::storage_check::{StartCheckError, StartCheckOperation};
+use aruna_ops_data::s3::object::delete::DeleteObjectInput;
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};

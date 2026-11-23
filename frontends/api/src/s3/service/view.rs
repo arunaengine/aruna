@@ -6,11 +6,11 @@
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::AuthContext;
+use aruna_ops_data::s3::object::visible::is_sealed;
 use aruna_ops_work::jobs::workflow::input_view::{
     MAX_VIEW_KEYS, ReadManifestOperation, ViewEntry, ViewEntryOperation, ViewError, ViewFrom,
     ViewLister, creator, decode_token, encode_token, names_manifest, view_bucket, view_entries,
 };
-use aruna_ops_work::s3::object::visible::is_sealed;
 use aruna_runner::driver::drive;
 use aruna_runner::position::{open_cursor, seal_cursor};
 use percent_encoding::utf8_percent_encode;

@@ -22,22 +22,22 @@ use aruna_core::structs::storage::global_id::GlobalId;
 use aruna_core::structs::storage::replication::{
     ArunaArn, ArunaArnType, VersionedObjectArn, W3idIdentifier,
 };
-use aruna_ops_work::auth::error::token_grant;
-use aruna_ops_work::distribution::resolve::{
+use aruna_ops_data::distribution::resolve::{
     GlobalResolution, content_resolved, resolve_content, resolve_version, resolved,
 };
-use aruna_ops_work::distribution::ticket::{
+use aruna_ops_data::distribution::ticket::{
     RedeemError, TicketInput, redeem_ticket, unsigned_ticket,
 };
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::holder_choice::PickHolderOperation;
-use aruna_ops_work::replication::locations::LocationSummaryError;
-use aruna_ops_work::replication::locations::holders::{
+use aruna_ops_data::holder_choice::PickHolderOperation;
+use aruna_ops_data::replication::locations::LocationSummaryError;
+use aruna_ops_data::replication::locations::holders::{
     HolderAnswer, HolderResolveError, HolderResolveOperation,
 };
-use aruna_ops_work::replication::locations::remote::RemoteLocationOperation;
-use aruna_ops_work::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use aruna_ops_work::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::replication::locations::remote::RemoteLocationOperation;
+use aruna_ops_data::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_ops_identity::auth::error::token_grant;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_runner::driver::{DriverContext, drive, drive_until};
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Path, Query, State};
@@ -1080,7 +1080,7 @@ async fn drs_part_of(
     bearer: Option<String>,
     resolved: &ResolvedObject,
 ) -> Option<DrsPartOf> {
-    let found = aruna_ops_work::metadata::api::links::part_of(
+    let found = aruna_ops_data::metadata::api::links::part_of(
         (state.get_realm_id(), state.get_node_id()),
         (auth, bearer),
         &resolved.bucket,

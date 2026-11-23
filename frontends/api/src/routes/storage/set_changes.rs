@@ -9,7 +9,7 @@ use std::sync::Arc;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::distribution::request::TransferRole;
 use aruna_core::structs::storage::distribution::{DistributionRevision, MetadataCoverage};
-use aruna_ops_work::transfer::change::{
+use aruna_ops_data::transfer::change::{
     JoinInput, add_copy, change_settings, delete_set, join_member, leave_member, split_range,
     transfer_range,
 };

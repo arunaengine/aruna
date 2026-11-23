@@ -46,17 +46,17 @@ use aruna_core::structured_id::{BucketId, PlacementHandle};
 use aruna_core::task::TaskKey;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
+use aruna_ops_data::s3::object::put::{
+    PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
+};
+use aruna_ops_data::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
+use aruna_ops_data::testing::fresh_job_id;
 use aruna_ops_work::jobs::workflow::credential::RunIdentity;
 use aruna_ops_work::jobs::workflow::inputs::LoadInputsOperation;
 use aruna_ops_work::jobs::workflow::outputs::{CaptureOutputsOperation, CaptureScope};
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::bucket::list::{ListBucketsInput, ListBucketsOperation};
-use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation, HeadObjectResult};
-use aruna_ops_work::s3::object::put::{
-    PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
-};
-use aruna_ops_work::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
-use aruna_ops_work::testing::fresh_job_id;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::NetConfig;
 use aruna_runner::driver::{DriverContext, drive, node_routing};

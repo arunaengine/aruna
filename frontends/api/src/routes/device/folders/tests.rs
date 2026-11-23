@@ -7,7 +7,7 @@ use super::{
 };
 use crate::routes::device::dto::hex_hash;
 use aruna_core::id::NodeId;
-use aruna_ops_work::device::sync::actions::ActionError;
+use aruna_ops_data::device::sync::actions::ActionError;
 use axum::http::StatusCode;
 
 #[test]

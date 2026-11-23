@@ -27,15 +27,17 @@ use aruna_core::structs::identity::auth::{
 use aruna_core::structs::identity::realm::{OidcProviderConfig, RealmConfigDocument, RealmId};
 use aruna_core::structs::identity::user::User;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_ops_identity::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_ops_identity::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
+use aruna_ops_identity::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_ops_identity::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_ops_work::node::api_state::LoadStateOperation;
-use aruna_ops_work::onboarding::consume_secret::{ConsumeSecretInput, ConsumeSecretOperation};
-use aruna_ops_work::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_ops_work::onboarding::recover_admin::{RecoverInitialInput, RecoverInitialOperation};
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_ops_work::users::get_oidc::{GetOidcError, GetOidcInput, GetOidcOperation};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};

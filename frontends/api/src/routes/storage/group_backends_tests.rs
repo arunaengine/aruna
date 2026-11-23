@@ -279,7 +279,7 @@ async fn bucket_check_refuses() {
         disabled: false,
         cleanup: CleanupStrategy::Retain,
     };
-    let writes = aruna_ops_work::groups::backends::record_writes(&fixed).unwrap();
+    let writes = aruna_ops_identity::groups::backends::record_writes(&fixed).unwrap();
     test.state
         .get_ctx()
         .storage_handle

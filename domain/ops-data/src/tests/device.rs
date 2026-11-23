@@ -119,22 +119,3 @@ pub(crate) fn replica() -> crate::device::replica::ReplicaRecord {
         crate::device::replica::ReplicaOrigin::Realm,
     )
 }
-
-/// One stored row as raw bytes, returning an error only if storage failed.
-pub(crate) async fn read_row(
-    context: &DriverContext,
-    key_space: &str,
-    key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, String> {
-    let read = StorageEffect::Read {
-        key_space: key_space.to_string(),
-        key: key.into(),
-        txn_id: None,
-    };
-    match context.storage_handle.send_storage_effect(read).await {
-        Event::Storage(StorageEvent::ReadResult { value, .. }) => {
-            Ok(value.map(|value| value.to_vec()))
-        }
-        other => Err(format!("unexpected storage event: {other:?}")),
-    }
-}

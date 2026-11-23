@@ -44,8 +44,8 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
     MultipartPartKey, MultipartUpload,
 };
+use aruna_ops_identity::placement::policy::cache::PolicyCacheEntry;
 use aruna_ops_work::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
-use aruna_ops_work::placement::policy::cache::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use craqle::{
     ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -394,7 +394,7 @@ fn decode_value(keyspace_name: &str, key: &[u8], value: &[u8]) -> DecodedValue {
         ),
         SYNC_PLACEMENT_KEYSPACE => decode_value_with(
             value,
-            aruna_ops_work::sync::shard_placement::decode_placement,
+            aruna_ops_identity::sync::shard_placement::decode_placement,
             |data| DecodedValue::PendingDocumentPlacement {
                 data: JsonPendingPlacement(data),
             },
@@ -1006,8 +1006,8 @@ mod tests {
         MultipartChecksumType, MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary,
         MultipartPart, MultipartPartKey, MultipartUpload, MultipartUploadStatus,
     };
+    use aruna_ops_identity::placement::policy::cache::PolicyCacheEntry;
     use aruna_ops_work::jobs::lifecycle::witness::arm::{WitnessDeadline, WitnessExplain};
-    use aruna_ops_work::placement::policy::cache::PolicyCacheEntry;
     use chrono::{DateTime, Utc};
     use craqle::{
         ActorId as CraqleActorId, Dot as CraqleDot, GraphPolicy as CraqleGraphPolicy,
@@ -1622,7 +1622,7 @@ mod tests {
         };
         let selected_peer = iroh::SecretKey::from_bytes(&[7_u8; 32]).public();
         let authoritative_node_id = iroh::SecretKey::from_bytes(&[6_u8; 32]).public();
-        let placement = aruna_ops_work::sync::shard_placement::new_placement(
+        let placement = aruna_ops_identity::sync::shard_placement::new_placement(
             realm_id,
             placement_ref,
             authoritative_node_id,
@@ -1630,7 +1630,8 @@ mod tests {
             1,
         );
         let value = postcard::to_allocvec(&placement).unwrap();
-        let key = aruna_ops_work::sync::shard_placement::placement_key(realm_id, &placement_ref);
+        let key =
+            aruna_ops_identity::sync::shard_placement::placement_key(realm_id, &placement_ref);
 
         let decoded = decode_entry(SYNC_PLACEMENT_KEYSPACE, key.as_ref(), &value);
         assert_eq!(

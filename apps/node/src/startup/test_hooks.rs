@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use aruna_ops_identity::shard::recovery::RecoveryStatus;
 use aruna_ops_work::node::recovery_run::RecoveryConfig;
-use aruna_ops_work::shard::recovery::RecoveryStatus;
 use aruna_runner::driver::DriverContext;
 #[cfg(debug_assertions)]
 use tokio_util::sync::CancellationToken;
@@ -107,16 +107,16 @@ async fn watch_recovery(
             return;
         }
         match status.snapshot().state {
-            aruna_ops_work::shard::recovery::RecoveryState::Degraded => {
+            aruna_ops_identity::shard::recovery::RecoveryState::Degraded => {
                 if let Err(error) = std::fs::write(&barrier.path, b"active") {
                     warn!(error = %error, "Failed to record recovery activity");
                 }
                 cancelled.cancelled().await;
                 return;
             }
-            aruna_ops_work::shard::recovery::RecoveryState::Converged => return,
-            aruna_ops_work::shard::recovery::RecoveryState::Pending
-            | aruna_ops_work::shard::recovery::RecoveryState::Running => {}
+            aruna_ops_identity::shard::recovery::RecoveryState::Converged => return,
+            aruna_ops_identity::shard::recovery::RecoveryState::Pending
+            | aruna_ops_identity::shard::recovery::RecoveryState::Running => {}
         }
         tokio::task::yield_now().await;
     }

@@ -11,7 +11,7 @@ use aruna_core::operation::Operation;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use tracing::{info, warn};
 
-use crate::node::usage_publish::{PublishUsageOperation, PublishedUsage, UsagePublishError};
+use aruna_ops_data::usage_publish::{PublishUsageOperation, PublishedUsage, UsagePublishError};
 use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_ops_identity::placement::process_placements::{
     PlacementReconcileOutcome, PlacementReconcileStatus, ReconcilePlacementsOperation,

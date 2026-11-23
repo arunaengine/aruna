@@ -16,28 +16,28 @@ use aruna_core::structs::execution::source_access::{
 };
 use aruna_core::structs::execution::source_connector::{SourceConnector, SourceConnectorKind};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
-use aruna_ops_work::connectors::create_connector::{
+use aruna_ops_data::connectors::create_connector::{
     SourceConnectorError, SourceConnectorInput, SourceConnectorOperation,
 };
-use aruna_ops_work::connectors::delete_connector::{
+use aruna_ops_data::connectors::delete_connector::{
     DeleteSourceError, DeleteSourceInput, DeleteSourceOperation,
 };
-use aruna_ops_work::connectors::get_connector::{
+use aruna_ops_data::connectors::get_connector::{
     GetSourceError, GetSourceInput, GetSourceOperation,
 };
-use aruna_ops_work::connectors::list_connectors::{
+use aruna_ops_data::connectors::list_connectors::{
     ListSourceError, ListSourceInput, ListSourceOperation,
 };
-use aruna_ops_work::connectors::replace_connector::{
+use aruna_ops_data::connectors::replace_connector::{
     ReplaceSourceError, ReplaceSourceInput, ReplaceSourceOperation,
 };
-use aruna_ops_work::connectors::resolver::{
+use aruna_ops_data::connectors::resolver::{
     ResolveConnectorInput, ResolveConnectorOperation, resolve_inline_access, validate_source_path,
 };
-use aruna_ops_work::connectors::secret_config::{HasConfigError, HasConfigOperation};
-use aruna_ops_work::connectors::validation::validate_connector_input;
-use aruna_ops_work::staging::check_source::CheckSourceOperation;
-use aruna_ops_work::staging::list_source::{
+use aruna_ops_data::connectors::secret_config::{HasConfigError, HasConfigOperation};
+use aruna_ops_data::connectors::validation::validate_connector_input;
+use aruna_ops_data::staging::check_source::CheckSourceOperation;
+use aruna_ops_data::staging::list_source::{
     ListStagingError, ListStagingInput, ListStagingOperation,
 };
 use aruna_runner::driver::drive;
@@ -1140,9 +1140,9 @@ async fn run_connector_check(
     }
 }
 
-fn check_error_message(error: &aruna_ops_work::staging::check_source::CheckSourceError) -> String {
+fn check_error_message(error: &aruna_ops_data::staging::check_source::CheckSourceError) -> String {
     use aruna_core::errors::StagingSourceError;
-    use aruna_ops_work::staging::check_source::CheckSourceError;
+    use aruna_ops_data::staging::check_source::CheckSourceError;
 
     match error {
         CheckSourceError::Staging(StagingSourceError::OperatorCreationFailed(_)) => {
@@ -1232,7 +1232,7 @@ fn map_connector_list(error: ListSourceError) -> ServerError {
     ServerError::InternalError(error.into())
 }
 
-fn map_get_error(error: aruna_ops_work::connectors::get_connector::GetSourceError) -> ServerError {
+fn map_get_error(error: aruna_ops_data::connectors::get_connector::GetSourceError) -> ServerError {
     match error {
         GetSourceError::NotFound => ServerError::NotFound,
         GetSourceError::StorageError(_) | GetSourceError::ConversionError(_) => {

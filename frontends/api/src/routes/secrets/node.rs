@@ -7,8 +7,8 @@ use std::sync::Arc;
 use aruna_clock::unix_timestamp_millis;
 use aruna_core::secrets::SecretRecord;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_ops_work::secrets::SecretChange;
-use aruna_ops_work::secrets::node::{
+use aruna_ops_identity::secrets::SecretChange;
+use aruna_ops_identity::secrets::node::{
     NodeChange, NodeSecretError, NodeSecretOperation, NodeSecretsOperation,
 };
 use aruna_runner::driver::drive;

@@ -14,17 +14,17 @@ use aruna_core::structs::persistent_id::PersistentIdMapping;
 use aruna_core::structs::secondary_id::SecondaryIdentifier;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::export_types::GetVisibleRequest;
-use aruna_ops_work::metadata::forward::authorized_create::CreateAuthorizedError;
-use aruna_ops_work::metadata::forward::authorized_create::PinnedCreateOperation;
-use aruna_ops_work::metadata::forward::pinned::PinnedCreate;
-use aruna_ops_work::metadata::forward::routed::read::RoutedReadOperation;
-use aruna_ops_work::metadata::forward::routed::write::RouteDeleteOperation;
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::id_mapping::PersistentIdError;
-use aruna_ops_work::metadata::persistent_id::MappingReadOperation;
-use aruna_ops_work::metadata::persistent_id::forward::{
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::export_types::GetVisibleRequest;
+use aruna_ops_data::metadata::forward::authorized_create::CreateAuthorizedError;
+use aruna_ops_data::metadata::forward::authorized_create::PinnedCreateOperation;
+use aruna_ops_data::metadata::forward::pinned::PinnedCreate;
+use aruna_ops_data::metadata::forward::routed::read::RoutedReadOperation;
+use aruna_ops_data::metadata::forward::routed::write::RouteDeleteOperation;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::id_mapping::PersistentIdError;
+use aruna_ops_data::metadata::persistent_id::MappingReadOperation;
+use aruna_ops_data::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution,
 };
 use aruna_runner::driver::{DriverContext, drive};
@@ -169,7 +169,7 @@ pub async fn route_metadata_update(
     token: Option<AuthToken>,
     commit_message: Option<String>,
 ) -> Result<MetadataRegistryRecord, MetadataWriteError> {
-    use aruna_ops_work::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+    use aruna_ops_data::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
     let update = DocumentUpdate {
         public,
         mutation,
@@ -186,15 +186,15 @@ pub async fn list_audit(
     realm_id: RealmId,
     local_node: NodeId,
     token: Option<AuthToken>,
-    request: aruna_ops_work::metadata::audit::ListAuditRequest,
+    request: aruna_ops_data::metadata::audit::ListAuditRequest,
     deadline: tokio::time::Instant,
 ) -> Result<
-    aruna_ops_work::metadata::audit::AuditAggregate,
-    aruna_ops_work::metadata::audit::ListAuditError,
+    aruna_ops_data::metadata::audit::AuditAggregate,
+    aruna_ops_data::metadata::audit::ListAuditError,
 > {
     use aruna_api::routes::audit::outbound_admission;
-    use aruna_ops_work::metadata::audit::ListAuditError;
-    use aruna_ops_work::metadata::audit_entry::AuditListOperation;
+    use aruna_ops_data::metadata::audit::ListAuditError;
+    use aruna_ops_data::metadata::audit_entry::AuditListOperation;
     let _admission = outbound_admission().ok_or(ListAuditError::Unavailable)?;
     let wait = deadline.saturating_duration_since(tokio::time::Instant::now());
     let list = AuditListOperation::new((realm_id, local_node), token, request, wait);

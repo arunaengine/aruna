@@ -10,9 +10,9 @@ use aruna_core::placement::holds_placement;
 use aruna_core::placement::transition::preview_transition;
 use aruna_core::structs::placement::transition::TransitionLimits;
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::metadata::create_document::mint_local_document;
-use aruna_ops_work::metadata::get_document::GetDocumentOperation;
-use aruna_ops_work::realm::mutate_placement::RealmPlacementMutation;
+use aruna_ops_data::metadata::create_document::mint_local_document;
+use aruna_ops_data::metadata::get_document::GetDocumentOperation;
+use aruna_ops_identity::realm::mutate_placement::RealmPlacementMutation;
 use aruna_runner::driver::drive;
 
 use crate::topology::document_present;

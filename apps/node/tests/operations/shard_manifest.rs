@@ -10,7 +10,7 @@ use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
 use aruna_runner::driver::drive;
@@ -18,7 +18,7 @@ use ulid::Ulid;
 
 use crate::convergence::wait_for_convergence;
 use crate::topology::{TestNode, announce_nodes, install_default_config, spawn_replicas};
-use aruna_ops_work::shard::AssembleManifestOperation;
+use aruna_ops_identity::shard::AssembleManifestOperation;
 
 // A metadata document created on node A must leave a manifest row on the origin AND on the
 // receiver that syncs it.

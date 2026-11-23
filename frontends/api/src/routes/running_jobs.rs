@@ -10,7 +10,7 @@ use crate::server::state::ServerState;
 use aruna_core::jobs::{JobTarget, RunningJobView};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::group_permission_path;
-use aruna_ops_work::auth::request_authorization::BucketAccessOperation;
+use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
 use aruna_runner::driver::drive;
 use axum::extract::State;
 use axum::http::StatusCode;

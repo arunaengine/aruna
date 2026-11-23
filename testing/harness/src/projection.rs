@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use aruna_core::id::NodeId;
 use aruna_core::metadata::MetadataEventRecord;
-use aruna_ops_work::metadata::projection::{
+use aruna_ops_data::metadata::projection::{
     DrainProjectionOperation, MetadataProjectionError, PendingProjectionResult,
     ProjectEventsOperation, ProjectLoggedOperation, ProjectionWakeOperation, ReplayPageOperation,
 };

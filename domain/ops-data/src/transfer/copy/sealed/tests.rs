@@ -162,10 +162,9 @@ async fn pending_alias_shared() {
     let pointer = CurrentVersionPointer::from_bytes(&head).unwrap();
     assert_eq!(pointer.version_id, result.version_id);
     // The copy is a new version of the destination key, journaled with it.
-    let page = aruna_ops_work::plugins::journal::journal_page(b'j', None, 10);
-    let (rows, _) = aruna_runner::driver::drive(page, &context).await.unwrap();
+    let rows = crate::tests::journal_events(&context, b'j', 10).await;
     assert_eq!(rows.len(), 1);
-    let uploaded = &rows[0].1;
+    let uploaded = &rows[0];
     assert_eq!(uploaded.revision, result.version_id.to_string());
     assert!(
         uploaded.resource.ends_with("/bucket/copy"),

@@ -334,15 +334,15 @@ mod tests {
     use aruna_core::structs::storage::blob::{Backend, BackendConfig, BucketInfo};
     use aruna_core::structs::storage::format::Compression;
     use aruna_core::testing::EnvGuard;
-    use aruna_ops_work::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-    use aruna_ops_work::groups::routing::{BucketRules, SnapshotOperation};
-    use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_ops_work::s3::access::create::{
+    use aruna_ops_data::s3::access::create::{
         CreateUserConfig, CreateUserOperation, DEFAULT_CREDENTIAL_TTL,
     };
-    use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-    use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+    use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+    use aruna_ops_identity::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+    use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
+    use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive, node_routing};

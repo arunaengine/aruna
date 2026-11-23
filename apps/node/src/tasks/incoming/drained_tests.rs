@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 use super::remove_drained_backends;
 use aruna_core::structs::storage::blob::BackendRef;
-use aruna_ops_work::groups::backends::{backend_key, index_key, record_writes};
+use aruna_ops_identity::groups::backends::{backend_key, index_key, record_writes};
 use aruna_runner::driver::DriverContext;
 
 fn context(root: &str) -> DriverContext {
@@ -66,7 +66,8 @@ async fn seed(context: &DriverContext, backend_id: Ulid, disabled: bool) {
         updated_at: SystemTime::UNIX_EPOCH,
     };
     let entry = GroupStorageSecret::vault_entry(backend_id);
-    let effect = aruna_ops_work::node_vault::write_secret(entry, secret.to_secret().unwrap(), None);
+    let effect =
+        aruna_ops_identity::node_vault::write_secret(entry, secret.to_secret().unwrap(), None);
     context.storage_handle.send_effect(effect).await;
 }
 
@@ -74,9 +75,10 @@ async fn stored_secret(context: &DriverContext, backend_id: Ulid) -> Option<Grou
     let entry = GroupStorageSecret::vault_entry(backend_id);
     let event = context
         .storage_handle
-        .send_effect(aruna_ops_work::node_vault::read_secret(entry, None))
+        .send_effect(aruna_ops_identity::node_vault::read_secret(entry, None))
         .await;
-    aruna_ops_work::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes).unwrap()
+    aruna_ops_identity::node_vault::parse_secret(event, entry, GroupStorageSecret::from_bytes)
+        .unwrap()
 }
 
 async fn read(context: &DriverContext, key_space: &str, key: Key) -> Option<Vec<u8>> {
@@ -241,5 +243,5 @@ async fn holding_backend_survives() {
 }
 
 fn record(backend_id: Ulid, disabled: bool) -> GroupStorage {
-    aruna_ops_work::testing::group_storage(backend_id, disabled)
+    aruna_ops_data::testing::group_storage(backend_id, disabled)
 }

@@ -105,7 +105,7 @@ async fn topic_page_blocks() {
     net.ensure_sync_topics(&[healthy_topic], Vec::new())
         .await
         .expect("healthy topic genesis");
-    let blocked = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let blocked = aruna_ops_identity::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         blocked_target,
@@ -117,7 +117,7 @@ async fn topic_page_blocks() {
         aruna_core::structs::placement::record::PlacementRef::NIL,
         true,
     );
-    let healthy = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let healthy = aruna_ops_identity::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         healthy_target,
@@ -412,7 +412,7 @@ async fn blocked_keeps_backoff() {
         strategy_id: Ulid::from_bytes([48; 16]),
         shard: 1,
     };
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target(),
@@ -485,7 +485,7 @@ async fn deferred_head_paginates() {
     };
     let mut writes = Vec::with_capacity(OUTBOX_DRAIN_SIZE + 1);
     for index in 0..OUTBOX_DRAIN_SIZE {
-        let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+        let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index as u128),
             node(1),
             deferred_target.clone(),
@@ -498,14 +498,14 @@ async fn deferred_head_paginates() {
             false,
         );
         writes.push(
-            aruna_ops_work::sync::outbox::record::outbox_write_entry(&record)
+            aruna_ops_identity::sync::outbox::record::outbox_write_entry(&record)
                 .expect("outbox entry"),
         );
     }
 
     // One later origin record for a shared (non-shard) topic, ordered
     // strictly after the head page, so only pagination reaches it.
-    let publish_record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let publish_record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         Ulid::from_parts(2, 0),
         node(1),
         DocumentTarget::RealmAuthorization { realm_id },
@@ -519,7 +519,8 @@ async fn deferred_head_paginates() {
     );
     let publish_key = outbox_key(&publish_record).to_vec();
     writes.push(
-        aruna_ops_work::sync::outbox::record::outbox_write_entry(&publish_record).expect("entry"),
+        aruna_ops_identity::sync::outbox::record::outbox_write_entry(&publish_record)
+            .expect("entry"),
     );
 
     match storage
@@ -638,7 +639,7 @@ async fn rotation_streak() {
     );
     let total = u128::from(OUTBOX_CONTINUATION_STREAK) + 2;
     for index in 1..=total {
-        let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+        let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, index),
             node(1),
             target.clone(),
@@ -753,7 +754,7 @@ async fn draining_a_topics() {
         "the rank-0 shard topic must not exist before the config change is drained"
     );
 
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
@@ -767,7 +768,7 @@ async fn draining_a_topics() {
     );
     write_outbox_record(&storage, &record).await;
     task_handle
-        .send_effect(aruna_ops_work::sync::outbox::record::schedule_drain_effect())
+        .send_effect(aruna_ops_identity::sync::outbox::record::schedule_drain_effect())
         .await;
 
     let exists = || std::future::ready(net.sync_topic_exists(topic).unwrap_or(false).then_some(()));
@@ -806,7 +807,7 @@ async fn retry_publishes_once() {
     net.refresh_document_peers(&config)
         .await
         .expect("refresh peers");
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         net.node_id(),
         DocumentTarget::RealmConfig { realm_id },
@@ -888,7 +889,7 @@ async fn config_setup() -> ConfigHarness {
         .expect("shared topic genesis");
     let mut shard_change = change();
     shard_change.placement = placement;
-    let shared = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let shared = aruna_ops_identity::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 1),
         node(1),
         shared_target,
@@ -900,7 +901,7 @@ async fn config_setup() -> ConfigHarness {
         aruna_core::structs::placement::record::PlacementRef::NIL,
         true,
     );
-    let shard = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let shard = aruna_ops_identity::sync::outbox::record::new_identified_record(
         Ulid::from_parts(1, 2),
         node(1),
         shard_target.clone(),
@@ -1031,7 +1032,7 @@ async fn pull_reaches_holder() {
 
     let mut change = change();
     change.placement = placement;
-    let record = aruna_ops_work::sync::outbox::record::new_identified_record(
+    let record = aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         net.node_id(),
         target,
@@ -1094,7 +1095,7 @@ fn admin_outbox(
         AdminDocumentClock, AdminDocumentEvent, AdminDocumentOperation, AdminDocumentTarget,
     };
     let user_id = aruna_core::user::id::UserId::nil(realm_id);
-    aruna_ops_work::sync::outbox::record::new_identified_record(
+    aruna_ops_identity::sync::outbox::record::new_identified_record(
         ulid::Ulid::generate(),
         node(1),
         target,
@@ -1184,7 +1185,7 @@ impl BoundaryHarness {
         target: DocumentTarget,
         event: DocumentOutboxEvent,
     ) -> DocumentOutboxRecord {
-        aruna_ops_work::sync::outbox::record::new_identified_record(
+        aruna_ops_identity::sync::outbox::record::new_identified_record(
             Ulid::from_parts(1, id),
             node(1),
             target,

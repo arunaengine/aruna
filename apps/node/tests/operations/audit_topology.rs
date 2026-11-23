@@ -7,11 +7,11 @@ use crate::topology;
 use crate::metadata_calls::list_audit;
 use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::metadata::audit::{
+use aruna_ops_data::metadata::audit::{
     AUDIT_DEADLINE_SECS, AUDIT_PAGE_LIMIT, AuditAggregate, ListAuditOperation, ListAuditRequest,
     LocalPageOperation,
 };
-use aruna_ops_work::metadata::create_document::mint_local_document;
+use aruna_ops_data::metadata::create_document::mint_local_document;
 use aruna_runner::driver::drive;
 use std::cell::RefCell;
 use ulid::Ulid;

@@ -23,7 +23,7 @@ use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::blob::CopyOrigin;
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::replication::locations::LocationSummaryError;
+use aruna_ops_data::replication::locations::LocationSummaryError;
 use aruna_runner::driver::DriverContext;
 use aruna_storage::storage::worker::FjallStorage;
 use axum::Extension;

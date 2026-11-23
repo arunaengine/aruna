@@ -6,14 +6,14 @@
 use std::sync::Arc;
 
 use aruna_core::structs::identity::identifier::{Identifier, IdentifierTarget};
-use aruna_ops_work::transfer::release::access::MembersCheckOperation;
-use aruna_ops_work::transfer::release::publish::{
+use aruna_ops_data::transfer::release::access::MembersCheckOperation;
+use aruna_ops_data::transfer::release::publish::{
     self as release_publish, PublishError, PublishInput, ReleaseSpec,
 };
-use aruna_ops_work::transfer::release::view::{
+use aruna_ops_data::transfer::release::view::{
     CheckedViewOperation, FilePage, MAX_PAGE, ViewError,
 };
-use aruna_ops_work::transfer::release::{BucketScope, MembershipCaller};
+use aruna_ops_data::transfer::release::{BucketScope, MembershipCaller};
 use aruna_runner::driver::{drive, node_routing};
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;

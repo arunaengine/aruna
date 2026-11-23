@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
-use aruna_ops_work::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
 use aruna_runner::driver::drive;
 
 use std::time::Duration;
@@ -12,12 +12,12 @@ use crate::metadata_calls::get_metadata_routed;
 use crate::metadata_calls::route_metadata_update;
 use aruna_core::metadata::api::{RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::device::replica_store::read_replica;
-use aruna_ops_work::device_node::realm_documents::fetch_realm_documents;
-use aruna_ops_work::metadata::api::export_types::{ExportMetadataRequest, GetVisibleRequest};
-use aruna_ops_work::metadata::create_document::mint_local_document;
-use aruna_ops_work::metadata::device::drain::drain_publish_queue;
-use aruna_ops_work::metadata::device::selection::select_document;
+use aruna_ops_data::device::replica_store::read_replica;
+use aruna_ops_data::metadata::api::export_types::{ExportMetadataRequest, GetVisibleRequest};
+use aruna_ops_data::metadata::create_document::mint_local_document;
+use aruna_ops_data::metadata::device::drain::drain_publish_queue;
+use aruna_ops_data::metadata::device::selection::select_document;
+use aruna_ops_identity::device_node::realm_documents::fetch_realm_documents;
 use aruna_test_harness::metadata::process_materialization_batch;
 use aruna_test_harness::projection::replay_event_log;
 use topology::{TestNode, TestResult, Topology, wait_until};

@@ -11,7 +11,7 @@ use aruna_clock::unix_timestamp_millis;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::metrics::NodeMetrics;
 use aruna_core::telemetry::QUEUE_LAG_INTERVAL;
-use aruna_ops_work::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
+use aruna_ops_identity::shard::recovery::{RecoveryOutcome, RecoveryState, RecoveryStatus};
 use aruna_runner::driver::DriverContext;
 use aruna_runner::effect_adapters::queue_lag::{QueueLagReporter, QueueLagSnapshot};
 use axum::Json;
@@ -656,7 +656,7 @@ mod tests {
     use super::*;
     use aruna_core::effects::StorageEffect;
     use aruna_core::keyspaces::{NODE_STATE_KEY, NODE_STATE_KEYSPACE};
-    use aruna_ops_work::shard::recovery::RecoveryError;
+    use aruna_ops_identity::shard::recovery::RecoveryError;
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::worker::FjallStorage;
     use axum::body::{Body, to_bytes};

@@ -25,10 +25,10 @@ use aruna_core::structs::execution::job::input::{
 use aruna_core::structs::execution::job::local::{JobRecord, RunCrateStatus};
 use aruna_core::structs::placement::record::FIRST_GRANTABLE_HANDLE;
 use aruna_core::structured_id::{BucketId, PlacementHandle};
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::testing::fresh_job_id;
 use aruna_ops_work::jobs::store::job_calls::{self, ClaimOutcome};
 use aruna_ops_work::jobs::store::{JobMutation, row_calls};
-use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_ops_work::testing::fresh_job_id;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aws_sdk_s3::primitives::ByteStream;

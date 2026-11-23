@@ -12,19 +12,19 @@ use crate::lookup::actor;
 use aruna_core::metadata::api::{CreateDocumentPayload, RoCrateExportView, UpdateDocumentMutation};
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
-use aruna_ops_work::auth::request_authorization::AuthorizeDocumentOperation;
-use aruna_ops_work::metadata::api::document_query::DocumentQueryOperation;
-use aruna_ops_work::metadata::api::export_types::ExportMetadataRequest;
-use aruna_ops_work::metadata::api::read::query_metadata;
-use aruna_ops_work::metadata::api::read_types::{
+use aruna_ops_data::metadata::api::document_query::DocumentQueryOperation;
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
+use aruna_ops_data::metadata::api::read::query_metadata;
+use aruna_ops_data::metadata::api::read_types::{
     DocumentQueryRequest, MetadataQueryRequest, MetadataReferencesRequest,
 };
-use aruna_ops_work::metadata::api::realm_search::search_metadata;
-use aruna_ops_work::metadata::api::references::ReferencesOperation;
-use aruna_ops_work::metadata::api::search_types::MetadataSearchRequest;
-use aruna_ops_work::metadata::forward::routed::export::RoutedExportOperation;
-use aruna_ops_work::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
-use aruna_ops_work::metadata::profile::validation::ProfileAssessOperation;
+use aruna_ops_data::metadata::api::realm_search::search_metadata;
+use aruna_ops_data::metadata::api::references::ReferencesOperation;
+use aruna_ops_data::metadata::api::search_types::MetadataSearchRequest;
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_ops_data::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_ops_data::metadata::profile::validation::ProfileAssessOperation;
+use aruna_ops_identity::auth::request_authorization::AuthorizeDocumentOperation;
 use aruna_runner::driver::drive;
 use rmcp::Json;
 use rmcp::handler::server::tool::Extension;
@@ -380,7 +380,7 @@ impl McpServer {
         let jsonld = stored_crate(self, &auth, &input.rocrate.0).await?;
         let ctx = self.state.get_ctx();
         let resolved = drive(
-            aruna_ops_work::git::location::resolve(ctx.node_id(), &auth, group_id, None),
+            aruna_ops_data::git::location::resolve(ctx.node_id(), &auth, group_id, None),
             &ctx,
         )
         .await
@@ -407,7 +407,7 @@ impl McpServer {
             error => write_error(error),
         })?;
         drive(
-            aruna_ops_work::git::location::establish(ctx.node_id(), &auth, &record, resolved),
+            aruna_ops_data::git::location::establish(ctx.node_id(), &auth, &record, resolved),
             &ctx,
         )
         .await
@@ -1077,7 +1077,7 @@ mod authorization_tests {
         Actor, NodeCapabilities, PathRestriction, Permission,
     };
     use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
-    use aruna_ops_work::realm::announce_presence::{
+    use aruna_ops_identity::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     use aruna_p2p::NetHandle;

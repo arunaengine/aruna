@@ -25,18 +25,18 @@ use aruna_core::structs::synced_folder::{
     ActionKind, ActionOutcome, ActionScope, FolderMode, FolderState, RemoteBinding,
 };
 use aruna_core::types::Key;
-use aruna_ops_work::device::sync::actions::{
+use aruna_ops_data::device::sync::actions::{
     ActionError, ApplyActionInput, ExpectedEntry, apply_action,
 };
-use aruna_ops_work::device::sync::folders::bind::{bind_folder, finish_binding, request_sync};
-use aruna_ops_work::device::sync::folders::reads::{
+use aruna_ops_data::device::sync::folders::bind::{bind_folder, finish_binding, request_sync};
+use aruna_ops_data::device::sync::folders::reads::{
     folder_counters, list_actions, list_entries, list_folders, read_bound, read_entry,
 };
-use aruna_ops_work::device::sync::folders::unbind::unbind_folder;
-use aruna_ops_work::device::sync::folders::{
+use aruna_ops_data::device::sync::folders::unbind::unbind_folder;
+use aruna_ops_data::device::sync::folders::{
     BindFolderInput, FolderError, set_folder_state, set_propagate_deletes,
 };
-use aruna_ops_work::staging::offered_directory::OfferedDirectoryError;
+use aruna_ops_data::staging::offered_directory::OfferedDirectoryError;
 
 use super::dto::{
     ActionRecordPage, ActionScopeName, EntryAction, FolderEntryPage, FolderEntryView,

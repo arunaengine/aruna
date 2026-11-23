@@ -12,7 +12,7 @@ use aruna_core::metadata::protocol::{
     check_header, check_variant, decode_frame, encode_frame, transport_message_kind, variant_read,
 };
 use aruna_core::telemetry::record_elapsed_ms;
-use aruna_ops_work::metadata::audit::AUDIT_DEADLINE_SECS;
+use aruna_ops_data::metadata::audit::AUDIT_DEADLINE_SECS;
 use aruna_p2p::streams::BiStream;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};

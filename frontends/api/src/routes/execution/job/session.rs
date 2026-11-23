@@ -22,13 +22,13 @@ use aruna_core::structs::execution::job::input::{CopyJobSpec, ExecutionSpec, Job
 use aruna_core::structs::execution::job::local::JobRecord;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::key_content_type;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::placement::policy::gate::{
-    GateContext, GateOperation, PolicyGateError, gate_decision, write_gate,
-};
-use aruna_ops_work::s3::object::head::{HeadObjectInput, HeadObjectOperation};
-use aruna_ops_work::transfer::copy::{
+use aruna_ops_data::s3::object::head::{HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::transfer::copy::{
     CopyObjectInput, CopyObjectOperation, CopyReferences, CopySourceConditions,
+};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::placement::policy::gate::{
+    GateContext, GateOperation, PolicyGateError, gate_decision, write_gate,
 };
 use aruna_runner::driver::{drive, node_routing};
 use axum::Json;

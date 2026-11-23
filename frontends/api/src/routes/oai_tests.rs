@@ -17,8 +17,8 @@ use aruna_core::structs::storage::metadata_registry::{
     MetadataAuditOperation, MetadataAuditRecord,
 };
 use aruna_core::types::{Key, Value};
-use aruna_ops_work::metadata::repository::create_outbox_entries;
-use aruna_ops_work::metadata::visibility_index::{CANDIDATE_BUDGET, RebuildIndexOperation};
+use aruna_ops_data::metadata::repository::create_outbox_entries;
+use aruna_ops_data::metadata::visibility_index::{CANDIDATE_BUDGET, RebuildIndexOperation};
 use std::collections::{HashMap, HashSet};
 
 struct Fixture {

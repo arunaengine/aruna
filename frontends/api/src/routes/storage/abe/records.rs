@@ -9,10 +9,10 @@ use crate::routes::access::groups::KeyRequestFailure;
 use aruna_core::structs::storage::abe_access::{
     GrantContext, KeyGrant, KeyIssuer, KeyRequest, KeyScope, MAX_REQUESTS,
 };
-use aruna_ops_work::abe::member::MemberKeysOperation;
-use aruna_ops_work::abe::reissue::ReissueOperation;
-use aruna_ops_work::auth::epoch_due::EpochDueOperation;
-use aruna_ops_work::transfer::abe_rekey::RekeyOperation;
+use aruna_ops_data::transfer::abe_rekey::RekeyOperation;
+use aruna_ops_identity::abe::member::MemberKeysOperation;
+use aruna_ops_identity::abe::reissue::ReissueOperation;
+use aruna_ops_identity::auth::epoch_due::EpochDueOperation;
 use axum::extract::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

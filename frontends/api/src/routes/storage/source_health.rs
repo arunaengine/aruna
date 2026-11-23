@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use aruna_core::structs::identity::auth::Permission;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_ops_work::transfer::origin::{OriginError, SourceHealth, SourceHealthOperation};
+use aruna_ops_data::transfer::origin::{OriginError, SourceHealth, SourceHealthOperation};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};

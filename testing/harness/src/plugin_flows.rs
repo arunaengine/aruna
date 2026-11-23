@@ -78,8 +78,8 @@ pub mod submit {
     use crate::plugins::flows::matcher::config;
     use crate::plugins::{Fixture, bound, edit_config};
     use aruna_core::plugin_installs::PluginInstall;
-    use aruna_ops_work::s3::object::put::PutObjectOperation;
-    use aruna_ops_work::testing_objects::put_config;
+    use aruna_ops_data::s3::object::put::PutObjectOperation;
+    use aruna_ops_data::testing_objects::put_config;
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_runner::testing::{seed_bucket, with_blob};
 
@@ -126,7 +126,7 @@ pub mod matcher {
     use aruna_core::plugin_installs::PluginInstall;
     use aruna_core::plugin_runs::{ForwardRow, SourceEvent, journal_entries};
     use aruna_core::structs::identity::realm::RealmConfigDocument;
-    use aruna_ops_work::document_repository::GetConfigOperation;
+    use aruna_ops_identity::document_repository::GetConfigOperation;
     use aruna_ops_work::plugins::rows::decode;
     use aruna_runner::driver::drive;
 

@@ -12,7 +12,7 @@ use aruna_core::structs::identity::auth::{PathRestriction, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::{bucket_permission_path, object_permission_path};
 use aruna_core::structs::storage::bucket_metadata::{ReleasePointer, release_key};
-use aruna_ops_work::transfer::origin::ReadOriginOperation;
+use aruna_ops_data::transfer::origin::ReadOriginOperation;
 use aruna_runner::driver::drive;
 
 use super::*;
@@ -358,10 +358,10 @@ async fn browses_release_files() {
 async fn purge_keeps_pinned() {
     use crate::routes::storage::deletion::{PurgeScopeRequest, SubmitPurgeRequest, submit_purge};
     use aruna_core::structs::storage::storage_purge::StoragePurgeScope;
-    use aruna_ops_work::s3::object::delete::{
+    use aruna_ops_data::s3::object::delete::{
         DeleteObjectError, DeleteObjectInput, DeleteObjectOperation,
     };
-    use aruna_ops_work::transfer::pinned::{
+    use aruna_ops_data::transfer::pinned::{
         PinnedError, RefusePinnedOperation, RefuseScopeOperation,
     };
     use aruna_runner::driver::drive;

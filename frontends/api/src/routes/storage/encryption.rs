@@ -28,16 +28,16 @@ use aruna_core::structs::storage::key_audit::AuditAction;
 use aruna_core::structs::storage::transition::{EncryptionTransition, TransitionState};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::s3::bucket::encryption::{EnableEncryptionOperation, EnableError, EnableInput};
-use aruna_ops_work::s3::bucket::holders::LookupKeysOperation;
-use aruna_ops_work::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
-use aruna_ops_work::s3::bucket::key::rows::SettingsError;
-use aruna_ops_work::s3::bucket::rotate::{
+use aruna_ops_data::s3::bucket::encryption::{EnableEncryptionOperation, EnableError, EnableInput};
+use aruna_ops_data::s3::bucket::holders::LookupKeysOperation;
+use aruna_ops_data::s3::bucket::key::install::{InstallInput, InstallKeyOperation};
+use aruna_ops_data::s3::bucket::key::rows::SettingsError;
+use aruna_ops_data::s3::bucket::rotate::{
     ChangeEncryptionOperation, ChangeError, ChangeInput, KeyChange,
 };
-use aruna_ops_work::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
-use aruna_ops_work::s3::unlock_limit::{UnlockLimitError, UnlockLimitInput, UnlockLimitOperation};
-use aruna_ops_work::transfer::key_status::{
+use aruna_ops_data::s3::bucket::token_list::{ListTokensOperation, TokenEntry};
+use aruna_ops_data::s3::unlock_limit::{UnlockLimitError, UnlockLimitInput, UnlockLimitOperation};
+use aruna_ops_data::transfer::key_status::{
     AbeSnapshot, KeySnapshot, KeyStatusError, KeyStatusOperation,
 };
 use aruna_runner::driver::{DriverContext, drive};
@@ -1052,7 +1052,7 @@ pub(crate) fn enable_refusal(error: EnableError) -> ServerError {
         EnableError::Mapped => refused(
             StatusCode::CONFLICT,
             "mapped_bucket",
-            aruna_ops_work::s3::imports::MAPPED_REASON,
+            aruna_ops_data::s3::imports::MAPPED_REASON,
         ),
         other => ServerError::InternalError(other.into()),
     }
@@ -1263,7 +1263,7 @@ mod tests {
 
     #[test]
     fn reports_abe_state() {
-        use aruna_ops_work::transfer::abe_rekey::RekeyProgress;
+        use aruna_ops_data::transfer::abe_rekey::RekeyProgress;
         let mut abe = snapshot();
         abe.abe = Some(AbeSnapshot {
             epoch: 4,

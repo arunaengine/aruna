@@ -884,6 +884,9 @@ mod tests {
     use crate::s3::realm_usage::{
         RealmUsage, RealmUsageError, RealmUsageOperation, RealmUsageScope,
     };
+    use crate::s3::summary_refresh::RefreshUsageOperation;
+    use crate::s3::usage_rebuild::{RebuildStatsError, RebuildStatsOperation, RebuildStatsState};
+    use crate::usage_publish::{ClearMarkersOperation, PublishUsageOperation, PublishedUsage};
     use aruna_core::calls::ChildOutcome;
     use aruna_core::effects::StorageEffect;
     use aruna_core::events::StorageEvent;
@@ -911,13 +914,6 @@ mod tests {
     use aruna_core::structs::storage::usage::{
         SUMMARY_GLOBAL_KEY, global_shard_keys, usage_global_key, usage_snapshot_key,
         usage_summary_key,
-    };
-    use aruna_ops_work::node::summary_refresh::RefreshUsageOperation;
-    use aruna_ops_work::node::usage_publish::{
-        ClearMarkersOperation, PublishUsageOperation, PublishedUsage,
-    };
-    use aruna_ops_work::node::usage_rebuild::{
-        RebuildStatsError, RebuildStatsOperation, RebuildStatsState,
     };
     use aruna_runner::driver::{DriverContext, drive};
     use aruna_runner::testing::path_context;

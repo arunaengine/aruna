@@ -93,7 +93,6 @@ use crate::node::peer_metadata::{MetadataNode, MetadataPeerOperation};
 use crate::node::placement_timer::PlacementTimerOperation;
 use crate::node::presence_timer::PresenceTimerOperation;
 use crate::node::range_timer::RangeTimerOperation;
-use crate::node::usage_publish::PublishUsageOperation;
 use crate::notifications::deliver::{DeliverBatchOperation, DeliverInput};
 use crate::notifications::holder::HolderRead;
 use crate::notifications::outbox::{DELIVERY_RETRY_AFTER, DrainOutboxOperation};
@@ -135,6 +134,7 @@ use aruna_ops_data::s3::object::metadata_drain::DrainRefreshOperation;
 use aruna_ops_data::s3::usage::SNAPSHOT_PUBLISH_DEBOUNCE;
 use aruna_ops_data::staging::native_source::{NativeAnswer, NativeAnswerOperation};
 use aruna_ops_data::transfer::sharding::maintain_retry;
+use aruna_ops_data::usage_publish::PublishUsageOperation;
 use aruna_ops_identity::shard::incoming::{ManifestAnswer, ServeManifestOperation};
 
 /// The operation of one timer run. Its output is when the timer runs again and what it keeps;
@@ -1366,7 +1366,6 @@ mod tests {
     use crate::jobs::drain::{DrainError, JobDrainResult};
     use crate::jobs::lifecycle::LifecycleError;
     use crate::jobs::prune::JobPruneOutcome;
-    use crate::node::usage_publish::{PublishedUsage, UsagePublishError};
     use aruna_core::native_reference::NativeAuthority;
     use aruna_ops_data::blob::hidden::HiddenSweepOutcome;
     use aruna_ops_data::blob::migration::drain::MigrationRun;
@@ -1376,6 +1375,7 @@ mod tests {
     use aruna_ops_data::replication::mirror_repair::{SyncMirrorError, SyncMirrorResult};
     use aruna_ops_data::s3::object::metadata::ReferenceRefreshError;
     use aruna_ops_data::s3::object::metadata_drain::ReferenceDrainResult;
+    use aruna_ops_data::usage_publish::{PublishedUsage, UsagePublishError};
     use ulid::Ulid;
 
     fn input() -> TimerInput {

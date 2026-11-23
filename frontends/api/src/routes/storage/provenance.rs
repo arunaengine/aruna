@@ -20,15 +20,15 @@ use aruna_core::structs::storage::release::{
     CrateChunk, CrateRead, CrateReadError, HolderAnswer, HolderAsk,
 };
 use aruna_core::structs::storage::replication::W3idIdentifier;
-use aruna_ops_work::distribution::resolve::{
+use aruna_ops_data::distribution::resolve::{
     GlobalResolution, RESOLVE_BUDGET, resolve_version, resolved,
 };
-use aruna_ops_work::metadata::provenance::export::{
+use aruna_ops_data::metadata::provenance::export::{
     ExportAnswer, ExportAsk, ExportStepOperation, ForgetSpoolOperation, Read, RootCursor,
     RootPageOperation,
 };
-use aruna_ops_work::metadata::provenance::{CrateFile, ExportState, Hop, Target};
-use aruna_ops_work::transfer::release::holder::{
+use aruna_ops_data::metadata::provenance::{CrateFile, ExportState, Hop, Target};
+use aruna_ops_data::transfer::release::holder::{
     AskHolderError, AskHolderOperation, ReadCrateOperation,
 };
 use async_zip::tokio::write::ZipFileWriter;

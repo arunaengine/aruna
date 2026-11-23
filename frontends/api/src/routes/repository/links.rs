@@ -11,6 +11,7 @@ use aruna_core::repository::link::{LinkFailure, LinkRemote, LinkStatus, Reposito
 use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
+use aruna_ops_data::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
 use aruna_ops_work::harvest::read_connector::{
     ConnectorView, GetRepositoryOperation, ReadConnectorError,
 };
@@ -22,7 +23,6 @@ use aruna_ops_work::jobs::repository::link_store::{
 };
 use aruna_ops_work::jobs::repository::links::{LinkChange, LinkError};
 use aruna_ops_work::jobs::repository::{Action, TransferError, seal_token, supports};
-use aruna_ops_work::metadata::profile::validation::{ProfileAssessOperation, profile_verdict};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};

@@ -48,16 +48,16 @@ use aruna_core::structs::storage::origin::VersionOrigin;
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::connectors::create_connector::{
+use aruna_ops_data::connectors::create_connector::{
     SourceConnectorInput, SourceConnectorOperation,
 };
-use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::object::put::{
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::object::put::{
     PutObjectConfig, PutObjectInput, PutObjectOperation, PutObjectResult,
 };
-use aruna_ops_work::testing::fresh_job_id;
-use aruna_ops_work::transfer::origin::ReadOriginOperation;
+use aruna_ops_data::testing::fresh_job_id;
+use aruna_ops_data::transfer::origin::ReadOriginOperation;
+use aruna_ops_work::jobs::store::job_calls::ClaimOutcome;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};

@@ -30,6 +30,8 @@ aruna-config = { workspace = true }
 aruna-core = { workspace = true }
 aruna-rdf-graph = { workspace = true }
 aruna-p2p = { workspace = true }
+aruna-ops-data = { workspace = true }
+aruna-ops-identity = { workspace = true }
 aruna-ops-work = { workspace = true }
 aruna-runner = { workspace = true }
 aruna-storage = { workspace = true }
@@ -91,6 +93,7 @@ percent-encoding = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 url = { workspace = true }
 zip = { workspace = true }
+aruna-ops-data = { workspace = true, features = ["test-hooks"] }
 aruna-ops-work = { workspace = true, features = ["test-hooks"] }
 aruna-runner = { workspace = true, features = ["test-hooks"] }
 keyring-core = { workspace = true }

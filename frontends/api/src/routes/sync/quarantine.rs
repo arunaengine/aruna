@@ -10,11 +10,11 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::sync_quarantine::{
     SyncQuarantineCapacity, SyncQuarantineRecord, SyncQuarantineUsage,
 };
-use aruna_ops_work::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::list::ListQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::prune::PruneQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::read::ReadQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::{QuarantineAdminError, QuarantinePageRequest};
+use aruna_ops_identity::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::{QuarantineAdminError, QuarantinePageRequest};
 use aruna_runner::driver::{drive, drive_retry};
 use axum::Json;
 use axum::extract::{Path, Query, State};

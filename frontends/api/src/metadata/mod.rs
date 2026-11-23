@@ -23,23 +23,23 @@ use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission};
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::{MetaResourceId, StructuredId};
-use aruna_ops_work::document_repository::{GetConfigError, GetConfigOperation};
-use aruna_ops_work::git::linked::unreadable_file;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
-use aruna_ops_work::metadata::api::list::ListVisibleOperation;
-use aruna_ops_work::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
-use aruna_ops_work::metadata::api::read_types::{
+use aruna_ops_data::git::linked::unreadable_file;
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::fanout_types::{MetadataFanoutStats, forwarded_bearer};
+use aruna_ops_data::metadata::api::list::ListVisibleOperation;
+use aruna_ops_data::metadata::api::list_types::{ListVisibleRequest, MetadataListOrder};
+use aruna_ops_data::metadata::api::read_types::{
     ApiQueryMode, MetadataReferenceEntry, MetadataReferencesExecution,
 };
-use aruna_ops_work::metadata::create_document::CreateDocumentError;
-use aruna_ops_work::metadata::forward::authorized_create::CreateAuthorizedError;
-use aruna_ops_work::metadata::forward::authorized_create::{
+use aruna_ops_data::metadata::create_document::CreateDocumentError;
+use aruna_ops_data::metadata::forward::authorized_create::CreateAuthorizedError;
+use aruna_ops_data::metadata::forward::authorized_create::{
     AuthorizedCreateOperation, DocumentCreate,
 };
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::metadata::update_document::UpdateDocumentError;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::metadata::update_document::UpdateDocumentError;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_runner::driver::drive;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
@@ -224,7 +224,7 @@ fn format_timestamp_ms(timestamp_ms: u64) -> String {
 
 /// The crate or entity with objects of local distributed member buckets named by global id.
 pub(crate) async fn with_global_ids(state: &ServerState, value: &Value) -> ServerResult<Value> {
-    use aruna_ops_work::metadata::global_entries::NormalizeEntriesOperation;
+    use aruna_ops_data::metadata::global_entries::NormalizeEntriesOperation;
     let (realm_id, node_id) = (state.get_realm_id(), state.get_node_id());
     let normalize = NormalizeEntriesOperation::new(realm_id, node_id, value.clone());
     let (value, _) = drive(normalize, state.get_ctx().as_ref())

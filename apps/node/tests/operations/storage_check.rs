@@ -10,13 +10,13 @@ use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::blob::{BackendLocation, VersionKey};
 use aruna_core::structs::storage::broken::BrokenReason;
 use aruna_core::structs::storage::format::Compression;
-use aruna_ops_work::blob::migration::broken::{
+use aruna_ops_data::blob::migration::broken::{
     CleanBrokenOperation, ListBrokenOperation, ReadCheckOperation,
 };
-use aruna_ops_work::s3::bucket::compression::PutCompressionOperation;
-use aruna_ops_work::s3::bucket::storage_check::StartCheckOperation;
-use aruna_ops_work::s3::bucket::storage_move::StartMoveOperation;
-use aruna_ops_work::s3::object::delete::DeleteObjectInput;
+use aruna_ops_data::s3::bucket::compression::PutCompressionOperation;
+use aruna_ops_data::s3::bucket::storage_check::StartCheckOperation;
+use aruna_ops_data::s3::bucket::storage_move::StartMoveOperation;
+use aruna_ops_data::s3::object::delete::DeleteObjectInput;
 use aruna_runner::driver::drive;
 use ulid::Ulid;
 

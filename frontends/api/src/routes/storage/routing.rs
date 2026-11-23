@@ -10,15 +10,15 @@ use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BackendRef, bucket_permission_path};
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule, target_warnings};
-use aruna_ops_work::groups::backends::query::GetBackendOperation;
-use aruna_ops_work::groups::default_rule::PutDefaultOperation;
-use aruna_ops_work::groups::storage_routing::{
-    GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
-};
-use aruna_ops_work::s3::bucket::routing::{
+use aruna_ops_data::s3::bucket::routing::{
     GetRoutingError, GetRoutingOperation, PutRoutingError, PutRoutingOperation,
 };
-use aruna_ops_work::transfer::bucket_jobs::{ActiveJob, JobKind};
+use aruna_ops_data::transfer::bucket_jobs::{ActiveJob, JobKind};
+use aruna_ops_identity::groups::backends::query::GetBackendOperation;
+use aruna_ops_identity::groups::default_rule::PutDefaultOperation;
+use aruna_ops_identity::groups::storage_routing::{
+    GroupInputsOperation, GroupRoutingOperation, PutGroupError, PutGroupOperation,
+};
 use aruna_runner::driver::{drive, node_routing};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -746,8 +746,8 @@ pub async fn list_group_buckets(
     Path(group_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<BucketPageQuery>,
 ) -> ServerResult<Json<BucketStoragePage>> {
-    use aruna_ops_work::s3::bucket::list::bucket_cursor;
-    use aruna_ops_work::transfer::bucket_storage::BucketStorageOperation;
+    use aruna_ops_data::s3::bucket::list::bucket_cursor;
+    use aruna_ops_data::transfer::bucket_storage::BucketStorageOperation;
     use aruna_runner::driver::node_routing;
     let group_id = parse_group_id(&group_id)?;
     ensure_group_admin(&state, &auth, group_id).await?;

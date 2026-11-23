@@ -12,7 +12,7 @@ use aruna_core::events::{Event, StorageEvent};
 use aruna_core::handle::Handle;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_ops_work::metadata::api::node_fanout::DiscoveryOperation;
+use aruna_ops_data::metadata::api::node_fanout::DiscoveryOperation;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::driver::drive;
 use aruna_test_harness::metadata::process_materialization_batch;

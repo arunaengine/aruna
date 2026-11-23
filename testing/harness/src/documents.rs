@@ -8,10 +8,10 @@ use aruna_core::document_apply::reconcile::ReconcileTopicsOperation;
 use aruna_core::id::NodeId;
 use aruna_core::row_plan::PlanOperation;
 use aruna_core::structs::identity::realm::RealmId;
-use aruna_ops_work::sync::document_outbox::{
+use aruna_ops_identity::sync::document_outbox::{
     OutboxPagePlan, OutboxReadBatch, OutboxTailsOperation, OutboxTimerOperation, ReadOutboxPlan,
 };
-use aruna_ops_work::sync::reconcile::SyncTopicsOperation;
+use aruna_ops_identity::sync::reconcile::SyncTopicsOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::testing::test_context;
 use aruna_scheduler::TaskHandle;

@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use aruna_core::keys::generate_signing_key;
-use aruna_ops_work::metadata::forward::route_create::RouteCreateOperation;
+use aruna_ops_data::metadata::forward::route_create::RouteCreateOperation;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -36,28 +36,30 @@ use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_ops_work::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
-use aruna_ops_work::device::inspect_draft::InspectDraftOperation;
-use aruna_ops_work::device::publish_queue::{
+use aruna_ops_data::device::enqueue_draft::{EnqueueDraftInput, EnqueueDraftOperation};
+use aruna_ops_data::device::inspect_draft::InspectDraftOperation;
+use aruna_ops_data::device::publish_queue::{
     DrainOutcome, PUBLISH_PAGE_SIZE, PublishEntry, PublishState, publish_entry,
 };
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::document_repository::{GetGroupConfig, GetGroupOperation};
-use aruna_ops_work::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_ops_work::groups::forward::{ForwardGroupError, ForwardGroupOperation};
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_forward_document, mint_local_document,
 };
-use aruna_ops_work::metadata::device::drain::drain_publish_queue;
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::metadata::update_document::UpdateDocumentError;
-use aruna_ops_work::realm::set_policies::{
+use aruna_ops_data::metadata::device::drain::drain_publish_queue;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::metadata::update_document::UpdateDocumentError;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::{GetGroupConfig, GetGroupOperation};
+use aruna_ops_identity::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_ops_identity::groups::forward::{ForwardGroupError, ForwardGroupOperation};
+use aruna_ops_identity::realm::set_policies::{
     SetPoliciesConfig, SetPoliciesError, SetPoliciesOperation,
 };
-use aruna_ops_work::sync::outbox::record::outbox_key;
-use aruna_ops_work::sync::outbox::record::{new_identified_record, write_outbox_effect};
+use aruna_ops_identity::sync::outbox::record::outbox_key;
+use aruna_ops_identity::sync::outbox::record::{new_identified_record, write_outbox_effect};
 use aruna_runner::driver::drive;
 use aruna_test_harness::documents::read_outbox_record;
 use ed25519_dalek::SigningKey;
@@ -69,7 +71,7 @@ use ulid::Ulid;
 use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::{TestNode, spawn_replica, write};
-use aruna_ops_work::forward::token::ForwardRevokeOperation;
+use aruna_ops_identity::forward::token::ForwardRevokeOperation;
 
 // Every wait below polls to a condition; the ceiling only bounds a genuine hang.
 const CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1216,7 +1218,7 @@ async fn install_realm_config(
     for _ in 0..5 {
         for node in nodes {
             aruna_runner::driver::drive(
-                aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+                aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(
                     node.net.node_id(),
                     realm_id,
                 ),
@@ -1227,7 +1229,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure())
+            retry |= aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {

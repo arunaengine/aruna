@@ -32,7 +32,7 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::multipart::{MultipartUpload, MultipartUploadStatus};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::node::usage_rebuild::RebuildStatsOperation;
+use aruna_ops_data::s3::usage_rebuild::RebuildStatsOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_scheduler::TaskHandle;

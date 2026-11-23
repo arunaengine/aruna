@@ -17,8 +17,8 @@ use aruna_core::structs::storage::blob::{
 };
 use aruna_core::structs::storage::cleanup::ReclaimCandidateKey;
 use aruna_core::structs::storage::routing::{RoutingTarget, StorageRoutingRule};
-use aruna_ops_work::blob::migration::misplaced::CountMisplacedOperation;
-use aruna_ops_work::s3::bucket::storage_move::StartMoveOperation;
+use aruna_ops_data::blob::migration::misplaced::CountMisplacedOperation;
+use aruna_ops_data::s3::bucket::storage_move::StartMoveOperation;
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::{drive, node_routing};
 use aruna_storage::storage;
@@ -171,7 +171,7 @@ async fn settles_gone_versions() {
     use aruna_core::keyspaces::IMPORT_INTENT_KEYSPACE;
     use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
     use aruna_core::structs::storage::blob::VersionKey;
-    use aruna_ops_work::blob::migration::drain::SettleMoveOperation;
+    use aruna_ops_data::blob::migration::drain::SettleMoveOperation;
     let context = setup_context().await;
     let id = Ulid::generate();
     let intent = WriteIntent {
@@ -217,7 +217,7 @@ async fn settles_missing_copies() {
     use aruna_core::keyspaces::{BROKEN_VERSION_KEYSPACE, IMPORT_INTENT_KEYSPACE};
     use aruna_core::structs::storage::backend_import::{WriteIntent, intent_key};
     use aruna_core::structs::storage::broken::{BrokenReason, BrokenVersion};
-    use aruna_ops_work::blob::migration::drain::SettleMoveOperation;
+    use aruna_ops_data::blob::migration::drain::SettleMoveOperation;
     let context = setup_context().await;
     let id = put(&context, "data/a.txt", b"lost research data").await;
     let stored = version(&context, "data/a.txt", id).await;

@@ -8,10 +8,10 @@ use crate::auth::RealmAuth;
 use crate::error::{ErrorResponse, ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::{CommitInfo, FileChange, FileChangeKind};
-use aruna_ops_work::git::GitError;
-use aruna_ops_work::git::changes::EntityChangeKind;
-use aruna_ops_work::git::changes::PropertyConflict;
-use aruna_ops_work::git::versions::{self, Comparison, Named, Version, VersionQuery};
+use aruna_ops_data::git::GitError;
+use aruna_ops_data::git::changes::EntityChangeKind;
+use aruna_ops_data::git::changes::PropertyConflict;
+use aruna_ops_data::git::versions::{self, Comparison, Named, Version, VersionQuery};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -423,7 +423,7 @@ pub async fn rocrate(
     RealmAuth(auth): RealmAuth,
     Path((id, revision)): Path<(Ulid, String)>,
 ) -> ServerResult<Response> {
-    let export = aruna_ops_work::git::snapshot::export(&git_node(&state), &auth, id, revision);
+    let export = aruna_ops_data::git::snapshot::export(&git_node(&state), &auth, id, revision);
     let result = drive(export, &state.get_ctx()).await;
     Ok(match result {
         Ok(bytes) => {

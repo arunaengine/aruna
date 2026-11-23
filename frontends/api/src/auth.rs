@@ -9,9 +9,9 @@ use aruna_core::errors::ConversionError;
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities, Permission, TokenClaims};
 use aruna_core::structs::identity::realm::OidcProviderConfig;
 use aruna_core::structs::storage::blob::object_permission_path;
-use aruna_ops_work::auth::error::AuthorizeError;
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
-use aruna_ops_work::document_repository::{GetConfigError, GetConfigOperation};
+use aruna_ops_identity::auth::error::AuthorizeError;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
+use aruna_ops_identity::document_repository::{GetConfigError, GetConfigOperation};
 use aruna_runner::driver::drive;
 use axum::Extension;
 use axum::extract::{FromRequestParts, Request};
@@ -795,13 +795,13 @@ mod test {
     use aruna_core::structs::identity::realm::OidcProviderConfig;
     use aruna_core::structs::identity::realm::{RealmAuthorizationDocument, RealmId};
     use aruna_core::user::id::UserId;
-    use aruna_ops_work::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
-    use aruna_ops_work::auth::error::AuthorizeError;
-    use aruna_ops_work::auth::revoke_token::{
+    use aruna_ops_identity::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+    use aruna_ops_identity::auth::error::AuthorizeError;
+    use aruna_ops_identity::auth::revoke_token::{
         RevokeTokenAdmission, RevokeTokenConfig, RevokeTokenOperation,
     };
-    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-    use aruna_ops_work::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_ops_identity::users::oidc_user::{ResolveOidcInput, ResolveOidcOperation};
     use aruna_p2p::NetHandle;
     use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
     use aruna_runner::driver::{DriverContext, drive};

@@ -13,11 +13,11 @@ use aruna_core::federation::{
 };
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::federation::publish::is_reporting;
-use aruna_ops_work::realm::set_federation::{
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::set_federation::{
     SetFederationConfig, SetFederationError, SetFederationOperation,
 };
+use aruna_ops_work::federation::publish::is_reporting;
 use aruna_runner::driver::{DriverContext, drive};
 use reqwest::Url;
 use thiserror::Error;
@@ -169,7 +169,7 @@ mod tests {
     use crate::startup::resources::resolve_settings;
     use aruna_config::settings::read_settings_from;
     use aruna_core::federation::FederationSettings;
-    use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+    use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
     use std::collections::BTreeMap;
     use tempfile::TempDir;
 

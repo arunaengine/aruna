@@ -17,11 +17,11 @@ use aruna_core::structs::sync_quarantine::{
     QUARANTINE_MAX_RECORDS, SyncQuarantineEvidence, SyncQuarantineIdentity, SyncQuarantineRecord,
     SyncQuarantineUsage, quarantine_row_entry, quarantine_usage_entry,
 };
-use aruna_ops_work::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::list::ListQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::prune::PruneQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::read::ReadQuarantineOperation;
-use aruna_ops_work::sync::sync_quarantine::{QuarantinePage, QuarantinePageRequest};
+use aruna_ops_identity::sync::sync_quarantine::acknowledge::AcknowledgeQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::list::ListQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::prune::PruneQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::read::ReadQuarantineOperation;
+use aruna_ops_identity::sync::sync_quarantine::{QuarantinePage, QuarantinePageRequest};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};

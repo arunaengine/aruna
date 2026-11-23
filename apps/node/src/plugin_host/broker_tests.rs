@@ -8,14 +8,14 @@ use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::api::ExportMetadataResult;
 use aruna_core::plugin_installs::PluginInstall;
 use aruna_core::structs::checksum::HASH_BLAKE3;
-use aruna_ops_work::auth::install_access::parse_grants;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::export_types::ExportMetadataRequest;
-use aruna_ops_work::metadata::forward::routed::export::RoutedExportOperation;
-use aruna_ops_work::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::metadata::update_document::UpdateDocumentError;
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_ops_data::metadata::forward::routed::update::{DocumentUpdate, RouteUpdateOperation};
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::metadata::update_document::UpdateDocumentError;
+use aruna_ops_identity::auth::install_access::parse_grants;
 use aruna_ops_work::plugins::dataset::{
     content_urls, dataset_change, dataset_crate, same_revision,
 };
@@ -25,10 +25,10 @@ use std::collections::BTreeMap;
 
 use super::*;
 use aruna_core::metadata::api::CreateDocumentPayload;
-use aruna_ops_work::metadata::api::document_query::DocumentQueryOperation;
-use aruna_ops_work::metadata::api::read_types::DocumentQueryRequest;
-use aruna_ops_work::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
-use aruna_ops_work::metadata::create_entry::CreateEntryOperation;
+use aruna_ops_data::metadata::api::document_query::DocumentQueryOperation;
+use aruna_ops_data::metadata::api::read_types::DocumentQueryRequest;
+use aruna_ops_data::metadata::create_document::{CreateDocumentConfig, CreateDocumentOperation};
+use aruna_ops_data::metadata::create_entry::CreateEntryOperation;
 use aruna_ops_work::plugins::host::calls::VisibleObjects;
 use aruna_ops_work::plugins::host::steps::GrantedCall;
 use aruna_plugin_contract::calls::merge_into;
@@ -1055,7 +1055,7 @@ async fn superseded_merge_journaled() {
         MetadataEventRecord,
     };
     use aruna_core::plugin_runs::source_key;
-    use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
+    use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
     use aruna_test_harness::projection::project_create_events;
     let (fixture, broker, _, _dir) = broker().await;
     let document = three_files(&fixture, &broker).await;

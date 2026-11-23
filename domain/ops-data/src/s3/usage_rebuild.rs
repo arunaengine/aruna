@@ -35,7 +35,7 @@ use thiserror::Error;
 use tracing::warn;
 use ulid::Ulid;
 
-use crate::node::rebuild_counts::{
+use crate::s3::rebuild_counts::{
     CounterDeltas, Joined, RebuildCounts, is_pithos, named_size, usable,
 };
 

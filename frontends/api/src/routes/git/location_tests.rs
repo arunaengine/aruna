@@ -12,7 +12,7 @@ use crate::tests::metadata_fixtures::drain_metadata_background;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::format::Compression;
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};

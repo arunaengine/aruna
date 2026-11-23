@@ -12,9 +12,9 @@ use aruna_core::request_policy::PolicyRequestExtras;
 use aruna_core::structs::checksum::HASH_MD5;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, object_permission_path};
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
-use aruna_ops_work::transfer::copy::{CopyResultData, CopySourceConditions};
-use aruna_ops_work::transfer::part_copy::PartCopyResult;
+use aruna_ops_data::transfer::copy::{CopyResultData, CopySourceConditions};
+use aruna_ops_data::transfer::part_copy::PartCopyResult;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_runner::driver::drive;
 use s3s::dto::{
     ChecksumType, CopyObjectOutput, CopyObjectResult, CopyPartResult, ETag, ETagCondition,

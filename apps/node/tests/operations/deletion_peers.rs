@@ -72,7 +72,7 @@ async fn peers_delete_together() {
     };
     for _ in 0..2 {
         aruna_runner::driver::drive(
-            aruna_ops_work::groups::deletion::coordinator::DeleteGroupOperation::new(
+            aruna_ops_identity::groups::deletion::coordinator::DeleteGroupOperation::new(
                 context.node_and_realm(),
                 auth.clone(),
                 None,
@@ -119,7 +119,7 @@ async fn check_reports_nodes() {
     let first_handler = initialize_incoming_fixture(first_context.clone()).unwrap();
     let second_handler = initialize_incoming_fixture(second_context.clone()).unwrap();
     let replies = aruna_runner::driver::drive(
-        aruna_ops_work::groups::deletion::check::CheckGroupOperation::new(
+        aruna_ops_identity::groups::deletion::check::CheckGroupOperation::new(
             first_context.node_and_realm(),
             auth,
             group_id,

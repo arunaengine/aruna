@@ -6,7 +6,7 @@ use super::*;
 use crate::auth::ValidatedBearer;
 use aruna_core::metadata::AuthToken;
 use aruna_core::metadata::MetadataQueryResults;
-use aruna_ops_work::metadata::api::distributed_types::{
+use aruna_ops_data::metadata::api::distributed_types::{
     MetadataQueryForm as QueryForm, aggregate_query_results,
 };
 use serde_json::json;

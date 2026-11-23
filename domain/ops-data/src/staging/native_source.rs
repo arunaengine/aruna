@@ -903,12 +903,11 @@ mod tests {
             .unwrap();
 
         let pending = aruna_core::plugin_runs::PENDING_ROW;
-        let page = aruna_ops_work::plugins::journal::journal_page(pending, None, 10);
-        let (rows, _) = aruna_runner::driver::drive(page, &context).await.unwrap();
+        let rows = crate::tests::journal_events(&context, pending, 10).await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].1.resource, relationship.id.to_string());
+        assert_eq!(rows[0].resource, relationship.id.to_string());
         let transition = format!("sync_failed/{source}/{}/", relationship.id);
-        assert!(rows[0].1.source.starts_with(&transition));
+        assert!(rows[0].source.starts_with(&transition));
     }
 
     #[test]

@@ -12,17 +12,17 @@ use crate::server::state::ServerState;
 use aruna_core::search::ObjectKeyMatch;
 use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
-use aruna_ops_work::metadata::api::bucket_search::search_buckets_distributed;
-use aruna_ops_work::metadata::api::fanout_types::forwarded_bearer;
-use aruna_ops_work::metadata::api::object_search::search_objects;
-use aruna_ops_work::metadata::api::realm_search::search_metadata as run_search_metadata;
-use aruna_ops_work::metadata::api::search_types::{
+use aruna_ops_data::metadata::api::bucket_search::search_buckets_distributed;
+use aruna_ops_data::metadata::api::fanout_types::forwarded_bearer;
+use aruna_ops_data::metadata::api::object_search::search_objects;
+use aruna_ops_data::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_ops_data::metadata::api::search_types::{
     BucketSearchExecution, BucketSearchRequest, MetadataSearchExecution, MetadataSearchRequest,
     ObjectExecution, ObjectQueryMode, SearchQueryRequest,
 };
-use aruna_ops_work::metadata::forward::read::DatasetSummaryOperation;
-use aruna_ops_work::users::search_users::{SearchUsersInput, SearchUsersOperation};
+use aruna_ops_data::metadata::forward::read::DatasetSummaryOperation;
+use aruna_ops_identity::groups::search_groups::{SearchGroupsInput, SearchGroupsOperation};
+use aruna_ops_identity::users::search_users::{SearchUsersInput, SearchUsersOperation};
 use aruna_runner::driver::drive;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;

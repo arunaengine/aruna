@@ -19,22 +19,22 @@ use aruna_core::structs::storage::share::{
     SHARE_SCHEME, ShareAction, ShareEvent, ShareLink, ShareTarget, ShareToken, TICKET_SECS,
     TicketBody, client_network,
 };
-use aruna_ops_work::distribution::nonce::SpendNonceOperation;
-use aruna_ops_work::s3::bucket::write_guard::BucketGuardOperation;
-use aruna_ops_work::s3::object::get::GetObjectInput;
-use aruna_ops_work::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
-use aruna_ops_work::shares::lifecycle::{
+use aruna_ops_data::distribution::nonce::SpendNonceOperation;
+use aruna_ops_data::s3::bucket::write_guard::BucketGuardOperation;
+use aruna_ops_data::s3::object::get::GetObjectInput;
+use aruna_ops_data::s3::object::head::{HeadObjectError, HeadObjectInput, HeadObjectOperation};
+use aruna_ops_data::shares::lifecycle::{
     OpenShareConfig, OpenShareOperation, OpenedShare, ShareError,
 };
-use aruna_ops_work::shares::names::{ClaimNameOperation, ReleaseNameOperation};
-use aruna_ops_work::shares::rules::{
+use aruna_ops_data::shares::names::{ClaimNameOperation, ReleaseNameOperation};
+use aruna_ops_data::shares::rules::{
     NodeScope, numbered_key, relative_path, scope_pattern, upload_key, visit_context,
 };
-use aruna_ops_work::shares::store::GetShareOperation;
-use aruna_ops_work::sync::notification_outbox::{
+use aruna_ops_data::shares::store::GetShareOperation;
+use aruna_ops_data::transfer::read::GetRoutedOperation;
+use aruna_ops_identity::sync::notification_outbox::{
     EmitNotificationsInput, EmitNotificationsOperation,
 };
-use aruna_ops_work::transfer::read::GetRoutedOperation;
 use aruna_runner::driver::{drive, drive_retry};
 use axum::Json;
 use axum::body::Body;
@@ -65,8 +65,8 @@ use crate::s3::service::ArunaS3Service;
 use crate::s3::service::forward::reads::delegated_caller;
 use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
-use aruna_ops_work::s3::object::member::read::{MemberKey, MemberRead, MemberReadOperation};
-use aruna_ops_work::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
+use aruna_ops_data::s3::object::member::read::{MemberKey, MemberRead, MemberReadOperation};
+use aruna_ops_data::s3::object::pages::{ListRequest, ObjectPageOperation, PageError};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Entries per listing page when the visitor names no limit.

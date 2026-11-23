@@ -22,17 +22,17 @@ use aruna_core::structs::placement::record::{
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::node::info::flows::SeedInfoOperation;
-use aruna_ops_work::realm::mutate_placement::{
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementOperation, RealmPlacementMutation,
 };
-use aruna_ops_work::sync::replicate_documents::{
+use aruna_ops_identity::sync::replicate_documents::{
     ReplicateDocumentsConfig, ReplicateDocumentsOperation,
 };
+use aruna_ops_work::node::info::flows::SeedInfoOperation;
 use aruna_runner::driver::drive;
 use aruna_runner::driver::node_facts;
 use aruna_test_harness::documents::sync_topics;
@@ -496,7 +496,7 @@ async fn install_realm_config(
     for _ in 0..5 {
         for node in nodes {
             aruna_runner::driver::drive(
-                aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+                aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(
                     node.net.node_id(),
                     realm_id,
                 ),
@@ -507,7 +507,7 @@ async fn install_realm_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure())
+            retry |= aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {

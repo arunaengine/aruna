@@ -49,20 +49,24 @@ use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::groups::add_member::{AddUserInput, AddUserOperation};
-use aruna_ops_work::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::get_document::GetDocumentOperation;
+use aruna_ops_data::metadata::get_document::GetDocumentOperation;
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::groups::add_member::{AddUserInput, AddUserOperation};
+use aruna_ops_identity::groups::create_group::{CreateGroupConfig, CreateGroupOperation};
+use aruna_ops_identity::placement::expand_placement::ExpandPlacementOperation;
+use aruna_ops_identity::placement::mutation::PlacementMutationOperation;
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_ops_identity::realm::get_nodes::GetNodesOperation;
+use aruna_ops_identity::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
 use aruna_ops_work::notifications::placement::resolve_inbox_holder;
-use aruna_ops_work::placement::expand_placement::ExpandPlacementOperation;
-use aruna_ops_work::placement::mutation::PlacementMutationOperation;
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
-use aruna_ops_work::realm::get_nodes::GetNodesOperation;
-use aruna_ops_work::realm::mutate_placement::{MutatePlacementConfig, RealmPlacementMutation};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};
@@ -915,7 +919,7 @@ impl Topology {
         // a freshly started node does; without it no admin event reaches it.
         let node = self.find(node_id);
         aruna_runner::driver::drive(
-            aruna_ops_work::shard::restore::RestoreTopicsOperation::new(node_id, self.realm_id),
+            aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(node_id, self.realm_id),
             &node.context,
         )
         .await
@@ -1209,7 +1213,7 @@ async fn install_realm_config(
         || async {
             join_all(nodes.iter().map(|node| {
                 aruna_runner::driver::drive(
-                    aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+                    aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(
                         node.node_id(),
                         realm_id,
                     ),
@@ -1218,7 +1222,7 @@ async fn install_realm_config(
             }))
             .await;
             let outcomes = join_all(nodes.iter().map(|node| {
-                async move { aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure()) }
+                async move { aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure()) }
             }))
             .await;
             let pending = outcomes
@@ -1305,7 +1309,7 @@ async fn seed_config_topic(
 async fn reconcile_nodes(
     nodes: &[TestNode],
     realm_id: RealmId,
-) -> Vec<aruna_ops_work::placement::process_placements::PlacementReconcileOutcome> {
+) -> Vec<aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome> {
     join_all(nodes.iter().map(|node| {
         let span = tracing::info_span!(
             "node_pass",
@@ -1314,7 +1318,7 @@ async fn reconcile_nodes(
         async move {
             let started = std::time::Instant::now();
             let outcome = tracing::Instrument::instrument(
-                async { aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure()) },
+                async { aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure()) },
                 span,
             )
             .await;
@@ -1657,7 +1661,7 @@ pub async fn install_replica_config(
     for _ in 0..5 {
         for node in nodes {
             aruna_runner::driver::drive(
-                aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+                aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(
                     node.net.node_id(),
                     *realm_id,
                 ),
@@ -1668,7 +1672,7 @@ pub async fn install_replica_config(
         }
         let mut retry = false;
         for node in nodes {
-            retry |= aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure())
+            retry |= aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure())
             .retry_scheduled;
         }
         if !retry {
@@ -1695,7 +1699,7 @@ pub async fn install_default_config(
         store_realm_config(&node.net, &node.context, *realm_id, &config).await?;
     }
     for node in nodes {
-        aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(*realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(config)
 }

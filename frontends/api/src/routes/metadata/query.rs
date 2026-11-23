@@ -14,11 +14,11 @@ use crate::metadata::{
 };
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
-use aruna_ops_work::metadata::api::document_query::DocumentQueryOperation;
-use aruna_ops_work::metadata::api::read::query_metadata as run_query_metadata;
-use aruna_ops_work::metadata::api::read_types::{DocumentQueryRequest, MetadataQueryRequest};
-use aruna_ops_work::metadata::api::realm_search::search_metadata as run_search_metadata;
-use aruna_ops_work::metadata::api::search_types::MetadataSearchRequest;
+use aruna_ops_data::metadata::api::document_query::DocumentQueryOperation;
+use aruna_ops_data::metadata::api::read::query_metadata as run_query_metadata;
+use aruna_ops_data::metadata::api::read_types::{DocumentQueryRequest, MetadataQueryRequest};
+use aruna_ops_data::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_ops_data::metadata::api::search_types::MetadataSearchRequest;
 use aruna_runner::driver::drive;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;

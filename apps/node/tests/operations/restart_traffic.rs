@@ -13,10 +13,12 @@ use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structured_id::StructuredId;
 use aruna_core::types::GroupId;
-use aruna_ops_work::metadata::get_document::GetDocumentOperation;
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
-use aruna_ops_work::shard::restore::RestoreTopicsOperation;
-use aruna_ops_work::shard::restore::plan::RESTORE_TOPIC_COUNT;
+use aruna_ops_data::metadata::get_document::GetDocumentOperation;
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_ops_identity::shard::restore::RestoreTopicsOperation;
+use aruna_ops_identity::shard::restore::plan::RESTORE_TOPIC_COUNT;
 use aruna_runner::driver::{DriverContext, drive};
 use tempfile::TempDir;
 use ulid::Ulid;
@@ -350,7 +352,7 @@ const INCIDENT_SHARDS: u32 = 128;
 /// Only this short prefix needs revision-chain ordering during peer recovery.
 const INCIDENT_METADATA_RECORDS: usize = 32;
 /// The production drain examines two full topic pages per invocation.
-const INCIDENT_LIMIT: usize = 2 * aruna_ops_work::sync::outbox::record::OUTBOX_DRAIN_SIZE;
+const INCIDENT_LIMIT: usize = 2 * aruna_ops_identity::sync::outbox::record::OUTBOX_DRAIN_SIZE;
 /// Two full invocation windows keep the scale assertion away from the boundary.
 const INCIDENT_SCALE_RECORDS: usize = 2 * INCIDENT_LIMIT;
 /// One bounded pass plus a short chain keeps peer-return coverage controllable.
@@ -371,7 +373,7 @@ fn offline_scale_bound() -> Result<(), BoxError> {
 
 async fn offline_bound_body() -> Result<(), BoxError> {
     use aruna::tasks::incoming::OutboxDrainer;
-    use aruna_ops_work::shard::recovery::{RecoveryError, RecoveryOutcome};
+    use aruna_ops_identity::shard::recovery::{RecoveryError, RecoveryOutcome};
 
     assert_eq!(INCIDENT_LIMIT, 8_192);
     assert_eq!(INCIDENT_SCALE_RECORDS, 2 * INCIDENT_LIMIT);
@@ -413,7 +415,7 @@ fn offline_recovery_converges() -> Result<(), BoxError> {
 
 async fn recovery_converges(record_count: usize, assert_bound: bool) -> Result<(), BoxError> {
     use aruna::tasks::incoming::OutboxDrainer;
-    use aruna_ops_work::shard::recovery::{RecoveryError, RecoveryOutcome};
+    use aruna_ops_identity::shard::recovery::{RecoveryError, RecoveryOutcome};
 
     let realm_id = RealmId([92u8; 32]);
     let outage = prepare_outage(realm_id, record_count).await?;
@@ -432,12 +434,12 @@ fn spawn_recovery(
     node: &TestNode,
     realm_id: RealmId,
 ) -> (
-    aruna_ops_work::shard::recovery::RecoveryStatus,
+    aruna_ops_identity::shard::recovery::RecoveryStatus,
     tokio_util::sync::CancellationToken,
     tokio::task::JoinHandle<()>,
 ) {
+    use aruna_ops_identity::shard::recovery::{RecoveryStatus, RecoveryStop};
     use aruna_ops_work::node::recovery_run::{RecoveryConfig, RecoveryOperation};
-    use aruna_ops_work::shard::recovery::{RecoveryStatus, RecoveryStop};
     use tokio_util::sync::CancellationToken;
 
     let status = RecoveryStatus::new();
@@ -535,11 +537,11 @@ async fn assert_drain_bound(
 async fn finish_outage(
     outage: OutageFixture,
     drainer: &mut aruna::tasks::incoming::OutboxDrainer,
-    status: &aruna_ops_work::shard::recovery::RecoveryStatus,
+    status: &aruna_ops_identity::shard::recovery::RecoveryStatus,
     cancelled: tokio_util::sync::CancellationToken,
     driver: tokio::task::JoinHandle<()>,
 ) -> Result<(), BoxError> {
-    use aruna_ops_work::shard::recovery::{RecoveryOutcome, RecoveryState};
+    use aruna_ops_identity::shard::recovery::{RecoveryOutcome, RecoveryState};
 
     let realm_id = outage.config.realm_id;
     let nodes = restore_peers(
@@ -559,7 +561,7 @@ async fn finish_outage(
     // Each restored peer runs its own restore, as every configured node does.
     for peer in &nodes[1..] {
         aruna_runner::driver::drive(
-            aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+            aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(
                 peer.net.node_id(),
                 realm_id,
             ),
@@ -568,7 +570,7 @@ async fn finish_outage(
         .await
         .expect("shard topics restore");
         aruna_runner::driver::drive(
-            aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(
+            aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(
                 realm_id,
                 peer.net.node_id(),
                 true,
@@ -577,7 +579,7 @@ async fn finish_outage(
         )
         .await
         .unwrap_or_else(|_| {
-            aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+            aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure()
         });
     }
 
@@ -800,9 +802,7 @@ async fn seed_outbox(
         let mut writes = Vec::with_capacity(1_024);
         for index in chunk_start..(chunk_start + 1_024).min(record_count) {
             let record = incident_record(realm_id, local, target, placement, holders, index)?;
-            writes.push(aruna_ops_work::sync::outbox::record::outbox_write_entry(
-                &record,
-            )?);
+            writes.push(aruna_ops_identity::sync::outbox::record::outbox_write_entry(&record)?);
         }
         match node
             .context
@@ -861,18 +861,20 @@ fn incident_record(
         placement,
     };
     let registry = incident_registry(realm_id, target, placement, holders, index)?;
-    Ok(aruna_ops_work::sync::outbox::record::new_identified_record(
-        Ulid::from_parts(1, index as u128),
-        local,
-        target.clone(),
-        holders.to_vec(),
-        DocumentOutboxEvent::Upsert {
-            bytes: postcard::to_allocvec(&registry)?,
-            change,
-        },
-        aruna_core::structs::placement::record::PlacementRef::NIL,
-        false,
-    ))
+    Ok(
+        aruna_ops_identity::sync::outbox::record::new_identified_record(
+            Ulid::from_parts(1, index as u128),
+            local,
+            target.clone(),
+            holders.to_vec(),
+            DocumentOutboxEvent::Upsert {
+                bytes: postcard::to_allocvec(&registry)?,
+                change,
+            },
+            aruna_core::structs::placement::record::PlacementRef::NIL,
+            false,
+        ),
+    )
 }
 
 fn incident_delete(
@@ -900,15 +902,17 @@ fn incident_delete(
     let target = DocumentTarget::MetadataGraphLifecycle {
         graph_iri: format!("https://aruna.example/incident/graph/{index}"),
     };
-    Ok(aruna_ops_work::sync::outbox::record::new_identified_record(
-        Ulid::from_parts(1, index as u128),
-        local,
-        target,
-        holders.to_vec(),
-        DocumentOutboxEvent::Delete { change },
-        aruna_core::structs::placement::record::PlacementRef::NIL,
-        false,
-    ))
+    Ok(
+        aruna_ops_identity::sync::outbox::record::new_identified_record(
+            Ulid::from_parts(1, index as u128),
+            local,
+            target,
+            holders.to_vec(),
+            DocumentOutboxEvent::Delete { change },
+            aruna_core::structs::placement::record::PlacementRef::NIL,
+            false,
+        ),
+    )
 }
 
 fn incident_registry(
@@ -975,9 +979,9 @@ async fn write_registry(
 }
 
 async fn wait_degraded(
-    status: &aruna_ops_work::shard::recovery::RecoveryStatus,
+    status: &aruna_ops_identity::shard::recovery::RecoveryStatus,
 ) -> Result<(), BoxError> {
-    use aruna_ops_work::shard::recovery::{RecoveryOutcome, RecoveryState};
+    use aruna_ops_identity::shard::recovery::{RecoveryOutcome, RecoveryState};
 
     wait_for_convergence("recovery did not report degraded", || async {
         let snapshot = status.snapshot();
@@ -1145,9 +1149,9 @@ async fn wait_registry(
 }
 
 async fn wait_recovery(
-    status: &aruna_ops_work::shard::recovery::RecoveryStatus,
+    status: &aruna_ops_identity::shard::recovery::RecoveryStatus,
 ) -> Result<(), BoxError> {
-    use aruna_ops_work::shard::recovery::RecoveryState;
+    use aruna_ops_identity::shard::recovery::RecoveryState;
 
     wait_for_convergence("recovery did not converge", || async {
         Ok::<usize, BoxError>(usize::from(

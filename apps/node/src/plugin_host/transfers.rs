@@ -20,16 +20,16 @@ use ulid::Ulid;
 use super::plugin_work::{PROGRESS_TICK, key_wait, permanent, refused};
 use aruna_core::install_work::WorkRow;
 use aruna_core::jobs::JobRunOutcome;
-use aruna_ops_work::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_ops_work::placement::policy::gate::GateOperation;
+use aruna_ops_data::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_ops_identity::placement::policy::gate::GateOperation;
 use aruna_ops_work::plugins::copy::steps::read_locked;
 use aruna_ops_work::plugins::transfer_steps::{
     KeepReply, PrepareDownload, PrepareUpload, TransferEnd, TransferWork, UploadReply, account,
     check_answer, send_end, source_gone, write_failure,
 };
 use aruna_ops_work::plugins::work::{WorkChange, begin_send, update_work};
-use aruna_ops_work::s3::object::get::{GetObjectError, GetObjectInput, GetObjectOperation};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_runner::driver::{drive, node_routing};
 use aruna_runner::jobs::context::JobContext;
 

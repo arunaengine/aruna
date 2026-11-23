@@ -26,12 +26,12 @@ use aruna_core::structs::identity::realm::{
     RealmConfigDocument, RealmDiscoveryConfig, RealmId, RealmNodeKind, StaticRealmEndpoint,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_ops_work::onboarding::finalize_bootstrap::BootstrapFinalizeError;
-use aruna_ops_work::onboarding::list_secrets::ListSecretsOperation;
-use aruna_ops_work::onboarding::reserve_secret::{ReserveSecretInput, ReserveSecretOperation};
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_ops_identity::onboarding::finalize_bootstrap::BootstrapFinalizeError;
+use aruna_ops_identity::onboarding::list_secrets::ListSecretsOperation;
+use aruna_ops_identity::onboarding::reserve_secret::{ReserveSecretInput, ReserveSecretOperation};
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};

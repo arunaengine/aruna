@@ -28,24 +28,28 @@ use aruna_core::structs::storage::blob::BackendRef;
 use aruna_core::structs::storage::node_info::NodeUtilization;
 use aruna_core::structs::storage::usage::{USAGE_GLOBAL_KEY, UsageCounters};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::device_node::realm_documents::{installed_displays, installed_management_urls};
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::federation::totals::DataTotalsOperation;
-use aruna_ops_work::groups::routing::UsageOperation;
-use aruna_ops_work::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
-use aruna_ops_work::node::contacts::PeerContactsOperation;
-use aruna_ops_work::placement::allocate_handle::HandleAllocationError;
-use aruna_ops_work::placement::mutation::PlacementMutationOperation;
-use aruna_ops_work::placement::provision::ProvisionBindingOperation;
-use aruna_ops_work::realm::get_nodes::{GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence};
-use aruna_ops_work::realm::mutate_placement::{
+use aruna_ops_data::metadata::realm_counts::{RealmDocumentsOperation, RealmGroupsOperation};
+use aruna_ops_data::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
+use aruna_ops_data::s3::usage::LoadCountersOperation;
+use aruna_ops_identity::device_node::realm_documents::{
+    installed_displays, installed_management_urls,
+};
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::groups::routing::UsageOperation;
+use aruna_ops_identity::placement::allocate_handle::HandleAllocationError;
+use aruna_ops_identity::placement::mutation::PlacementMutationOperation;
+use aruna_ops_identity::placement::provision::ProvisionBindingOperation;
+use aruna_ops_identity::realm::get_nodes::{
+    GetNodesOperation, REALM_DISCOVERY_TIMEOUT, RealmPresence,
+};
+use aruna_ops_identity::realm::mutate_placement::{
     MutatePlacementConfig, MutatePlacementError, RealmPlacementMutation,
 };
-use aruna_ops_work::realm::node_name::{NodeDisplays, ReadNamesOperation};
-use aruna_ops_work::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
+use aruna_ops_identity::realm::node_name::{NodeDisplays, ReadNamesOperation};
+use aruna_ops_identity::realm::set_quota::{SetQuotaConfig, SetQuotaError, SetQuotaOperation};
+use aruna_ops_work::federation::totals::DataTotalsOperation;
+use aruna_ops_work::node::contacts::PeerContactsOperation;
 use aruna_ops_work::relay::targets::management_node_urls;
-use aruna_ops_work::s3::realm_usage::{RealmUsage, RealmUsageOperation, RealmUsageScope};
-use aruna_ops_work::s3::usage::LoadCountersOperation;
 use aruna_runner::driver::drive;
 use aruna_wire::info::{
     AddressStatus, BackendStatus, BlobServiceStatus, ConnectionAddressInfo, DatabaseServiceStatus,
@@ -1190,7 +1194,7 @@ pub(crate) async fn run_realm_info(
     )
     .await
     .map_err(|error| match error {
-        aruna_ops_work::document_repository::GetConfigError::DocumentNotFound => {
+        aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),
@@ -1630,7 +1634,7 @@ pub async fn get_realm_placement(
     )
     .await
     .map_err(|error| match error {
-        aruna_ops_work::document_repository::GetConfigError::DocumentNotFound => {
+        aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound => {
             ServerError::NotFound
         }
         other => ServerError::InternalError(other.into()),
@@ -1810,7 +1814,7 @@ pub async fn mutate_realm_placement(
             drive(GetConfigOperation::new(actor.realm_id), &context)
                 .await
                 .map_err(|error| match error {
-                    aruna_ops_work::document_repository::GetConfigError::DocumentNotFound => {
+                    aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound => {
                         ServerError::NotFound
                     }
                     other => ServerError::InternalError(other.into()),
@@ -1833,7 +1837,7 @@ fn map_handle_error(error: HandleAllocationError) -> ServerError {
         }
         HandleAllocationError::Append(error) => map_placement_error(error),
         HandleAllocationError::ReadConfig(
-            aruna_ops_work::document_repository::GetConfigError::DocumentNotFound,
+            aruna_ops_identity::document_repository::GetConfigError::DocumentNotFound,
         ) => ServerError::NotFound,
         HandleAllocationError::Storage(StorageError::TransactionConflict) => {
             ServerError::Conflict("concurrent placement provisioning conflict; retry".to_string())
@@ -2167,7 +2171,7 @@ pub(crate) async fn distinct_buckets(
     group: Option<ulid::Ulid>,
     buckets: u64,
 ) -> Option<u64> {
-    let count = aruna_ops_work::distribution::counts::SetCountsOperation::new(group);
+    let count = aruna_ops_data::distribution::counts::SetCountsOperation::new(group);
     match aruna_runner::driver::drive(count, &state.get_ctx()).await {
         Ok(counts) => counts.distinct(buckets),
         Err(error) => {

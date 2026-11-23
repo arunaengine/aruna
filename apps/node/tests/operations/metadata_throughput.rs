@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::types::GroupId;
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
 use aruna_runner::driver::{DriverContext, drive};
 use ulid::Ulid;
 

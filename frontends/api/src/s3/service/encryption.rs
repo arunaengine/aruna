@@ -14,10 +14,10 @@ use aruna_core::structs::identity::auth::{AuthContext, Permission};
 use aruna_core::structs::placement::policy::document::group_admin_path;
 use aruna_core::structs::storage::blob::UserAccess;
 use aruna_core::structs::storage::encryption::{BucketKeyError, EncryptionMode};
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
-use aruna_ops_work::replication::plaintext::EncryptionCheckOperation;
-use aruna_ops_work::s3::bucket::encryption::EnableError;
-use aruna_ops_work::transfer::key_status::KeyStatusOperation;
+use aruna_ops_data::replication::plaintext::EncryptionCheckOperation;
+use aruna_ops_data::s3::bucket::encryption::EnableError;
+use aruna_ops_data::transfer::key_status::KeyStatusOperation;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
 use aruna_runner::driver::drive;
 use s3s::dto::{
     ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
@@ -168,7 +168,7 @@ fn enable_error(error: EnableError) -> S3Error {
         EnableError::Mapped => s3_error!(
             InvalidRequest,
             "{}",
-            aruna_ops_work::s3::imports::MAPPED_REASON
+            aruna_ops_data::s3::imports::MAPPED_REASON
         ),
         EnableError::Blob(BlobError::SizeLimitExceeded { limit }) => {
             s3_error!(InvalidRequest, "{}", too_large(limit))

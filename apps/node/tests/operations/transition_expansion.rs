@@ -9,10 +9,10 @@ use aruna_core::metadata::api::CreateDocumentPayload;
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::structured_id::StructuredId;
-use aruna_ops_work::metadata::create_document::{
+use aruna_ops_data::metadata::create_document::{
     CreateDocumentConfig, CreateDocumentOperation, mint_local_document,
 };
-use aruna_ops_work::metadata::create_entry::CreateEntryOperation;
+use aruna_ops_data::metadata::create_entry::CreateEntryOperation;
 use aruna_test_harness::projection::replay_event_log;
 use ulid::Ulid;
 

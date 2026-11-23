@@ -14,8 +14,8 @@ use aruna_core::structs::storage::blob::{BackendRef, BlobVersion, BlobVersionSta
 use aruna_core::structs::storage::broken::BrokenVersion;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::connectors::repository::connector_reference_write;
-use aruna_ops_work::connectors::root_record::{compact_version, root_write};
+use aruna_ops_data::connectors::repository::connector_reference_write;
+use aruna_ops_data::connectors::root_record::{compact_version, root_write};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};

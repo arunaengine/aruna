@@ -16,18 +16,18 @@ use aruna_core::structs::storage::blob::{BucketInfo, UserAccess, bucket_permissi
 use aruna_core::structs::storage::mirror_repair::SyncMirrorIntent;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::sync_relationship::{SyncMode, SyncRelationship};
-use aruna_ops_work::auth::error::AuthorizeError;
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::replication::live_queue::QueueLiveOperation;
-use aruna_ops_work::replication::mirror_repair::kick::KickRepairOperation;
-use aruna_ops_work::replication::mirror_repair::record::MirrorRecordOperation;
-use aruna_ops_work::replication::mirror_repair::remove::RemoveMirrorOperation;
-use aruna_ops_work::replication::mirror_repair::request::MirrorRequestOperation;
-use aruna_ops_work::replication::sync_relationship::SyncRelationshipDirection;
-use aruna_ops_work::replication::sync_relationship::delete::DeleteRelationshipOperation;
-use aruna_ops_work::replication::sync_relationship::list::ListRelationshipsOperation;
-use aruna_ops_work::replication::sync_relationship::store::StoreRelationshipOperation;
+use aruna_ops_data::replication::live_queue::QueueLiveOperation;
+use aruna_ops_data::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_ops_data::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_ops_data::replication::mirror_repair::remove::RemoveMirrorOperation;
+use aruna_ops_data::replication::mirror_repair::request::MirrorRequestOperation;
+use aruna_ops_data::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_ops_data::replication::sync_relationship::delete::DeleteRelationshipOperation;
+use aruna_ops_data::replication::sync_relationship::list::ListRelationshipsOperation;
+use aruna_ops_data::replication::sync_relationship::store::StoreRelationshipOperation;
+use aruna_ops_identity::auth::error::AuthorizeError;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_runner::driver::drive;
 use s3s::dto::{
     DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ReplicationConfiguration,

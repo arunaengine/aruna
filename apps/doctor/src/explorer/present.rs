@@ -25,8 +25,8 @@ use aruna_core::structs::storage::multipart::{
     MultipartObjectKey, MultipartObjectPart, MultipartObjectSummary, MultipartPart,
     MultipartPartKey, MultipartUpload,
 };
+use aruna_ops_identity::placement::policy::cache::PolicyCacheEntry;
 use aruna_ops_work::jobs::lifecycle::witness::arm::WitnessDeadline;
-use aruna_ops_work::placement::policy::cache::PolicyCacheEntry;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde::ser::{SerializeStruct, Serializer};

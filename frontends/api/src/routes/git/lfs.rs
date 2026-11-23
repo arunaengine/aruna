@@ -8,7 +8,7 @@ use crate::error::{ServerError, ServerResult};
 use crate::server::state::ServerState;
 use aruna_core::git::LfsObject;
 use aruna_core::structs::identity::auth::Permission;
-use aruna_ops_work::git::{self, GitError};
+use aruna_ops_data::git::{self, GitError};
 use aruna_runner::driver::{drive, node_routing};
 use axum::Json;
 use axum::body::Body;

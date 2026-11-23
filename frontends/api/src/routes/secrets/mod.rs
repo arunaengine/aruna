@@ -16,10 +16,10 @@ use aruna_core::compute::Secret;
 use aruna_core::secret_registers::{SecretBody, SecretEntry, SecretOwner};
 use aruna_core::secrets::{SecretFields, SecretKind, SecretName, SecretRecord, UseRule};
 use aruna_core::structs::identity::auth::{AuthContext, NodeCapabilities};
-use aruna_ops_work::secrets::owner::{
+use aruna_ops_identity::secrets::owner::{
     OwnerChange, OwnerSecretError, OwnerSecretOperation, OwnerSecretsOperation,
 };
-use aruna_ops_work::secrets::{ChangeError, SecretChange};
+use aruna_ops_identity::secrets::{ChangeError, SecretChange};
 use aruna_runner::driver::drive;
 use axum::http::HeaderMap;
 use axum::http::header::IF_MATCH;

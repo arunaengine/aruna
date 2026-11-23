@@ -7,7 +7,7 @@ use super::{Rewrites, row_note};
 use crate::explorer::ExplorerError;
 use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
 use aruna_core::onboarding::OnboardingSecretRecord;
-use aruna_ops_work::onboarding::create_secret::{SECRET_RECORD_PREFIX, secret_expiry_key};
+use aruna_ops_identity::onboarding::create_secret::{SECRET_RECORD_PREFIX, secret_expiry_key};
 use fjall::{OptimisticTxDatabase, OptimisticTxKeyspace, Readable};
 
 /// The index rows the stored secrets lack, with how many secrets were read. A secret that does
@@ -43,7 +43,7 @@ mod tests {
     use crate::migrate::tests::{read, write};
     use aruna_core::keyspaces::ONBOARDING_KEYSPACE;
     use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecretRecord};
-    use aruna_ops_work::onboarding::create_secret::{secret_expiry_key, secret_record_key};
+    use aruna_ops_identity::onboarding::create_secret::{secret_expiry_key, secret_record_key};
     use ulid::Ulid;
 
     // A secret stored before the expiry index gains its row, which sorts it by expiry; the

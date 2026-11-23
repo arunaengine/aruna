@@ -34,15 +34,15 @@ use aruna_core::structs::secondary_id::{
 };
 use aruna_core::structs::storage::metadata_registry::MetadataRegistryRecord;
 use aruna_core::structs::storage::replication::{ARUNA_DATA_PREFIX, W3idIdentifier};
-use aruna_ops_work::document_repository::GetConfigOperation;
-use aruna_ops_work::holder_choice::{HolderCandidate, PickHolderOperation};
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::identifier_fanout::lookup_identifier_distributed;
-use aruna_ops_work::metadata::identifier_lookup::IdentifierQuery;
-use aruna_ops_work::metadata::persistent_id::forward::{
+use aruna_ops_data::holder_choice::{HolderCandidate, PickHolderOperation};
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::identifier_fanout::lookup_identifier_distributed;
+use aruna_ops_data::metadata::identifier_lookup::IdentifierQuery;
+use aruna_ops_data::metadata::persistent_id::forward::{
     PidRouteOperation, outcome_mapping, outcome_resolution, outcome_status,
 };
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::driver::drive;
 

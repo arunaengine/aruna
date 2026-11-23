@@ -228,7 +228,7 @@ fn search_kind_names() {
 #[test]
 fn put_errors_mapped() {
     use crate::error::ServerError;
-    use aruna_ops_work::distribution::guard::GuardError;
+    use aruna_ops_data::distribution::guard::GuardError;
     for error in [
         PutObjectError::MissingBody,
         PutObjectError::IncompleteBody,
@@ -276,7 +276,7 @@ fn put_errors_mapped() {
 // A version held only by other members is this node's failure to read, never a missing key.
 #[test]
 fn held_read_internal() {
-    let held = aruna_ops_work::distribution::held::HeldElsewhere {
+    let held = aruna_ops_data::distribution::held::HeldElsewhere {
         set_id: ulid::Ulid::from_bytes([4; 16]),
         version_id: ulid::Ulid::from_bytes([5; 16]),
         identity: [6; 32],
@@ -415,7 +415,7 @@ mod distributed {
     async fn hidden_link(members: &Members, key: &str) {
         use aruna_core::structs::storage::link::LinkTarget;
         use aruna_core::structs::storage::replication::VersionedObjectArn;
-        use aruna_ops_work::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
+        use aruna_ops_data::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
         let node = &members.nodes[0];
         let target = LinkTarget {
             arn: VersionedObjectArn {
@@ -637,7 +637,7 @@ async fn external_reference(node: &crate::tests::distributed::Node, key: &str) {
     use aruna_core::structs::execution::staging::{
         PortableSourceDescriptor, StagingStrategy, VersionSourceBinding,
     };
-    use aruna_ops_work::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_ops_data::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let descriptor = PortableSourceDescriptor {
         kind: SourceConnectorKind::Http,
         public_config: HashMap::new(),

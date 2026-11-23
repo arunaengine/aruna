@@ -6,8 +6,8 @@ use super::driven::{seal_credential, search};
 use super::*;
 use aruna_core::repository::{ImportMode, ImportOptions, RepositoryQuery, RepositoryRecord};
 use aruna_core::structs::execution::harvest::RepositoryConnectorKind;
+use aruna_ops_data::s3::object::get::{GetObjectInput, GetObjectOperation};
 use aruna_ops_work::harvest::create_connector::{CreateConnectorInput, CreateConnectorOperation};
-use aruna_ops_work::s3::object::get::{GetObjectInput, GetObjectOperation};
 
 #[tokio::test]
 #[ignore = "requires a disposable loopback Invenio instance and personal token file"]
@@ -351,7 +351,7 @@ async fn link_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let event = aruna_runner::driver::drive(
-        aruna_ops_work::metadata::revision_read::RawViewOperation::revision(doc_id(1)),
+        aruna_ops_data::metadata::revision_read::RawViewOperation::revision(doc_id(1)),
         &fixture.context,
     )
     .await
@@ -457,7 +457,7 @@ async fn link_community() -> Result<(), Box<dyn std::error::Error>> {
     let pushed = current(&fixture, &link).await.0;
     let draft = pushed.remote.draft_id.clone().ok_or("no draft")?;
     let event = aruna_runner::driver::drive(
-        aruna_ops_work::metadata::revision_read::RawViewOperation::revision(doc_id(1)),
+        aruna_ops_data::metadata::revision_read::RawViewOperation::revision(doc_id(1)),
         &fixture.context,
     )
     .await
@@ -682,7 +682,7 @@ async fn zenodo_reference() -> Result<(), Box<dyn std::error::Error>> {
         process_materialization_batch(fixture.context.as_ref()).await?;
         super::driven::queue_changes(&fixture.context).await?;
         let crate_json = aruna_runner::driver::drive(
-            aruna_ops_work::metadata::revision_read::RawViewOperation::revision(document),
+            aruna_ops_data::metadata::revision_read::RawViewOperation::revision(document),
             &fixture.context,
         )
         .await
@@ -861,7 +861,7 @@ async fn pull_update() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(pulled.remote.identifier, second.identifier);
     assert_eq!(pulled.pull_reason(), None);
     let revision = aruna_runner::driver::drive(
-        aruna_ops_work::metadata::revision_read::RawViewOperation::revision(doc_id(2)),
+        aruna_ops_data::metadata::revision_read::RawViewOperation::revision(doc_id(2)),
         &fixture.context,
     )
     .await

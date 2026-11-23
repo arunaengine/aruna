@@ -24,7 +24,10 @@ use aruna_core::structs::execution::webhook::WebhookSubscription;
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::PlacementRef;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::sync::notification_outbox::{
+    EmitNotificationsInput, EmitNotificationsOperation,
+};
 use aruna_ops_work::notifications::client::{HolderRequestOperation, marked_read, unread_counted};
 use aruna_ops_work::notifications::dispatch::NotificationDispatchError;
 use aruna_ops_work::notifications::list::LIST_MAX_LIMIT;
@@ -32,9 +35,6 @@ use aruna_ops_work::notifications::placement::resolve_inbox_holder;
 use aruna_ops_work::notifications::settings::{Delivery, DeliveryOperation};
 use aruna_ops_work::notifications::webhook::{
     ReadWebhookOperation, RemoveWebhookOperation, SetWebhookOperation, WebhookOutcome,
-};
-use aruna_ops_work::sync::notification_outbox::{
-    EmitNotificationsInput, EmitNotificationsOperation,
 };
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
@@ -595,7 +595,7 @@ async fn install_config(
     // Config apply hook: the shard's rank-0 holder eagerly creates each
     // shard topic genesis (mirrors the production realm-config apply path).
     for node in nodes {
-        aruna_runner::driver::drive(aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure());
+        aruna_runner::driver::drive(aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(realm_id, node.net.node_id(), true), &node.context).await.unwrap_or_else(|_| aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure());
     }
     Ok(())
 }

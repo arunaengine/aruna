@@ -7,7 +7,7 @@ use crate::mcp::data::{ListObjectsInput, ObjectsOutput};
 use crate::tests::distributed::{
     BUCKET, CLOSED_API, LOCAL, PEER, distribute, mock_peer, node_id, node_state, publish_api,
 };
-use aruna_ops_work::distribution::resolve::key_holders;
+use aruna_ops_data::distribution::resolve::key_holders;
 use aruna_ops_work::relay::tool::route::HolderSearchOperation;
 use aruna_ops_work::relay::tool::{Holder, pick_node};
 use axum::http::StatusCode;
@@ -144,7 +144,7 @@ fn auth_parts(auth: &AuthContext, directed: Option<NodeId>) -> http::request::Pa
     parts.extensions.insert(Some(token));
     if let Some(node_id) = directed {
         let value = http::HeaderValue::try_from(node_id.to_string()).unwrap();
-        let header = aruna_ops_work::s3::object::member::rest::RELAY_NODE_HEADER;
+        let header = aruna_ops_data::s3::object::member::rest::RELAY_NODE_HEADER;
         parts.headers.insert(header, value);
     }
     parts
@@ -192,7 +192,7 @@ async fn directed_never_forwards() {
 // it, instead of the search asking it again and again.
 #[tokio::test]
 async fn discovery_stops() {
-    use aruna_ops_work::realm::announce_presence::{
+    use aruna_ops_identity::realm::announce_presence::{
         AnnouncePresenceConfig, AnnouncePresenceOperation,
     };
     let fixture = node_state().await;

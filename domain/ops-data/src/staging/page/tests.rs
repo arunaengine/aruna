@@ -653,23 +653,12 @@ async fn flush_keeps_page() {
         let commit = matches!(effect, StorageEffect::CommitTransaction { .. });
         if commit {
             let progress = job.progress.clone();
-            aruna_runner::driver::drive(
-                aruna_ops_work::jobs::store::job_calls::flush_progress(
-                    job.job_id,
-                    token(),
-                    progress,
-                    2,
-                ),
-                context,
-            )
-            .await
-            .unwrap();
-            aruna_runner::driver::drive(
-                aruna_ops_work::jobs::store::job_calls::renew_lease(job.job_id, token(), 3, None),
-                context,
-            )
-            .await
-            .unwrap();
+            aruna_test_harness::jobs::flush_progress(context, job.job_id, token(), progress, 2)
+                .await
+                .unwrap();
+            aruna_test_harness::jobs::renew_lease(context, job.job_id, token(), 3, None)
+                .await
+                .unwrap();
         }
         let event = storage.send_storage_effect(effect).await;
         if commit {

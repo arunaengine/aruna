@@ -27,7 +27,8 @@ use aruna_core::structs::identity::realm::{
 };
 use aruna_core::structs::storage::blob::object_permission_path;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::realm::load_config::config_unavailable;
 use aruna_ops_work::notifications::checks::MAX_FUTURE_SKEW;
 use aruna_ops_work::notifications::client::{
     HolderRequestOperation, RemoteError, delivered, events_delivered, listed, marked_read,
@@ -39,7 +40,6 @@ use aruna_ops_work::notifications::outbox::OUTBOX_BATCH_SIZE;
 use aruna_ops_work::notifications::placement::resolve_inbox_holder;
 use aruna_ops_work::notifications::watch::listing::{ListWatchesOperation, WatchScope};
 use aruna_ops_work::notifications::watch::records::WATCH_SUBSCRIPTION_UNAUTHORIZED;
-use aruna_ops_work::realm::load_config::config_unavailable;
 use aruna_ops_work::tests::notifications::local_watch;
 use aruna_ops_work::tests::notifications::{data_group_id, data_node_id, data_path};
 use aruna_ops_work::tests::notifications::{seeded_record, upload_event};

@@ -19,9 +19,9 @@ use crate::tests::routes::{seed_group_docs, seed_realm_auth, test_state, test_st
 use aruna_core::structs::identity::auth::{Actor, AuthContext, Permission};
 use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
-use aruna_ops_work::metadata::api::read_types::ApiQueryMode;
-use aruna_ops_work::metadata::api::realm_search::search_metadata as run_search_metadata;
-use aruna_ops_work::metadata::api::search_types::MetadataSearchRequest;
+use aruna_ops_data::metadata::api::read_types::ApiQueryMode;
+use aruna_ops_data::metadata::api::realm_search::search_metadata as run_search_metadata;
+use aruna_ops_data::metadata::api::search_types::MetadataSearchRequest;
 use aruna_runner::driver::drive;
 use aruna_runner::testing::installed_graph_handle;
 use aruna_runner::testing::test_context;
@@ -55,8 +55,10 @@ use aruna_core::structs::storage::blob::{
     VersionKey,
 };
 use aruna_core::task::{PersistedTaskTimer, TaskKey};
-use aruna_ops_work::metadata::repository::write_document_lifecycle;
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
+use aruna_ops_data::metadata::repository::write_document_lifecycle;
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::DriverContext;
@@ -3661,7 +3663,7 @@ async fn lookup_hides_private() {
         )
         .unwrap(),
     ];
-    use aruna_ops_work::metadata::persistent_id::forward::{PidRouteOperation, outcome_mapping};
+    use aruna_ops_data::metadata::persistent_id::forward::{PidRouteOperation, outcome_mapping};
     let ctx = test.state.get_ctx();
     let request = aruna_core::metadata::protocol::PersistentIdRequest::AddIdentifiers {
         identifiers,

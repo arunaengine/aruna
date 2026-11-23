@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use aruna_clock::testing::poll_until;
 use aruna_core::types::GroupId;
-use aruna_ops_work::metadata::get_document::GetDocumentOperation;
+use aruna_ops_data::metadata::get_document::GetDocumentOperation;
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_test_harness::metadata::materialization_jobs_exist;
 use tokio::time::timeout;

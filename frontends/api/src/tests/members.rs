@@ -32,8 +32,8 @@ use aruna_core::structs::storage::node_info::{
     AdvertisementEpoch, NodeInfoDocument, NodeUrls, NodeUtilization, node_info_key,
 };
 use aruna_core::user::id::UserId;
-use aruna_ops_work::distribution::admit::{AdmitConfig, AdmitOperation};
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::distribution::admit::{AdmitConfig, AdmitOperation};
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};

@@ -8,7 +8,7 @@ use crate::server::state::ServerState;
 use aruna_clock::unix_timestamp_secs;
 use aruna_core::structs::identity::auth::Actor;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::users::account_status::{
+use aruna_ops_identity::users::account_status::{
     AccountStatusConfig, AccountStatusError, AccountStatusOperation,
 };
 use aruna_runner::driver::drive;

@@ -11,10 +11,10 @@ use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::identity::auth::TokenClaims;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::bearer_token::{
+use aruna_ops_identity::auth::bearer_token::{
     DecodeTokenOperation, IssuerKeys, IssuerTrust, RevocationCheck, TokenChecks, claims_auth,
 };
-use aruna_ops_work::auth::error::ArunaBearerError;
+use aruna_ops_identity::auth::error::ArunaBearerError;
 use aruna_test_harness::tokens::sign_token;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};

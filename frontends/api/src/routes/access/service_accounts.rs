@@ -18,17 +18,17 @@ use aruna_core::structs::identity::auth::{Actor, AuthContext, SessionKind};
 use aruna_core::structs::identity::user::User;
 use aruna_core::structs::storage::blob::group_permission_path;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
-use aruna_ops_work::session::create::{
+use aruna_ops_data::s3::access::create::{CreateUserConfig, CreateUserError, CreateUserOperation};
+use aruna_ops_identity::session::create::{
     CreateSessionConfig, CreateSessionOperation, MAX_SESSION_TTL, bound_session_expiry,
 };
-use aruna_ops_work::users::service_account::check::{
+use aruna_ops_identity::users::service_account::check::{
     ServiceCheckConfig, ServiceCheckError, ServiceCheckOperation,
 };
-use aruna_ops_work::users::service_account::create::{
+use aruna_ops_identity::users::service_account::create::{
     CreateServiceConfig, CreateServiceError, CreateServiceOperation,
 };
-use aruna_ops_work::users::service_account::list::{ListServiceError, ListServiceOperation};
+use aruna_ops_identity::users::service_account::list::{ListServiceError, ListServiceOperation};
 use aruna_runner::driver::drive;
 use axum::Json;
 use axum::extract::{Path, State};

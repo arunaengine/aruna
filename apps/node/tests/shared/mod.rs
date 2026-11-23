@@ -47,15 +47,17 @@ use aruna_core::structs::storage::blob::{
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_ops_data::s3::access::get::GetAccessOperation;
+use aruna_ops_identity::auth::create_token::{CreateTokenConfig, CreateTokenOperation};
+use aruna_ops_identity::placement::policy::reconcile::{SubjectSyncOperation, SubjectTrigger};
+use aruna_ops_identity::placement::policy::subject::SubjectScanMode;
+use aruna_ops_identity::realm::announce_presence::{
+    AnnouncePresenceConfig, AnnouncePresenceOperation,
+};
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::realm::get_nodes::GetNodesOperation;
 use aruna_ops_work::node::info::flows::SeedInfoOperation;
-use aruna_ops_work::placement::policy::reconcile::{SubjectSyncOperation, SubjectTrigger};
-use aruna_ops_work::placement::policy::subject::SubjectScanMode;
-use aruna_ops_work::realm::announce_presence::{AnnouncePresenceConfig, AnnouncePresenceOperation};
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_ops_work::realm::get_nodes::GetNodesOperation;
-use aruna_ops_work::s3::access::get::GetAccessOperation;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::node_facts;
@@ -879,7 +881,7 @@ async fn spawn_seed_at(
     publish_core_documents(context.as_ref(), net.node_id(), realm_id, true, documents).await?;
     // The single-node seed owns rank zero and creates shard geneses before writes.
     aruna_runner::driver::drive(
-        aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(
+        aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(
             realm_id,
             net.node_id(),
             true,
@@ -888,7 +890,7 @@ async fn spawn_seed_at(
     )
     .await
     .unwrap_or_else(|_| {
-        aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+        aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure()
     });
     if !reopen {
         drive(
@@ -1043,7 +1045,7 @@ async fn spawn_joiner_mode(
     // Join co-holder shard topics before creating rank-zero geneses.
     // This ordering adopts geneses already created by the seed.
     aruna_runner::driver::drive(
-        aruna_ops_work::shard::restore::RestoreTopicsOperation::new(
+        aruna_ops_identity::shard::restore::RestoreTopicsOperation::new(
             config.node_id,
             config.realm_id,
         ),
@@ -1052,7 +1054,7 @@ async fn spawn_joiner_mode(
     .await
     .expect("shard topics restore");
     aruna_runner::driver::drive(
-        aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation::new(
+        aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation::new(
             config.realm_id,
             config.node_id,
             false,
@@ -1061,7 +1063,7 @@ async fn spawn_joiner_mode(
     )
     .await
     .unwrap_or_else(|_| {
-        aruna_ops_work::placement::process_placements::PlacementReconcileOutcome::storage_failure()
+        aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome::storage_failure()
     });
     announce_realm_presence(joiner_context.as_ref(), &config.realm_id, config.node_id).await?;
 

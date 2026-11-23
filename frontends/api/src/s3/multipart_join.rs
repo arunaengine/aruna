@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use aruna_core::structs::checksum::{ChecksumAlgorithm, ExpectedChecksum};
 use aruna_core::structs::storage::multipart::MultipartChecksumType;
-use aruna_ops_work::s3::multipart::complete::{CompleteMultipartPart, CompleteUploadResult};
+use aruna_ops_data::s3::multipart::complete::{CompleteMultipartPart, CompleteUploadResult};
 use s3s::{S3Error, S3ErrorCode, s3_error};
 use ulid::Ulid;
 

@@ -32,14 +32,14 @@ use aruna_core::structs::storage::blob::{Backend, BackendConfig};
 use aruna_core::structured_id::{BucketId, MetaResourceId, PlacementHandle};
 use aruna_core::types::GroupId;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::connectors::harvest_rows::connector_writes;
+use aruna_ops_data::connectors::harvest_rows::connector_writes;
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::testing::fresh_job_id;
 use aruna_ops_work::harvest::repository::{
     parse_provenance_read, parse_source_read, read_provenance_effect, read_source_effect,
     write_source_effect,
 };
 use aruna_ops_work::jobs::harvest::{HarvestJobOperation, harvest_outcome};
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::testing::fresh_job_id;
 use aruna_p2p::NetHandle;
 use aruna_p2p::config::{DiscoveryMethod, NetConfig, RelayMethod};
 use aruna_runner::driver::{DriverContext, drive};

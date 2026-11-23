@@ -15,7 +15,7 @@ use super::*;
 use crate::auth::RealmAuth;
 use crate::tests::assistant::spawn_mock;
 use crate::tests::distributed::{LOCAL, Node, PEER, node_id, node_state, publish_api};
-use aruna_ops_work::s3::object::member::rest::RELAY_NODE_HEADER;
+use aruna_ops_data::s3::object::member::rest::RELAY_NODE_HEADER;
 
 async fn run(
     node: &Node,

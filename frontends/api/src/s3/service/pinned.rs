@@ -6,11 +6,11 @@ use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::blob::BucketInfo;
 use aruna_core::structs::storage::release::MembershipQuery;
-use aruna_ops_work::s3::object::delete::bulk::BulkDeleteEntry;
-use aruna_ops_work::transfer::pinned::{
+use aruna_ops_data::s3::object::delete::bulk::BulkDeleteEntry;
+use aruna_ops_data::transfer::pinned::{
     PinnedError, RefusePinnedOperation, ReleaseGuards, VersionPinsOperation,
 };
-use aruna_ops_work::transfer::release::BucketScope;
+use aruna_ops_data::transfer::release::BucketScope;
 use aruna_runner::driver::drive;
 use s3s::dto::Error as S3DeleteError;
 use s3s::{S3Error, S3ErrorCode, S3Result};

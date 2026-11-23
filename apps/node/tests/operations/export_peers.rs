@@ -14,12 +14,12 @@ use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::identity::realm::RealmId;
 use aruna_core::structs::storage::replication::VersionedObjectArn;
 use aruna_core::user::id::UserId;
+use aruna_ops_data::replication::bao_read::BaoReadOutput;
 use aruna_ops_work::jobs::export::ExportFailure;
 use aruna_ops_work::jobs::export::open::OpenCandidateOperation;
 use aruna_ops_work::jobs::export::resolve::ExportCandidate;
 use aruna_ops_work::jobs::export::*;
 use aruna_ops_work::jobs::key_locks::AskWaitsOperation;
-use aruna_ops_work::replication::bao_read::BaoReadOutput;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::driver::drive;
 use aruna_test_harness::export::{

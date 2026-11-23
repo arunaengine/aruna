@@ -290,7 +290,7 @@ async fn holder_policy_hides() {
 // share policy on this member hides them, and no cursor names a hidden entry.
 #[tokio::test]
 async fn serving_policy_hides() {
-    use aruna_ops_work::s3::object::pages::decode_resume;
+    use aruna_ops_data::s3::object::pages::decode_resume;
     let shared = shared().await;
     put(&shared, 1, "a.txt", "first").await;
     put(&shared, 1, "private/secret.txt", "closed").await;
@@ -334,8 +334,8 @@ async fn serving_policy_hides() {
 
 /// Every field of a cursor a visitor can read; each cursor shape is named, so a new one must
 /// be added here.
-fn visible_fields(resume: &aruna_ops_work::s3::object::pages::Resume) -> Vec<String> {
-    use aruna_ops_work::s3::object::pages::Resume;
+fn visible_fields(resume: &aruna_ops_data::s3::object::pages::Resume) -> Vec<String> {
+    use aruna_ops_data::s3::object::pages::Resume;
     match resume {
         Resume::After { key, group } => [Some(key.clone()), group.clone()]
             .into_iter()
@@ -357,7 +357,7 @@ fn visible_fields(resume: &aruna_ops_work::s3::object::pages::Resume) -> Vec<Str
 // A page that visits its bound of empty ranges goes on from the next range's lower bound.
 #[tokio::test]
 async fn empty_ranges_resume() {
-    use aruna_ops_work::s3::object::pages::{Resume, decode_resume};
+    use aruna_ops_data::s3::object::pages::{Resume, decode_resume};
     let bounds: Vec<String> = (0..64).map(|n| format!("k{n:02}")).collect();
     let bounds: Vec<&str> = bounds.iter().map(String::as_str).collect();
     let shared = shared_ranges(&bounds).await;
@@ -382,8 +382,8 @@ async fn empty_ranges_resume() {
 // followed by the serving member's own scan, so only this member's rules end a page there.
 #[tokio::test]
 async fn hidden_run_resumes() {
-    use aruna_ops_work::s3::object::pages::{Resume, decode_resume};
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::pages::{Resume, decode_resume};
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let shared = shared().await;
     // Member 0 coordinates the keys below "m"; the visible key sorts after the hidden run.
     for n in 0..=SCAN_BUDGET {
@@ -413,7 +413,7 @@ async fn hidden_run_resumes() {
 #[test]
 fn cursor_fields_named() {
     // Each cursor shape shows the path parts it carries, so the check above sees them.
-    use aruna_ops_work::s3::object::pages::Resume;
+    use aruna_ops_data::s3::object::pages::Resume;
     let after = Resume::After {
         key: "private/a".into(),
         group: Some("private/".into()),
@@ -577,7 +577,7 @@ async fn ticket_error(shared: &Shared, visit: &str, name: &str) -> ServerError {
 #[tokio::test]
 async fn ended_link_refused() {
     use aruna_core::effects::StorageEffect;
-    use aruna_ops_work::shares::store::save_rows;
+    use aruna_ops_data::shares::store::save_rows;
     let shared = shared().await;
     put(&shared, 1, "y.txt", "far").await;
     let (link, opened) = visit(&shared, ShareModeBody::Read).await;

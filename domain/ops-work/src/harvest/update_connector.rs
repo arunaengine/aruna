@@ -323,4 +323,79 @@ pub(crate) mod tests {
         assert!(!read.has_secret_config);
         assert_eq!(read.connector.endpoint, "https://other.example/api/");
     }
+
+    #[tokio::test]
+    async fn invenio_token_bound() {
+        use aruna_core::repository::invenio::REFERENCE_GROUP;
+        use aruna_core::structs::execution::source_access::ResolvedSourceAccess;
+        use aruna_core::structs::execution::source_connector::SourceConnectorKind;
+        use aruna_core::structs::execution::staging::{StagingStrategy, VersionSourceBinding};
+        use aruna_ops_data::connectors::resolver::{ResolveBindingInput, ResolveBindingOperation};
+        let (_dir, context) = context();
+        let vault = aruna_core::node::vault::NodeVaultKey::random();
+        context.storage_handle.open_vault(vault);
+        let group_id = Ulid::generate();
+        let connector = drive(
+            CreateConnectorOperation::new(CreateConnectorInput {
+                group_id,
+                created_by: Default::default(),
+                name: "zenodo".into(),
+                kind: RepositoryConnectorKind::Invenio,
+                endpoint: "https://zenodo.org/api/".into(),
+                public_config: HashMap::new(),
+                secret_config: HashMap::from([("token".into(), "old".into())]),
+            }),
+            &context,
+        )
+        .await
+        .unwrap()
+        .connector;
+        let source = VersionSourceBinding {
+            strategy: StagingStrategy::Reference,
+            descriptor: aruna_core::structs::execution::staging::PortableSourceDescriptor {
+                kind: SourceConnectorKind::Invenio,
+                public_config: HashMap::from([
+                    ("endpoint".into(), "https://zenodo.org/api/".into()),
+                    (REFERENCE_GROUP.into(), group_id.to_string()),
+                ]),
+                source_path: "content".into(),
+                version_selector: None,
+                capabilities: Vec::new(),
+                origin_node_id: None,
+                namespace: None,
+                root: None,
+            },
+            connector_id: Some(connector.connector_id),
+            mirrors: Vec::new(),
+        };
+        let token = |access: ResolvedSourceAccess| {
+            let ResolvedSourceAccess::OpenDal { config, .. } = access;
+            config.get("token").cloned()
+        };
+        let resolve = || {
+            ResolveBindingOperation::new(ResolveBindingInput {
+                source: source.clone(),
+                group_id: None,
+            })
+        };
+        let bound = drive(resolve(), &context).await.unwrap();
+        assert_eq!(token(bound).as_deref(), Some("old"));
+
+        drive(
+            UpdateRepositoryOperation::new(UpdateConnectorInput {
+                group_id,
+                connector_id: connector.connector_id,
+                name: "moved".into(),
+                kind: RepositoryConnectorKind::Invenio,
+                endpoint: "https://other.example/api/".into(),
+                public_config: HashMap::new(),
+                secret_config: Some(HashMap::from([("token".into(), "new".into())])),
+            }),
+            &context,
+        )
+        .await
+        .unwrap();
+        let moved = drive(resolve(), &context).await.unwrap();
+        assert_eq!(token(moved), None);
+    }
 }

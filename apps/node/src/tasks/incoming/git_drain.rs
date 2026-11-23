@@ -9,8 +9,8 @@ use aruna_scheduler::shutdown::Shutdown;
 use tracing::warn;
 
 use aruna_core::git::GitNode;
-use aruna_ops_work::git::cleanup::remove_objects;
-use aruna_ops_work::git::pending::drain_merges;
+use aruna_ops_data::git::cleanup::remove_objects;
+use aruna_ops_data::git::pending::drain_merges;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
 
 const DRAIN_INTERVAL: Duration = Duration::from_secs(60);

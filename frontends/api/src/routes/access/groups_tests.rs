@@ -37,7 +37,7 @@ use aruna_core::structs::storage::format::Compression;
 use aruna_core::structs::storage::format::EncodingClass;
 use aruna_core::structs::storage::format::StoredFormat;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::groups::list_groups::ListGroupOperation;
+use aruna_ops_identity::groups::list_groups::ListGroupOperation;
 use aruna_runner::driver::DriverContext;
 use aruna_runner::driver::drive;
 use aruna_runner::testing::test_context;
@@ -193,8 +193,8 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
         realm_id,
     };
     drive(
-        aruna_ops_work::realm::create_realm::CreateRealmOperation::new(
-            aruna_ops_work::realm::create_realm::CreateRealmConfig {
+        aruna_ops_identity::realm::create_realm::CreateRealmOperation::new(
+            aruna_ops_identity::realm::create_realm::CreateRealmConfig {
                 actor: actor.clone(),
                 realm_description: "groups".to_string(),
                 oidc_providers: Vec::new(),
@@ -208,8 +208,8 @@ async fn setup_admin_state() -> (Arc<ServerState>, UserId, TempDir) {
     .await
     .unwrap();
     drive(
-        aruna_ops_work::realm::claim_admin::ClaimInitialOperation::new(
-            aruna_ops_work::realm::claim_admin::ClaimInitialInput { actor },
+        aruna_ops_identity::realm::claim_admin::ClaimInitialOperation::new(
+            aruna_ops_identity::realm::claim_admin::ClaimInitialInput { actor },
         ),
         &driver_ctx,
     )
@@ -237,7 +237,7 @@ async fn update_config(
 ) {
     let realm_id = state.get_realm_id();
     let mut config = drive(
-        aruna_ops_work::document_repository::GetConfigOperation::new(realm_id),
+        aruna_ops_identity::document_repository::GetConfigOperation::new(realm_id),
         &state.get_ctx(),
     )
     .await

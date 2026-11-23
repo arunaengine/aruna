@@ -9,7 +9,7 @@ use http::{Extensions, HeaderMap, Method, Uri};
 use s3s::dto::{GetObjectInput, PutObjectInput, StreamingBlob};
 use s3s::{S3, S3Request};
 
-use aruna_ops_work::s3::object::delete::bulk::BulkDeleteEntry;
+use aruna_ops_data::s3::object::delete::bulk::BulkDeleteEntry;
 
 use super::reads::STALE_HEADER;
 use crate::tests::members::{BUCKET, Members, members};
@@ -19,7 +19,7 @@ async fn snapshot_of(
     service: &crate::s3::service::ArunaS3Service,
     binding: &aruna_core::structs::storage::distribution::DistributionBinding,
 ) -> aruna_core::structs::storage::distribution::snapshot::DistributionSnapshot {
-    let view = aruna_ops_work::distribution::routing::bound_view(binding);
+    let view = aruna_ops_data::distribution::routing::bound_view(binding);
     let view = aruna_runner::driver::drive(view, service.state.as_ref());
     view.await.unwrap().head.snapshot
 }
@@ -376,7 +376,7 @@ async fn origin_of(
     let node = &members.nodes[on];
     let local = (members.realm_id, node.node_id());
     let view = aruna_runner::driver::drive(
-        aruna_ops_work::transfer::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
+        aruna_ops_data::transfer::origin::ReadOriginOperation::new(local.0, BUCKET, key, None),
         &node.context,
     )
     .await
@@ -768,7 +768,7 @@ async fn listing_merges_ranges() {
 async fn hidden_link(members: &Members, on: usize, key: &str) {
     use aruna_core::structs::storage::link::LinkTarget;
     use aruna_core::structs::storage::replication::VersionedObjectArn;
-    use aruna_ops_work::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
+    use aruna_ops_data::s3::object::reference::{ReferenceWrite, WriteReferenceOperation};
     let node = &members.nodes[on];
     let target = LinkTarget {
         arn: VersionedObjectArn {
@@ -816,7 +816,7 @@ async fn hidden_link(members: &Members, on: usize, key: &str) {
 // sealed cursor of its member, here and on another member, so the merged listing completes.
 #[tokio::test]
 async fn passes_hidden_runs() {
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let members = members(3, &["h", "p"], 0).await;
     for key in ["a/1", "k/zz", "q/1"] {
         put(&members, 0, key, key.as_bytes()).await;
@@ -844,7 +844,7 @@ async fn passes_hidden_runs() {
 /// Node 2 copies range [h, p), which node 1 coordinates and which starts with more hidden
 /// links than one request examines. Node 1 is down, so node 2 lists its copy and seals there.
 async fn sealed_copy() -> (Members, String) {
-    use aruna_ops_work::s3::object::visible::SCAN_BUDGET;
+    use aruna_ops_data::s3::object::visible::SCAN_BUDGET;
     let mut members = members(3, &["h", "p"], 1).await;
     put(&members, 0, "k/zz", b"k").await;
     for index in 0..=SCAN_BUDGET {
@@ -1343,7 +1343,7 @@ async fn head_miss_local() {
 // uploads list with their stored ids.
 #[tokio::test]
 async fn upload_markers_tagged() {
-    use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
+    use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
     use s3s::dto::ListMultipartUploadsInput;
     let members = members(3, &["h", "p"], 0).await;
     let first = create_upload(&members, 0, "a/up").await;
@@ -1530,19 +1530,19 @@ async fn copy_read_marked() {
     copy_rows(&members, 1, 2).await;
     let binding = members.nodes[0].bucket().await.distribution.unwrap();
     let snapshot = snapshot_of(&members.nodes[0].service, &binding).await;
-    let copy = aruna_ops_work::s3::object::member::read::MemberTarget {
+    let copy = aruna_ops_data::s3::object::member::read::MemberTarget {
         set_id: binding.set_id,
         range_id: snapshot.config.ranges[1].range_id,
         node_id: members.nodes[2].node_id(),
     };
-    let read = || aruna_ops_work::s3::object::member::read::MemberRequest {
+    let read = || aruna_ops_data::s3::object::member::read::MemberRequest {
         method: aruna_core::member_read::MemberMethod::Get,
         operation: "GetObject",
         bucket: BUCKET.to_string(),
         key: "k/1".to_string(),
         query: None,
         headers: Vec::new(),
-        body: aruna_ops_work::s3::object::member::read::MemberPayload::Empty,
+        body: aruna_ops_data::s3::object::member::read::MemberPayload::Empty,
     };
     let service = &members.nodes[0].service;
     let error = service

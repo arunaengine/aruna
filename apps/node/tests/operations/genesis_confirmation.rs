@@ -14,9 +14,9 @@ use aruna_core::placement::{resolve_shard_holders, shard_subject_bytes};
 use aruna_core::structs::identity::realm::{RealmConfigDocument, RealmId, RealmNodeKind};
 use aruna_core::structs::placement::record::{PlacementOverride, PlacementRef};
 use aruna_core::task::{TaskEffect, TaskEvent, TaskKey};
-use aruna_ops_work::shard::recovery::RecoveryStop;
-use aruna_ops_work::shard::restore::RestorePassOperation;
-use aruna_ops_work::shard::restore::plan::{ShardRestoreCursor, ShardRestorePass};
+use aruna_ops_identity::shard::recovery::RecoveryStop;
+use aruna_ops_identity::shard::restore::RestorePassOperation;
+use aruna_ops_identity::shard::restore::plan::{ShardRestoreCursor, ShardRestorePass};
 use aruna_p2p::NetHandle;
 use irokle::oplog::Oplog;
 use irokle::storage::Storage;
@@ -26,8 +26,8 @@ use crate::convergence::wait_for_convergence;
 use crate::topology::mesh;
 use crate::topology::store_realm_config;
 use crate::topology::{TestNode, spawn_replica};
-use aruna_ops_work::placement::process_placements::PlacementReconcileOutcome;
-use aruna_ops_work::placement::process_placements::ReconcilePlacementsOperation;
+use aruna_ops_identity::placement::process_placements::PlacementReconcileOutcome;
+use aruna_ops_identity::placement::process_placements::ReconcilePlacementsOperation;
 use aruna_runner::driver::drive;
 
 // If the final ensure/create step fails after the topic was selected for ensuring, no pending

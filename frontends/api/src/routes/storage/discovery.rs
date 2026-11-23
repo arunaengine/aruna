@@ -10,8 +10,8 @@ use crate::routes::storage::routing::ensure_group_admin;
 use crate::server::state::ServerState;
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::storage::discovery::DiscoveryRule;
-use aruna_ops_work::s3::imports::ReadImportOperation;
-use aruna_ops_work::transfer::discovery::{
+use aruna_ops_data::s3::imports::ReadImportOperation;
+use aruna_ops_data::transfer::discovery::{
     AuthorizedPreviewOperation, FileOutcome, ReadDiscoveryOperation, RuleAccessOperation,
     SetDiscoveryOperation,
 };

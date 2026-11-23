@@ -10,12 +10,12 @@ use aruna_core::structs::identity::auth::{Actor, NodeCapabilities};
 use aruna_core::structs::identity::realm::RealmNodeKind;
 use aruna_core::structs::storage::node_info::NodeUrls;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::device_node::realm_documents::fetch_realm_documents;
-use aruna_ops_work::metadata::projection::{MetadataProjectionError, ReplayPageOperation};
+use aruna_ops_data::metadata::projection::{MetadataProjectionError, ReplayPageOperation};
+use aruna_ops_identity::device_node::realm_documents::fetch_realm_documents;
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
+use aruna_ops_identity::shard::restore::PreparePolicyOperation;
 use aruna_ops_work::node::info::flows::SeedInfoOperation;
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_ops_work::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
-use aruna_ops_work::shard::restore::PreparePolicyOperation;
 use aruna_p2p::NetHandle;
 use aruna_runner::driver::node_facts;
 use aruna_runner::driver::{DriverContext, drive};
@@ -323,13 +323,13 @@ async fn provision_realm(
 /// placement map before it serves anything. A changed subject blocks governed
 /// serving until the local inventory has been revalidated under it.
 async fn sync_placement_subject(ctx: &DriverContext, config: &Config) -> Result<(), String> {
-    let mode = aruna_ops_work::placement::policy::subject::SubjectScanMode::Revalidate(
+    let mode = aruna_ops_identity::placement::policy::subject::SubjectScanMode::Revalidate(
         aruna_core::structs::storage::blob::ManagedCopyQuarantine::Rejoin,
     );
-    let sync = aruna_ops_work::placement::policy::reconcile::SubjectSyncOperation::new(
+    let sync = aruna_ops_identity::placement::policy::reconcile::SubjectSyncOperation::new(
         config.realm_id,
         config.node_id,
-        aruna_ops_work::placement::policy::reconcile::SubjectTrigger::Reconcile(mode),
+        aruna_ops_identity::placement::policy::reconcile::SubjectTrigger::Reconcile(mode),
         aruna_clock::unix_timestamp_millis(),
     );
     aruna_runner::driver::drive(sync, ctx)

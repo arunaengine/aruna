@@ -29,15 +29,15 @@ use aruna_core::structs::storage::multipart::{
 };
 use aruna_core::structs::storage::routing::RoutingSnapshot;
 use aruna_core::user::id::UserId;
-use aruna_ops_work::blob::cleanup::{CleanupNode, ProcessCleanupOperation, SweepUploadsOperation};
-use aruna_ops_work::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
-use aruna_ops_work::s3::multipart::complete::{
+use aruna_ops_data::blob::cleanup::{CleanupNode, ProcessCleanupOperation, SweepUploadsOperation};
+use aruna_ops_data::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_ops_data::s3::multipart::complete::{
     CompleteMultipartPart, CompleteUploadError, CompleteUploadInput, CompleteUploadOperation,
 };
-use aruna_ops_work::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
-use aruna_ops_work::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
-use aruna_ops_work::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
+use aruna_ops_data::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_ops_data::s3::multipart::part_upload::{UploadPartInput, UploadPartOperation};
+use aruna_ops_data::s3::object::delete::{DeleteObjectInput, DeleteObjectOperation};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectInput, PutObjectOperation};
 use aruna_p2p::NetHandle;
 use aruna_p2p::dht::storage::decode_entries;
 use aruna_runner::driver::{DriverContext, drive, node_routing};
@@ -165,7 +165,7 @@ async fn upload_part_bytes(
     part_number: u16,
     bytes: &[u8],
     created_by: UserId,
-) -> aruna_ops_work::s3::multipart::part_upload::UploadPartResult {
+) -> aruna_ops_data::s3::multipart::part_upload::UploadPartResult {
     drive(
         UploadPartOperation::new(UploadPartInput {
             bucket: bucket.to_string(),
@@ -191,11 +191,11 @@ async fn complete_upload(
     upload_id: Ulid,
     realm_id: RealmId,
     node_id: aruna_core::id::NodeId,
-    uploaded_parts: &[aruna_ops_work::s3::multipart::part_upload::UploadPartResult],
+    uploaded_parts: &[aruna_ops_data::s3::multipart::part_upload::UploadPartResult],
     checksum_type: MultipartChecksumType,
     object_size: Option<u64>,
     created_by: UserId,
-) -> aruna_ops_work::s3::multipart::complete::CompleteUploadResult {
+) -> aruna_ops_data::s3::multipart::complete::CompleteUploadResult {
     drive(
         CompleteUploadOperation::new(CompleteUploadInput {
             bucket: bucket.to_string(),
@@ -1259,7 +1259,7 @@ async fn checksum_mismatch_cleans() {
 
     assert!(matches!(
         err,
-        aruna_ops_work::s3::multipart::part_upload::UploadPartError::ChecksumMismatch("SHA256")
+        aruna_ops_data::s3::multipart::part_upload::UploadPartError::ChecksumMismatch("SHA256")
     ));
 
     let Event::Storage(StorageEvent::ReadResult { value, .. }) = context
@@ -1489,7 +1489,7 @@ async fn read_upload(context: &TestContext, upload_id: Ulid) -> Option<Multipart
 
 fn completion_input(
     upload_id: Ulid,
-    part: &aruna_ops_work::s3::multipart::part_upload::UploadPartResult,
+    part: &aruna_ops_data::s3::multipart::part_upload::UploadPartResult,
     realm_id: RealmId,
     node_id: aruna_core::id::NodeId,
     created_by: UserId,
@@ -1644,7 +1644,7 @@ async fn abort_refuses_lease() {
 
     assert!(matches!(
         refused,
-        Err(aruna_ops_work::s3::multipart::abort::AbortUploadError::CompletionInProgress)
+        Err(aruna_ops_data::s3::multipart::abort::AbortUploadError::CompletionInProgress)
     ));
 
     // Once the lease lapses the same abort reclaims the record and its part.

@@ -5,11 +5,9 @@
 use super::commit::CommitOperation;
 use super::prepare::PrepareOperation;
 use crate::groups::create_group::{CreateGroupConfig, CreateGroupError, CreateGroupOperation};
+use crate::tests::deletion::{Fixture, node, read, write};
 use aruna_core::admin_documents::AdminDocumentEvent;
-use aruna_core::calls::CallRun;
-use aruna_core::effects::Effect;
 use aruna_core::effects::StorageEffect;
-use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::*;
 use aruna_core::structs::identity::auth::AuthContext;
@@ -17,10 +15,7 @@ use aruna_core::structs::identity::group::{GroupAuthorizationDocument, owner_gro
 use aruna_core::structs::identity::group_delete::*;
 use aruna_core::structs::identity::realm::{RealmNode, RealmNodeKind};
 use aruna_core::user::id::UserId;
-use aruna_ops_data::s3::bucket::create::{CreateBucketError, CreateBucketOperation};
 use aruna_runner::driver::drive;
-use aruna_test_harness::groups::{Fixture, node, read, write};
-use std::collections::VecDeque;
 use std::time::SystemTime;
 use ulid::Ulid;
 
@@ -129,124 +124,6 @@ async fn commit_releases_owner() {
     drive(CreateGroupOperation::new(create), &fixture.context)
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn occupied_peer_refuses() {
-    let first = Fixture::new(&[1, 2]).await;
-    let second = Fixture::new(&[1, 2]).await;
-    drive(
-        CreateBucketOperation::new("owned".into(), second.bucket()),
-        &second.context,
-    )
-    .await
-    .unwrap();
-    prepare(&first, 1).await.unwrap();
-    assert_eq!(
-        prepare(&second, 2).await,
-        Err(GroupDeletionError::NotEmpty {
-            kinds: vec!["S3 buckets".into()],
-            buckets: vec!["owned".into()],
-            more: false,
-            hidden: 0,
-        })
-    );
-    for fixture in [&first, &second] {
-        assert!(
-            read(
-                &fixture.context,
-                GROUP_KEYSPACE,
-                fixture.plan.group_id.to_bytes().to_vec()
-            )
-            .await
-            .is_some()
-        );
-        assert!(
-            read(
-                &fixture.context,
-                AUTH_KEYSPACE,
-                fixture.plan.group_id.to_bytes().to_vec()
-            )
-            .await
-            .is_some()
-        );
-        drive(
-            PrepareOperation::new(
-                fixture.plan.clone(),
-                GroupDeletePhase::Cancelled,
-                fixture.actor.node_id,
-                SystemTime::UNIX_EPOCH,
-            ),
-            &fixture.context,
-        )
-        .await
-        .unwrap();
-    }
-    assert!(
-        read(&second.context, S3_BUCKET_KEYSPACE, b"owned".to_vec())
-            .await
-            .is_some()
-    );
-    assert!(matches!(
-        prepare(&first, 1).await,
-        Err(GroupDeletionError::Conflict(_))
-    ));
-    drive(
-        CreateBucketOperation::new("after-cancel".into(), first.bucket()),
-        &first.context,
-    )
-    .await
-    .unwrap();
-}
-
-#[tokio::test]
-async fn writer_conflicts_freeze() {
-    let fixture = Fixture::new(&[1]).await;
-    let mut operation = CallRun::new(CreateBucketOperation::new(
-        "racing".into(),
-        fixture.bucket(),
-    ));
-    let mut effects = VecDeque::from_iter(operation.start());
-    let mut prepared = false;
-    while !operation.is_complete() {
-        let effect = effects
-            .pop_front()
-            .expect("bucket creation must make progress");
-        let Effect::Storage(effect) = effect else {
-            panic!("unexpected bucket effect");
-        };
-        if matches!(effect, StorageEffect::CommitTransaction { .. }) {
-            assert!(!prepared);
-            prepare(&fixture, 1).await.unwrap();
-            prepared = true;
-        }
-        let event = fixture
-            .context
-            .storage_handle
-            .send_storage_effect(effect)
-            .await;
-        effects.extend(operation.step(event));
-    }
-    assert!(prepared);
-    assert!(matches!(
-        operation.finalize(),
-        Err(CreateBucketError::StorageError(
-            StorageError::TransactionConflict
-        ))
-    ));
-    assert!(
-        read(&fixture.context, S3_BUCKET_KEYSPACE, b"racing".to_vec())
-            .await
-            .is_none()
-    );
-    assert!(matches!(
-        drive(
-            CreateBucketOperation::new("blocked".into(), fixture.bucket()),
-            &fixture.context
-        )
-        .await,
-        Err(CreateBucketError::GroupWrite(GroupWriteError::Frozen))
-    ));
 }
 
 #[tokio::test]

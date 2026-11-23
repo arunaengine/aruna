@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: MIT or Apache-2.0
 
 use crate::topology;
-use aruna_ops_work::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
-use aruna_ops_work::metadata::forward::route_create::RouteCreateOperation;
+use aruna_ops_data::metadata::forward::pinned::{PinnedCreate, PinnedMintOperation};
+use aruna_ops_data::metadata::forward::route_create::RouteCreateOperation;
 
 use crate::job_calls::{
     cancel_job_routed, drain_job_batch, find_dedup_job, read_job_routed, read_owned_job,
@@ -34,7 +34,21 @@ use aruna_core::structs::execution::job::local::{WorkspaceMode, user_dedup_key};
 use aruna_core::structs::identity::auth::AuthContext;
 use aruna_core::structs::placement::record::band_start;
 use aruna_core::structured_id::{BucketId, PlacementHandle, StructuredId};
-use aruna_ops_work::document_repository::GetConfigOperation;
+use aruna_ops_data::metadata::api::MetadataApiError;
+use aruna_ops_data::metadata::api::document_query::DocumentQueryOperation;
+use aruna_ops_data::metadata::api::export_types::ExportMetadataRequest;
+use aruna_ops_data::metadata::api::read_types::{ApiQueryMode, DocumentQueryRequest};
+use aruna_ops_data::metadata::create_document::{
+    CreateDocumentOperation, mint_forward_document, mint_local_document, resolve_metadata_id,
+};
+use aruna_ops_data::metadata::forward::holders::origin_holds_document;
+use aruna_ops_data::metadata::forward::routed::export::RoutedExportOperation;
+use aruna_ops_data::metadata::forward::write::MetadataWriteError;
+use aruna_ops_data::metadata::get_document::{GetDocumentError, GetDocumentOperation};
+use aruna_ops_data::metadata::record_reads::DocumentRecordOperation;
+use aruna_ops_data::testing::fresh_job_id;
+use aruna_ops_identity::document_repository::GetConfigOperation;
+use aruna_ops_identity::sync::shard_placement::sort_node_ids;
 use aruna_ops_work::jobs::drain::JobClassBudget;
 use aruna_ops_work::jobs::job::cancel::RoutedCancelOutcome;
 use aruna_ops_work::jobs::lifecycle::admit::here::{AcceptedSubmission, placement_failure};
@@ -43,20 +57,6 @@ use aruna_ops_work::jobs::lifecycle::submit_external::{
 };
 use aruna_ops_work::jobs::node_inputs::ingress_node;
 use aruna_ops_work::jobs::route::JobRouteError;
-use aruna_ops_work::metadata::api::MetadataApiError;
-use aruna_ops_work::metadata::api::document_query::DocumentQueryOperation;
-use aruna_ops_work::metadata::api::export_types::ExportMetadataRequest;
-use aruna_ops_work::metadata::api::read_types::{ApiQueryMode, DocumentQueryRequest};
-use aruna_ops_work::metadata::create_document::{
-    CreateDocumentOperation, mint_forward_document, mint_local_document, resolve_metadata_id,
-};
-use aruna_ops_work::metadata::forward::holders::origin_holds_document;
-use aruna_ops_work::metadata::forward::routed::export::RoutedExportOperation;
-use aruna_ops_work::metadata::forward::write::MetadataWriteError;
-use aruna_ops_work::metadata::get_document::{GetDocumentError, GetDocumentOperation};
-use aruna_ops_work::metadata::record_reads::DocumentRecordOperation;
-use aruna_ops_work::sync::shard_placement::sort_node_ids;
-use aruna_ops_work::testing::fresh_job_id;
 use aruna_runner::driver::drive;
 use aruna_runner::jobs::runtime::JobsRuntime;
 use aruna_test_harness::jobs::submit_execution_job;

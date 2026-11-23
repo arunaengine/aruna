@@ -15,10 +15,10 @@ use aruna_core::onboarding::{OnboardingMode, OnboardingPurpose, OnboardingSecret
 use aruna_core::structs::identity::auth::{Actor, AuthContext, NodeCapabilities};
 use aruna_core::structs::identity::realm::{RealmId, RealmNodeKind};
 use aruna_core::user::id::UserId;
-use aruna_ops_work::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
-use aruna_ops_work::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
-use aruna_ops_work::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
-use aruna_ops_work::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
+use aruna_ops_identity::onboarding::create_secret::{CreateSecretInput, CreateSecretOperation};
+use aruna_ops_identity::realm::claim_admin::{ClaimInitialInput, ClaimInitialOperation};
+use aruna_ops_identity::realm::create_realm::{CreateRealmConfig, CreateRealmOperation};
+use aruna_ops_identity::realm::ensure_config::{EnsureConfigOperation, EnsureConfigParams};
 use aruna_runner::driver::{DriverContext, drive};
 use aruna_scheduler::TaskHandle;
 use aruna_storage::storage::worker::FjallStorage;

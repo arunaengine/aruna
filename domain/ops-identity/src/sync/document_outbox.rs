@@ -293,9 +293,31 @@ mod tests {
     use aruna_runner::testing::test_context;
     use aruna_storage::storage::handle::StorageHandle;
     use aruna_storage::storage::worker::FjallStorage;
-    use aruna_test_harness::documents::{read_outbox_record, read_outbox_records};
     use tempfile::tempdir;
     use ulid::Ulid;
+
+    /// The outbox record stored at `key`.
+    async fn read_outbox_record(
+        storage: &StorageHandle,
+        key: &[u8],
+    ) -> Result<Option<DocumentOutboxRecord>, ApplyError> {
+        let plan = ReadOutboxPlan { key: key.to_vec() };
+        drive(PlanOperation::new(plan), &test_context(storage.clone())).await
+    }
+
+    /// One page of all outbox records.
+    async fn outbox_page(
+        storage: &StorageHandle,
+        start_after: Option<Vec<u8>>,
+        limit: usize,
+    ) -> Result<OutboxReadBatch, ApplyError> {
+        let plan = OutboxPagePlan {
+            prefix: Vec::new(),
+            start_after,
+            limit,
+        };
+        drive(PlanOperation::new(plan), &test_context(storage.clone())).await
+    }
 
     async fn delete_outbox_records(
         storage: &StorageHandle,
@@ -423,7 +445,7 @@ mod tests {
         let corrupt_key = b"000-corrupt-outbox".to_vec();
         write_raw_record(&storage, corrupt_key.clone(), vec![1, 2, 3]).await;
 
-        let batch = read_outbox_records(&storage, &[], None, OUTBOX_DRAIN_SIZE)
+        let batch = outbox_page(&storage, None, OUTBOX_DRAIN_SIZE)
             .await
             .expect("outbox read succeeds");
 
@@ -465,14 +487,14 @@ mod tests {
             other => panic!("unexpected valid outbox write event: {other:?}"),
         }
 
-        let batch = read_outbox_records(&storage, &[], None, 1)
+        let batch = outbox_page(&storage, None, 1)
             .await
             .expect("outbox read succeeds");
 
         assert!(batch.records.is_empty());
         assert!(batch.has_more);
         assert_eq!(batch.next_start_after, Some(corrupt_key.clone()));
-        let next = read_outbox_records(&storage, &[], batch.next_start_after, 1)
+        let next = outbox_page(&storage, batch.next_start_after, 1)
             .await
             .expect("outbox read after malformed page succeeds");
         assert_eq!(next.records, vec![(outbox_key(&valid).to_vec(), valid)]);

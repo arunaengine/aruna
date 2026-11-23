@@ -4,6 +4,8 @@
 
 pub mod calls;
 #[cfg(test)]
+pub(crate) mod deletion;
+#[cfg(test)]
 pub(crate) mod groups;
 pub mod locations;
 pub mod peers;

@@ -44,8 +44,8 @@ use self::listing::{
 };
 use self::multipart::parse_upload_marker;
 use self::object::object_range_request;
-use aruna_ops_work::s3::object::member::merge::MergeResume as Resume;
-use aruna_ops_work::s3::object::member::write::CopyPath;
+use aruna_ops_data::s3::object::member::merge::MergeResume as Resume;
+use aruna_ops_data::s3::object::member::write::CopyPath;
 
 use crate::object_key::ObjectKey;
 use crate::s3::auth::map_authorize_error;
@@ -89,48 +89,50 @@ use aruna_core::structs::storage::replication::ArunaArn;
 use aruna_core::structs::sync_relationship::{
     SyncMode, SyncRelationship, SyncState, SyncStatusSnapshot,
 };
-use aruna_ops_work::auth::check_permissions::{CheckPermissionsConfig, CheckPermissionsOperation};
-use aruna_ops_work::auth::enforcement::PolicyLoadOperation;
-use aruna_ops_work::auth::error::AuthorizeError;
-use aruna_ops_work::auth::request_authorization::AuthorizeOperation;
-use aruna_ops_work::auth::request_authorization::BucketAccessOperation;
-use aruna_ops_work::groups::routing::{BucketRules, SnapshotOperation};
-use aruna_ops_work::jobs::session::SessionOperation;
-use aruna_ops_work::placement::policy::gate::GateOperation;
-use aruna_ops_work::replication::mirror_repair::kick::KickRepairOperation;
-use aruna_ops_work::replication::mirror_repair::record::MirrorRecordOperation;
-use aruna_ops_work::replication::sync_relationship::SyncRelationshipDirection;
-use aruna_ops_work::replication::sync_relationship::create::CreateRelationshipOperation;
-use aruna_ops_work::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
-use aruna_ops_work::s3::bucket::create::CreateBucketOperation;
-use aruna_ops_work::s3::bucket::delete::DeleteBucketOperation;
-use aruna_ops_work::s3::bucket::list::ListBucketsOperation;
-use aruna_ops_work::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
-use aruna_ops_work::s3::multipart::complete::{CompleteUploadInput, CompleteUploadOperation};
-use aruna_ops_work::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
-use aruna_ops_work::s3::multipart::part_upload::UploadPartOperation;
-use aruna_ops_work::s3::multipart::parts::ListPartsOperation;
-use aruna_ops_work::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
-use aruna_ops_work::s3::object::attributes::{GetAttributesInput, GetAttributesOperation};
-use aruna_ops_work::s3::object::delete::DeleteObjectOperation;
-use aruna_ops_work::s3::object::delete::bulk::{
+use aruna_ops_data::replication::mirror_repair::kick::KickRepairOperation;
+use aruna_ops_data::replication::mirror_repair::record::MirrorRecordOperation;
+use aruna_ops_data::replication::sync_relationship::SyncRelationshipDirection;
+use aruna_ops_data::replication::sync_relationship::create::CreateRelationshipOperation;
+use aruna_ops_data::s3::bucket::cors::{DeleteCorsOperation, GetCorsOperation, PutCorsOperation};
+use aruna_ops_data::s3::bucket::create::CreateBucketOperation;
+use aruna_ops_data::s3::bucket::delete::DeleteBucketOperation;
+use aruna_ops_data::s3::bucket::list::ListBucketsOperation;
+use aruna_ops_data::s3::multipart::abort::{AbortUploadInput, AbortUploadOperation};
+use aruna_ops_data::s3::multipart::complete::{CompleteUploadInput, CompleteUploadOperation};
+use aruna_ops_data::s3::multipart::create::{CreateMultipartInput, CreateMultipartOperation};
+use aruna_ops_data::s3::multipart::part_upload::UploadPartOperation;
+use aruna_ops_data::s3::multipart::parts::ListPartsOperation;
+use aruna_ops_data::s3::multipart::uploads::{ListUploadsInput, ListUploadsOperation};
+use aruna_ops_data::s3::object::attributes::{GetAttributesInput, GetAttributesOperation};
+use aruna_ops_data::s3::object::delete::DeleteObjectOperation;
+use aruna_ops_data::s3::object::delete::bulk::{
     BulkDeleteEntry, BulkDeleteInput, BulkDeleteOperation,
 };
-use aruna_ops_work::s3::object::head::HeadObjectOperation;
-use aruna_ops_work::s3::object::list::{ListBucketInput, ListBucketOperation};
-use aruna_ops_work::s3::object::member::read::{MemberPayload, MemberRead, MemberRequest};
-use aruna_ops_work::s3::object::put::{PutObjectConfig, PutObjectOperation};
-use aruna_ops_work::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
-use aruna_ops_work::s3::object::visible::{HiddenCursor, is_sealed};
-use aruna_ops_work::transfer::copy::{
+use aruna_ops_data::s3::object::head::HeadObjectOperation;
+use aruna_ops_data::s3::object::list::{ListBucketInput, ListBucketOperation};
+use aruna_ops_data::s3::object::member::read::{MemberPayload, MemberRead, MemberRequest};
+use aruna_ops_data::s3::object::put::{PutObjectConfig, PutObjectOperation};
+use aruna_ops_data::s3::object::versions::{ListVersionsInput, ListVersionsOperation};
+use aruna_ops_data::s3::object::visible::{HiddenCursor, is_sealed};
+use aruna_ops_data::transfer::copy::{
     CopyObjectInput as CopyObjectData, CopyObjectOperation, CopyReferences,
 };
-use aruna_ops_work::transfer::part_copy::{
+use aruna_ops_data::transfer::part_copy::{
     KeepPoliciesOperation, PartCopyInput as UploadPartCopyData, PartCopyOperation,
 };
-use aruna_ops_work::transfer::read::{
+use aruna_ops_data::transfer::read::{
     GetRoutedOperation, KeyedReadOperation, ObjectInfoOperation, TokenRead,
 };
+use aruna_ops_identity::auth::check_permissions::{
+    CheckPermissionsConfig, CheckPermissionsOperation,
+};
+use aruna_ops_identity::auth::enforcement::PolicyLoadOperation;
+use aruna_ops_identity::auth::error::AuthorizeError;
+use aruna_ops_identity::auth::request_authorization::AuthorizeOperation;
+use aruna_ops_identity::auth::request_authorization::BucketAccessOperation;
+use aruna_ops_identity::groups::routing::{BucketRules, SnapshotOperation};
+use aruna_ops_identity::placement::policy::gate::GateOperation;
+use aruna_ops_work::jobs::session::SessionOperation;
 use aruna_runner::driver::{DriverContext, drive, drive_retry, drive_until, node_routing};
 use aruna_runner::position::open_cursor;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -515,7 +517,7 @@ impl S3 for ArunaS3Service {
             })?;
 
         let result = drive(
-            ListBucketsOperation::new(aruna_ops_work::s3::bucket::list::ListBucketsInput {
+            ListBucketsOperation::new(aruna_ops_data::s3::bucket::list::ListBucketsInput {
                 group_id: user_access.group_id,
                 prefix: req.input.prefix.clone(),
                 continuation_token: req.input.continuation_token.clone(),
@@ -1668,7 +1670,7 @@ impl S3 for ArunaS3Service {
             .ok_or_else(|| s3_error!(InvalidRequest, "Missing body"))?;
 
         let operation = UploadPartOperation::new(
-            aruna_ops_work::s3::multipart::part_upload::UploadPartInput {
+            aruna_ops_data::s3::multipart::part_upload::UploadPartInput {
                 bucket: req.input.bucket,
                 key: req.input.key,
                 upload_id,
@@ -2180,7 +2182,7 @@ impl S3 for ArunaS3Service {
 
         let range_request = requested_range.map(object_range_request);
 
-        let input = aruna_ops_work::s3::object::get::GetObjectInput {
+        let input = aruna_ops_data::s3::object::get::GetObjectInput {
             bucket,
             key,
             version_id,
@@ -2210,7 +2212,7 @@ impl S3 for ArunaS3Service {
             }
         };
         // A link is read at its target, under the caller's own rights there.
-        if let Err(aruna_ops_work::s3::object::get::GetObjectError::Link(linked)) = &result {
+        if let Err(aruna_ops_data::s3::object::get::GetObjectError::Link(linked)) = &result {
             let bucket = response_bucket.as_str();
             return self
                 .follow_get(&user_access, bucket, linked, link_read)
@@ -2362,7 +2364,7 @@ impl S3 for ArunaS3Service {
             Some(
                 drive(
                     ObjectInfoOperation::new(
-                        aruna_ops_work::s3::object::get::GetObjectInput {
+                        aruna_ops_data::s3::object::get::GetObjectInput {
                             bucket,
                             key,
                             version_id,
@@ -2473,7 +2475,7 @@ impl S3 for ArunaS3Service {
         };
         let catching_up = self.read_scope(bucket_info.as_ref(), &key, false).await?;
         let operation =
-            HeadObjectOperation::new(aruna_ops_work::s3::object::head::HeadObjectInput {
+            HeadObjectOperation::new(aruna_ops_data::s3::object::head::HeadObjectInput {
                 bucket: bucket.clone(),
                 key: key.clone(),
                 version_id,
@@ -2512,7 +2514,7 @@ impl S3 for ArunaS3Service {
             Some(
                 drive(
                     ObjectInfoOperation::new(
-                        aruna_ops_work::s3::object::get::GetObjectInput {
+                        aruna_ops_data::s3::object::get::GetObjectInput {
                             bucket,
                             key,
                             version_id,
@@ -2640,7 +2642,7 @@ impl S3 for ArunaS3Service {
         };
 
         let result = drive(
-            ListPartsOperation::new(aruna_ops_work::s3::multipart::parts::ListPartsInput {
+            ListPartsOperation::new(aruna_ops_data::s3::multipart::parts::ListPartsInput {
                 bucket: req.input.bucket.clone(),
                 key: req.input.key.clone(),
                 upload_id,
@@ -2876,7 +2878,7 @@ impl S3 for ArunaS3Service {
         let replicate_latest_delete = version_id.is_none();
 
         let operation =
-            DeleteObjectOperation::new(aruna_ops_work::s3::object::delete::DeleteObjectInput {
+            DeleteObjectOperation::new(aruna_ops_data::s3::object::delete::DeleteObjectInput {
                 bucket: req.input.bucket,
                 key: req.input.key,
                 version_id,
