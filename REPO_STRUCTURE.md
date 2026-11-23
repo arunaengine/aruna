@@ -45,18 +45,21 @@ They start an operation in the same way as an HTTP request does.
 | Inputs | `frontends/api`, `frontends/wire` | REST, S3 and MCP transports: input checks, auth, error mapping, OpenAPI, wire DTOs |
 | Inputs | `apps/node`, `runtime/config` | the node binary: settings, portal assets, wiring, startup, shutdown, trigger shells |
 | Inputs | `apps/doctor`, `apps/cli`, `apps/registry` | operator tool on a stopped node; user client; standalone identifier registry |
-| Operations | `domain/ops-identity`, `domain/ops-data`, `domain/ops-work` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-ops-work` facade + triggers) |
+| Operations | `domain/ops-identity`, `domain/ops-data`, `domain/ops-work` | pure sans-IO use-case state machines in three layer crates (`aruna-ops-identity` -> `aruna-ops-data` -> `aruna-ops-work`, which also holds the trigger tables) |
 | Drivers | `runtime/runner` (`aruna-runner`) | the drive loop, effect routing to the backends and the job runtime |
 | Backends | `runtime/storage`, `runtime/p2p`, `runtime/blob`, `runtime/rdf-graph`, `runtime/scheduler`, `runtime/compute`, `runtime/egress`, `runtime/wasm-host` | Fjall, Iroh and document sync, blob backends, RDF/RO-Crate graph store, timers, executors, egress HTTP/SMTP, the WASM host |
 | Foundations | `domain/core`, `domain/kpabe`, `domain/plugin-contract` | domain types, record formats, keyspaces, effects, events, the `Operation` trait, pure helpers, plugin manifests/recipes |
 | Foundations | `runtime/clock` | host clocks and the OS random source for the runner, backends and inputs; never core or operations |
 | Tests | `testing/harness` (`aruna-test-harness`) | test helpers that drive operations through the drivers; only dev-dependencies use it |
 
-`domain/ops-work` holds only synchronous sans-IO state machines and the trigger tables
-(`domain/ops-work/src/triggers.rs`). The small number of remaining unconverted timer
+The three operations crates hold only synchronous sans-IO state machines;
+`domain/ops-work` also holds the trigger tables (`domain/ops-work/src/triggers.rs`).
+`aruna-ops-work` is no longer a facade: callers import each operation from the crate
+that owns it (`aruna-ops-identity`, `aruna-ops-data` or `aruna-ops-work`). An
+operations crate never depends on a higher one, also not as a dev-dependency. The small number of remaining unconverted timer
 and peer arms live in the `apps/node` trigger shells (`apps/node/src/tasks/incoming/mod.rs`
 and `apps/node/src/inbound.rs`) and are tracked by `scripts/dev/layers_baseline.json`.
-Do not add new async services to `domain/ops-work`.
+Do not add new async services to the operations crates.
 
 ## Call flows
 
@@ -82,7 +85,7 @@ Do not add new async services to `domain/ops-work`.
 | --- | --- |
 | Domain type, stored record format, key layout | `domain/core`, in the module of its domain |
 | Effect and event types | `domain/core/src/effects.rs`, `domain/core/src/events.rs` |
-| A decision, a rule, a check of an event against the state | an operation in `domain/ops-work` |
+| A decision, a rule, a check of an event against the state | an operation in the `domain/ops-*` crate of its domain group |
 | A use case with several steps | an operation built from sub-operations |
 | Retry after a transaction conflict | one rule in the drivers |
 | Background work, queue drains, repair sweeps | a timer trigger and an operation per page |
@@ -91,15 +94,15 @@ Do not add new async services to `domain/ops-work`.
 | Settings parsing and wiring | `apps/node` |
 | Shutdown coordination | `runtime/scheduler` |
 
-Inside `domain/ops-work`, domains form three groups. A domain may use its own group
-and lower groups, and never forms a cycle inside its group:
+The operations domains form three groups, one per crate. A domain may use its own
+group and lower groups, and never forms a cycle inside its group:
 
-1. Identity and realm: realm, auth, users, groups, session, device, onboarding,
+1. Identity and realm (`domain/ops-identity`): realm, auth, users, groups, session, device, onboarding,
    secrets, abe, placement, shard, sync, owner index, document repository,
    endpoint screening, forward, vaults, tasks.
-2. Data: s3, blob, staging, connectors, replication, distribution, metadata,
+2. Data (`domain/ops-data`): s3, blob, staging, connectors, replication, distribution, metadata,
    git, shares.
-3. Work and integrations: jobs, plugins, assistant, notifications, federation,
+3. Work and integrations (`domain/ops-work`): jobs, plugins, assistant, notifications, federation,
    harvest, node.
 
 ## The layer guard
@@ -114,26 +117,42 @@ hold async code. Raising a count is an explicit edit of that file with the
 reason in the pull request. A change that lowers a count lowers the baseline in
 the same change.
 
+The guard also enforces the layer order derived from each crate's top-level folder
+(`LAYERS` in the script), so a new crate needs no extra rule. The current state:
+
+- `StoragePort` in `domain/core/src/handle.rs` lets `runtime/blob` and `runtime/p2p`
+  use storage without a production dependency on `runtime/storage`; only their tests
+  name it.
+- `runtime/config` depends only on `aruna-core`, `aruna-clock` and `aruna-wire`, not
+  on storage, p2p or irokle.
+- The `crate_allow` list in `scripts/dev/layers_baseline.json` is empty, so
+  `apps/doctor` and every other crate stay inside the target table.
+- `frontends/api` production code builds no raw storage, net or blob effects
+  (`api_raw_effects: 0`), and tests hold no real sleeps (`test_sleeps: 0`).
+- Two trigger shell arms still run async code (`trigger_arms: 2`): `Alpn::Bao` and
+  `Alpn::DocumentSync` in `apps/node/src/inbound.rs`.
+
 ## Where new files live
 
 - bucket, object, multipart and access operations:
-  `domain/ops-work/src/s3/{bucket,object,multipart,access}/`;
-- routes: `frontends/api/src/routes/{execution,access,storage}/`; other route domains
-  stay flat under `frontends/api/src/routes/`;
+  `domain/ops-data/src/s3/{bucket,object,multipart,access}/`;
+- routes: a route domain with several features gets a folder under
+  `frontends/api/src/routes/` (for example `execution/`, `access/`, `storage/` and
+  `info/`); a single-file domain stays flat there;
+- S3 handlers: `frontends/api/src/s3/service/{buckets,lists,reads,writes,uploads}.rs`;
 - persisted records: `domain/core/src/structs/{placement,identity,storage,execution}/`;
 - effect adapters: `runtime/runner/src/effect_adapters/`;
 - test helpers: in a `src/tests/` folder beside the domain when the helper
   family qualifies under the folder threshold, otherwise a hoisted sibling file
   declared with an explicit `#[path]` (`apps/node/src/bootstrap_tests.rs`);
-- shared integration test fixtures of `domain/ops-work`: `domain/ops-work/tests/topology/`
-  (realm nodes, realm config, loopback net) and `domain/ops-work/tests/convergence/`
-  (progress waits and hang caps);
+- shared node test fixtures: `apps/node/tests/operations/{topology,convergence}/`
+  (realm nodes, realm config and loopback net; progress waits and hang caps);
 - raw fixture assets: the owning crate's `tests/fixtures/`.
 
 ## Add an operation
 
 1. Define the input, output, error and a private state enum in
-   `domain/ops-work/src/<area>/<verb>.rs`. Keep `Output` one domain value; failure
+   `domain/ops-<group>/src/<area>/<verb>.rs`. Keep `Output` one domain value; failure
    belongs in the error type.
 2. Implement `Operation` (`domain/core/src/operation.rs`): `first`, `next`, and as
    needed `transaction`, `hold_scope`, `abort`, `stamp`, `seed`, `on_conflict`,
@@ -154,7 +173,8 @@ the same change.
    and the OpenAPI document cannot diverge.
 2. Put an MCP tool in `frontends/api/src/mcp/<area>.rs` and register the area router in
    `frontends/api/src/mcp/mod.rs::router`. Reuse the operation call of the REST route.
-3. Map operation errors to responses explicitly. Test allowed, denied and
+3. Map operation errors to responses explicitly, with a `From<Error> for ServerError`
+   impl beside the handler. Test allowed, denied and
    public cases and the error shape.
 
 ## Add a background queue or timer
@@ -205,12 +225,16 @@ the same change.
 
 ## Tests, measurements and commands
 
-- `just test-fast` runs the no-I/O `state_machine_tests`, `pure_tests` and
-  `decision_tests` modules of `aruna-core` and `aruna-ops-work`. Cargo still
-  compiles both packages and their dependencies.
-- Runtime, storage and multi-node behavior lives in ordinary test modules,
-  `domain/ops-work/tests` and `apps/node/tests`. Tests wait on progress with a hang cap
-  and assert no speed.
+- `just test-fast` runs the library tests of `aruna-core` and the three
+  `aruna-ops-*` crates with the `fast` nextest profile.
+- Operation tests in `domain/ops-*` and route tests in `frontends/api` run on
+  `MemoryStorage::open()` (`runtime/storage/src/storage/memory.rs`), with no disk.
+- Runtime, storage and multi-node behavior of the node lives in one test binary,
+  `apps/node/tests/regimes.rs`. It groups the tests into seven modules:
+  `identity_regime`, `storage_regime`, `federation_regime`, `metadata_regime`,
+  `restart_regime`, `compute_regime` and `ops_regime`. Filter one with a test name
+  prefix, for example `cargo nextest run -p aruna --test regimes storage_regime::`.
+  Tests wait on progress with a hang cap and assert no speed.
 - Speed is measured on request with
   `cargo run --release -p aruna --example measure`, which prints
   rates for fixed workloads on real backends in temporary folders. Peak memory

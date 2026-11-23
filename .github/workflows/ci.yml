@@ -198,7 +198,7 @@ jobs:
           --binaries-metadata target/nextest/binaries-metadata.json
           --target-dir-remap target --workspace-remap .
           --profile ci --run-ignored only --no-tests pass --partition hash:${{ matrix.shard }}/4
-          -E 'package(aruna) & binary(compute_regime) & test(/^(compute_execution|mcp_artifacts)::/)'
+          -E 'package(aruna) & binary(regimes) & test(/^compute_regime::(compute_execution|mcp_artifacts)::/)'
 
       - name: Upload JUnit report
         if: failure()
@@ -298,7 +298,7 @@ jobs:
           sh -c 'export ARUNA_ARC_PYTHON="$(command -v python)";
           exec cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --profile ci --run-ignored only --no-tests fail
-          -E "package(aruna) & binary(metadata_regime) & test(/^git_native::/)"'
+          -E "package(aruna) & binary(regimes) & test(/^metadata_regime::git_native::/)"'
 
   # The example's own Python tests; the plugin examples job runs it in the plugin runtime.
   elabftw-python:
@@ -391,7 +391,7 @@ jobs:
         run: >-
           cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored only --no-tests fail
-          -E 'package(aruna) & binary(restart_regime) & test(/^restart_traffic::offline_scale_/)'
+          -E 'package(aruna) & binary(regimes) & test(/^restart_regime::restart_traffic::offline_scale_/)'
 
   s3-backend:
     needs: [test-build-crates, test-build-node]
@@ -466,9 +466,9 @@ jobs:
         run: >-
           cargo-nextest nextest run --archive-file nextest-node.tar.zst --workspace-remap . --extract-to . --extract-overwrite
           --run-ignored all --no-tests fail
-          -E '(package(aruna) & binary(storage_regime)
-          & (test(=multipart::s3_provider_flow) | test(=multipart::s3_framed_completion)))
-          | (package(aruna) & binary(storage_regime) & test(/^linked_import::/))'
+          -E '(package(aruna) & binary(regimes)
+          & (test(=storage_regime::multipart::s3_provider_flow) | test(=storage_regime::multipart::s3_framed_completion)))
+          | (package(aruna) & binary(regimes) & test(/^storage_regime::linked_import::/))'
 
   docker-backend:
     runs-on: ubuntu-latest

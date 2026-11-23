@@ -32,7 +32,7 @@ use ulid::Ulid;
 const CHILD_MODE_ENV: &str = "ARUNA_METADATA_RESTART_PERSISTENCE_CHILD";
 const DATABASE_DIR_ENV: &str = "ARUNA_METADATA_RESTART_DATABASE_DIR";
 const METADATA_PATH_ENV: &str = "ARUNA_METADATA_RESTART_METADATA_PATH";
-const CHILD_TEST_NAME: &str = "restart_persistence::child_writes_flushes";
+const CHILD_TEST_NAME: &str = "restart_regime::restart_persistence::child_writes_flushes";
 
 #[tokio::test]
 async fn restart_persists_flush() -> Result<(), Box<dyn std::error::Error>> {

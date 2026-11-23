@@ -1,14 +1,9 @@
-//! Builds the multi-node replication and delivery tests and their fixtures into one test binary.
+//! Groups the multi-node replication and delivery tests under one test regime.
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-// Fresh builds overflow the default query depth in nested async layouts.
-#![recursion_limit = "512"]
-
 #[path = "operations/audit_topology.rs"]
 mod audit_topology;
-#[path = "operations/convergence/mod.rs"]
-mod convergence;
 #[path = "operations/deletion_peers.rs"]
 mod deletion_peers;
 #[path = "operations/device_documents.rs"]
@@ -17,14 +12,11 @@ mod device_documents;
 mod disjoint_turnover;
 #[path = "operations/genesis_confirmation.rs"]
 mod genesis_confirmation;
-#[path = "operations/job_calls.rs"]
-mod job_calls;
 #[path = "operations/manifest_convergence.rs"]
 mod manifest_convergence;
 #[path = "operations/manifest_protocol.rs"]
 mod manifest_protocol;
-#[path = "operations/metadata_calls.rs"]
-mod metadata_calls;
+#[path = "network_recovery.rs"]
 mod network_recovery;
 #[path = "operations/nonholder_topology.rs"]
 mod nonholder_topology;
@@ -40,14 +32,12 @@ mod propagation_tail;
 mod quarantine_capacity;
 #[path = "operations/read_through.rs"]
 mod read_through;
+#[path = "replication.rs"]
 mod replication;
 #[path = "operations/shard_manifest.rs"]
 mod shard_manifest;
-mod shared;
 #[path = "operations/synced_folders.rs"]
 mod synced_folders;
-#[path = "operations/topology/mod.rs"]
-mod topology;
 #[path = "operations/transition_bounds.rs"]
 mod transition_bounds;
 #[path = "operations/transition_expansion.rs"]
@@ -60,9 +50,5 @@ mod transition_stall;
 mod transition_turnover;
 #[path = "operations/usage_replication.rs"]
 mod usage_replication;
-#[path = "operations/user_calls.rs"]
-mod user_calls;
 #[path = "operations/watch_delivery.rs"]
 mod watch_delivery;
-
-use convergence::fresh_ids;

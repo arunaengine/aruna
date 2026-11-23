@@ -111,32 +111,8 @@ rmcp = { workspace = true, features = [
 tempfile = { workspace = true }
 
 [[test]]
-name = "identity_regime"
-path = "tests/identity_regime.rs"
-
-[[test]]
-name = "storage_regime"
-path = "tests/storage_regime.rs"
-
-[[test]]
-name = "federation_regime"
-path = "tests/federation_regime.rs"
-
-[[test]]
-name = "metadata_regime"
-path = "tests/metadata_regime.rs"
-
-[[test]]
-name = "restart_regime"
-path = "tests/restart_regime.rs"
-
-[[test]]
-name = "compute_regime"
-path = "tests/compute_regime.rs"
-
-[[test]]
-name = "ops_regime"
-path = "tests/ops_regime.rs"
+name = "regimes"
+path = "tests/regimes.rs"
 
 # Prints workload rates on request (cargo run --release --example measure); never a test.
 [[example]]

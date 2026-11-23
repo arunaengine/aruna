@@ -2,7 +2,7 @@
 // Copyright (c) 2026 The Aruna Contributors
 // SPDX-License-Identifier: MIT or Apache-2.0
 
-use crate::lane_jobs::run_staging_job;
+use super::lane_jobs::run_staging_job;
 use aruna_core::bucket_read::GetBucketOperation;
 use aruna_core::structs::execution::job::identity::JobId;
 use aruna_core::structs::execution::table::SEARCH_EXACT_KEY;

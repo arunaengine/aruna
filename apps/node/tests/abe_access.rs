@@ -347,7 +347,7 @@ async fn abe_restart() -> TestResult<()> {
         .args([
             "--ignored",
             "--exact",
-            "abe_access::abe_restart_child",
+            "storage_regime::abe_access::abe_restart_child",
             "--nocapture",
         ])
         .env(RESTART_ROOT, root.path())
