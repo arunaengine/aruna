@@ -32,7 +32,7 @@ tantivy = { workspace = true }
 rustix = { workspace = true }
 
 [features]
-# Smaller key index limits for tests of crates that use the storage handle.
+# Test helpers for crates that use the storage handle: smaller key index limits and memory storage.
 test-hooks = []
 
 [dev-dependencies]

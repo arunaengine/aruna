@@ -106,6 +106,9 @@ pub struct StorageHandle {
     pub(super) policies: Arc<PolicyPrograms>,
     /// Point reads of read-mostly keyspaces; only a handle with its own worker keeps one.
     pub(super) cache: Option<Arc<HotCache>>,
+    /// The in-memory store that answers effects in place of the worker, in tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(super) memory: Option<Arc<super::memory::MemoryStore>>,
 }
 
 /// The opened node database behind a `Send + Sync` object, so the auto trait proofs of handle
@@ -178,6 +181,8 @@ impl StorageHandle {
                 range_indexes: Arc::new(OnceLock::new()),
                 policies: Arc::new(PolicyPrograms::default()),
                 cache: None,
+                #[cfg(any(test, feature = "test-hooks"))]
+                memory: None,
             },
             StorageReceivers { foreground, bulk },
         )
@@ -587,6 +592,10 @@ impl StorageHandle {
             };
             return self.observe_storage_event(committed);
         }
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(memory) = &self.memory {
+            return self.dispatch_memory(memory, effect);
+        }
         let mut deferred = None;
         let send_result: Result<(), StorageError> = {
             // Guard held across the close check and the queue send (never an
@@ -720,6 +729,51 @@ impl StorageHandle {
         }
     }
 
+    /// Runs an effect on the in-memory store at once, with the close fence and the cleanup
+    /// bookkeeping of a queued effect, so callers see the same answers as from the worker.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn dispatch_memory(
+        &self,
+        memory: &super::memory::MemoryStore,
+        effect: StorageEffect,
+    ) -> StorageEvent {
+        let cleanup = cleanup_effect(&effect);
+        let event = {
+            let close_guard = storage_effect_mutates(&effect).then(|| {
+                self.metrics
+                    .close_lock
+                    .read()
+                    .expect("storage close lock poisoned")
+            });
+            if close_guard.is_some() && self.writes_closed() {
+                self.metrics.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                let error = StorageError::Closed;
+                return self.observe_storage_event(StorageEvent::Error { error });
+            }
+            if let Some((txn_id, kind)) = cleanup {
+                let mut pending = self
+                    .transaction_cleanup
+                    .lock()
+                    .expect("transaction cleanup mutex poisoned");
+                if let Err(error) = reserve_cleanup(&mut pending, txn_id, kind) {
+                    drop(pending);
+                    return self.observe_storage_event(StorageEvent::Error { error });
+                }
+                if let Some(entry) = pending.get_mut(&txn_id) {
+                    entry.queued = true;
+                }
+            }
+            let mut token = ResponseToken::new(self, &effect);
+            let _in_flight = InFlightGuard::acquire(&self.metrics);
+            let event = memory.run(effect);
+            token.observe(&event);
+            token.claim();
+            event
+        };
+        self.observe_cleanup(cleanup, &event);
+        self.observe_storage_event(event)
+    }
+
     pub(super) fn enqueue_abort_transaction(&self, txn_id: Ulid, reason: &'static str) {
         let mut pending = self
             .transaction_cleanup
@@ -745,6 +799,14 @@ impl StorageHandle {
         let span = storage_effect_span(&effect);
         let in_flight = InFlightGuard::acquire(&self.metrics);
         self.mark_queued(txn_id, true);
+        // The worker drops an abort's answer, so its token ends the cleanup entry on drop.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Some(memory) = &self.memory {
+            let mut response_tx = response_tx;
+            response_tx.observe(&memory.run(effect));
+            drop((in_flight, response_tx));
+            return;
+        }
         match self.channel_for(&effect).try_send((
             effect,
             response_tx,

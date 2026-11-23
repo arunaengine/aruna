@@ -42,6 +42,7 @@ fn small_handle(capacity: usize) -> (StorageHandle, super::handle::StorageReceiv
         range_indexes: std::sync::Arc::new(std::sync::OnceLock::new()),
         policies: std::sync::Arc::new(super::policies::PolicyPrograms::default()),
         cache: None,
+        memory: None,
     };
     (handle, super::handle::StorageReceivers { foreground, bulk })
 }
@@ -573,6 +574,7 @@ fn worker_exit_latches() {
         range_indexes: _,
         policies: _,
         cache: _,
+        memory: _,
     } = handle;
 
     assert!(!metrics.channel_closed.load(Ordering::Relaxed));

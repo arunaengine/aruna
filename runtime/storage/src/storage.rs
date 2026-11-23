@@ -7,6 +7,8 @@ mod hot_cache;
 #[cfg(debug_assertions)]
 mod ledger;
 pub mod lifecycle;
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod memory;
 pub mod metrics;
 pub mod owner;
 pub mod persistence;
@@ -25,6 +27,8 @@ mod tests_cache;
 mod tests_config;
 #[cfg(test)]
 mod tests_counters;
+#[cfg(test)]
+mod tests_memory;
 #[cfg(test)]
 mod tests_persistence;
 #[cfg(test)]
