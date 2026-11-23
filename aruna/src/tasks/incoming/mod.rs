@@ -20,7 +20,7 @@ use aruna_tasks::shutdown::Shutdown;
 use aruna_tasks::{InboundTaskHandler, TaskHandle};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 #[cfg(debug_assertions)]
 struct OutboxBarrier {
@@ -30,7 +30,7 @@ struct OutboxBarrier {
 #[cfg(debug_assertions)]
 impl Drop for OutboxBarrier {
     fn drop(&mut self) {
-        info!(event = "test.outbox.joined", "Outbox drain joined");
+        tracing::info!(event = "test.outbox.joined", "Outbox drain joined");
         if let Err(error) = std::fs::write(&self.marker, b"joined") {
             warn!(error = %error, "Failed to record outbox join");
         }

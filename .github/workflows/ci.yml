@@ -695,10 +695,9 @@ jobs:
     # Hang cap for one release build, not a performance budget.
     timeout-minutes: 60
     env:
-      # Startup checks need no optimized workspace code; dependencies get opt-level 1
-      # below, and the release profile and target/release/ layout stay intact.
-      CARGO_PROFILE_RELEASE_OPT_LEVEL: 0
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 256
+      # Startup checks need no aggressive O3 passes; opt-level 1 keeps async
+      # frames compact for the 2 MiB Tokio stack while cutting LLVM time.
+      CARGO_PROFILE_RELEASE_OPT_LEVEL: 1
 
     steps:
       - name: Check out repository
@@ -711,8 +710,7 @@ jobs:
 
       - name: Build the deployment binaries
         run: |
-          cargo build --release --locked -p aruna -p aruna-doctor \
-            --config 'profile.release.package."*".opt-level=1'
+          cargo build --release --locked -p aruna -p aruna-doctor
           # A tarball keeps the executable bits that artifacts drop.
           tar -cf release-binaries.tar -C target/release aruna aruna-doctor
 
