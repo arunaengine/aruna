@@ -33,7 +33,7 @@ Aruna v3 is currently in public alpha (`v3.0.0-alpha.*`). Pre-built Linux (`linu
 images are published on Harbor:
 
 ```text
-harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:<tag>
+harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<tag>
 ```
 
 Each published image uses a distroless Debian 13 runtime (no shell inside the container) and
@@ -222,7 +222,7 @@ Create `/srv/aruna/compose.yaml`:
 ```yaml
 services:
   aruna:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3.0.0-alpha.208
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3.0.0-alpha.208
     container_name: aruna
     restart: unless-stopped
     stop_grace_period: 30s
@@ -591,7 +591,7 @@ docker compose start aruna
    ```bash
    docker run --rm \
      -v /srv/aruna:/srv/aruna \
-     harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3.0.0-alpha.208 \
+     harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3.0.0-alpha.208 \
      /run/aruna-doctor restore /srv/aruna/backups/aruna-<timestamp>.bak /srv/aruna/data-restored
    ```
 
@@ -617,7 +617,7 @@ Always follow this sequence when moving from one pinned tag to another:
 3. **Pull the new pinned image** and update the tag in `/srv/aruna/compose.yaml`:
 
    ```bash
-   NEW_IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:<new-tag>
+   NEW_IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<new-tag>
    docker pull "$NEW_IMAGE"
    ```
 

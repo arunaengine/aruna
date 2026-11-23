@@ -78,7 +78,7 @@ You need Docker. The node image is published on Harbor for linux/amd64. It conta
 `aruna-doctor` and the web portal:
 
 ```bash
-IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:v3
+IMAGE=harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:v3
 docker pull "$IMAGE"
 ```
 

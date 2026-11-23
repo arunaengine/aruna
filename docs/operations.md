@@ -106,7 +106,7 @@ The container can listen on unprivileged ports and Docker maps host ports `80` a
 ```yaml
 services:
   aruna:
-    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3-demo:<tag>
+    image: harbor.computational.bio.uni-giessen.de/aruna/aruna-v3:<tag>
     ports:
       - "443:8443"
       - "80:8080"
