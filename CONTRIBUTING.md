@@ -28,12 +28,15 @@ revision. The same commands are available locally: `just check` compiles every
 supported feature selection, and `just test` runs the nextest and doctest
 commands (it requires `cargo-nextest`).
 
-A crate with several `tests/` files builds them as modules of one test binary,
-named `integration` in most crates. The node crate `apps/node` builds them into
-the `regimes` binary, grouped under seven regime modules. Run them with nextest,
-which starts every test in its own process; select one file with
+Most crates with several `tests/` files consolidate them into one test binary,
+named `integration` in library crates and `regimes` (grouped under seven regime
+modules) in `apps/node`. Run them with nextest, which starts every test in its
+own process. For consolidated binaries, select one file by module prefix with
 `-E 'test(/^<file>::/)'`, and in `apps/node` add the regime prefix, for example
 `cargo nextest run -p aruna --test regimes -E 'test(/^storage_regime::s3_operations::/)'`.
+Crates that use Cargo's separate integration test targets (such as
+`elabftw-sync`) select a file by target name instead, for example
+`cargo nextest run -p elabftw-sync --test bodies`.
 
 All required PR checks must pass before merge. A failed, partial, or earlier
 run is not a pass; rerun affected checks after corrections. Use the pinned

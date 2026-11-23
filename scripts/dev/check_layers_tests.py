@@ -556,6 +556,31 @@ class EffectsTest(unittest.TestCase):
             ["frontends/api/src/routes.rs:4", "frontends/api/src/routes.rs:5"],
         )
 
+    def test_raw_alias(self):
+        text = (
+            "use aruna_core::effects::StorageEffect as r#type;\n"
+            "fn handler() {\n    let sync = r#type::SyncAll;\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, {"frontends/api/src/routes.rs": text})
+            sources = [check_layers.load_source(root, "frontends/api/src/routes.rs")]
+        self.assertEqual(check_layers.raw_effects(sources), ["frontends/api/src/routes.rs:3"])
+
+    def test_scoped_alias(self):
+        text = (
+            "fn first() {\n"
+            "    use aruna_core::effects::StorageEffect as Store;\n"
+            "    let _ = Store::SyncAll;\n"
+            "}\n"
+            "fn second() {\n"
+            "    let _ = Store::open();\n"
+            "}\n"
+        )
+        with tempfile.TemporaryDirectory() as root:
+            write_tree(root, {"frontends/api/src/routes.rs": text})
+            sources = [check_layers.load_source(root, "frontends/api/src/routes.rs")]
+        self.assertEqual(check_layers.raw_effects(sources), ["frontends/api/src/routes.rs:3"])
+
 
 class GuardTest(unittest.TestCase):
     def test_production_await(self):

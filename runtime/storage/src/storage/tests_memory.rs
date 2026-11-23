@@ -12,6 +12,7 @@ use aruna_core::errors::StorageError;
 use aruna_core::events::{Event, StorageEvent};
 use aruna_core::keyspaces::{
     AUTH_KEYSPACE, CONNECTOR_SECRET_KEYSPACE, REALM_CONFIG_KEYSPACE, S3_BUCKET_KEYSPACE,
+    USAGE_PREIMAGE_KEYSPACE,
 };
 use aruna_core::node::vault::{NodeVaultKey, VaultEntry, VaultPurpose};
 use aruna_core::structs::storage::distribution::OriginalEpoch;
@@ -26,6 +27,7 @@ use ulid::Ulid;
 use super::handle::StorageHandle;
 use super::hot_cache::cached_slot;
 use super::memory::MemoryStorage;
+use super::preimage::tagged;
 use super::worker::FjallStorage;
 
 const SPACE: &str = "rows";
@@ -758,6 +760,44 @@ async fn resumed_view(handle: &StorageHandle) -> Vec<String> {
 #[tokio::test]
 async fn resumed_view_matches() {
     parity(resumed_view).await;
+}
+
+/// Finishing a rebuild clears kept preimages without conflicting an open writer that read one.
+async fn clear_no_conflict(handle: &StorageHandle) -> Vec<String> {
+    let mut session = Session::new(handle);
+    session.send(source_put("s/1", "a", None)).await;
+    let rebuild = StorageEffect::BeginUsageRebuild {
+        key_space: USAGE.to_string(),
+    };
+    let view = match session.send(rebuild).await {
+        StorageEvent::TransactionStarted { txn_id } => txn_id,
+        other => panic!("rebuild did not begin: {other:?}"),
+    };
+    session.send(source_put("s/1", "b", None)).await;
+    let kept_key = tagged(S3_BUCKET_KEYSPACE, b"s/1");
+    let writer = session.begin(false).await;
+    let seen = session
+        .send(read_in(USAGE_PREIMAGE_KEYSPACE, &kept_key, Some(writer)))
+        .await;
+    assert!(read_value(&seen).is_some(), "the kept preimage row is live");
+    session.send(commit(view)).await;
+    session
+        .send(StorageEffect::FinishUsageRebuild {
+            key_space: USAGE.to_string(),
+        })
+        .await;
+    session.send(put("unrelated", "1", Some(writer))).await;
+    let committed = session.send(commit(writer)).await;
+    assert!(matches!(
+        committed,
+        StorageEvent::TransactionCommitted { .. }
+    ));
+    session.trace
+}
+
+#[tokio::test]
+async fn clear_conflict_matches() {
+    parity(clear_no_conflict).await;
 }
 
 fn config_put(txn_id: Option<Ulid>) -> StorageEffect {

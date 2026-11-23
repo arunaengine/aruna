@@ -146,8 +146,9 @@ RUNTIME_FOUNDATIONS = frozenset({"aruna-core", "aruna-kpabe", "aruna-plugin-cont
 RUNTIME_EXTRAS = {"aruna-config": ("aruna-wire",)}
 FRONTEND_RUNTIME = frozenset({"aruna-clock", "aruna-runner"})
 API_SRC = "frontends/api/src/"
-RAW_EFFECT = re.compile(r"\b(?:Storage|Net|Blob)Effect::")
-EFFECT_ALIAS = re.compile(r"\b(?:Storage|Net|Blob)Effect\s+as\s+([A-Za-z_]\w*)")
+RAW_EFFECT = re.compile(r"(?<![\w#])(?:r#)?(?:Storage|Net|Blob)Effect::")
+EFFECT_NAMES = frozenset({"StorageEffect", "NetEffect", "BlobEffect"})
+EFFECT_USE = re.compile(r"(?<![\w#.:])\buse\s+([\w:#*{},\s]+?);|[{}]")
 TRIGGER_MATCHES = (
     ("apps/node/src/tasks/incoming/mod.rs", "TaskKey::"),
     ("apps/node/src/inbound.rs", "Alpn::"),
@@ -873,6 +874,49 @@ def layer_findings(root):
     return found
 
 
+def tree_aliases(tree, prefix=()):
+    """Effect aliases bound by a `use` tree, including grouped and raw-identifier aliases."""
+    tree = tree.strip()
+    brace = tree.find("{")
+    close = tree.rfind("}")
+    if brace >= 0 and close > brace:
+        head = segments(tree[:brace])
+        body = tree[brace + 1 : close]
+        found = []
+        for part in split_top(body):
+            if part.strip():
+                found.extend(tree_aliases(part, prefix + head))
+        return found
+    parts = re.split(r"\s+as\s+", tree, maxsplit=1)
+    if len(parts) != 2:
+        return []
+    alias = parts[1].strip()
+    if not alias or alias == "_":
+        return []
+    path = prefix + tuple(part.strip() for part in parts[0].split("::") if part.strip())
+    if path and path[-1] == "self":
+        path = path[:-1]
+    return [alias] if path and path[-1].removeprefix("r#") in EFFECT_NAMES else []
+
+
+def scoped_aliases(masked):
+    """Each effect alias paired with the `(start, end)` span of its enclosing block."""
+    scopes = [[0, len(masked)]]
+    stack = [0]
+    bound = []
+    for hit in EFFECT_USE.finditer(masked):
+        tree = hit.group(1)
+        if tree is not None:
+            for alias in tree_aliases(SPACE_RE.sub(" ", tree)):
+                bound.append((stack[-1], alias))
+        elif hit.group() == "{":
+            stack.append(len(scopes))
+            scopes.append([hit.start(), len(masked)])
+        elif len(stack) > 1:
+            scopes[stack.pop()][1] = hit.end()
+    return [(alias, tuple(scopes[scope])) for scope, alias in bound]
+
+
 def raw_effects(sources):
     """Raw storage, net and blob effect paths in API production code, also through a `use` alias;
     handlers use operations."""
@@ -880,10 +924,12 @@ def raw_effects(sources):
     for source in sources:
         if not source.rel.startswith(API_SRC):
             continue
-        aliases = sorted({hit.group(1) for hit in EFFECT_ALIAS.finditer(source.masked)} - {"_"})
-        patterns = [RAW_EFFECT, *(re.compile(rf"\b{re.escape(alias)}::") for alias in aliases)]
-        starts = sorted(hit.start() for pattern in patterns for hit in pattern.finditer(source.masked))
-        found.extend(f"{source.rel}:{source.masked.count(chr(10), 0, start) + 1}" for start in starts)
+        starts = {hit.start() for hit in RAW_EFFECT.finditer(source.masked)}
+        for alias, (start, end) in scoped_aliases(source.masked):
+            name = alias.removeprefix("r#")
+            pattern = re.compile(rf"(?<![\w#])(?:r#)?{re.escape(name)}::")
+            starts.update(hit.start() for hit in pattern.finditer(source.masked, start, end))
+        found.extend(f"{source.rel}:{source.masked.count(chr(10), 0, pos) + 1}" for pos in sorted(starts))
     return found
 
 

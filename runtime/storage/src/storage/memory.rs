@@ -54,8 +54,16 @@ impl MemoryStorage {
     }
 }
 
-/// The versions of one key, oldest first: the commit sequence and the value, `None` once deleted.
-type Versions = Vec<(u64, Option<ByteView>)>;
+/// One committed version of a key; `transactional` distinguishes commits from keyspace clears.
+#[derive(Debug, PartialEq, Eq)]
+struct Version {
+    sequence: u64,
+    value: Option<ByteView>,
+    transactional: bool,
+}
+
+/// The versions of one key, oldest first.
+type Versions = Vec<Version>;
 /// Changed rows of one keyspace; `None` deletes the row.
 type Rows = BTreeMap<ByteView, Option<ByteView>>;
 /// Changed rows per keyspace, applied as one commit.
@@ -890,7 +898,7 @@ impl Committed {
         merged.filter_map(|(key, value)| Some(Ok((key, value?))))
     }
 
-    /// True when a commit after `snapshot` changed a key within `bounds`.
+    /// True when a transactional commit after `snapshot` changed a key within `bounds`.
     fn changed(&self, key_space: &str, bounds: &Bounds, snapshot: u64) -> bool {
         let Some(space) = self.spaces.get(key_space).filter(|_| ordered(bounds)) else {
             return false;
@@ -898,8 +906,10 @@ impl Committed {
         let mut rows = space.range(bounds.clone());
         rows.any(|(_, versions)| {
             versions
-                .last()
-                .is_some_and(|(sequence, _)| *sequence > snapshot)
+                .iter()
+                .rev()
+                .take_while(|version| version.sequence > snapshot)
+                .any(|version| version.transactional)
         })
     }
 
@@ -911,7 +921,11 @@ impl Committed {
             let space = self.spaces.entry(key_space).or_default();
             for (key, value) in rows {
                 let versions = space.entry(key.clone()).or_default();
-                versions.push((self.sequence, value));
+                versions.push(Version {
+                    sequence: self.sequence,
+                    value,
+                    transactional: true,
+                });
                 prune(versions, floor);
                 if versions.is_empty() {
                     space.remove(&key);
@@ -920,19 +934,37 @@ impl Committed {
         }
     }
 
-    /// Deletes every live row of a keyspace as the next commit; like Fjall, a snapshot from
-    /// `floor` on still reads the old rows.
+    /// Drops every live row of a keyspace outside optimistic conflict tracking; like Fjall, a
+    /// snapshot from `floor` on still reads the old rows, and closed delete histories are pruned.
     fn clear(&mut self, key_space: &str, floor: u64) {
-        let Some(space) = self.spaces.get(key_space) else {
+        let Some(space) = self.spaces.get_mut(key_space) else {
             return;
         };
-        let live = space
-            .iter()
-            .filter(|(_, versions)| versions.last().is_some_and(|(_, value)| value.is_some()));
-        let rows: Rows = live.map(|(key, _)| (key.clone(), None)).collect();
-        if !rows.is_empty() {
-            self.apply(Changes::from([(key_space.to_string(), rows)]), floor);
+        let any_live = space.values().any(|versions| {
+            versions
+                .last()
+                .is_some_and(|version| version.value.is_some())
+        });
+        if any_live {
+            self.sequence += 1;
+            let sequence = self.sequence;
+            for versions in space.values_mut() {
+                if versions
+                    .last()
+                    .is_some_and(|version| version.value.is_some())
+                {
+                    versions.push(Version {
+                        sequence,
+                        value: None,
+                        transactional: false,
+                    });
+                }
+            }
         }
+        space.retain(|_, versions| {
+            prune(versions, floor);
+            !versions.is_empty()
+        });
     }
 }
 
@@ -980,17 +1012,17 @@ fn visible(versions: &Versions, snapshot: u64) -> Option<ByteView> {
     let version = versions
         .iter()
         .rev()
-        .find(|(sequence, _)| *sequence <= snapshot);
-    version.and_then(|(_, value)| value.clone())
+        .find(|version| version.sequence <= snapshot);
+    version.and_then(|version| version.value.clone())
 }
 
 /// Keeps the versions after `floor` and the newest one at or before it, unless that is a delete.
 fn prune(versions: &mut Versions, floor: u64) {
     let older = versions
         .iter()
-        .take_while(|(sequence, _)| *sequence <= floor)
+        .take_while(|version| version.sequence <= floor)
         .count();
-    let deleted = older > 0 && versions[older - 1].1.is_none();
+    let deleted = older > 0 && versions[older - 1].value.is_none();
     let keep_from = if deleted {
         older
     } else {
@@ -1017,11 +1049,12 @@ fn byte_bounds((start, end): KeyBounds) -> Bounds {
 mod tests {
     use super::*;
 
-    fn version(sequence: u64, value: Option<&str>) -> (u64, Option<ByteView>) {
-        (
+    fn version(sequence: u64, value: Option<&str>) -> Version {
+        Version {
             sequence,
-            value.map(|value| ByteView::from(value.as_bytes())),
-        )
+            value: value.map(|value| ByteView::from(value.as_bytes())),
+            transactional: true,
+        }
     }
 
     #[test]
@@ -1035,6 +1068,34 @@ mod tests {
         assert_eq!(versions, [version(3, Some("b")), version(5, None)]);
         prune(&mut versions, u64::MAX);
         assert!(versions.is_empty(), "a delete nobody reads behind goes");
+    }
+
+    #[test]
+    fn clear_prunes_closed() {
+        let key = |text: &str| ByteView::from(text.as_bytes());
+        let mut rows = Committed::default();
+        let write = |k: &str, v: &str| {
+            Changes::from([(SPACE.to_string(), Rows::from([(key(k), Some(key(v)))]))])
+        };
+        rows.apply(write("a", "1"), 1);
+        rows.clear(SPACE, 1);
+        let all = (Unbounded, Unbounded);
+        assert_eq!(rows.get(SPACE, b"a", 1), Some(key("1")));
+        assert_eq!(rows.get(SPACE, b"a", 2), None);
+        assert!(!rows.changed(SPACE, &all, 1));
+        assert_eq!(rows.spaces[SPACE].len(), 1);
+
+        let before = rows.sequence;
+        rows.clear(SPACE, u64::MAX);
+        assert_eq!(rows.sequence, before, "pruning dead rows does not bump seq");
+        assert!(rows.spaces[SPACE].is_empty(), "closed delete goes away");
+
+        // A transactional write before a clear still conflicts with an earlier snapshot.
+        rows.apply(write("b", "1"), 2);
+        let snap = rows.sequence;
+        rows.apply(write("b", "2"), snap);
+        rows.clear(SPACE, snap);
+        assert!(rows.changed(SPACE, &all, snap));
     }
 
     #[test]

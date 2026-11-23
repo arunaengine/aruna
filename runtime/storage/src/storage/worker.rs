@@ -1365,7 +1365,8 @@ pub(super) fn range_page<R: Readable>(
 }
 
 /// Takes at most `limit` rows and, after the first, at most `max_bytes` of keys and values.
-/// Only taken rows pass through `decode`; the lookahead row stays undecoded.
+/// Only the `peek()` lookahead stays undecoded; a row that exceeds `max_bytes` is decoded to read
+/// its size before returning.
 pub(super) fn budget_page<T>(
     rows: impl Iterator<Item = T>,
     (limit, max_bytes): (usize, usize),
@@ -1419,5 +1420,5 @@ fn guard_row(guard: fjall::Guard) -> Result<(ByteView, ByteView), StorageError> 
     let (key, value) = guard
         .into_inner()
         .map_err(|error| StorageError::ReadError(error.to_string()))?;
-    Ok((ByteView::from(key.as_ref()), ByteView::from(value.as_ref())))
+    Ok((key.into(), value.into()))
 }
