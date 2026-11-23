@@ -383,3 +383,17 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.zstd-sys]
 opt-level = 2
+
+# Unoptimized profile for fast cross-platform unit tests and Windows checks.
+[profile.ci-platform]
+inherits = "dev"
+opt-level = 0
+debug = 0
+
+[profile.ci-platform.build-override]
+opt-level = 0
+debug = 0
+
+[profile.ci-platform.package."*"]
+opt-level = 0
+debug = 0
